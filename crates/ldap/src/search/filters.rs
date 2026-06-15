@@ -378,7 +378,12 @@ pub fn convert_group_filter(
                             message: format!("Invalid UUID: {e:#}"),
                         })
                 }
-                crate::core::utils::GroupFieldType::Member => {
+                crate::core::utils::GroupFieldType::Member
+                | crate::core::utils::GroupFieldType::UniqueMember
+                | crate::core::utils::GroupFieldType::MemberOf => {
+                    // "member" and "uniqueMember" are the standards; "memberof"/"ismemberof"
+                    // are accepted as aliases pointing to the same membership filter semantics
+                    // for groups (enables client compatibility + faster lookups).
                     Ok(get_user_id_from_distinguished_name_or_plain_name(
                         &value_lc,
                         &ldap_info.base_dn,
@@ -386,19 +391,7 @@ pub fn convert_group_filter(
                     )
                     .map(GroupRequestFilter::Member)
                     .unwrap_or_else(|e| {
-                        warn!("Invalid member filter on group: {}", e);
-                        GroupRequestFilter::False
-                    }))
-                }
-                crate::core::utils::GroupFieldType::UniqueMember => {
-                    Ok(get_user_id_from_distinguished_name_or_plain_name(
-                        &value_lc,
-                        &ldap_info.base_dn,
-                        &ldap_info.base_dn_str,
-                    )
-                    .map(GroupRequestFilter::Member)
-                    .unwrap_or_else(|e| {
-                        warn!("Invalid uniqueMember filter on group: {}", e);
+                        warn!("Invalid member/uniqueMember/memberOf filter on group: {}", e);
                         GroupRequestFilter::False
                     }))
                 }
@@ -628,6 +621,61 @@ mod tests {
                 assert_eq!(name.as_str(), "firstname"); // canonical name
             }
             other => panic!("Expected AttributeSubString, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_convert_group_filter_uid_maps_to_display_name() {
+        let schema = PublicSchema::get();
+        let ldap_info = crate::core::utils::LdapInfo {
+            base_dn: vec![],
+            base_dn_str: "dc=example,dc=com".to_string(),
+            ignored_user_attributes: vec![],
+            ignored_group_attributes: vec![],
+        };
+
+        // uid on a group filter should resolve via Primary(UserId) -> DisplayName
+        let filter = LdapFilter::Equality("uid".to_string(), "My Group".to_string());
+        let result = convert_group_filter(&ldap_info, &filter, &schema);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            GroupRequestFilter::DisplayName(name) => {
+                assert_eq!(name.as_str(), "my group");
+            }
+            other => panic!("Expected DisplayName for uid group filter, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_convert_group_filter_memberof_points_to_member() {
+        let schema = PublicSchema::get();
+        let ldap_info = crate::core::utils::LdapInfo {
+            base_dn: vec![],
+            base_dn_str: "dc=example,dc=com".to_string(),
+            ignored_user_attributes: vec![],
+            ignored_group_attributes: vec![],
+        };
+
+        // memberof (and ismemberof) on group filter should point to Member semantics
+        let filter = LdapFilter::Equality("memberof".to_string(), "someuser".to_string());
+        let result = convert_group_filter(&ldap_info, &filter, &schema);
+        assert!(result.is_ok());
+        match result.unwrap() {
+            GroupRequestFilter::Member(uid) => {
+                assert_eq!(uid.as_str(), "someuser");
+            }
+            other => panic!("Expected Member for memberof group filter, got {:?}", other),
+        }
+
+        // Also via the standard "member" name (plain value is accepted and lowercased)
+        let filter2 = LdapFilter::Equality("member".to_string(), "bar".to_string());
+        let result2 = convert_group_filter(&ldap_info, &filter2, &schema);
+        assert!(result2.is_ok());
+        match result2.unwrap() {
+            GroupRequestFilter::Member(uid) => {
+                assert_eq!(uid.as_str(), "bar");
+            }
+            other => panic!("Expected Member for member group filter, got {:?}", other),
         }
     }
 }

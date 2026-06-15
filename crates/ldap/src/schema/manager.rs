@@ -264,6 +264,7 @@ impl SchemaManager {
         if let Some((logical, _)) = self.resolve_attribute(field.as_str()) {
             return match logical {
                 LogicalAttr::ObjectClass => GroupFieldType::ObjectClass,
+                LogicalAttr::MemberOf => GroupFieldType::MemberOf,
                 LogicalAttr::Dn => GroupFieldType::Dn,
                 LogicalAttr::EntryDn => GroupFieldType::EntryDn,
                 LogicalAttr::Operational
@@ -280,6 +281,7 @@ impl SchemaManager {
                         GroupFieldType::ModifiedDate
                     }
                     lldap_domain_model::model::UserColumn::Uuid => GroupFieldType::Uuid,
+                    lldap_domain_model::model::UserColumn::UserId => GroupFieldType::DisplayName,
                     lldap_domain_model::model::UserColumn::DisplayName => {
                         GroupFieldType::DisplayName
                     }
@@ -289,11 +291,15 @@ impl SchemaManager {
                     GroupFieldType::Attribute(AttributeName::from(internal), t, is_list)
                 }
                 LogicalAttr::Operational => GroupFieldType::NoMatch,
-                _ => GroupFieldType::NoMatch,
             };
         }
 
-        // Explicit handling for uniqueMember (standard for groupOfUniqueNames)
+        // Explicit handling for member (standard for groupOfNames) and uniqueMember
+        // (standard for groupOfUniqueNames). "memberof"/"ismemberof" are handled via
+        // LogicalAttr::MemberOf above (pointed to Member semantics for group *filters*).
+        if field.as_str().eq_ignore_ascii_case("member") {
+            return GroupFieldType::Member;
+        }
         if field.as_str().eq_ignore_ascii_case("uniquemember") {
             return GroupFieldType::UniqueMember;
         }

@@ -417,6 +417,12 @@ pub fn get_group_attribute(
                 .collect();
             members.into_iter().map(|s| s.into_bytes()).collect()
         }
+        crate::core::utils::GroupFieldType::MemberOf => {
+            // memberOf is a user operational/virtual attribute (groups a user belongs to).
+            // For group entries we never emit it; use "member" / "uniqueMember" instead.
+            // (This prevents the filter alias from leaking into result attributes.)
+            return None;
+        }
         crate::core::utils::GroupFieldType::Uuid => vec![group.uuid.to_string().into_bytes()],
         crate::core::utils::GroupFieldType::Attribute(attr, _, _) => {
             get_custom_attribute(&group.attributes, &attr)?

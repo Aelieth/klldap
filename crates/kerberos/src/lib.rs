@@ -1,31 +1,27 @@
 #![recursion_limit = "256"]
 #![allow(unsafe_code)]
 use anyhow::{Context, Result};
-use tracing::{info, warn};
-use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
+pub use keycloak_config::KeycloakRealmGenerationOptions;
+pub use keycloak_config::generate_keycloak_realm_json;
 use lazy_static::lazy_static;
 use rand::rngs::OsRng;
-use rsa::{Oaep, RsaPrivateKey, RsaPublicKey};  // Removed old Pkcs1v15Encrypt — upgraded to modern OAEP
 use rsa::pkcs1::EncodeRsaPublicKey;
-use sha2::Sha256;  // New for secure OAEP padding (this is the security upgrade)
-use std::{env, fs};
+use rsa::{Oaep, RsaPrivateKey, RsaPublicKey}; // Removed old Pkcs1v15Encrypt — upgraded to modern OAEP
+use sha2::Sha256; // New for secure OAEP padding (this is the security upgrade)
 use std::process::Command;
-pub use keycloak_config::generate_keycloak_realm_json;
-pub use keycloak_config::KeycloakRealmGenerationOptions;
+use std::{env, fs};
+use tracing::{info, warn};
 
 pub mod keycloak_client;
 pub mod keycloak_config;
 
 pub use keycloak_client::KeycloakClient;
 pub use keycloak_config::{
-    KeycloakSuggestedConfig,
-    KeycloakConfig,
-    get_keycloak_suggested_config,
-    load_keycloak_config,
+    KeycloakConfig, KeycloakSuggestedConfig, get_keycloak_admin_password,
+    get_keycloak_suggested_config, load_full_keycloak_config, load_keycloak_config,
     save_keycloak_config,
-    get_keycloak_admin_password,
-    load_full_keycloak_config,
 };
 
 mod ffi;
@@ -34,31 +30,31 @@ pub(crate) use ffi::Kadm5Handle;
 // Shared helper — eliminates duplication between lib.rs and kerberos_manager.rs
 // Uses exact same logic as before (LLDAP_LDAP_BASE_DN → domain → realm)
 pub fn derive_realm_from_base_dn() -> String {
-    let base_dn = env::var("LLDAP_LDAP_BASE_DN")
-    .unwrap_or_else(|_| "dc=example,dc=com".to_string());
+    let base_dn =
+        env::var("LLDAP_LDAP_BASE_DN").unwrap_or_else(|_| "dc=example,dc=com".to_string());
     let domain = base_dn
-    .split(',')
-    .filter_map(|part| part.strip_prefix("dc="))
-    .collect::<Vec<_>>()
-    .join(".")
-    .to_lowercase();
+        .split(',')
+        .filter_map(|part| part.strip_prefix("dc="))
+        .collect::<Vec<_>>()
+        .join(".")
+        .to_lowercase();
     env::var("LLDAP_KERB_REALM_NAME")
-    .ok()
-    .filter(|s| !s.is_empty())
-    .unwrap_or_else(|| domain.to_uppercase())
-    .to_uppercase()
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| domain.to_uppercase())
+        .to_uppercase()
 }
 
 // NEW: Used by UI default + keytab export (auto "keycloak.yourdomain")
 pub fn derive_domain_from_base_dn() -> String {
-    let base_dn = env::var("LLDAP_LDAP_BASE_DN")
-    .unwrap_or_else(|_| "dc=example,dc=com".to_string());
+    let base_dn =
+        env::var("LLDAP_LDAP_BASE_DN").unwrap_or_else(|_| "dc=example,dc=com".to_string());
     base_dn
-    .split(',')
-    .filter_map(|part| part.strip_prefix("dc="))
-    .collect::<Vec<_>>()
-    .join(".")
-    .to_lowercase()
+        .split(',')
+        .filter_map(|part| part.strip_prefix("dc="))
+        .collect::<Vec<_>>()
+        .join(".")
+        .to_lowercase()
 }
 
 lazy_static! {
@@ -66,9 +62,13 @@ lazy_static! {
         match generate_keypair() {
             Ok(pair) => pair,
             Err(e) => {
-                warn!("Failed to generate RSA keypair for Kerberos—sync will fail: {}", e);
+                warn!(
+                    "Failed to generate RSA keypair for Kerberos—sync will fail: {}",
+                    e
+                );
                 let mut rng = OsRng;
-                let dummy_priv = RsaPrivateKey::new(&mut rng, 128).expect("Failed to generate dummy private key");
+                let dummy_priv = RsaPrivateKey::new(&mut rng, 128)
+                    .expect("Failed to generate dummy private key");
                 let dummy_pub = RsaPublicKey::from(&dummy_priv);
                 (dummy_priv, dummy_pub)
             }
@@ -89,14 +89,19 @@ pub fn decrypt_password(encrypted: &str) -> Result<String> {
     let dec_data = STANDARD.decode(encrypted).context("Base64 decode failed")?;
     // Security upgrade: OAEP + SHA-256 (modern, recommended padding)
     let padding = Oaep::new::<Sha256>();
-    let plain_data = priv_key.decrypt(padding, &dec_data).context("Decryption failed")?;
+    let plain_data = priv_key
+        .decrypt(padding, &dec_data)
+        .context("Decryption failed")?;
     String::from_utf8(plain_data).context("UTF-8 decode failed")
 }
 
 pub fn delete_kerberos_principal(username: &str) -> Result<()> {
     let realm_upper = derive_realm_from_base_dn();
     let full_principal = format!("{}@{}", username, realm_upper);
-    info!("Attempting to delete Kerberos principal via FFI: {}", full_principal);
+    info!(
+        "Attempting to delete Kerberos principal via FFI: {}",
+        full_principal
+    );
 
     let admin_principal = format!("admin/admin@{}", realm_upper);
     let keytab_path = "/data/kadm5.keytab";
@@ -112,7 +117,7 @@ pub fn delete_kerberos_principal(username: &str) -> Result<()> {
                  Treating as success (principal either never existed or Kerberos sync disabled).",
                 e
             );
-            return Ok(());   // ← idempotent success, no error, no warn
+            return Ok(()); // ← idempotent success, no error, no warn
         }
     };
 
@@ -129,29 +134,43 @@ pub fn sync_kerberos_principal(username: &str, plain_password: &str) -> Result<(
     let admin_principal = format!("admin/admin@{}", realm_upper);
     let keytab_path = "/data/kadm5.keytab";
 
-    info!("Using direct keytab auth for admin: {} (keytab: {})", admin_principal, keytab_path);
+    info!(
+        "Using direct keytab auth for admin: {} (keytab: {})",
+        admin_principal, keytab_path
+    );
 
     let handle = Kadm5Handle::init_with_keytab(keytab_path, &admin_principal, &realm_upper)
     .context("Failed to initialize Kerberos admin handle with keytab (check keytab exists/permissions)")?;
 
     // Try change password first (most common case after user already exists)
-    if handle.chpass_principal(username, plain_password, &realm_upper).is_ok() {
-        info!("✅ Kerberos password updated successfully for {}", full_principal);
+    if handle
+        .chpass_principal(username, plain_password, &realm_upper)
+        .is_ok()
+    {
+        info!(
+            "✅ Kerberos password updated successfully for {}",
+            full_principal
+        );
         return Ok(());
     }
 
     warn!("Change password failed (likely principal does not exist)—creating new principal...");
 
-    handle.create_principal(username, plain_password, &realm_upper)
-    .context("Failed to create new Kerberos principal")?;
+    handle
+        .create_principal(username, plain_password, &realm_upper)
+        .context("Failed to create new Kerberos principal")?;
 
-    info!("✅ Kerberos principal created and password set for {}", full_principal);
+    info!(
+        "✅ Kerberos principal created and password set for {}",
+        full_principal
+    );
     Ok(())
 }
 
 pub fn get_public_key_der_base64() -> String {
     let der = KEYPAIR.1.to_pkcs1_der().ok();
-    der.map(|d| STANDARD.encode(d.as_bytes())).unwrap_or_default()
+    der.map(|d| STANDARD.encode(d.as_bytes()))
+        .unwrap_or_default()
 }
 
 pub fn export_keytab_for_keycloak(hostname_input: &str) -> Result<String> {
@@ -170,7 +189,7 @@ pub fn export_keytab_for_keycloak(hostname_input: &str) -> Result<String> {
     let admin_principal = format!("admin/admin@{}", realm);
 
     let handle = Kadm5Handle::init_with_keytab("/data/kadm5.keytab", &admin_principal, &realm)
-    .context("Failed to initialize Kerberos admin handle")?;
+        .context("Failed to initialize Kerberos admin handle")?;
 
     let keytab_path = "/data/keytab/keycloak-http.keytab";
     let _ = fs::remove_file(keytab_path);
@@ -186,11 +205,11 @@ pub fn export_keytab_for_keycloak(hostname_input: &str) -> Result<String> {
     );
 
     let output = Command::new("/usr/sbin/kadmin.local")
-    .env("KRB5_CONFIG", "/etc/krb5.conf")
-    .arg("-q")
-    .arg(&query)
-    .output()
-    .context("Failed to execute kadmin.local")?;
+        .env("KRB5_CONFIG", "/etc/krb5.conf")
+        .arg("-q")
+        .arg(&query)
+        .output()
+        .context("Failed to execute kadmin.local")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -214,7 +233,10 @@ pub fn sync_kerberos_if_enabled(
     plain_password: &str,
 ) -> Result<()> {
     if sync_enabled {
-        info!("Kerberos sync enabled for user {}; triggering principal sync", user_id);
+        info!(
+            "Kerberos sync enabled for user {}; triggering principal sync",
+            user_id
+        );
         sync_kerberos_principal(user_id, plain_password)
     } else {
         info!("Kerberos sync disabled for user {}; skipping", user_id);

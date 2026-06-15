@@ -1,6 +1,8 @@
 use std::{fmt::Display, str::FromStr};
 
+use crate::components::avatar::{Avatar, validate_avatar_input};
 use anyhow::{Error, Result, bail};
+use base64::{Engine as _, engine::general_purpose};
 use gloo_file::{
     File,
     callbacks::{FileReader, read_as_bytes},
@@ -8,8 +10,6 @@ use gloo_file::{
 use web_sys::{FileList, HtmlInputElement, InputEvent};
 use yew::Properties;
 use yew::{prelude::*, virtual_dom::AttrValue};
-use crate::components::avatar::{Avatar, validate_avatar_input};
-use base64::{engine::general_purpose, Engine as _};
 
 #[derive(Default)]
 struct JsFile {
@@ -50,13 +50,29 @@ fn to_base64(file: &JsFile) -> Result<String> {
         Ok(b.clone())
     } else {
         match file {
-            JsFile { file: None, contents: None, .. } => Ok(String::new()),
-            JsFile { file: Some(_), contents: None, .. } => bail!("Image file hasn't finished loading, try again"),
-            JsFile { file: Some(_), contents: Some(data), .. } => {
+            JsFile {
+                file: None,
+                contents: None,
+                ..
+            } => Ok(String::new()),
+            JsFile {
+                file: Some(_),
+                contents: None,
+                ..
+            } => bail!("Image file hasn't finished loading, try again"),
+            JsFile {
+                file: Some(_),
+                contents: Some(data),
+                ..
+            } => {
                 let _ = validate_avatar(data)?;
                 Ok(general_purpose::STANDARD.encode(data))
             }
-            JsFile { file: None, contents: Some(data), .. } => Ok(general_purpose::STANDARD.encode(data)),
+            JsFile {
+                file: None,
+                contents: Some(data),
+                ..
+            } => Ok(general_purpose::STANDARD.encode(data)),
         }
     }
 }
@@ -90,8 +106,12 @@ impl Component for AvatarFileInput {
         Self {
             avatar: Some(JsFile {
                 file: None,
-                contents: ctx.props().value.as_ref().and_then(|x| general_purpose::STANDARD.decode(x).ok()),
-                         base64: ctx.props().value.clone(),
+                contents: ctx
+                    .props()
+                    .value
+                    .as_ref()
+                    .and_then(|x| general_purpose::STANDARD.decode(x).ok()),
+                base64: ctx.props().value.clone(),
             }),
             reader: None,
             error: None,
@@ -113,7 +133,9 @@ impl Component for AvatarFileInput {
             // Critical fix: sync to new base64 from backend after "Save changes"
             self.avatar = Some(JsFile {
                 file: None,
-                contents: props_value.as_ref().and_then(|x| general_purpose::STANDARD.decode(x).ok()),
+                contents: props_value
+                    .as_ref()
+                    .and_then(|x| general_purpose::STANDARD.decode(x).ok()),
                 base64: props_value.clone(),
             });
             self.error = None;
@@ -138,9 +160,16 @@ impl Component for AvatarFileInput {
                 let file_name = new_avatar.name();
                 let link = ctx.link().clone();
                 self.reader = Some(read_as_bytes(&new_avatar, move |res| {
-                    link.send_message(Msg::FileLoaded(file_name, res.map_err(|e| anyhow::anyhow!("{:#}", e))))
+                    link.send_message(Msg::FileLoaded(
+                        file_name,
+                        res.map_err(|e| anyhow::anyhow!("{:#}", e)),
+                    ))
                 }));
-                self.avatar = Some(JsFile { file: Some(new_avatar), contents: None, base64: None });
+                self.avatar = Some(JsFile {
+                    file: Some(new_avatar),
+                    contents: None,
+                    base64: None,
+                });
                 true
             }
             Msg::ClearClicked => {
@@ -157,22 +186,22 @@ impl Component for AvatarFileInput {
                     && let Some(file) = &avatar.file
                     && file.name() == file_name
                     && let Result::Ok(data) = data
-                    {
-                        match validate_avatar(&data) {
-                            Ok(()) => {
-                                let b64 = general_purpose::STANDARD.encode(&data);
-                                avatar.contents = Some(data);
-                                avatar.base64 = Some(b64.clone());
-                                self.error = None;
-                            }
-                            Err(e) => {
-                                self.error = Some(e.to_string());
-                                self.avatar = Some(JsFile::default());
-                            }
+                {
+                    match validate_avatar(&data) {
+                        Ok(()) => {
+                            let b64 = general_purpose::STANDARD.encode(&data);
+                            avatar.contents = Some(data);
+                            avatar.base64 = Some(b64.clone());
+                            self.error = None;
+                        }
+                        Err(e) => {
+                            self.error = Some(e.to_string());
+                            self.avatar = Some(JsFile::default());
                         }
                     }
-                    self.reader = None;
-                    true
+                }
+                self.reader = None;
+                true
             }
         }
     }
@@ -210,7 +239,9 @@ impl Component for AvatarFileInput {
 impl AvatarFileInput {
     fn upload_files(files: Option<FileList>) -> Msg {
         match files {
-            Some(files) if files.length() > 0 => Msg::FileSelected(File::from(files.item(0).unwrap())),
+            Some(files) if files.length() > 0 => {
+                Msg::FileSelected(File::from(files.item(0).unwrap()))
+            }
             _ => Msg::Update,
         }
     }

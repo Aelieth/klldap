@@ -1,13 +1,13 @@
 use crate::{
     components::{
+        avatar::Avatar,
         form::{
             attribute_input::{ListAttributeInput, SingleAttributeInput},
             static_value::StaticValue,
             submit::Submit,
         },
-        user_details::{Attribute, AttributeSchema, User},
-        avatar::Avatar,
         kerberos_switch::{KerberosSwitch, prepare_kerberos_update},
+        user_details::{Attribute, AttributeSchema, User},
     },
     infra::{
         common_component::{CommonComponent, CommonComponentParts},
@@ -17,11 +17,11 @@ use crate::{
 };
 use anyhow::Result;
 use chrono::NaiveDateTime;
+use gloo_console::log;
 use graphql_client::GraphQLQuery;
+use yew::Callback;
 use yew::prelude::*;
 use yew::virtual_dom::AttrValue;
-use yew::Callback;
-use gloo_console::log;
 
 #[derive(GraphQLQuery)]
 #[graphql(
@@ -35,10 +35,21 @@ pub struct UpdateUser;
 
 fn attribute_priority(name: &str) -> (i32, String) {
     let priorities = vec![
-        "firstname", "lastname", "displayname", "mail", "avatar",
-        "uidnumber", "gidnumber", "homedirectory", "loginshell",
+        "firstname",
+        "lastname",
+        "displayname",
+        "mail",
+        "avatar",
+        "uidnumber",
+        "gidnumber",
+        "homedirectory",
+        "loginshell",
     ];
-    let index = priorities.iter().position(|&p| p == name).map(|i| i as i32).unwrap_or(100);
+    let index = priorities
+        .iter()
+        .position(|&p| p == name)
+        .map(|i| i as i32)
+        .unwrap_or(100);
     (index, name.to_lowercase())
 }
 
@@ -59,7 +70,7 @@ pub enum Msg {
     ToggleKerberosSync(bool),
 }
 
-#[derive(yew::Properties, Clone, PartialEq)]  // Eq removed – Callback<()> does not implement Eq
+#[derive(yew::Properties, Clone, PartialEq)] // Eq removed – Callback<()> does not implement Eq
 pub struct Props {
     pub user: User,
     pub user_attributes_schema: Vec<AttributeSchema>,
@@ -105,8 +116,9 @@ impl Component for UserDetailsForm {
     type Properties = Props;
 
     fn create(ctx: &Context<Self>) -> Self {
-        let kerberossync_enabled = ctx.props().user.attributes.iter()
-        .any(|attr| attr.schema.name.to_lowercase() == "kerberossync" && attr.value == vec!["1"]);
+        let kerberossync_enabled = ctx.props().user.attributes.iter().any(|attr| {
+            attr.schema.name.to_lowercase() == "kerberossync" && attr.value == vec!["1"]
+        });
         Self {
             common: CommonComponentParts::<Self>::create(),
             just_updated: false,
@@ -168,7 +180,9 @@ impl Component for UserDetailsForm {
             }
         };
 
-        let mut all_attrs: Vec<&AttributeSchema> = ctx.props().user_attributes_schema
+        let mut all_attrs: Vec<&AttributeSchema> = ctx
+            .props()
+            .user_attributes_schema
             .iter()
             .filter(|a| a.name != "userid" && a.name != "kerberossync")
             .collect();
@@ -241,7 +255,9 @@ impl UserDetailsForm {
                 continue;
             }
 
-            let old_val = base_attributes.iter().find(|b| b.schema.name.to_lowercase() == name_lower);
+            let old_val = base_attributes
+                .iter()
+                .find(|b| b.schema.name.to_lowercase() == name_lower);
             let old_values = old_val.map_or(&empty, |v| &v.value);
 
             let has_changed = old_values != &attr.values;
@@ -251,7 +267,9 @@ impl UserDetailsForm {
             }
 
             if name_lower == "avatar" {
-                if attr.values.is_empty() || attr.values.first().map_or(true, |s| s.trim().is_empty()) {
+                if attr.values.is_empty()
+                    || attr.values.first().map_or(true, |s| s.trim().is_empty())
+                {
                     to_remove.push(attr.name.clone());
                     continue;
                 }
@@ -272,26 +290,35 @@ impl UserDetailsForm {
         to_insert.extend(kerberos_insert);
         to_remove.extend(kerberos_remove);
 
-        let remove_attributes = if to_remove.is_empty() { None } else { Some(to_remove) };
-
-        let insert_attributes: Option<Vec<update_user::AttributeValueInput>> = if to_insert.is_empty() {
+        let remove_attributes = if to_remove.is_empty() {
             None
         } else {
-            Some(
-                to_insert
-                    .into_iter()
-                    .map(|AttributeValue { name, values }| update_user::AttributeValueInput {
-                        name,
-                        value: values,
-                    })
-                    .collect(),
-            )
+            Some(to_remove)
         };
+
+        let insert_attributes: Option<Vec<update_user::AttributeValueInput>> =
+            if to_insert.is_empty() {
+                None
+            } else {
+                Some(
+                    to_insert
+                        .into_iter()
+                        .map(
+                            |AttributeValue { name, values }| update_user::AttributeValueInput {
+                                name,
+                                value: values,
+                            },
+                        )
+                        .collect(),
+                )
+            };
 
         // === Extract displayname (and other special fields) to top-level like create_user does ===
         let mut display_name = None;
         if let Some(dn_attr) = insert_attributes.as_ref().and_then(|attrs| {
-            attrs.iter().find(|a| a.name.to_lowercase() == "displayname")
+            attrs
+                .iter()
+                .find(|a| a.name.to_lowercase() == "displayname")
         }) {
             display_name = dn_attr.value.first().cloned();
         }
@@ -300,7 +327,9 @@ impl UserDetailsForm {
         // This ensures GetUserDetails returns it in response.user.avatar (for banner) and attributes (for form)
         let mut avatar = None;
         if let Some(av_attr) = insert_attributes.as_ref().and_then(|attrs| {
-            attrs.iter().find(|a| a.name.to_lowercase() == "avatar" || a.name.to_lowercase() == "jpegphoto")
+            attrs
+                .iter()
+                .find(|a| a.name.to_lowercase() == "avatar" || a.name.to_lowercase() == "jpegphoto")
         }) {
             avatar = av_attr.value.first().cloned();
         }

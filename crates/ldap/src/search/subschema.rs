@@ -1,28 +1,30 @@
 use crate::attributes::get_preferred_ldap_name;
 use crate::schema::SchemaManager;
 use chrono::Utc;
-use ldap3_proto::{
-    LdapPartialAttribute, LdapSearchResultEntry, proto::LdapOp,
-};
+use ldap3_proto::{LdapPartialAttribute, LdapSearchResultEntry, proto::LdapOp};
 use std::collections::HashSet;
 
-pub fn make_ldap_subschema_entry(
-    schema_manager: &SchemaManager,
-    base_dn_str: &str,
-) -> LdapOp {
+pub fn make_ldap_subschema_entry(schema_manager: &SchemaManager, base_dn_str: &str) -> LdapOp {
     let current_time_utc = Utc::now().format("%Y%m%d%H%M%SZ").to_string().into_bytes();
     let full_subschema_dn = format!("cn=Subschema,{}", base_dn_str);
 
     fn attr_type_to_ldap_syntax(attr: &lldap_schema::AttributeSchema) -> (String, bool, bool) {
         let (syntax, is_single) = match attr.attribute_type {
             lldap_schema::AttributeType::String => ("1.3.6.1.4.1.1466.115.121.1.15", !attr.is_list),
-            lldap_schema::AttributeType::Integer => ("1.3.6.1.4.1.1466.115.121.1.27", !attr.is_list),
-            lldap_schema::AttributeType::DateTime => ("1.3.6.1.4.1.1466.115.121.1.24", !attr.is_list),
+            lldap_schema::AttributeType::Integer => {
+                ("1.3.6.1.4.1.1466.115.121.1.27", !attr.is_list)
+            }
+            lldap_schema::AttributeType::DateTime => {
+                ("1.3.6.1.4.1.1466.115.121.1.24", !attr.is_list)
+            }
             lldap_schema::AttributeType::Avatar => ("1.3.6.1.4.1.1466.115.121.1.28", !attr.is_list),
         };
         let name_lower = attr.name.to_ascii_lowercase();
         let is_operational = attr.is_readonly
-            || matches!(name_lower.as_str(), "creationdate" | "modifieddate" | "passwordmodifieddate" | "uuid" | "entryuuid");
+            || matches!(
+                name_lower.as_str(),
+                "creationdate" | "modifieddate" | "passwordmodifieddate" | "uuid" | "entryuuid"
+            );
         (syntax.to_string(), is_single, is_operational)
     }
 
@@ -85,9 +87,16 @@ pub fn make_ldap_subschema_entry(
         "krbprincipalname",
         "sshpublickey",
         "ou",
-    ].iter().cloned().collect();
+    ]
+    .iter()
+    .cloned()
+    .collect();
 
-    for attr in schema_manager.get_all_user_attributes().iter().chain(schema_manager.get_all_group_attributes().iter()) {
+    for attr in schema_manager
+        .get_all_user_attributes()
+        .iter()
+        .chain(schema_manager.get_all_group_attributes().iter())
+    {
         if static_covered_attrs.contains(attr.name.as_str()) {
             continue;
         }
@@ -95,7 +104,11 @@ pub fn make_ldap_subschema_entry(
         let preferred = get_preferred_ldap_name(attr);
         let (syntax, is_single, is_operational) = attr_type_to_ldap_syntax(attr);
         let single_str = if is_single { " SINGLE-VALUE" } else { "" };
-        let op_str = if is_operational { " NO-USER-MODIFICATION USAGE directoryOperation" } else { "" };
+        let op_str = if is_operational {
+            " NO-USER-MODIFICATION USAGE directoryOperation"
+        } else {
+            ""
+        };
 
         // RFC-compliant EQUALITY per attribute type (future-proofs any custom DateTime/Integer attrs)
         let equality = match attr.attribute_type {
@@ -116,7 +129,11 @@ pub fn make_ldap_subschema_entry(
             names.join(" ")
         };
 
-        let desc = format!("LLDAP {} ({})", attr.name, if attr.is_list { "multi" } else { "single" });
+        let desc = format!(
+            "LLDAP {} ({})",
+            attr.name,
+            if attr.is_list { "multi" } else { "single" }
+        );
         let oid = match attr.name.as_str() {
             "avatar" => "10.0".to_string(),
             "sshpublickey" => "10.1".to_string(),
@@ -132,13 +149,7 @@ pub fn make_ldap_subschema_entry(
 
         let entry = format!(
             "( {} NAME ( {} ) DESC '{}' EQUALITY {} SYNTAX {}{}{} )",
-            oid,
-            name_list,
-            desc,
-            equality,
-            syntax,
-            single_str,
-            op_str
+            oid, name_list, desc, equality, syntax, single_str, op_str
         );
         // Always push — OIDs are now guaranteed unique
         dynamic_attr_types.push(entry.into_bytes());
@@ -175,12 +186,25 @@ pub fn make_ldap_subschema_entry(
     }
 
     let operational_names: HashSet<&str> = [
-        "createtimestamp", "creationdate", "creation_date",
-        "modifytimestamp", "modifieddate", "modified_date",
-        "pwdchangedtime", "passwordmodifieddate", "password_modified_date",
-        "entryuuid", "uuid",
-        "memberof", "hassubordinates", "structuralobjectclass", "subschemasubentry",
-    ].iter().cloned().collect();
+        "createtimestamp",
+        "creationdate",
+        "creation_date",
+        "modifytimestamp",
+        "modifieddate",
+        "modified_date",
+        "pwdchangedtime",
+        "passwordmodifieddate",
+        "password_modified_date",
+        "entryuuid",
+        "uuid",
+        "memberof",
+        "hassubordinates",
+        "structuralobjectclass",
+        "subschemasubentry",
+    ]
+    .iter()
+    .cloned()
+    .collect();
 
     for attr in schema_manager.get_all_user_attributes() {
         let pref = get_preferred_ldap_name(&attr);
@@ -191,7 +215,10 @@ pub fn make_ldap_subschema_entry(
     }
 
     for extra in [
-        "createTimestamp", "modifyTimestamp", "pwdChangedTime", "memberOf",
+        "createTimestamp",
+        "modifyTimestamp",
+        "pwdChangedTime",
+        "memberOf",
     ] {
         let lower = extra.to_ascii_lowercase();
         if seen.insert(lower) {
@@ -201,7 +228,9 @@ pub fn make_ldap_subschema_entry(
 
     let inet_may_str = inet_may.join(" $ ");
 
-    let posix_user_may = "userPassword $ loginShell $ gecos $ description $ sshPublicKey $ avatar $ kerberosSync".to_string();
+    let posix_user_may =
+        "userPassword $ loginShell $ gecos $ description $ sshPublicKey $ avatar $ kerberosSync"
+            .to_string();
     let posix_group_may = "userPassword $ memberUid $ description $ gidNumber".to_string();
 
     LdapOp::SearchResultEntry(LdapSearchResultEntry {
@@ -308,9 +337,11 @@ mod tests {
             assert!(entry.attributes.iter().any(|a| a.atype == "attributeTypes"));
             assert!(entry.attributes.iter().any(|a| a.atype == "objectClasses"));
             // Spot-check unique OID logic didn't collide
-            let attr_types = entry.attributes.iter()
-            .find(|a| a.atype == "attributeTypes")
-            .unwrap();
+            let attr_types = entry
+                .attributes
+                .iter()
+                .find(|a| a.atype == "attributeTypes")
+                .unwrap();
             assert!(!attr_types.vals.is_empty());
         } else {
             panic!("expected SearchResultEntry");

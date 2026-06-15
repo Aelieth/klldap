@@ -56,7 +56,10 @@ impl RequestFilter {
                         Err("Equality not supported for list fields".into())
                     }
                     UserFieldType::MemberOf => Ok(DomainRequestFilter::MemberOf(eq.value.into())),
-                    UserFieldType::ObjectClass | UserFieldType::Dn | UserFieldType::EntryDn | UserFieldType::EntryUuid => {
+                    UserFieldType::ObjectClass
+                    | UserFieldType::Dn
+                    | UserFieldType::EntryDn
+                    | UserFieldType::EntryUuid => {
                         Err("Ldap fields not supported in request filter".into())
                     }
                 }

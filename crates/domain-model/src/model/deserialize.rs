@@ -1,7 +1,9 @@
 use crate::error::DomainError;
 use lldap_domain::{
     schema::AttributeList,
-    types::{Attribute, AttributeName, AttributeType, AttributeValue, Avatar, Cardinality, Serialized},
+    types::{
+        Attribute, AttributeName, AttributeType, AttributeValue, Avatar, Cardinality, Serialized,
+    },
 };
 
 // Value must be a serialized attribute value of the type denoted by typ,

@@ -1,5 +1,5 @@
-use yew::prelude::*;
 use gloo_timers::callback::Timeout;
+use yew::prelude::*;
 
 #[derive(Properties, PartialEq)]
 pub struct StatusModalProps {
@@ -17,10 +17,16 @@ pub fn status_modal(props: &StatusModalProps) -> Html {
         let timeout = Timeout::new(4000, move || {
             on_dismiss.emit(());
         });
-        move || { timeout.cancel(); }
+        move || {
+            timeout.cancel();
+        }
     });
 
-    let bg_class = if props.is_success { "bg-success" } else { "bg-danger" };
+    let bg_class = if props.is_success {
+        "bg-success"
+    } else {
+        "bg-danger"
+    };
 
     html! {
         <div

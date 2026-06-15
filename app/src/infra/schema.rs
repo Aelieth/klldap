@@ -17,7 +17,7 @@ pub(crate) enum AttributeType {
 
 pub fn validate_attribute_type(attribute_type: &str) -> Result<(), ValidationError> {
     AttributeType::try_from(attribute_type)
-    .map_err(|_| ValidationError::new("Invalid attribute type"))?;
+        .map_err(|_| ValidationError::new("Invalid attribute type"))?;
     Ok(())
 }
 

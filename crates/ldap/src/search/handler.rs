@@ -4,10 +4,13 @@ use crate::core::{
     error::{LdapError, LdapResult},
     utils::LdapInfo,
 };
-use ldap3_proto::LdapResultCode;
 use crate::dn::parse_distinguished_name;
-use crate::search::{get_search_scope, build_ou_entries, make_ou_entry, convert_users_to_ldap_op, convert_groups_to_ldap_op, make_search_success};
 use crate::search::scope::ou_matches_filter;
+use crate::search::{
+    build_ou_entries, convert_groups_to_ldap_op, convert_users_to_ldap_op, get_search_scope,
+    make_ou_entry, make_search_success,
+};
+use ldap3_proto::LdapResultCode;
 use ldap3_proto::proto::{LdapOp, LdapSearchRequest, LdapSearchScope};
 use lldap_access_control::UserAndGroupListerBackendHandler;
 use lldap_domain::public_schema::PublicSchema;
@@ -30,25 +33,27 @@ where
     let scope = get_search_scope(base_dn, &dn_parts, &request.scope, allowed_ous);
     let schema = PublicSchema::get();
     let include_op = request.attrs.iter().any(|a| {
-        a == "+" ||
-        a.eq_ignore_ascii_case("hassubordinates") ||
-        a.eq_ignore_ascii_case("structuralobjectclass") ||
-        a.eq_ignore_ascii_case("subschemasubentry") ||
-        a.eq_ignore_ascii_case("createtimestamp") ||
-        a.eq_ignore_ascii_case("modifytimestamp") ||
-        a.eq_ignore_ascii_case("pwdchangedtime") ||
-        a.eq_ignore_ascii_case("entryuuid") ||
-        a.eq_ignore_ascii_case("memberof")
+        a == "+"
+            || a.eq_ignore_ascii_case("hassubordinates")
+            || a.eq_ignore_ascii_case("structuralobjectclass")
+            || a.eq_ignore_ascii_case("subschemasubentry")
+            || a.eq_ignore_ascii_case("createtimestamp")
+            || a.eq_ignore_ascii_case("modifytimestamp")
+            || a.eq_ignore_ascii_case("pwdchangedtime")
+            || a.eq_ignore_ascii_case("entryuuid")
+            || a.eq_ignore_ascii_case("memberof")
     });
 
     match scope {
         crate::search::scope::SearchScope::Root => {
             if request.scope == LdapSearchScope::Base {
-                let dc_val = base_dn.iter()
+                let dc_val = base_dn
+                    .iter()
                     .find(|(k, _)| k.eq_ignore_ascii_case("dc"))
                     .map(|(_, v)| v.as_bytes().to_vec())
                     .unwrap_or_else(|| b"lldap".to_vec());
-                let o_val = base_dn.iter()
+                let o_val = base_dn
+                    .iter()
                     .find(|(k, _)| k.eq_ignore_ascii_case("o"))
                     .map(|(_, v)| v.as_bytes().to_vec())
                     .unwrap_or_else(|| b"lldap Directory".to_vec());
@@ -57,7 +62,11 @@ where
                     attributes: vec![
                         ldap3_proto::LdapPartialAttribute {
                             atype: "objectClass".to_string(),
-                            vals: vec![b"top".to_vec(), b"dcObject".to_vec(), b"organization".to_vec()],
+                            vals: vec![
+                                b"top".to_vec(),
+                                b"dcObject".to_vec(),
+                                b"organization".to_vec(),
+                            ],
                         },
                         ldap3_proto::LdapPartialAttribute {
                             atype: "dc".to_string(),
@@ -77,11 +86,16 @@ where
                         },
                         ldap3_proto::LdapPartialAttribute {
                             atype: "subschemaSubentry".to_string(),
-                            vals: vec![format!("cn=Subschema,{}", ldap_info.base_dn_str).into_bytes()],
+                            vals: vec![
+                                format!("cn=Subschema,{}", ldap_info.base_dn_str).into_bytes(),
+                            ],
                         },
                     ],
                 };
-                return Ok(vec![LdapOp::SearchResultEntry(root_entry), make_search_success()]);
+                return Ok(vec![
+                    LdapOp::SearchResultEntry(root_entry),
+                    make_search_success(),
+                ]);
             }
             let top_level_ous = crate::dn::get_direct_child_ous("", allowed_ous);
             let ous_to_add = if request.scope == LdapSearchScope::Subtree {
@@ -104,7 +118,8 @@ where
                     &request.base,
                     backend,
                     &schema,
-                ).await?;
+                )
+                .await?;
                 results.extend(convert_users_to_ldap_op(
                     user_results,
                     &request.attrs,
@@ -118,7 +133,8 @@ where
                     &request.base,
                     backend,
                     &schema,
-                ).await?;
+                )
+                .await?;
                 results.extend(convert_groups_to_ldap_op(
                     group_results,
                     &request.attrs,
@@ -161,7 +177,11 @@ where
                     .filter(|ou| ou_matches_filter(ou, &request.filter))
                     .collect();
                 if !child_ous.is_empty() {
-                    results.extend(build_ou_entries(&child_ous, &ldap_info.base_dn_str, include_op));
+                    results.extend(build_ou_entries(
+                        &child_ous,
+                        &ldap_info.base_dn_str,
+                        include_op,
+                    ));
                 }
 
                 let user_results = crate::core::user::get_user_list(
@@ -171,13 +191,11 @@ where
                     &request.base,
                     backend,
                     &schema,
-                ).await?;
-                let mut user_ops: Vec<LdapOp> = convert_users_to_ldap_op(
-                    user_results,
-                    &request.attrs,
-                    ldap_info,
-                    &schema,
-                ).collect();
+                )
+                .await?;
+                let mut user_ops: Vec<LdapOp> =
+                    convert_users_to_ldap_op(user_results, &request.attrs, ldap_info, &schema)
+                        .collect();
 
                 let group_results = crate::core::group::get_groups_list(
                     ldap_info,
@@ -185,14 +203,16 @@ where
                     &request.base,
                     backend,
                     &schema,
-                ).await?;
+                )
+                .await?;
                 let mut group_ops: Vec<LdapOp> = convert_groups_to_ldap_op(
                     group_results,
                     &request.attrs,
                     ldap_info,
                     &None,
                     &schema,
-                ).collect();
+                )
+                .collect();
 
                 // ADS-compatible filtering (unchanged, stable)
                 {
@@ -251,7 +271,8 @@ where
                 Err(_) => return Ok(vec![make_search_success()]),
             };
             // FIX: existence check with specific filter (preserves NoSuchObject behavior)
-            let specific_filter = ldap3_proto::LdapFilter::Equality("uid".to_string(), user_id.to_string());
+            let specific_filter =
+                ldap3_proto::LdapFilter::Equality("uid".to_string(), user_id.to_string());
             let exists_users = crate::core::user::get_user_list(
                 ldap_info,
                 &specific_filter,
@@ -259,7 +280,8 @@ where
                 &request.base,
                 backend,
                 &schema,
-            ).await?;
+            )
+            .await?;
             if exists_users.is_empty() {
                 return Err(LdapError {
                     code: LdapResultCode::NoSuchObject,
@@ -274,13 +296,10 @@ where
                 &request.base,
                 backend,
                 &schema,
-            ).await?;
-            let mut results: Vec<LdapOp> = convert_users_to_ldap_op(
-                users,
-                &request.attrs,
-                ldap_info,
-                &schema,
-            ).collect();
+            )
+            .await?;
+            let mut results: Vec<LdapOp> =
+                convert_users_to_ldap_op(users, &request.attrs, ldap_info, &schema).collect();
             // Post-filter to exact base DN (consistent with Container pattern, reusable)
             let base_lower = request.base.to_ascii_lowercase();
             results.retain(|op| {
@@ -312,7 +331,8 @@ where
             // (displayname <-> cn) that was standardized in this release.
             let schema_manager = crate::schema::get_schema_manager();
             let group_rdn_attr = schema_manager.get_canonical_name("cn");
-            let specific_filter = ldap3_proto::LdapFilter::Equality(group_rdn_attr, group_name.to_string());
+            let specific_filter =
+                ldap3_proto::LdapFilter::Equality(group_rdn_attr, group_name.to_string());
 
             let exists_groups = crate::core::group::get_groups_list(
                 ldap_info,
@@ -320,7 +340,8 @@ where
                 &request.base,
                 backend,
                 &schema,
-            ).await?;
+            )
+            .await?;
             if exists_groups.is_empty() {
                 return Err(LdapError {
                     code: LdapResultCode::NoSuchObject,
@@ -337,14 +358,11 @@ where
                 &request.base,
                 backend,
                 &schema,
-            ).await?;
-            let mut results: Vec<LdapOp> = convert_groups_to_ldap_op(
-                groups,
-                &request.attrs,
-                ldap_info,
-                &None,
-                &schema,
-            ).collect();
+            )
+            .await?;
+            let mut results: Vec<LdapOp> =
+                convert_groups_to_ldap_op(groups, &request.attrs, ldap_info, &None, &schema)
+                    .collect();
 
             let base_lower = request.base.to_ascii_lowercase();
             results.retain(|op| {
@@ -360,6 +378,8 @@ where
             results.push(make_search_success());
             Ok(results)
         }
-        crate::search::scope::SearchScope::Invalid | crate::search::scope::SearchScope::Unknown => Ok(vec![make_search_success()]),
+        crate::search::scope::SearchScope::Invalid | crate::search::scope::SearchScope::Unknown => {
+            Ok(vec![make_search_success()])
+        }
     }
 }

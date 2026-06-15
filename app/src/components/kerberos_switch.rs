@@ -1,6 +1,6 @@
-use yew::prelude::*;
+use crate::infra::form_utils::AttributeValue;
 use yew::Callback;
-use crate::infra::form_utils::AttributeValue;  // needed for the helper
+use yew::prelude::*; // needed for the helper
 
 #[derive(Properties, PartialEq)]
 pub struct KerberosSwitchProps {
@@ -60,7 +60,10 @@ pub fn kerberos_switch(props: &KerberosSwitchProps) -> Html {
     }
 }
 
-pub fn prepare_kerberos_update(enabled: bool, original_enabled: bool) -> (Vec<AttributeValue>, Vec<String>) {
+pub fn prepare_kerberos_update(
+    enabled: bool,
+    original_enabled: bool,
+) -> (Vec<AttributeValue>, Vec<String>) {
     if enabled == original_enabled {
         return (vec![], vec![]);
     }

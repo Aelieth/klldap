@@ -1,23 +1,23 @@
+use derive_more::Display;
+use juniper::GraphQLEnum;
 use serde::{Deserialize, Serialize};
 use strum::{EnumIter, EnumString, IntoStaticStr};
-use juniper::GraphQLEnum;
-use derive_more::Display;
 
 // ==================== ATTRIBUTE TYPE (SINGLE SOURCE OF TRUTH) ====================
 #[derive(
-Clone,
-Copy,
-Debug,
-PartialEq,
-Eq,
-Serialize,
-Deserialize,
-sea_orm::DeriveActiveEnum,
-EnumIter,
-EnumString,
-IntoStaticStr,
-GraphQLEnum,
-Display,
+    Clone,
+    Copy,
+    Debug,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    sea_orm::DeriveActiveEnum,
+    EnumIter,
+    EnumString,
+    IntoStaticStr,
+    GraphQLEnum,
+    Display,
 )]
 #[sea_orm(rs_type = "String", db_type = "Text")]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -40,7 +40,7 @@ pub struct Schema {
     pub user_attributes: AttributeList,
     pub group_attributes: AttributeList,
     pub system_attributes: AttributeList,
-    pub posix_settings: PosixSettings,   // ← NEW: full POSIX settings
+    pub posix_settings: PosixSettings, // ← NEW: full POSIX settings
     pub extra_user_object_classes: Vec<String>,
     pub extra_group_object_classes: Vec<String>,
 }
@@ -93,8 +93,10 @@ impl AttributeList {
         // This fixes resolution when AttributeName::as_str() or loaded aliases
         // have subtle casing differences from CaseInsensitiveString.
         self.attributes.iter().find(|a| {
-            a.name.eq_ignore_ascii_case(name) ||
-            a.aliases.iter().any(|alias| alias.eq_ignore_ascii_case(name))
+            a.name.eq_ignore_ascii_case(name)
+                || a.aliases
+                    .iter()
+                    .any(|alias| alias.eq_ignore_ascii_case(name))
         })
     }
 
@@ -117,8 +119,6 @@ impl AttributeList {
 
     pub fn resolve_canonical_name(&self, name_or_alias: &str) -> Option<&str> {
         self.get_by_name_or_alias(name_or_alias)
-        .map(|a| a.name.as_str())
+            .map(|a| a.name.as_str())
     }
 }
-
-

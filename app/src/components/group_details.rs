@@ -202,10 +202,8 @@ impl CommonComponent<GroupDetails> for GroupDetails {
                     .as_ref()
                     .map(|(g, _)| g.display_name.clone())
                     .unwrap_or_default();
-                self.success_message = Some(format!(
-                    "{} has been added to {}.",
-                    user.id, group_name
-                ));
+                self.success_message =
+                    Some(format!("{} has been added to {}.", user.id, group_name));
                 self.group_and_schema.as_mut().unwrap().0.users.push(User {
                     id: user.id,
                     display_name: user.display_name,
@@ -217,10 +215,8 @@ impl CommonComponent<GroupDetails> for GroupDetails {
                     .as_ref()
                     .map(|(g, _)| g.display_name.clone())
                     .unwrap_or_default();
-                self.success_message = Some(format!(
-                    "{} has been removed from {}.",
-                    user_id, group_name
-                ));
+                self.success_message =
+                    Some(format!("{} has been removed from {}.", user_id, group_name));
                 self.group_and_schema
                     .as_mut()
                     .unwrap()

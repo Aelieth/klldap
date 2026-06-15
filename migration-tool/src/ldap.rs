@@ -1,8 +1,8 @@
 use anyhow::{Context, Result, anyhow};
+use base64::Engine;
 use ldap3::{ResultEntry, SearchEntry};
 use requestty::{Question, prompt_one};
 use smallvec::SmallVec;
-use base64::Engine;
 
 use crate::lldap::User;
 

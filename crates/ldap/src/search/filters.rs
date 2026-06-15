@@ -4,12 +4,15 @@
 //! Kept here so search/handler.rs can orchestrate cleanly while core/ stays slim.
 
 use crate::core::error::{LdapError, LdapResult};
-use crate::dn::{get_group_id_from_distinguished_name_or_plain_name, get_user_id_from_distinguished_name_or_plain_name};
+use crate::dn::{
+    get_group_id_from_distinguished_name_or_plain_name,
+    get_user_id_from_distinguished_name_or_plain_name,
+};
+use ldap3_proto::LdapFilter;
 use lldap_domain::deserialize::deserialize_attribute_value;
 use lldap_domain::public_schema::PublicSchema;
 use lldap_domain::types::{AttributeName, AttributeType, UserId};
 use lldap_domain_handlers::handler::{GroupRequestFilter, UserRequestFilter};
-use ldap3_proto::LdapFilter;
 use tracing::warn;
 
 use crate::core::utils::LdapInfo;
@@ -24,7 +27,8 @@ fn get_user_attribute_equality_filter(
 ) -> UserRequestFilter {
     let value_lc = value.to_ascii_lowercase();
     let attribute_value = deserialize_attribute_value(&[value.to_owned()], typ, is_list);
-    let attribute_value_lc = deserialize_attribute_value(std::slice::from_ref(&value_lc), typ, is_list);
+    let attribute_value_lc =
+        deserialize_attribute_value(std::slice::from_ref(&value_lc), typ, is_list);
     match (attribute_value, attribute_value_lc) {
         (Ok(v), Ok(v_lc)) => UserRequestFilter::Or(vec![
             UserRequestFilter::AttributeEquality(field.clone(), v),
@@ -50,7 +54,13 @@ pub fn convert_user_filter(
     match filter {
         LdapFilter::Equality(field, value) if field.eq_ignore_ascii_case("objectclass") => {
             let v = value.to_ascii_lowercase();
-            let standard_user_classes = ["top", "person", "inetorgperson", "posixaccount", "ldappublickey"];
+            let standard_user_classes = [
+                "top",
+                "person",
+                "inetorgperson",
+                "posixaccount",
+                "ldappublickey",
+            ];
             let extra_classes: Vec<String> = schema
                 .get_schema()
                 .extra_user_object_classes
@@ -109,10 +119,12 @@ pub fn convert_user_filter(
             let field = AttributeName::from(field.as_str());
             let value_lc = value.to_ascii_lowercase();
             match crate::schema::get_schema_manager().map_user_field(&field, schema) {
-                crate::core::utils::UserFieldType::PrimaryField(lldap_domain_model::model::UserColumn::UserId) => {
-                    Ok(UserRequestFilter::UserId(UserId::new(&value_lc)))
-                }
-                crate::core::utils::UserFieldType::PrimaryField(lldap_domain_model::model::UserColumn::Email) => Ok(UserRequestFilter::Equality(
+                crate::core::utils::UserFieldType::PrimaryField(
+                    lldap_domain_model::model::UserColumn::UserId,
+                ) => Ok(UserRequestFilter::UserId(UserId::new(&value_lc))),
+                crate::core::utils::UserFieldType::PrimaryField(
+                    lldap_domain_model::model::UserColumn::Email,
+                ) => Ok(UserRequestFilter::Equality(
                     lldap_domain_model::model::UserColumn::LowercaseEmail,
                     value_lc,
                 )),
@@ -132,18 +144,23 @@ pub fn convert_user_filter(
                     }
                     Ok(UserRequestFilter::False)
                 }
-                crate::core::utils::UserFieldType::ObjectClass => Ok(UserRequestFilter::And(vec![])),
-                crate::core::utils::UserFieldType::MemberOf => Ok(get_group_id_from_distinguished_name_or_plain_name(
-                    &value_lc,
-                    &ldap_info.base_dn,
-                    &ldap_info.base_dn_str,
-                )
-                .map(UserRequestFilter::MemberOf)
-                .unwrap_or_else(|e| {
-                    warn!("Invalid memberOf filter: {}", e);
-                    UserRequestFilter::False
-                })),
-                crate::core::utils::UserFieldType::EntryDn | crate::core::utils::UserFieldType::Dn => {
+                crate::core::utils::UserFieldType::ObjectClass => {
+                    Ok(UserRequestFilter::And(vec![]))
+                }
+                crate::core::utils::UserFieldType::MemberOf => {
+                    Ok(get_group_id_from_distinguished_name_or_plain_name(
+                        &value_lc,
+                        &ldap_info.base_dn,
+                        &ldap_info.base_dn_str,
+                    )
+                    .map(UserRequestFilter::MemberOf)
+                    .unwrap_or_else(|e| {
+                        warn!("Invalid memberOf filter: {}", e);
+                        UserRequestFilter::False
+                    }))
+                }
+                crate::core::utils::UserFieldType::EntryDn
+                | crate::core::utils::UserFieldType::Dn => {
                     Ok(get_user_id_from_distinguished_name_or_plain_name(
                         value_lc.as_str(),
                         &ldap_info.base_dn,
@@ -174,13 +191,20 @@ pub fn convert_user_filter(
             let field = AttributeName::from(field.as_str());
             match crate::schema::get_schema_manager().map_user_field(&field, schema) {
                 crate::core::utils::UserFieldType::PrimaryField(f)
-                    if matches!(f, lldap_domain_model::model::UserColumn::CreationDate | lldap_domain_model::model::UserColumn::ModifiedDate | lldap_domain_model::model::UserColumn::PasswordModifiedDate) =>
+                    if matches!(
+                        f,
+                        lldap_domain_model::model::UserColumn::CreationDate
+                            | lldap_domain_model::model::UserColumn::ModifiedDate
+                            | lldap_domain_model::model::UserColumn::PasswordModifiedDate
+                    ) =>
                 {
                     Ok(UserRequestFilter::GreaterOrEqual(f, value.to_string()))
                 }
-                crate::core::utils::UserFieldType::Attribute(name, AttributeType::DateTime, _) =>
-                {
-                    Ok(UserRequestFilter::AttributeGreaterOrEqual(name, value.to_string()))
+                crate::core::utils::UserFieldType::Attribute(name, AttributeType::DateTime, _) => {
+                    Ok(UserRequestFilter::AttributeGreaterOrEqual(
+                        name,
+                        value.to_string(),
+                    ))
                 }
                 _ => Err(LdapError {
                     code: ldap3_proto::LdapResultCode::UnwillingToPerform,
@@ -192,13 +216,20 @@ pub fn convert_user_filter(
             let field = AttributeName::from(field.as_str());
             match crate::schema::get_schema_manager().map_user_field(&field, schema) {
                 crate::core::utils::UserFieldType::PrimaryField(f)
-                    if matches!(f, lldap_domain_model::model::UserColumn::CreationDate | lldap_domain_model::model::UserColumn::ModifiedDate | lldap_domain_model::model::UserColumn::PasswordModifiedDate) =>
+                    if matches!(
+                        f,
+                        lldap_domain_model::model::UserColumn::CreationDate
+                            | lldap_domain_model::model::UserColumn::ModifiedDate
+                            | lldap_domain_model::model::UserColumn::PasswordModifiedDate
+                    ) =>
                 {
                     Ok(UserRequestFilter::LessOrEqual(f, value.to_string()))
                 }
-                crate::core::utils::UserFieldType::Attribute(name, AttributeType::DateTime, _) =>
-                {
-                    Ok(UserRequestFilter::AttributeLessOrEqual(name, value.to_string()))
+                crate::core::utils::UserFieldType::Attribute(name, AttributeType::DateTime, _) => {
+                    Ok(UserRequestFilter::AttributeLessOrEqual(
+                        name,
+                        value.to_string(),
+                    ))
                 }
                 _ => Err(LdapError {
                     code: ldap3_proto::LdapResultCode::UnwillingToPerform,
@@ -208,25 +239,34 @@ pub fn convert_user_filter(
         }
         LdapFilter::Present(field) => {
             let field = AttributeName::from(field.as_str());
-            Ok(match crate::schema::get_schema_manager().map_user_field(&field, schema) {
-                crate::core::utils::UserFieldType::Attribute(name, _, _) => {
-                    UserRequestFilter::CustomAttributePresent(name)
-                }
-                crate::core::utils::UserFieldType::NoMatch => UserRequestFilter::False,
-                _ => UserRequestFilter::True,
-            })
+            Ok(
+                match crate::schema::get_schema_manager().map_user_field(&field, schema) {
+                    crate::core::utils::UserFieldType::Attribute(name, _, _) => {
+                        UserRequestFilter::CustomAttributePresent(name)
+                    }
+                    crate::core::utils::UserFieldType::NoMatch => UserRequestFilter::False,
+                    _ => UserRequestFilter::True,
+                },
+            )
         }
         LdapFilter::Substring(field, substring_filter) => {
             let field = AttributeName::from(field.as_str());
             match crate::schema::get_schema_manager().map_user_field(&field, schema) {
-                crate::core::utils::UserFieldType::PrimaryField(lldap_domain_model::model::UserColumn::UserId) => Ok(
-                    UserRequestFilter::UserIdSubString(substring_filter.clone().into()),
-                ),
+                crate::core::utils::UserFieldType::PrimaryField(
+                    lldap_domain_model::model::UserColumn::UserId,
+                ) => Ok(UserRequestFilter::UserIdSubString(
+                    substring_filter.clone().into(),
+                )),
                 // === NEW: Support substring on custom String attributes ===
                 // This fixes Keycloak admin searches on givenName, sn, displayName, etc.
-                crate::core::utils::UserFieldType::Attribute(name, lldap_schema::AttributeType::String, _) => {
-                    Ok(UserRequestFilter::AttributeSubString(name, substring_filter.clone().into()))
-                }
+                crate::core::utils::UserFieldType::Attribute(
+                    name,
+                    lldap_schema::AttributeType::String,
+                    _,
+                ) => Ok(UserRequestFilter::AttributeSubString(
+                    name,
+                    substring_filter.clone().into(),
+                )),
                 // Non-string custom attributes still get rejected (makes sense)
                 crate::core::utils::UserFieldType::Attribute(_, _, _) => Err(LdapError {
                     code: ldap3_proto::LdapResultCode::UnwillingToPerform,
@@ -237,20 +277,25 @@ pub fn convert_user_filter(
                 | crate::core::utils::UserFieldType::Dn
                 | crate::core::utils::UserFieldType::EntryDn
                 | crate::core::utils::UserFieldType::EntryUuid
-                | crate::core::utils::UserFieldType::PrimaryField(lldap_domain_model::model::UserColumn::CreationDate)
-                | crate::core::utils::UserFieldType::PrimaryField(lldap_domain_model::model::UserColumn::Uuid) => Err(LdapError {
+                | crate::core::utils::UserFieldType::PrimaryField(
+                    lldap_domain_model::model::UserColumn::CreationDate,
+                )
+                | crate::core::utils::UserFieldType::PrimaryField(
+                    lldap_domain_model::model::UserColumn::Uuid,
+                ) => Err(LdapError {
                     code: ldap3_proto::LdapResultCode::UnwillingToPerform,
                     message: format!("Unsupported user attribute for substring filter: {field:?}"),
                 }),
                 crate::core::utils::UserFieldType::NoMatch => Ok(UserRequestFilter::False),
-                crate::core::utils::UserFieldType::PrimaryField(lldap_domain_model::model::UserColumn::Email) => Ok(UserRequestFilter::SubString(
+                crate::core::utils::UserFieldType::PrimaryField(
+                    lldap_domain_model::model::UserColumn::Email,
+                ) => Ok(UserRequestFilter::SubString(
                     lldap_domain_model::model::UserColumn::LowercaseEmail,
                     substring_filter.clone().into(),
                 )),
-                crate::core::utils::UserFieldType::PrimaryField(field) => Ok(UserRequestFilter::SubString(
-                    field,
-                    substring_filter.clone().into(),
-                )),
+                crate::core::utils::UserFieldType::PrimaryField(field) => Ok(
+                    UserRequestFilter::SubString(field, substring_filter.clone().into()),
+                ),
             }
         }
         _ => Err(LdapError {
@@ -270,7 +315,8 @@ fn get_group_attribute_equality_filter(
 ) -> GroupRequestFilter {
     let value_lc = value.to_ascii_lowercase();
     let serialized_value = deserialize_attribute_value(&[value.to_owned()], typ, is_list);
-    let serialized_value_lc = deserialize_attribute_value(std::slice::from_ref(&value_lc), typ, is_list);
+    let serialized_value_lc =
+        deserialize_attribute_value(std::slice::from_ref(&value_lc), typ, is_list);
     match (serialized_value, serialized_value_lc) {
         (Ok(v), Ok(v_lc)) => GroupRequestFilter::Or(vec![
             GroupRequestFilter::AttributeEquality(field.clone(), v),
@@ -321,35 +367,46 @@ pub fn convert_group_filter(
                         warn!("Given group id is not a valid integer: {}", value_lc);
                         GroupRequestFilter::False
                     })),
-                crate::core::utils::GroupFieldType::DisplayName => Ok(GroupRequestFilter::DisplayName(value_lc.into())),
-                crate::core::utils::GroupFieldType::Uuid => lldap_domain::types::Uuid::try_from(value_lc.as_str())
-                    .map(GroupRequestFilter::Uuid)
-                    .map_err(|e| LdapError {
-                        code: ldap3_proto::LdapResultCode::Other,
-                        message: format!("Invalid UUID: {e:#}"),
-                    }),
-                crate::core::utils::GroupFieldType::Member => Ok(get_user_id_from_distinguished_name_or_plain_name(
-                    &value_lc,
-                    &ldap_info.base_dn,
-                    &ldap_info.base_dn_str,
-                )
-                .map(GroupRequestFilter::Member)
-                .unwrap_or_else(|e| {
-                    warn!("Invalid member filter on group: {}", e);
-                    GroupRequestFilter::False
-                })),
-                crate::core::utils::GroupFieldType::UniqueMember => Ok(get_user_id_from_distinguished_name_or_plain_name(
-                    &value_lc,
-                    &ldap_info.base_dn,
-                    &ldap_info.base_dn_str,
-                )
-                .map(GroupRequestFilter::Member)
-                .unwrap_or_else(|e| {
-                    warn!("Invalid uniqueMember filter on group: {}", e);
-                    GroupRequestFilter::False
-                })),
-                crate::core::utils::GroupFieldType::ObjectClass => Ok(GroupRequestFilter::And(vec![])),
-                crate::core::utils::GroupFieldType::Dn | crate::core::utils::GroupFieldType::EntryDn => {
+                crate::core::utils::GroupFieldType::DisplayName => {
+                    Ok(GroupRequestFilter::DisplayName(value_lc.into()))
+                }
+                crate::core::utils::GroupFieldType::Uuid => {
+                    lldap_domain::types::Uuid::try_from(value_lc.as_str())
+                        .map(GroupRequestFilter::Uuid)
+                        .map_err(|e| LdapError {
+                            code: ldap3_proto::LdapResultCode::Other,
+                            message: format!("Invalid UUID: {e:#}"),
+                        })
+                }
+                crate::core::utils::GroupFieldType::Member => {
+                    Ok(get_user_id_from_distinguished_name_or_plain_name(
+                        &value_lc,
+                        &ldap_info.base_dn,
+                        &ldap_info.base_dn_str,
+                    )
+                    .map(GroupRequestFilter::Member)
+                    .unwrap_or_else(|e| {
+                        warn!("Invalid member filter on group: {}", e);
+                        GroupRequestFilter::False
+                    }))
+                }
+                crate::core::utils::GroupFieldType::UniqueMember => {
+                    Ok(get_user_id_from_distinguished_name_or_plain_name(
+                        &value_lc,
+                        &ldap_info.base_dn,
+                        &ldap_info.base_dn_str,
+                    )
+                    .map(GroupRequestFilter::Member)
+                    .unwrap_or_else(|e| {
+                        warn!("Invalid uniqueMember filter on group: {}", e);
+                        GroupRequestFilter::False
+                    }))
+                }
+                crate::core::utils::GroupFieldType::ObjectClass => {
+                    Ok(GroupRequestFilter::And(vec![]))
+                }
+                crate::core::utils::GroupFieldType::Dn
+                | crate::core::utils::GroupFieldType::EntryDn => {
                     Ok(get_group_id_from_distinguished_name_or_plain_name(
                         value_lc.as_str(),
                         &ldap_info.base_dn,
@@ -498,23 +555,28 @@ pub fn convert_group_filter(
         }),
         LdapFilter::Present(field) => {
             let field = AttributeName::from(field.as_str());
-            Ok(match crate::schema::get_schema_manager().map_group_field(&field, schema) {
-                crate::core::utils::GroupFieldType::Attribute(name, _, _) => {
-                    GroupRequestFilter::CustomAttributePresent(name)
-                }
-                crate::core::utils::GroupFieldType::NoMatch => GroupRequestFilter::False,
-                _ => GroupRequestFilter::True,
-            })
+            Ok(
+                match crate::schema::get_schema_manager().map_group_field(&field, schema) {
+                    crate::core::utils::GroupFieldType::Attribute(name, _, _) => {
+                        GroupRequestFilter::CustomAttributePresent(name)
+                    }
+                    crate::core::utils::GroupFieldType::NoMatch => GroupRequestFilter::False,
+                    _ => GroupRequestFilter::True,
+                },
+            )
         }
         LdapFilter::Substring(field, substring_filter) => {
             let field = AttributeName::from(field.as_str());
             match crate::schema::get_schema_manager().map_group_field(&field, schema) {
-                crate::core::utils::GroupFieldType::DisplayName => Ok(GroupRequestFilter::DisplayNameSubString(
-                    substring_filter.clone().into(),
-                )),
+                crate::core::utils::GroupFieldType::DisplayName => Ok(
+                    GroupRequestFilter::DisplayNameSubString(substring_filter.clone().into()),
+                ),
                 // NEW: Support substring filters on custom String attributes for groups
                 crate::core::utils::GroupFieldType::Attribute(name, AttributeType::String, _) => {
-                    Ok(GroupRequestFilter::AttributeSubString(name, substring_filter.clone().into()))
+                    Ok(GroupRequestFilter::AttributeSubString(
+                        name,
+                        substring_filter.clone().into(),
+                    ))
                 }
                 crate::core::utils::GroupFieldType::NoMatch => Ok(GroupRequestFilter::False),
                 _ => Err(LdapError {
@@ -535,8 +597,8 @@ pub fn convert_group_filter(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lldap_domain::public_schema::PublicSchema;
     use ldap3_proto::proto::LdapSubstringFilter;
+    use lldap_domain::public_schema::PublicSchema;
 
     #[test]
     fn test_convert_user_filter_substring_on_custom_string_attribute() {
@@ -550,11 +612,11 @@ mod tests {
 
         let filter = LdapFilter::Substring(
             "givenName".to_string(),
-                                           LdapSubstringFilter {
-                                               initial: Some("jo".to_string()),
-                                           any: vec![],
-                                           final_: None,
-                                           },
+            LdapSubstringFilter {
+                initial: Some("jo".to_string()),
+                any: vec![],
+                final_: None,
+            },
         );
 
         let result = convert_user_filter(&ldap_info, &filter, &schema);

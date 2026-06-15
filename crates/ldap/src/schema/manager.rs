@@ -20,33 +20,105 @@ impl SchemaManager {
         let mut attribute_map = std::collections::HashMap::new();
 
         // Helper to register an attribute + all its aliases
-        let mut register = |_internal_name: &str, logical: LogicalAttr, canonical: &str, aliases: &[String]| {
-            let lower_canonical = canonical.to_ascii_lowercase();
-            attribute_map.insert(lower_canonical.clone(), (logical, canonical.to_string()));
+        let mut register =
+            |_internal_name: &str, logical: LogicalAttr, canonical: &str, aliases: &[String]| {
+                let lower_canonical = canonical.to_ascii_lowercase();
+                attribute_map.insert(lower_canonical.clone(), (logical, canonical.to_string()));
 
-            for alias in aliases {
-                let lower_alias = alias.to_ascii_lowercase();
-                if lower_alias != lower_canonical {
-                    attribute_map.insert(lower_alias, (logical, canonical.to_string()));
+                for alias in aliases {
+                    let lower_alias = alias.to_ascii_lowercase();
+                    if lower_alias != lower_canonical {
+                        attribute_map.insert(lower_alias, (logical, canonical.to_string()));
+                    }
                 }
-            }
-        };
+            };
 
         // Register core operational / structural attributes (these are not in PublicSchema)
         let core_attrs: Vec<(&str, LogicalAttr, &str, Vec<String>)> = vec![
-            ("objectclass", LogicalAttr::ObjectClass, "objectClass", vec![]),
-            ("memberof", LogicalAttr::MemberOf, "memberOf", vec!["ismemberof".into()]),
-            ("dn", LogicalAttr::Dn, "dn", vec!["distinguishedname".into()]),
+            (
+                "objectclass",
+                LogicalAttr::ObjectClass,
+                "objectClass",
+                vec![],
+            ),
+            (
+                "memberof",
+                LogicalAttr::MemberOf,
+                "memberOf",
+                vec!["ismemberof".into()],
+            ),
+            (
+                "dn",
+                LogicalAttr::Dn,
+                "dn",
+                vec!["distinguishedname".into()],
+            ),
             ("entrydn", LogicalAttr::EntryDn, "entryDN", vec![]),
-            ("hassubordinates", LogicalAttr::Operational, "hasSubordinates", vec![]),
-            ("structuralobjectclass", LogicalAttr::Operational, "structuralObjectClass", vec![]),
-            ("subschemasubentry", LogicalAttr::Operational, "subschemaSubentry", vec![]),
-            ("createtimestamp", LogicalAttr::Operational, "createTimestamp", vec!["creationdate".into(), "creation_date".into(), "creationtimestamp".into()]),
-            ("modifytimestamp", LogicalAttr::Operational, "modifyTimestamp", vec!["modifieddate".into(), "modified_date".into(), "modifydate".into()]),
-            ("pwdchangedtime", LogicalAttr::Operational, "pwdChangedTime", vec!["passwordmodifieddate".into(), "password_modified_date".into()]),
-            ("creatorsname", LogicalAttr::Operational, "creatorsName", vec![]),
-            ("modifiersname", LogicalAttr::Operational, "modifiersName", vec![]),
-            ("entryuuid", LogicalAttr::Operational, "entryUUID", vec!["uuid".into()]),
+            (
+                "hassubordinates",
+                LogicalAttr::Operational,
+                "hasSubordinates",
+                vec![],
+            ),
+            (
+                "structuralobjectclass",
+                LogicalAttr::Operational,
+                "structuralObjectClass",
+                vec![],
+            ),
+            (
+                "subschemasubentry",
+                LogicalAttr::Operational,
+                "subschemaSubentry",
+                vec![],
+            ),
+            (
+                "createtimestamp",
+                LogicalAttr::Operational,
+                "createTimestamp",
+                vec![
+                    "creationdate".into(),
+                    "creation_date".into(),
+                    "creationtimestamp".into(),
+                ],
+            ),
+            (
+                "modifytimestamp",
+                LogicalAttr::Operational,
+                "modifyTimestamp",
+                vec![
+                    "modifieddate".into(),
+                    "modified_date".into(),
+                    "modifydate".into(),
+                ],
+            ),
+            (
+                "pwdchangedtime",
+                LogicalAttr::Operational,
+                "pwdChangedTime",
+                vec![
+                    "passwordmodifieddate".into(),
+                    "password_modified_date".into(),
+                ],
+            ),
+            (
+                "creatorsname",
+                LogicalAttr::Operational,
+                "creatorsName",
+                vec![],
+            ),
+            (
+                "modifiersname",
+                LogicalAttr::Operational,
+                "modifiersName",
+                vec![],
+            ),
+            (
+                "entryuuid",
+                LogicalAttr::Operational,
+                "entryUUID",
+                vec!["uuid".into()],
+            ),
         ];
 
         for (name, logical, canonical, aliases) in core_attrs {
@@ -83,13 +155,22 @@ impl SchemaManager {
     }
 
     /// Determines whether an attribute is a known Primary column, Operational, or a Custom attribute.
-    fn determine_logical_attr(attr: &lldap_schema::AttributeSchema, preferred: &str) -> LogicalAttr {
+    fn determine_logical_attr(
+        attr: &lldap_schema::AttributeSchema,
+        preferred: &str,
+    ) -> LogicalAttr {
         let lower = preferred.to_ascii_lowercase();
 
         // Operational attributes — must be hidden in "*" and only shown in "+"
-        if matches!(lower.as_str(), 
-            "hassubordinates" | "structuralobjectclass" | "subschemasubentry" |
-            "entryuuid" | "uuid" | "memberof" | "ismemberof"
+        if matches!(
+            lower.as_str(),
+            "hassubordinates"
+                | "structuralobjectclass"
+                | "subschemasubentry"
+                | "entryuuid"
+                | "uuid"
+                | "memberof"
+                | "ismemberof"
         ) {
             return LogicalAttr::Operational;
         }
@@ -157,7 +238,10 @@ impl SchemaManager {
                 LogicalAttr::MemberOf => UserFieldType::MemberOf,
                 LogicalAttr::Dn => UserFieldType::Dn,
                 LogicalAttr::EntryDn => UserFieldType::EntryDn,
-                LogicalAttr::Operational if field.as_str().eq_ignore_ascii_case("entryuuid") || field.as_str().eq_ignore_ascii_case("uuid") => {
+                LogicalAttr::Operational
+                    if field.as_str().eq_ignore_ascii_case("entryuuid")
+                        || field.as_str().eq_ignore_ascii_case("uuid") =>
+                {
                     UserFieldType::EntryUuid
                 }
                 LogicalAttr::Primary(col) => UserFieldType::PrimaryField(col),
@@ -182,14 +266,23 @@ impl SchemaManager {
                 LogicalAttr::ObjectClass => GroupFieldType::ObjectClass,
                 LogicalAttr::Dn => GroupFieldType::Dn,
                 LogicalAttr::EntryDn => GroupFieldType::EntryDn,
-                LogicalAttr::Operational if field.as_str().eq_ignore_ascii_case("entryuuid") || field.as_str().eq_ignore_ascii_case("uuid") => {
+                LogicalAttr::Operational
+                    if field.as_str().eq_ignore_ascii_case("entryuuid")
+                        || field.as_str().eq_ignore_ascii_case("uuid") =>
+                {
                     GroupFieldType::EntryUuid
                 }
                 LogicalAttr::Primary(col) => match col {
-                    lldap_domain_model::model::UserColumn::CreationDate => GroupFieldType::CreationDate,
-                    lldap_domain_model::model::UserColumn::ModifiedDate => GroupFieldType::ModifiedDate,
+                    lldap_domain_model::model::UserColumn::CreationDate => {
+                        GroupFieldType::CreationDate
+                    }
+                    lldap_domain_model::model::UserColumn::ModifiedDate => {
+                        GroupFieldType::ModifiedDate
+                    }
                     lldap_domain_model::model::UserColumn::Uuid => GroupFieldType::Uuid,
-                    lldap_domain_model::model::UserColumn::DisplayName => GroupFieldType::DisplayName,
+                    lldap_domain_model::model::UserColumn::DisplayName => {
+                        GroupFieldType::DisplayName
+                    }
                     _ => GroupFieldType::NoMatch,
                 },
                 LogicalAttr::Custom(internal, t, is_list) => {
@@ -228,43 +321,83 @@ impl SchemaManager {
         let mut operational_keys: Vec<String> = Vec::new();
 
         let always_operational: HashSet<&str> = [
-            "hassubordinates", "structuralobjectclass", "subschemasubentry",
-            "createtimestamp", "modifytimestamp", "pwdchangedtime",
-            "entryuuid", "entrydn", "memberof", "creatorsname", "modifiersname",
-        ].iter().cloned().collect();
+            "hassubordinates",
+            "structuralobjectclass",
+            "subschemasubentry",
+            "createtimestamp",
+            "modifytimestamp",
+            "pwdchangedtime",
+            "entryuuid",
+            "entrydn",
+            "memberof",
+            "creatorsname",
+            "modifiersname",
+        ]
+        .iter()
+        .cloned()
+        .collect();
 
         let _ignore_on_plus: HashSet<&str> = [
-            "attributetypes", "objectclasses", "matchingrules", "ldapsyntaxes",
-            "matchingruleuse", "creatorsname", "modifiersname", "namingcontexts",
-            "supportedcontrol", "supportedextension", "supportedfeatures",
-            "supportedldapversion", "supportedsaslmechanisms", "vendorname", "vendorversion",
-            "altserver", "ref", "queryid",
-        ].iter().cloned().collect();
+            "attributetypes",
+            "objectclasses",
+            "matchingrules",
+            "ldapsyntaxes",
+            "matchingruleuse",
+            "creatorsname",
+            "modifiersname",
+            "namingcontexts",
+            "supportedcontrol",
+            "supportedextension",
+            "supportedfeatures",
+            "supportedldapversion",
+            "supportedsaslmechanisms",
+            "vendorname",
+            "vendorversion",
+            "altserver",
+            "ref",
+            "queryid",
+        ]
+        .iter()
+        .cloned()
+        .collect();
 
-        for attr in schema.user_attributes().attributes.iter()
+        for attr in schema
+            .user_attributes()
+            .attributes
+            .iter()
             .chain(schema.group_attributes().attributes.iter())
         {
             let preferred_name = get_preferred_ldap_name(attr);
 
             if let Some((logical, _)) = self.resolve_attribute(&preferred_name) {
-                let is_always_op = always_operational.contains(preferred_name.to_ascii_lowercase().as_str());
+                let is_always_op =
+                    always_operational.contains(preferred_name.to_ascii_lowercase().as_str());
                 let target = if matches!(logical, LogicalAttr::Operational) || is_always_op {
                     &mut operational_keys
                 } else {
                     &mut standard_keys
                 };
-                if !target.iter().any(|k| k.eq_ignore_ascii_case(&preferred_name)) {
+                if !target
+                    .iter()
+                    .any(|k| k.eq_ignore_ascii_case(&preferred_name))
+                {
                     target.push(preferred_name);
                 }
             } else {
-                if !standard_keys.iter().any(|k| k.eq_ignore_ascii_case(&preferred_name)) {
+                if !standard_keys
+                    .iter()
+                    .any(|k| k.eq_ignore_ascii_case(&preferred_name))
+                {
                     standard_keys.push(preferred_name);
                 }
             }
         }
 
         for name in &always_operational {
-            if !operational_keys.iter().any(|k| k.eq_ignore_ascii_case(name)) {
+            if !operational_keys
+                .iter()
+                .any(|k| k.eq_ignore_ascii_case(name))
+            {
                 operational_keys.push(name.to_string());
             }
         }
@@ -273,7 +406,10 @@ impl SchemaManager {
         standard_keys.retain(|k| !always_operational_set.contains(k.to_ascii_lowercase().as_str()));
 
         // objectClass is always included for standard searches
-        if !standard_keys.iter().any(|k| k.eq_ignore_ascii_case("objectClass")) {
+        if !standard_keys
+            .iter()
+            .any(|k| k.eq_ignore_ascii_case("objectClass"))
+        {
             standard_keys.push("objectClass".to_string());
         }
 
@@ -319,7 +455,8 @@ impl SchemaManager {
         // If any explicitly requested attribute is operational, include operational attrs
         // (per LDAP spec: explicitly requested operational attrs must be returned)
         let has_explicit_operational = attributes_out.keys().any(|k| {
-            self.is_operational(k.as_str()) || always_operational.contains(k.as_str().to_ascii_lowercase().as_str())
+            self.is_operational(k.as_str())
+                || always_operational.contains(k.as_str().to_ascii_lowercase().as_str())
         });
 
         ExpandedAttributes {

@@ -1,9 +1,9 @@
 use crate::{
     components::{
-        router::{AppRoute, Link},
-        ou_table::OuTable,
         change_ou::OuChangeKind,
         delete_group::DeleteGroup,
+        ou_table::OuTable,
+        router::{AppRoute, Link},
         table_action_bar::TableActionBar,
         table_bulk_selection::TableBulkSelection,
     },
@@ -63,7 +63,11 @@ pub enum Msg {
 }
 
 impl CommonComponent<GroupTable> for GroupTable {
-    fn handle_msg(&mut self, ctx: &Context<Self>, msg: <Self as Component>::Message) -> Result<bool> {
+    fn handle_msg(
+        &mut self,
+        ctx: &Context<Self>,
+        msg: <Self as Component>::Message,
+    ) -> Result<bool> {
         match msg {
             Msg::ListGroupsResponse(groups) => {
                 self.groups = Some(groups?.groups.into_iter().collect());
@@ -117,7 +121,8 @@ impl CommonComponent<GroupTable> for GroupTable {
                             _ => true,
                         });
                     }
-                    self.bulk_selection.toggle_all(&filtered.iter().map(|g| g.id).collect::<Vec<_>>());
+                    self.bulk_selection
+                        .toggle_all(&filtered.iter().map(|g| g.id).collect::<Vec<_>>());
                 }
                 Ok(true)
             }
@@ -154,10 +159,11 @@ impl CommonComponent<GroupTable> for GroupTable {
 
 impl GroupTable {
     fn get_attribute_value(group: &Group, name: &str) -> Option<String> {
-        group.attributes
-        .iter()
-        .find(|a| a.schema.name == name)
-        .and_then(|a| a.value.first().cloned())
+        group
+            .attributes
+            .iter()
+            .find(|a| a.schema.name == name)
+            .and_then(|a| a.value.first().cloned())
     }
 
     fn get_ou(group: &Group) -> String {
@@ -297,7 +303,9 @@ impl Component for GroupTable {
 
 impl GroupTable {
     fn view_groups(&self, ctx: &Context<Self>, filtered_groups: &[Group]) -> Html {
-        let all_selected = self.bulk_selection.all_selected(&filtered_groups.iter().map(|g| g.id).collect::<Vec<_>>());
+        let all_selected = self
+            .bulk_selection
+            .all_selected(&filtered_groups.iter().map(|g| g.id).collect::<Vec<_>>());
 
         html! {
             <div class="table-responsive">

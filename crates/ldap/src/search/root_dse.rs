@@ -1,6 +1,8 @@
 //! Root DSE and subschema request handling.
 
-use ldap3_proto::proto::{LdapOp, LdapSearchRequest, LdapSearchScope, OID_PASSWORD_MODIFY, OID_WHOAMI};
+use ldap3_proto::proto::{
+    LdapOp, LdapSearchRequest, LdapSearchScope, OID_PASSWORD_MODIFY, OID_WHOAMI,
+};
 
 pub fn root_dse_response(base_dn: &str) -> LdapOp {
     let realm = {
@@ -33,7 +35,11 @@ pub fn root_dse_response(base_dn: &str) -> LdapOp {
             },
             ldap3_proto::LdapPartialAttribute {
                 atype: "vendorVersion".to_string(),
-                vals: vec![concat!("lldap_", env!("CARGO_PKG_VERSION")).to_string().into_bytes()],
+                vals: vec![
+                    concat!("lldap_", env!("CARGO_PKG_VERSION"))
+                        .to_string()
+                        .into_bytes(),
+                ],
             },
             ldap3_proto::LdapPartialAttribute {
                 atype: "supportedLDAPVersion".to_string(),
@@ -106,12 +112,17 @@ pub fn is_root_dse_request(request: &LdapSearchRequest) -> bool {
 pub fn is_subschema_entry_request(request: &LdapSearchRequest) -> bool {
     let base_lower = request.base.to_ascii_lowercase();
     let base_matches = base_lower.contains("cn=subschema");
-    let scope_ok = matches!(request.scope, LdapSearchScope::Base | LdapSearchScope::Subtree);
+    let scope_ok = matches!(
+        request.scope,
+        LdapSearchScope::Base | LdapSearchScope::Subtree
+    );
     let filter_ok = match &request.filter {
         ldap3_proto::LdapFilter::Present(attr) => attr.eq_ignore_ascii_case("objectclass"),
         ldap3_proto::LdapFilter::Equality(attr, val) => {
             attr.eq_ignore_ascii_case("objectclass")
-                && (val == "*" || val.eq_ignore_ascii_case("top") || val.eq_ignore_ascii_case("subschema"))
+                && (val == "*"
+                    || val.eq_ignore_ascii_case("top")
+                    || val.eq_ignore_ascii_case("subschema"))
         }
         ldap3_proto::LdapFilter::And(filters) | ldap3_proto::LdapFilter::Or(filters) => {
             filters.iter().any(|f| {

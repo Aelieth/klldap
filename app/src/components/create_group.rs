@@ -28,33 +28,34 @@ use yew_router::{prelude::History, scope_ext::RouterScopeExt};
 
 #[derive(GraphQLQuery)]
 #[graphql(
-schema_path = "../schema.graphql",
-query_path = "queries/get_group_attributes_schema.graphql",
-response_derives = "Debug,Clone,PartialEq,Eq",
-custom_scalars_module = "crate::infra::graphql",
-extern_enums("AttributeType")
+    schema_path = "../schema.graphql",
+    query_path = "queries/get_group_attributes_schema.graphql",
+    response_derives = "Debug,Clone,PartialEq,Eq",
+    custom_scalars_module = "crate::infra::graphql",
+    extern_enums("AttributeType")
 )]
 pub struct GetGroupAttributesSchema;
 
 #[derive(GraphQLQuery)]
 #[graphql(
-schema_path = "../schema.graphql",
-query_path = "queries/list_ous.graphql",
-response_derives = "Debug, Clone",
-custom_scalars_module = "crate::infra::graphql"
+    schema_path = "../schema.graphql",
+    query_path = "queries/list_ous.graphql",
+    response_derives = "Debug, Clone",
+    custom_scalars_module = "crate::infra::graphql"
 )]
 pub struct ListOusQuery;
 
 #[derive(GraphQLQuery)]
 #[graphql(
-schema_path = "../schema.graphql",
-query_path = "queries/get_posix_config.graphql",
-response_derives = "Debug",
-custom_scalars_module = "crate::infra::graphql")]
+    schema_path = "../schema.graphql",
+    query_path = "queries/get_posix_config.graphql",
+    response_derives = "Debug",
+    custom_scalars_module = "crate::infra::graphql"
+)]
 pub struct GetPosixConfig;
 
 pub type Attribute =
-get_group_attributes_schema::GetGroupAttributesSchemaSchemaGroupSchemaAttributes;
+    get_group_attributes_schema::GetGroupAttributesSchemaSchemaGroupSchemaAttributes;
 
 impl From<&Attribute> for GraphQlAttributeSchema {
     fn from(attr: &Attribute) -> Self {
@@ -69,23 +70,23 @@ impl From<&Attribute> for GraphQlAttributeSchema {
 
 #[derive(GraphQLQuery)]
 #[graphql(
-schema_path = "../schema.graphql",
-query_path = "queries/create_group.graphql",
-response_derives = "Debug",
-custom_scalars_module = "crate::infra::graphql"
+    schema_path = "../schema.graphql",
+    query_path = "queries/create_group.graphql",
+    response_derives = "Debug",
+    custom_scalars_module = "crate::infra::graphql"
 )]
 pub struct CreateGroup;
 
 pub struct CreateGroupForm {
     common: CommonComponentParts<Self>,
     form: yew_form::Form<CreateGroupModel>,
-        attributes_schema: Option<Vec<Attribute>>,
-        form_ref: NodeRef,
-            ous: Vec<String>,
-            selected_ou: String,
-            // POSIX auto-assign flags
-            posix_config_loaded: bool,
-            group_gidnumber_assign: bool,
+    attributes_schema: Option<Vec<Attribute>>,
+    form_ref: NodeRef,
+    ous: Vec<String>,
+    selected_ou: String,
+    // POSIX auto-assign flags
+    posix_config_loaded: bool,
+    group_gidnumber_assign: bool,
 }
 
 #[derive(Model, Validate, PartialEq, Eq, Clone, Default)]
@@ -141,24 +142,26 @@ impl CommonComponent<CreateGroupForm> for CreateGroupForm {
 
                 let all_values = read_all_form_attributes(
                     self.attributes_schema.iter().flatten(),
-                                                          &self.form_ref,
-                                                          IsAdmin(true),
-                                                          EmailIsRequired(false),
+                    &self.form_ref,
+                    IsAdmin(true),
+                    EmailIsRequired(false),
                 )?;
 
                 let mut attributes: Vec<create_group::AttributeValueInput> = all_values
-                .into_iter()
-                .filter(|a| !a.values.is_empty())
-                .map(|AttributeValue { name, values }| create_group::AttributeValueInput {
-                    name,
-                    value: values,
-                })
-                .collect();
+                    .into_iter()
+                    .filter(|a| !a.values.is_empty())
+                    .map(
+                        |AttributeValue { name, values }| create_group::AttributeValueInput {
+                            name,
+                            value: values,
+                        },
+                    )
+                    .collect();
 
                 // Always inject selected OU
                 attributes.push(create_group::AttributeValueInput {
                     name: "ou".to_string(),
-                                value: vec![self.selected_ou.clone()],
+                    value: vec![self.selected_ou.clone()],
                 });
 
                 let model = self.form.model();
@@ -178,7 +181,10 @@ impl CommonComponent<CreateGroupForm> for CreateGroupForm {
             }
             Msg::CreateGroupResponse(response) => {
                 let data = response?;
-                log!(format!("Created group '{}'", data.create_group.display_name));
+                log!(format!(
+                    "Created group '{}'",
+                    data.create_group.display_name
+                ));
                 ctx.link().history().unwrap().push(AppRoute::ListGroups);
                 Ok(true)
             }
@@ -202,26 +208,24 @@ impl Component for CreateGroupForm {
         let mut component = Self {
             common: CommonComponentParts::<Self>::create(),
             form: yew_form::Form::<CreateGroupModel>::new(CreateGroupModel::default()),
-                attributes_schema: None,
-                form_ref: NodeRef::default(),
-                    ous: vec![],
-                    selected_ou: "groups".to_string(),
-                    posix_config_loaded: false,
-                    group_gidnumber_assign: false,
+            attributes_schema: None,
+            form_ref: NodeRef::default(),
+            ous: vec![],
+            selected_ou: "groups".to_string(),
+            posix_config_loaded: false,
+            group_gidnumber_assign: false,
         };
 
         component
-        .common
-        .call_graphql::<GetGroupAttributesSchema, _>(
-            ctx,
-            get_group_attributes_schema::Variables {},
-            Msg::ListAttributesResponse,
-            "Error trying to fetch group schema",
-        );
+            .common
+            .call_graphql::<GetGroupAttributesSchema, _>(
+                ctx,
+                get_group_attributes_schema::Variables {},
+                Msg::ListAttributesResponse,
+                "Error trying to fetch group schema",
+            );
 
-        component
-        .common
-        .call_graphql::<ListOusQuery, _>(
+        component.common.call_graphql::<ListOusQuery, _>(
             ctx,
             list_ous_query::Variables {},
             Msg::ListUserOusResponse,

@@ -45,7 +45,11 @@ fn post_graphql<T: graphql_client::GraphQLQuery + 'static>(
                     "Raw probe to {} returned status: {} | body preview: {}",
                     graphql_url,
                     resp.status(),
-                    resp.text().unwrap_or_default().chars().take(200).collect::<String>()
+                    resp.text()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(200)
+                        .collect::<String>()
                 ),
                 Err(err) => format!("Raw probe failed: {}", err),
             };
@@ -185,7 +189,7 @@ impl LLDAPFixture {
             create_group::Variables {
                 group: create_group::CreateGroupInput {
                     display_name: group.to_owned(),
-                                         attributes: None,
+                    attributes: None,
                 },
             },
         );
@@ -227,7 +231,10 @@ impl LLDAPFixture {
     }
 
     fn add_user_to_group(&mut self, user: &str, group: &String) {
-        let group_id = *self.groups.get(group).expect("group id missing when adding user");
+        let group_id = *self
+            .groups
+            .get(group)
+            .expect("group id missing when adding user");
         let _ = post_graphql::<AddUserToGroup>(
             &self.client,
             &self.token,
@@ -253,7 +260,10 @@ impl Drop for LLDAPFixture {
         let groups: Vec<String> = self.groups.keys().cloned().collect();
         for group in groups {
             if let Err(e) = self.try_delete_group(&group) {
-                eprintln!("Warning during Drop: could not delete group {}: {}", group, e);
+                eprintln!(
+                    "Warning during Drop: could not delete group {}: {}",
+                    group, e
+                );
             }
         }
 

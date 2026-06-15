@@ -65,13 +65,13 @@ impl<C: Component + CommonComponent<C>> CommonComponentParts<C> {
     ) -> bool {
         let should_render = Self::update(com, ctx, msg);
         com.mut_common()
-        .error
-        .take()
-        .map(|e| {
-            report_fn.emit(e);
-            true
-        })
-        .unwrap_or(should_render)
+            .error
+            .take()
+            .map(|e| {
+                report_fn.emit(e);
+                true
+            })
+            .unwrap_or(should_render)
     }
 
     /// Call `method` from the backend with the given `request`, and pass the `callback` for the
@@ -80,8 +80,8 @@ impl<C: Component + CommonComponent<C>> CommonComponentParts<C> {
     /// NOTE: `Req` is removed entirely — we never use it. This eliminates all inference problems.
     pub fn call_backend<Resp, Fut, Cb>(&mut self, ctx: &Context<C>, fut: Fut, callback: Cb)
     where
-    Fut: Future<Output = Result<Resp>> + 'static,
-    Cb: FnOnce(Result<Resp>) -> C::Message + 'static,
+        Fut: Future<Output = Result<Resp>> + 'static,
+        Cb: FnOnce(Result<Resp>) -> C::Message + 'static,
     {
         {
             let mut running = self.is_task_running.lock().unwrap();
@@ -108,13 +108,13 @@ impl<C: Component + CommonComponent<C>> CommonComponentParts<C> {
         enum_callback: EnumCallback,
         error_message: &'static str,
     ) where
-    QueryType: GraphQLQuery + 'static,
-    EnumCallback: Fn(Result<QueryType::ResponseData>) -> C::Message + 'static,
+        QueryType: GraphQLQuery + 'static,
+        EnumCallback: Fn(Result<QueryType::ResponseData>) -> C::Message + 'static,
     {
         self.call_backend::<QueryType::ResponseData, _, _>(
             ctx,
             HostService::graphql_query::<QueryType>(variables, error_message),
-                                                           enum_callback,
+            enum_callback,
         );
     }
 }

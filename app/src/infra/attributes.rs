@@ -13,7 +13,7 @@ pub mod user {
 
     pub fn resolve_user_attribute_description_or_default<'a>(
         name: &'a str,
-        aliases: &'a [String],   // ← comes directly from GraphQL
+        aliases: &'a [String], // ← comes directly from GraphQL
     ) -> AttributeDescription<'a> {
         AttributeDescription {
             attribute_identifier: name,

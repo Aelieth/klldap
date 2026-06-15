@@ -120,11 +120,11 @@ pub async fn set_private_key_info(pool: &DbConnection, info: PrivateKeyInfo) -> 
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::sql_migrations;
+    use chrono::prelude::*;
     use lldap_domain::types::GroupId;
     use pretty_assertions::assert_eq;
-    use super::*;
-    use chrono::prelude::*;
     use sea_orm::{ConnectionTrait, Database, DbBackend, FromQueryResult};
     use tracing::error;
 
@@ -172,7 +172,7 @@ mod tests {
             .execute(raw_statement(
                 r#"INSERT INTO user_attributes
                    (user_attribute_user_id, user_attribute_name, user_attribute_value)
-                   VALUES ("bôb", "firstname", x'426f62')"#,  // raw bytes "Bob" — matches v5+ raw storage philosophy
+                   VALUES ("bôb", "firstname", x'426f62')"#, // raw bytes "Bob" — matches v5+ raw storage philosophy
             ))
             .await
             .unwrap();
@@ -278,7 +278,9 @@ mod tests {
             .unwrap(),
             vec![
                 SimpleUser { display_name: None },
-                SimpleUser { display_name: Some("John Doe".to_owned()) },
+                SimpleUser {
+                    display_name: Some("John Doe".to_owned())
+                },
             ]
         );
 
@@ -295,7 +297,7 @@ mod tests {
 
         let attrs = UserAttribute::find_by_statement(raw_statement(
             r#"SELECT user_attribute_user_id, user_attribute_name, user_attribute_value
-               FROM user_attributes ORDER BY user_attribute_user_id, user_attribute_name"#
+               FROM user_attributes ORDER BY user_attribute_user_id, user_attribute_name"#,
         ))
         .all(&sql_pool)
         .await
@@ -306,9 +308,20 @@ mod tests {
         // - PublicSchema seeding (18 user + 7 group attributes)
         // - Normalization step runs cleanly (legacy names → canonical)
         // - Core system attributes (kerberossync, ou) are present for all users
-        assert!(attrs.iter().any(|a| a.user_attribute_name == "kerberossync" && a.user_attribute_value == b"0"));
-        assert!(attrs.iter().any(|a| a.user_attribute_name == "ou" && a.user_attribute_value == b"people"));
-        assert!(attrs.len() >= 4, "Expected at least the v12-seeded system attributes after full migration");
+        assert!(
+            attrs
+                .iter()
+                .any(|a| a.user_attribute_name == "kerberossync" && a.user_attribute_value == b"0")
+        );
+        assert!(
+            attrs
+                .iter()
+                .any(|a| a.user_attribute_name == "ou" && a.user_attribute_value == b"people")
+        );
+        assert!(
+            attrs.len() >= 4,
+            "Expected at least the v12-seeded system attributes after full migration"
+        );
 
         #[derive(FromQueryResult, PartialEq, Eq, Debug)]
         struct ShortGroupDetails {
@@ -324,9 +337,18 @@ mod tests {
             .await
             .unwrap(),
             vec![
-                ShortGroupDetails { group_id: GroupId(1), display_name: "lldap_admin".to_string() },
-                ShortGroupDetails { group_id: GroupId(2), display_name: "lldap_password_manager".to_string() },
-                ShortGroupDetails { group_id: GroupId(3), display_name: "test".to_string() },
+                ShortGroupDetails {
+                    group_id: GroupId(1),
+                    display_name: "lldap_admin".to_string()
+                },
+                ShortGroupDetails {
+                    group_id: GroupId(2),
+                    display_name: "lldap_password_manager".to_string()
+                },
+                ShortGroupDetails {
+                    group_id: GroupId(3),
+                    display_name: "test".to_string()
+                },
             ]
         );
 
@@ -349,7 +371,9 @@ mod tests {
         crate::logging::init_for_tests();
         let sql_pool = get_in_memory_db().await;
         upgrade_to_v1(&sql_pool).await.unwrap();
-        migrate_from_version(&sql_pool, SchemaVersion(1), SchemaVersion(3)).await.unwrap();
+        migrate_from_version(&sql_pool, SchemaVersion(1), SchemaVersion(3))
+            .await
+            .unwrap();
 
         sql_pool
             .execute(raw_statement(
@@ -382,15 +406,21 @@ mod tests {
             .await
             .unwrap()
             .unwrap(),
-            sql_migrations::JustSchemaVersion { version: SchemaVersion(3) }
+            sql_migrations::JustSchemaVersion {
+                version: SchemaVersion(3)
+            }
         );
 
         sql_pool
-            .execute(raw_statement(r#"UPDATE users SET email = "new@bob.com" WHERE user_id = "bob2""#))
+            .execute(raw_statement(
+                r#"UPDATE users SET email = "new@bob.com" WHERE user_id = "bob2""#,
+            ))
             .await
             .unwrap();
 
-        migrate_from_version(&sql_pool, SchemaVersion(3), SchemaVersion(4)).await.unwrap();
+        migrate_from_version(&sql_pool, SchemaVersion(3), SchemaVersion(4))
+            .await
+            .unwrap();
 
         assert_eq!(
             sql_migrations::JustSchemaVersion::find_by_statement(raw_statement(
@@ -400,7 +430,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap(),
-            sql_migrations::JustSchemaVersion { version: SchemaVersion(4) }
+            sql_migrations::JustSchemaVersion {
+                version: SchemaVersion(4)
+            }
         );
     }
 
@@ -409,7 +441,9 @@ mod tests {
         crate::logging::init_for_tests();
         let sql_pool = get_in_memory_db().await;
         upgrade_to_v1(&sql_pool).await.unwrap();
-        migrate_from_version(&sql_pool, SchemaVersion(1), SchemaVersion(4)).await.unwrap();
+        migrate_from_version(&sql_pool, SchemaVersion(1), SchemaVersion(4))
+            .await
+            .unwrap();
 
         sql_pool
             .execute(raw_statement(
@@ -429,7 +463,9 @@ mod tests {
             .await
             .unwrap();
 
-        migrate_from_version(&sql_pool, SchemaVersion(4), SchemaVersion(5)).await.unwrap();
+        migrate_from_version(&sql_pool, SchemaVersion(4), SchemaVersion(5))
+            .await
+            .unwrap();
 
         assert_eq!(
             sql_migrations::JustSchemaVersion::find_by_statement(raw_statement(
@@ -439,7 +475,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap(),
-            sql_migrations::JustSchemaVersion { version: SchemaVersion(5) }
+            sql_migrations::JustSchemaVersion {
+                version: SchemaVersion(5)
+            }
         );
 
         #[derive(FromQueryResult, PartialEq, Eq, Debug)]
@@ -457,12 +495,23 @@ mod tests {
             .await
             .unwrap(),
             vec![
-                UserV5 { user_id: "bob".to_owned(), email: "bob@bob.com".to_owned(), display_name: None },
-                UserV5 { user_id: "bob2".to_owned(), email: "bob2@bob.com".to_owned(), display_name: Some("display bob".to_owned()) },
+                UserV5 {
+                    user_id: "bob".to_owned(),
+                    email: "bob@bob.com".to_owned(),
+                    display_name: None
+                },
+                UserV5 {
+                    user_id: "bob2".to_owned(),
+                    email: "bob2@bob.com".to_owned(),
+                    display_name: Some("display bob".to_owned())
+                },
             ]
         );
 
-        sql_pool.execute(raw_statement(r#"SELECT first_name FROM users"#)).await.unwrap_err();
+        sql_pool
+            .execute(raw_statement(r#"SELECT first_name FROM users"#))
+            .await
+            .unwrap_err();
 
         // v5 migration test: verifies legacy columns (first/last/avatar) are moved to EAV as *raw bytes*
         // (per the "no bincode" refactor). Note: at v5 we still have legacy names ("first_name");
@@ -477,16 +526,24 @@ mod tests {
 
         let v5_attrs = UserAttribute::find_by_statement(raw_statement(
             r#"SELECT user_attribute_user_id, user_attribute_name, user_attribute_value
-               FROM user_attributes ORDER BY user_attribute_user_id, user_attribute_name ASC"#
+               FROM user_attributes ORDER BY user_attribute_user_id, user_attribute_name ASC"#,
         ))
         .all(&sql_pool)
         .await
         .unwrap();
 
         assert_eq!(v5_attrs.len(), 3);
-        assert!(v5_attrs.iter().any(|a| a.user_attribute_name == "avatar" && a.user_attribute_value == lldap_domain::images::make_test_jpeg_bytes()));
-        assert!(v5_attrs.iter().any(|a| a.user_attribute_name == "first_name" && a.user_attribute_value == b"first bob"));
-        assert!(v5_attrs.iter().any(|a| a.user_attribute_name == "last_name" && a.user_attribute_value == b"last bob"));
+        assert!(v5_attrs.iter().any(|a| a.user_attribute_name == "avatar"
+            && a.user_attribute_value == lldap_domain::images::make_test_jpeg_bytes()));
+        assert!(v5_attrs.iter().any(
+            |a| a.user_attribute_name == "first_name" && a.user_attribute_value == b"first bob"
+        ));
+        assert!(
+            v5_attrs
+                .iter()
+                .any(|a| a.user_attribute_name == "last_name"
+                    && a.user_attribute_value == b"last bob")
+        );
     }
 
     #[tokio::test]
@@ -494,7 +551,9 @@ mod tests {
         crate::logging::init_for_tests();
         let sql_pool = get_in_memory_db().await;
         upgrade_to_v1(&sql_pool).await.unwrap();
-        migrate_from_version(&sql_pool, SchemaVersion(1), SchemaVersion(5)).await.unwrap();
+        migrate_from_version(&sql_pool, SchemaVersion(1), SchemaVersion(5))
+            .await
+            .unwrap();
 
         sql_pool
             .execute(raw_statement(
@@ -512,7 +571,9 @@ mod tests {
             .await
             .unwrap();
 
-        migrate_from_version(&sql_pool, SchemaVersion(5), SchemaVersion(6)).await.unwrap();
+        migrate_from_version(&sql_pool, SchemaVersion(5), SchemaVersion(6))
+            .await
+            .unwrap();
 
         assert_eq!(
             sql_migrations::JustSchemaVersion::find_by_statement(raw_statement(
@@ -522,7 +583,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap(),
-            sql_migrations::JustSchemaVersion { version: SchemaVersion(6) }
+            sql_migrations::JustSchemaVersion {
+                version: SchemaVersion(6)
+            }
         );
 
         #[derive(FromQueryResult, PartialEq, Eq, Debug)]
@@ -532,7 +595,7 @@ mod tests {
         }
 
         let result = ShortUserDetails::find_by_statement(raw_statement(
-            r#"SELECT email, lowercase_email FROM users WHERE user_id = "bob""#
+            r#"SELECT email, lowercase_email FROM users WHERE user_id = "bob""#,
         ))
         .one(&sql_pool)
         .await
@@ -554,7 +617,7 @@ mod tests {
         }
 
         let result = ShortGroupDetails::find_by_statement(raw_statement(
-            r#"SELECT display_name, lowercase_display_name FROM groups"#
+            r#"SELECT display_name, lowercase_display_name FROM groups"#,
         ))
         .one(&sql_pool)
         .await
@@ -574,11 +637,15 @@ mod tests {
     async fn test_too_high_version() {
         let sql_pool = get_in_memory_db().await;
         sql_pool
-            .execute(raw_statement(r#"CREATE TABLE metadata ( version INTEGER);"#))
+            .execute(raw_statement(
+                r#"CREATE TABLE metadata ( version INTEGER);"#,
+            ))
             .await
             .unwrap();
         sql_pool
-            .execute(raw_statement(r#"INSERT INTO metadata (version) VALUES (127)"#))
+            .execute(raw_statement(
+                r#"INSERT INTO metadata (version) VALUES (127)"#,
+            ))
             .await
             .unwrap();
         assert!(init_table(&sql_pool).await.is_err());

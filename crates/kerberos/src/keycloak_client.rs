@@ -33,7 +33,11 @@ impl KeycloakClient {
             admin_pass
         };
         Self {
-            config: KeycloakConfig { url, realm, admin_user },
+            config: KeycloakConfig {
+                url,
+                realm,
+                admin_user,
+            },
             admin_pass: pass,
             http_client: HttpClient::new(),
         }
@@ -47,7 +51,10 @@ impl KeycloakClient {
         enable_hsts: bool,
         enable_brute_force: bool,
     ) -> Result<String> {
-        info!("🔄 PushRealm starting - Realm: '{}', LLDAP URL: '{}'", self.config.realm, lldap_url);
+        info!(
+            "🔄 PushRealm starting - Realm: '{}', LLDAP URL: '{}'",
+            self.config.realm, lldap_url
+        );
         let token = self.acquire_token().await?;
 
         // 1. Check if realm already exists — error out to prevent accidental overwrite / data loss.
@@ -60,10 +67,13 @@ impl KeycloakClient {
         }
 
         // 2. Create the realm (clean slate)
-        self.create_realm(&token, enable_hsts, enable_brute_force).await?;
+        self.create_realm(&token, enable_hsts, enable_brute_force)
+            .await?;
 
         // 3. Create LDAP + Kerberos component and retrieve its ID for mapper parenting
-        let provider_id = self.create_ldap_kerberos_component(&token, &lldap_url, &sync_username, &sync_password).await?;
+        let provider_id = self
+            .create_ldap_kerberos_component(&token, &lldap_url, &sync_username, &sync_password)
+            .await?;
 
         // 4. Clear ALL default "dumb" Keycloak auto-created mappers (firstName<->cn oddities, generic ones, etc.)
         // This gives us a pristine provider to attach our schema-aligned custom mappers.
@@ -105,8 +115,12 @@ impl KeycloakClient {
 
     async fn acquire_token(&self) -> Result<String> {
         info!("   → Acquiring admin token...");
-        let resp = self.http_client
-            .post(format!("{}/realms/master/protocol/openid-connect/token", self.config.url))
+        let resp = self
+            .http_client
+            .post(format!(
+                "{}/realms/master/protocol/openid-connect/token",
+                self.config.url
+            ))
             .form(&[
                 ("client_id", "admin-cli"),
                 ("username", &self.config.admin_user),
@@ -118,7 +132,8 @@ impl KeycloakClient {
             .context("Failed to connect to Keycloak")?;
 
         let json: serde_json::Value = resp.json().await.context("Invalid token response")?;
-        let token = json["access_token"].as_str()
+        let token = json["access_token"]
+            .as_str()
             .ok_or_else(|| anyhow::anyhow!("No access_token in response (wrong admin password?)"))?
             .to_string();
 
@@ -126,7 +141,12 @@ impl KeycloakClient {
         Ok(token)
     }
 
-    async fn create_realm(&self, token: &str, enable_hsts: bool, enable_brute_force: bool) -> Result<()> {
+    async fn create_realm(
+        &self,
+        token: &str,
+        enable_hsts: bool,
+        enable_brute_force: bool,
+    ) -> Result<()> {
         info!("   → Creating realm '{}'...", self.config.realm);
         let realm_json = json!({
             "realm": self.config.realm,
@@ -155,7 +175,8 @@ impl KeycloakClient {
             "bruteForceProtected": enable_brute_force
         });
 
-        let resp = self.http_client
+        let resp = self
+            .http_client
             .post(format!("{}/admin/realms", self.config.url))
             .bearer_auth(token)
             .header("Content-Type", "application/json")
@@ -169,7 +190,11 @@ impl KeycloakClient {
             Ok(())
         } else {
             let body = resp.text().await.unwrap_or_default();
-            Err(anyhow::anyhow!("Realm creation failed: {} - {}", status, body))
+            Err(anyhow::anyhow!(
+                "Realm creation failed: {} - {}",
+                status,
+                body
+            ))
         }
     }
 
@@ -223,8 +248,12 @@ impl KeycloakClient {
             }
         });
 
-        let resp = self.http_client
-            .post(format!("{}/admin/realms/{}/components", self.config.url, self.config.realm))
+        let resp = self
+            .http_client
+            .post(format!(
+                "{}/admin/realms/{}/components",
+                self.config.url, self.config.realm
+            ))
             .bearer_auth(token)
             .header("Content-Type", "application/json")
             .json(&component_json)
@@ -234,7 +263,11 @@ impl KeycloakClient {
         let status = resp.status();
         if !(status.is_success() || status.as_u16() == 409) {
             let body = resp.text().await.unwrap_or_default();
-            return Err(anyhow::anyhow!("Component creation failed: {} - {}", status, body));
+            return Err(anyhow::anyhow!(
+                "Component creation failed: {} - {}",
+                status,
+                body
+            ));
         }
 
         // Retrieve the freshly created component's ID (Keycloak does not always echo it in POST body)
@@ -242,7 +275,8 @@ impl KeycloakClient {
             "{}/admin/realms/{}/components?providerId=ldap&name=lldap-with-kerberos",
             self.config.url, self.config.realm
         );
-        let components: Vec<serde_json::Value> = self.http_client
+        let components: Vec<serde_json::Value> = self
+            .http_client
             .get(&list_url)
             .bearer_auth(token)
             .send()
@@ -256,7 +290,11 @@ impl KeycloakClient {
             .iter()
             .find(|c| c.get("name").and_then(|n| n.as_str()) == Some("lldap-with-kerberos"))
             .and_then(|c| c.get("id").and_then(|i| i.as_str()))
-            .ok_or_else(|| anyhow::anyhow!("Could not locate ID of newly created 'lldap-with-kerberos' component"))?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Could not locate ID of newly created 'lldap-with-kerberos' component"
+                )
+            })?
             .to_string();
 
         info!("   → LDAP+Kerberos component ready (ID: {})", provider_id);
@@ -274,7 +312,8 @@ impl KeycloakClient {
             self.config.url, self.config.realm, provider_id
         );
 
-        let mappers: Vec<serde_json::Value> = self.http_client
+        let mappers: Vec<serde_json::Value> = self
+            .http_client
             .get(&url)
             .bearer_auth(token)
             .send()
@@ -287,16 +326,31 @@ impl KeycloakClient {
         let mut deleted = 0;
         for mapper in mappers {
             if let Some(id) = mapper.get("id").and_then(|v| v.as_str()) {
-                let name = mapper.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
-                let del_url = format!("{}/admin/realms/{}/components/{}", self.config.url, self.config.realm, id);
-                let del_resp = self.http_client.delete(&del_url).bearer_auth(token).send().await;
+                let name = mapper
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let del_url = format!(
+                    "{}/admin/realms/{}/components/{}",
+                    self.config.url, self.config.realm, id
+                );
+                let del_resp = self
+                    .http_client
+                    .delete(&del_url)
+                    .bearer_auth(token)
+                    .send()
+                    .await;
                 match del_resp {
                     Ok(r) if r.status().is_success() || r.status().as_u16() == 404 => {
                         info!("     ✓ Deleted default mapper: {}", name);
                         deleted += 1;
                     }
                     Ok(r) => {
-                        info!("     ! Delete mapper {} returned {} (non-fatal)", name, r.status());
+                        info!(
+                            "     ! Delete mapper {} returned {} (non-fatal)",
+                            name,
+                            r.status()
+                        );
                     }
                     Err(e) => {
                         info!("     ! Delete mapper {} failed: {} (non-fatal)", name, e);
@@ -385,7 +439,6 @@ impl KeycloakClient {
                     "is.mandatory.in.ldap": ["false"]
                 }
             }),
-
             // === POSIX (RFC2307) for scripts, home dirs, shells, numeric IDs in SSO/tokens ===
             json!({
                 "name": "uid number",
@@ -439,7 +492,6 @@ impl KeycloakClient {
                     "is.mandatory.in.ldap": ["false"]
                 }
             }),
-
             // === Kerberos principal (for SPNEGO / SSO) ===
             json!({
                 "name": "krb principal name",
@@ -454,7 +506,6 @@ impl KeycloakClient {
                     "is.mandatory.in.ldap": ["false"]
                 }
             }),
-
             // === SSH public keys (multivalued, from our schema) ===
             json!({
                 "name": "ssh public key",
@@ -470,7 +521,6 @@ impl KeycloakClient {
                     "multivalued": ["true"]
                 }
             }),
-
             // === OU (for custom/nested OU awareness in tokens or downstream apps) ===
             json!({
                 "name": "ou",
@@ -485,7 +535,6 @@ impl KeycloakClient {
                     "is.mandatory.in.ldap": ["false"]
                 }
             }),
-
             // === kerberossync flag (used by our search filter; exposed for completeness) ===
             json!({
                 "name": "kerberos sync",
@@ -503,9 +552,16 @@ impl KeycloakClient {
         ];
 
         for mapper in custom_mappers {
-            let name = mapper.get("name").and_then(|v| v.as_str()).unwrap_or("unnamed");
-            let resp = self.http_client
-                .post(format!("{}/admin/realms/{}/components", self.config.url, self.config.realm))
+            let name = mapper
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unnamed");
+            let resp = self
+                .http_client
+                .post(format!(
+                    "{}/admin/realms/{}/components",
+                    self.config.url, self.config.realm
+                ))
                 .bearer_auth(token)
                 .header("Content-Type", "application/json")
                 .json(&mapper)
@@ -517,11 +573,16 @@ impl KeycloakClient {
                 info!("     ✓ Created custom mapper: {}", name);
             } else {
                 let body = resp.text().await.unwrap_or_default();
-                info!("     ! Mapper '{}' creation returned {} (non-fatal, continuing): {}", name, status, body);
+                info!(
+                    "     ! Mapper '{}' creation returned {} (non-fatal, continuing): {}",
+                    name, status, body
+                );
             }
         }
 
-        info!("   → All custom mappers created. Attribute resolution for KLLDAP schema implemented.");
+        info!(
+            "   → All custom mappers created. Attribute resolution for KLLDAP schema implemented."
+        );
         Ok(())
     }
 
@@ -540,8 +601,12 @@ impl KeycloakClient {
             "webOrigins": ["+"]
         });
 
-        let resp = self.http_client
-            .post(format!("{}/admin/realms/{}/clients", self.config.url, self.config.realm))
+        let resp = self
+            .http_client
+            .post(format!(
+                "{}/admin/realms/{}/clients",
+                self.config.url, self.config.realm
+            ))
             .bearer_auth(token)
             .header("Content-Type", "application/json")
             .json(&client_json)
@@ -553,21 +618,32 @@ impl KeycloakClient {
             Ok(())
         } else {
             let body = resp.text().await.unwrap_or_default();
-            Err(anyhow::anyhow!("Client creation failed: {} - {}", status, body))
+            Err(anyhow::anyhow!(
+                "Client creation failed: {} - {}",
+                status,
+                body
+            ))
         }
     }
 
     pub async fn test_connection(&self) -> Result<String> {
         info!("🔍 Testing Keycloak connection...");
         let token = self.acquire_token().await?;
-        let resp = self.http_client
-            .get(format!("{}/admin/realms/{}", self.config.url, self.config.realm))
+        let resp = self
+            .http_client
+            .get(format!(
+                "{}/admin/realms/{}",
+                self.config.url, self.config.realm
+            ))
             .bearer_auth(token)
             .send()
             .await?;
 
         if resp.status().is_success() {
-            let msg = format!("✅ Connected to Keycloak at {} — realm '{}' is ready", self.config.url, self.config.realm);
+            let msg = format!(
+                "✅ Connected to Keycloak at {} — realm '{}' is ready",
+                self.config.url, self.config.realm
+            );
             info!("{}", msg);
             Ok(msg)
         } else {

@@ -1,8 +1,6 @@
-use crate::{
-    infra::{
-        common_component::{CommonComponent, CommonComponentParts},
-        modal::Modal,
-    },
+use crate::infra::{
+    common_component::{CommonComponent, CommonComponentParts},
+    modal::Modal,
 };
 use anyhow::{Error, Result};
 use graphql_client::GraphQLQuery;

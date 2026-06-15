@@ -6,7 +6,10 @@ use crate::{
         error::{LdapError, LdapResult},
         utils::LdapInfo,
     },
-    dn::{get_internal_ou_from_dn_parts, get_user_or_group_id_from_distinguished_name, parse_distinguished_name, UserOrGroupName},
+    dn::{
+        UserOrGroupName, get_internal_ou_from_dn_parts,
+        get_user_or_group_id_from_distinguished_name, parse_distinguished_name,
+    },
     handler::make_add_response,
 };
 use ldap3_proto::proto::{
@@ -70,10 +73,10 @@ async fn create_user(
     }
 
     let mut attributes: HashMap<String, Vec<u8>> = attributes
-    .into_iter()
-    .filter(|a| !a.atype.eq_ignore_ascii_case("objectclass"))
-    .map(parse_attribute)
-    .collect::<LdapResult<_>>()?;
+        .into_iter()
+        .filter(|a| !a.atype.eq_ignore_ascii_case("objectclass"))
+        .map(parse_attribute)
+        .collect::<LdapResult<_>>()?;
 
     // Default kerberossync = 0 if not provided (matches PublicSchema)
     if !attributes.contains_key("kerberossync") {
@@ -85,16 +88,13 @@ async fn create_user(
     attributes.insert("ou".to_string(), internal_ou.clone().into_bytes());
 
     let get_attribute = |name: &str| {
-        attributes
-        .get(name)
-        .map(Vec::as_slice)
-        .map(|v| {
+        attributes.get(name).map(Vec::as_slice).map(|v| {
             std::str::from_utf8(v)
-            .map(str::to_owned)
-            .map_err(|e| LdapError {
-                code: LdapResultCode::ConstraintViolation,
-                message: format!("Attribute value is invalid UTF-8: {e:#?}"),
-            })
+                .map(str::to_owned)
+                .map_err(|e| LdapError {
+                    code: LdapResultCode::ConstraintViolation,
+                    message: format!("Attribute value is invalid UTF-8: {e:#?}"),
+                })
         })
     };
 
@@ -104,7 +104,11 @@ async fn create_user(
     if let Some(first_name) = get_attribute("givenname").transpose()? {
         new_user_attributes.push(Attribute {
             name: "first_name".into(),
-            value: deserialize::deserialize_attribute_value(&[first_name], AttributeType::String, false)
+            value: deserialize::deserialize_attribute_value(
+                &[first_name],
+                AttributeType::String,
+                false,
+            )
             .map_err(|e| LdapError {
                 code: LdapResultCode::ConstraintViolation,
                 message: format!("Invalid first_name value: {e}"),
@@ -114,7 +118,11 @@ async fn create_user(
     if let Some(last_name) = get_attribute("sn").transpose()? {
         new_user_attributes.push(Attribute {
             name: "last_name".into(),
-            value: deserialize::deserialize_attribute_value(&[last_name], AttributeType::String, false)
+            value: deserialize::deserialize_attribute_value(
+                &[last_name],
+                AttributeType::String,
+                false,
+            )
             .map_err(|e| LdapError {
                 code: LdapResultCode::ConstraintViolation,
                 message: format!("Invalid last_name value: {e}"),
@@ -124,83 +132,100 @@ async fn create_user(
     if let Some(avatar) = get_attribute("avatar")
         .or_else(|| get_attribute("jpegphoto"))
         .transpose()?
-        {
-            new_user_attributes.push(Attribute {
-                name: "avatar".into(),
-                value: deserialize::deserialize_attribute_value(&[avatar], AttributeType::Avatar, false)  // ← TOTAL RIP-OUT: was JpegPhoto
-                .map_err(|e| LdapError {
-                    code: LdapResultCode::ConstraintViolation,
-                    message: format!("Invalid avatar value: {e}"),
-                })?,
-            });
-        }
-
-        // Always push ou (from DN) into custom attributes so backend stores the hierarchy value.
-        // get_user_ou() will then return it for correct EntryDn in search results.
+    {
         new_user_attributes.push(Attribute {
-        name: "ou".into(),
-        value: deserialize::deserialize_attribute_value(std::slice::from_ref(&internal_ou), AttributeType::String, false)
+            name: "avatar".into(),
+            value: deserialize::deserialize_attribute_value(
+                &[avatar],
+                AttributeType::Avatar,
+                false,
+            ) // ← TOTAL RIP-OUT: was JpegPhoto
             .map_err(|e| LdapError {
                 code: LdapResultCode::ConstraintViolation,
-                message: format!("Invalid ou value: {e}"),
+                message: format!("Invalid avatar value: {e}"),
             })?,
         });
+    }
 
-        // kerberossync handling (respect client-provided value, default to 0 only if missing)
-        let kerberossync_enabled = if let Some(ksync_str) = get_attribute("kerberossync").transpose()? {
-            new_user_attributes.push(Attribute {
-                name: "kerberossync".into(),
-                value: deserialize::deserialize_attribute_value(std::slice::from_ref(&ksync_str), AttributeType::Integer, false)
-                    .map_err(|e| LdapError {
-                        code: LdapResultCode::ConstraintViolation,
-                        message: format!("Invalid kerberossync value: {e}"),
-                    })?,
-            });
-            ksync_str == "1"
-        } else {
-            new_user_attributes.push(Attribute {
-                name: "kerberossync".into(),
-                value: deserialize::deserialize_attribute_value(&["0".to_string()], AttributeType::Integer, false)
-                    .map_err(|e| LdapError {
-                        code: LdapResultCode::ConstraintViolation,
-                        message: format!("Invalid default kerberossync value: {e}"),
-                    })?,
-            });
-            false
-        };
+    // Always push ou (from DN) into custom attributes so backend stores the hierarchy value.
+    // get_user_ou() will then return it for correct EntryDn in search results.
+    new_user_attributes.push(Attribute {
+        name: "ou".into(),
+        value: deserialize::deserialize_attribute_value(
+            std::slice::from_ref(&internal_ou),
+            AttributeType::String,
+            false,
+        )
+        .map_err(|e| LdapError {
+            code: LdapResultCode::ConstraintViolation,
+            message: format!("Invalid ou value: {e}"),
+        })?,
+    });
 
-        backend_handler
-            .create_user(CreateUserRequest {
-                user_id: user_id.clone(),
-                email: Email::from(
-                    get_attribute("mail")
-                        .or_else(|| get_attribute("email"))
-                        .transpose()?
-                        .unwrap_or_default(),
-                ),
-                display_name: get_attribute("cn").transpose()?,
-                attributes: new_user_attributes,
-            })
-            .await
+    // kerberossync handling (respect client-provided value, default to 0 only if missing)
+    let kerberossync_enabled = if let Some(ksync_str) = get_attribute("kerberossync").transpose()? {
+        new_user_attributes.push(Attribute {
+            name: "kerberossync".into(),
+            value: deserialize::deserialize_attribute_value(
+                std::slice::from_ref(&ksync_str),
+                AttributeType::Integer,
+                false,
+            )
             .map_err(|e| LdapError {
-                code: LdapResultCode::OperationsError,
-                message: format!("Could not create user: {e:#?}"),
-            })?;
+                code: LdapResultCode::ConstraintViolation,
+                message: format!("Invalid kerberossync value: {e}"),
+            })?,
+        });
+        ksync_str == "1"
+    } else {
+        new_user_attributes.push(Attribute {
+            name: "kerberossync".into(),
+            value: deserialize::deserialize_attribute_value(
+                &["0".to_string()],
+                AttributeType::Integer,
+                false,
+            )
+            .map_err(|e| LdapError {
+                code: LdapResultCode::ConstraintViolation,
+                message: format!("Invalid default kerberossync value: {e}"),
+            })?,
+        });
+        false
+    };
 
-        // Fire Kerberos sync on create if kerberossync=1 and password was supplied
-        if kerberossync_enabled
-            && let Some(pw_bytes) = attributes.get("userpassword").or_else(|| attributes.get("userPassword"))
-            && let Ok(plain) = std::str::from_utf8(pw_bytes)
-        {
-            let _ = lldap_kerberos::sync_kerberos_principal(user_id.as_str(), plain);
-        }
+    backend_handler
+        .create_user(CreateUserRequest {
+            user_id: user_id.clone(),
+            email: Email::from(
+                get_attribute("mail")
+                    .or_else(|| get_attribute("email"))
+                    .transpose()?
+                    .unwrap_or_default(),
+            ),
+            display_name: get_attribute("cn").transpose()?,
+            attributes: new_user_attributes,
+        })
+        .await
+        .map_err(|e| LdapError {
+            code: LdapResultCode::OperationsError,
+            message: format!("Could not create user: {e:#?}"),
+        })?;
 
-        Ok(vec![make_add_response(
-            LdapResultCode::Success,
-            String::new(),
-        )])
+    // Fire Kerberos sync on create if kerberossync=1 and password was supplied
+    if kerberossync_enabled
+        && let Some(pw_bytes) = attributes
+            .get("userpassword")
+            .or_else(|| attributes.get("userPassword"))
+        && let Ok(plain) = std::str::from_utf8(pw_bytes)
+    {
+        let _ = lldap_kerberos::sync_kerberos_principal(user_id.as_str(), plain);
+    }
+
+    Ok(vec![make_add_response(
+        LdapResultCode::Success,
+        String::new(),
+    )])
 }
-
 
 #[instrument(skip_all, level = "debug")]
 async fn create_group(
@@ -212,11 +237,15 @@ async fn create_group(
     let mut group_attributes: Vec<Attribute> = Vec::new();
     group_attributes.push(Attribute {
         name: "ou".into(),
-        value: deserialize::deserialize_attribute_value(std::slice::from_ref(&internal_ou), AttributeType::String, false)
-            .map_err(|e| LdapError {
-                code: LdapResultCode::ConstraintViolation,
-                message: format!("Invalid ou value: {e}"),
-            })?,
+        value: deserialize::deserialize_attribute_value(
+            std::slice::from_ref(&internal_ou),
+            AttributeType::String,
+            false,
+        )
+        .map_err(|e| LdapError {
+            code: LdapResultCode::ConstraintViolation,
+            message: format!("Invalid ou value: {e}"),
+        })?,
     });
     backend_handler
         .create_group(CreateGroupRequest {
@@ -248,15 +277,18 @@ mod tests {
         let mut mock = MockTestBackendHandler::new();
 
         mock.expect_create_user()
-        .with(mockall::predicate::function(|req: &CreateUserRequest| {
-            req.user_id == UserId::new("bob")
-            && req.email == Email::from("")
-            && req.display_name == Some("Bob".to_string())
-            && req.attributes.iter().any(|a| a.name.as_str() == "ou")
-            && req.attributes.iter().any(|a| a.name.as_str() == "kerberossync")
-        }))
-        .times(1)
-        .return_once(|_| Ok(()));
+            .with(mockall::predicate::function(|req: &CreateUserRequest| {
+                req.user_id == UserId::new("bob")
+                    && req.email == Email::from("")
+                    && req.display_name == Some("Bob".to_string())
+                    && req.attributes.iter().any(|a| a.name.as_str() == "ou")
+                    && req
+                        .attributes
+                        .iter()
+                        .any(|a| a.name.as_str() == "kerberossync")
+            }))
+            .times(1)
+            .return_once(|_| Ok(()));
 
         let ldap_handler = setup_bound_admin_handler(mock).await;
 
@@ -270,7 +302,10 @@ mod tests {
 
         assert_eq!(
             ldap_handler.create_user_or_group(request).await,
-                   Ok(vec![make_add_response(LdapResultCode::Success, String::new())])
+            Ok(vec![make_add_response(
+                LdapResultCode::Success,
+                String::new()
+            )])
         );
     }
 
@@ -279,8 +314,12 @@ mod tests {
         let mut mock = MockTestBackendHandler::new();
         let ou_attr = Attribute {
             name: "ou".into(),
-            value: deserialize::deserialize_attribute_value(&["groups".to_string()], AttributeType::String, false)
-                .expect("valid ou for test"),
+            value: deserialize::deserialize_attribute_value(
+                &["groups".to_string()],
+                AttributeType::String,
+                false,
+            )
+            .expect("valid ou for test"),
         };
         mock.expect_create_group()
             .with(eq(CreateGroupRequest {
@@ -313,15 +352,18 @@ mod tests {
         let mut mock = MockTestBackendHandler::new();
 
         mock.expect_create_user()
-        .with(mockall::predicate::function(|req: &CreateUserRequest| {
-            req.user_id == UserId::new("bob")
-            && req.email == Email::from("")
-            && req.display_name == Some("Bob".to_string())
-            && req.attributes.iter().any(|a| a.name.as_str() == "ou")
-            && req.attributes.iter().any(|a| a.name.as_str() == "kerberossync")
-        }))
-        .times(1)
-        .return_once(|_| Ok(()));
+            .with(mockall::predicate::function(|req: &CreateUserRequest| {
+                req.user_id == UserId::new("bob")
+                    && req.email == Email::from("")
+                    && req.display_name == Some("Bob".to_string())
+                    && req.attributes.iter().any(|a| a.name.as_str() == "ou")
+                    && req
+                        .attributes
+                        .iter()
+                        .any(|a| a.name.as_str() == "kerberossync")
+            }))
+            .times(1)
+            .return_once(|_| Ok(()));
 
         let ldap_handler = setup_bound_admin_handler(mock).await;
 
@@ -334,14 +376,21 @@ mod tests {
                 },
                 LdapPartialAttribute {
                     atype: "objectClass".to_owned(),
-                    vals: vec![b"top".to_vec(), b"person".to_vec(), b"inetOrgPerson".to_vec()],
+                    vals: vec![
+                        b"top".to_vec(),
+                        b"person".to_vec(),
+                        b"inetOrgPerson".to_vec(),
+                    ],
                 },
             ],
         };
 
         assert_eq!(
             ldap_handler.create_user_or_group(request).await,
-                   Ok(vec![make_add_response(LdapResultCode::Success, String::new())])
+            Ok(vec![make_add_response(
+                LdapResultCode::Success,
+                String::new()
+            )])
         );
     }
 }

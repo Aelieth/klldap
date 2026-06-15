@@ -4,8 +4,8 @@ use crate::components::{
     router::{AppRoute, Link},
 };
 use wasm_bindgen::prelude::wasm_bindgen;
-use yew::{Callback, Properties, function_component, html};
 use yew::virtual_dom::AttrValue;
+use yew::{Callback, Properties, function_component, html};
 
 #[derive(Properties, PartialEq)]
 pub struct Props {

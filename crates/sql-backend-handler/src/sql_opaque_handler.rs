@@ -95,9 +95,12 @@ impl LoginHandler for SqlBackendHandler {
     #[instrument(skip_all, level = "debug", err)]
     async fn bind(&self, request: BindRequest) -> Result<()> {
         if self.is_user_disabled(&request.name).await? {
-            warn!(r#"Login attempt denied for disabled user "{}""#, &request.name);
+            warn!(
+                r#"Login attempt denied for disabled user "{}""#,
+                &request.name
+            );
             return Err(DomainError::AuthenticationError(
-                "- Account disabled. Contact administrator.".to_string()
+                "- Account disabled. Contact administrator.".to_string(),
             ));
         }
 
@@ -139,9 +142,12 @@ impl OpaqueHandler for SqlOpaqueHandler {
         let user_id = request.username;
 
         if self.is_user_disabled(&user_id).await? {
-            warn!(r#"OPAQUE login attempt denied for disabled user "{}""#, &user_id);
+            warn!(
+                r#"OPAQUE login attempt denied for disabled user "{}""#,
+                &user_id
+            );
             return Err(DomainError::AuthenticationError(
-                "- Account disabled. Contact administrator.".to_string()
+                "- Account disabled. Contact administrator.".to_string(),
             ));
         }
 
@@ -191,9 +197,12 @@ impl OpaqueHandler for SqlOpaqueHandler {
 
         // Extra safety check (in case login_start check is ever bypassed)
         if self.is_user_disabled(&username).await? {
-            warn!(r#"OPAQUE login_finish denied for disabled user "{}""#, &username);
+            warn!(
+                r#"OPAQUE login_finish denied for disabled user "{}""#,
+                &username
+            );
             return Err(DomainError::AuthenticationError(
-                "- Account disabled. Contact administrator.".to_string()
+                "- Account disabled. Contact administrator.".to_string(),
             ));
         }
 
@@ -280,12 +289,12 @@ pub async fn register_password(
             registration_start_request: registration_start.message,
         })
         .await?;
-        let registration_finish = opaque::client::registration::finish_registration(
-            registration_start.state,
-            password.unsecure().as_bytes(),
-            start_response.registration_response,
-            &mut rng,
-        )?;
+    let registration_finish = opaque::client::registration::finish_registration(
+        registration_start.state,
+        password.unsecure().as_bytes(),
+        start_response.registration_response,
+        &mut rng,
+    )?;
     opaque_handler
         .registration_finish(ClientRegistrationFinishRequest {
             server_data: start_response.server_data,
@@ -317,12 +326,12 @@ mod tests {
                 login_start_request: login_start.message,
             })
             .await?;
-            let login_finish = opaque::client::login::finish_login(
-                login_start.state,
-                password.as_bytes(),
-                start_response.credential_response,
-                &mut rng,
-            )?;
+        let login_finish = opaque::client::login::finish_login(
+            login_start.state,
+            password.as_bytes(),
+            start_response.credential_response,
+            &mut rng,
+        )?;
         opaque_handler
             .login_finish(ClientLoginFinishRequest {
                 server_data: start_response.server_data,

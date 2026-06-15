@@ -2,7 +2,7 @@ use crate::{
     compare,
     core::{
         error::{LdapError, LdapResult},
-        utils::{internal_ou_to_ldap_rdn_chain, LdapInfo},
+        utils::{LdapInfo, internal_ou_to_ldap_rdn_chain},
     },
     create, delete, modify,
     password::{self, do_password_modification},
@@ -131,7 +131,10 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
         } else if is_subschema_entry_request(request) {
             debug!("Schema request");
             return Ok(vec![
-                make_ldap_subschema_entry(&crate::schema::get_schema_manager(), &self.ldap_info.base_dn_str),
+                make_ldap_subschema_entry(
+                    &crate::schema::get_schema_manager(),
+                    &self.ldap_info.base_dn_str,
+                ),
                 make_search_success(),
             ]);
         }
@@ -169,9 +172,9 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
                     match inner.get_user_details(&user_id).await {
                         Ok(user) => {
                             let stored_ou = crate::attributes::get_user_ou(&user);
-                            let provided_ou = if let Ok(parts) =
-                            crate::dn::parse_distinguished_name(&request.dn.to_ascii_lowercase())
-                            {
+                            let provided_ou = if let Ok(parts) = crate::dn::parse_distinguished_name(
+                                &request.dn.to_ascii_lowercase(),
+                            ) {
                                 crate::dn::get_internal_ou_from_dn_parts(&parts)
                             } else {
                                 String::new()
@@ -179,10 +182,10 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
 
                             if provided_ou.eq_ignore_ascii_case(&stored_ou) {
                                 self.user_info = self
-                                .backend_handler
-                                .get_permissions_for_user(user_id)
-                                .await
-                                .ok();
+                                    .backend_handler
+                                    .get_permissions_for_user(user_id)
+                                    .await
+                                    .ok();
                                 debug!("Success! OU verified: {}", stored_ou);
                                 (LdapResultCode::Success, "".to_string())
                             } else {
@@ -204,8 +207,8 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
             res: LdapResultOp {
                 code,
                 matcheddn: "".to_string(),
-                                  message,
-                                  referral: vec![],
+                message,
+                referral: vec![],
             },
             saslcreds: None,
         })]
@@ -272,7 +275,10 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
                 let authz_id = if ou_part.is_empty() {
                     format!("dn:uid={},{}", user_id, self.ldap_info.base_dn_str)
                 } else {
-                    format!("dn:uid={},{},{}", user_id, ou_part, self.ldap_info.base_dn_str)
+                    format!(
+                        "dn:uid={},{},{}",
+                        user_id, ou_part, self.ldap_info.base_dn_str
+                    )
                 };
 
                 vec![make_extended_response(LdapResultCode::Success, authz_id)]
@@ -395,7 +401,9 @@ pub mod tests {
     use lldap_domain::types::UserId;
     use lldap_test_utils::MockTestBackendHandler;
 
-    pub async fn setup_bound_admin_handler(mock: MockTestBackendHandler) -> LdapHandler<MockTestBackendHandler> {
+    pub async fn setup_bound_admin_handler(
+        mock: MockTestBackendHandler,
+    ) -> LdapHandler<MockTestBackendHandler> {
         let mut handler = LdapHandler::new_for_tests(mock, "dc=example,dc=com");
         handler.user_info = Some(ValidationResults {
             user: UserId::new("test"),
@@ -404,13 +412,17 @@ pub mod tests {
         handler
     }
 
-    pub async fn setup_bound_password_manager_handler(mock: MockTestBackendHandler) -> LdapHandler<MockTestBackendHandler> {
+    pub async fn setup_bound_password_manager_handler(
+        mock: MockTestBackendHandler,
+    ) -> LdapHandler<MockTestBackendHandler> {
         let handler = setup_bound_admin_handler(mock).await;
         // In real impl this would have password-manager group; for test we reuse admin-like
         handler
     }
 
-    pub async fn setup_bound_readonly_handler(mock: MockTestBackendHandler) -> LdapHandler<MockTestBackendHandler> {
+    pub async fn setup_bound_readonly_handler(
+        mock: MockTestBackendHandler,
+    ) -> LdapHandler<MockTestBackendHandler> {
         let mut handler = LdapHandler::new_for_tests(mock, "dc=example,dc=com");
         handler.user_info = Some(ValidationResults {
             user: UserId::new("test"),
@@ -419,18 +431,21 @@ pub mod tests {
         handler
     }
 
-    pub async fn setup_bound_handler_with_group(mock: MockTestBackendHandler, group: &str) -> LdapHandler<MockTestBackendHandler> {
+    pub async fn setup_bound_handler_with_group(
+        mock: MockTestBackendHandler,
+        group: &str,
+    ) -> LdapHandler<MockTestBackendHandler> {
         let mut handler = LdapHandler::new_for_tests(mock, "dc=example,dc=com");
         let permission = if group.eq_ignore_ascii_case("regular") {
-            Permission::Readonly   // non-admin; self-changes still allowed by can_change_password policy
+            Permission::Readonly // non-admin; self-changes still allowed by can_change_password policy
         } else if group.eq_ignore_ascii_case("password_manager") {
-            Permission::Admin      // keep existing "admin-like" behaviour for current tests
+            Permission::Admin // keep existing "admin-like" behaviour for current tests
         } else {
             Permission::Admin
         };
         handler.user_info = Some(ValidationResults {
             user: UserId::new("test"),
-                                 permission,
+            permission,
         });
         handler
     }

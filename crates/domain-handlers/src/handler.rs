@@ -11,10 +11,10 @@ use lldap_domain::{
     },
 };
 use lldap_domain_model::{error::Result, model::UserColumn};
+use lldap_opaque_handler::OpaqueHandler;
 use lldap_schema::PublicSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
-use lldap_opaque_handler::OpaqueHandler;   // needed for PasswordHandler supertrait
+use std::collections::HashSet; // needed for PasswordHandler supertrait
 
 #[derive(PartialEq, Eq, Debug, Serialize, Deserialize, Clone)]
 pub struct BindRequest {
@@ -33,10 +33,10 @@ impl SubStringFilter {
     pub fn to_sql_filter(&self) -> String {
         let mut filter = String::with_capacity(
             self.initial.as_ref().map(String::len).unwrap_or_default()
-            + 1
-            + self.any.iter().map(String::len).sum::<usize>()
-            + self.any.len()
-            + self.final_.as_ref().map(String::len).unwrap_or_default(),
+                + 1
+                + self.any.iter().map(String::len).sum::<usize>()
+                + self.any.len()
+                + self.final_.as_ref().map(String::len).unwrap_or_default(),
         );
         if let Some(f) = &self.initial {
             filter.push_str(&f.to_ascii_lowercase());

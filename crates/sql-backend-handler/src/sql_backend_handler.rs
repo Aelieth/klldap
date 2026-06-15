@@ -1,8 +1,8 @@
 use crate::sql_tables::DbConnection;
 use lldap_auth::opaque::server::ServerSetup;
 use lldap_domain::types::AttributeName;
-use lldap_schema::PublicSchema;
 use lldap_domain_handlers::handler::ReadSchemaBackendHandler;
+use lldap_schema::PublicSchema;
 
 #[derive(Clone)]
 pub struct SqlBackendHandler {
@@ -156,11 +156,11 @@ pub mod tests {
                 display_name: Some("display ".to_string() + name),
                 attributes: vec![
                     DomainAttribute {
-                        name: "firstname".into(),  // canonical
+                        name: "firstname".into(), // canonical
                         value: ("first ".to_string() + name).into(),
                     },
                     DomainAttribute {
-                        name: "lastname".into(),   // canonical
+                        name: "lastname".into(), // canonical
                         value: ("last ".to_string() + name).into(),
                     },
                 ],

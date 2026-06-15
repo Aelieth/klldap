@@ -216,7 +216,9 @@ impl Configuration {
 
     pub fn get_private_key_info(&self) -> PrivateKeyInfo {
         PrivateKeyInfo {
-            private_key_hash: PrivateKeyHash(stable_hash(self.get_server_keys().private().serialize().as_ref())),
+            private_key_hash: PrivateKeyHash(stable_hash(
+                self.get_server_keys().private().serialize().as_ref(),
+            )),
             private_key_location: self
                 .server_setup
                 .as_ref()
@@ -454,34 +456,34 @@ impl ConfigOverrider for RunOpts {
         self.general_config.override_config(config);
 
         self.server_key_file
-        .as_ref()
-        .inspect(|path| config.key_file = path.to_string());
+            .as_ref()
+            .inspect(|path| config.key_file = path.to_string());
 
         self.server_key_seed
-        .as_ref()
-        .inspect(|seed| config.key_seed = Some(SecUtf8::from(seed.as_str())));
+            .as_ref()
+            .inspect(|seed| config.key_seed = Some(SecUtf8::from(seed.as_str())));
 
         self.ldap_port.inspect(|&port| config.ldap_port = port);
 
         self.http_port.inspect(|&port| config.http_port = port);
 
         self.http_url
-        .as_ref()
-        .inspect(|&url| config.http_url = HttpUrl(url.clone()));
+            .as_ref()
+            .inspect(|&url| config.http_url = HttpUrl(url.clone()));
 
         self.database_url
-        .as_ref()
-        .inspect(|&database_url| config.database_url = database_url.clone());
+            .as_ref()
+            .inspect(|&database_url| config.database_url = database_url.clone());
 
         self.force_ldap_user_pass_reset
-        .inspect(|&force_ldap_user_pass_reset| {
-            config.force_ldap_user_pass_reset = force_ldap_user_pass_reset;
-        });
+            .inspect(|&force_ldap_user_pass_reset| {
+                config.force_ldap_user_pass_reset = force_ldap_user_pass_reset;
+            });
 
         self.force_update_private_key
-        .inspect(|&force_update_private_key| {
-            config.force_update_private_key = force_update_private_key;
-        });
+            .inspect(|&force_update_private_key| {
+                config.force_update_private_key = force_update_private_key;
+            });
 
         self.smtp_opts.override_config(config);
         self.ldaps_opts.override_config(config);
@@ -719,20 +721,27 @@ mod tests {
     fn check_generated_server_key() {
         // Exercise the full key-seed code path
         let result = get_server_setup("/doesnt/exist", "key seed", PrivateKeyLocation::Tests);
-        assert!(result.is_ok(), "key_seed path should succeed without a key file");
+        assert!(
+            result.is_ok(),
+            "key_seed path should succeed without a key file"
+        );
 
         let config = result.unwrap();
         let serialized = bincode::serialize(&config.server_setup)
-        .expect("ServerSetup must be bincode-serializable");
+            .expect("ServerSetup must be bincode-serializable");
 
-        assert!(!serialized.is_empty(), "generated server key must not be empty");
+        assert!(
+            !serialized.is_empty(),
+            "generated server key must not be empty"
+        );
 
         // Prove round-tripping still works after any opaque-ke / bincode updates
-        let _deserialized: ServerSetup = bincode::deserialize(&serialized)
-        .expect("ServerSetup must round-trip through bincode");
+        let _deserialized: ServerSetup =
+            bincode::deserialize(&serialized).expect("ServerSetup must round-trip through bincode");
 
         // The real guarantee of key_seed: same seed → identical key (determinism)
-        let result2 = get_server_setup("/doesnt/exist", "key seed", PrivateKeyLocation::Tests).unwrap();
+        let result2 =
+            get_server_setup("/doesnt/exist", "key seed", PrivateKeyLocation::Tests).unwrap();
         let serialized2 = bincode::serialize(&result2.server_setup).unwrap();
         assert_eq!(
             serialized, serialized2,

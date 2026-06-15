@@ -215,8 +215,8 @@ impl GroupDetailsForm {
         let base_attributes = &self.group.attributes;
         all_values.retain(|a| {
             let base_val = base_attributes
-            .iter()
-            .find(|base_val| base_val.schema.name == a.name);
+                .iter()
+                .find(|base_val| base_val.schema.name == a.name);
             base_val
                 .map(|v| v.value != a.values)
                 .unwrap_or(!a.values.is_empty())

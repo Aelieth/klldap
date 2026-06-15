@@ -1,14 +1,14 @@
+use crate::api::Context;
 use chrono::TimeZone;
 use juniper::{FieldResult, graphql_object};
 use lldap_domain::types::{
-    Attribute as DomainAttribute, AttributeValue as DomainAttributeValue,
-    Cardinality, Group as DomainGroup, GroupDetails, User as DomainUser,
+    Attribute as DomainAttribute, AttributeValue as DomainAttributeValue, Cardinality,
+    Group as DomainGroup, GroupDetails, User as DomainUser,
 };
 use lldap_domain_handlers::handler::BackendHandler;
-use serde::{Deserialize, Serialize};
 use lldap_opaque_handler::OpaqueHandler;
-use crate::api::Context;
 use lldap_schema::{AttributeSchema as SchemaAttributeSchema, PublicSchema};
+use serde::{Deserialize, Serialize};
 
 #[derive(PartialEq, Eq, Debug, Serialize, Deserialize, Clone)]
 pub struct AttributeSchema<Handler: BackendHandler> {
@@ -93,8 +93,8 @@ impl<Handler: BackendHandler> AttributeValue<Handler> {
 
     fn from_schema(a: DomainAttribute, schema_list: &lldap_schema::AttributeList) -> Option<Self> {
         schema_list
-        .get_by_name_or_alias(a.name.as_str())
-        .map(|s| Self::from_value(a, s.clone()))
+            .get_by_name_or_alias(a.name.as_str())
+            .map(|s| Self::from_value(a, s.clone()))
     }
 }
 
@@ -117,7 +117,8 @@ pub fn serialize_attribute_to_graphql(attribute_value: &DomainAttributeValue) ->
             vec![b64]
         }
         DomainAttributeValue::Avatar(Cardinality::Unbounded(l)) => {
-            let result: Vec<String> = l.iter()
+            let result: Vec<String> = l
+                .iter()
                 .map(|p| lldap_domain::images::avatar_to_graphql_base64(p.as_bytes()))
                 .collect();
             result

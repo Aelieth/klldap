@@ -1,9 +1,9 @@
-use yew::prelude::*;
 use crate::components::{
+    change_ou::{ChangeOu, OuChangeKind},
     router::{AppRoute, Link},
     search::SearchControls,
-    change_ou::{ChangeOu, OuChangeKind},
 };
+use yew::prelude::*;
 
 #[derive(Properties, PartialEq)]
 pub struct TableActionBarProps {

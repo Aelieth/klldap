@@ -1,6 +1,6 @@
-use yew::prelude::*;
-use wasm_bindgen::JsCast;
 use std::collections::HashMap;
+use wasm_bindgen::JsCast;
+use yew::prelude::*;
 
 #[derive(Properties, PartialEq)]
 pub struct OuSelectorProps {
@@ -21,7 +21,9 @@ pub fn ou_selector(props: &OuSelectorProps) -> Html {
     let mut primaries: Vec<String> = vec![];
 
     for ou in &props.ous {
-        if ou.trim().is_empty() { continue; }
+        if ou.trim().is_empty() {
+            continue;
+        }
         let parts: Vec<&str> = ou.splitn(2, '\\').collect();
         if parts.len() == 2 {
             let primary = parts[0].to_string();
@@ -60,7 +62,11 @@ pub fn ou_selector(props: &OuSelectorProps) -> Html {
             let mut sorted_secondaries = secondaries.clone();
             sorted_secondaries.sort();
             for (i, secondary) in sorted_secondaries.iter().enumerate() {
-                let prefix = if i == sorted_secondaries.len() - 1 { "└── " } else { "├── " };
+                let prefix = if i == sorted_secondaries.len() - 1 {
+                    "└── "
+                } else {
+                    "├── "
+                };
                 let full = format!("{}\\{}", primary, secondary);
                 let display = format!("{}{}", prefix, secondary);
                 display_ous.push((display, full));

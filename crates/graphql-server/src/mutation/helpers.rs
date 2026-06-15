@@ -1,20 +1,20 @@
+use super::inputs::AttributeValue;
+use crate::api::{Context, field_error_callback};
 use anyhow::anyhow;
-use base64::{engine::general_purpose, Engine as _};
+use base64::{Engine as _, engine::general_purpose};
 use juniper::FieldResult;
 use lldap_access_control::{AdminBackendHandler, ReadonlyBackendHandler};
 use lldap_domain::{
+    images::process_avatar_input,
     requests::CreateGroupRequest,
     types::{Attribute as DomainAttribute, AttributeName, Email, Serialized},
-    images::process_avatar_input,
 };
 use lldap_domain_handlers::handler::{BackendHandler, ReadSchemaBackendHandler};
 use lldap_domain_model::model::deserialize::deserialize_attribute_value;
+use lldap_opaque_handler::OpaqueHandler;
+use lldap_schema::{PublicSchema, schema::AttributeList};
 use std::{collections::BTreeMap, sync::Arc};
 use tracing::{Instrument, Span};
-use lldap_opaque_handler::OpaqueHandler;
-use super::inputs::AttributeValue;
-use crate::api::{Context, field_error_callback};
-use lldap_schema::{PublicSchema, schema::AttributeList};
 
 pub struct UnpackedAttributes {
     pub email: Option<Email>,
@@ -30,7 +30,8 @@ fn validate_ssh_public_key(key: &str) -> Result<(), String> {
     if !(trimmed.starts_with("ssh-")
         || trimmed.starts_with("ecdsa-")
         || trimmed.starts_with("sk-")
-        || trimmed.starts_with("ssh-ed25519")) {
+        || trimmed.starts_with("ssh-ed25519"))
+    {
         return Err(format!(
             "Invalid SSH public key format. Expected to start with ssh-, ecdsa-, sk-, or ssh-ed25519. Got: '{}'",
             trimmed.split_whitespace().next().unwrap_or(trimmed)
@@ -208,21 +209,21 @@ pub fn deserialize_attribute(
         return Err(anyhow!(
             "Permission denied: Attribute {} is read-only",
             attribute.name
-        ).into());
+        )
+        .into());
     }
     if !is_admin && !attr_schema.is_editable {
         return Err(anyhow!(
             "Permission denied: Attribute {} is not editable by regular users",
             attribute.name
-        ).into());
+        )
+        .into());
     }
 
     if canonical_name.eq_ignore_ascii_case("sshpublickey") && attr_schema.is_list {
         for key in &attribute.value {
             if let Err(err_msg) = validate_ssh_public_key(key) {
-                return Err(anyhow!(
-                    "Invalid SSH public key: {}", err_msg
-                ).into());
+                return Err(anyhow!("Invalid SSH public key: {}", err_msg).into());
             }
         }
     }
@@ -231,18 +232,22 @@ pub fn deserialize_attribute(
     // jpegphoto (and variants) resolve to canonical "avatar" via resolve_canonical_name above
 
     let serialized = if is_avatar && !attr_schema.is_list {
-        let val = attribute.value.first().cloned().unwrap_or_default().trim().to_string();
+        let val = attribute
+            .value
+            .first()
+            .cloned()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
 
         if val.is_empty() {
             Serialized(vec![])
         } else {
             match general_purpose::STANDARD.decode(&val) {
-                Ok(raw_bytes) => {
-                    match process_avatar_input(&raw_bytes) {
-                        Ok(jpeg) => Serialized(jpeg),
-                        Err(e) => return Err(anyhow!("Invalid avatar upload: {}", e).into()),
-                    }
-                }
+                Ok(raw_bytes) => match process_avatar_input(&raw_bytes) {
+                    Ok(jpeg) => Serialized(jpeg),
+                    Err(e) => return Err(anyhow!("Invalid avatar upload: {}", e).into()),
+                },
                 Err(e) => {
                     tracing::error!(target: "avatar_debug", "Avatar base64 decode FAILED: {}", e);
                     return Err(anyhow!("Invalid base64 avatar data: {}", e).into());
@@ -256,11 +261,8 @@ pub fn deserialize_attribute(
         Serialized(val.into_bytes())
     };
 
-    let value = deserialize_attribute_value(
-        &serialized,
-        attr_schema.attribute_type,
-        attr_schema.is_list,
-    );
+    let value =
+        deserialize_attribute_value(&serialized, attr_schema.attribute_type, attr_schema.is_list);
 
     Ok(DomainAttribute {
         name: attribute_name,

@@ -16,16 +16,16 @@ use yew::prelude::*;
 
 #[derive(GraphQLQuery)]
 #[graphql(
-schema_path = "../schema.graphql",
-query_path = "queries/get_group_attributes_schema.graphql",
-response_derives = "Debug,Clone,PartialEq,Eq",
-custom_scalars_module = "crate::infra::graphql",
-extern_enums("AttributeType")
+    schema_path = "../schema.graphql",
+    query_path = "queries/get_group_attributes_schema.graphql",
+    response_derives = "Debug,Clone,PartialEq,Eq",
+    custom_scalars_module = "crate::infra::graphql",
+    extern_enums("AttributeType")
 )]
 pub struct GetGroupAttributesSchema;
 
 pub type Attribute =
-get_group_attributes_schema::GetGroupAttributesSchemaSchemaGroupSchemaAttributes;
+    get_group_attributes_schema::GetGroupAttributesSchemaSchemaGroupSchemaAttributes;
 
 #[derive(yew::Properties, Clone, PartialEq, Eq)]
 pub struct Props {
@@ -131,7 +131,10 @@ impl GroupSchemaTable {
     }
 
     fn view_attribute(&self, ctx: &Context<Self>, attribute: &Attribute) -> Html {
-        let desc = group::resolve_group_attribute_description_or_default(&attribute.name, &attribute.aliases);
+        let desc = group::resolve_group_attribute_description_or_default(
+            &attribute.name,
+            &attribute.aliases,
+        );
 
         let aliases: Vec<&str> = attribute.aliases.iter().map(|s| s.as_str()).collect();
 

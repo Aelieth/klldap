@@ -5,7 +5,7 @@ use sea_orm::entity::prelude::*;
 pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub key: String,
-    pub value: String,          // JSON stored as TEXT string (simple & SQLite-safe)
+    pub value: String, // JSON stored as TEXT string (simple & SQLite-safe)
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

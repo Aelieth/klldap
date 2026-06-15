@@ -53,7 +53,9 @@ impl CommonComponent<DeleteUser> for DeleteUser {
                 for user_id in ctx.props().selected_users.clone() {
                     self.common.call_graphql::<DeleteUserQuery, _>(
                         ctx,
-                        delete_user_query::Variables { user: user_id.clone() },
+                        delete_user_query::Variables {
+                            user: user_id.clone(),
+                        },
                         move |response| Msg::DeleteUserResponse(response, user_id.clone()),
                         "Error trying to delete user",
                     );

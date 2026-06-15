@@ -4,14 +4,12 @@ use lldap_domain::types::AttributeName;
 
 // Re-export the constants and DN helpers that are still widely used
 pub use crate::dn::{
-    DEFAULT_PRIMARY_GROUP_OU,
-    DEFAULT_PRIMARY_USER_OU,
+    DEFAULT_PRIMARY_GROUP_OU, DEFAULT_PRIMARY_USER_OU, get_user_id_from_distinguished_name,
     internal_ou_to_ldap_rdn_chain,
-    get_user_id_from_distinguished_name,
 };
 
 // Re-export FieldType enums from schema (single source of truth)
-pub use crate::schema::definitions::{UserFieldType, GroupFieldType, ExpandedAttributes};
+pub use crate::schema::definitions::{ExpandedAttributes, GroupFieldType, UserFieldType};
 
 /// LdapInfo — shared configuration for the LDAP layer (base DN + ignored attributes).
 pub struct LdapInfo {
@@ -48,11 +46,17 @@ mod utils_tests {
         let info = LdapInfo::new(
             "dc=example,dc=com",
             vec![AttributeName::from("mail")],
-                                 vec![],
+            vec![],
         )
         .expect("valid DN should parse");
 
-        assert_eq!(info.base_dn, vec![("dc".to_string(), "example".to_string()), ("dc".to_string(), "com".to_string())]);
+        assert_eq!(
+            info.base_dn,
+            vec![
+                ("dc".to_string(), "example".to_string()),
+                ("dc".to_string(), "com".to_string())
+            ]
+        );
         assert_eq!(info.base_dn_str, "dc=example,dc=com");
         assert_eq!(info.ignored_user_attributes.len(), 1);
         assert!(info.ignored_group_attributes.is_empty());

@@ -143,7 +143,7 @@ async fn graphql_route<Handler: BackendHandler + lldap_opaque_handler::OpaqueHan
 
 pub fn configure_endpoint<Backend>(cfg: &mut web::ServiceConfig)
 where
-Backend: BackendHandler + lldap_opaque_handler::OpaqueHandler + Clone + 'static,
+    Backend: BackendHandler + lldap_opaque_handler::OpaqueHandler + Clone + 'static,
 {
     let json_config = web::JsonConfig::default()
         .limit(4096)

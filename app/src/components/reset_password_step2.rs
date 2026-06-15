@@ -1,7 +1,7 @@
 use crate::{
     components::{
         form::{field::Field, submit::Submit},
-            router::{AppRoute, Link},
+        router::{AppRoute, Link},
     },
     infra::{
         api::HostService,
@@ -11,29 +11,29 @@ use crate::{
 };
 use anyhow::{Result, bail};
 use graphql_client::GraphQLQuery;
+use lldap_auth::password_reset::ServerPasswordResetResponse;
 use lldap_auth::{opaque, registration};
 use validator_derive::Validate;
 use yew::prelude::*;
 use yew_form::Form;
 use yew_form_derive::Model;
 use yew_router::{prelude::History, scope_ext::RouterScopeExt};
-use lldap_auth::password_reset::ServerPasswordResetResponse;
 
 #[derive(GraphQLQuery)]
 #[graphql(
-schema_path = "../schema.graphql",
-query_path = "queries/get_kerberos_info.graphql",
-response_derives = "Debug,Clone,PartialEq,Eq",
-custom_scalars_module = "crate::infra::graphql"
+    schema_path = "../schema.graphql",
+    query_path = "queries/get_kerberos_info.graphql",
+    response_derives = "Debug,Clone,PartialEq,Eq",
+    custom_scalars_module = "crate::infra::graphql"
 )]
 pub struct GetKerberosInfo;
 
 #[derive(GraphQLQuery)]
 #[graphql(
-schema_path = "../schema.graphql",
-query_path = "queries/sync_kerberos.graphql",
-response_derives = "Debug,Clone",
-custom_scalars_module = "crate::infra::graphql"
+    schema_path = "../schema.graphql",
+    query_path = "queries/sync_kerberos.graphql",
+    response_derives = "Debug,Clone",
+    custom_scalars_module = "crate::infra::graphql"
 )]
 pub struct SyncKerberosPassword;
 
@@ -48,11 +48,11 @@ pub struct FormModel {
 pub struct ResetPasswordStep2Form {
     common: CommonComponentParts<Self>,
     form: Form<FormModel>,
-        username: Option<String>,
-        opaque_data: Option<opaque::client::registration::ClientRegistration>,
-        kerberos_info: Option<get_kerberos_info::GetKerberosInfoKerberosInfo>,
-        fetched_kerberos: bool,
-        encrypted_password: Option<String>,
+    username: Option<String>,
+    opaque_data: Option<opaque::client::registration::ClientRegistration>,
+    kerberos_info: Option<get_kerberos_info::GetKerberosInfoKerberosInfo>,
+    fetched_kerberos: bool,
+    encrypted_password: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq, Properties)]
@@ -106,7 +106,9 @@ impl CommonComponent<ResetPasswordStep2Form> for ResetPasswordStep2Form {
                             Err(e) => bail!("Failed to encrypt password for Kerberos sync: {}", e),
                         }
                     } else {
-                        bail!("Kerberos enabled but no public key available—check backend startup/logs");
+                        bail!(
+                            "Kerberos enabled but no public key available—check backend startup/logs"
+                        );
                     }
                 }
 
@@ -118,7 +120,7 @@ impl CommonComponent<ResetPasswordStep2Form> for ResetPasswordStep2Form {
                 let mut rng = rand::rngs::OsRng;
                 let registration_start_request = opaque::client::registration::start_registration(
                     new_password.as_bytes(),
-                                                                                                  &mut rng,
+                    &mut rng,
                 )?;
                 let req = registration::ClientRegistrationStartRequest {
                     username: self.username.as_ref().unwrap().clone().into(),
@@ -128,7 +130,7 @@ impl CommonComponent<ResetPasswordStep2Form> for ResetPasswordStep2Form {
                 self.common.call_backend(
                     ctx,
                     HostService::register_start(req),
-                                         Msg::RegistrationStartResponse,
+                    Msg::RegistrationStartResponse,
                 );
                 Ok(false)
             }
@@ -151,7 +153,7 @@ impl CommonComponent<ResetPasswordStep2Form> for ResetPasswordStep2Form {
                 self.common.call_backend(
                     ctx,
                     HostService::register_finish(req),
-                                         Msg::RegistrationFinishResponse,
+                    Msg::RegistrationFinishResponse,
                 );
                 Ok(false)
             }
@@ -195,17 +197,17 @@ impl Component for ResetPasswordStep2Form {
         let mut form = ResetPasswordStep2Form {
             common: CommonComponentParts::<Self>::create(),
             form: yew_form::Form::<FormModel>::new(FormModel::default()),
-                username: None,
-                opaque_data: None,
-                kerberos_info: None,
-                fetched_kerberos: false,
-                encrypted_password: None,
+            username: None,
+            opaque_data: None,
+            kerberos_info: None,
+            fetched_kerberos: false,
+            encrypted_password: None,
         };
         let token = ctx.props().token.clone();
         form.common.call_backend(
             ctx,
             HostService::reset_password_step2(token),
-                                 Msg::ValidateTokenResponse,
+            Msg::ValidateTokenResponse,
         );
         form
     }

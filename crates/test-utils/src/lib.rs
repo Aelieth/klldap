@@ -4,13 +4,15 @@ use lldap_domain::{
         CreateAttributeRequest, CreateGroupRequest, CreateUserRequest, UpdateGroupRequest,
         UpdateUserRequest,
     },
-    types::{AttributeName, Group, GroupDetails, GroupId, LdapObjectClass, User, UserAndGroups, UserId},
+    types::{
+        AttributeName, Group, GroupDetails, GroupId, LdapObjectClass, User, UserAndGroups, UserId,
+    },
 };
 use lldap_domain_handlers::handler::{
     BackendHandler, BindRequest, GroupBackendHandler, GroupListerBackendHandler,
     GroupRequestFilter, LoginHandler, PosixBackendHandler, PosixSettings, ReadSchemaBackendHandler,
-    SchemaBackendHandler, SystemConfigBackendHandler, UserBackendHandler,
-    UserListerBackendHandler, UserRequestFilter,
+    SchemaBackendHandler, SystemConfigBackendHandler, UserBackendHandler, UserListerBackendHandler,
+    UserRequestFilter,
 };
 use lldap_domain_model::error::Result;
 use lldap_opaque_handler::{OpaqueHandler, login, registration};
@@ -18,7 +20,7 @@ use lldap_schema::PublicSchema;
 use std::collections::HashSet;
 
 // Re-export the avatar test helpers so other crates can use them easily
-pub use lldap_domain::images::{make_test_jpeg_bytes, make_test_avatar_value};
+pub use lldap_domain::images::{make_test_avatar_value, make_test_jpeg_bytes};
 
 mockall::mock! {
     pub TestBackendHandler{}
@@ -106,9 +108,8 @@ mockall::mock! {
 }
 
 pub fn setup_default_schema(mock: &mut MockTestBackendHandler) {
-    mock.expect_get_schema().returning(|| {
-        Ok(PublicSchema::get())
-    });
+    mock.expect_get_schema()
+        .returning(|| Ok(PublicSchema::get()));
 }
 
 /// Robust default mock for all LDAP tests.
@@ -121,23 +122,22 @@ pub fn setup_default_ldap_mock(mock: &mut MockTestBackendHandler) {
         .returning(|| Ok(vec!["people".to_string(), "groups".to_string()]));
 
     // Default user details
-    mock.expect_get_user_details()
-        .returning(|uid| {
-            Ok(User {
-                user_id: uid.clone(),
-                email: format!("{}@example.com", uid.as_str()).into(),
-                display_name: None,
-                creation_date: chrono::Utc::now().naive_utc(),
-                modified_date: chrono::Utc::now().naive_utc(),
-                password_modified_date: chrono::Utc::now().naive_utc(),
-                uuid: lldap_domain::types::Uuid::from_name_and_date(
-                    uid.as_str(),
-                    &chrono::Utc::now().naive_utc(),
-                ),
-                attributes: vec![],
-                krb_principal_name: None,
-            })
-        });
+    mock.expect_get_user_details().returning(|uid| {
+        Ok(User {
+            user_id: uid.clone(),
+            email: format!("{}@example.com", uid.as_str()).into(),
+            display_name: None,
+            creation_date: chrono::Utc::now().naive_utc(),
+            modified_date: chrono::Utc::now().naive_utc(),
+            password_modified_date: chrono::Utc::now().naive_utc(),
+            uuid: lldap_domain::types::Uuid::from_name_and_date(
+                uid.as_str(),
+                &chrono::Utc::now().naive_utc(),
+            ),
+            attributes: vec![],
+            krb_principal_name: None,
+        })
+    });
 
     // Default empty groups (most tests expect this)
     mock.expect_get_user_groups()

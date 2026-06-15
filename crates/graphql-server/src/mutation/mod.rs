@@ -6,29 +6,28 @@ pub use inputs::{
     AttributeValue, CreateGroupInput, CreateUserInput, Success, UpdateGroupInput, UpdateUserInput,
 };
 
-use tracing::{Instrument, info, debug, debug_span, warn};
-use crate::api::{Context, field_error_callback, FullHandler};
+use crate::api::{Context, FullHandler, field_error_callback};
 use anyhow::anyhow;
+use helpers::{
+    UnpackedAttributes, consolidate_attributes, create_group_with_details, deserialize_attribute,
+    unpack_attributes,
+};
 use juniper::{FieldError, FieldResult, graphql_object, graphql_value};
 use lldap_access_control::{
     AdminBackendHandler, UserReadableBackendHandler, UserWriteableBackendHandler,
 };
 use lldap_domain::{
     requests::{CreateAttributeRequest, CreateUserRequest, UpdateGroupRequest, UpdateUserRequest},
-    types::{AttributeName, Email, GroupId, LdapObjectClass, UserId},
     schema::AttributeType,
+    types::{AttributeName, Email, GroupId, LdapObjectClass, UserId},
 };
 use lldap_domain_handlers::handler::{BackendHandler, ReadSchemaBackendHandler};
+use lldap_kerberos::{decrypt_password, sync_kerberos_principal};
+use lldap_opaque_handler::OpaqueHandler;
+use lldap_schema::PublicSchema;
 use lldap_validation::attributes::{ALLOWED_CHARACTERS_DESCRIPTION, validate_attribute_name};
 use std::sync::Arc;
-use lldap_opaque_handler::OpaqueHandler;
-use lldap_kerberos::{decrypt_password, sync_kerberos_principal,
-};
-use helpers::{
-    UnpackedAttributes, consolidate_attributes, create_group_with_details, deserialize_attribute,
-    unpack_attributes,
-};
-use lldap_schema::PublicSchema;
+use tracing::{Instrument, debug, debug_span, info, warn};
 
 #[derive(juniper::GraphQLObject)]
 struct ExportKeytabForKeycloakResponse {
@@ -127,23 +126,24 @@ impl<Handler: BackendHandler + OpaqueHandler> Default for Mutation<Handler> {
 
 fn extract_kerberos_sync(schema: &PublicSchema, attrs: &[lldap_domain::types::Attribute]) -> bool {
     let kerb_name = schema
-    .user_attributes()
-    .get_by_name_or_alias("kerberossync")
-    .map(|a| a.name.as_str())
-    .unwrap_or("kerberossync");
+        .user_attributes()
+        .get_by_name_or_alias("kerberossync")
+        .map(|a| a.name.as_str())
+        .unwrap_or("kerberossync");
 
-    attrs.iter()
-    .find(|a| a.name.as_str() == kerb_name)
-    .and_then(|a| match &a.value {
-        lldap_domain::types::AttributeValue::Integer(
-            lldap_domain::types::Cardinality::Singleton(i),
-        ) if *i == 1 => Some(true),
-              lldap_domain::types::AttributeValue::String(
-                  lldap_domain::types::Cardinality::Singleton(s),
-              ) if s == "1" || s.to_lowercase() == "true" => Some(true),
-              _ => None,
-    })
-    .unwrap_or(false)
+    attrs
+        .iter()
+        .find(|a| a.name.as_str() == kerb_name)
+        .and_then(|a| match &a.value {
+            lldap_domain::types::AttributeValue::Integer(
+                lldap_domain::types::Cardinality::Singleton(i),
+            ) if *i == 1 => Some(true),
+            lldap_domain::types::AttributeValue::String(
+                lldap_domain::types::Cardinality::Singleton(s),
+            ) if s == "1" || s.to_lowercase() == "true" => Some(true),
+            _ => None,
+        })
+        .unwrap_or(false)
 }
 
 #[graphql_object(context = Context<Handler>)]
@@ -157,8 +157,8 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
 
         let user_id = UserId::new(&user.id);
         let handler = context
-        .get_admin_handler()
-        .ok_or_else(field_error_callback(&span, "Unauthorized user creation"))?;
+            .get_admin_handler()
+            .ok_or_else(field_error_callback(&span, "Unauthorized user creation"))?;
 
         let schema = handler.get_schema().await?;
 
@@ -191,20 +191,24 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         let mut attributes = unpacked_attributes;
         attributes.push(lldap_domain::types::Attribute {
             name: lldap_domain::types::AttributeName::from("ou"),
-                        value: lldap_domain::types::AttributeValue::String(
-                            lldap_domain::types::Cardinality::Singleton(ou_value),
-                        ),
+            value: lldap_domain::types::AttributeValue::String(
+                lldap_domain::types::Cardinality::Singleton(ou_value),
+            ),
         });
 
         handler
-        .create_user(CreateUserRequest {
-            user_id: user_id.clone(),
-                     email: user.email.map(Email::from).or(email).ok_or_else(|| anyhow!("Email is required when creating a new user"))?,
-                     display_name: user.display_name.or(display_name),
-                     attributes,
-        })
-        .instrument(span.clone())
-        .await?;
+            .create_user(CreateUserRequest {
+                user_id: user_id.clone(),
+                email: user
+                    .email
+                    .map(Email::from)
+                    .or(email)
+                    .ok_or_else(|| anyhow!("Email is required when creating a new user"))?,
+                display_name: user.display_name.or(display_name),
+                attributes,
+            })
+            .instrument(span.clone())
+            .await?;
 
         let user_details = handler.get_user_details(&user_id).instrument(span).await?;
         super::query::User::<Handler>::from_user(user_details, Arc::new(schema))
@@ -220,22 +224,26 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
 
         let target_user_id = UserId::new(&user_id);
 
-        let handler = context.get_writeable_handler(target_user_id.clone())
-        .ok_or_else(field_error_callback(&span, "Unauthorized password set"))?;
+        let handler = context
+            .get_writeable_handler(target_user_id.clone())
+            .ok_or_else(field_error_callback(&span, "Unauthorized password set"))?;
 
         // OPAQUE registration
-        use lldap_auth::{opaque, registration};
         use anyhow::Context as AnyhowContext;
+        use lldap_auth::{opaque, registration};
         use rand::rngs::OsRng;
         let mut rng = OsRng;
-        let registration_start_request = opaque::client::registration::start_registration(password.as_bytes(), &mut rng)
-        .context("Could not initiate password registration")?;
+        let registration_start_request =
+            opaque::client::registration::start_registration(password.as_bytes(), &mut rng)
+                .context("Could not initiate password registration")?;
         let req = registration::ClientRegistrationStartRequest {
             username: target_user_id.clone(),
             registration_start_request: registration_start_request.message,
         };
-        let start_response = handler.registration_start(req).await
-        .context("Registration start failed")?;
+        let start_response = handler
+            .registration_start(req)
+            .await
+            .context("Registration start failed")?;
         let registration_finish = opaque::client::registration::finish_registration(
             registration_start_request.state,
             password.as_bytes(),
@@ -247,24 +255,34 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             server_data: start_response.server_data,
             registration_upload: registration_finish.message,
         };
-        handler.registration_finish(req).await
-        .context("Registration finish failed")?;
+        handler
+            .registration_finish(req)
+            .await
+            .context("Registration finish failed")?;
 
         // Fetch for sync check
-        let user = handler.get_user_details(&target_user_id).await
-        .context("Failed to fetch user for Kerberos sync check")?;
+        let user = handler
+            .get_user_details(&target_user_id)
+            .await
+            .context("Failed to fetch user for Kerberos sync check")?;
         let schema = handler.get_schema().await?;
         let sync_enabled = extract_kerberos_sync(&schema, &user.attributes);
 
         // Real Kerberos sync
-        if let Err(e) = lldap_kerberos::sync_kerberos_if_enabled(sync_enabled, &user_id, &password) {
+        if let Err(e) = lldap_kerberos::sync_kerberos_if_enabled(sync_enabled, &user_id, &password)
+        {
             warn!("Kerberos sync failed after password set: {}", e);
         } else if sync_enabled {
-            info!("Kerberos principal synced for user {} (password change)", user_id);
+            info!(
+                "Kerberos principal synced for user {} (password change)",
+                user_id
+            );
         }
 
         let inner = UserWriteableBackendHandler::unsafe_get_handler(handler);
-        let _ = inner.ensure_kerberos_principal_consistency(&target_user_id, sync_enabled).await;
+        let _ = inner
+            .ensure_kerberos_principal_consistency(&target_user_id, sync_enabled)
+            .await;
 
         Ok(Success::new())
     }
@@ -360,13 +378,13 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             debug!(?group.id);
         });
         let handler = context
-        .get_admin_handler()
-        .ok_or_else(field_error_callback(&span, "Unauthorized group update"))?;
+            .get_admin_handler()
+            .ok_or_else(field_error_callback(&span, "Unauthorized group update"))?;
         let new_display_name = group.display_name.clone().or_else(|| {
             group.insert_attributes.as_ref().and_then(|a| {
                 a.iter()
-                .find(|attr| attr.name == "displayname")
-                .map(|attr| attr.value[0].clone())
+                    .find(|attr| attr.name == "displayname")
+                    .map(|attr| attr.value[0].clone())
             })
         });
         if group.id == 1 && new_display_name.is_some() {
@@ -376,28 +394,28 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
 
         let schema = handler.get_schema().await?;
         let insert_attributes = group
-        .insert_attributes
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|attr| attr.name != "displayname")
-        .map(|attr| deserialize_attribute(schema.group_attributes(), attr, true))
-        .collect::<Result<Vec<_>, _>>()?;
+            .insert_attributes
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|attr| attr.name != "displayname")
+            .map(|attr| deserialize_attribute(schema.group_attributes(), attr, true))
+            .collect::<Result<Vec<_>, _>>()?;
 
         handler
-        .update_group(UpdateGroupRequest {
-            group_id: GroupId(group.id),
-                      display_name: new_display_name.map(|s| s.as_str().into()),
-                      delete_attributes: group
-                      .remove_attributes
-                      .unwrap_or_default()
-                      .into_iter()
-                      .filter(|attr| attr != "displayname")
-                      .map(AttributeName::from)
-                      .collect(),
-                      insert_attributes,
-        })
-        .instrument(span)
-        .await?;
+            .update_group(UpdateGroupRequest {
+                group_id: GroupId(group.id),
+                display_name: new_display_name.map(|s| s.as_str().into()),
+                delete_attributes: group
+                    .remove_attributes
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|attr| attr != "displayname")
+                    .map(AttributeName::from)
+                    .collect(),
+                insert_attributes,
+            })
+            .instrument(span)
+            .await?;
         Ok(Success::new())
     }
 
@@ -411,15 +429,15 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             debug!(?user_id, ?group_id);
         });
         let handler = context
-        .get_admin_handler()
-        .ok_or_else(field_error_callback(
-            &span,
-            "Unauthorized group membership modification",
-        ))?;
+            .get_admin_handler()
+            .ok_or_else(field_error_callback(
+                &span,
+                "Unauthorized group membership modification",
+            ))?;
         handler
-        .add_user_to_group(&UserId::new(&user_id), GroupId(group_id))
-        .instrument(span)
-        .await?;
+            .add_user_to_group(&UserId::new(&user_id), GroupId(group_id))
+            .instrument(span)
+            .await?;
         Ok(Success::new())
     }
 
@@ -433,35 +451,32 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             debug!(?user_id, ?group_id);
         });
         let handler = context
-        .get_admin_handler()
-        .ok_or_else(field_error_callback(
-            &span,
-            "Unauthorized group membership modification",
-        ))?;
+            .get_admin_handler()
+            .ok_or_else(field_error_callback(
+                &span,
+                "Unauthorized group membership modification",
+            ))?;
         let user_id = UserId::new(&user_id);
         if context.validation_result.user == user_id && group_id == 1 {
             span.in_scope(|| debug!("Cannot remove admin rights for current user"));
             return Err("Cannot remove admin rights for current user".into());
         }
         handler
-        .remove_user_from_group(&user_id, GroupId(group_id))
-        .instrument(span)
-        .await?;
+            .remove_user_from_group(&user_id, GroupId(group_id))
+            .instrument(span)
+            .await?;
         Ok(Success::new())
     }
 
-    async fn delete_user(
-        context: &Context<Handler>,
-        user_id: String,
-    ) -> FieldResult<Success> {
+    async fn delete_user(context: &Context<Handler>, user_id: String) -> FieldResult<Success> {
         let span = debug_span!("[GraphQL mutation] delete_user");
         span.in_scope(|| {
             debug!(?user_id);
         });
         let user_id_typed = UserId::new(&user_id);
         let handler = context
-        .get_admin_handler()
-        .ok_or_else(field_error_callback(&span, "Unauthorized user deletion"))?;
+            .get_admin_handler()
+            .ok_or_else(field_error_callback(&span, "Unauthorized user deletion"))?;
 
         if context.validation_result.user == user_id_typed {
             span.in_scope(|| debug!("Cannot delete current user"));
@@ -470,13 +485,15 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
 
         // The SQL backend now owns Kerberos principal cleanup (delete_user guard).
         handler
-        .delete_user(&user_id_typed)
-        .instrument(span.clone())
-        .await
-        .map_err(|e| FieldError::new(
-            "User deletion failed",
-            graphql_value!({ "details": (e.to_string()) })
-        ))?;
+            .delete_user(&user_id_typed)
+            .instrument(span.clone())
+            .await
+            .map_err(|e| {
+                FieldError::new(
+                    "User deletion failed",
+                    graphql_value!({ "details": (e.to_string()) }),
+                )
+            })?;
 
         info!("Deleted user {}", user_id);
         Ok(Success::new())
@@ -488,23 +505,20 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             debug!(?group_id);
         });
         let handler = context
-        .get_admin_handler()
-        .ok_or_else(field_error_callback(&span, "Unauthorized group deletion"))?;
+            .get_admin_handler()
+            .ok_or_else(field_error_callback(&span, "Unauthorized group deletion"))?;
         if group_id == 1 {
             span.in_scope(|| debug!("Cannot delete admin group"));
             return Err("Cannot delete admin group".into());
         }
         handler
-        .delete_group(GroupId(group_id))
-        .instrument(span)
-        .await?;
+            .delete_group(GroupId(group_id))
+            .instrument(span)
+            .await?;
         Ok(Success::new())
     }
 
-    async fn create_ou(
-        context: &Context<Handler>,
-        name: String,
-    ) -> FieldResult<Success> {
+    async fn create_ou(context: &Context<Handler>, name: String) -> FieldResult<Success> {
         let span = debug_span!("[GraphQL mutation] create_ou");
         span.in_scope(|| debug!(?name));
 
@@ -513,7 +527,11 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             .ok_or_else(field_error_callback(&span, "Unauthorized OU creation"))?;
 
         let name_lower = name.trim().to_lowercase();
-        if name_lower.is_empty() || name_lower == "all" || name_lower == "people" || name_lower == "groups" {
+        if name_lower.is_empty()
+            || name_lower == "all"
+            || name_lower == "people"
+            || name_lower == "groups"
+        {
             return Err("Invalid OU name (cannot be empty or built-in)".into());
         }
 
@@ -521,48 +539,74 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         let (primary, secondary) = match parts.len() {
             1 => (name.as_str(), None),
             2 => (parts[0], Some(parts[1])),
-            _ => return Err(FieldError::new(
-                "Invalid OU format: only one level of secondary OU allowed (primary\\secondary)",
-                juniper::Value::null(),
-            )),
+            _ => {
+                return Err(FieldError::new(
+                    "Invalid OU format: only one level of secondary OU allowed (primary\\secondary)",
+                    juniper::Value::null(),
+                ));
+            }
         };
 
-        if primary.len() < 2 || primary.len() > 64 ||
-           !primary.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') ||
-           primary.starts_with('-') || primary.starts_with('_') ||
-           primary.ends_with('-') || primary.ends_with('_') {
+        if primary.len() < 2
+            || primary.len() > 64
+            || !primary
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            || primary.starts_with('-')
+            || primary.starts_with('_')
+            || primary.ends_with('-')
+            || primary.ends_with('_')
+        {
             return Err(FieldError::new(
                 "Invalid primary OU name: 2-64 characters, only a-z A-Z 0-9 - _ allowed. No spaces or special characters.",
                 juniper::Value::null(),
             ));
         }
         if let Some(sec) = secondary
-            && (sec.trim().is_empty() ||
-            sec.len() < 2 || sec.len() > 64 ||
-            !sec.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') ||
-            sec.starts_with('-') || sec.starts_with('_') ||
-            sec.ends_with('-') || sec.ends_with('_')) {
-                return Err(FieldError::new(
-                    "Invalid secondary OU name: 2-64 characters, only a-z A-Z 0-9 - _ allowed. No spaces or special characters.",
-                    juniper::Value::null(),
-                ));
+            && (sec.trim().is_empty()
+                || sec.len() < 2
+                || sec.len() > 64
+                || !sec
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                || sec.starts_with('-')
+                || sec.starts_with('_')
+                || sec.ends_with('-')
+                || sec.ends_with('_'))
+        {
+            return Err(FieldError::new(
+                "Invalid secondary OU name: 2-64 characters, only a-z A-Z 0-9 - _ allowed. No spaces or special characters.",
+                juniper::Value::null(),
+            ));
         }
 
         let inner = AdminBackendHandler::unsafe_get_handler(handler);
-        let mut current_ous = inner.get_allowed_ous().await
+        let mut current_ous = inner
+            .get_allowed_ous()
+            .await
             .map_err(|_e| FieldError::new("Failed to load allowedous", juniper::Value::null()))?;
 
         let name_lower = name.to_lowercase();
-        if current_ous.iter().any(|existing| existing.to_lowercase() == name_lower) {
+        if current_ous
+            .iter()
+            .any(|existing| existing.to_lowercase() == name_lower)
+        {
             return Err(FieldError::new(
                 format!("Organizational Unit '{}' already exists", name),
                 juniper::Value::null(),
             ));
         }
 
-        if secondary.is_some() && !current_ous.iter().any(|p| p.to_lowercase() == primary.to_lowercase()) {
+        if secondary.is_some()
+            && !current_ous
+                .iter()
+                .any(|p| p.to_lowercase() == primary.to_lowercase())
+        {
             return Err(FieldError::new(
-                format!("Primary OU '{}' does not exist. Create it first before adding a secondary.", primary),
+                format!(
+                    "Primary OU '{}' does not exist. Create it first before adding a secondary.",
+                    primary
+                ),
                 juniper::Value::null(),
             ));
         }
@@ -570,23 +614,23 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         current_ous.push(name.clone());
         current_ous.sort();
 
-        inner.set_system_config("allowedous", serde_json::to_string(&current_ous).unwrap())
+        inner
+            .set_system_config("allowedous", serde_json::to_string(&current_ous).unwrap())
             .await
-            .map_err(|_e| FieldError::new("Failed to save updated OU list", juniper::Value::null()))?;
+            .map_err(|_e| {
+                FieldError::new("Failed to save updated OU list", juniper::Value::null())
+            })?;
 
         Ok(Success::new())
     }
 
-    async fn delete_ou(
-        context: &Context<Handler>,
-        name: String,
-    ) -> FieldResult<Success> {
+    async fn delete_ou(context: &Context<Handler>, name: String) -> FieldResult<Success> {
         let span = debug_span!("[GraphQL mutation] delete_ou");
         span.in_scope(|| debug!(?name));
 
         let handler = context
-        .get_admin_handler()
-        .ok_or_else(field_error_callback(&span, "Unauthorized OU deletion"))?;
+            .get_admin_handler()
+            .ok_or_else(field_error_callback(&span, "Unauthorized OU deletion"))?;
 
         let name_lower = name.trim().to_lowercase();
         if name_lower == "people" || name_lower == "groups" || name_lower == "all" {
@@ -594,8 +638,10 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         }
 
         let inner = AdminBackendHandler::unsafe_get_handler(handler);
-        let mut current_ous = inner.get_allowed_ous().await
-        .map_err(|_e| FieldError::new("Failed to load allowedous", juniper::Value::null()))?;
+        let mut current_ous = inner
+            .get_allowed_ous()
+            .await
+            .map_err(|_e| FieldError::new("Failed to load allowedous", juniper::Value::null()))?;
 
         let has_children = current_ous.iter().any(|ou| {
             let parts: Vec<&str> = ou.splitn(2, '\\').collect();
@@ -604,8 +650,11 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
 
         if has_children {
             return Err(FieldError::new(
-                format!("Cannot delete primary OU '{}' because it still contains secondary OUs. Delete the secondary OUs first.", name),
-                    juniper::Value::null(),
+                format!(
+                    "Cannot delete primary OU '{}' because it still contains secondary OUs. Delete the secondary OUs first.",
+                    name
+                ),
+                juniper::Value::null(),
             ));
         }
 
@@ -617,17 +666,17 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         if let Ok(users) = inner.list_users(None, false).await {
             for user_and_groups in users {
                 let current_ou = user_and_groups
-                .user
-                .attributes
-                .iter()
-                .find(|attr| attr.name.as_str() == "ou")
-                .and_then(|attr| match &attr.value {
-                    lldap_domain::types::AttributeValue::String(
-                        lldap_domain::types::Cardinality::Singleton(s),
-                    ) => Some(s.clone()),
-                          _ => None,
-                })
-                .unwrap_or_default();
+                    .user
+                    .attributes
+                    .iter()
+                    .find(|attr| attr.name.as_str() == "ou")
+                    .and_then(|attr| match &attr.value {
+                        lldap_domain::types::AttributeValue::String(
+                            lldap_domain::types::Cardinality::Singleton(s),
+                        ) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
 
                 if current_ou.to_lowercase() == name_lower {
                     let insert_attributes = vec![lldap_domain::types::Attribute {
@@ -664,16 +713,16 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         if let Ok(groups) = inner.list_groups(None).await {
             for group in groups {
                 let current_ou = group
-                .attributes
-                .iter()
-                .find(|attr| attr.name.as_str() == "ou")
-                .and_then(|attr| match &attr.value {
-                    lldap_domain::types::AttributeValue::String(
-                        lldap_domain::types::Cardinality::Singleton(s),
-                    ) => Some(s.clone()),
-                          _ => None,
-                })
-                .unwrap_or_default();
+                    .attributes
+                    .iter()
+                    .find(|attr| attr.name.as_str() == "ou")
+                    .and_then(|attr| match &attr.value {
+                        lldap_domain::types::AttributeValue::String(
+                            lldap_domain::types::Cardinality::Singleton(s),
+                        ) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
 
                 if current_ou.to_lowercase() == name_lower {
                     let insert_attributes = vec![lldap_domain::types::Attribute {
@@ -708,9 +757,12 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         // Now safe to remove the OU from the allowed list
         current_ous.retain(|o| o.to_lowercase() != name_lower);
 
-        inner.set_system_config("allowedous", serde_json::to_string(&current_ous).unwrap())
-        .await
-        .map_err(|_e| FieldError::new("Failed to save updated OU list", juniper::Value::null()))?;
+        inner
+            .set_system_config("allowedous", serde_json::to_string(&current_ous).unwrap())
+            .await
+            .map_err(|_e| {
+                FieldError::new("Failed to save updated OU list", juniper::Value::null())
+            })?;
 
         info!("Organizational Unit '{}' deleted.", name);
         Ok(Success::new())
@@ -725,8 +777,8 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         span.in_scope(|| debug!(?user_ids, ?new_ou));
 
         let handler = context
-        .get_admin_handler()
-        .ok_or_else(field_error_callback(&span, "Unauthorized OU change"))?;
+            .get_admin_handler()
+            .ok_or_else(field_error_callback(&span, "Unauthorized OU change"))?;
 
         let name_lower = new_ou.trim().to_lowercase();
         if name_lower == "all" {
@@ -754,7 +806,7 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             handler.update_user(update_req).await.map_err(|e| {
                 FieldError::new(
                     format!("Failed to change OU for user {}", user_id_str),
-                        graphql_value!({ "details": (e.to_string()) }),
+                    graphql_value!({ "details": (e.to_string()) }),
                 )
             })?;
             info!("Changed OU for user {} to '{}'", user_id_str, new_ou);
@@ -821,13 +873,20 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         span.in_scope(|| debug!(?name, ?attribute_type, is_list));
 
         let handler = context
-        .get_admin_handler()
-        .ok_or_else(field_error_callback(&span, "Unauthorized attribute creation"))?;
+            .get_admin_handler()
+            .ok_or_else(field_error_callback(
+                &span,
+                "Unauthorized attribute creation",
+            ))?;
 
         let schema = handler.get_schema().await?;
 
         // === STRICTER #1202 FIX: No duplicate names at all across user/group ===
-        if schema.group_attributes().get_by_name_or_alias(&name).is_some() {
+        if schema
+            .group_attributes()
+            .get_by_name_or_alias(&name)
+            .is_some()
+        {
             return Err(anyhow!(
                 "Attribute '{}' already exists in the group schema. Duplicate names are not allowed across user and group attributes.",
                 name
@@ -845,15 +904,15 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         })?;
 
         handler
-        .add_user_attribute(CreateAttributeRequest {
-            name: name.into(),
-                            attribute_type,
-                            is_list,
-                            is_visible,
-                            is_editable,
-        })
-        .instrument(span)
-        .await?;
+            .add_user_attribute(CreateAttributeRequest {
+                name: name.into(),
+                attribute_type,
+                is_list,
+                is_visible,
+                is_editable,
+            })
+            .instrument(span)
+            .await?;
         Ok(Success::new())
     }
 
@@ -869,13 +928,20 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         span.in_scope(|| debug!(?name, ?attribute_type, is_list));
 
         let handler = context
-        .get_admin_handler()
-        .ok_or_else(field_error_callback(&span, "Unauthorized attribute creation"))?;
+            .get_admin_handler()
+            .ok_or_else(field_error_callback(
+                &span,
+                "Unauthorized attribute creation",
+            ))?;
 
         let schema = handler.get_schema().await?;
 
         // === STRICTER #1202 FIX: No duplicate names at all across user/group ===
-        if schema.user_attributes().get_by_name_or_alias(&name).is_some() {
+        if schema
+            .user_attributes()
+            .get_by_name_or_alias(&name)
+            .is_some()
+        {
             return Err(anyhow!(
                 "Attribute '{}' already exists in the user schema. Duplicate names are not allowed across user and group attributes.",
                 name
@@ -893,15 +959,15 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         })?;
 
         handler
-        .add_group_attribute(CreateAttributeRequest {
-            name: name.into(),
-                             attribute_type,
-                             is_list,
-                             is_visible,
-                             is_editable,
-        })
-        .instrument(span)
-        .await?;
+            .add_group_attribute(CreateAttributeRequest {
+                name: name.into(),
+                attribute_type,
+                is_list,
+                is_visible,
+                is_editable,
+            })
+            .instrument(span)
+            .await?;
         Ok(Success::new())
     }
 
@@ -914,23 +980,26 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         span.in_scope(|| debug!(?name));
 
         let handler = context
-        .get_admin_handler()
-        .ok_or_else(field_error_callback(&span, "Unauthorized attribute deletion"))?;
+            .get_admin_handler()
+            .ok_or_else(field_error_callback(
+                &span,
+                "Unauthorized attribute deletion",
+            ))?;
 
-        let schema = handler.get_schema().await?;   // live PublicSchema — 17+ attributes (custom + POSIX + Kerberos)
+        let schema = handler.get_schema().await?; // live PublicSchema — 17+ attributes (custom + POSIX + Kerberos)
 
         let attribute_schema = schema
-        .user_attributes()
-        .get_attribute_schema(name.as_str())
-        .ok_or_else(|| anyhow!("Attribute {} is not defined in the schema", name))?;
+            .user_attributes()
+            .get_attribute_schema(name.as_str())
+            .ok_or_else(|| anyhow!("Attribute {} is not defined in the schema", name))?;
 
         if attribute_schema.is_hardcoded {
             return Err(anyhow!("Permission denied: Attribute {} cannot be deleted", name).into());
         }
         handler
-        .delete_user_attribute(&name)
-        .instrument(span)
-        .await?;
+            .delete_user_attribute(&name)
+            .instrument(span)
+            .await?;
         Ok(Success::new())
     }
 
@@ -943,23 +1012,26 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         span.in_scope(|| debug!(?name));
 
         let handler = context
-        .get_admin_handler()
-        .ok_or_else(field_error_callback(&span, "Unauthorized attribute deletion"))?;
+            .get_admin_handler()
+            .ok_or_else(field_error_callback(
+                &span,
+                "Unauthorized attribute deletion",
+            ))?;
 
-        let schema = handler.get_schema().await?;   // live PublicSchema — 17+ attributes (custom + POSIX + Kerberos)
+        let schema = handler.get_schema().await?; // live PublicSchema — 17+ attributes (custom + POSIX + Kerberos)
 
         let attribute_schema = schema
-        .group_attributes()
-        .get_attribute_schema(name.as_str())
-        .ok_or_else(|| anyhow!("Attribute {} is not defined in the schema", name))?;
+            .group_attributes()
+            .get_attribute_schema(name.as_str())
+            .ok_or_else(|| anyhow!("Attribute {} is not defined in the schema", name))?;
 
         if attribute_schema.is_hardcoded {
             return Err(anyhow!("Permission denied: Attribute {} cannot be deleted", name).into());
         }
         handler
-        .delete_group_attribute(&name)
-        .instrument(span)
-        .await?;
+            .delete_group_attribute(&name)
+            .instrument(span)
+            .await?;
         Ok(Success::new())
     }
 
@@ -972,15 +1044,15 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             debug!(?name);
         });
         let handler = context
-        .get_admin_handler()
-        .ok_or_else(field_error_callback(
-            &span,
-            "Unauthorized object class addition",
-        ))?;
+            .get_admin_handler()
+            .ok_or_else(field_error_callback(
+                &span,
+                "Unauthorized object class addition",
+            ))?;
         handler
-        .add_user_object_class(&LdapObjectClass::from(name))
-        .instrument(span)
-        .await?;
+            .add_user_object_class(&LdapObjectClass::from(name))
+            .instrument(span)
+            .await?;
         Ok(Success::new())
     }
 
@@ -993,15 +1065,15 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             debug!(?name);
         });
         let handler = context
-        .get_admin_handler()
-        .ok_or_else(field_error_callback(
-            &span,
-            "Unauthorized object class addition",
-        ))?;
+            .get_admin_handler()
+            .ok_or_else(field_error_callback(
+                &span,
+                "Unauthorized object class addition",
+            ))?;
         handler
-        .add_group_object_class(&LdapObjectClass::from(name))
-        .instrument(span)
-        .await?;
+            .add_group_object_class(&LdapObjectClass::from(name))
+            .instrument(span)
+            .await?;
         Ok(Success::new())
     }
 
@@ -1014,15 +1086,15 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             debug!(?name);
         });
         let handler = context
-        .get_admin_handler()
-        .ok_or_else(field_error_callback(
-            &span,
-            "Unauthorized object class deletion",
-        ))?;
+            .get_admin_handler()
+            .ok_or_else(field_error_callback(
+                &span,
+                "Unauthorized object class deletion",
+            ))?;
         handler
-        .delete_user_object_class(&LdapObjectClass::from(name))
-        .instrument(span)
-        .await?;
+            .delete_user_object_class(&LdapObjectClass::from(name))
+            .instrument(span)
+            .await?;
         Ok(Success::new())
     }
 
@@ -1035,15 +1107,15 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             debug!(?name);
         });
         let handler = context
-        .get_admin_handler()
-        .ok_or_else(field_error_callback(
-            &span,
-            "Unauthorized object class deletion",
-        ))?;
+            .get_admin_handler()
+            .ok_or_else(field_error_callback(
+                &span,
+                "Unauthorized object class deletion",
+            ))?;
         handler
-        .delete_group_object_class(&LdapObjectClass::from(name))
-        .instrument(span)
-        .await?;
+            .delete_group_object_class(&LdapObjectClass::from(name))
+            .instrument(span)
+            .await?;
         Ok(Success::new())
     }
 
@@ -1060,37 +1132,51 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         // Allow regular users to sync their OWN Kerberos principal after password change
         // (exactly like set_user_password). Admins can do any user.
         let handler = context
-        .get_writeable_handler(target_user_id.clone())
-        .ok_or_else(field_error_callback(&span, "Unauthorized Kerberos sync"))?;
+            .get_writeable_handler(target_user_id.clone())
+            .ok_or_else(field_error_callback(&span, "Unauthorized Kerberos sync"))?;
 
-        let plain_password = decrypt_password(&encrypted_password)
-        .map_err(|e| FieldError::new(
-            "Kerberos password decryption failed",
-            graphql_value!({ "details": (e.to_string()) })
-        ))?;
+        let plain_password = decrypt_password(&encrypted_password).map_err(|e| {
+            FieldError::new(
+                "Kerberos password decryption failed",
+                graphql_value!({ "details": (e.to_string()) }),
+            )
+        })?;
 
-        let user = handler.get_user_details(&target_user_id).await
-        .map_err(|e| FieldError::new(
-            "Failed to fetch user for Kerberos sync check",
-            graphql_value!({ "details": (e.to_string()) })
-        ))?;
+        let user = handler
+            .get_user_details(&target_user_id)
+            .await
+            .map_err(|e| {
+                FieldError::new(
+                    "Failed to fetch user for Kerberos sync check",
+                    graphql_value!({ "details": (e.to_string()) }),
+                )
+            })?;
 
         let schema = handler.get_schema().await?;
         let sync_enabled = extract_kerberos_sync(&schema, &user.attributes);
 
         if sync_enabled {
-            sync_kerberos_principal(&user_id, &plain_password)
-            .map_err(|e| FieldError::new(
-                "Kerberos sync failed",
-                graphql_value!({ "details": (e.to_string()) })
-            ))?;
-            info!("Kerberos principal synced for user {} (password change by self or admin)", user_id);
+            sync_kerberos_principal(&user_id, &plain_password).map_err(|e| {
+                FieldError::new(
+                    "Kerberos sync failed",
+                    graphql_value!({ "details": (e.to_string()) }),
+                )
+            })?;
+            info!(
+                "Kerberos principal synced for user {} (password change by self or admin)",
+                user_id
+            );
         } else {
-            info!("Kerberos sync disabled for user {} (kerberossync != '1'), skipping", user_id);
+            info!(
+                "Kerberos sync disabled for user {} (kerberossync != '1'), skipping",
+                user_id
+            );
         }
 
         let inner = UserWriteableBackendHandler::unsafe_get_handler(handler);
-        let _ = inner.ensure_kerberos_principal_consistency(&target_user_id, sync_enabled).await;
+        let _ = inner
+            .ensure_kerberos_principal_consistency(&target_user_id, sync_enabled)
+            .await;
 
         Ok(true)
     }
@@ -1113,7 +1199,7 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
                 Ok(ExportKeytabForKeycloakResponse {
                     ok: false,
                     path: "".to_string(),
-                   error_msg: e.to_string(),
+                    error_msg: e.to_string(),
                 })
             }
         }
@@ -1131,10 +1217,7 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         );
 
         match client.test_connection().await {
-            Ok(message) => Ok(TestKeycloakConnectionResponse {
-                ok: true,
-                message,
-            }),
+            Ok(message) => Ok(TestKeycloakConnectionResponse { ok: true, message }),
             Err(e) => Ok(TestKeycloakConnectionResponse {
                 ok: false,
                 message: format!("❌ {}", e),
@@ -1179,15 +1262,15 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         let enable_brute_force = input.enable_brute_force;
 
         let message = client
-        .setup_realm(
-            input.lldap_url,
-            input.sync_username,
-            input.sync_password,
-            enable_hsts,
-            enable_brute_force,
-        )
-        .await
-        .map_err(|e| juniper::FieldError::new(e.to_string(), juniper::Value::null()))?;
+            .setup_realm(
+                input.lldap_url,
+                input.sync_username,
+                input.sync_password,
+                enable_hsts,
+                enable_brute_force,
+            )
+            .await
+            .map_err(|e| juniper::FieldError::new(e.to_string(), juniper::Value::null()))?;
 
         Ok(PushRealmResponse { ok: true, message })
     }
@@ -1201,31 +1284,42 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
 
         // === CONDITIONAL range enforcement — only check fields that are actually enabled ===
         if input.user_uidnumber_assign
-            && (input.user_uidnumber_start < 3000 || input.user_uidnumber_start > 60000 ||
-            input.user_uidnumber_max < 3000 || input.user_uidnumber_max > 60000) {
-                return Err(FieldError::new(
-                    "user_uidnumber must be between 3000 and 60000",
-                    juniper::Value::null(),
-                ));
+            && (input.user_uidnumber_start < 3000
+                || input.user_uidnumber_start > 60000
+                || input.user_uidnumber_max < 3000
+                || input.user_uidnumber_max > 60000)
+        {
+            return Err(FieldError::new(
+                "user_uidnumber must be between 3000 and 60000",
+                juniper::Value::null(),
+            ));
         }
-        if input.user_gidnumber_assign && (input.user_gidnumber_start < 3000 || input.user_gidnumber_start > 60000) {
+        if input.user_gidnumber_assign
+            && (input.user_gidnumber_start < 3000 || input.user_gidnumber_start > 60000)
+        {
             return Err(FieldError::new(
                 "user_gidnumber_start must be between 3000 and 60000",
                 juniper::Value::null(),
             ));
         }
         if input.group_gidnumber_assign
-            && (input.group_gidnumber_start < 3000 || input.group_gidnumber_start > 60000 ||
-            input.group_gidnumber_max < 3000 || input.group_gidnumber_max > 60000) {
-                return Err(FieldError::new(
-                    "group_gidnumber must be between 3000 and 60000",
-                    juniper::Value::null(),
-                ));
+            && (input.group_gidnumber_start < 3000
+                || input.group_gidnumber_start > 60000
+                || input.group_gidnumber_max < 3000
+                || input.group_gidnumber_max > 60000)
+        {
+            return Err(FieldError::new(
+                "group_gidnumber must be between 3000 and 60000",
+                juniper::Value::null(),
+            ));
         }
 
         let handler = context
             .get_admin_handler()
-            .ok_or_else(field_error_callback(&span, "Unauthorized POSIX settings change"))?;
+            .ok_or_else(field_error_callback(
+                &span,
+                "Unauthorized POSIX settings change",
+            ))?;
 
         let inner = AdminBackendHandler::unsafe_get_handler(handler);
 
@@ -1244,11 +1338,12 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             group_gidnumber_max: input.group_gidnumber_max as i64,
         };
 
-        inner.set_posix_settings(settings).await
-            .map_err(|e| FieldError::new(
+        inner.set_posix_settings(settings).await.map_err(|e| {
+            FieldError::new(
                 "Failed to save POSIX settings",
                 graphql_value!({ "details": (e.to_string()) }),
-            ))?;
+            )
+        })?;
 
         Ok(PosixSettingsResponse {
             success: true,
@@ -1264,15 +1359,19 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
 
         let handler = context
             .get_admin_handler()
-            .ok_or_else(field_error_callback(&span, "Unauthorized uidNumber reassign"))?;
+            .ok_or_else(field_error_callback(
+                &span,
+                "Unauthorized uidNumber reassign",
+            ))?;
 
         let inner = AdminBackendHandler::unsafe_get_handler(handler);
 
-        inner.reassign_user_uid_numbers().await
-            .map_err(|e| FieldError::new(
+        inner.reassign_user_uid_numbers().await.map_err(|e| {
+            FieldError::new(
                 "Failed to reassign user uidNumbers",
                 graphql_value!({ "details": (e.to_string()) }),
-            ))?;
+            )
+        })?;
 
         Ok(PosixSettingsResponse {
             success: true,
@@ -1288,15 +1387,19 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
 
         let handler = context
             .get_admin_handler()
-            .ok_or_else(field_error_callback(&span, "Unauthorized gidNumber reassign"))?;
+            .ok_or_else(field_error_callback(
+                &span,
+                "Unauthorized gidNumber reassign",
+            ))?;
 
         let inner = AdminBackendHandler::unsafe_get_handler(handler);
 
-        inner.reassign_user_gid_numbers().await
-            .map_err(|e| FieldError::new(
+        inner.reassign_user_gid_numbers().await.map_err(|e| {
+            FieldError::new(
                 "Failed to reassign user gidNumbers",
                 graphql_value!({ "details": (e.to_string()) }),
-            ))?;
+            )
+        })?;
 
         Ok(PosixSettingsResponse {
             success: true,
@@ -1312,15 +1415,19 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
 
         let handler = context
             .get_admin_handler()
-            .ok_or_else(field_error_callback(&span, "Unauthorized homeDirectory reassign"))?;
+            .ok_or_else(field_error_callback(
+                &span,
+                "Unauthorized homeDirectory reassign",
+            ))?;
 
         let inner = AdminBackendHandler::unsafe_get_handler(handler);
 
-        inner.reassign_user_homedirectories().await
-            .map_err(|e| FieldError::new(
+        inner.reassign_user_homedirectories().await.map_err(|e| {
+            FieldError::new(
                 "Failed to reassign user homeDirectories",
                 graphql_value!({ "details": (e.to_string()) }),
-            ))?;
+            )
+        })?;
 
         Ok(PosixSettingsResponse {
             success: true,
@@ -1336,15 +1443,19 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
 
         let handler = context
             .get_admin_handler()
-            .ok_or_else(field_error_callback(&span, "Unauthorized loginShell reassign"))?;
+            .ok_or_else(field_error_callback(
+                &span,
+                "Unauthorized loginShell reassign",
+            ))?;
 
         let inner = AdminBackendHandler::unsafe_get_handler(handler);
 
-        inner.reassign_user_loginshells().await
-            .map_err(|e| FieldError::new(
+        inner.reassign_user_loginshells().await.map_err(|e| {
+            FieldError::new(
                 "Failed to reassign user loginShells",
                 graphql_value!({ "details": (e.to_string()) }),
-            ))?;
+            )
+        })?;
 
         Ok(PosixSettingsResponse {
             success: true,
@@ -1360,15 +1471,19 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
 
         let handler = context
             .get_admin_handler()
-            .ok_or_else(field_error_callback(&span, "Unauthorized gidNumber reassign"))?;
+            .ok_or_else(field_error_callback(
+                &span,
+                "Unauthorized gidNumber reassign",
+            ))?;
 
         let inner = AdminBackendHandler::unsafe_get_handler(handler);
 
-        inner.reassign_gid_numbers().await
-            .map_err(|e| FieldError::new(
+        inner.reassign_gid_numbers().await.map_err(|e| {
+            FieldError::new(
                 "Failed to reassign gidNumbers",
                 graphql_value!({ "details": (e.to_string()) }),
-            ))?;
+            )
+        })?;
 
         Ok(PosixSettingsResponse {
             success: true,
@@ -1387,10 +1502,10 @@ mod tests {
     };
     use lldap_auth::access_control::{Permission, ValidationResults};
     use lldap_domain::types::{AttributeName, AttributeType};
+    use lldap_schema::PublicSchema;
     use lldap_test_utils::MockTestBackendHandler;
     use mockall::predicate::eq;
     use pretty_assertions::assert_eq;
-    use lldap_schema::PublicSchema;
 
     fn mutation_schema<C, Q, M>(
         query_root: Q,
@@ -1424,7 +1539,8 @@ mod tests {
             }
         "#;
         let mut mock = MockTestBackendHandler::new();
-        mock.expect_get_schema().returning(|| Ok(make_test_schema()));
+        mock.expect_get_schema()
+            .returning(|| Ok(make_test_schema()));
         mock.expect_add_user_attribute()
             .with(eq(CreateAttributeRequest {
                 name: AttributeName::new("AttrName0"),
@@ -1479,7 +1595,8 @@ mod tests {
             }
         "#;
         let mut mock = MockTestBackendHandler::new();
-        mock.expect_get_schema().returning(|| Ok(make_test_schema()));
+        mock.expect_get_schema()
+            .returning(|| Ok(make_test_schema()));
         let context = Context::<MockTestBackendHandler>::new_for_tests(
             mock,
             ValidationResults {
@@ -1531,7 +1648,8 @@ mod tests {
             }
         "#;
         let mut mock = MockTestBackendHandler::new();
-        mock.expect_get_schema().returning(|| Ok(make_test_schema()));
+        mock.expect_get_schema()
+            .returning(|| Ok(make_test_schema()));
         mock.expect_add_group_attribute()
             .with(eq(CreateAttributeRequest {
                 name: AttributeName::new("AttrName0"),
@@ -1585,42 +1703,43 @@ mod tests {
             }
         }
     "#;
-    let mut mock = MockTestBackendHandler::new();
-    mock.expect_get_schema().returning(|| Ok(make_test_schema()));
-    let context = Context::<MockTestBackendHandler>::new_for_tests(
-        mock,
-        ValidationResults {
-            user: UserId::new("bob"),
-            permission: Permission::Admin,
-        },
-    );
-    let vars = Variables::from([
-        ("name".to_string(), InputValue::scalar("AttrName_0")),
-        (
-            "attributeType".to_string(),
-            InputValue::enum_value("STRING"),
-        ),
-        ("isList".to_string(), InputValue::scalar(false)),
-        ("isVisible".to_string(), InputValue::scalar(false)),
-        ("isEditable".to_string(), InputValue::scalar(false)),
-    ]);
-    let schema = mutation_schema(
-        Query::<MockTestBackendHandler>::new(),
-        Mutation::<MockTestBackendHandler>::default(),
-    );
-    let result = execute(QUERY, None, &schema, &vars, &context).await;
-    match result {
-        Ok(res) => {
-            let (response, errors) = res;
-            assert!(response.is_null());
-            let expected_error_msg =
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_get_schema()
+            .returning(|| Ok(make_test_schema()));
+        let context = Context::<MockTestBackendHandler>::new_for_tests(
+            mock,
+            ValidationResults {
+                user: UserId::new("bob"),
+                permission: Permission::Admin,
+            },
+        );
+        let vars = Variables::from([
+            ("name".to_string(), InputValue::scalar("AttrName_0")),
+            (
+                "attributeType".to_string(),
+                InputValue::enum_value("STRING"),
+            ),
+            ("isList".to_string(), InputValue::scalar(false)),
+            ("isVisible".to_string(), InputValue::scalar(false)),
+            ("isEditable".to_string(), InputValue::scalar(false)),
+        ]);
+        let schema = mutation_schema(
+            Query::<MockTestBackendHandler>::new(),
+            Mutation::<MockTestBackendHandler>::default(),
+        );
+        let result = execute(QUERY, None, &schema, &vars, &context).await;
+        match result {
+            Ok(res) => {
+                let (response, errors) = res;
+                assert!(response.is_null());
+                let expected_error_msg =
                 "Cannot create attribute with invalid name. Valid characters: a-z, A-Z, 0-9, and dash (-). Invalid chars found: _"
                     .to_string();
-            assert!(
-                errors
-                    .iter()
-                    .all(|e| e.error().message() == expected_error_msg)
-            );
+                assert!(
+                    errors
+                        .iter()
+                        .all(|e| e.error().message() == expected_error_msg)
+                );
             }
             Err(_) => {
                 panic!();

@@ -89,7 +89,7 @@ impl CommonComponent<LoginForm> for LoginForm {
                 };
                 let login_finish = match opaque::client::login::finish_login(
                     login_start,
-                    self.form.model().password.as_bytes(),   // ← fixed
+                    self.form.model().password.as_bytes(), // ← fixed
                     res.credential_response,
                     &mut rand::rngs::OsRng,
                 ) {
@@ -109,7 +109,7 @@ impl CommonComponent<LoginForm> for LoginForm {
                 self.common.call_backend(
                     ctx,
                     HostService::login_finish(req),
-                                         Msg::AuthenticationFinishResponse,
+                    Msg::AuthenticationFinishResponse,
                 );
                 Ok(false)
             }

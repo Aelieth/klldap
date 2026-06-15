@@ -1,13 +1,13 @@
+use crate::components::ou_selector::OuSelector;
+use crate::components::status_modal::StatusModal;
 use crate::infra::{
     common_component::{CommonComponent, CommonComponentParts},
     modal::Modal,
 };
-use crate::components::ou_selector::OuSelector;
-use crate::components::status_modal::StatusModal;
 use anyhow::{Error, Result};
 use graphql_client::GraphQLQuery;
-use yew::prelude::*;
 use wasm_bindgen::JsCast;
+use yew::prelude::*;
 
 #[derive(GraphQLQuery)]
 #[graphql(
@@ -33,7 +33,7 @@ pub struct CreateOuProps {
     pub on_ou_created: Callback<String>,
     pub on_error: Callback<Error>,
     pub ous: Vec<String>,
-    pub default_primary: String,   // "people" or "groups"
+    pub default_primary: String, // "people" or "groups"
 }
 
 pub enum Msg {
@@ -75,7 +75,9 @@ impl CommonComponent<CreateOu> for CreateOu {
                 }
                 self.common.call_graphql::<CreateOuQuery, _>(
                     ctx,
-                    create_ou_query::Variables { name: final_name.clone() },
+                    create_ou_query::Variables {
+                        name: final_name.clone(),
+                    },
                     Msg::CreateOuResponse,
                     "Error trying to create OU",
                 );
@@ -228,7 +230,10 @@ impl CreateOu {
         };
 
         let primary_selector = if !self.is_primary {
-            let primaries: Vec<String> = ctx.props().ous.iter()
+            let primaries: Vec<String> = ctx
+                .props()
+                .ous
+                .iter()
                 .filter(|o| !o.contains('\\'))
                 .cloned()
                 .collect();

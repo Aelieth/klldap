@@ -1,27 +1,27 @@
 use crate::{
-  components::{
-    add_user_to_group::AddUserToGroupComponent,
-    remove_user_from_group::RemoveUserFromGroupComponent,
-    router::{AppRoute, Link},
-    user_details_form::UserDetailsForm,
-  },
-  infra::{
-    common_component::{CommonComponent, CommonComponentParts},
-    form_utils::GraphQlAttributeSchema,
-    schema::AttributeType,
-  },
+    components::{
+        add_user_to_group::AddUserToGroupComponent,
+        remove_user_from_group::RemoveUserFromGroupComponent,
+        router::{AppRoute, Link},
+        user_details_form::UserDetailsForm,
+    },
+    infra::{
+        common_component::{CommonComponent, CommonComponentParts},
+        form_utils::GraphQlAttributeSchema,
+        schema::AttributeType,
+    },
 };
-use anyhow::{anyhow, Error, Result, bail};
+use anyhow::{Error, Result, anyhow, bail};
 use graphql_client::GraphQLQuery;
 use yew::prelude::*;
 
 #[derive(GraphQLQuery)]
 #[graphql(
-schema_path = "../schema.graphql",
-query_path = "queries/get_user_details.graphql",
-response_derives = "Debug, Hash, PartialEq, Eq, Clone",
-custom_scalars_module = "crate::infra::graphql",
-extern_enums("AttributeType")
+    schema_path = "../schema.graphql",
+    query_path = "queries/get_user_details.graphql",
+    response_derives = "Debug, Hash, PartialEq, Eq, Clone",
+    custom_scalars_module = "crate::infra::graphql",
+    extern_enums("AttributeType")
 )]
 pub struct GetUserDetails;
 
@@ -58,56 +58,62 @@ pub type Attribute = get_user_details::GetUserDetailsUserAttributes;
 pub type AttributeSchema = get_user_details::GetUserDetailsSchemaUserSchemaAttributes;
 
 impl From<&AttributeSchema> for GraphQlAttributeSchema {
-  fn from(attr: &AttributeSchema) -> Self {
-    Self {
-      name: attr.name.clone(),
-      is_list: attr.is_list,
-      is_readonly: attr.is_readonly,
-      is_editable: attr.is_editable,
+    fn from(attr: &AttributeSchema) -> Self {
+        Self {
+            name: attr.name.clone(),
+            is_list: attr.is_list,
+            is_readonly: attr.is_readonly,
+            is_editable: attr.is_editable,
+        }
     }
-  }
 }
 
 pub struct UserDetails {
-  common: CommonComponentParts<Self>,
-  user_and_schema: Option<(User, Vec<AttributeSchema>)>,
-  lldap_disabled_group_id: Option<i64>,
+    common: CommonComponentParts<Self>,
+    user_and_schema: Option<(User, Vec<AttributeSchema>)>,
+    lldap_disabled_group_id: Option<i64>,
 }
 
 impl UserDetails {
-  fn mut_groups(&mut self) -> &mut Vec<Group> {
-    &mut self.user_and_schema.as_mut().unwrap().0.groups
-  }
+    fn mut_groups(&mut self) -> &mut Vec<Group> {
+        &mut self.user_and_schema.as_mut().unwrap().0.groups
+    }
 }
 
 pub enum Msg {
-  UserDetailsResponse(Result<get_user_details::ResponseData>),
-  OnError(Error),
-  OnUserAddedToGroup(Group),
-  OnUserRemovedFromGroup((String, i64)),
-  Refresh,
-  AddToLldapDisabled,
-  AddToLldapDisabledResponse(Result<add_user_to_group::ResponseData>),
-  RemoveFromLldapDisabled,
-  RemoveFromLldapDisabledResponse(Result<remove_user_from_group::ResponseData>),
-  GroupListResponse(Result<get_group_list::ResponseData>),
-  GroupListResponseThenAdd(Result<get_group_list::ResponseData>),
+    UserDetailsResponse(Result<get_user_details::ResponseData>),
+    OnError(Error),
+    OnUserAddedToGroup(Group),
+    OnUserRemovedFromGroup((String, i64)),
+    Refresh,
+    AddToLldapDisabled,
+    AddToLldapDisabledResponse(Result<add_user_to_group::ResponseData>),
+    RemoveFromLldapDisabled,
+    RemoveFromLldapDisabledResponse(Result<remove_user_from_group::ResponseData>),
+    GroupListResponse(Result<get_group_list::ResponseData>),
+    GroupListResponseThenAdd(Result<get_group_list::ResponseData>),
 }
 
 #[derive(yew::Properties, Clone, PartialEq, Eq)]
 pub struct Props {
-  pub username: String,
-  pub is_admin: bool,
+    pub username: String,
+    pub is_admin: bool,
 }
 
 impl CommonComponent<UserDetails> for UserDetails {
-    fn handle_msg(&mut self, ctx: &Context<Self>, msg: <Self as Component>::Message) -> Result<bool> {
+    fn handle_msg(
+        &mut self,
+        ctx: &Context<Self>,
+        msg: <Self as Component>::Message,
+    ) -> Result<bool> {
         match msg {
             Msg::UserDetailsResponse(response) => match response {
                 Ok(data) => {
                     let user = data.user;
                     // Store the lldap_disabled group id if present (for toggle button)
-                    self.lldap_disabled_group_id = user.groups.iter()
+                    self.lldap_disabled_group_id = user
+                        .groups
+                        .iter()
                         .find(|g| g.display_name == "lldap_disabled")
                         .map(|g| g.id);
                     self.user_and_schema = Some((user, data.schema.user_schema.attributes));
@@ -121,10 +127,10 @@ impl CommonComponent<UserDetails> for UserDetails {
             Msg::OnError(e) => return Err(e),
             Msg::OnUserAddedToGroup(group) => {
                 self.mut_groups().push(group);
-            },
+            }
             Msg::OnUserRemovedFromGroup((_, group_id)) => {
                 self.mut_groups().retain(|g| g.id != group_id);
-            },
+            }
             Msg::Refresh => {
                 // Optimized: Always force fresh fetch after avatar update
                 // This prevents stale avatar display in user_details_form
@@ -191,7 +197,8 @@ impl CommonComponent<UserDetails> for UserDetails {
             }
             Msg::GroupListResponse(Ok(data)) => {
                 // Always store the lldap_disabled group id even if user is not a member
-                self.lldap_disabled_group_id = data.groups
+                self.lldap_disabled_group_id = data
+                    .groups
                     .into_iter()
                     .find(|g| g.display_name == "lldap_disabled")
                     .map(|g| g.id);
@@ -203,7 +210,11 @@ impl CommonComponent<UserDetails> for UserDetails {
             }
             Msg::GroupListResponseThenAdd(Ok(data)) => {
                 // Find the lldap_disabled group ID from the fresh list
-                if let Some(group) = data.groups.into_iter().find(|g| g.display_name == "lldap_disabled") {
+                if let Some(group) = data
+                    .groups
+                    .into_iter()
+                    .find(|g| g.display_name == "lldap_disabled")
+                {
                     self.lldap_disabled_group_id = Some(group.id);
                     // Now actually perform the add
                     self.common.call_graphql::<AddUserToGroup, _>(
@@ -216,7 +227,8 @@ impl CommonComponent<UserDetails> for UserDetails {
                         "Error trying to add user to lldap_disabled group",
                     );
                 } else {
-                    self.common.error = Some(anyhow!("lldap_disabled group does not exist in the system"));
+                    self.common.error =
+                        Some(anyhow!("lldap_disabled group does not exist in the system"));
                 }
                 return Ok(false);
             }
@@ -234,101 +246,103 @@ impl CommonComponent<UserDetails> for UserDetails {
 }
 
 impl Component for UserDetails {
-  type Message = Msg;
-  type Properties = Props;
+    type Message = Msg;
+    type Properties = Props;
 
-  fn create(ctx: &Context<Self>) -> Self {
-    let mut component = Self {
-      common: CommonComponentParts::<Self>::create(),
-      user_and_schema: None,
-      lldap_disabled_group_id: None,
-    };
-    component.get_user_details(ctx);
-    component.common.call_graphql::<GetGroupList, _>(
-        ctx,
-        get_group_list::Variables {},
-        Msg::GroupListResponse,
-        "Error trying to fetch group list for disabled toggle",
-    );
-    component
-  }
-
-  fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
-    CommonComponentParts::<Self>::update(self, ctx, msg)
-  }
-
-  fn view(&self, ctx: &Context<Self>) -> Html {
-    match (&self.user_and_schema, &self.common.error) {
-      (Some((u, schema)), error) => {
-        let can_change_password = ctx.props().is_admin || ctx.props().username == u.id;
-        let is_disabled = u.groups.iter().any(|g| g.display_name == "lldap_disabled");
-
-        let link = ctx.link();  // ← REQUIRED for on_updated callback
-
-        let toggle_button = if ctx.props().is_admin {
-            let onclick = if is_disabled {
-                link.callback(|_| Msg::RemoveFromLldapDisabled)
-            } else {
-                link.callback(|_| Msg::AddToLldapDisabled)
-            };
-            let (label, btn_class) = if is_disabled {
-                ("✖️ Disabled", "btn btn-outline-secondary me-2")
-            } else {
-                ("🟢 Enabled", "btn btn-success me-2")
-            };
-            html! {
-                <button
-                    class={btn_class}
-                    onclick={onclick}
-                    disabled={self.common.is_task_running()}
-                    title={if is_disabled { "Remove from lldap_disabled group (enable user)" } else { "Add to lldap_disabled group (disable user)" }}
-                >
-                    {label}
-                </button>
-            }
-        } else {
-            html! {}
+    fn create(ctx: &Context<Self>) -> Self {
+        let mut component = Self {
+            common: CommonComponentParts::<Self>::create(),
+            user_and_schema: None,
+            lldap_disabled_group_id: None,
         };
-
-        html! {
-          <>
-          <h3>{u.id.to_string()}</h3>
-          <div class="d-flex flex-row-reverse">
-          { if can_change_password {
-            html! {
-              <Link
-              to={AppRoute::ChangePassword{user_id: u.id.clone()}}
-              classes="btn btn-secondary">
-              <i class="bi-key me-2"></i>
-              {"Modify password"}
-              </Link>
-            }
-          } else { html! {} }}
-          {toggle_button}
-          </div>
-
-          <div>
-          <h5 class="row m-3 fw-bold">{"User details"}</h5>
-          </div>
-
-          <UserDetailsForm
-          user={u.clone()}
-          user_attributes_schema={schema.clone()}
-          is_admin={ctx.props().is_admin}
-          is_edited_user_admin={u.groups.iter().any(|g| g.display_name == "lldap_admin")}
-          on_updated={link.callback(|_| Msg::Refresh)}
-          />
-
-          {self.view_group_memberships(ctx, u)}
-          {self.view_add_group_button(ctx, u)}
-          {self.view_messages(error)}
-          </>
-        }
-      }
-      (None, None) => html! {{"Loading user details..."}},
-      (None, Some(e)) => html! {<div class="alert alert-danger">{"Error: "}{e.to_string()}</div>},
+        component.get_user_details(ctx);
+        component.common.call_graphql::<GetGroupList, _>(
+            ctx,
+            get_group_list::Variables {},
+            Msg::GroupListResponse,
+            "Error trying to fetch group list for disabled toggle",
+        );
+        component
     }
-  }
+
+    fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
+        CommonComponentParts::<Self>::update(self, ctx, msg)
+    }
+
+    fn view(&self, ctx: &Context<Self>) -> Html {
+        match (&self.user_and_schema, &self.common.error) {
+            (Some((u, schema)), error) => {
+                let can_change_password = ctx.props().is_admin || ctx.props().username == u.id;
+                let is_disabled = u.groups.iter().any(|g| g.display_name == "lldap_disabled");
+
+                let link = ctx.link(); // ← REQUIRED for on_updated callback
+
+                let toggle_button = if ctx.props().is_admin {
+                    let onclick = if is_disabled {
+                        link.callback(|_| Msg::RemoveFromLldapDisabled)
+                    } else {
+                        link.callback(|_| Msg::AddToLldapDisabled)
+                    };
+                    let (label, btn_class) = if is_disabled {
+                        ("✖️ Disabled", "btn btn-outline-secondary me-2")
+                    } else {
+                        ("🟢 Enabled", "btn btn-success me-2")
+                    };
+                    html! {
+                        <button
+                            class={btn_class}
+                            onclick={onclick}
+                            disabled={self.common.is_task_running()}
+                            title={if is_disabled { "Remove from lldap_disabled group (enable user)" } else { "Add to lldap_disabled group (disable user)" }}
+                        >
+                            {label}
+                        </button>
+                    }
+                } else {
+                    html! {}
+                };
+
+                html! {
+                  <>
+                  <h3>{u.id.to_string()}</h3>
+                  <div class="d-flex flex-row-reverse">
+                  { if can_change_password {
+                    html! {
+                      <Link
+                      to={AppRoute::ChangePassword{user_id: u.id.clone()}}
+                      classes="btn btn-secondary">
+                      <i class="bi-key me-2"></i>
+                      {"Modify password"}
+                      </Link>
+                    }
+                  } else { html! {} }}
+                  {toggle_button}
+                  </div>
+
+                  <div>
+                  <h5 class="row m-3 fw-bold">{"User details"}</h5>
+                  </div>
+
+                  <UserDetailsForm
+                  user={u.clone()}
+                  user_attributes_schema={schema.clone()}
+                  is_admin={ctx.props().is_admin}
+                  is_edited_user_admin={u.groups.iter().any(|g| g.display_name == "lldap_admin")}
+                  on_updated={link.callback(|_| Msg::Refresh)}
+                  />
+
+                  {self.view_group_memberships(ctx, u)}
+                  {self.view_add_group_button(ctx, u)}
+                  {self.view_messages(error)}
+                  </>
+                }
+            }
+            (None, None) => html! {{"Loading user details..."}},
+            (None, Some(e)) => {
+                html! {<div class="alert alert-danger">{"Error: "}{e.to_string()}</div>}
+            }
+        }
+    }
 }
 
 impl UserDetails {

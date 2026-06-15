@@ -299,7 +299,11 @@ pub fn get_group_id_from_distinguished_name_or_plain_name(
 /// correctness bug where ou_part == "" produced an invalid "uid=foo,,dc=..." DN.
 pub fn build_user_dn(user_id: &UserId, internal_ou: &str, base_dn_str: &str) -> String {
     let rdn_chain = internal_ou_to_ldap_rdn_chain(internal_ou);
-    let ou_part = rdn_chain.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(",");
+    let ou_part = rdn_chain
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect::<Vec<_>>()
+        .join(",");
     if ou_part.is_empty() {
         format!("uid={},{}", user_id, base_dn_str)
     } else {
@@ -310,7 +314,11 @@ pub fn build_user_dn(user_id: &UserId, internal_ou: &str, base_dn_str: &str) -> 
 /// Builds a full group Distinguished Name. Symmetric to build_user_dn for consistency and reuse.
 pub fn build_group_dn(group_name: &GroupName, internal_ou: &str, base_dn_str: &str) -> String {
     let rdn_chain = internal_ou_to_ldap_rdn_chain(internal_ou);
-    let ou_part = rdn_chain.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join(",");
+    let ou_part = rdn_chain
+        .iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect::<Vec<_>>()
+        .join(",");
     if ou_part.is_empty() {
         format!("cn={},{}", group_name, base_dn_str)
     } else {

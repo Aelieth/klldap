@@ -40,10 +40,10 @@ where
     let is_real_operation = matches!(
         msg.op,
         LdapOp::BindRequest(_)
-        | LdapOp::ModifyRequest(_)
-        | LdapOp::AddRequest(_)
-        | LdapOp::DelRequest(_)
-        | LdapOp::ExtendedRequest(_)
+            | LdapOp::ModifyRequest(_)
+            | LdapOp::AddRequest(_)
+            | LdapOp::DelRequest(_)
+            | LdapOp::ExtendedRequest(_)
     );
 
     match session.handle_ldap_message(msg.op).await {
@@ -56,7 +56,10 @@ where
             if is_real_operation {
                 info!("LDAP request session_id: {}", session.session_uuid());
             } else {
-                debug!("LDAP request [idle ping] session_id: {}", session.session_uuid());
+                debug!(
+                    "LDAP request [idle ping] session_id: {}",
+                    session.session_uuid()
+                );
             }
 
             let results: i64 = result.len().try_into().unwrap();

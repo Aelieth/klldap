@@ -26,15 +26,14 @@ pub fn compare(
 
     // Find the *exact* target by DN (case-insensitive per LDAP rules).
     // This allows the new search layer to return OUs + target without breaking compare.
-    let matching_entry = entries.iter().find(|e| {
-        e.dn.eq_ignore_ascii_case(&request.dn)
-    });
+    let matching_entry = entries
+        .iter()
+        .find(|e| e.dn.eq_ignore_ascii_case(&request.dn));
 
     match matching_entry {
         Some(entry) => {
             let attribute_exists = entry.attributes.iter().any(|attr| {
-                AttributeName::from(&attr.atype) == attr_name
-                    && attr.vals.contains(&request.val)
+                AttributeName::from(&attr.atype) == attr_name && attr.vals.contains(&request.val)
             });
 
             Ok(vec![LdapOp::CompareResult(LdapResultOp {
@@ -122,7 +121,10 @@ mod tests {
                 display_name: "group".into(),
                 creation_date: chrono::Utc.timestamp_opt(42, 42).unwrap().naive_utc(),
                 users: vec![],
-                uuid: Uuid::from_name_and_date("group", &chrono::Utc.timestamp_opt(42, 42).unwrap().naive_utc()),
+                uuid: Uuid::from_name_and_date(
+                    "group",
+                    &chrono::Utc.timestamp_opt(42, 42).unwrap().naive_utc(),
+                ),
                 attributes: Vec::new(),
                 modified_date: chrono::Utc.timestamp_opt(42, 42).unwrap().naive_utc(),
             }])
@@ -225,7 +227,10 @@ mod tests {
                     user_id: UserId::new("bob"),
                     ou: "people".to_string(),
                 }],
-                uuid: Uuid::from_name_and_date("group", &chrono::Utc.timestamp_opt(42, 42).unwrap().naive_utc()),
+                uuid: Uuid::from_name_and_date(
+                    "group",
+                    &chrono::Utc.timestamp_opt(42, 42).unwrap().naive_utc(),
+                ),
                 attributes: Vec::new(),
                 modified_date: chrono::Utc.timestamp_opt(42, 42).unwrap().naive_utc(),
             }])

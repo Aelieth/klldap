@@ -8,9 +8,9 @@ use lldap_schema::{AttributeSchema, AttributeType};
 #[sea_orm(table_name = "user_attribute_schema")]
 pub struct Model {
     #[sea_orm(
-    primary_key,
-    auto_increment = false,
-    column_name = "user_attribute_schema_name"
+        primary_key,
+        auto_increment = false,
+        column_name = "user_attribute_schema_name"
     )]
     pub attribute_name: AttributeName,
     #[sea_orm(column_name = "user_attribute_schema_type")]
@@ -47,8 +47,7 @@ impl From<Model> for AttributeSchema {
     fn from(value: Model) -> Self {
         let name_str = value.attribute_name.into_string();
 
-        let aliases: Vec<String> = serde_json::from_str(&value.aliases)
-        .unwrap_or_else(|_| vec![]);
+        let aliases: Vec<String> = serde_json::from_str(&value.aliases).unwrap_or_else(|_| vec![]);
 
         AttributeSchema {
             name: name_str,

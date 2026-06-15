@@ -4,24 +4,24 @@ use itertools::Itertools;
 use lldap_domain::{
     requests::{CreateUserRequest, UpdateUserRequest},
     types::{
-        Attribute, AttributeName, AttributeValue, Cardinality, GroupDetails, GroupId, Serialized, User, UserAndGroups, UserId,
-        Uuid,
+        Attribute, AttributeName, AttributeValue, Cardinality, GroupDetails, GroupId, Serialized,
+        User, UserAndGroups, UserId, Uuid,
     },
 };
-use lldap_schema::PublicSchema;
 use lldap_domain_handlers::handler::{
-    GroupBackendHandler, PosixBackendHandler, PosixSettings,
-    ReadSchemaBackendHandler, SystemConfigBackendHandler, UserBackendHandler,
-    UserListerBackendHandler, UserRequestFilter, SubStringFilter,
+    GroupBackendHandler, PosixBackendHandler, PosixSettings, ReadSchemaBackendHandler,
+    SubStringFilter, SystemConfigBackendHandler, UserBackendHandler, UserListerBackendHandler,
+    UserRequestFilter,
 };
 use lldap_domain_model::{
     error::{DomainError, Result},
     model::{self, GroupColumn, UserColumn, deserialize, system_config},
 };
 use lldap_kerberos::delete_kerberos_principal;
+use lldap_schema::PublicSchema;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue, ColumnTrait, DatabaseTransaction, EntityTrait, ModelTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, QueryTrait, Set, TransactionTrait,
+    ActiveModelTrait, ActiveValue, ColumnTrait, DatabaseTransaction, EntityTrait, ModelTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait, Set, TransactionTrait,
     sea_query::{
         Alias, Cond, Expr, Func, IntoColumnRef, IntoCondition, SimpleExpr, query::OnConflict,
     },
@@ -38,7 +38,9 @@ fn attribute_value_to_db_bytes(value: &AttributeValue) -> Vec<u8> {
         }
         AttributeValue::Integer(Cardinality::Singleton(i)) => i.to_string().as_bytes().to_vec(),
         AttributeValue::Avatar(Cardinality::Singleton(p)) => p.0.clone(),
-        AttributeValue::DateTime(Cardinality::Singleton(dt)) => dt.and_utc().timestamp().to_string().as_bytes().to_vec(),
+        AttributeValue::DateTime(Cardinality::Singleton(dt)) => {
+            dt.and_utc().timestamp().to_string().as_bytes().to_vec()
+        }
         _ => vec![],
     }
 }
@@ -46,16 +48,16 @@ fn attribute_value_to_db_bytes(value: &AttributeValue) -> Vec<u8> {
 fn attribute_condition(name: AttributeName, value: Option<&AttributeValue>) -> Cond {
     Expr::in_subquery(
         Expr::col(UserColumn::UserId.as_column_ref()),
-                      model::UserAttributes::find()
-                      .select_only()
-                      .column(model::UserAttributesColumn::UserId)
-                      .filter(model::UserAttributesColumn::AttributeName.eq(name))
-                      .filter(
-                          value
-                          .map(|v| model::UserAttributesColumn::Value.eq(attribute_value_to_db_bytes(v)))
-                          .unwrap_or_else(|| SimpleExpr::Constant(true.into())),
-                      )
-                      .into_query(),
+        model::UserAttributes::find()
+            .select_only()
+            .column(model::UserAttributesColumn::UserId)
+            .filter(model::UserAttributesColumn::AttributeName.eq(name))
+            .filter(
+                value
+                    .map(|v| model::UserAttributesColumn::Value.eq(attribute_value_to_db_bytes(v)))
+                    .unwrap_or_else(|| SimpleExpr::Constant(true.into())),
+            )
+            .into_query(),
     )
     .into_condition()
 }
@@ -64,15 +66,17 @@ fn attribute_substring_condition(name: AttributeName, filter: &SubStringFilter) 
     let like_pattern = filter.to_sql_filter();
     Expr::in_subquery(
         Expr::col(UserColumn::UserId.as_column_ref()),
-                      model::UserAttributes::find()
-                      .select_only()
-                      .column(model::UserAttributesColumn::UserId)
-                      .filter(model::UserAttributesColumn::AttributeName.eq(name.clone()))
-                      .filter(
-                          SimpleExpr::FunctionCall(Func::lower(Expr::col(model::UserAttributesColumn::Value)))
-                          .like(like_pattern),
-                      )
-                      .into_query(),
+        model::UserAttributes::find()
+            .select_only()
+            .column(model::UserAttributesColumn::UserId)
+            .filter(model::UserAttributesColumn::AttributeName.eq(name.clone()))
+            .filter(
+                SimpleExpr::FunctionCall(Func::lower(Expr::col(
+                    model::UserAttributesColumn::Value,
+                )))
+                .like(like_pattern),
+            )
+            .into_query(),
     )
     .into_condition()
 }
@@ -80,12 +84,12 @@ fn attribute_substring_condition(name: AttributeName, filter: &SubStringFilter) 
 fn user_id_subcondition(filter: Cond) -> Cond {
     Expr::in_subquery(
         Expr::col(UserColumn::UserId.as_column_ref()),
-                      model::User::find()
-                      .find_also_linked(model::memberships::UserToGroup)
-                      .select_only()
-                      .column(UserColumn::UserId)
-                      .filter(filter)
-                      .into_query(),
+        model::User::find()
+            .find_also_linked(model::memberships::UserToGroup)
+            .select_only()
+            .column(UserColumn::UserId)
+            .filter(filter)
+            .into_query(),
     )
     .into_condition()
 }
@@ -148,46 +152,38 @@ fn get_user_filter_expr(filter: UserRequestFilter) -> Cond {
         CustomAttributePresent(name) => attribute_condition(name, None),
 
         // NEW: GreaterOrEqual / LessOrEqual for timestamps (user side) — closes #1308
-        GreaterOrEqual(column, value) => {
-            match column {
-                UserColumn::CreationDate | UserColumn::ModifiedDate | UserColumn::PasswordModifiedDate => {
-                    ColumnTrait::gte(&column, value).into_condition()
-                }
-                _ => panic!("GreaterOrEqual only supported on date columns"),
-            }
-        }
-        LessOrEqual(column, value) => {
-            match column {
-                UserColumn::CreationDate | UserColumn::ModifiedDate | UserColumn::PasswordModifiedDate => {
-                    ColumnTrait::lte(&column, value).into_condition()
-                }
-                _ => panic!("LessOrEqual only supported on date columns"),
-            }
-        }
-        AttributeGreaterOrEqual(name, value) => {
-            Expr::in_subquery(
-                Expr::col(GroupColumn::GroupId.as_column_ref()),
-                model::GroupAttributes::find()
-                    .select_only()
-                    .column(model::GroupAttributesColumn::GroupId)
-                    .filter(model::GroupAttributesColumn::AttributeName.eq(name))
-                    .filter(model::GroupAttributesColumn::Value.gte(value))
-                    .into_query(),
-            )
-            .into_condition()
-        }
-        AttributeLessOrEqual(name, value) => {
-            Expr::in_subquery(
-                Expr::col(GroupColumn::GroupId.as_column_ref()),
-                model::GroupAttributes::find()
-                    .select_only()
-                    .column(model::GroupAttributesColumn::GroupId)
-                    .filter(model::GroupAttributesColumn::AttributeName.eq(name))
-                    .filter(model::GroupAttributesColumn::Value.lte(value))
-                    .into_query(),
-            )
-            .into_condition()
-        }
+        GreaterOrEqual(column, value) => match column {
+            UserColumn::CreationDate
+            | UserColumn::ModifiedDate
+            | UserColumn::PasswordModifiedDate => ColumnTrait::gte(&column, value).into_condition(),
+            _ => panic!("GreaterOrEqual only supported on date columns"),
+        },
+        LessOrEqual(column, value) => match column {
+            UserColumn::CreationDate
+            | UserColumn::ModifiedDate
+            | UserColumn::PasswordModifiedDate => ColumnTrait::lte(&column, value).into_condition(),
+            _ => panic!("LessOrEqual only supported on date columns"),
+        },
+        AttributeGreaterOrEqual(name, value) => Expr::in_subquery(
+            Expr::col(GroupColumn::GroupId.as_column_ref()),
+            model::GroupAttributes::find()
+                .select_only()
+                .column(model::GroupAttributesColumn::GroupId)
+                .filter(model::GroupAttributesColumn::AttributeName.eq(name))
+                .filter(model::GroupAttributesColumn::Value.gte(value))
+                .into_query(),
+        )
+        .into_condition(),
+        AttributeLessOrEqual(name, value) => Expr::in_subquery(
+            Expr::col(GroupColumn::GroupId.as_column_ref()),
+            model::GroupAttributes::find()
+                .select_only()
+                .column(model::GroupAttributesColumn::GroupId)
+                .filter(model::GroupAttributesColumn::AttributeName.eq(name))
+                .filter(model::GroupAttributesColumn::Value.lte(value))
+                .into_query(),
+        )
+        .into_condition(),
         AttributeSubString(name, filter) => attribute_substring_condition(name, &filter),
     }
 }
@@ -195,7 +191,11 @@ fn get_user_filter_expr(filter: UserRequestFilter) -> Cond {
 fn to_value(opt_name: &Option<String>) -> ActiveValue<Option<String>> {
     match opt_name {
         None => ActiveValue::NotSet,
-        Some(name) => ActiveValue::Set(if name.is_empty() { None } else { Some(name.to_owned()) }),
+        Some(name) => ActiveValue::Set(if name.is_empty() {
+            None
+        } else {
+            Some(name.to_owned())
+        }),
     }
 }
 
@@ -215,53 +215,53 @@ impl UserListerBackendHandler for SqlBackendHandler {
         _get_groups: bool,
     ) -> Result<Vec<UserAndGroups>> {
         let filters = filters
-        .map(get_user_filter_expr)
-        .unwrap_or_else(|| SimpleExpr::Value(true.into()).into_condition());
+            .map(get_user_filter_expr)
+            .unwrap_or_else(|| SimpleExpr::Value(true.into()).into_condition());
 
         let mut users: Vec<_> = model::User::find()
-        .filter(filters.clone())
-        .order_by_asc(UserColumn::UserId)
-        .find_with_linked(model::memberships::UserToGroup)
-        .order_by_asc(SimpleExpr::Column(
-            (Alias::new("r1"), GroupColumn::DisplayName).into_column_ref(),
-        ))
-        .all(&self.sql_pool)
-        .await?
-        .into_iter()
-        .map(|(user, groups)| UserAndGroups {
-            user: user.into(),
-             groups: Some(groups.into_iter().map(Into::<GroupDetails>::into).collect()),
-        })
-        .collect();
+            .filter(filters.clone())
+            .order_by_asc(UserColumn::UserId)
+            .find_with_linked(model::memberships::UserToGroup)
+            .order_by_asc(SimpleExpr::Column(
+                (Alias::new("r1"), GroupColumn::DisplayName).into_column_ref(),
+            ))
+            .all(&self.sql_pool)
+            .await?
+            .into_iter()
+            .map(|(user, groups)| UserAndGroups {
+                user: user.into(),
+                groups: Some(groups.into_iter().map(Into::<GroupDetails>::into).collect()),
+            })
+            .collect();
 
         let attributes = model::UserAttributes::find()
-        .filter(
-            model::UserAttributesColumn::UserId.in_subquery(
-                model::User::find()
-                .filter(filters)
-                .select_only()
-                .column(model::users::Column::UserId)
-                .into_query(),
-            ),
-        )
-        .order_by_asc(model::UserAttributesColumn::UserId)
-        .order_by_asc(model::UserAttributesColumn::AttributeName)
-        .all(&self.sql_pool)
-        .await?;
+            .filter(
+                model::UserAttributesColumn::UserId.in_subquery(
+                    model::User::find()
+                        .filter(filters)
+                        .select_only()
+                        .column(model::users::Column::UserId)
+                        .into_query(),
+                ),
+            )
+            .order_by_asc(model::UserAttributesColumn::UserId)
+            .order_by_asc(model::UserAttributesColumn::AttributeName)
+            .all(&self.sql_pool)
+            .await?;
 
         let mut attributes_iter = attributes.into_iter().peekable();
         let schema = self.get_schema().await?;
         for user in users.iter_mut() {
             let mut attrs: Vec<_> = attributes_iter
-            .take_while_ref(|u| u.user_id == user.user.user_id)
-            .map(|a| {
-                deserialize::deserialize_attribute(
-                    a.attribute_name,
-                    &a.value,
-                    schema.user_attributes(),
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
+                .take_while_ref(|u| u.user_id == user.user.user_id)
+                .map(|a| {
+                    deserialize::deserialize_attribute(
+                        a.attribute_name,
+                        &a.value,
+                        schema.user_attributes(),
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
 
             // Defensive canonical remap on read path (matches get_user_details).
             // Ensures AttributeEquality filters and list output always use canonical names,
@@ -283,7 +283,11 @@ impl SqlBackendHandler {
         insert_attributes: Vec<Attribute>,
         delete_attributes: Vec<AttributeName>,
         schema: &PublicSchema,
-    ) -> Result<(Vec<model::user_attributes::ActiveModel>, Vec<AttributeName>, Option<bool>)> {
+    ) -> Result<(
+        Vec<model::user_attributes::ActiveModel>,
+        Vec<AttributeName>,
+        Option<bool>,
+    )> {
         let mut update_user_attributes = Vec::new();
         // Resolve delete names to canonical too (supports alias in delete requests + keeps storage invariant)
         let mut remove_user_attributes: Vec<AttributeName> = delete_attributes
@@ -302,13 +306,11 @@ impl SqlBackendHandler {
             if attribute.name.as_str() == "kerberossync" {
                 kerb_sync_enabled = match &attribute.value {
                     // Frontend (user_details_form + kerberos_switch) sends String "0"/"1"
-                    AttributeValue::String(Cardinality::Singleton(s)) => {
-                        match s.trim() {
-                            "1" | "true" | "TRUE" => Some(true),
-                            "0" | "false" | "FALSE" => Some(false),
-                            _ => Some(false),
-                        }
-                    }
+                    AttributeValue::String(Cardinality::Singleton(s)) => match s.trim() {
+                        "1" | "true" | "TRUE" => Some(true),
+                        "0" | "false" | "FALSE" => Some(false),
+                        _ => Some(false),
+                    },
                     // Support the old Integer style too (for safety)
                     AttributeValue::Integer(Cardinality::Singleton(1)) => Some(true),
                     AttributeValue::Integer(Cardinality::Singleton(0)) => Some(false),
@@ -318,7 +320,10 @@ impl SqlBackendHandler {
 
             // === BACKEND BYPASS FOR READONLY ATTRIBUTES USED BY OU OPERATIONS ===
             let attr_name = attribute.name.as_str();
-            if schema.user_attributes().get_attribute_type(attr_name).is_some()
+            if schema
+                .user_attributes()
+                .get_attribute_type(attr_name)
+                .is_some()
                 || is_backend_writable_readonly_attribute(attr_name)
             {
                 let db_value = attribute_value_to_db_bytes(&attribute.value);
@@ -337,10 +342,16 @@ impl SqlBackendHandler {
         }
 
         remove_user_attributes.retain(|name| {
-            !update_user_attributes.iter().any(|u| u.attribute_name == Set(name.clone()))
+            !update_user_attributes
+                .iter()
+                .any(|u| u.attribute_name == Set(name.clone()))
         });
 
-        Ok((update_user_attributes, remove_user_attributes, kerb_sync_enabled))
+        Ok((
+            update_user_attributes,
+            remove_user_attributes,
+            kerb_sync_enabled,
+        ))
     }
 
     async fn update_user_with_transaction(
@@ -349,12 +360,12 @@ impl SqlBackendHandler {
     ) -> Result<()> {
         let schema = Self::get_schema_with_transaction(transaction).await?;
         let (update_user_attributes, remove_user_attributes, kerb_sync_enabled) =
-        Self::compute_user_attribute_changes(
-            &request.user_id,
-            request.insert_attributes,
-            request.delete_attributes,
-            &schema,
-        )?;
+            Self::compute_user_attribute_changes(
+                &request.user_id,
+                request.insert_attributes,
+                request.delete_attributes,
+                &schema,
+            )?;
 
         let lower_email = request.email.as_ref().map(|s| s.as_str().to_lowercase());
         let now = chrono::Utc::now().naive_utc();
@@ -369,19 +380,18 @@ impl SqlBackendHandler {
             };
 
             let value = match &attr.value {
-                ActiveValue::Set(Serialized(bytes)) => {
-                    match String::from_utf8(bytes.clone()) {
-                        Ok(s) => s.trim().parse::<i64>().unwrap_or(0),
-                        Err(_) => continue,
-                    }
-                }
+                ActiveValue::Set(Serialized(bytes)) => match String::from_utf8(bytes.clone()) {
+                    Ok(s) => s.trim().parse::<i64>().unwrap_or(0),
+                    Err(_) => continue,
+                },
                 _ => continue,
             };
 
             if name == "uidnumber" || name == "gidnumber" {
                 if !(3000..=60000).contains(&value) {
                     return Err(DomainError::InternalError(format!(
-                        "{} must be between 3000 and 60000", name
+                        "{} must be between 3000 and 60000",
+                        name
                     )));
                 }
 
@@ -393,7 +403,8 @@ impl SqlBackendHandler {
 
                 if taken {
                     return Err(DomainError::InternalError(format!(
-                        "Number {} is already assigned to another user/group", value
+                        "Number {} is already assigned to another user/group",
+                        value
                     )));
                 }
             }
@@ -411,24 +422,24 @@ impl SqlBackendHandler {
 
         if !remove_user_attributes.is_empty() {
             model::UserAttributes::delete_many()
-            .filter(model::UserAttributesColumn::UserId.eq(&request.user_id))
-            .filter(model::UserAttributesColumn::AttributeName.is_in(remove_user_attributes))
-            .exec(transaction)
-            .await?;
+                .filter(model::UserAttributesColumn::UserId.eq(&request.user_id))
+                .filter(model::UserAttributesColumn::AttributeName.is_in(remove_user_attributes))
+                .exec(transaction)
+                .await?;
         }
 
         if !update_user_attributes.is_empty() {
             model::UserAttributes::insert_many(update_user_attributes)
-            .on_conflict(
-                OnConflict::columns([
-                    model::UserAttributesColumn::UserId,
-                    model::UserAttributesColumn::AttributeName,
-                ])
-                .update_column(model::UserAttributesColumn::Value)
-                .to_owned(),
-            )
-            .exec(transaction)
-            .await?;
+                .on_conflict(
+                    OnConflict::columns([
+                        model::UserAttributesColumn::UserId,
+                        model::UserAttributesColumn::AttributeName,
+                    ])
+                    .update_column(model::UserAttributesColumn::Value)
+                    .to_owned(),
+                )
+                .exec(transaction)
+                .await?;
         }
 
         match kerb_sync_enabled {
@@ -444,7 +455,11 @@ impl SqlBackendHandler {
 
                 // === Actually delete the principal from the Kerberos KDC ===
                 if let Err(e) = delete_kerberos_principal(request.user_id.as_str()) {
-                    tracing::warn!("Failed to delete Kerberos principal for user {} when disabling sync: {}", request.user_id, e);
+                    tracing::warn!(
+                        "Failed to delete Kerberos principal for user {} when disabling sync: {}",
+                        request.user_id,
+                        e
+                    );
                 }
             }
             Some(true) => {}
@@ -453,7 +468,6 @@ impl SqlBackendHandler {
 
         Ok(())
     }
-
 }
 
 #[async_trait]
@@ -465,7 +479,8 @@ impl SystemConfigBackendHandler for SqlBackendHandler {
             .await?;
 
         let json_str = config.map(|c| c.value).unwrap_or_else(|| "[]".to_string());
-        Ok(serde_json::from_str(&json_str).unwrap_or_else(|_| vec!["people".to_string(), "groups".to_string()]))
+        Ok(serde_json::from_str(&json_str)
+            .unwrap_or_else(|_| vec!["people".to_string(), "groups".to_string()]))
     }
 
     async fn set_system_config(&self, key: &str, value: String) -> Result<()> {
@@ -498,7 +513,11 @@ impl SystemConfigBackendHandler for SqlBackendHandler {
 
         if enabled {
             let principal = lldap_kerberos::get_kerberos_principal_name(user_id.as_str());
-            tracing::info!("Kerberos sync succeeded → injecting protected krbPrincipalName = {} for user {}", principal, user_id);
+            tracing::info!(
+                "Kerberos sync succeeded → injecting protected krbPrincipalName = {} for user {}",
+                principal,
+                user_id
+            );
 
             let update = model::users::ActiveModel {
                 user_id: ActiveValue::Set(user_id.clone()),
@@ -506,9 +525,15 @@ impl SystemConfigBackendHandler for SqlBackendHandler {
                 modified_date: ActiveValue::Set(now),
                 ..Default::default()
             };
-            update.update(&self.sql_pool).await.map_err(lldap_domain_model::error::DomainError::DatabaseError)?;
+            update
+                .update(&self.sql_pool)
+                .await
+                .map_err(lldap_domain_model::error::DomainError::DatabaseError)?;
         } else {
-            tracing::info!("Kerberos sync disabled → clearing krbPrincipalName for user {}", user_id);
+            tracing::info!(
+                "Kerberos sync disabled → clearing krbPrincipalName for user {}",
+                user_id
+            );
 
             let update = model::users::ActiveModel {
                 user_id: ActiveValue::Set(user_id.clone()),
@@ -516,7 +541,10 @@ impl SystemConfigBackendHandler for SqlBackendHandler {
                 modified_date: ActiveValue::Set(now),
                 ..Default::default()
             };
-            update.update(&self.sql_pool).await.map_err(lldap_domain_model::error::DomainError::DatabaseError)?;
+            update
+                .update(&self.sql_pool)
+                .await
+                .map_err(lldap_domain_model::error::DomainError::DatabaseError)?;
         }
         Ok(())
     }
@@ -530,17 +558,19 @@ impl SqlBackendHandler {
             .one(&self.sql_pool)
             .await?;
 
-        let json_str = config.map(|c| c.value).unwrap_or_else(|| {
-            serde_json::to_string(&PosixSettings::default()).unwrap()
-        });
+        let json_str = config
+            .map(|c| c.value)
+            .unwrap_or_else(|| serde_json::to_string(&PosixSettings::default()).unwrap());
 
-        serde_json::from_str(&json_str)
-            .map_err(|e| DomainError::InternalError(format!("Failed to parse posix_settings JSON: {}", e)))
+        serde_json::from_str(&json_str).map_err(|e| {
+            DomainError::InternalError(format!("Failed to parse posix_settings JSON: {}", e))
+        })
     }
 
     pub async fn set_posix_settings(&self, settings: PosixSettings) -> Result<()> {
-        let json = serde_json::to_string(&settings)
-            .map_err(|e| DomainError::InternalError(format!("Failed to serialize posix_settings: {}", e)))?;
+        let json = serde_json::to_string(&settings).map_err(|e| {
+            DomainError::InternalError(format!("Failed to serialize posix_settings: {}", e))
+        })?;
         self.set_system_config("posix_settings", json).await
     }
 
@@ -553,15 +583,16 @@ impl SqlBackendHandler {
             .one(transaction)
             .await?;
 
-        let json_str = config.map(|c| c.value).unwrap_or_else(|| {
-            serde_json::to_string(&PosixSettings::default()).unwrap()
-        });
+        let json_str = config
+            .map(|c| c.value)
+            .unwrap_or_else(|| serde_json::to_string(&PosixSettings::default()).unwrap());
 
-        serde_json::from_str(&json_str)
-            .map_err(|e| DomainError::InternalError(format!("Failed to parse posix_settings JSON: {}", e)))
+        serde_json::from_str(&json_str).map_err(|e| {
+            DomainError::InternalError(format!("Failed to parse posix_settings JSON: {}", e))
+        })
     }
 
-        // === NEXT AVAILABLE POSIX NUMBER HELPERS (respect admin overrides + skip collisions) ===
+    // === NEXT AVAILABLE POSIX NUMBER HELPERS (respect admin overrides + skip collisions) ===
     pub(crate) async fn next_available_uid_number(
         transaction: &DatabaseTransaction,
         start: i64,
@@ -569,7 +600,8 @@ impl SqlBackendHandler {
     ) -> Result<i64> {
         if start > max {
             return Err(DomainError::InternalError(format!(
-                "uidNumber start ({}) > max ({})", start, max
+                "uidNumber start ({}) > max ({})",
+                start, max
             )));
         }
         let mut candidate = start;
@@ -580,7 +612,8 @@ impl SqlBackendHandler {
             candidate += 1;
         }
         Err(DomainError::InternalError(format!(
-            "No available uidNumber in range {}-{} (all taken)", start, max
+            "No available uidNumber in range {}-{} (all taken)",
+            start, max
         )))
     }
 
@@ -591,7 +624,8 @@ impl SqlBackendHandler {
     ) -> Result<i64> {
         if start > max {
             return Err(DomainError::InternalError(format!(
-                "gidNumber start ({}) > max ({})", start, max
+                "gidNumber start ({}) > max ({})",
+                start, max
             )));
         }
         let mut candidate = start;
@@ -602,7 +636,8 @@ impl SqlBackendHandler {
             candidate += 1;
         }
         Err(DomainError::InternalError(format!(
-            "No available gidNumber in range {}-{} (all taken)", start, max
+            "No available gidNumber in range {}-{} (all taken)",
+            start, max
         )))
     }
 
@@ -612,10 +647,10 @@ impl SqlBackendHandler {
         uid: i64,
     ) -> Result<bool> {
         let count = model::UserAttributes::find()
-        .filter(model::UserAttributesColumn::AttributeName.eq("uidnumber"))
-        .filter(model::UserAttributesColumn::Value.eq(uid.to_string().into_bytes()))
-        .count(transaction)
-        .await?;
+            .filter(model::UserAttributesColumn::AttributeName.eq("uidnumber"))
+            .filter(model::UserAttributesColumn::Value.eq(uid.to_string().into_bytes()))
+            .count(transaction)
+            .await?;
         Ok(count > 0)
     }
 
@@ -624,14 +659,14 @@ impl SqlBackendHandler {
         gid: i64,
     ) -> Result<bool> {
         let count = model::GroupAttributes::find()
-        .filter(model::GroupAttributesColumn::AttributeName.eq("gidnumber"))
-        .filter(model::GroupAttributesColumn::Value.eq(gid.to_string().into_bytes()))
-        .count(transaction)
-        .await?;
+            .filter(model::GroupAttributesColumn::AttributeName.eq("gidnumber"))
+            .filter(model::GroupAttributesColumn::Value.eq(gid.to_string().into_bytes()))
+            .count(transaction)
+            .await?;
         Ok(count > 0)
     }
 
-#[instrument(skip(self), level = "info", err)]
+    #[instrument(skip(self), level = "info", err)]
     pub async fn reassign_gid_numbers(&self) -> Result<()> {
         let settings = self.get_posix_settings().await?;
         self.sql_pool
@@ -642,29 +677,31 @@ impl SqlBackendHandler {
                             .order_by_asc(model::groups::Column::CreationDate)
                             .all(transaction)
                             .await?;
-                        for (next_gid, group) in (settings.group_gidnumber_start..).zip(groups.into_iter()) {
+                        for (next_gid, group) in
+                            (settings.group_gidnumber_start..).zip(groups.into_iter())
+                        {
                             let gid_value = next_gid.to_string().into_bytes();
                             let attr = model::group_attributes::ActiveModel {
                                 group_id: Set(group.group_id),
-                         attribute_name: Set(AttributeName::from("gidnumber")),
-                         value: Set(Serialized(gid_value)),
+                                attribute_name: Set(AttributeName::from("gidnumber")),
+                                value: Set(Serialized(gid_value)),
                             };
                             model::GroupAttributes::insert(attr)
-                            .on_conflict(
-                                OnConflict::columns([
-                                    model::group_attributes::Column::GroupId,
-                                    model::group_attributes::Column::AttributeName,
-                                ])
-                                .update_column(model::group_attributes::Column::Value)
-                                .to_owned(),
-                            )
-                            .exec(transaction)
-                            .await?;
+                                .on_conflict(
+                                    OnConflict::columns([
+                                        model::group_attributes::Column::GroupId,
+                                        model::group_attributes::Column::AttributeName,
+                                    ])
+                                    .update_column(model::group_attributes::Column::Value)
+                                    .to_owned(),
+                                )
+                                .exec(transaction)
+                                .await?;
                             let now = chrono::Utc::now().naive_utc();
                             let update = model::groups::ActiveModel {
                                 group_id: Set(group.group_id),
-                         modified_date: Set(now),
-                         ..Default::default()
+                                modified_date: Set(now),
+                                ..Default::default()
                             };
                             update.update(transaction).await?;
                         }
@@ -681,159 +718,208 @@ impl SqlBackendHandler {
         Ok(())
     }
 
-#[instrument(skip(self), level = "info", err)]
+    #[instrument(skip(self), level = "info", err)]
     pub async fn reassign_user_uid_numbers(&self) -> Result<()> {
         let settings = self.get_posix_settings().await?;
-        self.sql_pool.transaction::<_, (), DomainError>(|tx| {
-            Box::pin(async move {
-                if settings.user_uidnumber_assign {
-                    let users = model::User::find().order_by_asc(model::users::Column::CreationDate).all(tx).await?;
-                    for (next, user) in (settings.user_uidnumber_start..).zip(users.into_iter()) {
-                        let uid_value = next.to_string().into_bytes();
-                        let attr = model::user_attributes::ActiveModel {
-                            user_id: Set(user.user_id.clone()),
-                     attribute_name: Set(AttributeName::from("uidnumber")),
-                     value: Set(Serialized(uid_value)),
-                        };
-                        model::UserAttributes::insert(attr)
-                        .on_conflict(
-                            OnConflict::columns([
-                                model::user_attributes::Column::UserId,
-                                model::user_attributes::Column::AttributeName,
-                            ])
-                            .update_column(model::user_attributes::Column::Value)
-                            .to_owned(),
-                        )
-                        .exec(tx)
-                        .await?;
-                        let now = chrono::Utc::now().naive_utc();
-                        model::users::ActiveModel {
-                            user_id: Set(user.user_id),
-                     modified_date: Set(now),
-                     ..Default::default()
+        self.sql_pool
+            .transaction::<_, (), DomainError>(|tx| {
+                Box::pin(async move {
+                    if settings.user_uidnumber_assign {
+                        let users = model::User::find()
+                            .order_by_asc(model::users::Column::CreationDate)
+                            .all(tx)
+                            .await?;
+                        for (next, user) in (settings.user_uidnumber_start..).zip(users.into_iter())
+                        {
+                            let uid_value = next.to_string().into_bytes();
+                            let attr = model::user_attributes::ActiveModel {
+                                user_id: Set(user.user_id.clone()),
+                                attribute_name: Set(AttributeName::from("uidnumber")),
+                                value: Set(Serialized(uid_value)),
+                            };
+                            model::UserAttributes::insert(attr)
+                                .on_conflict(
+                                    OnConflict::columns([
+                                        model::user_attributes::Column::UserId,
+                                        model::user_attributes::Column::AttributeName,
+                                    ])
+                                    .update_column(model::user_attributes::Column::Value)
+                                    .to_owned(),
+                                )
+                                .exec(tx)
+                                .await?;
+                            let now = chrono::Utc::now().naive_utc();
+                            model::users::ActiveModel {
+                                user_id: Set(user.user_id),
+                                modified_date: Set(now),
+                                ..Default::default()
+                            }
+                            .update(tx)
+                            .await?;
                         }
-                        .update(tx)
-                        .await?;
+                    } else {
+                        model::UserAttributes::delete_many()
+                            .filter(model::user_attributes::Column::AttributeName.eq("uidnumber"))
+                            .exec(tx)
+                            .await?;
                     }
-                } else {
-                    model::UserAttributes::delete_many()
-                        .filter(model::user_attributes::Column::AttributeName.eq("uidnumber"))
-                        .exec(tx)
-                        .await?;
-                }
-                Ok(())
+                    Ok(())
+                })
             })
-        }).await?;
+            .await?;
         Ok(())
     }
 
     #[instrument(skip(self), level = "info", err)]
     pub async fn reassign_user_gid_numbers(&self) -> Result<()> {
         let settings = self.get_posix_settings().await?;
-        self.sql_pool.transaction::<_, (), DomainError>(|tx| {
-            Box::pin(async move {
-                if settings.user_gidnumber_assign {
-                    // STATIC assignment — every user gets the exact same gidNumber from config
-                    let users = model::User::find().all(tx).await?;
-                    for user in users {
-                        let gid_value = settings.user_gidnumber_start.to_string().into_bytes();
-                        let attr = model::user_attributes::ActiveModel {
-                            user_id: Set(user.user_id.clone()),
-                            attribute_name: Set(AttributeName::from("gidnumber")),
-                            value: Set(Serialized(gid_value)),
-                        };
-                        model::UserAttributes::insert(attr)
-                            .on_conflict(OnConflict::columns([
-                                model::user_attributes::Column::UserId,
-                                model::user_attributes::Column::AttributeName,
-                            ])
-                            .update_column(model::user_attributes::Column::Value)
-                            .to_owned())
-                            .exec(tx).await?;
-                        let now = chrono::Utc::now().naive_utc();
-                        model::users::ActiveModel {
-                            user_id: Set(user.user_id),
-                            modified_date: Set(now),
-                            ..Default::default()
-                        }.update(tx).await?;
+        self.sql_pool
+            .transaction::<_, (), DomainError>(|tx| {
+                Box::pin(async move {
+                    if settings.user_gidnumber_assign {
+                        // STATIC assignment — every user gets the exact same gidNumber from config
+                        let users = model::User::find().all(tx).await?;
+                        for user in users {
+                            let gid_value = settings.user_gidnumber_start.to_string().into_bytes();
+                            let attr = model::user_attributes::ActiveModel {
+                                user_id: Set(user.user_id.clone()),
+                                attribute_name: Set(AttributeName::from("gidnumber")),
+                                value: Set(Serialized(gid_value)),
+                            };
+                            model::UserAttributes::insert(attr)
+                                .on_conflict(
+                                    OnConflict::columns([
+                                        model::user_attributes::Column::UserId,
+                                        model::user_attributes::Column::AttributeName,
+                                    ])
+                                    .update_column(model::user_attributes::Column::Value)
+                                    .to_owned(),
+                                )
+                                .exec(tx)
+                                .await?;
+                            let now = chrono::Utc::now().naive_utc();
+                            model::users::ActiveModel {
+                                user_id: Set(user.user_id),
+                                modified_date: Set(now),
+                                ..Default::default()
+                            }
+                            .update(tx)
+                            .await?;
+                        }
+                    } else {
+                        // Toggle OFF → delete gidnumber from all users
+                        model::UserAttributes::delete_many()
+                            .filter(model::user_attributes::Column::AttributeName.eq("gidnumber"))
+                            .exec(tx)
+                            .await?;
                     }
-                } else {
-                    // Toggle OFF → delete gidnumber from all users
-                    model::UserAttributes::delete_many()
-                        .filter(model::user_attributes::Column::AttributeName.eq("gidnumber"))
-                        .exec(tx)
-                        .await?;
-                }
-                Ok(())
+                    Ok(())
+                })
             })
-        }).await?;
+            .await?;
         Ok(())
     }
 
-#[instrument(skip(self), level = "info", err)]
+    #[instrument(skip(self), level = "info", err)]
     pub async fn reassign_user_homedirectories(&self) -> Result<()> {
         let settings = self.get_posix_settings().await?;
-        self.sql_pool.transaction::<_, (), DomainError>(|tx| {
-            Box::pin(async move {
-                if settings.user_homedirectory_assign {
-                    let users = model::User::find().all(tx).await?;
-                    for user in users {
-                        let home = format!("{}/{}", settings.user_homedirectory_prefix, user.user_id);
-                        let attr = model::user_attributes::ActiveModel {
-                            user_id: Set(user.user_id.clone()),
-                            attribute_name: Set(AttributeName::from("homedirectory")),
-                            value: Set(Serialized(home.into_bytes())),
-                        };
-                        model::UserAttributes::insert(attr)
-                            .on_conflict(OnConflict::columns([model::user_attributes::Column::UserId, model::user_attributes::Column::AttributeName]).update_column(model::user_attributes::Column::Value).to_owned())
-                            .exec(tx).await?;
-                        let now = chrono::Utc::now().naive_utc();
-                        model::users::ActiveModel { user_id: Set(user.user_id), modified_date: Set(now), ..Default::default() }.update(tx).await?;
+        self.sql_pool
+            .transaction::<_, (), DomainError>(|tx| {
+                Box::pin(async move {
+                    if settings.user_homedirectory_assign {
+                        let users = model::User::find().all(tx).await?;
+                        for user in users {
+                            let home =
+                                format!("{}/{}", settings.user_homedirectory_prefix, user.user_id);
+                            let attr = model::user_attributes::ActiveModel {
+                                user_id: Set(user.user_id.clone()),
+                                attribute_name: Set(AttributeName::from("homedirectory")),
+                                value: Set(Serialized(home.into_bytes())),
+                            };
+                            model::UserAttributes::insert(attr)
+                                .on_conflict(
+                                    OnConflict::columns([
+                                        model::user_attributes::Column::UserId,
+                                        model::user_attributes::Column::AttributeName,
+                                    ])
+                                    .update_column(model::user_attributes::Column::Value)
+                                    .to_owned(),
+                                )
+                                .exec(tx)
+                                .await?;
+                            let now = chrono::Utc::now().naive_utc();
+                            model::users::ActiveModel {
+                                user_id: Set(user.user_id),
+                                modified_date: Set(now),
+                                ..Default::default()
+                            }
+                            .update(tx)
+                            .await?;
+                        }
+                    } else {
+                        model::UserAttributes::delete_many()
+                            .filter(
+                                model::user_attributes::Column::AttributeName.eq("homedirectory"),
+                            )
+                            .exec(tx)
+                            .await?;
                     }
-                } else {
-                    model::UserAttributes::delete_many()
-                        .filter(model::user_attributes::Column::AttributeName.eq("homedirectory"))
-                        .exec(tx)
-                        .await?;
-                }
-                Ok(())
+                    Ok(())
+                })
             })
-        }).await?;
+            .await?;
         Ok(())
     }
 
-#[instrument(skip(self), level = "info", err)]
+    #[instrument(skip(self), level = "info", err)]
     pub async fn reassign_user_loginshells(&self) -> Result<()> {
         let settings = self.get_posix_settings().await?;
-        self.sql_pool.transaction::<_, (), DomainError>(|tx| {
-            Box::pin(async move {
-                if settings.user_loginshell_assign {
-                    let users = model::User::find().all(tx).await?;
-                    for user in users {
-                        let attr = model::user_attributes::ActiveModel {
-                            user_id: Set(user.user_id.clone()),
-                            attribute_name: Set(AttributeName::from("loginshell")),
-                            value: Set(Serialized(settings.user_loginshell_default.clone().into_bytes())),
-                        };
-                        model::UserAttributes::insert(attr)
-                            .on_conflict(OnConflict::columns([model::user_attributes::Column::UserId, model::user_attributes::Column::AttributeName]).update_column(model::user_attributes::Column::Value).to_owned())
-                            .exec(tx).await?;
-                        let now = chrono::Utc::now().naive_utc();
-                        model::users::ActiveModel { user_id: Set(user.user_id), modified_date: Set(now), ..Default::default() }.update(tx).await?;
+        self.sql_pool
+            .transaction::<_, (), DomainError>(|tx| {
+                Box::pin(async move {
+                    if settings.user_loginshell_assign {
+                        let users = model::User::find().all(tx).await?;
+                        for user in users {
+                            let attr = model::user_attributes::ActiveModel {
+                                user_id: Set(user.user_id.clone()),
+                                attribute_name: Set(AttributeName::from("loginshell")),
+                                value: Set(Serialized(
+                                    settings.user_loginshell_default.clone().into_bytes(),
+                                )),
+                            };
+                            model::UserAttributes::insert(attr)
+                                .on_conflict(
+                                    OnConflict::columns([
+                                        model::user_attributes::Column::UserId,
+                                        model::user_attributes::Column::AttributeName,
+                                    ])
+                                    .update_column(model::user_attributes::Column::Value)
+                                    .to_owned(),
+                                )
+                                .exec(tx)
+                                .await?;
+                            let now = chrono::Utc::now().naive_utc();
+                            model::users::ActiveModel {
+                                user_id: Set(user.user_id),
+                                modified_date: Set(now),
+                                ..Default::default()
+                            }
+                            .update(tx)
+                            .await?;
+                        }
+                    } else {
+                        model::UserAttributes::delete_many()
+                            .filter(model::user_attributes::Column::AttributeName.eq("loginshell"))
+                            .exec(tx)
+                            .await?;
                     }
-                } else {
-                    model::UserAttributes::delete_many()
-                        .filter(model::user_attributes::Column::AttributeName.eq("loginshell"))
-                        .exec(tx)
-                        .await?;
-                }
-                Ok(())
+                    Ok(())
+                })
             })
-        }).await?;
+            .await?;
         Ok(())
     }
 }
-
 
 #[async_trait]
 impl UserBackendHandler for SqlBackendHandler {
@@ -841,36 +927,36 @@ impl UserBackendHandler for SqlBackendHandler {
     async fn get_user_details(&self, user_id: &UserId) -> Result<User> {
         let mut user = User::from(
             model::User::find_by_id(user_id.to_owned())
-            .one(&self.sql_pool)
-            .await?
-            .ok_or_else(|| DomainError::EntityNotFound(user_id.to_string()))?,
+                .one(&self.sql_pool)
+                .await?
+                .ok_or_else(|| DomainError::EntityNotFound(user_id.to_string()))?,
         );
 
         let attributes = model::UserAttributes::find()
-        .filter(model::UserAttributesColumn::UserId.eq(user_id))
-        .order_by_asc(model::UserAttributesColumn::AttributeName)
-        .all(&self.sql_pool)
-        .await?;
+            .filter(model::UserAttributesColumn::UserId.eq(user_id))
+            .order_by_asc(model::UserAttributesColumn::AttributeName)
+            .all(&self.sql_pool)
+            .await?;
 
         let schema = self.get_schema().await?;
         user.attributes = attributes
-        .into_iter()
-        .map(|a| {
-            let mut attr = deserialize::deserialize_attribute(
-                a.attribute_name,
-                &a.value,
-                schema.user_attributes(),
-            )?;
+            .into_iter()
+            .map(|a| {
+                let mut attr = deserialize::deserialize_attribute(
+                    a.attribute_name,
+                    &a.value,
+                    schema.user_attributes(),
+                )?;
 
-            // Force canonical name on output (defensive against any legacy alias data)
-            attr.name = Self::canonical_user_attribute_name(&schema, attr.name.as_str());
+                // Force canonical name on output (defensive against any legacy alias data)
+                attr.name = Self::canonical_user_attribute_name(&schema, attr.name.as_str());
 
-            if attr.name.as_str() == "avatar" {
-                debug!("GET_USER_DETAILS: avatar attribute found in EAV");
-            }
-            Ok(attr)
-        })
-        .collect::<Result<Vec<_>>>()?;
+                if attr.name.as_str() == "avatar" {
+                    debug!("GET_USER_DETAILS: avatar attribute found in EAV");
+                }
+                Ok(attr)
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         user.materialize_protected_fields();
         Ok(user)
@@ -879,17 +965,17 @@ impl UserBackendHandler for SqlBackendHandler {
     #[instrument(skip_all, level = "debug", err, fields(user_id = ?user_id.as_str()))]
     async fn get_user_groups(&self, user_id: &UserId) -> Result<HashSet<GroupDetails>> {
         let user = model::User::find_by_id(user_id.to_owned())
-        .one(&self.sql_pool)
-        .await?
-        .ok_or_else(|| DomainError::EntityNotFound(user_id.to_string()))?;
+            .one(&self.sql_pool)
+            .await?
+            .ok_or_else(|| DomainError::EntityNotFound(user_id.to_string()))?;
 
         Ok(user
-        .find_linked(model::memberships::UserToGroup)
-        .all(&self.sql_pool)
-        .await?
-        .into_iter()
-        .map(Into::<GroupDetails>::into)
-        .collect())
+            .find_linked(model::memberships::UserToGroup)
+            .all(&self.sql_pool)
+            .await?
+            .into_iter()
+            .map(Into::<GroupDetails>::into)
+            .collect())
     }
 
     #[instrument(skip(self), level = "debug", err, fields(user_id = ?request.user_id.as_str()))]
@@ -898,7 +984,9 @@ impl UserBackendHandler for SqlBackendHandler {
         let uuid = Uuid::from_name_and_date(request.user_id.as_str(), &now);
         let lower_email = request.email.as_str().to_lowercase();
 
-        let default_ou = self.get_allowed_ous().await?
+        let default_ou = self
+            .get_allowed_ous()
+            .await?
             .into_iter()
             .next()
             .unwrap_or_else(|| "people".to_string());
@@ -928,7 +1016,8 @@ impl UserBackendHandler for SqlBackendHandler {
                         if name == "uidnumber" || name == "gidnumber" {
                             if value != 0 && !(3000..=60000).contains(&value) {
                                 return Err(DomainError::InternalError(format!(
-                                    "{} must be between 3000 and 60000", name
+                                    "{} must be between 3000 and 60000",
+                                    name
                                 )));
                             }
 
@@ -940,7 +1029,8 @@ impl UserBackendHandler for SqlBackendHandler {
 
                             if taken {
                                 return Err(DomainError::InternalError(format!(
-                                    "Number {} is already assigned to another user/group", value
+                                    "Number {} is already assigned to another user/group",
+                                    value
                                 )));
                             }
                         }
@@ -950,13 +1040,16 @@ impl UserBackendHandler for SqlBackendHandler {
                     let mut final_attributes = request.attributes;
 
                     if settings.user_uidnumber_assign {
-                        let already_has_uid = final_attributes.iter().any(|a| a.name.as_str() == "uidnumber");
+                        let already_has_uid = final_attributes
+                            .iter()
+                            .any(|a| a.name.as_str() == "uidnumber");
                         if !already_has_uid {
                             let next_uid = Self::next_available_uid_number(
                                 transaction,
                                 settings.user_uidnumber_start,
                                 settings.user_uidnumber_max,
-                            ).await?;
+                            )
+                            .await?;
                             final_attributes.push(Attribute {
                                 name: "uidnumber".into(),
                                 value: AttributeValue::Integer(Cardinality::Singleton(next_uid)),
@@ -965,29 +1058,42 @@ impl UserBackendHandler for SqlBackendHandler {
                     }
 
                     if settings.user_gidnumber_assign {
-                        let already_has_gid = final_attributes.iter().any(|a| a.name.as_str() == "gidnumber");
+                        let already_has_gid = final_attributes
+                            .iter()
+                            .any(|a| a.name.as_str() == "gidnumber");
                         if !already_has_gid {
                             final_attributes.push(Attribute {
                                 name: "gidnumber".into(),
-                                value: AttributeValue::Integer(Cardinality::Singleton(settings.user_gidnumber_start)),
+                                value: AttributeValue::Integer(Cardinality::Singleton(
+                                    settings.user_gidnumber_start,
+                                )),
                             });
                         }
                     }
 
                     if settings.user_loginshell_assign {
-                        let already_has_shell = final_attributes.iter().any(|a| a.name.as_str() == "loginshell");
+                        let already_has_shell = final_attributes
+                            .iter()
+                            .any(|a| a.name.as_str() == "loginshell");
                         if !already_has_shell {
                             final_attributes.push(Attribute {
                                 name: "loginshell".into(),
-                                value: AttributeValue::String(Cardinality::Singleton(settings.user_loginshell_default.clone())),
+                                value: AttributeValue::String(Cardinality::Singleton(
+                                    settings.user_loginshell_default.clone(),
+                                )),
                             });
                         }
                     }
 
                     if settings.user_homedirectory_assign {
-                        let already_has_home = final_attributes.iter().any(|a| a.name.as_str() == "homedirectory");
+                        let already_has_home = final_attributes
+                            .iter()
+                            .any(|a| a.name.as_str() == "homedirectory");
                         if !already_has_home {
-                            let home_dir = format!("{}/{}", settings.user_homedirectory_prefix, request.user_id);
+                            let home_dir = format!(
+                                "{}/{}",
+                                settings.user_homedirectory_prefix, request.user_id
+                            );
                             final_attributes.push(Attribute {
                                 name: "homedirectory".into(),
                                 value: AttributeValue::String(Cardinality::Singleton(home_dir)),
@@ -1018,7 +1124,11 @@ impl UserBackendHandler for SqlBackendHandler {
                             .map(|s| s.name.clone().into())
                             .unwrap_or_else(|| attribute.name.clone());
 
-                        if schema.user_attributes().get_attribute_type(attribute.name.as_str()).is_some() {
+                        if schema
+                            .user_attributes()
+                            .get_attribute_type(attribute.name.as_str())
+                            .is_some()
+                        {
                             let db_value = attribute_value_to_db_bytes(&attribute.value);
                             new_user_attributes.push(model::user_attributes::ActiveModel {
                                 user_id: Set(request.user_id.clone()),
@@ -1044,10 +1154,12 @@ impl UserBackendHandler for SqlBackendHandler {
     #[instrument(skip(self), level = "debug", err, fields(user_id = ?request.user_id.as_str()))]
     async fn update_user(&self, request: UpdateUserRequest) -> Result<()> {
         self.sql_pool
-        .transaction::<_, (), DomainError>(|transaction| {
-            Box::pin(async move { Self::update_user_with_transaction(transaction, request).await })
-        })
-        .await?;
+            .transaction::<_, (), DomainError>(|transaction| {
+                Box::pin(
+                    async move { Self::update_user_with_transaction(transaction, request).await },
+                )
+            })
+            .await?;
         Ok(())
     }
 
@@ -1059,16 +1171,18 @@ impl UserBackendHandler for SqlBackendHandler {
         if let Err(e) = delete_kerberos_principal(user_id.as_str()) {
             tracing::warn!(
                 "Failed to delete Kerberos principal for user {} during deletion (non-fatal): {}",
-                           user_id,
-                           e
+                user_id,
+                e
             );
         }
 
         let res = model::User::delete_by_id(user_id.clone())
-        .exec(&self.sql_pool)
-        .await?;
+            .exec(&self.sql_pool)
+            .await?;
         if res.rows_affected == 0 {
-            return Err(DomainError::EntityNotFound(format!("No such user: '{user_id}'")));
+            return Err(DomainError::EntityNotFound(format!(
+                "No such user: '{user_id}'"
+            )));
         }
         Ok(())
     }
@@ -1080,10 +1194,16 @@ impl UserBackendHandler for SqlBackendHandler {
         let target_group_details = self.get_group_details(group_id).await?;
 
         let target_name = target_group_details.display_name.as_str();
-        let has_admin = user_groups.iter().any(|g| g.display_name == "lldap_admin".into());
-        let has_disabled = user_groups.iter().any(|g| g.display_name == "lldap_disabled".into());
+        let has_admin = user_groups
+            .iter()
+            .any(|g| g.display_name == "lldap_admin".into());
+        let has_disabled = user_groups
+            .iter()
+            .any(|g| g.display_name == "lldap_disabled".into());
 
-        if (target_name == "lldap_admin" && has_disabled) || (target_name == "lldap_disabled" && has_admin) {
+        if (target_name == "lldap_admin" && has_disabled)
+            || (target_name == "lldap_disabled" && has_admin)
+        {
             return Err(DomainError::InternalError(
                 "A user cannot be in both lldap_admin and lldap_disabled groups".to_string(),
             ));
@@ -1091,25 +1211,25 @@ impl UserBackendHandler for SqlBackendHandler {
 
         let user_id = user_id.clone();
         self.sql_pool
-        .transaction::<_, _, sea_orm::DbErr>(|transaction| {
-            Box::pin(async move {
-                let new_membership = model::memberships::ActiveModel {
-                    user_id: ActiveValue::Set(user_id),
-                     group_id: ActiveValue::Set(group_id),
-                };
-                new_membership.insert(transaction).await?;
+            .transaction::<_, _, sea_orm::DbErr>(|transaction| {
+                Box::pin(async move {
+                    let new_membership = model::memberships::ActiveModel {
+                        user_id: ActiveValue::Set(user_id),
+                        group_id: ActiveValue::Set(group_id),
+                    };
+                    new_membership.insert(transaction).await?;
 
-                let now = chrono::Utc::now().naive_utc();
-                let update_group = model::groups::ActiveModel {
-                    group_id: Set(group_id),
-                     modified_date: Set(now),
-                     ..Default::default()
-                };
-                update_group.update(transaction).await?;
-                Ok(())
+                    let now = chrono::Utc::now().naive_utc();
+                    let update_group = model::groups::ActiveModel {
+                        group_id: Set(group_id),
+                        modified_date: Set(now),
+                        ..Default::default()
+                    };
+                    update_group.update(transaction).await?;
+                    Ok(())
+                })
             })
-        })
-        .await?;
+            .await?;
         Ok(())
     }
 
@@ -1117,38 +1237,38 @@ impl UserBackendHandler for SqlBackendHandler {
     async fn remove_user_from_group(&self, user_id: &UserId, group_id: GroupId) -> Result<()> {
         let user_id = user_id.clone();
         self.sql_pool
-        .transaction::<_, _, sea_orm::DbErr>(|transaction| {
-            Box::pin(async move {
-                let res = model::Membership::delete_by_id((user_id.clone(), group_id))
-                .exec(transaction)
-                .await?;
-                if res.rows_affected == 0 {
-                    return Err(sea_orm::DbErr::Custom(format!(
-                        "No such membership: '{user_id}' -> {group_id:?}"
-                    )));
-                }
+            .transaction::<_, _, sea_orm::DbErr>(|transaction| {
+                Box::pin(async move {
+                    let res = model::Membership::delete_by_id((user_id.clone(), group_id))
+                        .exec(transaction)
+                        .await?;
+                    if res.rows_affected == 0 {
+                        return Err(sea_orm::DbErr::Custom(format!(
+                            "No such membership: '{user_id}' -> {group_id:?}"
+                        )));
+                    }
 
-                let now = chrono::Utc::now().naive_utc();
-                let update_group = model::groups::ActiveModel {
-                    group_id: Set(group_id),
-                     modified_date: Set(now),
-                     ..Default::default()
-                };
-                update_group.update(transaction).await?;
-                Ok(())
+                    let now = chrono::Utc::now().naive_utc();
+                    let update_group = model::groups::ActiveModel {
+                        group_id: Set(group_id),
+                        modified_date: Set(now),
+                        ..Default::default()
+                    };
+                    update_group.update(transaction).await?;
+                    Ok(())
+                })
             })
-        })
-        .await
-        .map_err(|e| match e {
-            sea_orm::TransactionError::Connection(sea_orm::DbErr::Custom(msg)) => {
-                DomainError::EntityNotFound(msg)
-            }
-            sea_orm::TransactionError::Transaction(sea_orm::DbErr::Custom(msg)) => {
-                DomainError::EntityNotFound(msg)
-            }
-            sea_orm::TransactionError::Connection(e) => DomainError::DatabaseError(e),
-                 sea_orm::TransactionError::Transaction(e) => DomainError::DatabaseError(e),
-        })?;
+            .await
+            .map_err(|e| match e {
+                sea_orm::TransactionError::Connection(sea_orm::DbErr::Custom(msg)) => {
+                    DomainError::EntityNotFound(msg)
+                }
+                sea_orm::TransactionError::Transaction(sea_orm::DbErr::Custom(msg)) => {
+                    DomainError::EntityNotFound(msg)
+                }
+                sea_orm::TransactionError::Connection(e) => DomainError::DatabaseError(e),
+                sea_orm::TransactionError::Transaction(e) => DomainError::DatabaseError(e),
+            })?;
         Ok(())
     }
 }
@@ -1226,7 +1346,7 @@ mod tests {
         let users = get_user_names(
             &fixture.handler,
             Some(UserRequestFilter::AttributeEquality(
-                AttributeName::from("firstname"),       // ← canonical name
+                AttributeName::from("firstname"), // ← canonical name
                 "first bob".to_string().into(),
             )),
         )
@@ -1239,19 +1359,19 @@ mod tests {
         let fixture = TestFixture::new().await;
         insert_user_no_password(&fixture.handler, "UppEr").await;
         let users_and_emails = fixture
-        .handler
-        .list_users(
-            Some(UserRequestFilter::Equality(
-                UserColumn::Email,
-                "uPPer@bob.bob".to_string(),
-            )),
-            false,
-        )
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|u| (u.user.user_id.to_string(), u.user.email.to_string()))
-        .collect::<Vec<_>>();
+            .handler
+            .list_users(
+                Some(UserRequestFilter::Equality(
+                    UserColumn::Email,
+                    "uPPer@bob.bob".to_string(),
+                )),
+                false,
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|u| (u.user.user_id.to_string(), u.user.email.to_string()))
+            .collect::<Vec<_>>();
         assert_eq!(
             users_and_emails,
             vec![("upper".to_owned(), "UppEr@bob.bob".to_owned())]
@@ -1266,15 +1386,15 @@ mod tests {
             Some(UserRequestFilter::And(vec![
                 UserRequestFilter::UserIdSubString(SubStringFilter {
                     initial: Some("Pa".to_owned()),
-                                                   any: vec!["rI".to_owned()],
-                                                   final_: Some("K".to_owned()),
+                    any: vec!["rI".to_owned()],
+                    final_: Some("K".to_owned()),
                 }),
                 UserRequestFilter::SubString(
                     UserColumn::DisplayName,
                     SubStringFilter {
                         initial: None,
                         any: vec!["t".to_owned(), "r".to_owned()],
-                                             final_: None,
+                        final_: None,
                     },
                 ),
             ])),
@@ -1314,7 +1434,7 @@ mod tests {
             &fixture.handler,
             Some(UserRequestFilter::Or(vec![
                 UserRequestFilter::MemberOf("Best Group".into()),
-                                       UserRequestFilter::Equality(UserColumn::Uuid, "abc".to_string()),
+                UserRequestFilter::Equality(UserColumn::Uuid, "abc".to_string()),
             ])),
         )
         .await;
@@ -1339,7 +1459,7 @@ mod tests {
             &fixture.handler,
             Some(UserRequestFilter::And(vec![
                 UserRequestFilter::MemberOf("Best Group".into()),
-                                        UserRequestFilter::MemberOf("Worst Group".into()),
+                UserRequestFilter::MemberOf("Worst Group".into()),
             ])),
         )
         .await;
@@ -1353,7 +1473,7 @@ mod tests {
             &fixture.handler,
             Some(UserRequestFilter::And(vec![
                 UserRequestFilter::MemberOfId(fixture.groups[0]),
-                                        UserRequestFilter::MemberOfId(fixture.groups[1]),
+                UserRequestFilter::MemberOfId(fixture.groups[1]),
             ])),
         )
         .await;
@@ -1381,7 +1501,7 @@ mod tests {
             &fixture.handler,
             Some(UserRequestFilter::Or(vec![
                 UserRequestFilter::UserId(UserId::new("bob")),
-                                       UserRequestFilter::UserId(UserId::new("John")),
+                UserRequestFilter::UserId(UserId::new("John")),
             ])),
         )
         .await;
@@ -1397,8 +1517,8 @@ mod tests {
                 UserRequestFilter::False,
                 UserRequestFilter::Or(vec![
                     UserRequestFilter::UserId(UserId::new("bob")),
-                                      UserRequestFilter::UserId(UserId::new("John")),
-                                      UserRequestFilter::UserId(UserId::new("random")),
+                    UserRequestFilter::UserId(UserId::new("John")),
+                    UserRequestFilter::UserId(UserId::new("random")),
                 ]),
             ])),
         )
@@ -1423,46 +1543,46 @@ mod tests {
     async fn test_list_users_with_groups() {
         let fixture = TestFixture::new().await;
         let users = fixture
-        .handler
-        .list_users(None, true)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|u| {
-            (
-                u.user.user_id.to_string(),
-             u.user
-             .display_name
-             .as_deref()
-             .unwrap_or("<unknown>")
-             .to_owned(),
-             u.groups
-             .unwrap_or_default()
-             .into_iter()
-             .map(|g| g.group_id)
-             .collect::<Vec<_>>(),
-            )
-        })
-        .collect::<Vec<_>>();
+            .handler
+            .list_users(None, true)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|u| {
+                (
+                    u.user.user_id.to_string(),
+                    u.user
+                        .display_name
+                        .as_deref()
+                        .unwrap_or("<unknown>")
+                        .to_owned(),
+                    u.groups
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|g| g.group_id)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
             users,
             vec![
                 (
                     "bob".to_string(),
-                 "display bob".to_string(),
-                 vec![fixture.groups[0]]
+                    "display bob".to_string(),
+                    vec![fixture.groups[0]]
                 ),
                 (
                     "john".to_string(),
-                 "display John".to_string(),
-                 vec![fixture.groups[1]]
+                    "display John".to_string(),
+                    vec![fixture.groups[1]]
                 ),
                 ("nogroup".to_string(), "display NoGroup".to_string(), vec![]),
-                   (
-                       "patrick".to_string(),
+                (
+                    "patrick".to_string(),
                     "display patrick".to_string(),
                     vec![fixture.groups[0], fixture.groups[1]]
-                   ),
+                ),
             ]
         );
     }
@@ -1471,22 +1591,22 @@ mod tests {
     async fn test_list_users_groups_have_different_creation_date_than_users() {
         let fixture = TestFixture::new().await;
         let users = fixture
-        .handler
-        .list_users(None, true)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|u| {
-            (
-                u.user.creation_date,
-             u.groups
-             .unwrap_or_default()
-             .into_iter()
-             .map(|g| g.creation_date)
-             .collect::<Vec<_>>(),
-            )
-        })
-        .collect::<Vec<_>>();
+            .handler
+            .list_users(None, true)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|u| {
+                (
+                    u.user.creation_date,
+                    u.groups
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|g| g.creation_date)
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
         for (user_date, groups) in users {
             for group_date in groups {
                 assert_ne!(user_date, group_date);
@@ -1497,7 +1617,7 @@ mod tests {
     #[tokio::test]
     async fn test_get_user_details() {
         let handler =
-        SqlBackendHandler::new(generate_random_private_key(), get_initialized_db().await);
+            SqlBackendHandler::new(generate_random_private_key(), get_initialized_db().await);
         insert_user_no_password(&handler, "bob").await;
         {
             let user = handler.get_user_details(&UserId::new("bob")).await.unwrap();
@@ -1505,16 +1625,16 @@ mod tests {
         }
         {
             handler
-            .get_user_details(&UserId::new("John"))
-            .await
-            .unwrap_err();
+                .get_user_details(&UserId::new("John"))
+                .await
+                .unwrap_err();
         }
     }
 
     #[tokio::test]
     async fn test_user_lowercase() {
         let handler =
-        SqlBackendHandler::new(generate_random_private_key(), get_initialized_db().await);
+            SqlBackendHandler::new(generate_random_private_key(), get_initialized_db().await);
         insert_user_no_password(&handler, "Bob").await;
         {
             let user = handler.get_user_details(&UserId::new("bOb")).await.unwrap();
@@ -1522,9 +1642,9 @@ mod tests {
         }
         {
             handler
-            .get_user_details(&UserId::new("John"))
-            .await
-            .unwrap_err();
+                .get_user_details(&UserId::new("John"))
+                .await
+                .unwrap_err();
         }
     }
 
@@ -1532,32 +1652,32 @@ mod tests {
     async fn test_delete_user() {
         let fixture = TestFixture::new().await;
         fixture
-        .handler
-        .delete_user(&UserId::new("bob"))
-        .await
-        .unwrap();
+            .handler
+            .delete_user(&UserId::new("bob"))
+            .await
+            .unwrap();
 
         assert_eq!(
             get_user_names(&fixture.handler, None).await,
-                   vec!["john", "nogroup", "patrick"]
+            vec!["john", "nogroup", "patrick"]
         );
 
         // Insert new user and remove two
         insert_user_no_password(&fixture.handler, "NewBoi").await;
         fixture
-        .handler
-        .delete_user(&UserId::new("nogroup"))
-        .await
-        .unwrap();
+            .handler
+            .delete_user(&UserId::new("nogroup"))
+            .await
+            .unwrap();
         fixture
-        .handler
-        .delete_user(&UserId::new("NewBoi"))
-        .await
-        .unwrap();
+            .handler
+            .delete_user(&UserId::new("NewBoi"))
+            .await
+            .unwrap();
 
         assert_eq!(
             get_user_names(&fixture.handler, None).await,
-                   vec!["john", "patrick"]
+            vec!["john", "patrick"]
         );
     }
 
@@ -1566,20 +1686,20 @@ mod tests {
         let fixture = TestFixture::new().await;
         let get_group_ids = async |user: &'static str| {
             let mut groups = fixture
-            .handler
-            .get_user_groups(&UserId::new(user))
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|g| g.group_id)
-            .collect::<Vec<_>>();
+                .handler
+                .get_user_groups(&UserId::new(user))
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|g| g.group_id)
+                .collect::<Vec<_>>();
             groups.sort_by(|g1, g2| g1.0.cmp(&g2.0));
             groups
         };
         assert_eq!(get_group_ids("bob").await, vec![fixture.groups[0]]);
         assert_eq!(
             get_group_ids("patrick").await,
-                   vec![fixture.groups[0], fixture.groups[1]]
+            vec![fixture.groups[0], fixture.groups[1]]
         );
         assert_eq!(get_group_ids("nogroup").await, vec![]);
     }
@@ -1589,48 +1709,58 @@ mod tests {
         let fixture = TestFixture::new().await;
 
         fixture
-        .handler
-        .update_user(UpdateUserRequest {
-            user_id: UserId::new("bob"),
-                     email: Some("email".into()),
-                     display_name: Some("display_name".to_string()),
-                     delete_attributes: Vec::new(),
-                     insert_attributes: vec![
-                         Attribute {
-                             name: "firstname".into(),           // canonical
-                     value: "first_name".to_string().into(),
-                         },
-                         Attribute {
-                             name: "lastname".into(),            // canonical
-                     value: "last_name".to_string().into(),
-                         },
-                         Attribute {
-                             name: "avatar".into(),
-                     value: lldap_domain::images::make_test_avatar_value(),
-                         },
-                     ],
-        })
-        .await
-        .unwrap();
+            .handler
+            .update_user(UpdateUserRequest {
+                user_id: UserId::new("bob"),
+                email: Some("email".into()),
+                display_name: Some("display_name".to_string()),
+                delete_attributes: Vec::new(),
+                insert_attributes: vec![
+                    Attribute {
+                        name: "firstname".into(), // canonical
+                        value: "first_name".to_string().into(),
+                    },
+                    Attribute {
+                        name: "lastname".into(), // canonical
+                        value: "last_name".to_string().into(),
+                    },
+                    Attribute {
+                        name: "avatar".into(),
+                        value: lldap_domain::images::make_test_avatar_value(),
+                    },
+                ],
+            })
+            .await
+            .unwrap();
 
         let user = fixture
-        .handler
-        .get_user_details(&UserId::new("bob"))
-        .await
-        .unwrap();
+            .handler
+            .get_user_details(&UserId::new("bob"))
+            .await
+            .unwrap();
 
         assert_eq!(user.email, "email".into());
         assert_eq!(user.display_name.unwrap(), "display_name");
 
         // Canonical names + ou + avatar type check (no exact bytes)
-        assert!(user.attributes.iter().any(|a| a.name.as_str() == "avatar"
-        && matches!(a.value, AttributeValue::Avatar(_))));
-        assert!(user.attributes.iter().any(|a|
-        a.name.as_str() == "firstname" && a.value == "first_name".to_string().into()));
+        assert!(
+            user.attributes.iter().any(
+                |a| a.name.as_str() == "avatar" && matches!(a.value, AttributeValue::Avatar(_))
+            )
+        );
+        assert!(
+            user.attributes
+                .iter()
+                .any(|a| a.name.as_str() == "firstname"
+                    && a.value == "first_name".to_string().into())
+        );
         assert!(user.attributes.iter().any(|a|
         a.name.as_str() == "lastname" && a.value == "last_name".to_string().into()));
-        assert!(user.attributes.iter().any(|a|
-        a.name.as_str() == "ou" && a.value == "people".to_string().into()));
+        assert!(
+            user.attributes
+                .iter()
+                .any(|a| a.name.as_str() == "ou" && a.value == "people".to_string().into())
+        );
     }
 
     #[tokio::test]
@@ -1638,36 +1768,45 @@ mod tests {
         let fixture = TestFixture::new().await;
 
         fixture
-        .handler
-        .update_user(UpdateUserRequest {
-            user_id: UserId::new("bob"),
-                     delete_attributes: vec!["last_name".into()],
-                     insert_attributes: vec![Attribute {
-                         name: "avatar".into(),
-                     value: lldap_domain::images::make_test_avatar_value(),
-                     }],
-                     ..Default::default()
-        })
-        .await
-        .unwrap();
+            .handler
+            .update_user(UpdateUserRequest {
+                user_id: UserId::new("bob"),
+                delete_attributes: vec!["last_name".into()],
+                insert_attributes: vec![Attribute {
+                    name: "avatar".into(),
+                    value: lldap_domain::images::make_test_avatar_value(),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
 
         let user = fixture
-        .handler
-        .get_user_details(&UserId::new("bob"))
-        .await
-        .unwrap();
+            .handler
+            .get_user_details(&UserId::new("bob"))
+            .await
+            .unwrap();
 
         assert_eq!(user.display_name.unwrap(), "display bob");
 
         // Verify canonical names + correct types (image conversion verified in images.rs)
-        assert!(user.attributes.iter().any(|a| a.name.as_str() == "avatar"
-        && matches!(a.value, AttributeValue::Avatar(_))));
+        assert!(
+            user.attributes.iter().any(
+                |a| a.name.as_str() == "avatar" && matches!(a.value, AttributeValue::Avatar(_))
+            )
+        );
 
-        assert!(user.attributes.iter().any(|a|
-        a.name.as_str() == "firstname" && a.value == "first bob".to_string().into()));
+        assert!(
+            user.attributes.iter().any(
+                |a| a.name.as_str() == "firstname" && a.value == "first bob".to_string().into()
+            )
+        );
 
-        assert!(user.attributes.iter().any(|a|
-        a.name.as_str() == "ou" && a.value == "people".to_string().into()));
+        assert!(
+            user.attributes
+                .iter()
+                .any(|a| a.name.as_str() == "ou" && a.value == "people".to_string().into())
+        );
     }
 
     #[tokio::test]
@@ -1675,38 +1814,38 @@ mod tests {
         let fixture = TestFixture::new().await;
 
         fixture
-        .handler
-        .update_user(UpdateUserRequest {
-            user_id: UserId::new("bob"),
-                     insert_attributes: vec![Attribute {
-                         name: "firstname".into(),           // canonical
-                     value: "new first".to_string().into(),
-                     }],
-                     ..Default::default()
-        })
-        .await
-        .unwrap();
+            .handler
+            .update_user(UpdateUserRequest {
+                user_id: UserId::new("bob"),
+                insert_attributes: vec![Attribute {
+                    name: "firstname".into(), // canonical
+                    value: "new first".to_string().into(),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
 
         let user = fixture
-        .handler
-        .get_user_details(&UserId::new("bob"))
-        .await
-        .unwrap();
+            .handler
+            .get_user_details(&UserId::new("bob"))
+            .await
+            .unwrap();
 
         assert_eq!(
             user.attributes,
             vec![
                 Attribute {
                     name: "firstname".into(),
-                   value: "new first".to_string().into()
+                    value: "new first".to_string().into()
                 },
                 Attribute {
                     name: "lastname".into(),
-                   value: "last bob".to_string().into()
+                    value: "last bob".to_string().into()
                 },
                 Attribute {
                     name: "ou".into(),
-                   value: "people".to_string().into()
+                    value: "people".to_string().into()
                 }
             ]
         );
@@ -1717,31 +1856,31 @@ mod tests {
         let fixture = TestFixture::new().await;
 
         fixture
-        .handler
-        .update_user(UpdateUserRequest {
-            user_id: UserId::new("bob"),
-                     delete_attributes: vec!["firstname".into()],   // canonical
-                     ..Default::default()
-        })
-        .await
-        .unwrap();
+            .handler
+            .update_user(UpdateUserRequest {
+                user_id: UserId::new("bob"),
+                delete_attributes: vec!["firstname".into()], // canonical
+                ..Default::default()
+            })
+            .await
+            .unwrap();
 
         let user = fixture
-        .handler
-        .get_user_details(&UserId::new("bob"))
-        .await
-        .unwrap();
+            .handler
+            .get_user_details(&UserId::new("bob"))
+            .await
+            .unwrap();
 
         assert_eq!(
             user.attributes,
             vec![
                 Attribute {
                     name: "lastname".into(),
-                   value: "last bob".to_string().into()
+                    value: "last bob".to_string().into()
                 },
                 Attribute {
                     name: "ou".into(),
-                   value: "people".to_string().into()
+                    value: "people".to_string().into()
                 }
             ]
         );
@@ -1752,39 +1891,39 @@ mod tests {
         let fixture = TestFixture::new().await;
 
         fixture
-        .handler
-        .update_user(UpdateUserRequest {
-            user_id: UserId::new("bob"),
-                     delete_attributes: vec!["firstname".into()],
-                     insert_attributes: vec![Attribute {
-                         name: "firstname".into(),
-                     value: "new first".to_string().into(),
-                     }],
-                     ..Default::default()
-        })
-        .await
-        .unwrap();
+            .handler
+            .update_user(UpdateUserRequest {
+                user_id: UserId::new("bob"),
+                delete_attributes: vec!["firstname".into()],
+                insert_attributes: vec![Attribute {
+                    name: "firstname".into(),
+                    value: "new first".to_string().into(),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
 
         let user = fixture
-        .handler
-        .get_user_details(&UserId::new("bob"))
-        .await
-        .unwrap();
+            .handler
+            .get_user_details(&UserId::new("bob"))
+            .await
+            .unwrap();
 
         assert_eq!(
             user.attributes,
             vec![
                 Attribute {
                     name: "firstname".into(),
-                   value: "new first".to_string().into()
+                    value: "new first".to_string().into()
                 },
                 Attribute {
                     name: "lastname".into(),
-                   value: "last bob".to_string().into()
+                    value: "last bob".to_string().into()
                 },
                 Attribute {
                     name: "ou".into(),
-                   value: "people".to_string().into()
+                    value: "people".to_string().into()
                 },
             ]
         );
@@ -1796,41 +1935,41 @@ mod tests {
 
         // First insert an avatar
         fixture
-        .handler
-        .update_user(UpdateUserRequest {
-            user_id: UserId::new("bob"),
-                     insert_attributes: vec![Attribute {
-                         name: "avatar".into(),
-                     value: lldap_domain::images::make_test_avatar_value(),
-                     }],
-                     ..Default::default()
-        })
-        .await
-        .unwrap();
+            .handler
+            .update_user(UpdateUserRequest {
+                user_id: UserId::new("bob"),
+                insert_attributes: vec![Attribute {
+                    name: "avatar".into(),
+                    value: lldap_domain::images::make_test_avatar_value(),
+                }],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
 
         let user = fixture
-        .handler
-        .get_user_details(&UserId::new("bob"))
-        .await
-        .unwrap();
+            .handler
+            .get_user_details(&UserId::new("bob"))
+            .await
+            .unwrap();
         assert!(user.attributes.iter().any(|a| a.name.as_str() == "avatar"));
 
         // Now delete it
         fixture
-        .handler
-        .update_user(UpdateUserRequest {
-            user_id: UserId::new("bob"),
-                     delete_attributes: vec!["avatar".into()],
-                     ..Default::default()
-        })
-        .await
-        .unwrap();
+            .handler
+            .update_user(UpdateUserRequest {
+                user_id: UserId::new("bob"),
+                delete_attributes: vec!["avatar".into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
 
         let user = fixture
-        .handler
-        .get_user_details(&UserId::new("bob"))
-        .await
-        .unwrap();
+            .handler
+            .get_user_details(&UserId::new("bob"))
+            .await
+            .unwrap();
         assert!(!user.attributes.iter().any(|a| a.name.as_str() == "avatar"));
     }
 
@@ -1839,46 +1978,56 @@ mod tests {
         let fixture = TestFixture::new().await;
 
         fixture
-        .handler
-        .create_user(CreateUserRequest {
-            user_id: UserId::new("james"),
-                     email: "email".into(),
-                     display_name: Some("display_name".to_string()),
-                     attributes: vec![
-                         Attribute {
-                             name: "firstname".into(),
-                     value: "First Name".to_string().into(),
-                         },
-                         Attribute {
-                             name: "lastname".into(),
-                     value: "last_name".to_string().into(),
-                         },
-                         Attribute {
-                             name: "avatar".into(),
-                     value: lldap_domain::images::make_test_avatar_value(),
-                         },
-                     ],
-        })
-        .await
-        .unwrap();
+            .handler
+            .create_user(CreateUserRequest {
+                user_id: UserId::new("james"),
+                email: "email".into(),
+                display_name: Some("display_name".to_string()),
+                attributes: vec![
+                    Attribute {
+                        name: "firstname".into(),
+                        value: "First Name".to_string().into(),
+                    },
+                    Attribute {
+                        name: "lastname".into(),
+                        value: "last_name".to_string().into(),
+                    },
+                    Attribute {
+                        name: "avatar".into(),
+                        value: lldap_domain::images::make_test_avatar_value(),
+                    },
+                ],
+            })
+            .await
+            .unwrap();
 
         let user = fixture
-        .handler
-        .get_user_details(&UserId::new("james"))
-        .await
-        .unwrap();
+            .handler
+            .get_user_details(&UserId::new("james"))
+            .await
+            .unwrap();
 
         assert_eq!(user.email, "email".into());
         assert_eq!(user.display_name.unwrap(), "display_name");
 
-        assert!(user.attributes.iter().any(|a| a.name.as_str() == "avatar"
-        && matches!(a.value, AttributeValue::Avatar(_))));
-        assert!(user.attributes.iter().any(|a|
-        a.name.as_str() == "firstname" && a.value == "First Name".to_string().into()));
+        assert!(
+            user.attributes.iter().any(
+                |a| a.name.as_str() == "avatar" && matches!(a.value, AttributeValue::Avatar(_))
+            )
+        );
+        assert!(
+            user.attributes
+                .iter()
+                .any(|a| a.name.as_str() == "firstname"
+                    && a.value == "First Name".to_string().into())
+        );
         assert!(user.attributes.iter().any(|a|
         a.name.as_str() == "lastname" && a.value == "last_name".to_string().into()));
-        assert!(user.attributes.iter().any(|a|
-        a.name.as_str() == "ou" && a.value == "people".to_string().into()));
+        assert!(
+            user.attributes
+                .iter()
+                .any(|a| a.name.as_str() == "ou" && a.value == "people".to_string().into())
+        );
     }
 
     #[tokio::test]
@@ -1886,10 +2035,10 @@ mod tests {
         let fixture = TestFixture::new().await;
 
         fixture
-        .handler
-        .remove_user_from_group(&UserId::new("bob"), fixture.groups[0])
-        .await
-        .unwrap();
+            .handler
+            .remove_user_from_group(&UserId::new("bob"), fixture.groups[0])
+            .await
+            .unwrap();
 
         assert_eq!(
             get_user_names(
@@ -1906,10 +2055,10 @@ mod tests {
         let fixture = TestFixture::new().await;
 
         fixture
-        .handler
-        .delete_user(&UserId::new("not found"))
-        .await
-        .expect_err("Should have failed");
+            .handler
+            .delete_user(&UserId::new("not found"))
+            .await
+            .expect_err("Should have failed");
     }
 
     #[tokio::test]
@@ -1917,16 +2066,16 @@ mod tests {
         let fixture = TestFixture::new().await;
 
         fixture
-        .handler
-        .remove_user_from_group(&UserId::new("not found"), fixture.groups[0])
-        .await
-        .expect_err("Should have failed");
+            .handler
+            .remove_user_from_group(&UserId::new("not found"), fixture.groups[0])
+            .await
+            .expect_err("Should have failed");
 
         fixture
-        .handler
-        .remove_user_from_group(&UserId::new("not found"), GroupId(16242))
-        .await
-        .expect_err("Should have failed");
+            .handler
+            .remove_user_from_group(&UserId::new("not found"), GroupId(16242))
+            .await
+            .expect_err("Should have failed");
     }
 
     #[tokio::test]
@@ -1934,23 +2083,23 @@ mod tests {
         let fixture = TestFixture::new().await;
 
         fixture
-        .handler
-        .create_user(CreateUserRequest {
-            user_id: UserId::new("james"),
-                     email: "email".into(),
-                     ..Default::default()
-        })
-        .await
-        .unwrap();
+            .handler
+            .create_user(CreateUserRequest {
+                user_id: UserId::new("james"),
+                email: "email".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
 
         fixture
-        .handler
-        .create_user(CreateUserRequest {
-            user_id: UserId::new("john"),
-                     email: "eMail".into(),
-                     ..Default::default()
-        })
-        .await
-        .unwrap_err();
+            .handler
+            .create_user(CreateUserRequest {
+                user_id: UserId::new("john"),
+                email: "eMail".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
     }
 }

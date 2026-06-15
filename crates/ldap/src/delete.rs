@@ -2,14 +2,14 @@ use crate::core::{
     error::{LdapError, LdapResult},
     utils::LdapInfo,
 };
-use crate::dn::{get_user_or_group_id_from_distinguished_name, UserOrGroupName};
+use crate::dn::{UserOrGroupName, get_user_or_group_id_from_distinguished_name};
 use ldap3_proto::proto::{LdapOp, LdapResult as LdapResultOp, LdapResultCode};
 use lldap_access_control::AdminBackendHandler;
 use lldap_domain::types::{GroupName, UserId};
 use lldap_domain_handlers::handler::GroupRequestFilter;
 use lldap_domain_model::error::DomainError;
-use tracing::instrument;
 use lldap_kerberos::delete_kerberos_principal;
+use tracing::instrument;
 
 pub(crate) fn make_del_response(code: LdapResultCode, message: String) -> LdapOp {
     LdapOp::DelResponse(LdapResultOp {
@@ -62,11 +62,15 @@ async fn delete_user(
             code: LdapResultCode::OperationsError,
             message: format!("Error while deleting user: {e:?}"),
         })?;
-        // Clean up Kerberos principal (idempotent/safe if none exists)
-        if let Err(e) = delete_kerberos_principal(user_id.as_str()) {
-            tracing::warn!("Failed to delete Kerberos principal for deleted user {}: {}", user_id, e);
-            // Non-fatal—user already deleted from LLDAP
-        }
+    // Clean up Kerberos principal (idempotent/safe if none exists)
+    if let Err(e) = delete_kerberos_principal(user_id.as_str()) {
+        tracing::warn!(
+            "Failed to delete Kerberos principal for deleted user {}: {}",
+            user_id,
+            e
+        );
+        // Non-fatal—user already deleted from LLDAP
+    }
     Ok(vec![make_del_response(
         LdapResultCode::Success,
         String::new(),
@@ -155,7 +159,10 @@ mod tests {
                     id: GroupId(34),
                     display_name: GroupName::from("bob"),
                     creation_date: chrono::Utc.timestamp_opt(42, 42).unwrap().naive_utc(),
-                    uuid: Uuid::from_name_and_date("bob", &chrono::Utc.timestamp_opt(42, 42).unwrap().naive_utc()),
+                    uuid: Uuid::from_name_and_date(
+                        "bob",
+                        &chrono::Utc.timestamp_opt(42, 42).unwrap().naive_utc(),
+                    ),
                     users: Vec::new(),
                     attributes: Vec::new(),
                     modified_date: chrono::Utc.timestamp_opt(42, 42).unwrap().naive_utc(),
@@ -286,7 +293,10 @@ mod tests {
                     id: GroupId(34),
                     display_name: GroupName::from("bob"),
                     creation_date: chrono::Utc.timestamp_opt(42, 42).unwrap().naive_utc(),
-                    uuid: Uuid::from_name_and_date("bob", &chrono::Utc.timestamp_opt(42, 42).unwrap().naive_utc()),
+                    uuid: Uuid::from_name_and_date(
+                        "bob",
+                        &chrono::Utc.timestamp_opt(42, 42).unwrap().naive_utc(),
+                    ),
                     users: Vec::new(),
                     attributes: Vec::new(),
                     modified_date: chrono::Utc.timestamp_opt(42, 42).unwrap().naive_utc(),

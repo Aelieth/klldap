@@ -18,11 +18,11 @@ use sea_orm::{
 impl ReadSchemaBackendHandler for SqlBackendHandler {
     async fn get_schema(&self) -> Result<PublicSchema> {
         Ok(self
-        .sql_pool
-        .transaction::<_, PublicSchema, DomainError>(|transaction| {
-            Box::pin(async move { Self::get_schema_with_transaction(transaction).await })
-        })
-        .await?)
+            .sql_pool
+            .transaction::<_, PublicSchema, DomainError>(|transaction| {
+                Box::pin(async move { Self::get_schema_with_transaction(transaction).await })
+            })
+            .await?)
     }
 }
 
@@ -36,7 +36,7 @@ impl SchemaBackendHandler for SqlBackendHandler {
             is_user_visible: Set(request.is_visible),
             is_user_editable: Set(request.is_editable),
             is_hardcoded: Set(false),
-            is_readonly: Set(false),  // custom attributes are never readonly
+            is_readonly: Set(false), // custom attributes are never readonly
             aliases: Set("[]".to_string()),
         };
         new_attribute.insert(&self.sql_pool).await?;
@@ -51,7 +51,7 @@ impl SchemaBackendHandler for SqlBackendHandler {
             is_group_visible: Set(request.is_visible),
             is_group_editable: Set(request.is_editable),
             is_hardcoded: Set(false),
-            is_readonly: Set(false),  // custom attributes are never readonly
+            is_readonly: Set(false), // custom attributes are never readonly
             aliases: Set("[]".to_string()),
         };
         new_attribute.insert(&self.sql_pool).await?;
@@ -60,15 +60,15 @@ impl SchemaBackendHandler for SqlBackendHandler {
 
     async fn delete_user_attribute(&self, name: &AttributeName) -> Result<()> {
         model::UserAttributeSchema::delete_by_id(name.clone())
-        .exec(&self.sql_pool)
-        .await?;
+            .exec(&self.sql_pool)
+            .await?;
         Ok(())
     }
 
     async fn delete_group_attribute(&self, name: &AttributeName) -> Result<()> {
         model::GroupAttributeSchema::delete_by_id(name.clone())
-        .exec(&self.sql_pool)
-        .await?;
+            .exec(&self.sql_pool)
+            .await?;
         Ok(())
     }
 
@@ -98,15 +98,15 @@ impl SchemaBackendHandler for SqlBackendHandler {
 
     async fn delete_user_object_class(&self, name: &LdapObjectClass) -> Result<()> {
         model::UserObjectClasses::delete_by_id(name.as_str().to_ascii_lowercase())
-        .exec(&self.sql_pool)
-        .await?;
+            .exec(&self.sql_pool)
+            .await?;
         Ok(())
     }
 
     async fn delete_group_object_class(&self, name: &LdapObjectClass) -> Result<()> {
         model::GroupObjectClasses::delete_by_id(name.as_str().to_ascii_lowercase())
-        .exec(&self.sql_pool)
-        .await?;
+            .exec(&self.sql_pool)
+            .await?;
         Ok(())
     }
 }
@@ -120,26 +120,36 @@ impl SqlBackendHandler {
 
         // Load only truly dynamic (custom) attributes from DB
         let dynamic_user_attrs: Vec<_> = Self::get_user_attributes(transaction)
-        .await?
-        .into_iter()
-        .filter(|a| !a.is_hardcoded) // only keep custom ones
-        .collect();
+            .await?
+            .into_iter()
+            .filter(|a| !a.is_hardcoded) // only keep custom ones
+            .collect();
 
         let dynamic_group_attrs: Vec<_> = Self::get_group_attributes(transaction)
-        .await?
-        .into_iter()
-        .filter(|a| !a.is_hardcoded)
-        .collect();
+            .await?
+            .into_iter()
+            .filter(|a| !a.is_hardcoded)
+            .collect();
 
         // Merge dynamic attributes (avoid duplicates by canonical name)
         for attr in dynamic_user_attrs {
-            if !full.user_attributes.attributes.iter().any(|existing| existing.name == attr.name) {
+            if !full
+                .user_attributes
+                .attributes
+                .iter()
+                .any(|existing| existing.name == attr.name)
+            {
                 full.user_attributes.attributes.push(attr);
             }
         }
 
         for attr in dynamic_group_attrs {
-            if !full.group_attributes.attributes.iter().any(|existing| existing.name == attr.name) {
+            if !full
+                .group_attributes
+                .attributes
+                .iter()
+                .any(|existing| existing.name == attr.name)
+            {
                 full.group_attributes.attributes.push(attr);
             }
         }
@@ -165,16 +175,16 @@ impl SqlBackendHandler {
 
         // Object classes
         full.extra_user_object_classes = Self::get_user_object_classes(transaction)
-        .await?
-        .into_iter()
-        .map(|oc| oc.into_string())
-        .collect();
+            .await?
+            .into_iter()
+            .map(|oc| oc.into_string())
+            .collect();
 
         full.extra_group_object_classes = Self::get_group_object_classes(transaction)
-        .await?
-        .into_iter()
-        .map(|oc| oc.into_string())
-        .collect();
+            .await?
+            .into_iter()
+            .map(|oc| oc.into_string())
+            .collect();
 
         Ok(PublicSchema(full))
     }
@@ -183,66 +193,66 @@ impl SqlBackendHandler {
         transaction: &DatabaseTransaction,
     ) -> Result<Vec<AttributeSchema>> {
         Ok(model::UserAttributeSchema::find()
-        .order_by_asc(model::UserAttributeSchemaColumn::AttributeName)
-        .all(transaction)
-        .await?
-        .into_iter()
-        .map(|m| AttributeSchema {
-            name: m.attribute_name.into_string(),
-             aliases: serde_json::from_str(&m.aliases).unwrap_or_default(),
-             attribute_type: m.attribute_type,
-             is_list: m.is_list,
-             is_visible: m.is_user_visible,
-             is_editable: m.is_user_editable,
-             is_hardcoded: m.is_hardcoded,
-             is_readonly: m.is_readonly,
-        })
-        .collect())
+            .order_by_asc(model::UserAttributeSchemaColumn::AttributeName)
+            .all(transaction)
+            .await?
+            .into_iter()
+            .map(|m| AttributeSchema {
+                name: m.attribute_name.into_string(),
+                aliases: serde_json::from_str(&m.aliases).unwrap_or_default(),
+                attribute_type: m.attribute_type,
+                is_list: m.is_list,
+                is_visible: m.is_user_visible,
+                is_editable: m.is_user_editable,
+                is_hardcoded: m.is_hardcoded,
+                is_readonly: m.is_readonly,
+            })
+            .collect())
     }
 
     async fn get_group_attributes(
         transaction: &DatabaseTransaction,
     ) -> Result<Vec<AttributeSchema>> {
         Ok(model::GroupAttributeSchema::find()
-        .order_by_asc(model::GroupAttributeSchemaColumn::AttributeName)
-        .all(transaction)
-        .await?
-        .into_iter()
-        .map(|m| AttributeSchema {
-            name: m.attribute_name.into_string(),
-             aliases: serde_json::from_str(&m.aliases).unwrap_or_default(),
-             attribute_type: m.attribute_type,
-             is_list: m.is_list,
-             is_visible: m.is_group_visible,
-             is_editable: m.is_group_editable,
-             is_hardcoded: m.is_hardcoded,
-             is_readonly: m.is_readonly,
-        })
-        .collect())
+            .order_by_asc(model::GroupAttributeSchemaColumn::AttributeName)
+            .all(transaction)
+            .await?
+            .into_iter()
+            .map(|m| AttributeSchema {
+                name: m.attribute_name.into_string(),
+                aliases: serde_json::from_str(&m.aliases).unwrap_or_default(),
+                attribute_type: m.attribute_type,
+                is_list: m.is_list,
+                is_visible: m.is_group_visible,
+                is_editable: m.is_group_editable,
+                is_hardcoded: m.is_hardcoded,
+                is_readonly: m.is_readonly,
+            })
+            .collect())
     }
 
     async fn get_user_object_classes(
         transaction: &DatabaseTransaction,
     ) -> Result<Vec<LdapObjectClass>> {
         Ok(model::UserObjectClasses::find()
-        .order_by_asc(model::UserObjectClassesColumn::ObjectClass)
-        .all(transaction)
-        .await?
-        .into_iter()
-        .map(Into::into)
-        .collect())
+            .order_by_asc(model::UserObjectClassesColumn::ObjectClass)
+            .all(transaction)
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect())
     }
 
     async fn get_group_object_classes(
         transaction: &DatabaseTransaction,
     ) -> Result<Vec<LdapObjectClass>> {
         Ok(model::GroupObjectClasses::find()
-        .order_by_asc(model::GroupObjectClassesColumn::ObjectClass)
-        .all(transaction)
-        .await?
-        .into_iter()
-        .map(Into::into)
-        .collect())
+            .order_by_asc(model::GroupObjectClassesColumn::ObjectClass)
+            .all(transaction)
+            .await?
+            .into_iter()
+            .map(Into::into)
+            .collect())
     }
 }
 
@@ -260,9 +270,24 @@ mod tests {
         let fixture = TestFixture::new().await;
         let schema = fixture.handler.get_schema().await.unwrap();
 
-        assert!(schema.user_attributes().get_by_name_or_alias("avatar").is_some());
-        assert!(schema.user_attributes().get_by_name_or_alias("kerberossync").is_some());
-        assert!(schema.user_attributes().get_by_name_or_alias("uidnumber").is_some());
+        assert!(
+            schema
+                .user_attributes()
+                .get_by_name_or_alias("avatar")
+                .is_some()
+        );
+        assert!(
+            schema
+                .user_attributes()
+                .get_by_name_or_alias("kerberossync")
+                .is_some()
+        );
+        assert!(
+            schema
+                .user_attributes()
+                .get_by_name_or_alias("uidnumber")
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -277,15 +302,33 @@ mod tests {
             is_editable: false,
         };
 
-        fixture.handler.add_user_attribute(new_attribute).await.unwrap();
+        fixture
+            .handler
+            .add_user_attribute(new_attribute)
+            .await
+            .unwrap();
 
         let schema = fixture.handler.get_schema().await.unwrap();
-        assert!(schema.user_attributes().get_by_name_or_alias("new_attribute").is_some());
+        assert!(
+            schema
+                .user_attributes()
+                .get_by_name_or_alias("new_attribute")
+                .is_some()
+        );
 
-        fixture.handler.delete_user_attribute(&"new_attribute".into()).await.unwrap();
+        fixture
+            .handler
+            .delete_user_attribute(&"new_attribute".into())
+            .await
+            .unwrap();
 
         let schema = fixture.handler.get_schema().await.unwrap();
-        assert!(schema.user_attributes().get_by_name_or_alias("new_attribute").is_none());
+        assert!(
+            schema
+                .user_attributes()
+                .get_by_name_or_alias("new_attribute")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -300,7 +343,11 @@ mod tests {
             is_editable: false,
         };
 
-        fixture.handler.add_user_attribute(new_attribute).await.unwrap();
+        fixture
+            .handler
+            .add_user_attribute(new_attribute)
+            .await
+            .unwrap();
 
         fixture
             .handler
@@ -317,7 +364,9 @@ mod tests {
 
         let users = get_user_names(
             &fixture.handler,
-            Some(UserRequestFilter::CustomAttributePresent("new_attribute".into())),
+            Some(UserRequestFilter::CustomAttributePresent(
+                "new_attribute".into(),
+            )),
         )
         .await;
 
@@ -336,7 +385,11 @@ mod tests {
             is_editable: false,
         };
 
-        fixture.handler.add_group_attribute(new_attribute).await.unwrap();
+        fixture
+            .handler
+            .add_group_attribute(new_attribute)
+            .await
+            .unwrap();
 
         let expected_value = AttributeSchema {
             name: "new_attribute".into(),
@@ -350,12 +403,26 @@ mod tests {
         };
 
         let schema = fixture.handler.get_schema().await.unwrap();
-        assert!(schema.group_attributes().attributes.contains(&expected_value));
+        assert!(
+            schema
+                .group_attributes()
+                .attributes
+                .contains(&expected_value)
+        );
 
-        fixture.handler.delete_group_attribute(&"new_attriBUte".into()).await.unwrap();
+        fixture
+            .handler
+            .delete_group_attribute(&"new_attriBUte".into())
+            .await
+            .unwrap();
 
         let schema = fixture.handler.get_schema().await.unwrap();
-        assert!(!schema.group_attributes().attributes.contains(&expected_value));
+        assert!(
+            !schema
+                .group_attributes()
+                .attributes
+                .contains(&expected_value)
+        );
     }
 
     #[tokio::test]
@@ -363,7 +430,11 @@ mod tests {
         let fixture = TestFixture::new().await;
         let new_object_class = LdapObjectClass::new("newObjectClass");
 
-        fixture.handler.add_user_object_class(&new_object_class).await.unwrap();
+        fixture
+            .handler
+            .add_user_object_class(&new_object_class)
+            .await
+            .unwrap();
 
         let schema = fixture.handler.get_schema().await.unwrap();
         assert_eq!(
@@ -383,7 +454,11 @@ mod tests {
             vec!["newObjectClass".to_string()]
         );
 
-        fixture.handler.delete_user_object_class(&new_object_class).await.unwrap();
+        fixture
+            .handler
+            .delete_user_object_class(&new_object_class)
+            .await
+            .unwrap();
 
         let schema = fixture.handler.get_schema().await.unwrap();
         assert!(schema.0.extra_user_object_classes.is_empty());
@@ -391,52 +466,52 @@ mod tests {
 
     #[tokio::test]
     async fn test_schema_does_not_leak_aliases_as_top_level_names() {
-    let fixture = crate::sql_backend_handler::tests::TestFixture::new().await;
-    let schema = fixture.handler.get_schema().await.unwrap();
+        let fixture = crate::sql_backend_handler::tests::TestFixture::new().await;
+        let schema = fixture.handler.get_schema().await.unwrap();
 
-    let user_attrs = schema.user_attributes();
+        let user_attrs = schema.user_attributes();
 
-    // Collect all top-level attribute names
-    let top_level_names: Vec<&str> = user_attrs
-        .attributes
-        .iter()
-        .map(|a| a.name.as_str())
-        .collect();
+        // Collect all top-level attribute names
+        let top_level_names: Vec<&str> = user_attrs
+            .attributes
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect();
 
-    // These must NEVER appear as top-level names.
-    // They should only exist inside the `aliases` vector of their canonical attribute.
-    let forbidden_alias_names = ["first_name", "last_name", "givenName", "sn"];
+        // These must NEVER appear as top-level names.
+        // They should only exist inside the `aliases` vector of their canonical attribute.
+        let forbidden_alias_names = ["first_name", "last_name", "givenName", "sn"];
 
-    for forbidden in forbidden_alias_names {
-        assert!(
-            !top_level_names.contains(&forbidden),
-            "Alias '{}' should not appear as a top-level attribute name in the schema. \
-             It must only exist inside the `aliases` field of its canonical attribute.",
-            forbidden
-        );
-    }
-
-    // Sanity check: the canonical names must be present
-    assert!(
-        top_level_names.contains(&"firstname"),
-        "Canonical name 'firstname' must be present"
-    );
-    assert!(
-        top_level_names.contains(&"lastname"),
-        "Canonical name 'lastname' must be present"
-    );
-
-    // Extra safety: no top-level name should appear in another attribute's aliases list
-    for attr in &user_attrs.attributes {
-        for alias in &attr.aliases {
+        for forbidden in forbidden_alias_names {
             assert!(
-                !top_level_names.contains(&alias.as_str()),
-                "Alias '{}' from attribute '{}' is also appearing as a top-level name. \
-                 This indicates alias leakage in the schema.",
-                alias,
-                attr.name
+                !top_level_names.contains(&forbidden),
+                "Alias '{}' should not appear as a top-level attribute name in the schema. \
+             It must only exist inside the `aliases` field of its canonical attribute.",
+                forbidden
             );
         }
+
+        // Sanity check: the canonical names must be present
+        assert!(
+            top_level_names.contains(&"firstname"),
+            "Canonical name 'firstname' must be present"
+        );
+        assert!(
+            top_level_names.contains(&"lastname"),
+            "Canonical name 'lastname' must be present"
+        );
+
+        // Extra safety: no top-level name should appear in another attribute's aliases list
+        for attr in &user_attrs.attributes {
+            for alias in &attr.aliases {
+                assert!(
+                    !top_level_names.contains(&alias.as_str()),
+                    "Alias '{}' from attribute '{}' is also appearing as a top-level name. \
+                 This indicates alias leakage in the schema.",
+                    alias,
+                    attr.name
+                );
+            }
+        }
     }
-}
 }

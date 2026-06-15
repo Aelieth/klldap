@@ -2,9 +2,9 @@ use crate::{
     components::form::{date_input::DateTimeInput, file_input::AvatarFileInput},
     infra::{schema::AttributeType, tooltip::Tooltip},
 };
-use web_sys::{HtmlInputElement, Element, FocusEvent};
+use web_sys::{Element, FocusEvent, HtmlInputElement};
 use yew::{
-    Component, Callback, Context, Event, Html, Properties, function_component, html, TargetCast,
+    Callback, Component, Context, Event, Html, Properties, TargetCast, function_component, html,
     use_effect_with_deps, use_node_ref, use_state, virtual_dom::AttrValue,
 };
 
@@ -21,7 +21,12 @@ struct AttributeInputProps {
 #[function_component(AttributeInput)]
 fn attribute_input(props: &AttributeInputProps) -> Html {
     let current_value = use_state(|| {
-        if props.auto_assign && props.value.as_ref().map_or(true, |v| v.is_empty() || *v == "Auto-assign") {
+        if props.auto_assign
+            && props
+                .value
+                .as_ref()
+                .map_or(true, |v| v.is_empty() || *v == "Auto-assign")
+        {
             "Auto-assign".to_string()
         } else {
             props.value.clone().unwrap_or_default()

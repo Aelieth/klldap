@@ -1,17 +1,17 @@
 // crates/graphql-server/src/query/user.rs
+use super::attribute::AttributeValue;
+use super::group::Group;
+use crate::api::Context;
 use chrono::TimeZone;
 use juniper::{FieldResult, graphql_object};
 use lldap_access_control::UserReadableBackendHandler;
 use lldap_domain::public_schema::PublicSchema;
 use lldap_domain::types::{User as DomainUser, UserAndGroups as DomainUserAndGroups};
 use lldap_domain_handlers::handler::BackendHandler;
+use lldap_opaque_handler::OpaqueHandler;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{Instrument, debug, debug_span};
-use lldap_opaque_handler::OpaqueHandler;
-use super::attribute::AttributeValue;
-use super::group::Group;
-use crate::api::Context;
 
 #[derive(PartialEq, Eq, Debug, Serialize, Deserialize, Clone)]
 /// Represents a single user.
@@ -45,9 +45,9 @@ impl<Handler: BackendHandler> User<Handler> {
         if let Some(groups) = groups {
             user.groups = Some(
                 groups
-                .into_iter()
-                .map(|g| Group::<Handler>::from_group_details(g, schema.clone()))
-                .collect::<FieldResult<Vec<_>>>()?,
+                    .into_iter()
+                    .map(|g| Group::<Handler>::from_group_details(g, schema.clone()))
+                    .collect::<FieldResult<Vec<_>>>()?,
             );
         }
         Ok(user)
@@ -69,51 +69,67 @@ impl<Handler: BackendHandler + OpaqueHandler> User<Handler> {
     }
 
     fn first_name(&self) -> &str {
-        let canonical = self.schema.resolve_user_canonical_name("first_name").unwrap_or("firstname");
+        let canonical = self
+            .schema
+            .resolve_user_canonical_name("first_name")
+            .unwrap_or("firstname");
         self.attributes
-        .iter()
-        .find(|a| a.name() == canonical)
-        .and_then(|a| a.attribute.value.as_str())
-        .unwrap_or_default()
+            .iter()
+            .find(|a| a.name() == canonical)
+            .and_then(|a| a.attribute.value.as_str())
+            .unwrap_or_default()
     }
 
     fn last_name(&self) -> &str {
-        let canonical = self.schema.resolve_user_canonical_name("last_name").unwrap_or("lastname");
+        let canonical = self
+            .schema
+            .resolve_user_canonical_name("last_name")
+            .unwrap_or("lastname");
         self.attributes
-        .iter()
-        .find(|a| a.name() == canonical)
-        .and_then(|a| a.attribute.value.as_str())
-        .unwrap_or_default()
+            .iter()
+            .find(|a| a.name() == canonical)
+            .and_then(|a| a.attribute.value.as_str())
+            .unwrap_or_default()
     }
 
     fn avatar(&self) -> Option<String> {
         // Use the same serialization as the attributes list (proper base64 via avatar_to_graphql_base64)
         // This ensures the top-level avatar field returns clean JPEG base64, matching what the attributes[] list produces.
         self.attributes
-        .iter()
-        .find(|a| a.name() == "avatar")
-        .and_then(|a| super::serialize_attribute_to_graphql(&a.attribute.value).into_iter().next())
+            .iter()
+            .find(|a| a.name() == "avatar")
+            .and_then(|a| {
+                super::serialize_attribute_to_graphql(&a.attribute.value)
+                    .into_iter()
+                    .next()
+            })
     }
 
     /// Single-layer OU (defaults to "people" — editable by admin only)
     fn ou(&self) -> String {
-        let canonical = self.schema.resolve_user_canonical_name("ou").unwrap_or("ou");
+        let canonical = self
+            .schema
+            .resolve_user_canonical_name("ou")
+            .unwrap_or("ou");
         self.attributes
-        .iter()
-        .find(|a| a.name() == canonical)
-        .and_then(|a| a.attribute.value.as_str())
-        .unwrap_or("people")
-        .to_string()
+            .iter()
+            .find(|a| a.name() == canonical)
+            .and_then(|a| a.attribute.value.as_str())
+            .unwrap_or("people")
+            .to_string()
     }
 
     /// SSH public keys (multi-value list — exactly like authorized_keys)
     fn ssh_public_keys(&self) -> Vec<String> {
-        let canonical = self.schema.resolve_user_canonical_name("sshpublickey").unwrap_or("sshpublickey");
+        let canonical = self
+            .schema
+            .resolve_user_canonical_name("sshpublickey")
+            .unwrap_or("sshpublickey");
         self.attributes
-        .iter()
-        .find(|a| a.name() == canonical)
-        .map(|a| super::serialize_attribute_to_graphql(&a.attribute.value))
-        .unwrap_or_default()
+            .iter()
+            .find(|a| a.name() == canonical)
+            .map(|a| super::serialize_attribute_to_graphql(&a.attribute.value))
+            .unwrap_or_default()
     }
 
     fn creation_date(&self) -> chrono::DateTime<chrono::Utc> {
@@ -126,9 +142,9 @@ impl<Handler: BackendHandler + OpaqueHandler> User<Handler> {
 
     /// Whether the user is disabled (member of the built-in lldap_disabled group).
     fn is_disabled(&self) -> bool {
-        self.groups.as_ref().is_some_and(|groups| {
-            groups.iter().any(|g| g.display_name == "lldap_disabled")
-        })
+        self.groups
+            .as_ref()
+            .is_some_and(|groups| groups.iter().any(|g| g.display_name == "lldap_disabled"))
     }
 
     /// User-defined attributes (includes ou + sshpublickey for legacy clients).
@@ -143,16 +159,16 @@ impl<Handler: BackendHandler + OpaqueHandler> User<Handler> {
             debug!(user_id = ?self.user.user_id);
         });
         let handler = context
-        .get_readable_handler(self.user.user_id.clone())
-        .expect("We shouldn't be able to get there without readable permission");
+            .get_readable_handler(self.user.user_id.clone())
+            .expect("We shouldn't be able to get there without readable permission");
         let domain_groups = handler
-        .get_user_groups(&self.user.user_id)
-        .instrument(span)
-        .await?;
+            .get_user_groups(&self.user.user_id)
+            .instrument(span)
+            .await?;
         let mut groups = domain_groups
-        .into_iter()
-        .map(|g| Group::<Handler>::from_group_details(g, self.schema.clone()))
-        .collect::<FieldResult<Vec<Group<Handler>>>>()?;
+            .into_iter()
+            .map(|g| Group::<Handler>::from_group_details(g, self.schema.clone()))
+            .collect::<FieldResult<Vec<Group<Handler>>>>()?;
         groups.sort_by(|g1, g2| g1.display_name.cmp(&g2.display_name));
         Ok(groups)
     }

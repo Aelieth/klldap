@@ -1,8 +1,8 @@
+use crate::components::{ou_selector::OuSelector, status_modal::StatusModal};
 use crate::infra::{
     common_component::{CommonComponent, CommonComponentParts},
     modal::Modal,
 };
-use crate::components::{ou_selector::OuSelector, status_modal::StatusModal};
 use anyhow::{Error, Result};
 use graphql_client::GraphQLQuery;
 use yew::prelude::*;
@@ -54,11 +54,15 @@ pub enum Msg {
     NewOuSelected(String),
     ShowStatus(String, bool),
     DismissStatus,
-    ChangeOuResponse(Result<()>),  // unified response type
+    ChangeOuResponse(Result<()>), // unified response type
 }
 
 impl CommonComponent<ChangeOu> for ChangeOu {
-    fn handle_msg(&mut self, ctx: &Context<Self>, msg: <Self as Component>::Message) -> Result<bool> {
+    fn handle_msg(
+        &mut self,
+        ctx: &Context<Self>,
+        msg: <Self as Component>::Message,
+    ) -> Result<bool> {
         match msg {
             Msg::ClickedChangeOu => {
                 let empty = match &ctx.props().kind {
@@ -134,7 +138,10 @@ impl CommonComponent<ChangeOu> for ChangeOu {
                             OuChangeKind::Users(_) => "user(s)",
                             OuChangeKind::Groups(_) => "group(s)",
                         };
-                        let msg = format!("Successfully moved {} {} to OU: {}", count, entity, self.selected_ou);
+                        let msg = format!(
+                            "Successfully moved {} {} to OU: {}",
+                            count, entity, self.selected_ou
+                        );
                         ctx.link().send_message(Msg::ShowStatus(msg, true));
                         ctx.props().on_ou_changed.emit(self.selected_ou.clone());
                         self.selected_ou = match &ctx.props().kind {
@@ -168,7 +175,7 @@ impl Component for ChangeOu {
             common: CommonComponentParts::<Self>::create(),
             node_ref: NodeRef::default(),
             modal: None,
-            selected_ou: "people".to_string(),  // default, overridden on click
+            selected_ou: "people".to_string(), // default, overridden on click
             status_message: None,
         }
     }

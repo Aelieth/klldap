@@ -1,10 +1,10 @@
+use super::attribute::AttributeSchema;
+use crate::api::Context;
 use juniper::graphql_object;
 use lldap_domain_handlers::handler::BackendHandler;
 use lldap_ldap::{get_default_group_object_classes, get_default_user_object_classes};
-use serde::{Deserialize, Serialize};
 use lldap_opaque_handler::OpaqueHandler;
-use super::attribute::AttributeSchema;
-use crate::api::Context;
+use serde::{Deserialize, Serialize};
 
 // Single source of truth for GraphQL schema wrapper (user + group + system + POSIX + Kerberos)
 use lldap_schema::{AttributeList as SchemaAttributeList, PublicSchema};
@@ -95,7 +95,9 @@ impl<Handler: BackendHandler + OpaqueHandler> Schema<Handler> {
         AttributeList::<Handler>::new(
             self.schema.user_attributes().clone(),
             get_default_user_object_classes(),
-            self.schema.get_schema().extra_user_object_classes
+            self.schema
+                .get_schema()
+                .extra_user_object_classes
                 .iter()
                 .map(|s| lldap_domain::types::LdapObjectClass::from(s.as_str()))
                 .collect(),
@@ -106,7 +108,9 @@ impl<Handler: BackendHandler + OpaqueHandler> Schema<Handler> {
         AttributeList::<Handler>::new(
             self.schema.group_attributes().clone(),
             get_default_group_object_classes(),
-            self.schema.get_schema().extra_group_object_classes
+            self.schema
+                .get_schema()
+                .extra_group_object_classes
                 .iter()
                 .map(|s| lldap_domain::types::LdapObjectClass::from(s.as_str()))
                 .collect(),
@@ -117,7 +121,7 @@ impl<Handler: BackendHandler + OpaqueHandler> Schema<Handler> {
     fn system_schema(&self) -> AttributeList<Handler> {
         AttributeList::<Handler>::new(
             self.schema.system_attributes().clone(),
-            vec![],  // no default classes for system attributes
+            vec![], // no default classes for system attributes
             vec![],
         )
     }

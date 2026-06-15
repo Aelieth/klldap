@@ -6,6 +6,7 @@ use crate::{
         create_group_attribute::CreateGroupAttributeForm,
         create_user::CreateUserForm,
         create_user_attribute::CreateUserAttributeForm,
+        federation::Federation,
         group_details::GroupDetails,
         group_schema_table::ListGroupSchema,
         group_table::GroupTable,
@@ -16,7 +17,6 @@ use crate::{
         user_details::UserDetails,
         user_schema_table::ListUserSchema,
         user_table::UserTable,
-        federation::Federation,
     },
     infra::{api::HostService, cookies::get_cookie},
 };

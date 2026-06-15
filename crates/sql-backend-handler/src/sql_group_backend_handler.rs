@@ -2,11 +2,14 @@ use crate::sql_backend_handler::SqlBackendHandler;
 use async_trait::async_trait;
 use lldap_domain::{
     requests::{CreateGroupRequest, UpdateGroupRequest},
-    types::{Attribute, AttributeName, AttributeValue, Cardinality, Group, GroupDetails, GroupId, Serialized, Uuid, UserId},
+    types::{
+        Attribute, AttributeName, AttributeValue, Cardinality, Group, GroupDetails, GroupId,
+        Serialized, UserId, Uuid,
+    },
 };
 use lldap_domain_handlers::handler::{
     GroupBackendHandler, GroupListerBackendHandler, GroupRequestFilter, ReadSchemaBackendHandler,
-    SystemConfigBackendHandler, SubStringFilter,
+    SubStringFilter, SystemConfigBackendHandler,
 };
 use lldap_domain_model::{
     error::{DomainError, Result},
@@ -28,7 +31,9 @@ fn attribute_value_to_db_bytes(value: &AttributeValue) -> Vec<u8> {
         }
         AttributeValue::Integer(Cardinality::Singleton(i)) => i.to_string().as_bytes().to_vec(),
         AttributeValue::Avatar(Cardinality::Singleton(p)) => p.0.clone(),
-        AttributeValue::DateTime(Cardinality::Singleton(dt)) => dt.and_utc().timestamp().to_string().as_bytes().to_vec(),
+        AttributeValue::DateTime(Cardinality::Singleton(dt)) => {
+            dt.and_utc().timestamp().to_string().as_bytes().to_vec()
+        }
         _ => vec![],
     }
 }
@@ -43,16 +48,16 @@ fn is_backend_writable_readonly_attribute(name: &str) -> bool {
 fn attribute_condition(name: AttributeName, value: Option<&AttributeValue>) -> Cond {
     Expr::in_subquery(
         Expr::col(GroupColumn::GroupId.as_column_ref()),
-                      model::GroupAttributes::find()
-                      .select_only()
-                      .column(model::GroupAttributesColumn::GroupId)
-                      .filter(model::GroupAttributesColumn::AttributeName.eq(name))
-                      .filter(
-                          value
-                          .map(|v| model::GroupAttributesColumn::Value.eq(attribute_value_to_db_bytes(v)))
-                          .unwrap_or_else(|| SimpleExpr::Constant(true.into())),
-                      )
-                      .into_query(),
+        model::GroupAttributes::find()
+            .select_only()
+            .column(model::GroupAttributesColumn::GroupId)
+            .filter(model::GroupAttributesColumn::AttributeName.eq(name))
+            .filter(
+                value
+                    .map(|v| model::GroupAttributesColumn::Value.eq(attribute_value_to_db_bytes(v)))
+                    .unwrap_or_else(|| SimpleExpr::Constant(true.into())),
+            )
+            .into_query(),
     )
     .into_condition()
 }
@@ -61,15 +66,17 @@ fn attribute_substring_condition(name: AttributeName, filter: &SubStringFilter) 
     let like_pattern = filter.to_sql_filter();
     Expr::in_subquery(
         Expr::col(GroupColumn::GroupId.as_column_ref()),
-                      model::GroupAttributes::find()
-                      .select_only()
-                      .column(model::GroupAttributesColumn::GroupId)
-                      .filter(model::GroupAttributesColumn::AttributeName.eq(name.clone()))
-                      .filter(
-                          SimpleExpr::FunctionCall(Func::lower(Expr::col(model::GroupAttributesColumn::Value)))
-                          .like(like_pattern),
-                      )
-                      .into_query(),
+        model::GroupAttributes::find()
+            .select_only()
+            .column(model::GroupAttributesColumn::GroupId)
+            .filter(model::GroupAttributesColumn::AttributeName.eq(name.clone()))
+            .filter(
+                SimpleExpr::FunctionCall(Func::lower(Expr::col(
+                    model::GroupAttributesColumn::Value,
+                )))
+                .like(like_pattern),
+            )
+            .into_query(),
     )
     .into_condition()
 }
@@ -117,8 +124,8 @@ fn get_group_filter_expr(filter: GroupRequestFilter) -> Cond {
             group_table,
             GroupColumn::LowercaseDisplayName,
         ))))
-            .like(filter.to_sql_filter())
-            .into_condition(),
+        .like(filter.to_sql_filter())
+        .into_condition(),
         AttributeEquality(name, value) => attribute_condition(name, Some(&value)),
         CustomAttributePresent(name) => attribute_condition(name, None),
 
@@ -133,11 +140,9 @@ fn get_group_filter_expr(filter: GroupRequestFilter) -> Cond {
                         .gte(value)
                         .into_condition()
                 }
-                "modifieddate" => {
-                    Expr::col((group_table.clone(), GroupColumn::ModifiedDate))
-                        .gte(value)
-                        .into_condition()
-                }
+                "modifieddate" => Expr::col((group_table.clone(), GroupColumn::ModifiedDate))
+                    .gte(value)
+                    .into_condition(),
                 _ => {
                     tracing::warn!(
                         "GreaterOrEqual filter received on unsupported group column: {}. Returning no results.",
@@ -151,16 +156,12 @@ fn get_group_filter_expr(filter: GroupRequestFilter) -> Cond {
         LessOrEqual(column, value) => {
             let col = column.to_ascii_lowercase();
             match col.as_str() {
-                "creationdate" => {
-                    Expr::col((group_table.clone(), GroupColumn::CreationDate))
-                        .lte(value)
-                        .into_condition()
-                }
-                "modifieddate" => {
-                    Expr::col((group_table.clone(), GroupColumn::ModifiedDate))
-                        .lte(value)
-                        .into_condition()
-                }
+                "creationdate" => Expr::col((group_table.clone(), GroupColumn::CreationDate))
+                    .lte(value)
+                    .into_condition(),
+                "modifieddate" => Expr::col((group_table.clone(), GroupColumn::ModifiedDate))
+                    .lte(value)
+                    .into_condition(),
                 _ => {
                     tracing::warn!(
                         "LessOrEqual filter received on unsupported group column: {}. Returning no results.",
@@ -170,30 +171,26 @@ fn get_group_filter_expr(filter: GroupRequestFilter) -> Cond {
                 }
             }
         }
-        AttributeGreaterOrEqual(name, value) => {
-            Expr::in_subquery(
-                Expr::col(GroupColumn::GroupId.as_column_ref()),
-                model::GroupAttributes::find()
-                    .select_only()
-                    .column(model::GroupAttributesColumn::GroupId)
-                    .filter(model::GroupAttributesColumn::AttributeName.eq(name))
-                    .filter(model::GroupAttributesColumn::Value.gte(value))
-                    .into_query(),
-            )
-            .into_condition()
-        }
-        AttributeLessOrEqual(name, value) => {
-            Expr::in_subquery(
-                Expr::col(GroupColumn::GroupId.as_column_ref()),
-                model::GroupAttributes::find()
-                    .select_only()
-                    .column(model::GroupAttributesColumn::GroupId)
-                    .filter(model::GroupAttributesColumn::AttributeName.eq(name))
-                    .filter(model::GroupAttributesColumn::Value.lte(value))
-                    .into_query(),
-            )
-            .into_condition()
-        }
+        AttributeGreaterOrEqual(name, value) => Expr::in_subquery(
+            Expr::col(GroupColumn::GroupId.as_column_ref()),
+            model::GroupAttributes::find()
+                .select_only()
+                .column(model::GroupAttributesColumn::GroupId)
+                .filter(model::GroupAttributesColumn::AttributeName.eq(name))
+                .filter(model::GroupAttributesColumn::Value.gte(value))
+                .into_query(),
+        )
+        .into_condition(),
+        AttributeLessOrEqual(name, value) => Expr::in_subquery(
+            Expr::col(GroupColumn::GroupId.as_column_ref()),
+            model::GroupAttributes::find()
+                .select_only()
+                .column(model::GroupAttributesColumn::GroupId)
+                .filter(model::GroupAttributesColumn::AttributeName.eq(name))
+                .filter(model::GroupAttributesColumn::Value.lte(value))
+                .into_query(),
+        )
+        .into_condition(),
         AttributeSubString(name, filter) => attribute_substring_condition(name, &filter),
     }
 }
@@ -203,116 +200,115 @@ impl GroupListerBackendHandler for SqlBackendHandler {
     #[instrument(skip(self), level = "debug", ret, err)]
     async fn list_groups(&self, filters: Option<GroupRequestFilter>) -> Result<Vec<Group>> {
         let filters = filters
-        .map(|f| {
-            GroupColumn::GroupId
-            .in_subquery(
-                model::Group::find()
-                .find_also_linked(model::memberships::GroupToUser)
-                .select_only()
-                .column(GroupColumn::GroupId)
-                .filter(get_group_filter_expr(f))
-                .into_query(),
-            )
-            .into_condition()
-        })
-        .unwrap_or_else(|| SimpleExpr::Value(true.into()).into_condition());
+            .map(|f| {
+                GroupColumn::GroupId
+                    .in_subquery(
+                        model::Group::find()
+                            .find_also_linked(model::memberships::GroupToUser)
+                            .select_only()
+                            .column(GroupColumn::GroupId)
+                            .filter(get_group_filter_expr(f))
+                            .into_query(),
+                    )
+                    .into_condition()
+            })
+            .unwrap_or_else(|| SimpleExpr::Value(true.into()).into_condition());
         let results = model::Group::find()
-        .order_by_asc(GroupColumn::GroupId)
-        .find_with_related(model::Membership)
-        .filter(filters.clone())
-        .all(&self.sql_pool)
-        .await?;
+            .order_by_asc(GroupColumn::GroupId)
+            .find_with_related(model::Membership)
+            .filter(filters.clone())
+            .all(&self.sql_pool)
+            .await?;
         // Step 1: Collect all user IDs across all groups first
         let all_user_ids: Vec<UserId> = results
-        .iter()
-        .flat_map(|(_, memberships)| {
-            memberships.iter().map(|m| m.user_id.clone())
-        })
-        .collect();
+            .iter()
+            .flat_map(|(_, memberships)| memberships.iter().map(|m| m.user_id.clone()))
+            .collect();
 
         // Step 2: Fetch OU for all users in one query (efficient)
         let member_ous: std::collections::HashMap<UserId, String> = if all_user_ids.is_empty() {
             std::collections::HashMap::new()
         } else {
             let ou_attrs = model::UserAttributes::find()
-            .filter(model::UserAttributesColumn::UserId.is_in(all_user_ids.clone()))
-            .filter(model::UserAttributesColumn::AttributeName.eq("ou"))
-            .all(&self.sql_pool)
-            .await?;
+                .filter(model::UserAttributesColumn::UserId.is_in(all_user_ids.clone()))
+                .filter(model::UserAttributesColumn::AttributeName.eq("ou"))
+                .all(&self.sql_pool)
+                .await?;
 
             ou_attrs
-            .into_iter()
-            .filter_map(|attr| {
-                String::from_utf8(attr.value.0.clone())
-                .ok()
-                .map(|ou| (attr.user_id, ou))
-            })
-            .collect()
+                .into_iter()
+                .filter_map(|attr| {
+                    String::from_utf8(attr.value.0.clone())
+                        .ok()
+                        .map(|ou| (attr.user_id, ou))
+                })
+                .collect()
         };
 
         // Step 3: Build groups with real GroupMember data
         let mut groups: Vec<_> = results
-        .into_iter()
-        .map(|(group, memberships)| {
-            use std::collections::BTreeSet;
+            .into_iter()
+            .map(|(group, memberships)| {
+                use std::collections::BTreeSet;
 
-            // Deduplicate by user_id (sufficient for uniquemember)
-            let mut seen = BTreeSet::new();
-            let mut unique_users = Vec::new();
+                // Deduplicate by user_id (sufficient for uniquemember)
+                let mut seen = BTreeSet::new();
+                let mut unique_users = Vec::new();
 
-            for m in memberships {
-                if seen.insert(m.user_id.clone()) {
-                    let ou = member_ous
-                    .get(&m.user_id)
-                    .cloned()
-                    .unwrap_or_else(|| "people".to_string());
+                for m in memberships {
+                    if seen.insert(m.user_id.clone()) {
+                        let ou = member_ous
+                            .get(&m.user_id)
+                            .cloned()
+                            .unwrap_or_else(|| "people".to_string());
 
-                    unique_users.push(lldap_domain::types::GroupMember {
-                        user_id: m.user_id,
-                        ou,
-                    });
+                        unique_users.push(lldap_domain::types::GroupMember {
+                            user_id: m.user_id,
+                            ou,
+                        });
+                    }
                 }
-            }
 
-            Group {
-                users: unique_users,
-                ..group.into()
-            }
-        })
-        .collect();
+                Group {
+                    users: unique_users,
+                    ..group.into()
+                }
+            })
+            .collect();
 
         let schema = self.get_schema().await?;
         let attributes = model::GroupAttributes::find()
-        .filter(
-            model::GroupAttributesColumn::GroupId.in_subquery(
-                model::Group::find()
-                .filter(filters)
-                .select_only()
-                .column(model::groups::Column::GroupId)
-                .into_query(),
-            ),
-        )
-        .order_by_asc(model::GroupAttributesColumn::GroupId)
-        .order_by_asc(model::GroupAttributesColumn::AttributeName)
-        .all(&self.sql_pool)
-        .await?;
+            .filter(
+                model::GroupAttributesColumn::GroupId.in_subquery(
+                    model::Group::find()
+                        .filter(filters)
+                        .select_only()
+                        .column(model::groups::Column::GroupId)
+                        .into_query(),
+                ),
+            )
+            .order_by_asc(model::GroupAttributesColumn::GroupId)
+            .order_by_asc(model::GroupAttributesColumn::AttributeName)
+            .all(&self.sql_pool)
+            .await?;
         let mut attributes_iter = attributes.into_iter().peekable();
         use itertools::Itertools;
         for group in groups.iter_mut() {
             let mut attrs: Vec<_> = attributes_iter
-            .take_while_ref(|u| u.group_id == group.id)
-            .map(|a| {
-                deserialize::deserialize_attribute(
-                    a.attribute_name,
-                    &a.value,
-                    schema.group_attributes(),
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
+                .take_while_ref(|u| u.group_id == group.id)
+                .map(|a| {
+                    deserialize::deserialize_attribute(
+                        a.attribute_name,
+                        &a.value,
+                        schema.group_attributes(),
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
 
             // Defensive canonical remap on group read path (symmetry with user side)
             for attr in &mut attrs {
-                attr.name = SqlBackendHandler::canonical_group_attribute_name(&schema, attr.name.as_str());
+                attr.name =
+                    SqlBackendHandler::canonical_group_attribute_name(&schema, attr.name.as_str());
             }
             group.attributes = attrs;
         }
@@ -326,43 +322,44 @@ impl GroupBackendHandler for SqlBackendHandler {
     #[instrument(skip(self), level = "debug", ret, err)]
     async fn get_group_details(&self, group_id: GroupId) -> Result<GroupDetails> {
         let mut group_details = model::Group::find_by_id(group_id)
-        .one(&self.sql_pool)
-        .await?
-        .map(Into::<GroupDetails>::into)
-        .ok_or_else(|| DomainError::EntityNotFound(format!("{group_id:?}")))?;
+            .one(&self.sql_pool)
+            .await?
+            .map(Into::<GroupDetails>::into)
+            .ok_or_else(|| DomainError::EntityNotFound(format!("{group_id:?}")))?;
         let attributes = model::GroupAttributes::find()
-        .filter(model::GroupAttributesColumn::GroupId.eq(group_details.group_id))
-        .order_by_asc(model::GroupAttributesColumn::AttributeName)
-        .all(&self.sql_pool)
-        .await?;
+            .filter(model::GroupAttributesColumn::GroupId.eq(group_details.group_id))
+            .order_by_asc(model::GroupAttributesColumn::AttributeName)
+            .all(&self.sql_pool)
+            .await?;
         let schema = self.get_schema().await?;
         group_details.attributes = attributes
-        .into_iter()
-        .map(|a| {
-            let mut attr = deserialize::deserialize_attribute(
-                a.attribute_name,
-                &a.value,
-                schema.group_attributes(),
-            )?;
+            .into_iter()
+            .map(|a| {
+                let mut attr = deserialize::deserialize_attribute(
+                    a.attribute_name,
+                    &a.value,
+                    schema.group_attributes(),
+                )?;
 
-            // Defensive canonical remap (consistent with user side)
-            attr.name = SqlBackendHandler::canonical_group_attribute_name(&schema, attr.name.as_str());
-            Ok(attr)
-        })
-        .collect::<Result<Vec<_>>>()?;
+                // Defensive canonical remap (consistent with user side)
+                attr.name =
+                    SqlBackendHandler::canonical_group_attribute_name(&schema, attr.name.as_str());
+                Ok(attr)
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok(group_details)
     }
 
     #[instrument(skip(self), level = "debug", err, fields(group_id = ?request.group_id))]
     async fn update_group(&self, request: UpdateGroupRequest) -> Result<()> {
         Ok(self
-        .sql_pool
-        .transaction::<_, (), DomainError>(|transaction| {
-            Box::pin(
-                async move { Self::update_group_with_transaction(request, transaction).await },
-            )
-        })
-        .await?)
+            .sql_pool
+            .transaction::<_, (), DomainError>(|transaction| {
+                Box::pin(
+                    async move { Self::update_group_with_transaction(request, transaction).await },
+                )
+            })
+            .await?)
     }
 
     #[instrument(skip(self), level = "debug", ret, err)]
@@ -406,7 +403,8 @@ impl GroupBackendHandler for SqlBackendHandler {
                         if name == "uidnumber" || name == "gidnumber" {
                             if value != 0 && !(3000..=60000).contains(&value) {
                                 return Err(DomainError::InternalError(format!(
-                                    "{} must be between 3000 and 60000", name
+                                    "{} must be between 3000 and 60000",
+                                    name
                                 )));
                             }
 
@@ -418,7 +416,8 @@ impl GroupBackendHandler for SqlBackendHandler {
 
                             if taken {
                                 return Err(DomainError::InternalError(format!(
-                                    "Number {} is already assigned to another user/group", value
+                                    "Number {} is already assigned to another user/group",
+                                    value
                                 )));
                             }
                         }
@@ -436,13 +435,16 @@ impl GroupBackendHandler for SqlBackendHandler {
 
                     // === POSIX GID AUTO-ASSIGNMENT (restored exactly as original) ===
                     if settings.group_gidnumber_assign {
-                        let already_has_gid = final_attributes.iter().any(|a| a.name.as_str() == "gidnumber");
+                        let already_has_gid = final_attributes
+                            .iter()
+                            .any(|a| a.name.as_str() == "gidnumber");
                         if !already_has_gid {
                             let next_gid = Self::next_available_gid_number(
                                 transaction,
                                 settings.group_gidnumber_start,
                                 settings.group_gidnumber_max,
-                            ).await?;
+                            )
+                            .await?;
                             final_attributes.push(Attribute {
                                 name: "gidnumber".into(),
                                 value: AttributeValue::Integer(Cardinality::Singleton(next_gid)),
@@ -511,8 +513,8 @@ impl GroupBackendHandler for SqlBackendHandler {
         }
 
         let res = model::Group::delete_by_id(group_id)
-        .exec(&self.sql_pool)
-        .await?;
+            .exec(&self.sql_pool)
+            .await?;
         if res.rows_affected == 0 {
             return Err(DomainError::EntityNotFound(format!(
                 "No such group: '{group_id:?}'"
@@ -572,7 +574,8 @@ impl SqlBackendHandler {
             if name == "uidnumber" || name == "gidnumber" {
                 if value != 0 && !(3000..=20000).contains(&value) {
                     return Err(DomainError::InternalError(format!(
-                        "{} must be between 3000 and 20000 (or 0 for no limit)", name
+                        "{} must be between 3000 and 20000 (or 0 for no limit)",
+                        name
                     )));
                 }
 
@@ -584,7 +587,8 @@ impl SqlBackendHandler {
 
                 if taken {
                     return Err(DomainError::InternalError(format!(
-                        "Number {} is already assigned to another user/group", value
+                        "Number {} is already assigned to another user/group",
+                        value
                     )));
                 }
             }
@@ -660,12 +664,12 @@ mod tests {
         filters: Option<GroupRequestFilter>,
     ) -> Vec<GroupId> {
         handler
-        .list_groups(filters)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|g| g.id)
-        .collect::<Vec<_>>()
+            .list_groups(filters)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|g| g.id)
+            .collect::<Vec<_>>()
     }
 
     async fn get_group_names(
@@ -673,12 +677,12 @@ mod tests {
         filters: Option<GroupRequestFilter>,
     ) -> Vec<GroupName> {
         handler
-        .list_groups(filters)
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|g| g.display_name)
-        .collect::<Vec<_>>()
+            .list_groups(filters)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|g| g.display_name)
+            .collect::<Vec<_>>()
     }
 
     #[tokio::test]
@@ -686,11 +690,11 @@ mod tests {
         let fixture = TestFixture::new().await;
         assert_eq!(
             get_group_names(&fixture.handler, None).await,
-                   vec![
-                       "Best Group".into(),
-                   "Empty Group".into(),
-                   "Worst Group".into()
-                   ]
+            vec![
+                "Best Group".into(),
+                "Empty Group".into(),
+                "Worst Group".into()
+            ]
         );
     }
 
@@ -702,7 +706,7 @@ mod tests {
                 &fixture.handler,
                 Some(GroupRequestFilter::Or(vec![
                     GroupRequestFilter::DisplayName("Empty Group".into()),
-                                            GroupRequestFilter::Member(UserId::new("bob")),
+                    GroupRequestFilter::Member(UserId::new("bob")),
                 ]))
             )
             .await,
@@ -749,8 +753,8 @@ mod tests {
                 &fixture.handler,
                 Some(GroupRequestFilter::DisplayNameSubString(SubStringFilter {
                     initial: Some("be".to_owned()),
-                                                              any: vec!["sT".to_owned()],
-                                                              final_: Some("P".to_owned()),
+                    any: vec!["sT".to_owned()],
+                    final_: Some("P".to_owned()),
                 })),
             )
             .await,
@@ -762,35 +766,35 @@ mod tests {
     async fn test_list_groups_other_filter() {
         let fixture = TestFixture::new().await;
         fixture
-        .handler
-        .add_group_attribute(CreateAttributeRequest {
-            name: "gid".into(),
-                             attribute_type: AttributeType::Integer,
-                             is_list: false,
-                             is_visible: true,
-                             is_editable: true,
-        })
-        .await
-        .unwrap();
+            .handler
+            .add_group_attribute(CreateAttributeRequest {
+                name: "gid".into(),
+                attribute_type: AttributeType::Integer,
+                is_list: false,
+                is_visible: true,
+                is_editable: true,
+            })
+            .await
+            .unwrap();
         fixture
-        .handler
-        .update_group(UpdateGroupRequest {
-            group_id: fixture.groups[0],
-            display_name: None,
-            delete_attributes: Vec::new(),
-                      insert_attributes: vec![Attribute {
-                          name: "gid".into(),
-                      value: 512.into(),
-                      }],
-        })
-        .await
-        .unwrap();
+            .handler
+            .update_group(UpdateGroupRequest {
+                group_id: fixture.groups[0],
+                display_name: None,
+                delete_attributes: Vec::new(),
+                insert_attributes: vec![Attribute {
+                    name: "gid".into(),
+                    value: 512.into(),
+                }],
+            })
+            .await
+            .unwrap();
         assert_eq!(
             get_group_ids(
                 &fixture.handler,
                 Some(GroupRequestFilter::AttributeEquality(
                     AttributeName::from("gid"),
-                                                           512.into(),
+                    512.into(),
                 )),
             )
             .await,
@@ -802,10 +806,10 @@ mod tests {
     async fn test_get_group_details() {
         let fixture = TestFixture::new().await;
         let details = fixture
-        .handler
-        .get_group_details(fixture.groups[0])
-        .await
-        .unwrap();
+            .handler
+            .get_group_details(fixture.groups[0])
+            .await
+            .unwrap();
         assert_eq!(details.group_id, fixture.groups[0]);
         assert_eq!(details.display_name, "Best Group".into());
         assert_eq!(
@@ -822,20 +826,20 @@ mod tests {
     async fn test_update_group() {
         let fixture = TestFixture::new().await;
         fixture
-        .handler
-        .update_group(UpdateGroupRequest {
-            group_id: fixture.groups[0],
-            display_name: Some("Awesomest Group".into()),
-                      delete_attributes: Vec::new(),
-                      insert_attributes: Vec::new(),
-        })
-        .await
-        .unwrap();
+            .handler
+            .update_group(UpdateGroupRequest {
+                group_id: fixture.groups[0],
+                display_name: Some("Awesomest Group".into()),
+                delete_attributes: Vec::new(),
+                insert_attributes: Vec::new(),
+            })
+            .await
+            .unwrap();
         let details = fixture
-        .handler
-        .get_group_details(fixture.groups[0])
-        .await
-        .unwrap();
+            .handler
+            .get_group_details(fixture.groups[0])
+            .await
+            .unwrap();
         assert_eq!(details.display_name, "Awesomest Group".into());
     }
 
@@ -844,16 +848,16 @@ mod tests {
         let fixture = TestFixture::new().await;
         assert_eq!(
             get_group_ids(&fixture.handler, None).await,
-                   vec![fixture.groups[0], fixture.groups[2], fixture.groups[1]]
+            vec![fixture.groups[0], fixture.groups[2], fixture.groups[1]]
         );
         fixture
-        .handler
-        .delete_group(fixture.groups[0])
-        .await
-        .unwrap();
+            .handler
+            .delete_group(fixture.groups[0])
+            .await
+            .unwrap();
         assert_eq!(
             get_group_ids(&fixture.handler, None).await,
-                   vec![fixture.groups[2], fixture.groups[1]]
+            vec![fixture.groups[2], fixture.groups[1]]
         );
     }
 
@@ -862,34 +866,34 @@ mod tests {
         let fixture = TestFixture::new().await;
 
         fixture
-        .handler
-        .add_group_attribute(CreateAttributeRequest {
-            name: "new_attribute".into(),
-                             attribute_type: AttributeType::String,
-                             is_list: false,
-                             is_visible: true,
-                             is_editable: true,
-        })
-        .await
-        .unwrap();
+            .handler
+            .add_group_attribute(CreateAttributeRequest {
+                name: "new_attribute".into(),
+                attribute_type: AttributeType::String,
+                is_list: false,
+                is_visible: true,
+                is_editable: true,
+            })
+            .await
+            .unwrap();
 
         let new_group_id = fixture
-        .handler
-        .create_group(CreateGroupRequest {
-            display_name: "New Group".into(),
-                      attributes: vec![Attribute {
-                          name: "new_attribute".into(),
-                      value: "value".to_string().into(),
-                      }],
-        })
-        .await
-        .unwrap();
+            .handler
+            .create_group(CreateGroupRequest {
+                display_name: "New Group".into(),
+                attributes: vec![Attribute {
+                    name: "new_attribute".into(),
+                    value: "value".to_string().into(),
+                }],
+            })
+            .await
+            .unwrap();
 
         let group_details = fixture
-        .handler
-        .get_group_details(new_group_id)
-        .await
-        .unwrap();
+            .handler
+            .get_group_details(new_group_id)
+            .await
+            .unwrap();
 
         assert_eq!(group_details.display_name, "New Group".into());
 
@@ -899,11 +903,11 @@ mod tests {
             vec![
                 Attribute {
                     name: "new_attribute".into(),
-                   value: "value".to_string().into(),
+                    value: "value".to_string().into(),
                 },
                 Attribute {
                     name: "ou".into(),
-                   value: "people".to_string().into(),   // default from allowed_ous
+                    value: "people".to_string().into(), // default from allowed_ous
                 },
             ]
         );
@@ -914,16 +918,16 @@ mod tests {
         let fixture = TestFixture::new().await;
 
         fixture
-        .handler
-        .add_group_attribute(CreateAttributeRequest {
-            name: "new_attribute".into(),
-                             attribute_type: AttributeType::Integer,
-                             is_list: false,
-                             is_visible: true,
-                             is_editable: true,
-        })
-        .await
-        .unwrap();
+            .handler
+            .add_group_attribute(CreateAttributeRequest {
+                name: "new_attribute".into(),
+                attribute_type: AttributeType::Integer,
+                is_list: false,
+                is_visible: true,
+                is_editable: true,
+            })
+            .await
+            .unwrap();
 
         let group_id = fixture.groups[0];
 
@@ -934,36 +938,46 @@ mod tests {
         }];
 
         fixture
-        .handler
-        .update_group(UpdateGroupRequest {
-            group_id,
-            display_name: None,
-            delete_attributes: Vec::new(),
-                      insert_attributes: attributes.clone(),
-        })
-        .await
-        .unwrap();
+            .handler
+            .update_group(UpdateGroupRequest {
+                group_id,
+                display_name: None,
+                delete_attributes: Vec::new(),
+                insert_attributes: attributes.clone(),
+            })
+            .await
+            .unwrap();
 
         let details = fixture.handler.get_group_details(group_id).await.unwrap();
 
         // Should contain both the custom attribute + the mandatory "ou"
-        assert!(details.attributes.iter().any(|a| a.name.as_str() == "new_attribute" && a.value == 42i64.into()));
+        assert!(
+            details
+                .attributes
+                .iter()
+                .any(|a| a.name.as_str() == "new_attribute" && a.value == 42i64.into())
+        );
         assert!(details.attributes.iter().any(|a| a.name.as_str() == "ou"));
 
         // Delete the custom attribute (ou should remain)
         fixture
-        .handler
-        .update_group(UpdateGroupRequest {
-            group_id,
-            display_name: None,
-            delete_attributes: vec!["new_attribute".into()],
-                      insert_attributes: Vec::new(),
-        })
-        .await
-        .unwrap();
+            .handler
+            .update_group(UpdateGroupRequest {
+                group_id,
+                display_name: None,
+                delete_attributes: vec!["new_attribute".into()],
+                insert_attributes: Vec::new(),
+            })
+            .await
+            .unwrap();
 
         let details = fixture.handler.get_group_details(group_id).await.unwrap();
-        assert!(!details.attributes.iter().any(|a| a.name.as_str() == "new_attribute"));
+        assert!(
+            !details
+                .attributes
+                .iter()
+                .any(|a| a.name.as_str() == "new_attribute")
+        );
         assert!(details.attributes.iter().any(|a| a.name.as_str() == "ou")); // ou is protected
     }
 
@@ -971,20 +985,20 @@ mod tests {
     async fn test_create_group_duplicate_name() {
         let fixture = TestFixture::new().await;
         fixture
-        .handler
-        .create_group(CreateGroupRequest {
-            display_name: "New Group".into(),
-                      ..Default::default()
-        })
-        .await
-        .unwrap();
+            .handler
+            .create_group(CreateGroupRequest {
+                display_name: "New Group".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         fixture
-        .handler
-        .create_group(CreateGroupRequest {
-            display_name: "neW group".into(),
-                      ..Default::default()
-        })
-        .await
-        .unwrap_err();
+            .handler
+            .create_group(CreateGroupRequest {
+                display_name: "neW group".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
     }
 }

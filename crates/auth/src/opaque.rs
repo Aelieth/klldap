@@ -55,7 +55,7 @@ impl opaque_ke::ksf::Ksf for ArgonKsf {
         input: GenericArray<u8, L>,
     ) -> Result<GenericArray<u8, L>, opaque_ke::errors::InternalError> {
         let hash = argon2::hash_raw(&input, ArgonHasher::SALT, ArgonHasher::CONFIG)
-        .map_err(|_| opaque_ke::errors::InternalError::KsfError)?;
+            .map_err(|_| opaque_ke::errors::InternalError::KsfError)?;
 
         let mut output: GenericArray<u8, L> = GenericArray::default();
         let copy_len = std::cmp::min(hash.len(), L::to_usize());
@@ -225,10 +225,7 @@ pub mod server {
             login_start: ServerLogin,
             credential_finalization: CredentialFinalization,
         ) -> AuthenticationResult<ServerLoginFinishResult> {
-            Ok(login_start.finish(
-                credential_finalization,
-                ServerLoginParameters::default(),
-            )?)
+            Ok(login_start.finish(credential_finalization, ServerLoginParameters::default())?)
         }
     }
 }

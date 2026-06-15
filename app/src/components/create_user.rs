@@ -5,30 +5,27 @@ use crate::{
             field::Field,
             submit::Submit,
         },
-        router::AppRoute,
-        ou_selector::OuSelector,
         kerberos_switch::KerberosSwitch,
+        ou_selector::OuSelector,
+        router::AppRoute,
     },
     infra::{
         api::HostService,
         common_component::{CommonComponent, CommonComponentParts},
-        form_utils::{
-            EmailIsRequired, GraphQlAttributeSchema, IsAdmin,
-            read_all_form_attributes,
-        },
         encrypt::encrypt_password,
+        form_utils::{EmailIsRequired, GraphQlAttributeSchema, IsAdmin, read_all_form_attributes},
         schema::AttributeType,
     },
 };
 use anyhow::{Result, bail};
+use gloo_console::log;
 use graphql_client::GraphQLQuery;
 use lldap_auth::{opaque, registration};
 use validator_derive::Validate;
+use yew::Context as YewContext;
 use yew::prelude::*;
 use yew_form_derive::Model;
 use yew_router::{prelude::History, scope_ext::RouterScopeExt};
-use yew::Context as YewContext;
-use gloo_console::log;
 
 fn attribute_priority(name: &str) -> (i32, String) {
     let priorities = vec![
@@ -42,63 +39,68 @@ fn attribute_priority(name: &str) -> (i32, String) {
         "homedirectory",
         "loginshell",
     ];
-    let index = priorities.iter().position(|&p| p == name).map(|i| i as i32).unwrap_or(100);
+    let index = priorities
+        .iter()
+        .position(|&p| p == name)
+        .map(|i| i as i32)
+        .unwrap_or(100);
     (index, name.to_lowercase())
 }
 
 #[derive(GraphQLQuery)]
 #[graphql(
-schema_path = "../schema.graphql",
-query_path = "queries/get_kerberos_info.graphql",
-response_derives = "Debug,Clone,PartialEq,Eq",
-custom_scalars_module = "crate::infra::graphql"
+    schema_path = "../schema.graphql",
+    query_path = "queries/get_kerberos_info.graphql",
+    response_derives = "Debug,Clone,PartialEq,Eq",
+    custom_scalars_module = "crate::infra::graphql"
 )]
 pub struct GetKerberosInfo;
 
 #[derive(GraphQLQuery)]
 #[graphql(
-schema_path = "../schema.graphql",
-query_path = "queries/sync_kerberos.graphql",
-response_derives = "Debug,Clone",
-custom_scalars_module = "crate::infra::graphql"
+    schema_path = "../schema.graphql",
+    query_path = "queries/sync_kerberos.graphql",
+    response_derives = "Debug,Clone",
+    custom_scalars_module = "crate::infra::graphql"
 )]
 pub struct SyncKerberosPassword;
 
 #[derive(GraphQLQuery)]
 #[graphql(
-schema_path = "../schema.graphql",
-query_path = "queries/create_user.graphql",
-response_derives = "Debug,Clone",
-custom_scalars_module = "crate::infra::graphql"
+    schema_path = "../schema.graphql",
+    query_path = "queries/create_user.graphql",
+    response_derives = "Debug,Clone",
+    custom_scalars_module = "crate::infra::graphql"
 )]
 pub struct CreateUser;
 
 #[derive(GraphQLQuery)]
 #[graphql(
-schema_path = "../schema.graphql",
-query_path = "queries/get_posix_config.graphql",
-response_derives = "Debug",
-custom_scalars_module = "crate::infra::graphql")]
+    schema_path = "../schema.graphql",
+    query_path = "queries/get_posix_config.graphql",
+    response_derives = "Debug",
+    custom_scalars_module = "crate::infra::graphql"
+)]
 pub struct GetPosixConfig;
 
 use create_user::AttributeValueInput as GraphQLAttributeValue;
 
 #[derive(GraphQLQuery)]
 #[graphql(
-schema_path = "../schema.graphql",
-query_path = "queries/get_user_attributes_schema.graphql",
-response_derives = "Debug,Clone,PartialEq,Eq",
-custom_scalars_module = "crate::infra::graphql",
-extern_enums("AttributeType")
+    schema_path = "../schema.graphql",
+    query_path = "queries/get_user_attributes_schema.graphql",
+    response_derives = "Debug,Clone,PartialEq,Eq",
+    custom_scalars_module = "crate::infra::graphql",
+    extern_enums("AttributeType")
 )]
 pub struct GetUserAttributesSchema;
 
 #[derive(GraphQLQuery)]
 #[graphql(
-schema_path = "../schema.graphql",
-query_path = "queries/list_ous.graphql",
-response_derives = "Debug, Clone",
-custom_scalars_module = "crate::infra::graphql"
+    schema_path = "../schema.graphql",
+    query_path = "queries/list_ous.graphql",
+    response_derives = "Debug, Clone",
+    custom_scalars_module = "crate::infra::graphql"
 )]
 pub struct ListOusQuery;
 
@@ -118,23 +120,23 @@ impl From<&Attribute> for GraphQlAttributeSchema {
 pub struct CreateUserForm {
     common: CommonComponentParts<Self>,
     form: yew_form::Form<CreateUserModel>,
-        attributes_schema: Option<Vec<Attribute>>,
-        form_ref: NodeRef,
-            fetched_schema: bool,
-            encrypted_password: Option<String>,
-            user_id: Option<String>,
-            opaque_data: Option<opaque::client::registration::ClientRegistration>,
-            kerberos_info: Option<get_kerberos_info::GetKerberosInfoKerberosInfo>,
-            kerberossync_enabled: bool,
-            selected_ou: String,
-            ous: Vec<String>,
-            // POSIX auto-assign flags
-            posix_config_loaded: bool,
-            user_uidnumber_assign: bool,
-            user_gidnumber_assign: bool,
-            user_loginshell_assign: bool,
-            user_homedirectory_assign: bool,
-            group_gidnumber_assign: bool,
+    attributes_schema: Option<Vec<Attribute>>,
+    form_ref: NodeRef,
+    fetched_schema: bool,
+    encrypted_password: Option<String>,
+    user_id: Option<String>,
+    opaque_data: Option<opaque::client::registration::ClientRegistration>,
+    kerberos_info: Option<get_kerberos_info::GetKerberosInfoKerberosInfo>,
+    kerberossync_enabled: bool,
+    selected_ou: String,
+    ous: Vec<String>,
+    // POSIX auto-assign flags
+    posix_config_loaded: bool,
+    user_uidnumber_assign: bool,
+    user_gidnumber_assign: bool,
+    user_loginshell_assign: bool,
+    user_homedirectory_assign: bool,
+    group_gidnumber_assign: bool,
 }
 
 #[derive(Model, Validate, PartialEq, Eq, Clone, Default)]
@@ -239,24 +241,35 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
                             }
                         }
                     } else {
-                        bail!("Kerberos enabled but no public key available—check backend startup/logs");
+                        bail!(
+                            "Kerberos enabled but no public key available—check backend startup/logs"
+                        );
                     }
                 }
 
                 let all_values = read_all_form_attributes(
                     self.attributes_schema.iter().flatten(),
-                                                          &self.form_ref,
-                                                          IsAdmin(true),
-                                                          EmailIsRequired(true),
+                    &self.form_ref,
+                    IsAdmin(true),
+                    EmailIsRequired(true),
                 )?;
 
                 if let Some(avatar_attr) = all_values.iter().find(|a| a.name == "avatar") {
                     let avatar_val = avatar_attr.values.first().cloned().unwrap_or_default();
-                    log!("CREATE_FORM_READER: avatar (bytes) length = {}", avatar_val.len());
+                    log!(
+                        "CREATE_FORM_READER: avatar (bytes) length = {}",
+                        avatar_val.len()
+                    );
                     if avatar_val.len() > 100 {
-                        log!("CREATE_FORM_READER: avatar base64 starts with: {}", &avatar_val[0..100.min(avatar_val.len())]);
+                        log!(
+                            "CREATE_FORM_READER: avatar base64 starts with: {}",
+                            &avatar_val[0..100.min(avatar_val.len())]
+                        );
                     } else if !avatar_val.is_empty() {
-                        log!("CREATE_FORM_READER: avatar base64 is short (len={})", avatar_val.len());
+                        log!(
+                            "CREATE_FORM_READER: avatar base64 is short (len={})",
+                            avatar_val.len()
+                        );
                     }
                 }
 
@@ -307,13 +320,13 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
 
                 attributes.push(GraphQLAttributeValue {
                     name: "ou".to_string(),
-                                value: vec![self.selected_ou.clone()],
+                    value: vec![self.selected_ou.clone()],
                 });
 
                 let kerb_value = if self.kerberossync_enabled { "1" } else { "0" };
                 attributes.push(GraphQLAttributeValue {
                     name: "kerberossync".to_string(),
-                                value: vec![kerb_value.to_string()],
+                    value: vec![kerb_value.to_string()],
                 });
 
                 let user = create_user::CreateUserInput {
@@ -339,7 +352,7 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
                 let mut rng = rand::rngs::OsRng;
                 let registration_start_request = opaque::client::registration::start_registration(
                     self.form.model().password.as_bytes(),
-                                                                                                  &mut rng,
+                    &mut rng,
                 )
                 .context("Could not initiate registration")?;
                 let req = registration::ClientRegistrationStartRequest {
@@ -350,7 +363,7 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
                 self.common.call_backend(
                     ctx,
                     HostService::register_start(req),
-                                         Msg::RegistrationStartResponse,
+                    Msg::RegistrationStartResponse,
                 );
                 Ok(false)
             }
@@ -360,7 +373,7 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
                 let mut rng = rand::rngs::OsRng;
                 let registration_finish = opaque::client::registration::finish_registration(
                     registration,
-                    self.form.model().password.as_bytes(),   // ← added password
+                    self.form.model().password.as_bytes(), // ← added password
                     res.registration_response,
                     &mut rng,
                 )
@@ -372,7 +385,7 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
                 self.common.call_backend(
                     ctx,
                     HostService::register_finish(req),
-                                         Msg::RegistrationFinishResponse,
+                    Msg::RegistrationFinishResponse,
                 );
                 Ok(false)
             }
@@ -422,22 +435,22 @@ impl Component for CreateUserForm {
         CreateUserForm {
             common: CommonComponentParts::<Self>::create(),
             form: yew_form::Form::<CreateUserModel>::new(CreateUserModel::default()),
-                attributes_schema: None,
-                form_ref: NodeRef::default(),
-                    fetched_schema: false,
-                    encrypted_password: None,
-                    user_id: None,
-                    opaque_data: None,
-                    kerberos_info: None,
-                    kerberossync_enabled: true,
-                    selected_ou: "people".to_string(),
-                    ous: vec!["people".to_string()],
-                    posix_config_loaded: false,
-                    user_uidnumber_assign: false,
-                    user_gidnumber_assign: false,
-                    user_loginshell_assign: false,
-                    user_homedirectory_assign: false,
-                    group_gidnumber_assign: false,
+            attributes_schema: None,
+            form_ref: NodeRef::default(),
+            fetched_schema: false,
+            encrypted_password: None,
+            user_id: None,
+            opaque_data: None,
+            kerberos_info: None,
+            kerberossync_enabled: true,
+            selected_ou: "people".to_string(),
+            ous: vec!["people".to_string()],
+            posix_config_loaded: false,
+            user_uidnumber_assign: false,
+            user_gidnumber_assign: false,
+            user_loginshell_assign: false,
+            user_homedirectory_assign: false,
+            group_gidnumber_assign: false,
         }
     }
 
@@ -447,14 +460,18 @@ impl Component for CreateUserForm {
 
     fn view(&self, ctx: &YewContext<Self>) -> Html {
         let link = ctx.link();
-        if self.attributes_schema.is_none() || self.kerberos_info.is_none() || !self.posix_config_loaded {
+        if self.attributes_schema.is_none()
+            || self.kerberos_info.is_none()
+            || !self.posix_config_loaded
+        {
             html! { <div>{"Loading schema, Kerberos info and POSIX config..."}</div> }
         } else {
             let attrs = self.attributes_schema.as_ref().unwrap();
 
             let should_show = |a: &Attribute| !a.is_readonly && a.name != "kerberossync";
 
-            let mut visible_attrs: Vec<&Attribute> = attrs.iter().filter(|a| should_show(a)).collect();
+            let mut visible_attrs: Vec<&Attribute> =
+                attrs.iter().filter(|a| should_show(a)).collect();
             visible_attrs.sort_by_key(|a| attribute_priority(&a.name));
 
             html! {

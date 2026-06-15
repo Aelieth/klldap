@@ -17,8 +17,8 @@ use lldap_access_control::{AccessControlledBackendHandler, UserReadableBackendHa
 use lldap_auth::access_control::ValidationResults;
 use lldap_domain::types::UserId;
 use lldap_domain_handlers::handler::{BackendHandler, BindRequest, LoginHandler};
-use lldap_opaque_handler::OpaqueHandler;
 use lldap_kerberos::sync_kerberos_principal;
+use lldap_opaque_handler::OpaqueHandler;
 use tracing::{info, warn};
 
 pub(crate) async fn do_bind(
@@ -54,11 +54,11 @@ pub(crate) async fn do_bind(
         });
     };
     match login_handler
-    .bind(BindRequest {
-        name: user_id.clone(),
-          password: password.clone(),
-    })
-    .await
+        .bind(BindRequest {
+            name: user_id.clone(),
+            password: password.clone(),
+        })
+        .await
     {
         Ok(()) => Ok(user_id),
         Err(_) => Err(LdapError {
@@ -76,7 +76,7 @@ pub(crate) async fn change_password<B: OpaqueHandler>(
     use lldap_auth::*;
     let mut rng = rand::rngs::OsRng;
     let registration_start_request =
-    opaque::client::registration::start_registration(password, &mut rng)?;
+        opaque::client::registration::start_registration(password, &mut rng)?;
     let req = registration::ClientRegistrationStartRequest {
         username: user.clone(),
         registration_start_request: registration_start_request.message,
@@ -108,23 +108,23 @@ pub(crate) async fn do_password_modification<Handler: BackendHandler + OpaqueHan
         (Some(user), Some(password)) => {
             match get_user_id_from_distinguished_name(
                 &user.to_ascii_lowercase(),
-                                                      &ldap_info.base_dn,
-                                                      &ldap_info.base_dn_str,
+                &ldap_info.base_dn,
+                &ldap_info.base_dn_str,
             ) {
                 Ok(uid) => {
                     let user_is_admin = backend_handler
-                    .get_readable_handler(credentials, uid.clone())
-                    .expect("Unexpected permission error")
-                    .get_user_groups(&uid)
-                    .await
-                    .map_err(|e| LdapError {
-                        code: LdapResultCode::OperationsError,
-                        message: format!(
-                            "Internal error while requesting user's groups: {e:#?}"
-                        ),
-                    })?
-                    .iter()
-                    .any(|g| g.display_name == "lldap_admin".into());
+                        .get_readable_handler(credentials, uid.clone())
+                        .expect("Unexpected permission error")
+                        .get_user_groups(&uid)
+                        .await
+                        .map_err(|e| LdapError {
+                            code: LdapResultCode::OperationsError,
+                            message: format!(
+                                "Internal error while requesting user's groups: {e:#?}"
+                            ),
+                        })?
+                        .iter()
+                        .any(|g| g.display_name == "lldap_admin".into());
                     if !credentials.can_change_password(&uid, user_is_admin) {
                         Err(LdapError {
                             code: LdapResultCode::InsufficentAccessRights,
@@ -135,51 +135,61 @@ pub(crate) async fn do_password_modification<Handler: BackendHandler + OpaqueHan
                         })
                     } else if let Err(e) =
                         change_password(opaque_handler, uid.clone(), password.as_bytes()).await
-                        {
-                            Err(LdapError {
-                                code: LdapResultCode::Other,
-                                message: format!("Error while changing the password: {e:#?}"),
-                            })
-                        } else {
-                            // Kerberos sync for LDAP-native password changes (OS/PAM/ldapmodify support)
-                            let readable = backend_handler
+                    {
+                        Err(LdapError {
+                            code: LdapResultCode::Other,
+                            message: format!("Error while changing the password: {e:#?}"),
+                        })
+                    } else {
+                        // Kerberos sync for LDAP-native password changes (OS/PAM/ldapmodify support)
+                        let readable = backend_handler
                             .get_readable_handler(credentials, uid.clone())
                             .expect("Unexpected permission error");
-                            let user_details = readable
-                            .get_user_details(&uid)
-                            .await
-                            .map_err(|e| LdapError {
-                                code: LdapResultCode::OperationsError,
-                                message: format!("Failed to fetch user for Kerberos sync: {e}"),
-                            })?;
+                        let user_details =
+                            readable
+                                .get_user_details(&uid)
+                                .await
+                                .map_err(|e| LdapError {
+                                    code: LdapResultCode::OperationsError,
+                                    message: format!("Failed to fetch user for Kerberos sync: {e}"),
+                                })?;
 
-                            let sync_enabled = user_details.attributes.iter().any(|a| {
-                                a.name.as_str() == "kerberossync"
+                        let sync_enabled = user_details.attributes.iter().any(|a| {
+                            a.name.as_str() == "kerberossync"
                                 && matches!(
                                     &a.value,
                                     lldap_domain::types::AttributeValue::Integer(
                                         lldap_domain::types::Cardinality::Singleton(1)
                                     )
                                 )
-                            });
+                        });
 
-                            if sync_enabled {
-                                if let Err(e) = sync_kerberos_principal(uid.as_str(), password.as_str()) {
-                                    warn!("Kerberos principal sync failed after LDAP password change: {}", e);
-                                } else {
-                                    info!("Kerberos principal synced for user {} (LDAP password change)", uid);
-                                }
-
-                                // ←←← Use unsafe_get_handler to reach the concrete BackendHandler (same pattern as GraphQL)
-                                let inner = backend_handler.unsafe_get_handler();
-                                let _ = inner.ensure_kerberos_principal_consistency(&uid, true).await;
+                        if sync_enabled {
+                            if let Err(e) = sync_kerberos_principal(uid.as_str(), password.as_str())
+                            {
+                                warn!(
+                                    "Kerberos principal sync failed after LDAP password change: {}",
+                                    e
+                                );
+                            } else {
+                                info!(
+                                    "Kerberos principal synced for user {} (LDAP password change)",
+                                    uid
+                                );
                             }
 
-                            Ok(vec![make_extended_response(
-                                LdapResultCode::Success,
-                                "".to_string(),
-                            )])
+                            // ←←← Use unsafe_get_handler to reach the concrete BackendHandler (same pattern as GraphQL)
+                            let inner = backend_handler.unsafe_get_handler();
+                            let _ = inner
+                                .ensure_kerberos_principal_consistency(&uid, true)
+                                .await;
                         }
+
+                        Ok(vec![make_extended_response(
+                            LdapResultCode::Success,
+                            "".to_string(),
+                        )])
+                    }
                 }
                 Err(e) => Err(LdapError {
                     code: LdapResultCode::InvalidDNSyntax,
@@ -205,9 +215,7 @@ pub mod tests {
         },
     };
     use chrono::TimeZone;
-    use ldap3_proto::proto::{
-        LdapBindResponse, LdapOp, LdapResult as LdapResultOp, LdapBindCred,
-    };
+    use ldap3_proto::proto::{LdapBindCred, LdapBindResponse, LdapOp, LdapResult as LdapResultOp};
     use lldap_domain::types::{GroupDetails, GroupId, UserId, Uuid};
     use lldap_test_utils::{MockTestBackendHandler, setup_default_ldap_mock};
     use mockall::predicate::eq;
@@ -278,7 +286,10 @@ pub mod tests {
             group_id: GroupId(1),
             display_name: "lldap_admin".into(),
             creation_date: chrono::Utc.timestamp_opt(0, 0).unwrap().naive_utc(),
-            uuid: Uuid::from_name_and_date("test", &chrono::Utc.timestamp_opt(0, 0).unwrap().naive_utc()),
+            uuid: Uuid::from_name_and_date(
+                "test",
+                &chrono::Utc.timestamp_opt(0, 0).unwrap().naive_utc(),
+            ),
             attributes: vec![],
             modified_date: chrono::Utc.timestamp_opt(0, 0).unwrap().naive_utc(),
         });
@@ -320,7 +331,10 @@ pub mod tests {
         };
         assert_eq!(
             ldap_handler.do_bind(&request).await,
-            make_bind_result(LdapResultCode::NamingViolation, "Not a subtree of the base tree"),
+            make_bind_result(
+                LdapResultCode::NamingViolation,
+                "Not a subtree of the base tree"
+            ),
         );
 
         let request = LdapBindRequest {
@@ -329,7 +343,10 @@ pub mod tests {
         };
         assert_eq!(
             ldap_handler.do_bind(&request).await,
-            make_bind_result(LdapResultCode::NamingViolation, "Not a subtree of the base tree"),
+            make_bind_result(
+                LdapResultCode::NamingViolation,
+                "Not a subtree of the base tree"
+            ),
         );
 
         // VALID: correct base DN + uid= RDN type → Success (POSIX style)
@@ -337,10 +354,7 @@ pub mod tests {
             dn: "uid=bob,ou=people,dc=example,dc=com".to_string(),
             cred: LdapBindCred::Simple("pass".to_string()),
         };
-        assert_eq!(
-            ldap_handler.do_bind(&request).await,
-            make_bind_success()
-        );
+        assert_eq!(ldap_handler.do_bind(&request).await, make_bind_success());
 
         // VALID: correct base DN + cn= RDN type for user in people OU → Success (dual resolution)
         // Both uid= and cn= must succeed and return the user "bob"
@@ -348,10 +362,7 @@ pub mod tests {
             dn: "cn=bob,ou=people,dc=example,dc=com".to_string(),
             cred: LdapBindCred::Simple("pass".to_string()),
         };
-        assert_eq!(
-            ldap_handler.do_bind(&request).await,
-            make_bind_success()
-        );
+        assert_eq!(ldap_handler.do_bind(&request).await, make_bind_success());
     }
 
     // ========================================================================
@@ -363,7 +374,8 @@ pub mod tests {
 
         let mut rng = rand::rngs::OsRng;
         let registration_start_request =
-            opaque::client::registration::start_registration("password".as_bytes(), &mut rng).unwrap();
+            opaque::client::registration::start_registration("password".as_bytes(), &mut rng)
+                .unwrap();
 
         let request = registration::ClientRegistrationStartRequest {
             username: user.into(),
@@ -374,14 +386,17 @@ pub mod tests {
             &opaque::server::ServerSetup::new(&mut rng),
             request.registration_start_request,
             &request.username,
-        ).unwrap();
+        )
+        .unwrap();
 
-        mock.expect_registration_start().times(1).return_once(move |_| {
-            Ok(registration::ServerRegistrationStartResponse {
-                server_data: "".to_string(),
-                registration_response: start_response.message,
-            })
-        });
+        mock.expect_registration_start()
+            .times(1)
+            .return_once(move |_| {
+                Ok(registration::ServerRegistrationStartResponse {
+                    server_data: "".to_string(),
+                    registration_response: start_response.message,
+                })
+            });
 
         mock.expect_registration_finish()
             .times(1)
@@ -407,7 +422,10 @@ pub mod tests {
 
         assert_eq!(
             ldap_handler.handle_ldap_message(request).await,
-            Some(vec![make_extended_response(LdapResultCode::Success, "".to_string())])
+            Some(vec![make_extended_response(
+                LdapResultCode::Success,
+                "".to_string()
+            )])
         );
     }
 
@@ -430,7 +448,10 @@ pub mod tests {
 
         assert_eq!(
             ldap_handler.handle_ldap_message(request).await,
-            Some(vec![make_extended_response(LdapResultCode::Success, "".to_string())])
+            Some(vec![make_extended_response(
+                LdapResultCode::Success,
+                "".to_string()
+            )])
         );
     }
 
@@ -453,7 +474,10 @@ pub mod tests {
 
         assert_eq!(
             ldap_handler.handle_ldap_message(request).await,
-            Some(vec![make_extended_response(LdapResultCode::Success, "".to_string())])
+            Some(vec![make_extended_response(
+                LdapResultCode::Success,
+                "".to_string()
+            )])
         );
     }
 

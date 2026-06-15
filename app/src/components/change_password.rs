@@ -1,7 +1,7 @@
 use crate::{
     components::{
         form::{field::Field, submit::Submit},
-            router::AppRoute,
+        router::AppRoute,
     },
     infra::{
         api::HostService,
@@ -11,7 +11,7 @@ use crate::{
 };
 use anyhow::{Result, bail};
 use graphql_client::GraphQLQuery;
-use lldap_auth::{opaque, login, registration};
+use lldap_auth::{login, opaque, registration};
 use validator_derive::Validate;
 use yew::prelude::*;
 use yew_form::Form;
@@ -20,19 +20,19 @@ use yew_router::{prelude::History, scope_ext::RouterScopeExt};
 
 #[derive(GraphQLQuery)]
 #[graphql(
-schema_path = "../schema.graphql",
-query_path = "queries/get_kerberos_info.graphql",
-response_derives = "Debug,Clone,PartialEq,Eq",
-custom_scalars_module = "crate::infra::graphql"
+    schema_path = "../schema.graphql",
+    query_path = "queries/get_kerberos_info.graphql",
+    response_derives = "Debug,Clone,PartialEq,Eq",
+    custom_scalars_module = "crate::infra::graphql"
 )]
 pub struct GetKerberosInfo;
 
 #[derive(GraphQLQuery)]
 #[graphql(
-schema_path = "../schema.graphql",
-query_path = "queries/sync_kerberos.graphql",
-response_derives = "Debug,Clone",
-custom_scalars_module = "crate::infra::graphql"
+    schema_path = "../schema.graphql",
+    query_path = "queries/sync_kerberos.graphql",
+    response_derives = "Debug,Clone",
+    custom_scalars_module = "crate::infra::graphql"
 )]
 pub struct SyncKerberosPassword;
 
@@ -53,8 +53,8 @@ impl OpaqueData {
 #[derive(Model, Validate, PartialEq, Eq, Clone, Default)]
 pub struct FormModel {
     #[validate(custom(
-    function = "empty_or_long",
-    message = "Password should be longer than 8 characters"
+        function = "empty_or_long",
+        message = "Password should be longer than 8 characters"
     ))]
     old_password: String,
     #[validate(length(min = 8, message = "Invalid password. Min length: 8"))]
@@ -74,10 +74,10 @@ fn empty_or_long(value: &str) -> Result<(), validator::ValidationError> {
 pub struct ChangePasswordForm {
     common: CommonComponentParts<Self>,
     form: Form<FormModel>,
-        opaque_data: OpaqueData,
-        kerberos_info: Option<get_kerberos_info::GetKerberosInfoKerberosInfo>,
-        fetched_kerberos: bool,
-        encrypted_password: Option<String>,
+    opaque_data: OpaqueData,
+    kerberos_info: Option<get_kerberos_info::GetKerberosInfoKerberosInfo>,
+    fetched_kerberos: bool,
+    encrypted_password: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq, Properties)]
@@ -132,7 +132,7 @@ impl CommonComponent<ChangePasswordForm> for ChangePasswordForm {
                     self.common.call_backend(
                         ctx,
                         HostService::login_start(req),
-                                             Msg::LoginStartResponse,
+                        Msg::LoginStartResponse,
                     );
                     Ok(false)
                 }
@@ -156,7 +156,7 @@ impl CommonComponent<ChangePasswordForm> for ChangePasswordForm {
                 self.common.call_backend(
                     ctx,
                     HostService::login_finish(req),
-                                         Msg::LoginFinishResponse,
+                    Msg::LoginFinishResponse,
                 );
                 Ok(false)
             }
@@ -176,7 +176,9 @@ impl CommonComponent<ChangePasswordForm> for ChangePasswordForm {
                             Err(e) => bail!("Failed to encrypt password for Kerberos sync: {}", e),
                         }
                     } else {
-                        bail!("Kerberos enabled but no public key available—check backend startup/logs");
+                        bail!(
+                            "Kerberos enabled but no public key available—check backend startup/logs"
+                        );
                     }
                 }
 
@@ -188,7 +190,7 @@ impl CommonComponent<ChangePasswordForm> for ChangePasswordForm {
                 let mut rng = rand::rngs::OsRng;
                 let registration_start_request = opaque::client::registration::start_registration(
                     new_password.as_bytes(),
-                                                                                                  &mut rng,
+                    &mut rng,
                 )?;
                 let req = registration::ClientRegistrationStartRequest {
                     username: ctx.props().username.clone().into(),
@@ -198,7 +200,7 @@ impl CommonComponent<ChangePasswordForm> for ChangePasswordForm {
                 self.common.call_backend(
                     ctx,
                     HostService::register_start(req),
-                                         Msg::RegistrationStartResponse,
+                    Msg::RegistrationStartResponse,
                 );
                 Ok(false)
             }
@@ -221,7 +223,7 @@ impl CommonComponent<ChangePasswordForm> for ChangePasswordForm {
                 self.common.call_backend(
                     ctx,
                     HostService::register_finish(req),
-                                         Msg::RegistrationFinishResponse,
+                    Msg::RegistrationFinishResponse,
                 );
                 Ok(false)
             }
@@ -273,10 +275,10 @@ impl Component for ChangePasswordForm {
         ChangePasswordForm {
             common: CommonComponentParts::<Self>::create(),
             form: Form::<FormModel>::new(FormModel::default()),
-                opaque_data: OpaqueData::None,
-                kerberos_info: None,
-                fetched_kerberos: false,
-                encrypted_password: None,
+            opaque_data: OpaqueData::None,
+            kerberos_info: None,
+            fetched_kerberos: false,
+            encrypted_password: None,
         }
     }
 

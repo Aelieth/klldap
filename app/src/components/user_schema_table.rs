@@ -21,11 +21,11 @@ use yew::prelude::*;
 
 #[derive(GraphQLQuery)]
 #[graphql(
-schema_path = "../schema.graphql",
-query_path = "queries/get_user_attributes_schema.graphql",
-response_derives = "Debug,Clone,PartialEq,Eq",
-custom_scalars_module = "crate::infra::graphql",
-extern_enums("AttributeType")
+    schema_path = "../schema.graphql",
+    query_path = "queries/get_user_attributes_schema.graphql",
+    response_derives = "Debug,Clone,PartialEq,Eq",
+    custom_scalars_module = "crate::infra::graphql",
+    extern_enums("AttributeType")
 )]
 pub struct GetUserAttributesSchema;
 
@@ -66,9 +66,9 @@ impl CommonComponent<UserSchemaTable> for UserSchemaTable {
                 }
                 Some(_) => {
                     self.attributes
-                    .as_mut()
-                    .unwrap()
-                    .retain(|a| a.name != attribute_name);
+                        .as_mut()
+                        .unwrap()
+                        .retain(|a| a.name != attribute_name);
                     Ok(true)
                 }
             },
@@ -147,7 +147,10 @@ impl UserSchemaTable {
     }
 
     fn view_attribute(&self, ctx: &Context<Self>, attribute: &Attribute) -> Html {
-        let desc = user::resolve_user_attribute_description_or_default(&attribute.name, &attribute.aliases);
+        let desc = user::resolve_user_attribute_description_or_default(
+            &attribute.name,
+            &attribute.aliases,
+        );
 
         // Convert GraphQL Vec<String> → Vec<&str> to match AttributeDescription
         let aliases: Vec<&str> = attribute.aliases.iter().map(|s| s.as_str()).collect();

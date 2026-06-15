@@ -1,4 +1,7 @@
-use crate::core::{error::{LdapError, LdapResult}, utils::LdapInfo};
+use crate::core::{
+    error::{LdapError, LdapResult},
+    utils::LdapInfo,
+};
 use lldap_domain::public_schema::PublicSchema;
 use lldap_domain::types::Group;
 use lldap_domain_handlers::handler::GroupListerBackendHandler;
@@ -36,9 +39,9 @@ mod object_classes_tests {
     #[test]
     fn default_group_object_classes_includes_posix() {
         let classes: Vec<String> = get_default_group_object_classes()
-        .into_iter()
-        .map(|c| c.to_string())
-        .collect();
+            .into_iter()
+            .map(|c| c.to_string())
+            .collect();
 
         assert!(classes.contains(&"groupOfUniqueNames".to_string()));
         assert!(classes.contains(&"groupOfNames".to_string()));

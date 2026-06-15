@@ -1,9 +1,9 @@
 // crates/graphql-server/src/query/mod.rs
 pub mod attribute;
 pub mod filters;
+pub mod group;
 pub mod schema;
-pub mod user;
-pub mod group;   // moved AFTER user so the cycle breaks
+pub mod user; // moved AFTER user so the cycle breaks
 
 // Re-export public types
 pub use attribute::{AttributeSchema, AttributeValue, serialize_attribute_to_graphql};
@@ -12,19 +12,21 @@ pub use group::Group;
 pub use schema::{AttributeList, ObjectClassInfo, Schema};
 pub use user::User;
 
+use crate::api::FullHandler;
+use crate::api::{Context, field_error_callback};
+use juniper::GraphQLObject;
 use juniper::{FieldError, FieldResult, graphql_object, graphql_value};
-use lldap_access_control::{AdminBackendHandler, ReadonlyBackendHandler, UserReadableBackendHandler};
+use lldap_access_control::{
+    AdminBackendHandler, ReadonlyBackendHandler, UserReadableBackendHandler,
+};
 use lldap_domain::types::{GroupId, UserId};
 use lldap_domain_handlers::handler::{BackendHandler, ReadSchemaBackendHandler};
-use crate::api::FullHandler;
+use lldap_kerberos;
+use lldap_kerberos::get_keycloak_suggested_config;
+use lldap_opaque_handler::OpaqueHandler;
+use lldap_schema::PublicSchema;
 use std::sync::Arc;
 use tracing::{Instrument, Span, debug, debug_span};
-use lldap_opaque_handler::OpaqueHandler;
-use crate::api::{Context, field_error_callback};
-use lldap_kerberos;
-use juniper::GraphQLObject;
-use lldap_kerberos::get_keycloak_suggested_config;
-use lldap_schema::PublicSchema;
 
 #[derive(PartialEq, Eq, Debug)]
 /// The top-level GraphQL query type.
@@ -97,7 +99,11 @@ impl<Handler: FullHandler + OpaqueHandler> Query<Handler> {
         "1.0"
     }
 
-    pub async fn user(&self, context: &Context<Handler>, user_id: String) -> FieldResult<User<Handler>> {
+    pub async fn user(
+        &self,
+        context: &Context<Handler>,
+        user_id: String,
+    ) -> FieldResult<User<Handler>> {
         use anyhow::Context;
         let span = debug_span!("[GraphQL query] user");
         span.in_scope(|| {
@@ -105,12 +111,13 @@ impl<Handler: FullHandler + OpaqueHandler> Query<Handler> {
         });
         let user_id = urlencoding::decode(&user_id).context("Invalid user parameter")?;
         let user_id = UserId::new(&user_id);
-        let handler = context
-            .get_readable_handler(user_id.clone())
-            .ok_or_else(field_error_callback(
-                &span,
-                "Unauthorized access to user data",
-            ))?;
+        let handler =
+            context
+                .get_readable_handler(user_id.clone())
+                .ok_or_else(field_error_callback(
+                    &span,
+                    "Unauthorized access to user data",
+                ))?;
         let schema = Arc::new(self.get_schema(context, span.clone()).await?);
         let user = handler.get_user_details(&user_id).instrument(span).await?;
         User::<Handler>::from_user(user, schema)
@@ -163,7 +170,11 @@ impl<Handler: FullHandler + OpaqueHandler> Query<Handler> {
             .collect()
     }
 
-    async fn group(&self, context: &Context<Handler>, group_id: i32) -> FieldResult<Group<Handler>> {
+    async fn group(
+        &self,
+        context: &Context<Handler>,
+        group_id: i32,
+    ) -> FieldResult<Group<Handler>> {
         let span = debug_span!("[GraphQL query] group");
         span.in_scope(|| {
             debug!(?group_id);
@@ -190,7 +201,7 @@ impl<Handler: FullHandler + OpaqueHandler> Query<Handler> {
     fn kerberos_info(&self, _context: &Context<Handler>) -> FieldResult<KerberosInfo> {
         let public_key_der_base64 = lldap_kerberos::get_public_key_der_base64();
         Ok(KerberosInfo {
-            public_key_der_base64: Some(public_key_der_base64)
+            public_key_der_base64: Some(public_key_der_base64),
         })
     }
 
@@ -206,14 +217,13 @@ impl<Handler: FullHandler + OpaqueHandler> Query<Handler> {
         })
     }
 
-    async fn keycloak_config(
-        _context: &Context<Handler>,
-    ) -> FieldResult<KeycloakConfigResponse> {
-        let cfg = lldap_kerberos::load_keycloak_config()
-        .unwrap_or_else(|_| lldap_kerberos::KeycloakConfig {
-            url: "http://keycloak:8080".to_string(),
-                        realm: "master".to_string(),
-                        admin_user: "admin".to_string(),
+    async fn keycloak_config(_context: &Context<Handler>) -> FieldResult<KeycloakConfigResponse> {
+        let cfg = lldap_kerberos::load_keycloak_config().unwrap_or_else(|_| {
+            lldap_kerberos::KeycloakConfig {
+                url: "http://keycloak:8080".to_string(),
+                realm: "master".to_string(),
+                admin_user: "admin".to_string(),
+            }
         });
 
         Ok(KeycloakConfigResponse {
@@ -223,9 +233,7 @@ impl<Handler: FullHandler + OpaqueHandler> Query<Handler> {
         })
     }
 
-    async fn list_ous(
-        context: &Context<Handler>,
-    ) -> FieldResult<Vec<String>> {
+    async fn list_ous(context: &Context<Handler>) -> FieldResult<Vec<String>> {
         let span = debug_span!("[GraphQL query] list_ous");
         span.in_scope(|| debug!("Fetching global allowedous list (single source of truth)"));
 
@@ -234,32 +242,35 @@ impl<Handler: FullHandler + OpaqueHandler> Query<Handler> {
             .ok_or_else(field_error_callback(&span, "Unauthorized to read OUs"))?;
 
         let inner = AdminBackendHandler::unsafe_get_handler(handler);
-        let ous = inner.get_allowed_ous().await
-            .map_err(|e| FieldError::new(
+        let ous = inner.get_allowed_ous().await.map_err(|e| {
+            FieldError::new(
                 "Failed to load allowedous",
                 graphql_value!({ "details": (e.to_string()) }),
-            ))?;
+            )
+        })?;
 
         Ok(ous)
     }
 
-async fn posix_settings(
-        context: &Context<Handler>,
-    ) -> FieldResult<PosixSettings> {
+    async fn posix_settings(context: &Context<Handler>) -> FieldResult<PosixSettings> {
         let span = debug_span!("[GraphQL query] posix_settings");
         span.in_scope(|| debug!("Fetching full POSIX settings (single source of truth)"));
 
         let handler = context
             .get_admin_handler()
-            .ok_or_else(field_error_callback(&span, "Unauthorized to read POSIX settings"))?;
+            .ok_or_else(field_error_callback(
+                &span,
+                "Unauthorized to read POSIX settings",
+            ))?;
 
         let inner = AdminBackendHandler::unsafe_get_handler(handler);
 
-        let settings = inner.get_posix_settings().await
-            .map_err(|e| FieldError::new(
+        let settings = inner.get_posix_settings().await.map_err(|e| {
+            FieldError::new(
                 "Failed to load posix_settings",
                 graphql_value!({ "details": (e.to_string()) }),
-            ))?;
+            )
+        })?;
 
         Ok(PosixSettings {
             user_uidnumber_assign: settings.user_uidnumber_assign,
@@ -285,12 +296,9 @@ impl<Handler: BackendHandler + OpaqueHandler> Query<Handler> {
         span: Span,
     ) -> FieldResult<PublicSchema> {
         let handler = context
-        .handler
-        .get_user_restricted_lister_handler(&context.validation_result);
-        Ok(handler
-        .get_schema()
-        .instrument(span)
-        .await?)
+            .handler
+            .get_user_restricted_lister_handler(&context.validation_result);
+        Ok(handler.get_schema().instrument(span).await?)
     }
 }
 
@@ -394,7 +402,10 @@ mod tests {
                 },
                 system_attributes: AttributeList { attributes: vec![] },
                 posix_settings: DomainPosixSettings::default(),
-                extra_user_object_classes: vec!["customUserClass".to_string(), "myUserClass".to_string()],
+                extra_user_object_classes: vec![
+                    "customUserClass".to_string(),
+                    "myUserClass".to_string(),
+                ],
                 extra_group_object_classes: vec!["customGroupClass".to_string()],
             }))
         });
@@ -469,8 +480,8 @@ mod tests {
     }
 
     #[tokio::test]
-async fn list_users() {
-    const QUERY: &str = r#"{
+    async fn list_users() {
+        const QUERY: &str = r#"{
         users(where: {
             any: [
                 {eq: { field: "id", value: "bob" }},
@@ -483,87 +494,95 @@ async fn list_users() {
         }
     }"#;
 
-    let mut mock = MockTestBackendHandler::new();
-    setup_default_schema(&mut mock);
-    mock.expect_list_users()
-        .with(
-            eq(Some(lldap_domain_handlers::handler::UserRequestFilter::Or(vec![
-                lldap_domain_handlers::handler::UserRequestFilter::AttributeEquality(
-                    AttributeName::from("userid"),
-                    "bob".to_string().into(),
-                ),
-                lldap_domain_handlers::handler::UserRequestFilter::Equality(
-                    UserColumn::Email,
-                    "robert@bobbers.on".to_owned(),
-                ),
-                lldap_domain_handlers::handler::UserRequestFilter::AttributeEquality(
-                    AttributeName::from("firstname"),
-                    "robert".to_string().into(),
-                ),
-            ]))),
-            eq(true),   // ← Fixed: must be true
-        )
-        .return_once(|_, _| {
-            Ok(vec![
-                lldap_domain::types::UserAndGroups {
-                    user: DomainUser {
-                        user_id: UserId::new("bob"),
-                        email: "bob@bobbers.on".into(),
-                        display_name: None,
-                        creation_date: chrono::Utc.timestamp_opt(0, 0).unwrap().naive_utc(),
-                        modified_date: chrono::Utc.timestamp_opt(0, 0).unwrap().naive_utc(),
-                        password_modified_date: chrono::Utc.timestamp_opt(0, 0).unwrap().naive_utc(),
-                        uuid: lldap_domain::types::Uuid::from_name_and_date(
-                            "bob",
-                            &chrono::Utc.timestamp_opt(0, 0).unwrap().naive_utc(),
+        let mut mock = MockTestBackendHandler::new();
+        setup_default_schema(&mut mock);
+        mock.expect_list_users()
+            .with(
+                eq(Some(lldap_domain_handlers::handler::UserRequestFilter::Or(
+                    vec![
+                        lldap_domain_handlers::handler::UserRequestFilter::AttributeEquality(
+                            AttributeName::from("userid"),
+                            "bob".to_string().into(),
                         ),
-                        attributes: Vec::new(),
-                        krb_principal_name: None,
-                    },
-                    groups: None,
-                },
-                lldap_domain::types::UserAndGroups {
-                    user: DomainUser {
-                        user_id: UserId::new("robert"),
-                        email: "robert@bobbers.on".into(),
-                        display_name: None,
-                        creation_date: chrono::Utc.timestamp_opt(0, 0).unwrap().naive_utc(),
-                        modified_date: chrono::Utc.timestamp_opt(0, 0).unwrap().naive_utc(),
-                        password_modified_date: chrono::Utc.timestamp_opt(0, 0).unwrap().naive_utc(),
-                        uuid: lldap_domain::types::Uuid::from_name_and_date(
-                            "robert",
-                            &chrono::Utc.timestamp_opt(0, 0).unwrap().naive_utc(),
+                        lldap_domain_handlers::handler::UserRequestFilter::Equality(
+                            UserColumn::Email,
+                            "robert@bobbers.on".to_owned(),
                         ),
-                        attributes: Vec::new(),
-                        krb_principal_name: None,
+                        lldap_domain_handlers::handler::UserRequestFilter::AttributeEquality(
+                            AttributeName::from("firstname"),
+                            "robert".to_string().into(),
+                        ),
+                    ],
+                ))),
+                eq(true), // ← Fixed: must be true
+            )
+            .return_once(|_, _| {
+                Ok(vec![
+                    lldap_domain::types::UserAndGroups {
+                        user: DomainUser {
+                            user_id: UserId::new("bob"),
+                            email: "bob@bobbers.on".into(),
+                            display_name: None,
+                            creation_date: chrono::Utc.timestamp_opt(0, 0).unwrap().naive_utc(),
+                            modified_date: chrono::Utc.timestamp_opt(0, 0).unwrap().naive_utc(),
+                            password_modified_date: chrono::Utc
+                                .timestamp_opt(0, 0)
+                                .unwrap()
+                                .naive_utc(),
+                            uuid: lldap_domain::types::Uuid::from_name_and_date(
+                                "bob",
+                                &chrono::Utc.timestamp_opt(0, 0).unwrap().naive_utc(),
+                            ),
+                            attributes: Vec::new(),
+                            krb_principal_name: None,
+                        },
+                        groups: None,
                     },
-                    groups: None,
-                },
-            ])
-        });
+                    lldap_domain::types::UserAndGroups {
+                        user: DomainUser {
+                            user_id: UserId::new("robert"),
+                            email: "robert@bobbers.on".into(),
+                            display_name: None,
+                            creation_date: chrono::Utc.timestamp_opt(0, 0).unwrap().naive_utc(),
+                            modified_date: chrono::Utc.timestamp_opt(0, 0).unwrap().naive_utc(),
+                            password_modified_date: chrono::Utc
+                                .timestamp_opt(0, 0)
+                                .unwrap()
+                                .naive_utc(),
+                            uuid: lldap_domain::types::Uuid::from_name_and_date(
+                                "robert",
+                                &chrono::Utc.timestamp_opt(0, 0).unwrap().naive_utc(),
+                            ),
+                            attributes: Vec::new(),
+                            krb_principal_name: None,
+                        },
+                        groups: None,
+                    },
+                ])
+            });
 
-    let context = Context::<MockTestBackendHandler>::new_for_tests(
-        mock,
-        ValidationResults {
-            user: UserId::new("admin"),
-            permission: Permission::Admin,
-        },
-    );
+        let context = Context::<MockTestBackendHandler>::new_for_tests(
+            mock,
+            ValidationResults {
+                user: UserId::new("admin"),
+                permission: Permission::Admin,
+            },
+        );
 
-    let schema = schema(Query::<MockTestBackendHandler>::new());
-    assert_eq!(
-        execute(QUERY, None, &schema, &Variables::new(), &context).await,
-        Ok((
-            graphql_value!({
-                "users": [
-                    { "id": "bob", "email": "bob@bobbers.on" },
-                    { "id": "robert", "email": "robert@bobbers.on" }
-                ]
-            }),
-            vec![]
-        ))
-    );
-}
+        let schema = schema(Query::<MockTestBackendHandler>::new());
+        assert_eq!(
+            execute(QUERY, None, &schema, &Variables::new(), &context).await,
+            Ok((
+                graphql_value!({
+                    "users": [
+                        { "id": "bob", "email": "bob@bobbers.on" },
+                        { "id": "robert", "email": "robert@bobbers.on" }
+                    ]
+                }),
+                vec![]
+            ))
+        );
+    }
 
     #[tokio::test]
     async fn get_schema() {
@@ -637,7 +656,9 @@ async fn list_users() {
                         is_readonly: false,
                     }],
                 },
-                group_attributes: AttributeList { attributes: Vec::new() },
+                group_attributes: AttributeList {
+                    attributes: Vec::new(),
+                },
                 system_attributes: AttributeList { attributes: vec![] },
                 posix_settings: DomainPosixSettings::default(),
                 extra_user_object_classes: vec!["customUserClass".to_string()],

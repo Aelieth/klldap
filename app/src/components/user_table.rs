@@ -1,9 +1,9 @@
 use crate::{
     components::{
-        router::{AppRoute, Link},
-        ou_table::OuTable,
         change_ou::OuChangeKind,
         delete_user::DeleteUser,
+        ou_table::OuTable,
+        router::{AppRoute, Link},
         table_action_bar::TableActionBar,
         table_bulk_selection::TableBulkSelection,
     },
@@ -11,8 +11,8 @@ use crate::{
 };
 use anyhow::{Error, Result};
 use graphql_client::GraphQLQuery;
-use list_users_query::ResponseData;
 use list_ous_query::ResponseData as OusResponseData;
+use list_users_query::ResponseData;
 use yew::prelude::*;
 
 #[derive(GraphQLQuery)]
@@ -63,7 +63,11 @@ pub enum Msg {
 }
 
 impl CommonComponent<UserTable> for UserTable {
-    fn handle_msg(&mut self, ctx: &Context<Self>, msg: <Self as Component>::Message) -> Result<bool> {
+    fn handle_msg(
+        &mut self,
+        ctx: &Context<Self>,
+        msg: <Self as Component>::Message,
+    ) -> Result<bool> {
         match msg {
             Msg::ListUsersResponse(users) => {
                 self.users = Some(users?.users.into_iter().collect());
@@ -113,13 +117,20 @@ impl CommonComponent<UserTable> for UserTable {
                             "User ID" => u.id.to_lowercase().contains(&term),
                             "Email" => u.email.to_lowercase().contains(&term),
                             "Display Name" => u.display_name.to_lowercase().contains(&term),
-                            "First Name" => Self::get_attribute_value(u, "firstname").unwrap_or_default().to_lowercase().contains(&term),
-                            "Last Name" => Self::get_attribute_value(u, "lastname").unwrap_or_default().to_lowercase().contains(&term),
+                            "First Name" => Self::get_attribute_value(u, "firstname")
+                                .unwrap_or_default()
+                                .to_lowercase()
+                                .contains(&term),
+                            "Last Name" => Self::get_attribute_value(u, "lastname")
+                                .unwrap_or_default()
+                                .to_lowercase()
+                                .contains(&term),
                             "Creation Date" => Self::get_creation_date_str(u).contains(&term),
                             _ => true,
                         });
                     }
-                    self.bulk_selection.toggle_all(&filtered.iter().map(|u| u.id.clone()).collect::<Vec<_>>());
+                    self.bulk_selection
+                        .toggle_all(&filtered.iter().map(|u| u.id.clone()).collect::<Vec<_>>());
                 }
                 Ok(true)
             }
@@ -161,9 +172,9 @@ impl CommonComponent<UserTable> for UserTable {
 impl UserTable {
     fn get_attribute_value(user: &User, name: &str) -> Option<String> {
         user.attributes
-        .iter()
-        .find(|a| a.schema.name == name)
-        .and_then(|a| a.value.first().cloned())
+            .iter()
+            .find(|a| a.schema.name == name)
+            .and_then(|a| a.value.first().cloned())
     }
 
     fn get_kerberos_sync(user: &User) -> bool {
@@ -233,8 +244,14 @@ impl Component for UserTable {
                     "User ID" => u.id.to_lowercase().contains(&term),
                     "Email" => u.email.to_lowercase().contains(&term),
                     "Display Name" => u.display_name.to_lowercase().contains(&term),
-                    "First Name" => Self::get_attribute_value(u, "firstname").unwrap_or_default().to_lowercase().contains(&term),
-                    "Last Name" => Self::get_attribute_value(u, "lastname").unwrap_or_default().to_lowercase().contains(&term),
+                    "First Name" => Self::get_attribute_value(u, "firstname")
+                        .unwrap_or_default()
+                        .to_lowercase()
+                        .contains(&term),
+                    "Last Name" => Self::get_attribute_value(u, "lastname")
+                        .unwrap_or_default()
+                        .to_lowercase()
+                        .contains(&term),
                     "Creation Date" => Self::get_creation_date_str(u).contains(&term),
                     _ => true,
                 });
@@ -297,7 +314,12 @@ impl Component for UserTable {
 
 impl UserTable {
     fn view_users(&self, ctx: &Context<Self>, filtered_users: &[User]) -> Html {
-        let all_selected = self.bulk_selection.all_selected(&filtered_users.iter().map(|u| u.id.clone()).collect::<Vec<_>>());
+        let all_selected = self.bulk_selection.all_selected(
+            &filtered_users
+                .iter()
+                .map(|u| u.id.clone())
+                .collect::<Vec<_>>(),
+        );
 
         html! {
             <div class="table-responsive">

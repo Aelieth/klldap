@@ -1,40 +1,71 @@
-use crate::{
-    infra::{
-        common_component::{CommonComponent, CommonComponentParts},
-    },
-};
+use crate::infra::common_component::{CommonComponent, CommonComponentParts};
 use anyhow::Result;
 use graphql_client::GraphQLQuery;
-use yew::prelude::*;
 use wasm_bindgen::JsCast;
+use yew::prelude::*;
 
 // GraphQL derives
 #[derive(GraphQLQuery)]
-#[graphql(schema_path = "../schema.graphql", query_path = "queries/get_posix_config.graphql", response_derives = "Debug", custom_scalars_module = "crate::infra::graphql")]
+#[graphql(
+    schema_path = "../schema.graphql",
+    query_path = "queries/get_posix_config.graphql",
+    response_derives = "Debug",
+    custom_scalars_module = "crate::infra::graphql"
+)]
 pub struct GetPosixConfig;
 
 #[derive(GraphQLQuery)]
-#[graphql(schema_path = "../schema.graphql", query_path = "queries/set_posix_config.graphql", response_derives = "Debug", custom_scalars_module = "crate::infra::graphql")]
+#[graphql(
+    schema_path = "../schema.graphql",
+    query_path = "queries/set_posix_config.graphql",
+    response_derives = "Debug",
+    custom_scalars_module = "crate::infra::graphql"
+)]
 pub struct SetPosixConfig;
 
 #[derive(GraphQLQuery)]
-#[graphql(schema_path = "../schema.graphql", query_path = "queries/reassign_gid_numbers.graphql", response_derives = "Debug", custom_scalars_module = "crate::infra::graphql")]
+#[graphql(
+    schema_path = "../schema.graphql",
+    query_path = "queries/reassign_gid_numbers.graphql",
+    response_derives = "Debug",
+    custom_scalars_module = "crate::infra::graphql"
+)]
 pub struct ReassignGidNumbers;
 
 #[derive(GraphQLQuery)]
-#[graphql(schema_path = "../schema.graphql", query_path = "queries/reassign_user_uid_numbers.graphql", response_derives = "Debug", custom_scalars_module = "crate::infra::graphql")]
+#[graphql(
+    schema_path = "../schema.graphql",
+    query_path = "queries/reassign_user_uid_numbers.graphql",
+    response_derives = "Debug",
+    custom_scalars_module = "crate::infra::graphql"
+)]
 pub struct ReassignUserUidNumbers;
 
 #[derive(GraphQLQuery)]
-#[graphql(schema_path = "../schema.graphql", query_path = "queries/reassign_user_gid_numbers.graphql", response_derives = "Debug", custom_scalars_module = "crate::infra::graphql")]
+#[graphql(
+    schema_path = "../schema.graphql",
+    query_path = "queries/reassign_user_gid_numbers.graphql",
+    response_derives = "Debug",
+    custom_scalars_module = "crate::infra::graphql"
+)]
 pub struct ReassignUserGidNumbers;
 
 #[derive(GraphQLQuery)]
-#[graphql(schema_path = "../schema.graphql", query_path = "queries/reassign_user_homedirectories.graphql", response_derives = "Debug", custom_scalars_module = "crate::infra::graphql")]
+#[graphql(
+    schema_path = "../schema.graphql",
+    query_path = "queries/reassign_user_homedirectories.graphql",
+    response_derives = "Debug",
+    custom_scalars_module = "crate::infra::graphql"
+)]
 pub struct ReassignUserHomeDirectories;
 
 #[derive(GraphQLQuery)]
-#[graphql(schema_path = "../schema.graphql", query_path = "queries/reassign_user_loginshells.graphql", response_derives = "Debug", custom_scalars_module = "crate::infra::graphql")]
+#[graphql(
+    schema_path = "../schema.graphql",
+    query_path = "queries/reassign_user_loginshells.graphql",
+    response_derives = "Debug",
+    custom_scalars_module = "crate::infra::graphql"
+)]
 pub struct ReassignUserLoginShells;
 
 #[derive(Properties, PartialEq)]
@@ -114,7 +145,12 @@ impl CommonComponent<PosixOptions> for PosixOptions {
         match msg {
             Msg::LoadConfig => {
                 let vars = get_posix_config::Variables {};
-                self.common.call_graphql::<GetPosixConfig, _>(ctx, vars, Msg::ConfigResponse, "Failed to load POSIX config");
+                self.common.call_graphql::<GetPosixConfig, _>(
+                    ctx,
+                    vars,
+                    Msg::ConfigResponse,
+                    "Failed to load POSIX config",
+                );
                 self.loading = true;
                 self.status = "Loading POSIX config...".to_string();
                 self.status_class = "bg-info".to_string();
@@ -125,25 +161,53 @@ impl CommonComponent<PosixOptions> for PosixOptions {
 
                 self.user_uidnumber_assign = cfg.user_uidnumber_assign;
                 self.saved_user_uidnumber_assign = cfg.user_uidnumber_assign;
-                self.user_uidnumber_start = if cfg.user_uidnumber_assign { cfg.user_uidnumber_start.to_string() } else { "".to_string() };
-                self.user_uidnumber_max = if cfg.user_uidnumber_assign { cfg.user_uidnumber_max.to_string() } else { "".to_string() };
+                self.user_uidnumber_start = if cfg.user_uidnumber_assign {
+                    cfg.user_uidnumber_start.to_string()
+                } else {
+                    "".to_string()
+                };
+                self.user_uidnumber_max = if cfg.user_uidnumber_assign {
+                    cfg.user_uidnumber_max.to_string()
+                } else {
+                    "".to_string()
+                };
 
                 self.user_gidnumber_assign = cfg.user_gidnumber_assign;
                 self.saved_user_gidnumber_assign = cfg.user_gidnumber_assign;
-                self.user_gidnumber_start = if cfg.user_gidnumber_assign { cfg.user_gidnumber_start.to_string() } else { "".to_string() };
+                self.user_gidnumber_start = if cfg.user_gidnumber_assign {
+                    cfg.user_gidnumber_start.to_string()
+                } else {
+                    "".to_string()
+                };
 
                 self.user_loginshell_assign = cfg.user_loginshell_assign;
                 self.saved_user_loginshell_assign = cfg.user_loginshell_assign;
-                self.user_loginshell_default = if cfg.user_loginshell_assign { cfg.user_loginshell_default } else { "".to_string() };
+                self.user_loginshell_default = if cfg.user_loginshell_assign {
+                    cfg.user_loginshell_default
+                } else {
+                    "".to_string()
+                };
 
                 self.user_homedirectory_assign = cfg.user_homedirectory_assign;
                 self.saved_user_homedirectory_assign = cfg.user_homedirectory_assign;
-                self.user_homedirectory_prefix = if cfg.user_homedirectory_assign { cfg.user_homedirectory_prefix } else { "".to_string() };
+                self.user_homedirectory_prefix = if cfg.user_homedirectory_assign {
+                    cfg.user_homedirectory_prefix
+                } else {
+                    "".to_string()
+                };
 
                 self.group_gidnumber_assign = cfg.group_gidnumber_assign;
                 self.saved_group_gidnumber_assign = cfg.group_gidnumber_assign;
-                self.group_gidnumber_start = if cfg.group_gidnumber_assign { cfg.group_gidnumber_start.to_string() } else { "".to_string() };
-                self.group_gidnumber_max = if cfg.group_gidnumber_assign { cfg.group_gidnumber_max.to_string() } else { "".to_string() };
+                self.group_gidnumber_start = if cfg.group_gidnumber_assign {
+                    cfg.group_gidnumber_start.to_string()
+                } else {
+                    "".to_string()
+                };
+                self.group_gidnumber_max = if cfg.group_gidnumber_assign {
+                    cfg.group_gidnumber_max.to_string()
+                } else {
+                    "".to_string()
+                };
 
                 self.loading = false;
                 self.config_changed = false;
@@ -170,8 +234,16 @@ impl CommonComponent<PosixOptions> for PosixOptions {
                 self.config_changed = true;
                 Ok(true)
             }
-            Msg::UpdateUserUidStart(s) => { self.user_uidnumber_start = s; self.config_changed = true; Ok(true) }
-            Msg::UpdateUserUidMax(s) => { self.user_uidnumber_max = s; self.config_changed = true; Ok(true) }
+            Msg::UpdateUserUidStart(s) => {
+                self.user_uidnumber_start = s;
+                self.config_changed = true;
+                Ok(true)
+            }
+            Msg::UpdateUserUidMax(s) => {
+                self.user_uidnumber_max = s;
+                self.config_changed = true;
+                Ok(true)
+            }
             Msg::UpdateUserGidAssign(v) => {
                 self.user_gidnumber_assign = v;
                 if !v {
@@ -180,7 +252,11 @@ impl CommonComponent<PosixOptions> for PosixOptions {
                 self.config_changed = true;
                 Ok(true)
             }
-            Msg::UpdateUserGidStart(s) => { self.user_gidnumber_start = s; self.config_changed = true; Ok(true) }
+            Msg::UpdateUserGidStart(s) => {
+                self.user_gidnumber_start = s;
+                self.config_changed = true;
+                Ok(true)
+            }
             Msg::UpdateUserLoginShellAssign(v) => {
                 self.user_loginshell_assign = v;
                 if !v {
@@ -189,7 +265,11 @@ impl CommonComponent<PosixOptions> for PosixOptions {
                 self.config_changed = true;
                 Ok(true)
             }
-            Msg::UpdateUserLoginShellDefault(s) => { self.user_loginshell_default = s; self.config_changed = true; Ok(true) }
+            Msg::UpdateUserLoginShellDefault(s) => {
+                self.user_loginshell_default = s;
+                self.config_changed = true;
+                Ok(true)
+            }
             Msg::UpdateUserHomeAssign(v) => {
                 self.user_homedirectory_assign = v;
                 if !v {
@@ -198,7 +278,11 @@ impl CommonComponent<PosixOptions> for PosixOptions {
                 self.config_changed = true;
                 Ok(true)
             }
-            Msg::UpdateUserHomePrefix(s) => { self.user_homedirectory_prefix = s; self.config_changed = true; Ok(true) }
+            Msg::UpdateUserHomePrefix(s) => {
+                self.user_homedirectory_prefix = s;
+                self.config_changed = true;
+                Ok(true)
+            }
             Msg::UpdateGroupGidAssign(v) => {
                 self.group_gidnumber_assign = v;
                 if !v {
@@ -208,8 +292,16 @@ impl CommonComponent<PosixOptions> for PosixOptions {
                 self.config_changed = true;
                 Ok(true)
             }
-            Msg::UpdateGroupGidStart(s) => { self.group_gidnumber_start = s; self.config_changed = true; Ok(true) }
-            Msg::UpdateGroupGidMax(s) => { self.group_gidnumber_max = s; self.config_changed = true; Ok(true) }
+            Msg::UpdateGroupGidStart(s) => {
+                self.group_gidnumber_start = s;
+                self.config_changed = true;
+                Ok(true)
+            }
+            Msg::UpdateGroupGidMax(s) => {
+                self.group_gidnumber_max = s;
+                self.config_changed = true;
+                Ok(true)
+            }
 
             Msg::SaveConfig => {
                 let input = set_posix_config::PosixSettingsInput {
@@ -227,7 +319,12 @@ impl CommonComponent<PosixOptions> for PosixOptions {
                     group_gidnumber_max: self.group_gidnumber_max.parse().unwrap_or(60000),
                 };
                 let vars = set_posix_config::Variables { input };
-                self.common.call_graphql::<SetPosixConfig, _>(ctx, vars, Msg::SaveResponse, "Save POSIX config failure");
+                self.common.call_graphql::<SetPosixConfig, _>(
+                    ctx,
+                    vars,
+                    Msg::SaveResponse,
+                    "Save POSIX config failure",
+                );
                 self.status = "Saving...".to_string();
                 self.status_class = "bg-info".to_string();
                 Ok(false)
@@ -254,34 +351,74 @@ impl CommonComponent<PosixOptions> for PosixOptions {
             }
 
             // Reassign buttons open the confirmation modal
-            Msg::ReassignUserUidNumbers => { self.pending_reassign = Some(ReassignAction::UserUidNumbers); Ok(true) }
-            Msg::ReassignUserGidNumbers => { self.pending_reassign = Some(ReassignAction::UserGidNumbers); Ok(true) }
-            Msg::ReassignUserLoginShells => { self.pending_reassign = Some(ReassignAction::UserLoginShells); Ok(true) }
-            Msg::ReassignUserHomeDirectories => { self.pending_reassign = Some(ReassignAction::UserHomeDirectories); Ok(true) }
-            Msg::ReassignGroupGidNumbers => { self.pending_reassign = Some(ReassignAction::GroupGidNumbers); Ok(true) }
+            Msg::ReassignUserUidNumbers => {
+                self.pending_reassign = Some(ReassignAction::UserUidNumbers);
+                Ok(true)
+            }
+            Msg::ReassignUserGidNumbers => {
+                self.pending_reassign = Some(ReassignAction::UserGidNumbers);
+                Ok(true)
+            }
+            Msg::ReassignUserLoginShells => {
+                self.pending_reassign = Some(ReassignAction::UserLoginShells);
+                Ok(true)
+            }
+            Msg::ReassignUserHomeDirectories => {
+                self.pending_reassign = Some(ReassignAction::UserHomeDirectories);
+                Ok(true)
+            }
+            Msg::ReassignGroupGidNumbers => {
+                self.pending_reassign = Some(ReassignAction::GroupGidNumbers);
+                Ok(true)
+            }
 
             Msg::ConfirmReassign => {
                 if let Some(action) = self.pending_reassign.take() {
                     match action {
                         ReassignAction::UserUidNumbers => {
                             let vars = reassign_user_uid_numbers::Variables {};
-                            self.common.call_graphql::<ReassignUserUidNumbers, _>(ctx, vars, |r| Msg::ReassignResponse(r.map(|_| ())), "Reassign user uidNumbers failure");
+                            self.common.call_graphql::<ReassignUserUidNumbers, _>(
+                                ctx,
+                                vars,
+                                |r| Msg::ReassignResponse(r.map(|_| ())),
+                                "Reassign user uidNumbers failure",
+                            );
                         }
                         ReassignAction::UserGidNumbers => {
                             let vars = reassign_user_gid_numbers::Variables {};
-                            self.common.call_graphql::<ReassignUserGidNumbers, _>(ctx, vars, |r| Msg::ReassignResponse(r.map(|_| ())), "Reassign user gidNumbers failure");
+                            self.common.call_graphql::<ReassignUserGidNumbers, _>(
+                                ctx,
+                                vars,
+                                |r| Msg::ReassignResponse(r.map(|_| ())),
+                                "Reassign user gidNumbers failure",
+                            );
                         }
                         ReassignAction::UserLoginShells => {
                             let vars = reassign_user_login_shells::Variables {};
-                            self.common.call_graphql::<ReassignUserLoginShells, _>(ctx, vars, |r| Msg::ReassignResponse(r.map(|_| ())), "Reassign user loginShells failure");
+                            self.common.call_graphql::<ReassignUserLoginShells, _>(
+                                ctx,
+                                vars,
+                                |r| Msg::ReassignResponse(r.map(|_| ())),
+                                "Reassign user loginShells failure",
+                            );
                         }
                         ReassignAction::UserHomeDirectories => {
                             let vars = reassign_user_home_directories::Variables {};
-                            self.common.call_graphql::<ReassignUserHomeDirectories, _>(ctx, vars, |r| Msg::ReassignResponse(r.map(|_| ())), "Reassign user homeDirectories failure");
+                            self.common.call_graphql::<ReassignUserHomeDirectories, _>(
+                                ctx,
+                                vars,
+                                |r| Msg::ReassignResponse(r.map(|_| ())),
+                                "Reassign user homeDirectories failure",
+                            );
                         }
                         ReassignAction::GroupGidNumbers => {
                             let vars = reassign_gid_numbers::Variables {};
-                            self.common.call_graphql::<ReassignGidNumbers, _>(ctx, vars, |r| Msg::ReassignResponse(r.map(|_| ())), "Reassign group gidNumbers failure");
+                            self.common.call_graphql::<ReassignGidNumbers, _>(
+                                ctx,
+                                vars,
+                                |r| Msg::ReassignResponse(r.map(|_| ())),
+                                "Reassign group gidNumbers failure",
+                            );
                         }
                     }
                     self.status = "Reassigning...".to_string();
@@ -309,7 +446,9 @@ impl CommonComponent<PosixOptions> for PosixOptions {
         }
     }
 
-    fn mut_common(&mut self) -> &mut CommonComponentParts<Self> { &mut self.common }
+    fn mut_common(&mut self) -> &mut CommonComponentParts<Self> {
+        &mut self.common
+    }
 }
 
 impl Component for PosixOptions {
@@ -355,18 +494,114 @@ impl Component for PosixOptions {
         let link = ctx.link();
 
         // Callbacks
-        let on_user_uid_assign = link.callback(|e: Event| { let checked = e.target().unwrap().dyn_into::<web_sys::HtmlInputElement>().unwrap().checked(); Msg::UpdateUserUidAssign(checked) });
-        let on_user_uid_start = link.callback(|e: InputEvent| Msg::UpdateUserUidStart(e.target().unwrap().dyn_into::<web_sys::HtmlInputElement>().unwrap().value()));
-        let on_user_uid_max = link.callback(|e: InputEvent| Msg::UpdateUserUidMax(e.target().unwrap().dyn_into::<web_sys::HtmlInputElement>().unwrap().value()));
-        let on_user_gid_assign = link.callback(|e: Event| { let checked = e.target().unwrap().dyn_into::<web_sys::HtmlInputElement>().unwrap().checked(); Msg::UpdateUserGidAssign(checked) });
-        let on_user_gid_start = link.callback(|e: InputEvent| Msg::UpdateUserGidStart(e.target().unwrap().dyn_into::<web_sys::HtmlInputElement>().unwrap().value()));
-        let on_user_loginshell_assign = link.callback(|e: Event| { let checked = e.target().unwrap().dyn_into::<web_sys::HtmlInputElement>().unwrap().checked(); Msg::UpdateUserLoginShellAssign(checked) });
-        let on_user_loginshell_default = link.callback(|e: InputEvent| Msg::UpdateUserLoginShellDefault(e.target().unwrap().dyn_into::<web_sys::HtmlInputElement>().unwrap().value()));
-        let on_user_home_assign = link.callback(|e: Event| { let checked = e.target().unwrap().dyn_into::<web_sys::HtmlInputElement>().unwrap().checked(); Msg::UpdateUserHomeAssign(checked) });
-        let on_user_home_prefix = link.callback(|e: InputEvent| Msg::UpdateUserHomePrefix(e.target().unwrap().dyn_into::<web_sys::HtmlInputElement>().unwrap().value()));
-        let on_group_gid_assign = link.callback(|e: Event| { let checked = e.target().unwrap().dyn_into::<web_sys::HtmlInputElement>().unwrap().checked(); Msg::UpdateGroupGidAssign(checked) });
-        let on_group_gid_start = link.callback(|e: InputEvent| Msg::UpdateGroupGidStart(e.target().unwrap().dyn_into::<web_sys::HtmlInputElement>().unwrap().value()));
-        let on_group_gid_max = link.callback(|e: InputEvent| Msg::UpdateGroupGidMax(e.target().unwrap().dyn_into::<web_sys::HtmlInputElement>().unwrap().value()));
+        let on_user_uid_assign = link.callback(|e: Event| {
+            let checked = e
+                .target()
+                .unwrap()
+                .dyn_into::<web_sys::HtmlInputElement>()
+                .unwrap()
+                .checked();
+            Msg::UpdateUserUidAssign(checked)
+        });
+        let on_user_uid_start = link.callback(|e: InputEvent| {
+            Msg::UpdateUserUidStart(
+                e.target()
+                    .unwrap()
+                    .dyn_into::<web_sys::HtmlInputElement>()
+                    .unwrap()
+                    .value(),
+            )
+        });
+        let on_user_uid_max = link.callback(|e: InputEvent| {
+            Msg::UpdateUserUidMax(
+                e.target()
+                    .unwrap()
+                    .dyn_into::<web_sys::HtmlInputElement>()
+                    .unwrap()
+                    .value(),
+            )
+        });
+        let on_user_gid_assign = link.callback(|e: Event| {
+            let checked = e
+                .target()
+                .unwrap()
+                .dyn_into::<web_sys::HtmlInputElement>()
+                .unwrap()
+                .checked();
+            Msg::UpdateUserGidAssign(checked)
+        });
+        let on_user_gid_start = link.callback(|e: InputEvent| {
+            Msg::UpdateUserGidStart(
+                e.target()
+                    .unwrap()
+                    .dyn_into::<web_sys::HtmlInputElement>()
+                    .unwrap()
+                    .value(),
+            )
+        });
+        let on_user_loginshell_assign = link.callback(|e: Event| {
+            let checked = e
+                .target()
+                .unwrap()
+                .dyn_into::<web_sys::HtmlInputElement>()
+                .unwrap()
+                .checked();
+            Msg::UpdateUserLoginShellAssign(checked)
+        });
+        let on_user_loginshell_default = link.callback(|e: InputEvent| {
+            Msg::UpdateUserLoginShellDefault(
+                e.target()
+                    .unwrap()
+                    .dyn_into::<web_sys::HtmlInputElement>()
+                    .unwrap()
+                    .value(),
+            )
+        });
+        let on_user_home_assign = link.callback(|e: Event| {
+            let checked = e
+                .target()
+                .unwrap()
+                .dyn_into::<web_sys::HtmlInputElement>()
+                .unwrap()
+                .checked();
+            Msg::UpdateUserHomeAssign(checked)
+        });
+        let on_user_home_prefix = link.callback(|e: InputEvent| {
+            Msg::UpdateUserHomePrefix(
+                e.target()
+                    .unwrap()
+                    .dyn_into::<web_sys::HtmlInputElement>()
+                    .unwrap()
+                    .value(),
+            )
+        });
+        let on_group_gid_assign = link.callback(|e: Event| {
+            let checked = e
+                .target()
+                .unwrap()
+                .dyn_into::<web_sys::HtmlInputElement>()
+                .unwrap()
+                .checked();
+            Msg::UpdateGroupGidAssign(checked)
+        });
+        let on_group_gid_start = link.callback(|e: InputEvent| {
+            Msg::UpdateGroupGidStart(
+                e.target()
+                    .unwrap()
+                    .dyn_into::<web_sys::HtmlInputElement>()
+                    .unwrap()
+                    .value(),
+            )
+        });
+        let on_group_gid_max = link.callback(|e: InputEvent| {
+            Msg::UpdateGroupGidMax(
+                e.target()
+                    .unwrap()
+                    .dyn_into::<web_sys::HtmlInputElement>()
+                    .unwrap()
+                    .value(),
+            )
+        });
 
         let on_reassign_user_uid = link.callback(|_| Msg::ReassignUserUidNumbers);
         let on_reassign_user_gid = link.callback(|_| Msg::ReassignUserGidNumbers);
@@ -379,20 +614,45 @@ impl Component for PosixOptions {
         let save_disabled = self.loading || !self.config_changed;
 
         // per-button logic (label + enabled after save)
-        let uid_button_text = if self.user_uidnumber_assign { "Reassign" } else { "Remove" };
-        let uid_button_disabled = self.loading || (self.user_uidnumber_assign != self.saved_user_uidnumber_assign);
+        let uid_button_text = if self.user_uidnumber_assign {
+            "Reassign"
+        } else {
+            "Remove"
+        };
+        let uid_button_disabled =
+            self.loading || (self.user_uidnumber_assign != self.saved_user_uidnumber_assign);
 
-        let gid_user_button_text = if self.user_gidnumber_assign { "Reassign" } else { "Remove" };
-        let gid_user_button_disabled = self.loading || (self.user_gidnumber_assign != self.saved_user_gidnumber_assign);
+        let gid_user_button_text = if self.user_gidnumber_assign {
+            "Reassign"
+        } else {
+            "Remove"
+        };
+        let gid_user_button_disabled =
+            self.loading || (self.user_gidnumber_assign != self.saved_user_gidnumber_assign);
 
-        let loginshell_button_text = if self.user_loginshell_assign { "Reassign" } else { "Remove" };
-        let loginshell_button_disabled = self.loading || (self.user_loginshell_assign != self.saved_user_loginshell_assign);
+        let loginshell_button_text = if self.user_loginshell_assign {
+            "Reassign"
+        } else {
+            "Remove"
+        };
+        let loginshell_button_disabled =
+            self.loading || (self.user_loginshell_assign != self.saved_user_loginshell_assign);
 
-        let home_button_text = if self.user_homedirectory_assign { "Reassign" } else { "Remove" };
-        let home_button_disabled = self.loading || (self.user_homedirectory_assign != self.saved_user_homedirectory_assign);
+        let home_button_text = if self.user_homedirectory_assign {
+            "Reassign"
+        } else {
+            "Remove"
+        };
+        let home_button_disabled = self.loading
+            || (self.user_homedirectory_assign != self.saved_user_homedirectory_assign);
 
-        let gid_group_button_text = if self.group_gidnumber_assign { "Reassign" } else { "Remove" };
-        let gid_group_button_disabled = self.loading || (self.group_gidnumber_assign != self.saved_group_gidnumber_assign);
+        let gid_group_button_text = if self.group_gidnumber_assign {
+            "Reassign"
+        } else {
+            "Remove"
+        };
+        let gid_group_button_disabled =
+            self.loading || (self.group_gidnumber_assign != self.saved_group_gidnumber_assign);
 
         html! {
             <div class="row">

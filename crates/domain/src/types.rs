@@ -1,39 +1,39 @@
 // crates/domain/src/types.rs
 // KLLDAP 7.0 — Avatar refactor complete (centralized in images.rs)
 
-use std::cmp::Ordering;
+use base64::Engine;
+use base64::engine::general_purpose;
+use bytes::Bytes;
 use chrono::{NaiveDateTime, TimeZone};
 use lldap_auth::types::CaseInsensitiveString;
+pub use lldap_auth::types::UserId;
+pub use lldap_schema::AttributeType;
 use sea_orm::{
     DbErr, DeriveValueType, TryFromU64, Value,
     entity::IntoActiveValue,
-    sea_query::{
-        SeaRc, StringLen,
-        extension::mysql::MySqlType,
-    },
+    sea_query::{SeaRc, StringLen, extension::mysql::MySqlType},
 };
 use serde::{Deserialize, Serialize};
-use bytes::Bytes;
-use base64::Engine;
-use base64::engine::general_purpose;
-pub use lldap_auth::types::UserId;
-pub use lldap_schema::AttributeType;
+use std::cmp::Ordering;
 
 use crate::images;
 pub use crate::images::{
-    process_avatar_input,
-    avatar_to_graphql_base64,
-    validate_stored_avatar_bytes,
-    AvatarError,
-    TARGET_AVATAR_SIZE,
-    JPEG_QUALITY,
-    MAX_AVATAR_JPEG_SIZE,
+    AvatarError, JPEG_QUALITY, MAX_AVATAR_JPEG_SIZE, TARGET_AVATAR_SIZE, avatar_to_graphql_base64,
+    process_avatar_input, validate_stored_avatar_bytes,
 };
 
 // ==================== UUID ====================
 #[derive(
-    PartialEq, Hash, Eq, Clone, Default, Serialize, Deserialize,
-    DeriveValueType, derive_more::Debug, derive_more::Display,
+    PartialEq,
+    Hash,
+    Eq,
+    Clone,
+    Default,
+    Serialize,
+    Deserialize,
+    DeriveValueType,
+    derive_more::Debug,
+    derive_more::Display,
 )]
 #[serde(try_from = "&str")]
 #[sea_orm(column_type = "String(StringLen::N(36))")]
@@ -94,7 +94,9 @@ impl std::fmt::Debug for Serialized {
                 f.debug_tuple("Serialized").field(&s).finish()
             }
         } else {
-            f.debug_tuple("Serialized").field(&format!("raw[{} bytes]", self.0.len())).finish()
+            f.debug_tuple("Serialized")
+                .field(&format!("raw[{} bytes]", self.0.len()))
+                .finish()
         }
     }
 }
@@ -142,7 +144,9 @@ fn compare_str_case_insensitive(s1: &str, s2: &str) -> Ordering {
         match (it_1.next(), it_2.next()) {
             (Some(c1), Some(c2)) => {
                 let o = c1.cmp(&c2);
-                if o != Ordering::Equal { return o; }
+                if o != Ordering::Equal {
+                    return o;
+                }
             }
             (None, Some(_)) => return Ordering::Less,
             (Some(_), None) => return Ordering::Greater,
@@ -153,7 +157,15 @@ fn compare_str_case_insensitive(s1: &str, s2: &str) -> Ordering {
 
 macro_rules! make_case_insensitive_comparable_string {
     ($c:ident) => {
-        #[derive(Clone, Default, Serialize, Deserialize, DeriveValueType, derive_more::Debug, derive_more::Display)]
+        #[derive(
+            Clone,
+            Default,
+            Serialize,
+            Deserialize,
+            DeriveValueType,
+            derive_more::Debug,
+            derive_more::Display,
+        )]
         #[debug(r#""{_0}""#)]
         #[display("{_0}")]
         pub struct $c(String);
@@ -165,7 +177,9 @@ macro_rules! make_case_insensitive_comparable_string {
         }
         impl Eq for $c {}
         impl PartialOrd for $c {
-            fn partial_cmp(&self, other: &Self) -> Option<Ordering> { Some(self.cmp(other)) }
+            fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+                Some(self.cmp(other))
+            }
         }
         impl Ord for $c {
             fn cmp(&self, other: &Self) -> Ordering {
@@ -178,16 +192,37 @@ macro_rules! make_case_insensitive_comparable_string {
             }
         }
         impl $c {
-            pub fn new(raw: &str) -> Self { Self(raw.to_owned()) }
-            pub fn as_str(&self) -> &str { self.0.as_str() }
-            pub fn into_string(self) -> String { self.0 }
+            pub fn new(raw: &str) -> Self {
+                Self(raw.to_owned())
+            }
+            pub fn as_str(&self) -> &str {
+                self.0.as_str()
+            }
+            pub fn into_string(self) -> String {
+                self.0
+            }
         }
-        impl From<String> for $c { fn from(s: String) -> Self { Self(s) } }
-        impl From<&str> for $c { fn from(s: &str) -> Self { Self::new(s) } }
-        impl From<&$c> for Value { fn from(v: &$c) -> Self { v.as_str().into() } }
+        impl From<String> for $c {
+            fn from(s: String) -> Self {
+                Self(s)
+            }
+        }
+        impl From<&str> for $c {
+            fn from(s: &str) -> Self {
+                Self::new(s)
+            }
+        }
+        impl From<&$c> for Value {
+            fn from(v: &$c) -> Self {
+                v.as_str().into()
+            }
+        }
         impl TryFromU64 for $c {
             fn try_from_u64(_n: u64) -> Result<Self, DbErr> {
-                Err(DbErr::ConvertFromU64(concat!(stringify!($c), " cannot be constructed from u64")))
+                Err(DbErr::ConvertFromU64(concat!(
+                    stringify!($c),
+                    " cannot be constructed from u64"
+                )))
             }
         }
     };
@@ -198,28 +233,61 @@ make_case_insensitive_comparable_string!(Email);
 make_case_insensitive_comparable_string!(GroupName);
 
 impl AsRef<GroupName> for GroupName {
-    fn as_ref(&self) -> &GroupName { self }
+    fn as_ref(&self) -> &GroupName {
+        self
+    }
 }
 
-#[derive(PartialEq, Eq, PartialOrd, Ord, Clone, Debug, Default, Hash, Serialize, Deserialize, DeriveValueType)]
+#[derive(
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Clone,
+    Debug,
+    Default,
+    Hash,
+    Serialize,
+    Deserialize,
+    DeriveValueType,
+)]
 #[serde(from = "CaseInsensitiveString")]
 pub struct AttributeName(CaseInsensitiveString);
 
 impl AttributeName {
-    pub fn new(s: &str) -> Self { s.into() }
-    pub fn as_str(&self) -> &str { self.0.as_str() }
-    pub fn into_string(self) -> String { self.0.into_string() }
+    pub fn new(s: &str) -> Self {
+        s.into()
+    }
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+    pub fn into_string(self) -> String {
+        self.0.into_string()
+    }
 }
-impl<T> From<T> for AttributeName where T: Into<CaseInsensitiveString> {
-    fn from(s: T) -> Self { Self(s.into()) }
+impl<T> From<T> for AttributeName
+where
+    T: Into<CaseInsensitiveString>,
+{
+    fn from(s: T) -> Self {
+        Self(s.into())
+    }
 }
 impl std::fmt::Display for AttributeName {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { write!(f, "{}", self.0.as_str()) }
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.0.as_str())
+    }
 }
-impl From<&AttributeName> for Value { fn from(v: &AttributeName) -> Self { v.as_str().into() } }
+impl From<&AttributeName> for Value {
+    fn from(v: &AttributeName) -> Self {
+        v.as_str().into()
+    }
+}
 impl TryFromU64 for AttributeName {
     fn try_from_u64(_n: u64) -> Result<Self, DbErr> {
-        Err(DbErr::ConvertFromU64("AttributeName cannot be constructed from u64"))
+        Err(DbErr::ConvertFromU64(
+            "AttributeName cannot be constructed from u64",
+        ))
     }
 }
 
@@ -254,26 +322,43 @@ impl Avatar {
         Self::new(bytes.into())
     }
 
-    pub fn is_empty(&self) -> bool { self.0.is_empty() }
-    pub fn null() -> Self { Self(vec![]) }
-    pub fn into_bytes(self) -> Bytes { Bytes::from(self.0) }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    pub fn null() -> Self {
+        Self(vec![])
+    }
+    pub fn into_bytes(self) -> Bytes {
+        Bytes::from(self.0)
+    }
 
     /// Returns the raw JPEG bytes (for serialization / LDAP responses).
-    pub fn as_bytes(&self) -> &[u8] { &self.0 }
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
 
     #[cfg(any(feature = "test", test))]
     pub fn for_tests() -> Self {
         use image::{ImageFormat, Rgb, RgbImage};
         let img = RgbImage::from_fn(TARGET_AVATAR_SIZE, TARGET_AVATAR_SIZE, |x, y| {
-            if (x + y) % 2 == 0 { Rgb([0, 0, 0]) } else { Rgb([255, 255, 255]) }
+            if (x + y) % 2 == 0 {
+                Rgb([0, 0, 0])
+            } else {
+                Rgb([255, 255, 255])
+            }
         });
         let mut buf = Vec::new();
-        img.write_to(&mut std::io::Cursor::new(&mut buf), ImageFormat::Jpeg).unwrap();
+        img.write_to(&mut std::io::Cursor::new(&mut buf), ImageFormat::Jpeg)
+            .unwrap();
         Self::new(buf)
     }
 }
 
-impl From<&Avatar> for Value { fn from(photo: &Avatar) -> Self { photo.0.as_slice().into() } }
+impl From<&Avatar> for Value {
+    fn from(photo: &Avatar) -> Self {
+        photo.0.as_slice().into()
+    }
+}
 
 impl TryFrom<&[u8]> for Avatar {
     type Error = anyhow::Error;
@@ -284,13 +369,12 @@ impl TryFrom<&[u8]> for Avatar {
 
         // Defense-in-depth: validate any bytes entering the Avatar struct
         // (catches corrupted DB data or bypass attempts)
-        images::validate_stored_avatar_bytes(bytes)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        images::validate_stored_avatar_bytes(bytes).map_err(|e| anyhow::anyhow!("{}", e))?;
 
         // For new uploads this will also enforce full processing + conversion.
         // For already-valid stored JPEGs it will pass through quickly.
-        let jpeg_bytes = images::process_avatar_input(bytes)
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let jpeg_bytes =
+            images::process_avatar_input(bytes).map_err(|e| anyhow::anyhow!("{}", e))?;
 
         Ok(Self::new(jpeg_bytes))
     }
@@ -298,7 +382,9 @@ impl TryFrom<&[u8]> for Avatar {
 
 impl TryFrom<Bytes> for Avatar {
     type Error = anyhow::Error;
-    fn try_from(bytes: Bytes) -> anyhow::Result<Self> { Self::try_from(bytes.as_ref()) }
+    fn try_from(bytes: Bytes) -> anyhow::Result<Self> {
+        Self::try_from(bytes.as_ref())
+    }
 }
 
 impl TryFrom<&str> for Avatar {
@@ -310,22 +396,37 @@ impl TryFrom<&str> for Avatar {
 }
 
 impl From<&Avatar> for String {
-    fn from(val: &Avatar) -> Self { images::avatar_to_graphql_base64(&val.0) }
+    fn from(val: &Avatar) -> Self {
+        images::avatar_to_graphql_base64(&val.0)
+    }
 }
 
 impl std::fmt::Debug for Avatar {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let mut encoded = general_purpose::STANDARD.encode(&self.0);
-        if encoded.len() > 100 { encoded.truncate(100); encoded.push_str(" ..."); }
-        f.debug_tuple("Avatar").field(&format!("b64[{} bytes]", self.0.len())).finish()
+        if encoded.len() > 100 {
+            encoded.truncate(100);
+            encoded.push_str(" ...");
+        }
+        f.debug_tuple("Avatar")
+            .field(&format!("b64[{} bytes]", self.0.len()))
+            .finish()
     }
 }
 
-impl Default for Avatar { fn default() -> Self { Self::null() } }
+impl Default for Avatar {
+    fn default() -> Self {
+        Self::null()
+    }
+}
 
 impl IntoActiveValue<Avatar> for Avatar {
     fn into_active_value(self) -> sea_orm::ActiveValue<Avatar> {
-        if self.is_empty() { sea_orm::ActiveValue::NotSet } else { sea_orm::ActiveValue::Set(self) }
+        if self.is_empty() {
+            sea_orm::ActiveValue::NotSet
+        } else {
+            sea_orm::ActiveValue::Set(self)
+        }
     }
 }
 
@@ -338,7 +439,10 @@ pub enum Cardinality<T: Clone> {
 
 impl<T: Clone> Cardinality<T> {
     pub fn into_vec(self) -> Vec<T> {
-        match self { Self::Singleton(v) => vec![v], Self::Unbounded(l) => l }
+        match self {
+            Self::Singleton(v) => vec![v],
+            Self::Unbounded(l) => l,
+        }
     }
 }
 
@@ -360,24 +464,68 @@ impl AttributeValue {
         }
     }
     pub fn as_str(&self) -> Option<&str> {
-        if let AttributeValue::String(Cardinality::Singleton(s)) = self { Some(s.as_str()) } else { None }
+        if let AttributeValue::String(Cardinality::Singleton(s)) = self {
+            Some(s.as_str())
+        } else {
+            None
+        }
     }
     pub fn into_string(self) -> Option<String> {
-        if let AttributeValue::String(Cardinality::Singleton(s)) = self { Some(s) } else { None }
+        if let AttributeValue::String(Cardinality::Singleton(s)) = self {
+            Some(s)
+        } else {
+            None
+        }
     }
     pub fn as_avatar(&self) -> Option<&Avatar> {
-        if let AttributeValue::Avatar(Cardinality::Singleton(p)) = self { Some(p) } else { None }
+        if let AttributeValue::Avatar(Cardinality::Singleton(p)) = self {
+            Some(p)
+        } else {
+            None
+        }
     }
 }
 
-impl From<String> for AttributeValue { fn from(s: String) -> Self { AttributeValue::String(Cardinality::Singleton(s)) } }
-impl From<Vec<String>> for AttributeValue { fn from(l: Vec<String>) -> Self { AttributeValue::String(Cardinality::Unbounded(l)) } }
-impl From<i64> for AttributeValue { fn from(i: i64) -> Self { AttributeValue::Integer(Cardinality::Singleton(i)) } }
-impl From<Vec<i64>> for AttributeValue { fn from(l: Vec<i64>) -> Self { AttributeValue::Integer(Cardinality::Unbounded(l)) } }
-impl From<Avatar> for AttributeValue { fn from(j: Avatar) -> Self { AttributeValue::Avatar(Cardinality::Singleton(j)) } }
-impl From<Vec<Avatar>> for AttributeValue { fn from(l: Vec<Avatar>) -> Self { AttributeValue::Avatar(Cardinality::Unbounded(l)) } }
-impl From<NaiveDateTime> for AttributeValue { fn from(dt: NaiveDateTime) -> Self { AttributeValue::DateTime(Cardinality::Singleton(dt)) } }
-impl From<Vec<NaiveDateTime>> for AttributeValue { fn from(l: Vec<NaiveDateTime>) -> Self { AttributeValue::DateTime(Cardinality::Unbounded(l)) } }
+impl From<String> for AttributeValue {
+    fn from(s: String) -> Self {
+        AttributeValue::String(Cardinality::Singleton(s))
+    }
+}
+impl From<Vec<String>> for AttributeValue {
+    fn from(l: Vec<String>) -> Self {
+        AttributeValue::String(Cardinality::Unbounded(l))
+    }
+}
+impl From<i64> for AttributeValue {
+    fn from(i: i64) -> Self {
+        AttributeValue::Integer(Cardinality::Singleton(i))
+    }
+}
+impl From<Vec<i64>> for AttributeValue {
+    fn from(l: Vec<i64>) -> Self {
+        AttributeValue::Integer(Cardinality::Unbounded(l))
+    }
+}
+impl From<Avatar> for AttributeValue {
+    fn from(j: Avatar) -> Self {
+        AttributeValue::Avatar(Cardinality::Singleton(j))
+    }
+}
+impl From<Vec<Avatar>> for AttributeValue {
+    fn from(l: Vec<Avatar>) -> Self {
+        AttributeValue::Avatar(Cardinality::Unbounded(l))
+    }
+}
+impl From<NaiveDateTime> for AttributeValue {
+    fn from(dt: NaiveDateTime) -> Self {
+        AttributeValue::DateTime(Cardinality::Singleton(dt))
+    }
+}
+impl From<Vec<NaiveDateTime>> for AttributeValue {
+    fn from(l: Vec<NaiveDateTime>) -> Self {
+        AttributeValue::DateTime(Cardinality::Unbounded(l))
+    }
+}
 
 // ==================== ATTRIBUTE ====================
 #[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize, Hash)]
@@ -404,12 +552,12 @@ impl User {
     pub fn materialize_protected_fields(&mut self) {
         if let Some(principal) = &self.krb_principal_name
             && !principal.is_empty()
-            {
-                self.attributes.push(Attribute {
-                    name: AttributeName::from("krbprincipalname"),
-                    value: vec![principal.clone()].into(),
-                });
-            }
+        {
+            self.attributes.push(Attribute {
+                name: AttributeName::from("krbprincipalname"),
+                value: vec![principal.clone()].into(),
+            });
+        }
     }
 }
 
@@ -464,11 +612,19 @@ impl Default for User {
     }
 }
 
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, DeriveValueType, derive_more::Debug)]
+#[derive(
+    Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, DeriveValueType, derive_more::Debug,
+)]
 #[debug("{_0}")]
 pub struct GroupId(pub i32);
 
 impl TryFromU64 for GroupId {
-    fn try_from_u64(n: u64) -> Result<Self, DbErr> { Ok(GroupId(i32::try_from_u64(n)?)) }
+    fn try_from_u64(n: u64) -> Result<Self, DbErr> {
+        Ok(GroupId(i32::try_from_u64(n)?))
+    }
 }
-impl From<&GroupId> for Value { fn from(id: &GroupId) -> Self { (*id).into() } }
+impl From<&GroupId> for Value {
+    fn from(id: &GroupId) -> Self {
+        (*id).into()
+    }
+}

@@ -52,7 +52,7 @@ impl From<Model> for lldap_domain::types::GroupDetails {
             display_name: value.display_name,
             creation_date: value.creation_date,
             uuid: value.uuid,
-            attributes: vec![],      // populated later
+            attributes: vec![], // populated later
             modified_date: value.modified_date,
         }
     }

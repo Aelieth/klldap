@@ -19,7 +19,9 @@ pub struct GetUserDetails;
 /// we simplify the logic and assume JPEG unless we detect otherwise.
 fn get_avatar_data_url(base64_data: &str) -> String {
     let trimmed = base64_data.trim();
-    if trimmed.is_empty() { return String::new(); }
+    if trimmed.is_empty() {
+        return String::new();
+    }
     // Backend guarantee: always JPEG
     format!("data:image/jpeg;base64,{}", trimmed)
 }
@@ -97,8 +99,8 @@ pub fn validate_avatar_input(bytes: &[u8]) -> anyhow::Result<()> {
 
     // Fast magic-byte format check (no decode needed)
     let is_jpeg = bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xD8;
-    let is_png  = bytes.len() >= 4 && bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]);
-    let is_bmp  = bytes.len() >= 2 && bytes.starts_with(&[0x42, 0x4D]);
+    let is_png = bytes.len() >= 4 && bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]);
+    let is_bmp = bytes.len() >= 2 && bytes.starts_with(&[0x42, 0x4D]);
 
     if !(is_jpeg || is_png || is_bmp) {
         anyhow::bail!("Only JPEG, PNG, or BMP images are allowed");
@@ -106,17 +108,21 @@ pub fn validate_avatar_input(bytes: &[u8]) -> anyhow::Result<()> {
 
     // Size limits (match backend leniency for BMP)
     let max_size = if is_bmp {
-        2 * 1024 * 1024   // 2 MB for BMP
+        2 * 1024 * 1024 // 2 MB for BMP
     } else {
-        512 * 1024        // 512 KB for JPEG/PNG
+        512 * 1024 // 512 KB for JPEG/PNG
     };
 
     if bytes.len() > max_size {
         anyhow::bail!(
             "Image must be {} or smaller (got {} bytes). {}",
-                if is_bmp { "2 MB (for BMP)" } else { "512 KiB" },
-                    bytes.len(),
-                if is_bmp { "BMPs are allowed larger because they will be compressed." } else { "Only JPEG/PNG up to 512 KiB." }
+            if is_bmp { "2 MB (for BMP)" } else { "512 KiB" },
+            bytes.len(),
+            if is_bmp {
+                "BMPs are allowed larger because they will be compressed."
+            } else {
+                "Only JPEG/PNG up to 512 KiB."
+            }
         );
     }
 
@@ -134,7 +140,11 @@ struct BlankAvatarDisplayProps {
 
 #[function_component(BlankAvatarDisplay)]
 fn blank_avatar_display(props: &BlankAvatarDisplayProps) -> Html {
-    let fill = if props.error.is_some() { "red" } else { "currentColor" };
+    let fill = if props.error.is_some() {
+        "red"
+    } else {
+        "currentColor"
+    };
     html! {
         <svg xmlns="http://www.w3.org/2000/svg" width={props.width.to_string()} height={props.height.to_string()} fill={fill} class="bi bi-person-circle" viewBox="0 0 16 16">
             <title>{props.error.clone().unwrap_or(AttrValue::Static("Avatar"))}</title>

@@ -1,6 +1,6 @@
 // app/src/components/search.rs  (now a pure column fragment — no outer row)
-use yew::prelude::*;
 use wasm_bindgen::JsCast;
+use yew::prelude::*;
 
 #[derive(Properties, PartialEq)]
 pub struct Props {

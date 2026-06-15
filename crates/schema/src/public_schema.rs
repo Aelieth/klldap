@@ -255,33 +255,31 @@ impl PublicSchema {
                         is_hardcoded: true,
                         is_readonly: true,
                     },
-                     // POSIX
-                     AttributeSchema {
-                         name: "gidnumber".into(),
-                     aliases: vec!["gid_number".into(), "gidNumber".into()],
-                     attribute_type: AttributeType::Integer,
-                     is_list: false,
-                     is_visible: true,
-                     is_editable: false,
-                     is_hardcoded: true,
-                     is_readonly: false,
-                     },
+                    // POSIX
+                    AttributeSchema {
+                        name: "gidnumber".into(),
+                        aliases: vec!["gid_number".into(), "gidNumber".into()],
+                        attribute_type: AttributeType::Integer,
+                        is_list: false,
+                        is_visible: true,
+                        is_editable: false,
+                        is_hardcoded: true,
+                        is_readonly: false,
+                    },
                 ],
             },
             // ==================== NEW SYSTEM SECTION ====================
             system_attributes: AttributeList {
-                attributes: vec![
-                    AttributeSchema {
-                        name: "allowedous".into(),
-                        aliases: vec!["allowedOUs".into(), "AllowedOUs".into()],
-                        attribute_type: AttributeType::String,
-                        is_list: true,
-                        is_visible: false,
-                        is_editable: false,
-                        is_hardcoded: true,
-                        is_readonly: true,
-                    },
-                ],
+                attributes: vec![AttributeSchema {
+                    name: "allowedous".into(),
+                    aliases: vec!["allowedOUs".into(), "AllowedOUs".into()],
+                    attribute_type: AttributeType::String,
+                    is_list: true,
+                    is_visible: false,
+                    is_editable: false,
+                    is_hardcoded: true,
+                    is_readonly: true,
+                }],
             },
             // === Full POSIX settings  ===
             posix_settings: PosixSettings {
@@ -304,9 +302,7 @@ impl PublicSchema {
                 "posixAccount".into(),
                 "ldapPublicKey".into(),
             ],
-            extra_group_object_classes: vec![
-                "posixGroup".into(),
-            ],
+            extra_group_object_classes: vec!["posixGroup".into()],
         })
     }
 
@@ -339,6 +335,7 @@ impl PublicSchema {
     }
 
     pub fn resolve_group_canonical_name(&self, name_or_alias: &str) -> Option<&str> {
-        self.group_attributes().resolve_canonical_name(name_or_alias)
+        self.group_attributes()
+            .resolve_canonical_name(name_or_alias)
     }
 }

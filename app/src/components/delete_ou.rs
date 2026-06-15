@@ -1,8 +1,8 @@
+use crate::components::status_modal::StatusModal;
 use crate::infra::{
     common_component::{CommonComponent, CommonComponentParts},
     modal::Modal,
 };
-use crate::components::status_modal::StatusModal;
 use anyhow::{Error, Result};
 use graphql_client::GraphQLQuery;
 use yew::prelude::*;
@@ -26,7 +26,7 @@ pub struct DeleteOu {
 #[derive(yew::Properties, Clone, PartialEq, Debug)]
 pub struct DeleteOuProps {
     pub ou: String,
-    pub reassign_to: String,           // "people" or "groups"
+    pub reassign_to: String, // "people" or "groups"
     pub on_ou_deleted: Callback<String>,
     pub on_error: Callback<Error>,
 }
@@ -48,10 +48,13 @@ impl CommonComponent<DeleteOu> for DeleteOu {
     ) -> Result<bool> {
         match msg {
             Msg::ClickedDeleteOu => {
-                if ctx.props().ou == "people" || ctx.props().ou == "groups" || ctx.props().ou == "All" {
+                if ctx.props().ou == "people"
+                    || ctx.props().ou == "groups"
+                    || ctx.props().ou == "All"
+                {
                     ctx.link().send_message(Msg::ShowStatus(
                         "Cannot delete built-in OU 'people', 'groups', or 'All'".to_string(),
-                        false
+                        false,
                     ));
                     return Ok(true);
                 }

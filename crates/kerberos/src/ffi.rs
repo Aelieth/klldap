@@ -18,11 +18,11 @@
 #![allow(unsafe_code)]
 
 use anyhow::{Context, Result};
-use tracing::{info, warn};
-use std::ffi::{CString, CStr};
-use std::os::raw::{c_int, c_void, c_long, c_char};
+use std::ffi::{CStr, CString};
 use std::mem;
+use std::os::raw::{c_char, c_int, c_long, c_void};
 use std::ptr;
+use tracing::{info, warn};
 
 // Generated FFI bindings — created at compile time by build.rs
 #[allow(non_camel_case_types)]
@@ -45,7 +45,10 @@ impl Kadm5Handle {
         let mut context: krb5_context = ptr::null_mut();
         let ret = unsafe { krb5_init_context(&mut context) };
         if ret != 0 {
-            return Err(anyhow::anyhow!("krb5_init_context failed with code {}", ret));
+            return Err(anyhow::anyhow!(
+                "krb5_init_context failed with code {}",
+                ret
+            ));
         }
 
         let mut handle: *mut c_void = ptr::null_mut();
@@ -69,17 +72,19 @@ impl Kadm5Handle {
             kadm5_init_with_skey(
                 context,
                 client_name_cstr.as_ptr() as *mut c_char,
-                                 keytab_cstr.as_ptr() as *mut c_char,
-                                 service_name_ptr,
-                                 &mut params,
-                                 struct_version,
-                                 api_version,
-                                 db_args_ptr,
-                                 &mut handle,
+                keytab_cstr.as_ptr() as *mut c_char,
+                service_name_ptr,
+                &mut params,
+                struct_version,
+                api_version,
+                db_args_ptr,
+                &mut handle,
             )
         };
 
-        unsafe { let _ = CString::from_raw(params.realm); }
+        unsafe {
+            let _ = CString::from_raw(params.realm);
+        }
 
         if ret != 0 {
             let code = ret as i32;
@@ -137,8 +142,14 @@ impl Kadm5Handle {
                 unsafe { krb5_free_error_message(self.context, msg_ptr) };
                 s
             };
-            warn!("kadm5_create_principal failed with code {}: {}", ret, err_msg);
-            return Err(anyhow::anyhow!("kadm5_create_principal failed: {}", err_msg));
+            warn!(
+                "kadm5_create_principal failed with code {}: {}",
+                ret, err_msg
+            );
+            return Err(anyhow::anyhow!(
+                "kadm5_create_principal failed: {}",
+                err_msg
+            ));
         }
 
         Ok(())
@@ -157,11 +168,7 @@ impl Kadm5Handle {
         let pass_cstr = CString::new(password)?;
 
         let ret = unsafe {
-            kadm5_chpass_principal(
-                self.handle,
-                princ,
-                pass_cstr.as_ptr() as *mut c_char,
-            )
+            kadm5_chpass_principal(self.handle, princ, pass_cstr.as_ptr() as *mut c_char)
         };
 
         unsafe { krb5_free_principal(self.context, princ) };
@@ -176,14 +183,18 @@ impl Kadm5Handle {
                 unsafe { krb5_free_error_message(self.context, msg_ptr) };
                 s
             };
-            return Err(anyhow::anyhow!("kadm5_chpass_principal failed: {}", err_msg));
+            return Err(anyhow::anyhow!(
+                "kadm5_chpass_principal failed: {}",
+                err_msg
+            ));
         }
 
         Ok(())
     }
 
     pub fn delete_principal(&self, principal_str: &str) -> Result<()> {
-        let principal_c = CString::new(principal_str).context("Invalid principal string for CString")?;
+        let principal_c =
+            CString::new(principal_str).context("Invalid principal string for CString")?;
 
         let mut principal: krb5_principal = ptr::null_mut();
 
@@ -191,7 +202,11 @@ impl Kadm5Handle {
         // exactly once with krb5_free_principal (done below on all paths).
         let ret = unsafe { krb5_parse_name(self.context, principal_c.as_ptr(), &mut principal) };
         if ret != 0 {
-            return Err(anyhow::anyhow!("Failed to parse principal {}: krb5_parse_name ret {}", principal_str, ret));
+            return Err(anyhow::anyhow!(
+                "Failed to parse principal {}: krb5_parse_name ret {}",
+                principal_str,
+                ret
+            ));
         }
 
         // SAFETY: principal is owned by us; kadm5_delete_principal takes it for the delete operation.
@@ -204,11 +219,20 @@ impl Kadm5Handle {
             info!("Deleted principal via FFI: {}", principal_str);
             Ok(())
         } else if ret == KADM5_UNK_PRINC as i64 {
-            info!("Principal {} does not exist, skipping delete", principal_str);
+            info!(
+                "Principal {} does not exist, skipping delete",
+                principal_str
+            );
             Ok(())
         } else {
-            warn!("FFI delete principal failed for {} (code {})", principal_str, ret);
-            Err(anyhow::anyhow!("FFI delete principal failed (code {})", ret))
+            warn!(
+                "FFI delete principal failed for {} (code {})",
+                principal_str, ret
+            );
+            Err(anyhow::anyhow!(
+                "FFI delete principal failed (code {})",
+                ret
+            ))
         }
     }
 
@@ -217,8 +241,7 @@ impl Kadm5Handle {
     /// This function stays purely in the FFI layer and only talks to kadm5.
     /// Keytab file writing is handled by the caller (lib.rs).
     pub fn set_random_key_for_service(&self, principal_name: &str) -> Result<()> {
-        let principal_cstr = CString::new(principal_name)
-        .context("Invalid principal name")?;
+        let principal_cstr = CString::new(principal_name).context("Invalid principal name")?;
 
         let mut princ: krb5_principal = ptr::null_mut();
         let ret = unsafe { krb5_parse_name(self.context, principal_cstr.as_ptr(), &mut princ) };
@@ -229,9 +252,8 @@ impl Kadm5Handle {
         let mut keyblocks = ptr::null_mut::<krb5_keyblock>();
         let mut n_keys: c_int = 0;
 
-        let ret = unsafe {
-            kadm5_randkey_principal(self.handle, princ, &mut keyblocks, &mut n_keys)
-        };
+        let ret =
+            unsafe { kadm5_randkey_principal(self.handle, princ, &mut keyblocks, &mut n_keys) };
 
         if ret != 0 {
             let code = ret as i32;
@@ -245,8 +267,8 @@ impl Kadm5Handle {
             };
 
             let principal_not_found = ret == KADM5_UNK_PRINC as i64
-            || err_msg.contains("Principal does not exist")
-            || err_msg.contains("No such principal");
+                || err_msg.contains("Principal does not exist")
+                || err_msg.contains("No such principal");
 
             if principal_not_found {
                 let mut ent: kadm5_principal_ent_rec = unsafe { mem::zeroed() };
@@ -256,25 +278,31 @@ impl Kadm5Handle {
                 const KADM5_KEY: c_long = 0x00000020;
                 let mask = (KADM5_PRINCIPAL | KADM5_KEY) as c_long;
 
-                let ret = unsafe {
-                    kadm5_create_principal(self.handle, &mut ent, mask, ptr::null_mut())
-                };
+                let ret =
+                    unsafe { kadm5_create_principal(self.handle, &mut ent, mask, ptr::null_mut()) };
 
                 if ret != 0 {
                     unsafe { krb5_free_principal(self.context, princ) };
                     return Err(anyhow::anyhow!(
                         "Failed to create service principal {}: code {}",
-                        principal_name, ret
+                        principal_name,
+                        ret
                     ));
                 }
 
                 info!("Created new service principal: {}", principal_name);
             } else {
                 unsafe { krb5_free_principal(self.context, princ) };
-                return Err(anyhow::anyhow!("kadm5_randkey_principal failed: {}", err_msg));
+                return Err(anyhow::anyhow!(
+                    "kadm5_randkey_principal failed: {}",
+                    err_msg
+                ));
             }
         } else {
-            info!("Rotated random key for service principal: {}", principal_name);
+            info!(
+                "Rotated random key for service principal: {}",
+                principal_name
+            );
         }
 
         // Free any keyblocks that were returned

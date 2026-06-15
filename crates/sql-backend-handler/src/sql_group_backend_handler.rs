@@ -390,7 +390,7 @@ impl GroupBackendHandler for SqlBackendHandler {
                 Box::pin(async move {
                     let schema = Self::get_schema_with_transaction(transaction).await?;
 
-                    // === POSIX RANGE + DUPLICATE CHECKS ===
+                    // === POSIX RANGE + DUPLICATE CHECKS (for group uidnumber/gidnumber) ===
                     let settings = Self::get_posix_settings_with_transaction(transaction).await?;
 
                     for attr in &request.attributes {
@@ -545,7 +545,7 @@ impl SqlBackendHandler {
 
         let schema = Self::get_schema_with_transaction(transaction).await?;
 
-        // === POSIX RANGE + DUPLICATE CHECKS (on any inserted uidnumber/gidnumber) ===
+        // === POSIX RANGE + DUPLICATE CHECKS (on any inserted uidnumber/gidnumber for groups) ===
         let _settings = Self::get_posix_settings_with_transaction(transaction).await?;
 
         let mut update_group_attributes = Vec::new();

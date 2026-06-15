@@ -370,7 +370,7 @@ impl SqlBackendHandler {
         let lower_email = request.email.as_ref().map(|s| s.as_str().to_lowercase());
         let now = chrono::Utc::now().naive_utc();
 
-        // === POSIX RANGE + DUPLICATE CHECKS (only on inserted uidnumber/gidnumber) ===
+        // === POSIX RANGE + DUPLICATE CHECKS (uidnumber on users; gidnumber uniqueness is group-only) ===
         let _settings = Self::get_posix_settings_with_transaction(transaction).await?;
 
         for attr in &update_user_attributes {
@@ -395,18 +395,17 @@ impl SqlBackendHandler {
                     )));
                 }
 
-                let taken = if name == "uidnumber" {
-                    Self::is_uidnumber_taken(transaction, value).await?
-                } else {
-                    Self::is_gidnumber_taken(transaction, value).await?
-                };
-
-                if taken {
-                    return Err(DomainError::InternalError(format!(
-                        "Number {} is already assigned to another user/group",
-                        value
-                    )));
+                if name == "uidnumber" {
+                    if Self::is_uidnumber_taken(transaction, value).await? {
+                        return Err(DomainError::InternalError(format!(
+                            "Number {} is already assigned to another user/group",
+                            value
+                        )));
+                    }
                 }
+                // NOTE: gidnumber on *users* deliberately allows duplicates (may match a group gidnumber
+                // for primary group semantics, or other users). Group gidnumber uniqueness is still
+                // enforced in the group create/update paths.
             }
         }
 
@@ -641,7 +640,7 @@ impl SqlBackendHandler {
         )))
     }
 
-    // === DUPLICATE NUMBER ENFORCEMENT HELPERS (used by create/update user/group) ===
+    // === DUPLICATE NUMBER ENFORCEMENT HELPERS (uidnumber uniqueness for users; gidnumber uniqueness for groups) ===
     pub(crate) async fn is_uidnumber_taken(
         transaction: &DatabaseTransaction,
         uid: i64,
@@ -1003,7 +1002,7 @@ impl UserBackendHandler for SqlBackendHandler {
                 Box::pin(async move {
                     let schema = Self::get_schema_with_transaction(transaction).await?;
 
-                    // === POSIX RANGE + DUPLICATE CHECKS ===
+                    // === POSIX RANGE + DUPLICATE CHECKS (uidnumber on users; gidnumber uniqueness is group-only) ===
                     let settings = Self::get_posix_settings_with_transaction(transaction).await?;
 
                     for attr in &request.attributes {
@@ -1021,18 +1020,17 @@ impl UserBackendHandler for SqlBackendHandler {
                                 )));
                             }
 
-                            let taken = if name == "uidnumber" {
-                                Self::is_uidnumber_taken(transaction, value).await?
-                            } else {
-                                Self::is_gidnumber_taken(transaction, value).await?
-                            };
-
-                            if taken {
-                                return Err(DomainError::InternalError(format!(
-                                    "Number {} is already assigned to another user/group",
-                                    value
-                                )));
+                            if name == "uidnumber" {
+                                if Self::is_uidnumber_taken(transaction, value).await? {
+                                    return Err(DomainError::InternalError(format!(
+                                        "Number {} is already assigned to another user/group",
+                                        value
+                                    )));
+                                }
                             }
+                            // NOTE: gidnumber on *users* deliberately allows duplicates (may match a group gidnumber
+                            // for primary group semantics, or other users). Group gidnumber uniqueness is still
+                            // enforced in the group create/update paths.
                         }
                     }
 

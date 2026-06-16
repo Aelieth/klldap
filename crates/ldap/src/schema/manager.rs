@@ -119,6 +119,18 @@ impl SchemaManager {
                 "entryUUID",
                 vec!["uuid".into()],
             ),
+            (
+                "logindisabled",
+                LogicalAttr::Operational,
+                "loginDisabled",
+                vec!["loginDisabled".into()],
+            ),
+            (
+                "sudohost",
+                LogicalAttr::Operational,
+                "sudoHost",
+                vec!["sudoHost".into()],
+            ),
         ];
 
         for (name, logical, canonical, aliases) in core_attrs {

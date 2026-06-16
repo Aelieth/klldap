@@ -654,7 +654,7 @@ main() {
   printf -- '--- user schemas ---\n'
 
   local redundant_groups=''
-  redundant_groups="$(get_group_list | jq '[ .data.groups[].displayName ]' | jq --compact-output '. - ["lldap_admin","lldap_password_manager","lldap_strict_readonly"]')"
+  redundant_groups="$(get_group_list | jq '[ .data.groups[].displayName ]' | jq --compact-output '. - ["lldap_admin","lldap_password_manager","lldap_strict_readonly","lldap_disabled","lldap_sudohost"]')"
 
   printf -- '\n--- groups ---\n'
   local group_config=''

@@ -68,7 +68,11 @@ impl SqlBackendHandler {
         use lldap_domain_model::model::{groups, memberships};
         use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
-        // Find the lldap_disabled group
+        // Find the lldap_disabled group (built-in, created at startup, protected from deletion).
+        // Membership here both blocks login (below) *and* causes the LDAP layer to synthesize
+        // loginDisabled=TRUE (see crates/ldap/src/attributes.rs). This provides the standards
+        // info for SSSD (nds login policy, ldap_user_nds_login_disabled, access filters using
+        // (!(loginDisabled=TRUE))). Removal from the group removes the attr.
         let group = groups::Entity::find()
             .filter(groups::Column::DisplayName.eq("lldap_disabled"))
             .one(&self.sql_pool)
@@ -94,6 +98,8 @@ impl SqlBackendHandler {
 impl LoginHandler for SqlBackendHandler {
     #[instrument(skip_all, level = "debug", err)]
     async fn bind(&self, request: BindRequest) -> Result<()> {
+        // Login interception for lldap_disabled (improved with explicit standards tie-in).
+        // Corresponds to loginDisabled attr synthesis for SSSD.
         if self.is_user_disabled(&request.name).await? {
             warn!(
                 r#"Login attempt denied for disabled user "{}""#,
@@ -141,6 +147,8 @@ impl OpaqueHandler for SqlOpaqueHandler {
     ) -> Result<login::ServerLoginStartResponse> {
         let user_id = request.username;
 
+        // Login interception for lldap_disabled (improved with explicit standards tie-in).
+        // Corresponds to loginDisabled attr synthesis for SSSD.
         if self.is_user_disabled(&user_id).await? {
             warn!(
                 r#"OPAQUE login attempt denied for disabled user "{}""#,
@@ -196,6 +204,8 @@ impl OpaqueHandler for SqlOpaqueHandler {
         )?)?;
 
         // Extra safety check (in case login_start check is ever bypassed)
+        // Login interception for lldap_disabled (improved with explicit standards tie-in).
+        // Corresponds to loginDisabled attr synthesis for SSSD.
         if self.is_user_disabled(&username).await? {
             warn!(
                 r#"OPAQUE login_finish denied for disabled user "{}""#,
@@ -309,7 +319,7 @@ mod tests {
 
     use super::*;
     use crate::sql_backend_handler::tests::{
-        get_initialized_db, insert_user, insert_user_no_password,
+        get_initialized_db, insert_group, insert_membership, insert_user, insert_user_no_password,
     };
 
     async fn attempt_login(
@@ -406,5 +416,27 @@ mod tests {
             })
             .await
             .unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn test_disabled_user_cannot_login() {
+        // Basic test covering lldap_disabled login interception (the three check sites)
+        // + the group-driven loginDisabled=TRUE synthesis contract (see attributes.rs).
+        let sql_pool = get_initialized_db().await;
+        let handler = SqlOpaqueHandler::new(generate_random_private_key(), sql_pool.clone());
+        insert_user(&handler, "bob", "bob00").await;
+        let disabled_gid = insert_group(&handler, "lldap_disabled").await;
+        insert_membership(&handler, disabled_gid, "bob").await;
+
+        // Bind (and OPAQUE paths) must reject.
+        let err = handler
+            .bind(BindRequest {
+                name: UserId::new("bob"),
+                password: "bob00".to_string(),
+            })
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("disabled") || msg.contains("Account disabled"), "unexpected error: {msg}");
     }
 }

@@ -87,6 +87,10 @@ pub fn make_ldap_subschema_entry(schema_manager: &SchemaManager, base_dn_str: &s
         "krbprincipalname",
         "sshpublickey",
         "ou",
+        // The two virtual synthesized attrs (loginDisabled/sudoHost) are published via hardcoded
+        // op_entries above (RFC OIDs + standards).
+        "logindisabled",
+        "sudohost",
     ]
     .iter()
     .cloned()
@@ -167,6 +171,8 @@ pub fn make_ldap_subschema_entry(schema_manager: &SchemaManager, base_dn_str: &s
         ("2.5.21.1", b"( 2.5.21.1 NAME 'structuralObjectClass' DESC 'X.500 Structural Object Class' EQUALITY objectIdentifierMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.38 SINGLE-VALUE NO-USER-MODIFICATION USAGE directoryOperation )".to_vec()),
         ("2.5.21.2", b"( 2.5.21.2 NAME 'subschemaSubentry' DESC 'X.500 Subschema Subentry' EQUALITY distinguishedNameMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.12 SINGLE-VALUE NO-USER-MODIFICATION USAGE directoryOperation )".to_vec()),
         ("1.3.6.1.4.1.42.2.27.8.1.16", b"( 1.3.6.1.4.1.42.2.27.8.1.16 NAME ( 'pwdChangedTime' 'passwordmodifieddate' 'password_modified_date' ) DESC 'Password last changed time' EQUALITY generalizedTimeMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.24 SINGLE-VALUE NO-USER-MODIFICATION USAGE dSAOperation )".to_vec()),
+        ("1.3.6.1.4.1.15953.9.1.2", b"( 1.3.6.1.4.1.15953.9.1.2 NAME ( 'sudoHost' 'sudohost' ) DESC 'Host(s) who may run sudo (from sudoers LDAP schema; synthesized by lldap_sudohost group membership)' EQUALITY caseExactIA5Match SUBSTR caseExactIA5SubstringsMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.26 NO-USER-MODIFICATION USAGE directoryOperation )".to_vec()),
+        ("2.16.840.1.113719.1.1.4.1.7", b"( 2.16.840.1.113719.1.1.4.1.7 NAME ( 'loginDisabled' 'logindisabled' ) DESC 'NDS/eDirectory loginDisabled (SSSD nds policy / account disable; synthesized by lldap_disabled group membership)' EQUALITY caseIgnoreMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE NO-USER-MODIFICATION USAGE directoryOperation )".to_vec()),
     ];
     for (oid, entry) in op_entries {
         if seen_attr_oids.insert(oid.to_string()) {
@@ -219,6 +225,8 @@ pub fn make_ldap_subschema_entry(schema_manager: &SchemaManager, base_dn_str: &s
         "modifyTimestamp",
         "pwdChangedTime",
         "memberOf",
+        "loginDisabled",
+        "sudoHost",
     ] {
         let lower = extra.to_ascii_lowercase();
         if seen.insert(lower) {
@@ -229,7 +237,7 @@ pub fn make_ldap_subschema_entry(schema_manager: &SchemaManager, base_dn_str: &s
     let inet_may_str = inet_may.join(" $ ");
 
     let posix_user_may =
-        "userPassword $ loginShell $ gecos $ description $ sshPublicKey $ avatar $ kerberosSync"
+        "userPassword $ loginShell $ gecos $ description $ sshPublicKey $ avatar $ kerberosSync $ loginDisabled $ sudoHost"
             .to_string();
     let posix_group_may = "userPassword $ memberUid $ description $ gidNumber".to_string();
 
@@ -343,6 +351,24 @@ mod tests {
                 .find(|a| a.atype == "attributeTypes")
                 .unwrap();
             assert!(!attr_types.vals.is_empty());
+
+            // RFC compliance check for the two virtual synthesized attributes.
+            let attr_types_blob: String = attr_types
+                .vals
+                .iter()
+                .map(|v| String::from_utf8_lossy(v).to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert!(
+                attr_types_blob.contains("1.3.6.1.4.1.15953.9.1.2")
+                    && (attr_types_blob.contains("'sudoHost'") || attr_types_blob.contains("sudoHost")),
+                "sudoHost (sudoers schema) attributeType missing from subschema"
+            );
+            assert!(
+                attr_types_blob.contains("2.16.840.1.113719.1.1.4.1.7")
+                    && (attr_types_blob.contains("'loginDisabled'") || attr_types_blob.contains("loginDisabled")),
+                "loginDisabled (NDS/eDirectory/SSSD) attributeType missing from subschema"
+            );
         } else {
             panic!("expected SearchResultEntry");
         }

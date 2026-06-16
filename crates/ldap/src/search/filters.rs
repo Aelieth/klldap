@@ -118,6 +118,29 @@ pub fn convert_user_filter(
         LdapFilter::Equality(field, value) => {
             let field = AttributeName::from(field.as_str());
             let value_lc = value.to_ascii_lowercase();
+
+            // RFC/standards-mapped virtual attributes (loginDisabled, sudoHost).
+            // These are synthesized from lldap_* group membership (see attributes.rs + subschema.rs).
+            // Translate filters on the standardized names into the equivalent MemberOf on the
+            // source built-in group. This makes (loginDisabled=TRUE) etc. work for "proper search"
+            // and avoids the generic "unknown attribute" warning + False for these now-published attrs.
+            let fname = field.as_str();
+            if fname.eq_ignore_ascii_case("logindisabled") {
+                if value_lc == "true" || value_lc == "1" || value_lc == "yes" {
+                    return Ok(UserRequestFilter::MemberOf("lldap_disabled".into()));
+                } else {
+                    return Ok(UserRequestFilter::False);
+                }
+            }
+            if fname.eq_ignore_ascii_case("sudohost") {
+                // Support common "has the flag" assertions (clients may send *, ALL, or true-ish).
+                if value_lc == "*" || value_lc == "all" || value_lc == "true" || value_lc == "1" {
+                    return Ok(UserRequestFilter::MemberOf("lldap_sudohost".into()));
+                } else {
+                    return Ok(UserRequestFilter::False);
+                }
+            }
+
             match crate::schema::get_schema_manager().map_user_field(&field, schema) {
                 crate::core::utils::UserFieldType::PrimaryField(
                     lldap_domain_model::model::UserColumn::UserId,
@@ -239,6 +262,17 @@ pub fn convert_user_filter(
         }
         LdapFilter::Present(field) => {
             let field = AttributeName::from(field.as_str());
+
+            // Same virtual attr translation as Equality: presence of loginDisabled/sudoHost
+            // means "member of the corresponding lldap_* built-in group".
+            let fname = field.as_str();
+            if fname.eq_ignore_ascii_case("logindisabled") {
+                return Ok(UserRequestFilter::MemberOf("lldap_disabled".into()));
+            }
+            if fname.eq_ignore_ascii_case("sudohost") {
+                return Ok(UserRequestFilter::MemberOf("lldap_sudohost".into()));
+            }
+
             Ok(
                 match crate::schema::get_schema_manager().map_user_field(&field, schema) {
                     crate::core::utils::UserFieldType::Attribute(name, _, _) => {

@@ -503,6 +503,7 @@ impl GroupBackendHandler for SqlBackendHandler {
             "lldap_disabled",
             "lldap_password_manager",
             "lldap_strict_readonly",
+            "lldap_sudohost",
         ];
 
         if protected.contains(&group_details.display_name.as_str()) {

@@ -186,6 +186,8 @@ pub fn get_preferred_ldap_name(attr: &lldap_schema::AttributeSchema) -> String {
         "krbprincipalname",
         "jpegphoto",
         "avatar",
+        "loginDisabled",
+        "sudoHost",
     ];
 
     for alias in &attr.aliases {
@@ -328,6 +330,21 @@ pub fn get_user_attribute(
             "1.1" => return None,
             "+" => return None,
             "*" => panic!("Matched {attribute}, * should have been expanded"),
+            // Virtual attributes driven purely by built-in group membership
+            s if s.eq_ignore_ascii_case("logindisabled") => {
+                if groups.map_or(false, |gs| gs.iter().any(|g| g.display_name.as_str() == "lldap_disabled")) {
+                    vec![b"TRUE".to_vec()]
+                } else {
+                    return None;
+                }
+            }
+            s if s.eq_ignore_ascii_case("sudohost") => {
+                if groups.map_or(false, |gs| gs.iter().any(|g| g.display_name.as_str() == "lldap_sudohost")) {
+                    vec![b"ALL".to_vec()]
+                } else {
+                    return None;
+                }
+            }
             _ => {
                 if ignored_user_attributes.contains(&attribute) {
                     return None;

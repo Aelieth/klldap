@@ -2,7 +2,7 @@
 
 ## [0.7.2] 2026-06-16
 
-- Bugfixes: user GID no longer clashes and errors against group GID's. Group uid and memberof lookup added to ldap search
+- Bugfixes: user GID no longer clashes and errors against group GID's. Group uid and memberof lookup added to ldap search. startup figment logic for .lldap_initialized
 - kadm5.acl no longer automatically overwritten on container restart allowing for custom access permissions
 - kadm5.acl now checks for sanity and attempts basic self heal if not sane, if unable restores to default
 - attribute group: lldap_sudohost added with RFC compliance for search and lookup for SSSD

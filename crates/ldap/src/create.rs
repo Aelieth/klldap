@@ -330,7 +330,6 @@ mod tests {
             .times(1)
             .return_once(|_| Ok(GroupId(5)));
         let ldap_handler = setup_bound_admin_handler(mock).await;
-        // Fixed: groups use cn= (not uid=)
         let request = LdapAddRequest {
             dn: "cn=bob,ou=groups,dc=example,dc=com".to_owned(),
             attributes: vec![LdapPartialAttribute {

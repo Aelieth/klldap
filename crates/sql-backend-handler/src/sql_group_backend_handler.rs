@@ -1,6 +1,7 @@
 use crate::sql_backend_handler::SqlBackendHandler;
 use async_trait::async_trait;
 use lldap_domain::{
+    is_builtin_group,
     requests::{CreateGroupRequest, UpdateGroupRequest},
     types::{
         Attribute, AttributeName, AttributeValue, Cardinality, Group, GroupDetails, GroupId,
@@ -352,6 +353,17 @@ impl GroupBackendHandler for SqlBackendHandler {
 
     #[instrument(skip(self), level = "debug", err, fields(group_id = ?request.group_id))]
     async fn update_group(&self, request: UpdateGroupRequest) -> Result<()> {
+        // === Protect built-in groups from rename (defense in depth) ===
+        if request.display_name.is_some() {
+            let current = self.get_group_details(request.group_id).await?;
+            if is_builtin_group(current.display_name.as_str()) {
+                return Err(DomainError::InternalError(format!(
+                    "Cannot rename built-in group '{}'",
+                    current.display_name
+                )));
+            }
+        }
+
         Ok(self
             .sql_pool
             .transaction::<_, (), DomainError>(|transaction| {
@@ -498,17 +510,9 @@ impl GroupBackendHandler for SqlBackendHandler {
     async fn delete_group(&self, group_id: GroupId) -> Result<()> {
         let group_details = self.get_group_details(group_id).await?;
 
-        let protected = [
-            "lldap_admin",
-            "lldap_disabled",
-            "lldap_password_manager",
-            "lldap_strict_readonly",
-            "lldap_sudohost",
-        ];
-
-        if protected.contains(&group_details.display_name.as_str()) {
+        if is_builtin_group(group_details.display_name.as_str()) {
             return Err(DomainError::InternalError(format!(
-                "Cannot delete core group '{}'",
+                "Cannot delete built-in group '{}'",
                 group_details.display_name
             )));
         }
@@ -1001,5 +1005,88 @@ mod tests {
             })
             .await
             .unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn test_cannot_delete_builtin_group_by_name() {
+        let fixture = TestFixture::new().await;
+        // Create a group that uses one of the protected names
+        let gid = fixture
+            .handler
+            .create_group(CreateGroupRequest {
+                display_name: "lldap_sudohost".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let err = fixture.handler.delete_group(gid).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("built-in group") || msg.contains("Cannot delete"),
+            "expected built-in delete protection, got: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cannot_rename_builtin_group() {
+        let fixture = TestFixture::new().await;
+        let gid = fixture
+            .handler
+            .create_group(CreateGroupRequest {
+                display_name: "lldap_password_manager".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let err = fixture
+            .handler
+            .update_group(UpdateGroupRequest {
+                group_id: gid,
+                display_name: Some("renamed-pm".into()),
+                delete_attributes: vec![],
+                insert_attributes: vec![],
+            })
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("built-in group") || msg.contains("Cannot rename"),
+            "expected built-in rename protection, got: {}",
+            msg
+        );
+    }
+
+    #[tokio::test]
+    async fn test_builtin_protection_does_not_affect_normal_groups() {
+        let fixture = TestFixture::new().await;
+        let gid = fixture
+            .handler
+            .create_group(CreateGroupRequest {
+                display_name: "my-custom-group".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Rename should succeed
+        fixture
+            .handler
+            .update_group(UpdateGroupRequest {
+                group_id: gid,
+                display_name: Some("my-custom-renamed".into()),
+                delete_attributes: vec![],
+                insert_attributes: vec![],
+            })
+            .await
+            .unwrap();
+
+        let details = fixture.handler.get_group_details(gid).await.unwrap();
+        assert_eq!(details.display_name.as_str(), "my-custom-renamed");
+
+        // Delete should succeed
+        fixture.handler.delete_group(gid).await.unwrap();
     }
 }

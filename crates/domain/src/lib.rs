@@ -6,3 +6,4 @@ pub mod requests;
 pub mod schema;
 pub mod types;
 pub use crate::public_schema::{PublicSchema, schema};
+pub use crate::types::{is_builtin_group, BUILTIN_GROUPS};

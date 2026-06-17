@@ -14,14 +14,16 @@ use helpers::{
 };
 use juniper::{FieldError, FieldResult, graphql_object, graphql_value};
 use lldap_access_control::{
-    AdminBackendHandler, UserReadableBackendHandler, UserWriteableBackendHandler,
+    AdminBackendHandler, ReadonlyBackendHandler, UserReadableBackendHandler,
+    UserWriteableBackendHandler,
 };
 use lldap_domain::{
+    is_builtin_group,
     requests::{CreateAttributeRequest, CreateUserRequest, UpdateGroupRequest, UpdateUserRequest},
     schema::AttributeType,
     types::{AttributeName, Email, GroupId, LdapObjectClass, UserId},
 };
-use lldap_domain_handlers::handler::{BackendHandler, ReadSchemaBackendHandler};
+use lldap_domain_handlers::handler::{BackendHandler, ReadSchemaBackendHandler, UserRequestFilter};
 use lldap_kerberos::{decrypt_password, sync_kerberos_principal};
 use lldap_opaque_handler::OpaqueHandler;
 use lldap_schema::PublicSchema;
@@ -387,9 +389,21 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
                     .map(|attr| attr.value[0].clone())
             })
         });
-        if group.id == 1 && new_display_name.is_some() {
-            span.in_scope(|| debug!("Cannot change lldap_admin group name"));
-            return Err("Cannot change lldap_admin group name".into());
+
+        // Name-based protection for all built-in groups (replaces fragile id==1 check)
+        if new_display_name.is_some() {
+            if let Ok(details) = handler.get_group_details(GroupId(group.id)).await {
+                if is_builtin_group(details.display_name.as_str()) {
+                    span.in_scope(|| {
+                        debug!("Cannot rename built-in group '{}'", details.display_name)
+                    });
+                    return Err(format!(
+                        "Cannot rename built-in group '{}'",
+                        details.display_name
+                    )
+                    .into());
+                }
+            }
         }
 
         let schema = handler.get_schema().await?;
@@ -456,13 +470,43 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
                 &span,
                 "Unauthorized group membership modification",
             ))?;
-        let user_id = UserId::new(&user_id);
-        if context.validation_result.user == user_id && group_id == 1 {
-            span.in_scope(|| debug!("Cannot remove admin rights for current user"));
-            return Err("Cannot remove admin rights for current user".into());
+        let target_user_id = UserId::new(&user_id);
+        let target_group_id = GroupId(group_id);
+
+        // Resolve group name for built-in protections
+        let group_name = handler
+            .get_group_details(target_group_id)
+            .await
+            .ok()
+            .map(|d| d.display_name.to_string())
+            .unwrap_or_default();
+
+        let is_lldap_admin = group_name == "lldap_admin";
+
+        if is_lldap_admin {
+            // Prevent emptying the admin group entirely (last member protection)
+            if let Ok(members) = handler
+                .list_users(
+                    Some(UserRequestFilter::MemberOfId(target_group_id)),
+                    false,
+                )
+                .await
+            {
+                if members.len() <= 1 {
+                    span.in_scope(|| debug!("Cannot remove the last member of lldap_admin"));
+                    return Err("Cannot remove the last member of lldap_admin".into());
+                }
+            }
+
+            // Preserve existing UX: a user cannot remove their own admin rights (when >1 admins)
+            if context.validation_result.user == target_user_id {
+                span.in_scope(|| debug!("Cannot remove admin rights for current user"));
+                return Err("Cannot remove admin rights for current user".into());
+            }
         }
+
         handler
-            .remove_user_from_group(&user_id, GroupId(group_id))
+            .remove_user_from_group(&target_user_id, target_group_id)
             .instrument(span)
             .await?;
         Ok(Success::new())
@@ -507,10 +551,15 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         let handler = context
             .get_admin_handler()
             .ok_or_else(field_error_callback(&span, "Unauthorized group deletion"))?;
-        if group_id == 1 {
-            span.in_scope(|| debug!("Cannot delete admin group"));
-            return Err("Cannot delete admin group".into());
+
+        // Name-based protection for all built-in groups (replaces fragile id==1 check)
+        if let Ok(details) = handler.get_group_details(GroupId(group_id)).await {
+            if is_builtin_group(details.display_name.as_str()) {
+                span.in_scope(|| debug!("Cannot delete built-in group '{}'", details.display_name));
+                return Err(format!("Cannot delete built-in group '{}'", details.display_name).into());
+            }
         }
+
         handler
             .delete_group(GroupId(group_id))
             .instrument(span)
@@ -1130,7 +1179,6 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         let target_user_id = UserId::new(&user_id);
 
         // Allow regular users to sync their OWN Kerberos principal after password change
-        // (exactly like set_user_password). Admins can do any user.
         let handler = context
             .get_writeable_handler(target_user_id.clone())
             .ok_or_else(field_error_callback(&span, "Unauthorized Kerberos sync"))?;

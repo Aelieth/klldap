@@ -659,28 +659,6 @@ mod tests {
     }
 
     #[test]
-    fn test_convert_group_filter_uid_maps_to_display_name() {
-        let schema = PublicSchema::get();
-        let ldap_info = crate::core::utils::LdapInfo {
-            base_dn: vec![],
-            base_dn_str: "dc=example,dc=com".to_string(),
-            ignored_user_attributes: vec![],
-            ignored_group_attributes: vec![],
-        };
-
-        // uid on a group filter should resolve via Primary(UserId) -> DisplayName
-        let filter = LdapFilter::Equality("uid".to_string(), "My Group".to_string());
-        let result = convert_group_filter(&ldap_info, &filter, &schema);
-        assert!(result.is_ok());
-        match result.unwrap() {
-            GroupRequestFilter::DisplayName(name) => {
-                assert_eq!(name.as_str(), "my group");
-            }
-            other => panic!("Expected DisplayName for uid group filter, got {:?}", other),
-        }
-    }
-
-    #[test]
     fn test_convert_group_filter_memberof_points_to_member() {
         let schema = PublicSchema::get();
         let ldap_info = crate::core::utils::LdapInfo {

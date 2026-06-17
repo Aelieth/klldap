@@ -368,11 +368,9 @@ impl TryFrom<&[u8]> for Avatar {
         }
 
         // Defense-in-depth: validate any bytes entering the Avatar struct
-        // (catches corrupted DB data or bypass attempts)
         images::validate_stored_avatar_bytes(bytes).map_err(|e| anyhow::anyhow!("{}", e))?;
 
         // For new uploads this will also enforce full processing + conversion.
-        // For already-valid stored JPEGs it will pass through quickly.
         let jpeg_bytes =
             images::process_avatar_input(bytes).map_err(|e| anyhow::anyhow!("{}", e))?;
 
@@ -627,4 +625,19 @@ impl From<&GroupId> for Value {
     fn from(id: &GroupId) -> Self {
         (*id).into()
     }
+}
+
+/// Built-in groups whose exact names are load-bearing invariants of lldap.
+/// They must not be renamed or deleted.
+pub const BUILTIN_GROUPS: &[&str] = &[
+    "lldap_admin",
+    "lldap_password_manager",
+    "lldap_strict_readonly",
+    "lldap_disabled",
+    "lldap_sudohost",
+];
+
+/// Returns true if `name` matches one of the built-in protected group names.
+pub fn is_builtin_group(name: &str) -> bool {
+    BUILTIN_GROUPS.iter().any(|&g| g == name)
 }

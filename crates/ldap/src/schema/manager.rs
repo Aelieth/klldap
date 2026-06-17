@@ -293,7 +293,6 @@ impl SchemaManager {
                         GroupFieldType::ModifiedDate
                     }
                     lldap_domain_model::model::UserColumn::Uuid => GroupFieldType::Uuid,
-                    lldap_domain_model::model::UserColumn::UserId => GroupFieldType::DisplayName,
                     lldap_domain_model::model::UserColumn::DisplayName => {
                         GroupFieldType::DisplayName
                     }

@@ -403,9 +403,7 @@ impl SqlBackendHandler {
                         )));
                     }
                 }
-                // NOTE: gidnumber on *users* deliberately allows duplicates (may match a group gidnumber
-                // for primary group semantics, or other users). Group gidnumber uniqueness is still
-                // enforced in the group create/update paths.
+                // NOTE: gidnumber on *users* deliberately allows duplicates
             }
         }
 
@@ -1028,9 +1026,7 @@ impl UserBackendHandler for SqlBackendHandler {
                                     )));
                                 }
                             }
-                            // NOTE: gidnumber on *users* deliberately allows duplicates (may match a group gidnumber
-                            // for primary group semantics, or other users). Group gidnumber uniqueness is still
-                            // enforced in the group create/update paths.
+                            // NOTE: gidnumber on *users* deliberately allows duplicates
                         }
                     }
 
@@ -1237,6 +1233,25 @@ impl UserBackendHandler for SqlBackendHandler {
         self.sql_pool
             .transaction::<_, _, sea_orm::DbErr>(|transaction| {
                 Box::pin(async move {
+                    // === LAST ADMIN PROTECTION (backend layer) ===
+                    // Prevent removing the final member of lldap_admin, regardless of caller.
+                    let group_details = model::Group::find_by_id(group_id)
+                        .one(transaction)
+                        .await?;
+                    if let Some(g) = &group_details {
+                        if g.display_name.as_str() == "lldap_admin" {
+                            let current_count = model::Membership::find()
+                                .filter(model::MembershipColumn::GroupId.eq(group_id))
+                                .count(transaction)
+                                .await?;
+                            if current_count <= 1 {
+                                return Err(sea_orm::DbErr::Custom(
+                                    "Cannot remove the last member of lldap_admin".to_string(),
+                                ));
+                            }
+                        }
+                    }
+
                     let res = model::Membership::delete_by_id((user_id.clone(), group_id))
                         .exec(transaction)
                         .await?;
@@ -1301,6 +1316,7 @@ mod tests {
     use super::*;
     use crate::sql_backend_handler::tests::*;
     use lldap_auth::opaque::server::generate_random_private_key;
+    use lldap_domain::requests::CreateGroupRequest;
     use lldap_domain::types::Attribute;
     use lldap_domain_handlers::handler::SubStringFilter;
     use lldap_domain_model::model::UserColumn;
@@ -2046,6 +2062,51 @@ mod tests {
             .await,
             vec!["patrick"]
         );
+    }
+
+    #[tokio::test]
+    async fn test_cannot_remove_last_member_of_lldap_admin() {
+        let fixture = TestFixture::new().await;
+
+        // Create a group that matches the protected admin name
+        let admin_gid = fixture
+            .handler
+            .create_group(CreateGroupRequest {
+                display_name: "lldap_admin".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Add exactly one user to it
+        fixture
+            .handler
+            .add_user_to_group(&UserId::new("bob"), admin_gid)
+            .await
+            .unwrap();
+
+        // Attempting to remove that last member must be rejected by the backend guard
+        let err = fixture
+            .handler
+            .remove_user_from_group(&UserId::new("bob"), admin_gid)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("last member of lldap_admin"),
+            "expected last-admin protection, got: {}",
+            err
+        );
+
+        // The membership should still exist
+        let still_member = fixture
+            .handler
+            .list_users(
+                Some(UserRequestFilter::MemberOfId(admin_gid)),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(still_member.len(), 1);
     }
 
     #[tokio::test]

@@ -3,6 +3,11 @@ set -e
 
 CONFIG_FILE=/data/lldap_config.toml
 
+# === UID/GID for rootless-friendly operation (matches upstream LLDAP docker entrypoint style) ===
+# Defaults keep current image behavior (hardcoded 1000 user created in Dockerfile).
+LLDAP_UID="${UID:-1000}"
+LLDAP_GID="${GID:-1000}"
+
 # === Required env checks ===
 if [ -z "$LLDAP_JWT_SECRET" ]; then
     echo "ERROR: LLDAP_JWT_SECRET is required."
@@ -23,7 +28,11 @@ LLDAP_PID=$!
 
 echo "Waiting for LLDAP to become ready..."
 for i in $(seq 1 60); do
-    if /app/lldap healthcheck >/dev/null 2>&1; then
+    # Run healthcheck as the target user (prevents root from creating root-owned
+    # 0400 "server_key" files in /app that the real lldap process cannot read).
+    # Also pass --config-file so we reliably load the /data copy (with key_seed etc.),
+    # matching upstream LLDAP docker CMD + HEALTHCHECK behavior.
+    if gosu "${LLDAP_UID}:${LLDAP_GID}" /app/lldap healthcheck --config-file "$CONFIG_FILE" >/dev/null 2>&1; then
         echo "LLDAP is ready!"
         break
     fi

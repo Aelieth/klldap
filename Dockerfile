@@ -124,11 +124,20 @@ VOLUME /data /var/kerberos/krb5kdc
 # Ports
 EXPOSE 3890 17170 88/tcp 88/udp 749/tcp
 
-# Entry & health
+# UID/GID can be overridden at runtime for rootless deployments (e.g. podman rootless,
+# docker --user, or kubernetes securityContext). Scripts + gosu will use them.
+# Default matches the lldap user created below (1000:1000). The named "lldap" user/group
+# is intentionally kept so that kerberos_manager's sudo/chown steps (which reference the
+# name) continue to act as a sanity check that the user exists in the image.
+ENV UID=1000 GID=1000
+
+# Entry & health — pass --config-file explicitly (like upstream LLDAP) so the prepared
+# /data/lldap_config.toml (with key_seed, database_url pointing at the volume, etc.) is
+# always used for both the long-lived server and healthchecks.
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["run"]
-HEALTHCHECK CMD ["/app/lldap", "healthcheck"]
+CMD ["run", "--config-file", "/data/lldap_config.toml"]
+HEALTHCHECK CMD ["/app/lldap", "healthcheck", "--config-file", "/data/lldap_config.toml"]
 
 LABEL maintainer="Aelieth <https://github.com/Aelieth>" \
-      version="0.7.1" \
+      version="0.7.2" \
       description="KLLDAP"

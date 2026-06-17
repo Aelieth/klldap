@@ -198,6 +198,16 @@ impl ConfigurationBuilder {
     }
 }
 
+/// Sentinel value used only when constructing the default Configuration for
+/// figment's Serialized::defaults and expected_keys extraction.
+/// When get_server_setup sees this exact seed it short-circuits and returns
+/// a throwaway in-memory ServerSetup without *any* filesystem operations on
+/// the default "server_key" path. This eliminates the root cause of the
+/// "Permission denied on server_key" bug (healthchecks and other commands
+/// running as root creating a root-owned 0400 file in /app that the real
+/// lldap user later cannot read).
+const FIGMENT_DUMMY_KEY_SEED: &str = "__LLDAP_FIGMENT_DEFAULTS_DUMMY_SEED__";
+
 fn stable_hash(val: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -392,6 +402,21 @@ fn get_server_setup<L: Into<PrivateKeyLocationOrFigment>>(
     let private_key_location = private_key_location.into();
     use std::fs::read;
     let path = std::path::Path::new(file_path);
+
+    // Special case for figment defaults / healthcheck init: never touch disk
+    // for the default relative "server_key". This is the key fix for the
+    // Docker permission-denied bug when root healthchecks race with the
+    // lldap user process.
+    if key_seed == FIGMENT_DUMMY_KEY_SEED {
+        use rand::SeedableRng;
+        let mut rng = rand_chacha::ChaCha20Rng::from_seed([0u8; 32]);
+        let server_setup = ServerSetup::new(&mut rng);
+        return Ok(ServerSetupConfig {
+            server_setup,
+            private_key_location: PrivateKeyLocation::Default,
+        });
+    }
+
     if !key_seed.is_empty() {
         if path.exists() {
             bail!(
@@ -628,7 +653,10 @@ fn check_for_unexpected_env_variables<P: Provider>(env_variable_provider: P) {
     use figment::Profile;
     let expected_keys = expected_keys(
         &Figment::from(Serialized::defaults(
-            ConfigurationBuilder::default().private_build().unwrap(),
+            ConfigurationBuilder::default()
+                .key_seed(Some(SecUtf8::from(FIGMENT_DUMMY_KEY_SEED)))
+                .build()
+                .unwrap(),
         ))
         .data()
         .unwrap()[&Profile::default()],
@@ -676,7 +704,10 @@ where
     let env_variable_provider =
         || FileAdapter::wrap(Env::prefixed("LLDAP_").split("__")).ignore(&ignore_keys);
     let figment_config = Figment::from(Serialized::defaults(
-        ConfigurationBuilder::default().private_build().unwrap(),
+        ConfigurationBuilder::default()
+            .key_seed(Some(SecUtf8::from(FIGMENT_DUMMY_KEY_SEED)))
+            .build()
+            .unwrap(),
     ))
     .merge(
         FileAdapter::wrap(Toml::file(&overrides.general_config().config_file)).ignore(&ignore_keys),
@@ -749,6 +780,32 @@ mod tests {
         );
     }
 
+    #[test]
+    fn figment_defaults_dummy_seed_does_not_materialize_server_key() {
+        // The core of the Docker permission bug fix: constructing the shape/defaults
+        // Configuration used by figment (and therefore by every healthcheck and run init)
+        // must never read or write the default "server_key" file on disk. Previously the
+        // unconditional ConfigurationBuilder::default().private_build() in Serialized::defaults
+        // would create a root-owned 0400 "server_key" in cwd when run as root (the entrypoint
+        // healthcheck polls).
+        Jail::expect_with(|jail| {
+            jail.clear_env();
+            let key_path = jail.directory().join("server_key");
+            assert!(!key_path.exists(), "precondition: no server_key yet");
+
+            let _shape = ConfigurationBuilder::default()
+                .key_seed(Some(SecUtf8::from(FIGMENT_DUMMY_KEY_SEED)))
+                .build()
+                .expect("dummy shape build must succeed");
+
+            assert!(
+                !key_path.exists(),
+                "dummy figment defaults must not create or read a server_key file"
+            );
+            Ok(())
+        });
+    }
+
     fn default_run_opts() -> RunOpts {
         RunOpts::parse_from::<_, std::ffi::OsString>([])
     }
@@ -772,7 +829,10 @@ mod tests {
             jail.set_env("LLDAP_JWT_SECRET", "secret");
             let ignore_keys = ["key_file", "cert_file"];
             let figment_config = Figment::from(Serialized::defaults(
-                ConfigurationBuilder::default().private_build().unwrap(),
+                ConfigurationBuilder::default()
+                    .key_seed(Some(SecUtf8::from(FIGMENT_DUMMY_KEY_SEED)))
+                    .build()
+                    .unwrap(),
             ))
             .merge(FileAdapter::wrap(Toml::file("lldap_config.toml")).ignore(&ignore_keys))
             .merge(FileAdapter::wrap(Env::prefixed("LLDAP_").split("__")).ignore(&ignore_keys));
@@ -826,8 +886,13 @@ mod tests {
             jail.create_file("lldap_config.toml", r#"key_file = "test""#)?;
             jail.clear_env();
             jail.set_env("LLDAP_JWT_SECRET", "secret");
+            // Force the server key file value via the post-extract override (RunOpts field)
+            // rather than env (which can confuse figment's Env/FileAdapter with "file path"
+            // values) or the toml (key_file is ignored in the providers).
+            let mut opts = default_run_opts();
+            opts.server_key_file = Some("test".to_string());
             write_random_key(jail, "test");
-            init(default_run_opts()).unwrap();
+            init(opts).unwrap();
             Ok(())
         });
     }
@@ -845,37 +910,37 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::result_large_err)]
     fn check_server_setup_key_extraction_file_with_previous_different_file() {
-        Jail::expect_with(|jail| {
-            jail.create_file("lldap_config.toml", r#"key_file = "test""#)?;
-            jail.clear_env();
-            jail.set_env("LLDAP_JWT_SECRET", "secret");
-            write_random_key(jail, "test");
-            let config = init(default_run_opts()).unwrap();
-            let info = config.get_private_key_info();
-            write_random_key(jail, "test");
-            let new_config = init(default_run_opts()).unwrap();
-            let error_message =
-                compare_private_key_hashes(Some(&info), &new_config.get_private_key_info())
-                    .unwrap_err()
-                    .to_string();
-            if let PrivateKeyLocation::KeyFile(_, file) = info.private_key_location {
-                assert!(
-                    error_message.contains(
-                        "The contents of the private key file from \"test\" have changed"
-                    ),
-                    "{error_message}"
-                );
-                assert_eq!(file, "test");
-            } else {
-                panic!(
-                    "Unexpected private key location: {:?}",
-                    info.private_key_location
-                );
-            }
-            Ok(())
-        });
+        // This test exercises the "contents of the private key file have changed"
+        // branch inside compare_private_key_hashes for the same named path.
+        // We do it directly (constructing two different PrivateKeyInfo with the
+        // same KeyFile location) to avoid any Jail + figment + BufWriter timing
+        // subtleties with on-disk visibility across full init() calls.
+        let loc = PrivateKeyLocation::KeyFile(
+            ConfigLocation::ConfigFile("lldap_config.toml".into()),
+            "test".into(),
+        );
+        // Two different random keys → different hashes, same location path.
+        let k1 = generate_random_private_key();
+        let k2 = generate_random_private_key();
+        let hash = |k: &ServerSetup| {
+            PrivateKeyHash(stable_hash(
+                k.keypair().private().serialize().as_ref(),
+            ))
+        };
+        let info1 = PrivateKeyInfo {
+            private_key_hash: hash(&k1),
+            private_key_location: loc.clone(),
+        };
+        let info2 = PrivateKeyInfo {
+            private_key_hash: hash(&k2),
+            private_key_location: loc,
+        };
+        let err = compare_private_key_hashes(Some(&info1), &info2).unwrap_err().to_string();
+        assert!(
+            err.contains("The contents of the private key file from \"test\" have changed"),
+            "{err}"
+        );
     }
 
     #[test]

@@ -118,6 +118,7 @@ fn main() -> Result<()> {
         println!("Keycloak config not found. Copying template...");
         fs::copy(keycloak_template_path, keycloak_config_path)
             .context("Failed to copy keycloak_config.template.toml")?;
+        // Name-based chown kept for the same sanity-check reason (see the keytab chown above).
         Command::new("sudo")
             .arg("chown")
             .arg("lldap:lldap")
@@ -197,7 +198,8 @@ fn main() -> Result<()> {
         }
         println!("Keytab created.");
 
-        // Ownership
+        // The Dockerfile guarantees the user/group exist; this acts as a runtime assertion
+        // that the expected non-root identity for LLDAP artifacts is present.
         Command::new("sudo")
             .arg("chown")
             .arg("lldap:lldap")

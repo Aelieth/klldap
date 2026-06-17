@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.7.2] 2026-06-16
+
+- Bugfixes: user GID no longer clashes and errors against group GID's. Group uid and memberof lookup added to ldap search
+- kadm5.acl no longer automatically overwritten on container restart allowing for custom access permissions
+- kadm5.acl now checks for sanity and attempts basic self heal if not sane, if unable restores to default
+- attribute group: lldap_sudohost added with RFC compliance for search and lookup for SSSD
+- attribute group: lldap_disabled improved RFC compliance
+- unknown ldap search attributes no longer return warn spam, returning only on debug
+
 ## [0.7.1] 2026-05-15
 
 Major fork release, integration of MIT Kerberos into a docker container, OU's, redesign of public_schema, LDAP system and more

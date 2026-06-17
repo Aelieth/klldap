@@ -354,7 +354,7 @@ pub fn get_user_attribute(
                     .is_none();
                 get_custom_attribute(&user.attributes, &attribute).or_else(|| {
                     if is_unknown {
-                        tracing::warn!(r#"Ignoring unrecognized user attribute: {}. Add to "ignored_user_attributes"."#, attribute);
+                        tracing::debug!(r#"Ignoring unrecognized user attribute: {}. Add to "ignored_user_attributes"."#, attribute);
                     }
                     None
                 })?
@@ -457,7 +457,7 @@ pub fn get_group_attribute(
                     .is_none();
                 get_custom_attribute(&group.attributes, attribute).or_else(|| {
                     if is_unknown {
-                        tracing::warn!(r#"Ignoring unrecognized group attribute: {}. Add to "ignored_group_attributes"."#, attribute);
+                        tracing::debug!(r#"Ignoring unrecognized group attribute: {}. Add to "ignored_group_attributes"."#, attribute);
                     }
                     None
                 })?

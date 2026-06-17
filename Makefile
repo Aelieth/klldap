@@ -51,7 +51,7 @@ docker-build:
 		--file Dockerfile \
 		--platform $(PLATFORMS) \
 		--tag aelieth/klldap:latest \
-		--tag aelieth/klldap:0.7.1 \
+		--tag aelieth/klldap:0.7.2 \
 		--push .
 
 # Quick cleanup of generated tarballs

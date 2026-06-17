@@ -8,7 +8,7 @@ use ldap3::{LdapConn, Scope, SearchEntry, SearchResult};
 use serial_test::file_serial;
 mod common;
 
-/// Production-grade LDAP tests for KLLDAP 0.7.1
+/// Production-grade LDAP tests for KLLDAP 0.7.2
 /// Validates unlimited nested OUs, correct DNs, leaf semantics, and attribute casing.
 
 #[test]

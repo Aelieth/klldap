@@ -12,7 +12,7 @@ This is a major fork of [LLDAP](https://github.com/lldap/lldap) with integrated 
 KDC, POSIX extensions, admin-controlled Organizational Units, and Keycloak federation support.
 
 <img
-  src="https://raw.githubusercontent.com/Aelieth/lldap-with-kerberos/refs/heads/main/screenshot.png"
+  src="https://raw.githubusercontent.com/Aelieth/klldap/refs/heads/main/screenshot.png"
   alt="Screenshot of the user list page"
   width="50%"
   align="right"

@@ -24,7 +24,11 @@ ENV PATH="/app/.cargo/bin:${PATH}"
 # Verify Rust/Cargo
 RUN rustc --version && cargo --version
 
-ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=x86-64"
+# Portable x86-64 baseline for release images. `make test` overrides with native.
+ARG CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=x86-64"
+ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=$CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS
+ARG CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS=$CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS
 
 # Install cargo-chef for dependency caching, add wasm target
 RUN cargo install cargo-chef && rustup target add wasm32-unknown-unknown

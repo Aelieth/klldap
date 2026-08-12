@@ -22,6 +22,8 @@ struct KerberosConfig {
     rdns: bool,
 }
 
+const ADMIN_KEYTAB_PATH: &str = "/data/kadm5.keytab";
+
 /// Run kadmin.local — only show output on error
 fn run_kadmin_local(query: &str) -> Result<Output> {
     let output = Command::new("sudo")
@@ -45,6 +47,77 @@ fn run_kadmin_local(query: &str) -> Result<Output> {
     }
 
     Ok(output)
+}
+
+#[derive(Debug, PartialEq)]
+enum KeytabAction {
+    UpToDate,
+    Regenerate { create_principal: bool },
+}
+
+fn plan_admin_keytab(keytab_exists: bool, db_created: bool) -> KeytabAction {
+    match (keytab_exists, db_created) {
+        (true, false) => KeytabAction::UpToDate,
+        (_, true) => KeytabAction::Regenerate {
+            create_principal: true,
+        },
+        (false, false) => KeytabAction::Regenerate {
+            create_principal: false,
+        },
+    }
+}
+
+fn ensure_admin_keytab(admin_princ: &str, db_created: bool) -> Result<()> {
+    let create_principal =
+        match plan_admin_keytab(Path::new(ADMIN_KEYTAB_PATH).exists(), db_created) {
+            KeytabAction::UpToDate => return Ok(()),
+            KeytabAction::Regenerate { create_principal } => create_principal,
+        };
+
+    if create_principal {
+        println!("Creating admin principal with random key: {}", admin_princ);
+        let add_output = run_kadmin_local(&format!("addprinc -randkey {}", admin_princ))?;
+        if !add_output.status.success() {
+            anyhow::bail!("addprinc failed for {}", admin_princ);
+        }
+        let _ = fs::remove_file(ADMIN_KEYTAB_PATH);
+    } else {
+        println!(
+            "Admin keytab {} missing — regenerating from existing KDC database.",
+            ADMIN_KEYTAB_PATH
+        );
+    }
+
+    // ktadd rotates the kvno; safe here since this keytab is the only consumer of the
+    // admin principal's key.
+    let ktadd_output =
+        run_kadmin_local(&format!("ktadd -k {} {}", ADMIN_KEYTAB_PATH, admin_princ))?;
+    if !ktadd_output.status.success() {
+        anyhow::bail!("ktadd failed — Kerberos admin operations will fail");
+    }
+
+    ensure_admin_keytab_ownership()?;
+
+    if !Path::new(ADMIN_KEYTAB_PATH).exists() {
+        anyhow::bail!("admin keytab still missing after ktadd");
+    }
+    println!("Admin keytab ready at {}.", ADMIN_KEYTAB_PATH);
+    Ok(())
+}
+
+fn ensure_admin_keytab_ownership() -> Result<()> {
+    let status = Command::new("sudo")
+        .arg("chown")
+        .arg("lldap:lldap")
+        .arg(ADMIN_KEYTAB_PATH)
+        .status()
+        .context("Failed to chown keytab")?;
+    if !status.success() {
+        anyhow::bail!("chown keytab failed");
+    }
+    fs::set_permissions(ADMIN_KEYTAB_PATH, fs::Permissions::from_mode(0o640))
+        .context("Failed to chmod keytab")?;
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -126,8 +199,10 @@ fn main() -> Result<()> {
 
     // --- Kerberos Bootstrap ---
     let db_path = Path::new("/var/kerberos/krb5kdc/principal");
+    let admin_princ = format!("admin/admin@{}", config.realm_name.to_uppercase());
+    let db_created = !db_path.exists();
 
-    if !db_path.exists() {
+    if db_created {
         println!("First run detected — no KDC database. Bootstrapping password-less...");
 
         // Generate random master password (in-memory only)
@@ -176,30 +251,8 @@ fn main() -> Result<()> {
         }
         println!("KDC database created successfully.");
 
-        // Create admin principal + keytab
-        let admin_princ = format!("admin/admin@{}", config.realm_name.to_uppercase());
-        println!("Creating admin principal with random key: {}", admin_princ);
-        let add_output = run_kadmin_local(&format!("addprinc -randkey {}", admin_princ))?;
-        if !add_output.status.success() {
-            anyhow::bail!("addprinc failed");
-        }
-
-        let keytab_path = "/data/kadm5.keytab";
-        println!("Exporting admin principal to keytab: {}", keytab_path);
-        let ktadd_output = run_kadmin_local(&format!("ktadd -k {} {}", keytab_path, admin_princ))?;
-        if !ktadd_output.status.success() {
-            anyhow::bail!("ktadd failed");
-        }
-        println!("Keytab created.");
-
         // The Dockerfile guarantees the user/group exist; this acts as a runtime assertion
         // that the expected non-root identity for LLDAP artifacts is present.
-        Command::new("sudo")
-            .arg("chown")
-            .arg("lldap:lldap")
-            .arg(keytab_path)
-            .status()
-            .context("Failed to chown keytab")?;
         Command::new("sudo")
             .arg("chown")
             .arg("-R")
@@ -207,10 +260,13 @@ fn main() -> Result<()> {
             .arg("/var/kerberos/krb5kdc")
             .status()
             .context("Failed to chown DB dir")?;
-        println!("Ownership set on keytab and DB files.");
+        println!("Ownership set on DB files.");
     } else {
-        println!("Existing KDC database detected — skipping bootstrap.");
+        println!("Existing KDC database detected — skipping database creation.");
     }
+
+    // /data and /var/kerberos/krb5kdc are separate volumes; either can vanish.
+    ensure_admin_keytab(&admin_princ, db_created)?;
 
     // Start daemons
     println!("Starting krb5kdc...");
@@ -234,8 +290,7 @@ fn main() -> Result<()> {
     }
 
     // Populate ccache
-    if Path::new("/data/kadm5.keytab").exists() {
-        let admin_princ = format!("admin/admin@{}", config.realm_name.to_uppercase());
+    if Path::new(ADMIN_KEYTAB_PATH).exists() {
         println!(
             "Populating ccache with keytab (daemons ready): {}",
             admin_princ
@@ -244,7 +299,7 @@ fn main() -> Result<()> {
             .env("KRB5_CONFIG", "/etc/krb5.conf")
             .arg("-k")
             .arg("-t")
-            .arg("/data/kadm5.keytab")
+            .arg(ADMIN_KEYTAB_PATH)
             .arg(&admin_princ)
             .output()
             .context("Failed kinit")?;
@@ -510,6 +565,41 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn test_plan_admin_keytab_healthy_restart_is_noop() {
+        assert_eq!(plan_admin_keytab(true, false), KeytabAction::UpToDate);
+    }
+
+    #[test]
+    fn test_plan_admin_keytab_missing_with_existing_db_regenerates() {
+        assert_eq!(
+            plan_admin_keytab(false, false),
+            KeytabAction::Regenerate {
+                create_principal: false
+            }
+        );
+    }
+
+    #[test]
+    fn test_plan_admin_keytab_first_run_creates_principal() {
+        assert_eq!(
+            plan_admin_keytab(false, true),
+            KeytabAction::Regenerate {
+                create_principal: true
+            }
+        );
+    }
+
+    #[test]
+    fn test_plan_admin_keytab_fresh_db_overwrites_stale_keytab() {
+        assert_eq!(
+            plan_admin_keytab(true, true),
+            KeytabAction::Regenerate {
+                create_principal: true
+            }
+        );
+    }
 
     /// Helper that sets up an isolated temp directory with a minimal kadm5 template
     /// (only needs REALM_NAME) and yields paths for the test body. Cleans up after.

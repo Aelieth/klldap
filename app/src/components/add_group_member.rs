@@ -1,3 +1,4 @@
+use crate::infra::queries::{AddUserToGroup, add_user_to_group};
 use crate::{
     components::select::{Select, SelectOption, SelectOptionProps},
     infra::common_component::{CommonComponent, CommonComponentParts},
@@ -6,16 +7,6 @@ use anyhow::{Error, Result};
 use graphql_client::GraphQLQuery;
 use std::collections::HashSet;
 use yew::prelude::*;
-
-#[derive(GraphQLQuery)]
-#[graphql(
-    schema_path = "../schema.graphql",
-    query_path = "queries/add_user_to_group.graphql",
-    response_derives = "Debug",
-    variables_derives = "Clone",
-    custom_scalars_module = "crate::infra::graphql"
-)]
-pub struct AddUserToGroup;
 
 #[derive(GraphQLQuery)]
 #[graphql(
@@ -116,8 +107,8 @@ impl AddGroupMemberComponent {
         Ok(true)
     }
 
-    fn get_selectable_user_list(&self, ctx: &Context<Self>, user_list: &[User]) -> Vec<User> {
-        let user_groups = ctx.props().users.iter().collect::<HashSet<_>>();
+    fn get_selectable_user_list(props: &Props, user_list: &[User]) -> Vec<User> {
+        let user_groups = props.users.iter().collect::<HashSet<_>>();
         user_list
             .iter()
             .filter(|u| !user_groups.contains(u))
@@ -152,7 +143,7 @@ impl Component for AddGroupMemberComponent {
     fn view(&self, ctx: &Context<Self>) -> Html {
         let link = ctx.link();
         if let Some(user_list) = &self.user_list {
-            let to_add_user_list = self.get_selectable_user_list(ctx, user_list);
+            let to_add_user_list = Self::get_selectable_user_list(ctx.props(), user_list);
             #[allow(unused_braces)]
             let make_select_option = |user: User| {
                 let name = if user.display_name.is_empty() {
@@ -176,7 +167,7 @@ impl Component for AddGroupMemberComponent {
                   }
                 </Select>
               </div>
-              <div class="col-3">
+              <div class="col-sm-3">
                 <button
                   class="btn btn-secondary"
                   disabled={self.selected_user.is_none() || self.common.is_task_running()}
@@ -189,7 +180,7 @@ impl Component for AddGroupMemberComponent {
             }
         } else {
             html! {
-              {"Loading groups"}
+              {"Loading users"}
             }
         }
     }

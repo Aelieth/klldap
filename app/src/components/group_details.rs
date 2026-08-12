@@ -51,7 +51,7 @@ pub struct GroupDetails {
 }
 
 /// State machine describing the possible transitions of the component state.
-/// It starts out by fetching the user's details from the backend when loading.
+/// It starts out by fetching the group's details from the backend when loading.
 pub enum Msg {
     /// Received the group details response, either the group data or an error.
     GroupDetailsResponse(Result<get_group_details::ResponseData>),

@@ -50,8 +50,7 @@ RUN cargo install wasm-pack --locked
 RUN cargo install wasm-bindgen-cli --locked
 
 # Build the frontend
-RUN cd app && wasm-pack build --target web --release
-RUN cd app && gzip -9 -k -f pkg/lldap_app_bg.wasm
+RUN ./app/build.sh
 
 # Final runtime image
 FROM quay.io/almalinuxorg/10-minimal

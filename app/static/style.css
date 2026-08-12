@@ -30,3 +30,7 @@ html.dark .nav-link {
 .nav-link {
   color: #212529
 }
+
+.app-content {
+  padding-bottom: 80px;
+}

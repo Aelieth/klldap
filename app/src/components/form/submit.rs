@@ -5,7 +5,6 @@ use yew::{Callback, Children, Properties, function_component, html, virtual_dom:
 pub struct Props {
     pub disabled: bool,
     pub onclick: Callback<MouseEvent>,
-    // Additional elements to insert after the button, in the same div
     #[prop_or_default]
     pub children: Children,
     #[prop_or(AttrValue::from("Submit"))]

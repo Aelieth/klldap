@@ -1,3 +1,4 @@
+use crate::components::fragments::attribute_order::attribute_priority;
 use crate::{
     components::{
         avatar::Avatar,
@@ -17,7 +18,6 @@ use crate::{
 };
 use anyhow::Result;
 use chrono::NaiveDateTime;
-use gloo_console::log;
 use graphql_client::GraphQLQuery;
 use yew::Callback;
 use yew::prelude::*;
@@ -33,26 +33,6 @@ use yew::virtual_dom::AttrValue;
 )]
 pub struct UpdateUser;
 
-fn attribute_priority(name: &str) -> (i32, String) {
-    let priorities = vec![
-        "firstname",
-        "lastname",
-        "displayname",
-        "mail",
-        "avatar",
-        "uidnumber",
-        "gidnumber",
-        "homedirectory",
-        "loginshell",
-    ];
-    let index = priorities
-        .iter()
-        .position(|&p| p == name)
-        .map(|i| i as i32)
-        .unwrap_or(100);
-    (index, name.to_lowercase())
-}
-
 pub struct UserDetailsForm {
     common: CommonComponentParts<Self>,
     just_updated: bool,
@@ -64,13 +44,12 @@ pub struct UserDetailsForm {
 }
 
 pub enum Msg {
-    Update,
     SubmitClicked,
     UserUpdated(Result<update_user::ResponseData>),
     ToggleKerberosSync(bool),
 }
 
-#[derive(yew::Properties, Clone, PartialEq)] // Eq removed – Callback<()> does not implement Eq
+#[derive(yew::Properties, Clone, PartialEq)]
 pub struct Props {
     pub user: User,
     pub user_attributes_schema: Vec<AttributeSchema>,
@@ -86,21 +65,22 @@ impl CommonComponent<UserDetailsForm> for UserDetailsForm {
         ctx: &Context<Self>,
         msg: <Self as Component>::Message,
     ) -> Result<bool> {
-        // All real logic is in the Component impl below.
-        // This just satisfies the trait bounds.
+        self.just_updated = false;
         match msg {
-            Msg::Update => Ok(true),
             Msg::SubmitClicked => Ok(self.submit_user_update_form(ctx)),
             Msg::UserUpdated(response) => {
-                if response.is_ok() {
-                    self.show_kerberos_banner = false;
-                    self.just_updated = true;
-                    self.original_kerberossync_enabled = self.kerberossync_enabled;
+                response?;
+                self.just_updated = true;
+                self.show_kerberos_banner = false;
+                self.original_kerberossync_enabled = self.kerberossync_enabled;
+                if let Some(cb) = &ctx.props().on_updated {
+                    cb.emit(());
                 }
                 Ok(true)
             }
             Msg::ToggleKerberosSync(value) => {
                 self.kerberossync_enabled = value;
+                self.show_kerberos_banner = value;
                 Ok(true)
             }
         }
@@ -131,37 +111,7 @@ impl Component for UserDetailsForm {
     }
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
-        self.just_updated = false;
-        match msg {
-            Msg::Update => true,
-            Msg::SubmitClicked => self.submit_user_update_form(ctx),
-            Msg::UserUpdated(response) => {
-                match response {
-                    Ok(_) => {
-                        self.just_updated = true;
-                        self.show_kerberos_banner = false;
-                        self.original_kerberossync_enabled = self.kerberossync_enabled;
-
-                        // OPTIMIZED AVATAR REFRESH:
-                        // Immediately notify parent to re-fetch fresh data
-                        // This guarantees the new avatar base64 is loaded
-                        // and displayed without stale data
-                        if let Some(cb) = &ctx.props().on_updated {
-                            cb.emit(());
-                        }
-                    }
-                    Err(e) => {
-                        self.common.error = Some(e);
-                    }
-                }
-                true
-            }
-            Msg::ToggleKerberosSync(value) => {
-                self.kerberossync_enabled = value;
-                self.show_kerberos_banner = value;
-                true
-            }
-        }
+        CommonComponentParts::<Self>::update(self, ctx, msg)
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
@@ -250,7 +200,7 @@ impl UserDetailsForm {
         for attr in form_values {
             let name_lower = attr.name.to_lowercase();
 
-            // === SKIP kerberossync — we handle it specially below ===
+            // kerberossync is handled separately via the Kerberos switch below.
             if name_lower == "kerberossync" {
                 continue;
             }
@@ -281,7 +231,7 @@ impl UserDetailsForm {
             }
         }
 
-        // === KERBEROS LOGIC (centralized in kerberos_switch.rs) ===
+        // Kerberos sync toggle (see kerberos_switch.rs).
         let (kerberos_insert, kerberos_remove) = prepare_kerberos_update(
             self.kerberossync_enabled,
             self.original_kerberossync_enabled,
@@ -312,7 +262,6 @@ impl UserDetailsForm {
                 )
             };
 
-        // === Extract displayname (and other special fields) to top-level like create_user does ===
         let mut display_name = None;
         if let Some(dn_attr) = insert_attributes.as_ref().and_then(|attrs| {
             attrs
@@ -322,8 +271,6 @@ impl UserDetailsForm {
             display_name = dn_attr.value.first().cloned();
         }
 
-        // === Extract avatar to top-level (special field, like displayName) so backend persists it ===
-        // This ensures GetUserDetails returns it in response.user.avatar (for banner) and attributes (for form)
         let mut avatar = None;
         if let Some(av_attr) = insert_attributes.as_ref().and_then(|attrs| {
             attrs
@@ -332,7 +279,6 @@ impl UserDetailsForm {
         }) {
             avatar = av_attr.value.first().cloned();
         }
-        // If removing avatar, avatar stays None (clears it); removeAttributes also sent for cleanup
 
         let user_input = update_user::UpdateUserInput {
             id: self.user.id.clone(),
@@ -403,15 +349,6 @@ fn get_custom_attribute_static(
         .unwrap_or_default();
 
     if attribute_schema.attribute_type == AttributeType::Avatar {
-        let avatar_b64 = values.first().cloned().unwrap_or_default();
-        let preview = avatar_b64.chars().take(30).collect::<String>();
-        log!(format!(
-            "[FORM DEBUG] STATIC Avatar | b64_len={} | preview='{}...' | using GraphQL user={} path",
-            avatar_b64.len(),
-            preview,
-            user_id
-        ));
-
         // Use GraphQL path (same as banner) — reliable
         return html! {
             <StaticValue label={attribute_schema.name.clone()} id={attribute_schema.name.clone()}>

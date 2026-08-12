@@ -20,9 +20,6 @@ gloo-file = "0.4"
 gloo-net = "0.7"
 gloo-timers = "0.3"
 graphql_client = { workspace = true }
-http = "0.2"
-image = { workspace = true }
-indexmap = "=1.6.2"
 jwt = { workspace = true }
 rand = { workspace = true }
 rsa = "0.9.6"
@@ -38,18 +35,14 @@ wasm-bindgen-futures = "0"
 yew = "0.19.3"
 yew-router = "0.16"
 
-# Needed because of https://github.com/tkaitchuck/aHash/issues/95
-# indexmap = "=1.6.2"
-
+# opaque_server stays enabled (default): the shared login/registration wire types
+# in lldap_auth reference opaque::server types even on the client side.
 [dependencies.lldap_auth]
 path = "../crates/auth"
 features = [ "opaque_client" ]
 
 [dependencies.lldap_frontend_options]
 path = "../crates/frontend-options"
-
-[dependencies.lldap_schema]
-path = "../crates/schema"
 
 [dependencies.lldap_validation]
 path = "../crates/validation"
@@ -60,16 +53,17 @@ features = [
   "Document",
   "Element",
   "Event",
-  "FileReader",
+  "FileList",
+  "FocusEvent",
   "FormData",
   "HtmlDocument",
   "HtmlFormElement",
   "HtmlInputElement",
-  "HtmlOptionElement",
-  "HtmlOptionsCollection",
   "HtmlSelectElement",
-  "SubmitEvent",
-  "console",
+  "InputEvent",
+  "MouseEvent",
+  "RequestCredentials",
+  "Window",
 ]
 
 [dependencies.yew_form]

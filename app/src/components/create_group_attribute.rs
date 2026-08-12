@@ -9,7 +9,6 @@ use crate::{
     },
 };
 use anyhow::{Result, bail};
-use gloo_console::log;
 use graphql_client::GraphQLQuery;
 use lldap_validation::attributes::validate_attribute_name;
 use validator_derive::Validate;
@@ -86,11 +85,6 @@ impl CommonComponent<CreateGroupAttributeForm> for CreateGroupAttributeForm {
             }
             Msg::CreateGroupAttributeResponse(response) => {
                 response?;
-                let model = self.form.model();
-                log!(&format!(
-                    "Created group attribute '{}'",
-                    model.attribute_name
-                ));
                 ctx.link()
                     .history()
                     .unwrap()

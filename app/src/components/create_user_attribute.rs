@@ -9,7 +9,6 @@ use crate::{
     },
 };
 use anyhow::{Result, bail};
-use gloo_console::log;
 use graphql_client::GraphQLQuery;
 use lldap_validation::attributes::validate_attribute_name;
 use validator_derive::Validate;
@@ -91,11 +90,6 @@ impl CommonComponent<CreateUserAttributeForm> for CreateUserAttributeForm {
             }
             Msg::CreateUserAttributeResponse(response) => {
                 response?;
-                let model = self.form.model();
-                log!(&format!(
-                    "Created user attribute '{}'",
-                    model.attribute_name
-                ));
                 ctx.link().history().unwrap().push(AppRoute::ListUserSchema);
                 Ok(true)
             }

@@ -1,3 +1,10 @@
+use crate::components::fragments::attribute_order::attribute_priority;
+use crate::infra::opaque::{begin_registration, finish_registration};
+use crate::infra::queries::{
+    GetKerberosInfo, GetPosixConfig, GetUserAttributesSchema, ListOusQuery, SyncKerberosPassword,
+    get_kerberos_info, get_posix_config, get_user_attributes_schema, list_ous_query,
+    sync_kerberos_password,
+};
 use crate::{
     components::{
         form::{
@@ -12,13 +19,11 @@ use crate::{
     infra::{
         api::HostService,
         common_component::{CommonComponent, CommonComponentParts},
-        encrypt::encrypt_password,
+        encrypt::encrypt_kerberos_password,
         form_utils::{EmailIsRequired, GraphQlAttributeSchema, IsAdmin, read_all_form_attributes},
-        schema::AttributeType,
     },
 };
 use anyhow::{Result, bail};
-use gloo_console::log;
 use graphql_client::GraphQLQuery;
 use lldap_auth::{opaque, registration};
 use validator_derive::Validate;
@@ -26,44 +31,6 @@ use yew::Context as YewContext;
 use yew::prelude::*;
 use yew_form_derive::Model;
 use yew_router::{prelude::History, scope_ext::RouterScopeExt};
-
-fn attribute_priority(name: &str) -> (i32, String) {
-    let priorities = vec![
-        "firstname",
-        "lastname",
-        "displayname",
-        "mail",
-        "avatar",
-        "uidnumber",
-        "gidnumber",
-        "homedirectory",
-        "loginshell",
-    ];
-    let index = priorities
-        .iter()
-        .position(|&p| p == name)
-        .map(|i| i as i32)
-        .unwrap_or(100);
-    (index, name.to_lowercase())
-}
-
-#[derive(GraphQLQuery)]
-#[graphql(
-    schema_path = "../schema.graphql",
-    query_path = "queries/get_kerberos_info.graphql",
-    response_derives = "Debug,Clone,PartialEq,Eq",
-    custom_scalars_module = "crate::infra::graphql"
-)]
-pub struct GetKerberosInfo;
-
-#[derive(GraphQLQuery)]
-#[graphql(
-    schema_path = "../schema.graphql",
-    query_path = "queries/sync_kerberos.graphql",
-    response_derives = "Debug,Clone",
-    custom_scalars_module = "crate::infra::graphql"
-)]
-pub struct SyncKerberosPassword;
 
 #[derive(GraphQLQuery)]
 #[graphql(
@@ -74,35 +41,7 @@ pub struct SyncKerberosPassword;
 )]
 pub struct CreateUser;
 
-#[derive(GraphQLQuery)]
-#[graphql(
-    schema_path = "../schema.graphql",
-    query_path = "queries/get_posix_config.graphql",
-    response_derives = "Debug",
-    custom_scalars_module = "crate::infra::graphql"
-)]
-pub struct GetPosixConfig;
-
 use create_user::AttributeValueInput as GraphQLAttributeValue;
-
-#[derive(GraphQLQuery)]
-#[graphql(
-    schema_path = "../schema.graphql",
-    query_path = "queries/get_user_attributes_schema.graphql",
-    response_derives = "Debug,Clone,PartialEq,Eq",
-    custom_scalars_module = "crate::infra::graphql",
-    extern_enums("AttributeType")
-)]
-pub struct GetUserAttributesSchema;
-
-#[derive(GraphQLQuery)]
-#[graphql(
-    schema_path = "../schema.graphql",
-    query_path = "queries/list_ous.graphql",
-    response_derives = "Debug, Clone",
-    custom_scalars_module = "crate::infra::graphql"
-)]
-pub struct ListOusQuery;
 
 pub type Attribute = get_user_attributes_schema::GetUserAttributesSchemaSchemaUserSchemaAttributes;
 
@@ -122,7 +61,6 @@ pub struct CreateUserForm {
     form: yew_form::Form<CreateUserModel>,
     attributes_schema: Option<Vec<Attribute>>,
     form_ref: NodeRef,
-    fetched_schema: bool,
     encrypted_password: Option<String>,
     user_id: Option<String>,
     opaque_data: Option<opaque::client::registration::ClientRegistration>,
@@ -136,7 +74,6 @@ pub struct CreateUserForm {
     user_gidnumber_assign: bool,
     user_loginshell_assign: bool,
     user_homedirectory_assign: bool,
-    group_gidnumber_assign: bool,
 }
 
 #[derive(Model, Validate, PartialEq, Eq, Clone, Default)]
@@ -152,7 +89,7 @@ pub struct CreateUserModel {
 pub enum Msg {
     Update,
     ListAttributesResponse(Result<get_user_attributes_schema::ResponseData>),
-    ListUserOusResponse(Result<list_ous_query::ResponseData>),
+    ListOusResponse(Result<list_ous_query::ResponseData>),
     KerberosInfoResponse(Result<get_kerberos_info::ResponseData>),
     PosixConfigResponse(Result<get_posix_config::ResponseData>),
     SubmitForm,
@@ -190,7 +127,7 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
                 );
                 Ok(true)
             }
-            Msg::ListUserOusResponse(ous) => {
+            Msg::ListOusResponse(ous) => {
                 self.ous = ous?.list_ous;
                 Ok(true)
             }
@@ -204,7 +141,6 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
                 self.user_gidnumber_assign = cfg.user_gidnumber_assign;
                 self.user_loginshell_assign = cfg.user_loginshell_assign;
                 self.user_homedirectory_assign = cfg.user_homedirectory_assign;
-                self.group_gidnumber_assign = cfg.group_gidnumber_assign;
                 self.posix_config_loaded = true;
                 Ok(true)
             }
@@ -230,21 +166,13 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
                 let model = self.form.model();
                 let new_password = model.password.clone();
 
-                if let Some(info) = &self.kerberos_info {
-                    if let Some(ref pub_key_der_base64) = info.public_key_der_base64 {
-                        match encrypt_password(pub_key_der_base64, &new_password) {
-                            Ok(encrypted) => {
-                                self.encrypted_password = Some(encrypted);
-                            }
-                            Err(e) => {
-                                bail!("Failed to encrypt password for Kerberos sync: {}", e);
-                            }
-                        }
-                    } else {
-                        bail!(
-                            "Kerberos enabled but no public key available—check backend startup/logs"
-                        );
-                    }
+                if self.kerberos_info.is_some() {
+                    self.encrypted_password = Some(encrypt_kerberos_password(
+                        self.kerberos_info
+                            .as_ref()
+                            .and_then(|i| i.public_key_der_base64.as_deref()),
+                        &new_password,
+                    )?);
                 }
 
                 let all_values = read_all_form_attributes(
@@ -253,25 +181,6 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
                     IsAdmin(true),
                     EmailIsRequired(true),
                 )?;
-
-                if let Some(avatar_attr) = all_values.iter().find(|a| a.name == "avatar") {
-                    let avatar_val = avatar_attr.values.first().cloned().unwrap_or_default();
-                    log!(
-                        "CREATE_FORM_READER: avatar (bytes) length = {}",
-                        avatar_val.len()
-                    );
-                    if avatar_val.len() > 100 {
-                        log!(
-                            "CREATE_FORM_READER: avatar base64 starts with: {}",
-                            &avatar_val[0..100.min(avatar_val.len())]
-                        );
-                    } else if !avatar_val.is_empty() {
-                        log!(
-                            "CREATE_FORM_READER: avatar base64 is short (len={})",
-                            avatar_val.len()
-                        );
-                    }
-                }
 
                 let mut attributes = vec![];
                 let mut email = None;
@@ -348,18 +257,10 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
                 Ok(true)
             }
             Msg::CreateUserResponse(res) => {
-                self.user_id = Some(res?.create_user.id);
-                let mut rng = rand::rngs::OsRng;
-                let registration_start_request = opaque::client::registration::start_registration(
-                    self.form.model().password.as_bytes(),
-                    &mut rng,
-                )
-                .context("Could not initiate registration")?;
-                let req = registration::ClientRegistrationStartRequest {
-                    username: self.user_id.clone().unwrap().into(),
-                    registration_start_request: registration_start_request.message,
-                };
-                self.opaque_data = Some(registration_start_request.state);
+                let user_id = res?.create_user.id;
+                self.user_id = Some(user_id.clone());
+                let (state, req) = begin_registration(&user_id, &self.form.model().password)?;
+                self.opaque_data = Some(state);
                 self.common.call_backend(
                     ctx,
                     HostService::register_start(req),
@@ -369,19 +270,11 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
             }
             Msg::RegistrationStartResponse(res) => {
                 let res = res.context("Could not initiate registration")?;
-                let registration = self.opaque_data.take().expect("Missing registration data");
-                let mut rng = rand::rngs::OsRng;
-                let registration_finish = opaque::client::registration::finish_registration(
-                    registration,
-                    self.form.model().password.as_bytes(), // ← added password
-                    res.registration_response,
-                    &mut rng,
-                )
-                .context("Error during registration")?;
-                let req = registration::ClientRegistrationFinishRequest {
-                    server_data: res.server_data,
-                    registration_upload: registration_finish.message,
-                };
+                let state = self
+                    .opaque_data
+                    .take()
+                    .context("Missing registration data")?;
+                let req = finish_registration(state, &self.form.model().password, *res)?;
                 self.common.call_backend(
                     ctx,
                     HostService::register_finish(req),
@@ -437,7 +330,6 @@ impl Component for CreateUserForm {
             form: yew_form::Form::<CreateUserModel>::new(CreateUserModel::default()),
             attributes_schema: None,
             form_ref: NodeRef::default(),
-            fetched_schema: false,
             encrypted_password: None,
             user_id: None,
             opaque_data: None,
@@ -450,7 +342,6 @@ impl Component for CreateUserForm {
             user_gidnumber_assign: false,
             user_loginshell_assign: false,
             user_homedirectory_assign: false,
-            group_gidnumber_assign: false,
         }
     }
 
@@ -542,19 +433,18 @@ impl Component for CreateUserForm {
     }
 
     fn rendered(&mut self, ctx: &YewContext<Self>, first_render: bool) {
-        if first_render && !self.fetched_schema {
+        if first_render {
             self.common.call_graphql::<GetUserAttributesSchema, _>(
                 ctx,
                 get_user_attributes_schema::Variables {},
                 Msg::ListAttributesResponse,
                 "Error trying to fetch user schema",
             );
-            self.fetched_schema = true;
 
             self.common.call_graphql::<ListOusQuery, _>(
                 ctx,
                 list_ous_query::Variables {},
-                Msg::ListUserOusResponse,
+                Msg::ListOusResponse,
                 "Error trying to fetch OUs",
             );
         }

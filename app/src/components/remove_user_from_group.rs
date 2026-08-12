@@ -1,17 +1,7 @@
 use crate::infra::common_component::{CommonComponent, CommonComponentParts};
+use crate::infra::queries::{RemoveUserFromGroup, remove_user_from_group};
 use anyhow::{Error, Result};
-use graphql_client::GraphQLQuery;
 use yew::prelude::*;
-
-#[derive(GraphQLQuery)]
-#[graphql(
-    schema_path = "../schema.graphql",
-    query_path = "queries/remove_user_from_group.graphql",
-    response_derives = "Debug",
-    variables_derives = "Clone",
-    custom_scalars_module = "crate::infra::graphql"
-)]
-pub struct RemoveUserFromGroup;
 
 pub struct RemoveUserFromGroupComponent {
     common: CommonComponentParts<Self>,

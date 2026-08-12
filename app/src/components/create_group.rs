@@ -1,3 +1,7 @@
+use crate::infra::queries::{
+    GetGroupAttributesSchema, GetPosixConfig, ListOusQuery, get_group_attributes_schema,
+    get_posix_config, list_ous_query,
+};
 use crate::{
     components::{
         form::{
@@ -14,45 +18,15 @@ use crate::{
             AttributeValue, EmailIsRequired, GraphQlAttributeSchema, IsAdmin,
             read_all_form_attributes,
         },
-        schema::AttributeType,
     },
 };
 use anyhow::{Result, ensure};
-use gloo_console::log;
 use graphql_client::GraphQLQuery;
 use list_ous_query::ResponseData as OusResponseData;
 use validator_derive::Validate;
 use yew::prelude::*;
 use yew_form_derive::Model;
 use yew_router::{prelude::History, scope_ext::RouterScopeExt};
-
-#[derive(GraphQLQuery)]
-#[graphql(
-    schema_path = "../schema.graphql",
-    query_path = "queries/get_group_attributes_schema.graphql",
-    response_derives = "Debug,Clone,PartialEq,Eq",
-    custom_scalars_module = "crate::infra::graphql",
-    extern_enums("AttributeType")
-)]
-pub struct GetGroupAttributesSchema;
-
-#[derive(GraphQLQuery)]
-#[graphql(
-    schema_path = "../schema.graphql",
-    query_path = "queries/list_ous.graphql",
-    response_derives = "Debug, Clone",
-    custom_scalars_module = "crate::infra::graphql"
-)]
-pub struct ListOusQuery;
-
-#[derive(GraphQLQuery)]
-#[graphql(
-    schema_path = "../schema.graphql",
-    query_path = "queries/get_posix_config.graphql",
-    response_derives = "Debug",
-    custom_scalars_module = "crate::infra::graphql"
-)]
-pub struct GetPosixConfig;
 
 pub type Attribute =
     get_group_attributes_schema::GetGroupAttributesSchemaSchemaGroupSchemaAttributes;
@@ -98,7 +72,7 @@ pub struct CreateGroupModel {
 pub enum Msg {
     Update,
     ListAttributesResponse(Result<get_group_attributes_schema::ResponseData>),
-    ListUserOusResponse(Result<OusResponseData>),
+    ListOusResponse(Result<OusResponseData>),
     PosixConfigResponse(Result<get_posix_config::ResponseData>),
     SubmitForm,
     CreateGroupResponse(Result<create_group::ResponseData>),
@@ -123,7 +97,7 @@ impl CommonComponent<CreateGroupForm> for CreateGroupForm {
                 );
                 Ok(true)
             }
-            Msg::ListUserOusResponse(ous) => {
+            Msg::ListOusResponse(ous) => {
                 self.ous = ous?.list_ous;
                 Ok(true)
             }
@@ -180,11 +154,7 @@ impl CommonComponent<CreateGroupForm> for CreateGroupForm {
                 Ok(true)
             }
             Msg::CreateGroupResponse(response) => {
-                let data = response?;
-                log!(format!(
-                    "Created group '{}'",
-                    data.create_group.display_name
-                ));
+                response?;
                 ctx.link().history().unwrap().push(AppRoute::ListGroups);
                 Ok(true)
             }
@@ -228,7 +198,7 @@ impl Component for CreateGroupForm {
         component.common.call_graphql::<ListOusQuery, _>(
             ctx,
             list_ous_query::Variables {},
-            Msg::ListUserOusResponse,
+            Msg::ListOusResponse,
             "Error trying to fetch OUs",
         );
 

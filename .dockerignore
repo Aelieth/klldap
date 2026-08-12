@@ -22,7 +22,7 @@ README.md
 docs/*
 example_configs/*
 
-# Output of `npm install rollup`
+# npm/wasm-pack residue
 node_modules/*
 package-lock.json
 package.json

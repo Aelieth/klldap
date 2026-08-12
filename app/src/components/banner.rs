@@ -59,7 +59,7 @@ pub fn banner(props: &Props) -> Html {
                       {"Group schema"}
                     </Link>
                   </li>
-                  <li>  // NEW: Federation tab link
+                  <li>
                   <Link
                     classes="nav-link px-2 h6"
                       to={AppRoute::Federation}>
@@ -105,7 +105,7 @@ fn user_menu(props: &UserMenuProps) -> Html {
             </a>
             <ul
               class="dropdown-menu text-small dropdown-menu-lg-end"
-              aria-labelledby="dropdownUser1"
+              aria-labelledby="dropdownUser"
               style="">
               <li>
                 <Link

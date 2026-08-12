@@ -1,18 +1,9 @@
 use crate::infra::common_component::{CommonComponent, CommonComponentParts};
+use crate::infra::form_utils::{input_checked, input_value};
+use crate::infra::queries::{GetPosixConfig, get_posix_config};
 use anyhow::Result;
 use graphql_client::GraphQLQuery;
-use wasm_bindgen::JsCast;
 use yew::prelude::*;
-
-// GraphQL derives
-#[derive(GraphQLQuery)]
-#[graphql(
-    schema_path = "../schema.graphql",
-    query_path = "queries/get_posix_config.graphql",
-    response_derives = "Debug",
-    custom_scalars_module = "crate::infra::graphql"
-)]
-pub struct GetPosixConfig;
 
 #[derive(GraphQLQuery)]
 #[graphql(
@@ -495,113 +486,38 @@ impl Component for PosixOptions {
 
         // Callbacks
         let on_user_uid_assign = link.callback(|e: Event| {
-            let checked = e
-                .target()
-                .unwrap()
-                .dyn_into::<web_sys::HtmlInputElement>()
-                .unwrap()
-                .checked();
+            let checked = input_checked(&e);
             Msg::UpdateUserUidAssign(checked)
         });
-        let on_user_uid_start = link.callback(|e: InputEvent| {
-            Msg::UpdateUserUidStart(
-                e.target()
-                    .unwrap()
-                    .dyn_into::<web_sys::HtmlInputElement>()
-                    .unwrap()
-                    .value(),
-            )
-        });
-        let on_user_uid_max = link.callback(|e: InputEvent| {
-            Msg::UpdateUserUidMax(
-                e.target()
-                    .unwrap()
-                    .dyn_into::<web_sys::HtmlInputElement>()
-                    .unwrap()
-                    .value(),
-            )
-        });
+        let on_user_uid_start =
+            link.callback(|e: InputEvent| Msg::UpdateUserUidStart(input_value(&e)));
+        let on_user_uid_max = link.callback(|e: InputEvent| Msg::UpdateUserUidMax(input_value(&e)));
         let on_user_gid_assign = link.callback(|e: Event| {
-            let checked = e
-                .target()
-                .unwrap()
-                .dyn_into::<web_sys::HtmlInputElement>()
-                .unwrap()
-                .checked();
+            let checked = input_checked(&e);
             Msg::UpdateUserGidAssign(checked)
         });
-        let on_user_gid_start = link.callback(|e: InputEvent| {
-            Msg::UpdateUserGidStart(
-                e.target()
-                    .unwrap()
-                    .dyn_into::<web_sys::HtmlInputElement>()
-                    .unwrap()
-                    .value(),
-            )
-        });
+        let on_user_gid_start =
+            link.callback(|e: InputEvent| Msg::UpdateUserGidStart(input_value(&e)));
         let on_user_loginshell_assign = link.callback(|e: Event| {
-            let checked = e
-                .target()
-                .unwrap()
-                .dyn_into::<web_sys::HtmlInputElement>()
-                .unwrap()
-                .checked();
+            let checked = input_checked(&e);
             Msg::UpdateUserLoginShellAssign(checked)
         });
-        let on_user_loginshell_default = link.callback(|e: InputEvent| {
-            Msg::UpdateUserLoginShellDefault(
-                e.target()
-                    .unwrap()
-                    .dyn_into::<web_sys::HtmlInputElement>()
-                    .unwrap()
-                    .value(),
-            )
-        });
+        let on_user_loginshell_default =
+            link.callback(|e: InputEvent| Msg::UpdateUserLoginShellDefault(input_value(&e)));
         let on_user_home_assign = link.callback(|e: Event| {
-            let checked = e
-                .target()
-                .unwrap()
-                .dyn_into::<web_sys::HtmlInputElement>()
-                .unwrap()
-                .checked();
+            let checked = input_checked(&e);
             Msg::UpdateUserHomeAssign(checked)
         });
-        let on_user_home_prefix = link.callback(|e: InputEvent| {
-            Msg::UpdateUserHomePrefix(
-                e.target()
-                    .unwrap()
-                    .dyn_into::<web_sys::HtmlInputElement>()
-                    .unwrap()
-                    .value(),
-            )
-        });
+        let on_user_home_prefix =
+            link.callback(|e: InputEvent| Msg::UpdateUserHomePrefix(input_value(&e)));
         let on_group_gid_assign = link.callback(|e: Event| {
-            let checked = e
-                .target()
-                .unwrap()
-                .dyn_into::<web_sys::HtmlInputElement>()
-                .unwrap()
-                .checked();
+            let checked = input_checked(&e);
             Msg::UpdateGroupGidAssign(checked)
         });
-        let on_group_gid_start = link.callback(|e: InputEvent| {
-            Msg::UpdateGroupGidStart(
-                e.target()
-                    .unwrap()
-                    .dyn_into::<web_sys::HtmlInputElement>()
-                    .unwrap()
-                    .value(),
-            )
-        });
-        let on_group_gid_max = link.callback(|e: InputEvent| {
-            Msg::UpdateGroupGidMax(
-                e.target()
-                    .unwrap()
-                    .dyn_into::<web_sys::HtmlInputElement>()
-                    .unwrap()
-                    .value(),
-            )
-        });
+        let on_group_gid_start =
+            link.callback(|e: InputEvent| Msg::UpdateGroupGidStart(input_value(&e)));
+        let on_group_gid_max =
+            link.callback(|e: InputEvent| Msg::UpdateGroupGidMax(input_value(&e)));
 
         let on_reassign_user_uid = link.callback(|_| Msg::ReassignUserUidNumbers);
         let on_reassign_user_gid = link.callback(|_| Msg::ReassignUserGidNumbers);

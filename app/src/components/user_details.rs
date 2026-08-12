@@ -1,3 +1,7 @@
+use crate::infra::queries::{
+    AddUserToGroup, GetGroupList, RemoveUserFromGroup, add_user_to_group, get_group_list,
+    remove_user_from_group,
+};
 use crate::{
     components::{
         add_user_to_group::AddUserToGroupComponent,
@@ -24,33 +28,6 @@ use yew::prelude::*;
     extern_enums("AttributeType")
 )]
 pub struct GetUserDetails;
-
-#[derive(GraphQLQuery)]
-#[graphql(
-    schema_path = "../schema.graphql",
-    query_path = "queries/add_user_to_group.graphql",
-    response_derives = "Debug",
-    custom_scalars_module = "crate::infra::graphql"
-)]
-pub struct AddUserToGroup;
-
-#[derive(GraphQLQuery)]
-#[graphql(
-    schema_path = "../schema.graphql",
-    query_path = "queries/remove_user_from_group.graphql",
-    response_derives = "Debug",
-    custom_scalars_module = "crate::infra::graphql"
-)]
-pub struct RemoveUserFromGroup;
-
-#[derive(GraphQLQuery)]
-#[graphql(
-    schema_path = "../schema.graphql",
-    query_path = "queries/get_group_list.graphql",
-    response_derives = "Debug, Clone, PartialEq, Eq",
-    custom_scalars_module = "crate::infra::graphql"
-)]
-pub struct GetGroupList;
 
 pub type User = get_user_details::GetUserDetailsUser;
 pub type Group = get_user_details::GetUserDetailsUserGroups;
@@ -132,8 +109,6 @@ impl CommonComponent<UserDetails> for UserDetails {
                 self.mut_groups().retain(|g| g.id != group_id);
             }
             Msg::Refresh => {
-                // Optimized: Always force fresh fetch after avatar update
-                // This prevents stale avatar display in user_details_form
                 self.common.call_graphql::<GetUserDetails, _>(
                     ctx,
                     get_user_details::Variables {
@@ -216,7 +191,6 @@ impl CommonComponent<UserDetails> for UserDetails {
                     .find(|g| g.display_name == "lldap_disabled")
                 {
                     self.lldap_disabled_group_id = Some(group.id);
-                    // Now actually perform the add
                     self.common.call_graphql::<AddUserToGroup, _>(
                         ctx,
                         add_user_to_group::Variables {
@@ -275,7 +249,7 @@ impl Component for UserDetails {
                 let can_change_password = ctx.props().is_admin || ctx.props().username == u.id;
                 let is_disabled = u.groups.iter().any(|g| g.display_name == "lldap_disabled");
 
-                let link = ctx.link(); // ← REQUIRED for on_updated callback
+                let link = ctx.link();
 
                 let toggle_button = if ctx.props().is_admin {
                     let onclick = if is_disabled {

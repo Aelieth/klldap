@@ -38,8 +38,6 @@ pub struct GroupDetailsForm {
 }
 
 pub enum Msg {
-    /// A form field changed.
-    Update,
     /// The "Submit" button was clicked.
     SubmitClicked,
     /// We got the response from the server about our update message.
@@ -62,7 +60,6 @@ impl CommonComponent<GroupDetailsForm> for GroupDetailsForm {
         msg: <Self as Component>::Message,
     ) -> Result<bool> {
         match msg {
-            Msg::Update => Ok(true),
             Msg::SubmitClicked => self.submit_group_update_form(ctx),
             Msg::GroupUpdated(Err(e)) => Err(e),
             Msg::GroupUpdated(Result::Ok(_)) => {

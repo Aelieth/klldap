@@ -1,7 +1,5 @@
-// Single source of truth: renders the full user schema table from GraphQL
-// (which pulls directly from crates/schema/public_schema.rs)
-// POSIX + Kerberos fields (uidnumber, kerberossync, etc.) now appear with friendly names
-// in the hardcoded table — perfect for web UI on ZimaBlade home/lab setup.
+use crate::components::fragments::icons::checkmark;
+use crate::infra::queries::{GetUserAttributesSchema, get_user_attributes_schema};
 use crate::{
     components::{
         delete_user_attribute::DeleteUserAttribute,
@@ -9,25 +7,12 @@ use crate::{
         router::{AppRoute, Link},
     },
     infra::{
-        attributes::user,
+        attributes::resolve_attribute_description,
         common_component::{CommonComponent, CommonComponentParts},
-        schema::AttributeType,
     },
 };
 use anyhow::{Error, Result, anyhow};
-use gloo_console::log;
-use graphql_client::GraphQLQuery;
 use yew::prelude::*;
-
-#[derive(GraphQLQuery)]
-#[graphql(
-    schema_path = "../schema.graphql",
-    query_path = "queries/get_user_attributes_schema.graphql",
-    response_derives = "Debug,Clone,PartialEq,Eq",
-    custom_scalars_module = "crate::infra::graphql",
-    extern_enums("AttributeType")
-)]
-pub struct GetUserAttributesSchema;
 
 use get_user_attributes_schema::ResponseData;
 
@@ -58,12 +43,7 @@ impl CommonComponent<UserSchemaTable> for UserSchemaTable {
             }
             Msg::OnError(e) => Err(e),
             Msg::OnAttributeDeleted(attribute_name) => match self.attributes {
-                None => {
-                    log!(format!(
-                        "Attribute {attribute_name} was deleted but component has no attributes"
-                    ));
-                    Err(anyhow!("invalid state"))
-                }
+                None => Err(anyhow!("invalid state")),
                 Some(_) => {
                     self.attributes
                         .as_mut()
@@ -147,23 +127,14 @@ impl UserSchemaTable {
     }
 
     fn view_attribute(&self, ctx: &Context<Self>, attribute: &Attribute) -> Html {
-        let desc = user::resolve_user_attribute_description_or_default(
-            &attribute.name,
-            &attribute.aliases,
-        );
-
-        // Convert GraphQL Vec<String> → Vec<&str> to match AttributeDescription
-        let aliases: Vec<&str> = attribute.aliases.iter().map(|s| s.as_str()).collect();
-
-        let mut desc_with_aliases = desc;
-        desc_with_aliases.aliases = aliases;
+        let desc = resolve_attribute_description(&attribute.name, &attribute.aliases);
 
         html! {
             <tr key={attribute.name.clone()}>
             <td>
             {render_attribute_name(
                 ctx.props().hardcoded,
-                                   &desc_with_aliases
+                                   &desc
             )}
             </td>
             <td>
@@ -173,8 +144,8 @@ impl UserSchemaTable {
                 attribute.attribute_type.to_string()
             }}
             </td>
-            <td>{if attribute.is_editable { render_check() } else {html!{}}}</td>
-            <td>{if attribute.is_visible { render_check() } else {html!{}}}</td>
+            <td>{if attribute.is_editable { checkmark() } else {html!{}}}</td>
+            <td>{if attribute.is_visible { checkmark() } else {html!{}}}</td>
             {
                 if !attribute.is_hardcoded {
                     html!{
@@ -212,14 +183,5 @@ pub fn list_user_schema() -> Html {
         {"Create an attribute"}
         </Link>
         </div>
-    }
-}
-
-// Small helper so we don't duplicate the checkmark
-fn render_check() -> Html {
-    html! {
-        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-check" viewBox="0 0 16 16">
-        <path d="M10.97 4.97a.75.75 0 0 1 1.07 1.05l-3.99 4.99a.75.75 0 0 1-1.08.02L4.324 8.384a.75.75 0 1 1 1.06-1.06l2.094 2.093 3.473-4.425z"></path>
-        </svg>
     }
 }

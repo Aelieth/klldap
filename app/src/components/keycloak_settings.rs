@@ -1,7 +1,7 @@
 use crate::infra::common_component::{CommonComponent, CommonComponentParts};
+use crate::infra::form_utils::input_value;
 use anyhow::Result;
 use graphql_client::GraphQLQuery;
-use wasm_bindgen::JsCast;
 use yew::events::InputEvent;
 use yew::prelude::*;
 
@@ -364,79 +364,31 @@ impl Component for KeycloakSettings {
         let on_export = ctx.link().callback(|_| Msg::ExportKeytab);
         let on_push = ctx.link().callback(|_| Msg::PushRealmToKeycloak);
 
-        let on_keycloak_url = ctx.link().callback(|e: InputEvent| {
-            Msg::UpdateKeycloakUrl(
-                e.target()
-                    .unwrap()
-                    .dyn_into::<web_sys::HtmlInputElement>()
-                    .unwrap()
-                    .value(),
-            )
-        });
-        let on_realm = ctx.link().callback(|e: InputEvent| {
-            Msg::UpdateRealm(
-                e.target()
-                    .unwrap()
-                    .dyn_into::<web_sys::HtmlInputElement>()
-                    .unwrap()
-                    .value(),
-            )
-        });
-        let on_admin_username = ctx.link().callback(|e: InputEvent| {
-            Msg::UpdateAdminUsername(
-                e.target()
-                    .unwrap()
-                    .dyn_into::<web_sys::HtmlInputElement>()
-                    .unwrap()
-                    .value(),
-            )
-        });
-        let on_admin_password = ctx.link().callback(|e: InputEvent| {
-            Msg::UpdateAdminPassword(
-                e.target()
-                    .unwrap()
-                    .dyn_into::<web_sys::HtmlInputElement>()
-                    .unwrap()
-                    .value(),
-            )
-        });
+        let on_keycloak_url = ctx
+            .link()
+            .callback(|e: InputEvent| Msg::UpdateKeycloakUrl(input_value(&e)));
+        let on_realm = ctx
+            .link()
+            .callback(|e: InputEvent| Msg::UpdateRealm(input_value(&e)));
+        let on_admin_username = ctx
+            .link()
+            .callback(|e: InputEvent| Msg::UpdateAdminUsername(input_value(&e)));
+        let on_admin_password = ctx
+            .link()
+            .callback(|e: InputEvent| Msg::UpdateAdminPassword(input_value(&e)));
 
-        let on_new_realm_name = ctx.link().callback(|e: InputEvent| {
-            Msg::UpdateNewRealmName(
-                e.target()
-                    .unwrap()
-                    .dyn_into::<web_sys::HtmlInputElement>()
-                    .unwrap()
-                    .value(),
-            )
-        });
-        let on_lldap_url = ctx.link().callback(|e: InputEvent| {
-            Msg::UpdateLldapUrl(
-                e.target()
-                    .unwrap()
-                    .dyn_into::<web_sys::HtmlInputElement>()
-                    .unwrap()
-                    .value(),
-            )
-        });
-        let on_sync_username = ctx.link().callback(|e: InputEvent| {
-            Msg::UpdateSyncUsername(
-                e.target()
-                    .unwrap()
-                    .dyn_into::<web_sys::HtmlInputElement>()
-                    .unwrap()
-                    .value(),
-            )
-        });
-        let on_sync_password = ctx.link().callback(|e: InputEvent| {
-            Msg::UpdateSyncPassword(
-                e.target()
-                    .unwrap()
-                    .dyn_into::<web_sys::HtmlInputElement>()
-                    .unwrap()
-                    .value(),
-            )
-        });
+        let on_new_realm_name = ctx
+            .link()
+            .callback(|e: InputEvent| Msg::UpdateNewRealmName(input_value(&e)));
+        let on_lldap_url = ctx
+            .link()
+            .callback(|e: InputEvent| Msg::UpdateLldapUrl(input_value(&e)));
+        let on_sync_username = ctx
+            .link()
+            .callback(|e: InputEvent| Msg::UpdateSyncUsername(input_value(&e)));
+        let on_sync_password = ctx
+            .link()
+            .callback(|e: InputEvent| Msg::UpdateSyncPassword(input_value(&e)));
 
         let on_hsts = ctx.link().callback(|_| Msg::ToggleHsts);
         let on_brute = ctx.link().callback(|_| Msg::ToggleBruteForce);
@@ -496,7 +448,7 @@ impl Component for KeycloakSettings {
                                         </div>
 
                                         <div class="d-flex align-items-center mb-3">
-                                            <label class="form-label me-3" style="min-width: 140px;">{ "LLDAP URL" }</label>
+                                            <label class="form-label me-3" style="min-width: 140px;">{ "KLLDAP URL" }</label>
                                             <input type="text" class="form-control flex-grow-1" value={self.lldap_url.clone()} oninput={on_lldap_url} />
                                         </div>
 

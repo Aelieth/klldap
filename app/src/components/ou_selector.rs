@@ -1,5 +1,5 @@
+use crate::infra::form_utils::select_value;
 use std::collections::HashMap;
-use wasm_bindgen::JsCast;
 use yew::prelude::*;
 
 #[derive(Properties, PartialEq)]
@@ -7,12 +7,8 @@ pub struct OuSelectorProps {
     pub ous: Vec<String>,
     pub current_ou: String,
     pub on_ou_changed: Callback<String>,
-    #[prop_or_default]
-    pub built_in_primaries: Vec<String>,
     #[prop_or(true)]
     pub show_all: bool,
-    #[prop_or_default]
-    pub label: Option<String>,
 }
 
 #[function_component(OuSelector)]
@@ -37,13 +33,6 @@ pub fn ou_selector(props: &OuSelectorProps) -> Html {
             if !primaries.contains(&primary) {
                 primaries.push(primary);
             }
-        }
-    }
-
-    // Add caller-supplied built-in primaries if missing
-    for built_in in &props.built_in_primaries {
-        if !primaries.contains(built_in) {
-            primaries.push(built_in.clone());
         }
     }
 
@@ -79,9 +68,7 @@ pub fn ou_selector(props: &OuSelectorProps) -> Html {
             class="form-select"
             onchange={props.on_ou_changed.reform(|e: Event| {
 
-                e.target().unwrap()
-                    .dyn_into::<web_sys::HtmlSelectElement>().unwrap()
-                    .value()
+                select_value(&e)
             })}>
             { for display_ous.iter().map(|(display, value)| html! {
                 <option value={value.clone()} selected={value == &props.current_ou}>

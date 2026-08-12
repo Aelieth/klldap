@@ -121,8 +121,8 @@ impl Component for App {
         html! {
           <div>
             <Banner is_admin={is_admin} username={username} on_logged_out={link.callback(|_| Msg::Logout)} />
-            <div class="container py-3 bg-kug">
-              <div class="row justify-content-center" style="padding-bottom: 80px;">
+            <div class="container py-3">
+              <div class="row justify-content-center app-content">
                 <main class="py-3">
                   <Switch<AppRoute>
                     render={Switch::render(move |routes| Self::dispatch_route(routes, &link, is_admin, password_reset_enabled))}
@@ -222,7 +222,7 @@ impl App {
             AppRoute::ListGroupSchema => html! {
                 <ListGroupSchema />
             },
-            AppRoute::Federation => html! {  // NEW
+            AppRoute::Federation => html! {
                 <Federation />
             },
             AppRoute::GroupDetails { group_id } => html! {
@@ -259,12 +259,12 @@ impl App {
               <span>{format!("KLLDAP version {}", env!("CARGO_PKG_VERSION"))}</span>
             </div>
             <div>
-              <a href="https://github.com/Aelieth/lldap-with-kerberos" class="me-4 text-reset">
+              <a href="https://github.com/Aelieth/klldap" class="me-4 text-reset">
                 <i class="bi-github"></i>
               </a>
             </div>
             <div>
-              <span>{"License "}<a href="https://github.com/Aelieth/lldap-with-kerberos/blob/main/LICENSE" class="link-secondary">{"GNU GPL"}</a></span>
+              <span>{"License "}<a href="https://github.com/Aelieth/klldap/blob/main/LICENSE" class="link-secondary">{"AGPL-3.0"}</a></span>
             </div>
           </footer>
         }

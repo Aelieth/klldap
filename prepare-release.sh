@@ -28,13 +28,13 @@ VERSION=$(git describe --tags)
 # Package x86_64 (glibc) release
 mkdir -p /tmp/release/x86_64
 cp target/release/lldap /tmp/release/x86_64
-cp -R app/index.html app/main.js app/pkg lldap_config.docker_template.toml README.md LICENSE /tmp/release/x86_64
+cp -R app/index.html app/static app/pkg lldap_config.docker_template.toml README.md LICENSE /tmp/release/x86_64
 tar -czvf lldap-x86_64-glibc-${VERSION}.tar.gz /tmp/release/x86_64
 
 # Package armv7 (glibc) release
 mkdir -p /tmp/release/armv7
 cp target/armv7-unknown-linux-gnueabihf/release/lldap /tmp/release/armv7
-cp -R app/index.html app/main.js app/pkg lldap_config.docker_template.toml README.md LICENSE /tmp/release/armv7
+cp -R app/index.html app/static app/pkg lldap_config.docker_template.toml README.md LICENSE /tmp/release/armv7
 tar -czvf lldap-armv7-glibc-${VERSION}.tar.gz /tmp/release/armv7
 
 echo "Release archives created:"

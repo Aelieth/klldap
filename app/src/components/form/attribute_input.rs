@@ -1,12 +1,24 @@
 use crate::{
     components::form::{date_input::DateTimeInput, file_input::AvatarFileInput},
-    infra::{schema::AttributeType, tooltip::Tooltip},
+    infra::{form_utils::input_value, schema::AttributeType, tooltip::Tooltip},
 };
-use web_sys::{Element, FocusEvent, HtmlInputElement};
+use web_sys::{Element, FocusEvent};
 use yew::{
-    Callback, Component, Context, Event, Html, Properties, TargetCast, function_component, html,
+    Callback, Component, Context, Event, Html, Properties, function_component, html,
     use_effect_with_deps, use_node_ref, use_state, virtual_dom::AttrValue,
 };
+
+fn attribute_display_name(name: &str) -> String {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) => format!(
+            "{}{}",
+            first.to_uppercase(),
+            chars.as_str().replace('_', " ")
+        ),
+        None => String::new(),
+    }
+}
 
 #[derive(Properties, PartialEq)]
 struct AttributeInputProps {
@@ -33,10 +45,6 @@ fn attribute_input(props: &AttributeInputProps) -> Html {
         }
     });
 
-    // ROBUST AVATAR GUARD (Improved)
-    // Force AvatarFileInput for any avatar field.
-    // Matches on both type and common field names (case-insensitive).
-    // Survives EAV + Kerberos schema changes.
     let name_lower = props.name.to_lowercase();
     if props.attribute_type == AttributeType::Avatar
         || name_lower == "avatar"
@@ -67,8 +75,7 @@ fn attribute_input(props: &AttributeInputProps) -> Html {
     let onchange = {
         let current_value = current_value.clone();
         Callback::from(move |e: Event| {
-            let input: HtmlInputElement = e.target_unchecked_into();
-            current_value.set(input.value());
+            current_value.set(input_value(&e));
         })
     };
 
@@ -125,7 +132,7 @@ fn attribute_label(props: &AttributeLabelProps) -> Html {
         <label for={props.name.clone()}
             class="form-label col-4 col-form-label"
             >
-            {format!("{}{}", props.name[0..1].to_uppercase(), props.name[1..].replace('_', " "))}
+            {attribute_display_name(&props.name)}
             {if props.required { html!{<span class="text-danger">{"*"}</span>} } else { html!{} }}
             {":"}
             <button
@@ -257,5 +264,24 @@ impl Component for ListAttributeInput {
                 </div>
             </div>
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::attribute_display_name;
+
+    #[test]
+    fn capitalizes_and_unslashes() {
+        assert_eq!(attribute_display_name("firstname"), "Firstname");
+        assert_eq!(attribute_display_name("home_directory"), "Home directory");
+        assert_eq!(attribute_display_name(""), "");
+    }
+
+    #[test]
+    fn does_not_panic_on_multibyte_first_char() {
+        // Regression: byte-slicing name[0..1] panicked on non-ASCII first bytes.
+        assert_eq!(attribute_display_name("émail"), "Émail");
+        assert_eq!(attribute_display_name("日本_語"), "日本 語");
     }
 }

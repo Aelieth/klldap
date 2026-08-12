@@ -1,7 +1,7 @@
 use crate::components::{ou_selector::OuSelector, status_modal::StatusModal};
 use crate::infra::{
     common_component::{CommonComponent, CommonComponentParts},
-    modal::Modal,
+    modal::ModalHandle,
 };
 use anyhow::{Error, Result};
 use graphql_client::GraphQLQuery;
@@ -41,8 +41,7 @@ pub struct ChangeOuProps {
 
 pub struct ChangeOu {
     common: CommonComponentParts<Self>,
-    node_ref: NodeRef,
-    modal: Option<Modal>,
+    modal: ModalHandle,
     selected_ou: String,
     status_message: Option<(String, bool)>,
 }
@@ -54,7 +53,7 @@ pub enum Msg {
     NewOuSelected(String),
     ShowStatus(String, bool),
     DismissStatus,
-    ChangeOuResponse(Result<()>), // unified response type
+    ChangeOuResponse(Result<()>),
 }
 
 impl CommonComponent<ChangeOu> for ChangeOu {
@@ -78,7 +77,7 @@ impl CommonComponent<ChangeOu> for ChangeOu {
                     OuChangeKind::Groups(_) => "groups".to_string(),
                 };
                 self.status_message = None;
-                self.modal.as_ref().expect("modal not initialized").show();
+                self.modal.show();
                 Ok(true)
             }
             Msg::ConfirmChangeOu => {
@@ -112,7 +111,7 @@ impl CommonComponent<ChangeOu> for ChangeOu {
                 Ok(true)
             }
             Msg::DismissModal => {
-                self.modal.as_ref().expect("modal not initialized").hide();
+                self.modal.hide();
                 Ok(true)
             }
             Msg::NewOuSelected(ou) => {
@@ -155,7 +154,7 @@ impl CommonComponent<ChangeOu> for ChangeOu {
                         ctx.link().send_message(Msg::ShowStatus(err_msg, false));
                     }
                 }
-                self.modal.as_ref().expect("modal not initialized").hide();
+                self.modal.hide();
                 Ok(true)
             }
         }
@@ -173,21 +172,14 @@ impl Component for ChangeOu {
     fn create(_: &Context<Self>) -> Self {
         Self {
             common: CommonComponentParts::<Self>::create(),
-            node_ref: NodeRef::default(),
-            modal: None,
+            modal: ModalHandle::new(),
             selected_ou: "people".to_string(), // default, overridden on click
             status_message: None,
         }
     }
 
     fn rendered(&mut self, _: &Context<Self>, first_render: bool) {
-        if first_render {
-            self.modal = Some(Modal::new(
-                self.node_ref
-                    .cast::<web_sys::Element>()
-                    .expect("Modal node is not an element"),
-            ));
-        }
+        self.modal.init_on_first_render(first_render);
     }
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
@@ -255,7 +247,7 @@ impl ChangeOu {
             tabindex="-1"
             aria-labelledby="changeOuModalLabel"
             aria-hidden="true"
-            ref={self.node_ref.clone()}>
+            ref={self.modal.node_ref()}>
             <div class="modal-dialog">
               <div class="modal-content">
                 <div class="modal-header">
@@ -272,7 +264,6 @@ impl ChangeOu {
                     ous={ctx.props().ous.clone()}
                     current_ou={self.selected_ou.clone()}
                     on_ou_changed={link.callback(Msg::NewOuSelected)}
-                    label={None::<String>}
                     show_all={false} />
                 </div>
                 <div class="modal-footer">

@@ -1,6 +1,7 @@
 #! /bin/sh
+set -e
 
-cd $(dirname $0)
+cd "$(dirname "$0")"
 if ! which wasm-pack > /dev/null 2>&1
 then
   >&2 echo '`wasm-pack` not found. Try running `cargo install wasm-pack`'

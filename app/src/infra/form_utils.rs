@@ -1,7 +1,35 @@
 use anyhow::{Result, anyhow, ensure};
 use validator::validate_email;
-use web_sys::{FormData, HtmlFormElement};
+use wasm_bindgen::JsCast;
+use web_sys::{FormData, HtmlFormElement, HtmlInputElement, HtmlSelectElement};
 use yew::NodeRef;
+
+/// Reads the `.value()` of the `<input>` that fired `event`.
+pub fn input_value(event: &web_sys::Event) -> String {
+    event
+        .target()
+        .and_then(|t| t.dyn_into::<HtmlInputElement>().ok())
+        .map(|el| el.value())
+        .unwrap_or_default()
+}
+
+/// Reads the `.checked()` state of the checkbox `<input>` that fired `event`.
+pub fn input_checked(event: &web_sys::Event) -> bool {
+    event
+        .target()
+        .and_then(|t| t.dyn_into::<HtmlInputElement>().ok())
+        .map(|el| el.checked())
+        .unwrap_or(false)
+}
+
+/// Reads the `.value()` of the `<select>` that fired `event`.
+pub fn select_value(event: &web_sys::Event) -> String {
+    event
+        .target()
+        .and_then(|t| t.dyn_into::<HtmlSelectElement>().ok())
+        .map(|el| el.value())
+        .unwrap_or_default()
+}
 
 #[derive(Clone, Debug)]
 pub struct AttributeValue {
@@ -65,4 +93,29 @@ pub fn read_all_form_attributes(
         validate_email_attributes(&all_values)?;
     }
     Ok(all_values)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AttributeValue, validate_email_attributes};
+
+    fn attr(name: &str, values: &[&str]) -> AttributeValue {
+        AttributeValue {
+            name: name.to_string(),
+            values: values.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn accepts_single_valid_email() {
+        assert!(validate_email_attributes(&[attr("mail", &["a@b.com"])]).is_ok());
+    }
+
+    #[test]
+    fn rejects_missing_empty_multiple_and_invalid() {
+        assert!(validate_email_attributes(&[attr("other", &["x"])]).is_err());
+        assert!(validate_email_attributes(&[attr("mail", &[])]).is_err());
+        assert!(validate_email_attributes(&[attr("mail", &["a@b.com", "c@d.com"])]).is_err());
+        assert!(validate_email_attributes(&[attr("mail", &["not-an-email"])]).is_err());
+    }
 }

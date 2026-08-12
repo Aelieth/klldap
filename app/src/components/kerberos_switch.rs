@@ -1,6 +1,5 @@
 use crate::infra::form_utils::AttributeValue;
-use yew::Callback;
-use yew::prelude::*; // needed for the helper
+use yew::prelude::*;
 
 #[derive(Properties, PartialEq)]
 pub struct KerberosSwitchProps {

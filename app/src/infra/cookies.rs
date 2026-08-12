@@ -14,13 +14,7 @@ fn get_document() -> Result<HtmlDocument> {
 }
 
 pub fn set_cookie(cookie_name: &str, value: &str, expiration: &DateTime<Utc>) -> Result<()> {
-    let doc = web_sys::window()
-        .and_then(|w| w.document())
-        .ok_or_else(|| anyhow!("Could not get window document"))
-        .and_then(|d| {
-            d.dyn_into::<web_sys::HtmlDocument>()
-                .map_err(|_| anyhow!("Document is not an HTMLDocument"))
-        })?;
+    let doc = get_document()?;
     let cookie_string = format!(
         "{}={}; expires={}; sameSite=Strict; path={}/",
         cookie_name,

@@ -1,12 +1,12 @@
 use crate::components::ou_selector::OuSelector;
 use crate::components::status_modal::StatusModal;
+use crate::infra::form_utils::input_value;
 use crate::infra::{
     common_component::{CommonComponent, CommonComponentParts},
-    modal::Modal,
+    modal::ModalHandle,
 };
 use anyhow::{Error, Result};
 use graphql_client::GraphQLQuery;
-use wasm_bindgen::JsCast;
 use yew::prelude::*;
 
 #[derive(GraphQLQuery)]
@@ -20,8 +20,7 @@ pub struct CreateOuQuery;
 
 pub struct CreateOu {
     common: CommonComponentParts<Self>,
-    node_ref: NodeRef,
-    modal: Option<Modal>,
+    modal: ModalHandle,
     is_primary: bool,
     selected_primary: String,
     secondary_name: String,
@@ -61,7 +60,7 @@ impl CommonComponent<CreateOu> for CreateOu {
                 self.selected_primary = ctx.props().default_primary.clone();
                 self.secondary_name = String::new();
                 self.status_message = None;
-                self.modal.as_ref().expect("modal not initialized").show();
+                self.modal.show();
                 Ok(true)
             }
             Msg::ConfirmCreateOu => {
@@ -84,7 +83,7 @@ impl CommonComponent<CreateOu> for CreateOu {
                 Ok(true)
             }
             Msg::DismissModal => {
-                self.modal.as_ref().expect("modal not initialized").hide();
+                self.modal.hide();
                 Ok(true)
             }
             Msg::CreateOuResponse(response) => {
@@ -105,7 +104,7 @@ impl CommonComponent<CreateOu> for CreateOu {
                         ctx.link().send_message(Msg::ShowStatus(msg, false));
                     }
                 }
-                self.modal.as_ref().expect("modal not initialized").hide();
+                self.modal.hide();
                 Ok(true)
             }
             Msg::ToggleMode(is_primary) => {
@@ -146,8 +145,7 @@ impl Component for CreateOu {
     fn create(ctx: &Context<Self>) -> Self {
         Self {
             common: CommonComponentParts::<Self>::create(),
-            node_ref: NodeRef::default(),
-            modal: None,
+            modal: ModalHandle::new(),
             is_primary: true,
             selected_primary: ctx.props().default_primary.clone(),
             secondary_name: String::new(),
@@ -156,13 +154,7 @@ impl Component for CreateOu {
     }
 
     fn rendered(&mut self, _: &Context<Self>, first_render: bool) {
-        if first_render {
-            self.modal = Some(Modal::new(
-                self.node_ref
-                    .cast::<web_sys::Element>()
-                    .expect("Modal node is not an element"),
-            ));
-        }
+        self.modal.init_on_first_render(first_render);
     }
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
@@ -245,7 +237,6 @@ impl CreateOu {
                         ous={primaries}
                         current_ou={self.selected_primary.clone()}
                         on_ou_changed={link.callback(Msg::PrimarySelected)}
-                        label={None::<String>}
                         show_all={false} />
                 </div>
             }
@@ -261,11 +252,7 @@ impl CreateOu {
                     placeholder="Enter primary OU name (e.g. office)"
                     value={self.selected_primary.clone()}
                     oninput={link.callback(|e: InputEvent| {
-                        let value = e.target()
-                            .unwrap()
-                            .dyn_into::<web_sys::HtmlInputElement>()
-                            .unwrap()
-                            .value();
+                        let value = input_value(&e);
                         Msg::PrimarySelected(value)
                     })} />
             }
@@ -277,11 +264,7 @@ impl CreateOu {
                     placeholder="Enter secondary OU name (e.g. accounting)"
                     value={self.secondary_name.clone()}
                     oninput={link.callback(|e: InputEvent| {
-                        let value = e.target()
-                            .unwrap()
-                            .dyn_into::<web_sys::HtmlInputElement>()
-                            .unwrap()
-                            .value();
+                        let value = input_value(&e);
                         Msg::SecondaryNameChanged(value)
                     })} />
             }
@@ -294,7 +277,7 @@ impl CreateOu {
             tabindex="-1"
             aria-labelledby="createOuModalLabel"
             aria-hidden="true"
-            ref={self.node_ref.clone()}>
+            ref={self.modal.node_ref()}>
             <div class="modal-dialog">
               <div class="modal-content">
                 <div class="modal-header">

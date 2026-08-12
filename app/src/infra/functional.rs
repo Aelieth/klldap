@@ -26,8 +26,10 @@ impl<T: PartialEq> PartialEq for LoadableResult<T> {
     }
 }
 
+/// Runs the query when `variables` is `Some`; stays `Loading` when `None`.
+/// Taking an `Option` keeps the hook call unconditional (Yew's rules of hooks).
 pub fn use_graphql_call<QueryType>(
-    variables: QueryType::Variables,
+    variables: Option<QueryType::Variables>,
 ) -> UseStateHandle<LoadableResult<QueryType::ResponseData>>
 where
     QueryType: GraphQLQuery + 'static,
@@ -39,16 +41,20 @@ where
     {
         let loadable_result = loadable_result.clone();
         use_effect_with_deps(
-            move |variables| {
-                let task = HostService::graphql_query::<QueryType>(
-                    variables.clone(),
-                    "Failed graphql query",
-                );
-
-                spawn_local(async move {
-                    let response = task.await;
-                    loadable_result.set(LoadableResult::Loaded(response));
-                });
+            move |variables: &Option<QueryType::Variables>| {
+                match variables {
+                    Some(variables) => {
+                        let task = HostService::graphql_query::<QueryType>(
+                            variables.clone(),
+                            "Failed graphql query",
+                        );
+                        spawn_local(async move {
+                            let response = task.await;
+                            loadable_result.set(LoadableResult::Loaded(response));
+                        });
+                    }
+                    None => loadable_result.set(LoadableResult::Loading),
+                }
 
                 || ()
             },

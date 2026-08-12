@@ -8,24 +8,6 @@ use lldap_frontend_options::Options;
 use serde::{Serialize, de::DeserializeOwned};
 use web_sys::RequestCredentials;
 
-#[derive(GraphQLQuery)]
-#[graphql(
-    schema_path = "../schema.graphql",
-    query_path = "queries/get_kerberos_info.graphql",
-    response_derives = "Debug,Clone,PartialEq,Eq",
-    custom_scalars_module = "crate::infra::graphql"
-)]
-pub struct GetKerberosInfo;
-
-#[derive(GraphQLQuery)]
-#[graphql(
-    schema_path = "../schema.graphql",
-    query_path = "queries/sync_kerberos.graphql",
-    response_derives = "Debug",
-    custom_scalars_module = "crate::infra::graphql"
-)]
-pub struct SyncKerberosPassword;
-
 #[derive(Default)]
 pub struct HostService {}
 
@@ -197,7 +179,6 @@ impl HostService {
         .and_then(set_cookies_from_jwt)
     }
 
-    // The `_request` parameter is to make it the same shape as the other functions.
     pub async fn logout() -> Result<()> {
         call_server_empty_response_with_error_message(
             &(base_url() + "/auth/logout"),
@@ -224,7 +205,11 @@ impl HostService {
         token: String,
     ) -> Result<lldap_auth::password_reset::ServerPasswordResetResponse> {
         call_server_json_with_error_message(
-            &format!("{}/auth/reset/step2/{}", base_url(), token),
+            &format!(
+                "{}/auth/reset/step2/{}",
+                base_url(),
+                url_escape::encode_query(&token)
+            ),
             GET_REQUEST,
             "Could not validate token",
         )

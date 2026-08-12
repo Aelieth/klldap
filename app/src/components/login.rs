@@ -89,7 +89,7 @@ impl CommonComponent<LoginForm> for LoginForm {
                 };
                 let login_finish = match opaque::client::login::finish_login(
                     *login_start,
-                    self.form.model().password.as_bytes(), // ← fixed
+                    self.form.model().password.as_bytes(),
                     res.credential_response,
                     &mut rand::rngs::OsRng,
                 ) {
@@ -163,7 +163,7 @@ impl Component for LoginForm {
         if self.refreshing {
             html! {
               <div>
-                <img src={"spinner.gif"} alt={"Loading"} />
+                <img src={"/static/spinner.gif"} alt={"Loading"} />
               </div>
             }
         } else {

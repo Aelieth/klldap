@@ -1,4 +1,5 @@
 use crate::components::{create_ou::CreateOu, delete_ou::DeleteOu, ou_selector::OuSelector};
+use anyhow::Error;
 use yew::prelude::*;
 
 #[derive(Properties, PartialEq)]
@@ -8,6 +9,7 @@ pub struct OuTableProps {
     pub on_ou_changed: Callback<String>,
     pub on_ou_created: Callback<String>,
     pub on_ou_deleted: Callback<String>,
+    pub on_error: Callback<Error>,
     pub error: Option<String>,
     pub default_primary: String,
 }
@@ -22,7 +24,6 @@ pub fn ou_table(props: &OuTableProps) -> Html {
                     ous={props.ous.clone()}
                     current_ou={props.ou_filter.clone()}
                     on_ou_changed={props.on_ou_changed.clone()}
-                    label={None::<String>}
                     show_all={true} />
             </div>
 
@@ -41,7 +42,7 @@ pub fn ou_table(props: &OuTableProps) -> Html {
                     ous={props.ous.clone()}
                     default_primary={props.default_primary.clone()}
                     on_ou_created={props.on_ou_created.clone()}
-                    on_error={Callback::noop()}
+                    on_error={props.on_error.clone()}
                 />
             </div>
 
@@ -50,7 +51,7 @@ pub fn ou_table(props: &OuTableProps) -> Html {
                     ou={props.ou_filter.clone()}
                     reassign_to={props.default_primary.clone()}
                     on_ou_deleted={props.on_ou_deleted.clone()}
-                    on_error={Callback::noop()}
+                    on_error={props.on_error.clone()}
                 />
             </div>
         </div>

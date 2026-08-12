@@ -1,3 +1,4 @@
+use crate::infra::queries::{AddUserToGroup, GetGroupList, add_user_to_group, get_group_list};
 use crate::{
     components::{
         select::{Select, SelectOption, SelectOptionProps},
@@ -6,29 +7,9 @@ use crate::{
     infra::common_component::{CommonComponent, CommonComponentParts},
 };
 use anyhow::{Error, Result};
-use graphql_client::GraphQLQuery;
 use std::collections::HashSet;
 use yew::prelude::*;
 
-#[derive(GraphQLQuery)]
-#[graphql(
-    schema_path = "../schema.graphql",
-    query_path = "queries/add_user_to_group.graphql",
-    response_derives = "Debug",
-    variables_derives = "Clone",
-    custom_scalars_module = "crate::infra::graphql"
-)]
-pub struct AddUserToGroup;
-
-#[derive(GraphQLQuery)]
-#[graphql(
-    schema_path = "../schema.graphql",
-    query_path = "queries/get_group_list.graphql",
-    response_derives = "Debug",
-    variables_derives = "Clone",
-    custom_scalars_module = "crate::infra::graphql"
-)]
-pub struct GetGroupList;
 type GroupListGroup = get_group_list::GetGroupListGroups;
 
 impl From<GroupListGroup> for Group {
@@ -130,7 +111,7 @@ impl AddUserToGroupComponent {
         Ok(true)
     }
 
-    fn get_selectable_group_list(&self, props: &Props, group_list: &[Group]) -> Vec<Group> {
+    fn get_selectable_group_list(props: &Props, group_list: &[Group]) -> Vec<Group> {
         let user_groups = props.groups.iter().collect::<HashSet<_>>();
         group_list
             .iter()
@@ -165,7 +146,7 @@ impl Component for AddUserToGroupComponent {
     fn view(&self, ctx: &Context<Self>) -> Html {
         let link = ctx.link();
         if let Some(group_list) = &self.group_list {
-            let to_add_group_list = self.get_selectable_group_list(ctx.props(), group_list);
+            let to_add_group_list = Self::get_selectable_group_list(ctx.props(), group_list);
             #[allow(unused_braces)]
             let make_select_option = |group: Group| {
                 html_nested! {

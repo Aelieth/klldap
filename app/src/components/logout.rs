@@ -34,6 +34,7 @@ impl CommonComponent<LogoutButton> for LogoutButton {
             Msg::LogoutCompleted(res) => {
                 res?;
                 delete_cookie("user_id")?;
+                delete_cookie("is_admin")?;
                 ctx.props().on_logged_out.emit(());
             }
         }

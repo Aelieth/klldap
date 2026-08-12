@@ -1,8 +1,6 @@
-use std::str::FromStr;
-
+use crate::infra::form_utils::input_value;
 use chrono::{DateTime, NaiveDateTime, Utc};
-use wasm_bindgen::JsCast;
-use web_sys::HtmlInputElement;
+use std::str::FromStr;
 use yew::{Event, Properties, function_component, html, use_state, virtual_dom::AttrValue};
 
 #[derive(Properties, PartialEq)]
@@ -32,11 +30,7 @@ pub fn date_time_input(props: &DateTimeInputProps) -> Html {
                 class="form-control"
                 value={value.as_ref().map(|v: &DateTime<Utc>| v.naive_utc().to_string())}
                 onchange={move |e: Event| {
-                    let string_val =
-                        e.target()
-                         .expect("Event should have target")
-                         .unchecked_into::<HtmlInputElement>()
-                         .value();
+                    let string_val = input_value(&e);
                     value.set(
                         NaiveDateTime::from_str(&string_val)
                             .ok()

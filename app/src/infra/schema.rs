@@ -9,9 +9,8 @@ use validator::ValidationError;
 pub(crate) enum AttributeType {
     String,
     Integer,
-    #[strum(serialize = "DATE_TIME", serialize = "DATETIME")]
+    #[strum(serialize = "DATE_TIME", serialize = "DateTime")]
     DateTime,
-    #[strum(serialize = "AVATAR", serialize = "AVATAR")]
     Avatar,
 }
 

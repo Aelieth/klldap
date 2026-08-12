@@ -1,3 +1,4 @@
+use crate::infra::queries::{GetGroupList, ListOusQuery, get_group_list, list_ous_query};
 use crate::{
     components::{
         change_ou::OuChangeKind,
@@ -10,27 +11,8 @@ use crate::{
     infra::common_component::{CommonComponent, CommonComponentParts},
 };
 use anyhow::{Error, Result};
-use graphql_client::GraphQLQuery;
 use list_ous_query::ResponseData as OusResponseData;
 use yew::prelude::*;
-
-#[derive(GraphQLQuery)]
-#[graphql(
-    schema_path = "../schema.graphql",
-    query_path = "queries/get_group_list.graphql",
-    response_derives = "Debug,Clone,PartialEq,Eq",
-    custom_scalars_module = "crate::infra::graphql"
-)]
-pub struct GetGroupList;
-
-#[derive(GraphQLQuery)]
-#[graphql(
-    schema_path = "../schema.graphql",
-    query_path = "queries/list_ous.graphql",
-    response_derives = "Debug, Clone",
-    custom_scalars_module = "crate::infra::graphql"
-)]
-pub struct ListOusQuery;
 
 use get_group_list::ResponseData;
 
@@ -48,7 +30,7 @@ pub struct GroupTable {
 
 pub enum Msg {
     ListGroupsResponse(Result<ResponseData>),
-    ListUserOusResponse(Result<OusResponseData>),
+    ListOusResponse(Result<OusResponseData>),
     OnGroupDeleted(i64),
     OnError(Error),
     OuFilterChanged(String),
@@ -73,7 +55,7 @@ impl CommonComponent<GroupTable> for GroupTable {
                 self.groups = Some(groups?.groups.into_iter().collect());
                 Ok(true)
             }
-            Msg::ListUserOusResponse(ous) => {
+            Msg::ListOusResponse(ous) => {
                 self.ous = ous?.list_ous;
                 Ok(true)
             }
@@ -220,7 +202,7 @@ impl Component for GroupTable {
         table.common.call_graphql::<ListOusQuery, _>(
             ctx,
             list_ous_query::Variables {},
-            Msg::ListUserOusResponse,
+            Msg::ListOusResponse,
             "Error trying to fetch OUs",
         );
 
@@ -258,6 +240,7 @@ impl Component for GroupTable {
             on_ou_changed={ctx.link().callback(Msg::OuFilterChanged)}
             on_ou_created={ctx.link().callback(Msg::OuCreated)}
             on_ou_deleted={ctx.link().callback(Msg::OuDeleted)}
+            on_error={ctx.link().callback(|e: Error| Msg::CreateOuError(e.to_string()))}
             error={self.common.error.as_ref().map(|e| e.to_string())}
             default_primary={"groups".to_string()}
             />

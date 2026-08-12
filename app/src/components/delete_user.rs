@@ -1,6 +1,6 @@
 use crate::infra::{
     common_component::{CommonComponent, CommonComponentParts},
-    modal::Modal,
+    modal::ModalHandle,
 };
 use anyhow::{Error, Result};
 use graphql_client::GraphQLQuery;
@@ -17,8 +17,7 @@ pub struct DeleteUserQuery;
 
 pub struct DeleteUser {
     common: CommonComponentParts<Self>,
-    node_ref: NodeRef,
-    modal: Option<Modal>,
+    modal: ModalHandle,
 }
 
 #[derive(yew::Properties, Clone, PartialEq, Debug)]
@@ -46,7 +45,7 @@ impl CommonComponent<DeleteUser> for DeleteUser {
                 if ctx.props().selected_users.is_empty() {
                     return Ok(true);
                 }
-                self.modal.as_ref().expect("modal not initialized").show();
+                self.modal.show();
                 Ok(true)
             }
             Msg::ConfirmDeleteUser => {
@@ -60,11 +59,11 @@ impl CommonComponent<DeleteUser> for DeleteUser {
                         "Error trying to delete user",
                     );
                 }
-                self.modal.as_ref().expect("modal not initialized").hide();
+                self.modal.hide();
                 Ok(true)
             }
             Msg::DismissModal => {
-                self.modal.as_ref().expect("modal not initialized").hide();
+                self.modal.hide();
                 Ok(true)
             }
             Msg::DeleteUserResponse(response, user_id) => {
@@ -93,19 +92,12 @@ impl Component for DeleteUser {
     fn create(_: &Context<Self>) -> Self {
         Self {
             common: CommonComponentParts::<Self>::create(),
-            node_ref: NodeRef::default(),
-            modal: None,
+            modal: ModalHandle::new(),
         }
     }
 
     fn rendered(&mut self, _: &Context<Self>, first_render: bool) {
-        if first_render {
-            self.modal = Some(Modal::new(
-                self.node_ref
-                    .cast::<web_sys::Element>()
-                    .expect("Modal node is not an element"),
-            ));
-        }
+        self.modal.init_on_first_render(first_render);
     }
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
@@ -154,7 +146,7 @@ impl DeleteUser {
             tabindex="-1"
             aria-labelledby="deleteUsersModalLabel"
             aria-hidden="true"
-            ref={self.node_ref.clone()}>
+            ref={self.modal.node_ref()}>
             <div class="modal-dialog">
               <div class="modal-content">
                 <div class="modal-header">

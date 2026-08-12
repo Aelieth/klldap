@@ -65,7 +65,7 @@ fn to_base64(file: &JsFile) -> Result<String> {
                 contents: Some(data),
                 ..
             } => {
-                let _ = validate_avatar(data)?;
+                validate_avatar(data)?;
                 Ok(general_purpose::STANDARD.encode(data))
             }
             JsFile {
@@ -130,7 +130,6 @@ impl Component for AvatarFileInput {
         let current_base64 = self.avatar.as_ref().and_then(|a| a.base64.clone());
 
         if current_base64 != props_value {
-            // Critical fix: sync to new base64 from backend after "Save changes"
             self.avatar = Some(JsFile {
                 file: None,
                 contents: props_value

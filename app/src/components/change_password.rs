@@ -1,3 +1,7 @@
+use crate::infra::opaque::{begin_registration, finish_registration};
+use crate::infra::queries::{
+    GetKerberosInfo, SyncKerberosPassword, get_kerberos_info, sync_kerberos_password,
+};
 use crate::{
     components::{
         form::{field::Field, submit::Submit},
@@ -6,35 +10,16 @@ use crate::{
     infra::{
         api::HostService,
         common_component::{CommonComponent, CommonComponentParts},
-        encrypt::encrypt_password,
+        encrypt::encrypt_kerberos_password,
     },
 };
 use anyhow::{Result, bail};
-use graphql_client::GraphQLQuery;
 use lldap_auth::{login, opaque, registration};
 use validator_derive::Validate;
 use yew::prelude::*;
 use yew_form::Form;
 use yew_form_derive::Model;
 use yew_router::{prelude::History, scope_ext::RouterScopeExt};
-
-#[derive(GraphQLQuery)]
-#[graphql(
-    schema_path = "../schema.graphql",
-    query_path = "queries/get_kerberos_info.graphql",
-    response_derives = "Debug,Clone,PartialEq,Eq",
-    custom_scalars_module = "crate::infra::graphql"
-)]
-pub struct GetKerberosInfo;
-
-#[derive(GraphQLQuery)]
-#[graphql(
-    schema_path = "../schema.graphql",
-    query_path = "queries/sync_kerberos.graphql",
-    response_derives = "Debug,Clone",
-    custom_scalars_module = "crate::infra::graphql"
-)]
-pub struct SyncKerberosPassword;
 
 #[derive(PartialEq, Eq, Default)]
 enum OpaqueData {
@@ -76,7 +61,6 @@ pub struct ChangePasswordForm {
     form: Form<FormModel>,
     opaque_data: OpaqueData,
     kerberos_info: Option<get_kerberos_info::GetKerberosInfoKerberosInfo>,
-    fetched_kerberos: bool,
     encrypted_password: Option<String>,
 }
 
@@ -168,36 +152,15 @@ impl CommonComponent<ChangePasswordForm> for ChangePasswordForm {
                 let new_password = self.form.model().password.clone();
 
                 // Kerberos encryption (strict, same pattern as create_user.rs)
-                self.encrypted_password = None;
-                if let Some(info) = &self.kerberos_info {
-                    if let Some(ref pub_key_der_base64) = info.public_key_der_base64 {
-                        match encrypt_password(pub_key_der_base64, &new_password) {
-                            Ok(encrypted) => self.encrypted_password = Some(encrypted),
-                            Err(e) => bail!("Failed to encrypt password for Kerberos sync: {}", e),
-                        }
-                    } else {
-                        bail!(
-                            "Kerberos enabled but no public key available—check backend startup/logs"
-                        );
-                    }
-                }
+                self.encrypted_password = Some(encrypt_kerberos_password(
+                    self.kerberos_info
+                        .as_ref()
+                        .and_then(|i| i.public_key_der_base64.as_deref()),
+                    &new_password,
+                )?);
 
-                if self.encrypted_password.is_none() {
-                    bail!("Kerberos password encryption failed");
-                }
-
-                // OPAQUE registration for new password
-                let mut rng = rand::rngs::OsRng;
-                let registration_start_request = opaque::client::registration::start_registration(
-                    new_password.as_bytes(),
-                    &mut rng,
-                )?;
-                let req = registration::ClientRegistrationStartRequest {
-                    username: ctx.props().username.clone().into(),
-                    registration_start_request: registration_start_request.message,
-                };
-                self.opaque_data =
-                    OpaqueData::Registration(Box::new(registration_start_request.state));
+                let (state, req) = begin_registration(&ctx.props().username, &new_password)?;
+                self.opaque_data = OpaqueData::Registration(Box::new(state));
                 self.common.call_backend(
                     ctx,
                     HostService::register_start(req),
@@ -211,16 +174,7 @@ impl CommonComponent<ChangePasswordForm> for ChangePasswordForm {
                     OpaqueData::Registration(r) => *r,
                     _ => bail!("Invalid state"),
                 };
-                let registration_finish = opaque::client::registration::finish_registration(
-                    registration,
-                    self.form.model().password.as_bytes(),
-                    res.registration_response,
-                    &mut rand::rngs::OsRng,
-                )?;
-                let req = registration::ClientRegistrationFinishRequest {
-                    server_data: res.server_data,
-                    registration_upload: registration_finish.message,
-                };
+                let req = finish_registration(registration, &self.form.model().password, *res)?;
                 self.common.call_backend(
                     ctx,
                     HostService::register_finish(req),
@@ -278,7 +232,6 @@ impl Component for ChangePasswordForm {
             form: Form::<FormModel>::new(FormModel::default()),
             opaque_data: OpaqueData::None,
             kerberos_info: None,
-            fetched_kerberos: false,
             encrypted_password: None,
         }
     }
@@ -292,7 +245,14 @@ impl Component for ChangePasswordForm {
         let is_admin = ctx.props().is_admin;
 
         if self.kerberos_info.is_none() {
-            return html! { <div>{"Loading Kerberos configuration..."}</div> };
+            return html! {
+              <>
+              { if let Some(e) = &self.common.error {
+                  html! { <div class="alert alert-danger">{e.to_string()}</div> }
+              } else { html! {} }}
+              <div>{"Loading Kerberos configuration..."}</div>
+              </>
+            };
         }
 
         html! {
@@ -348,14 +308,13 @@ impl Component for ChangePasswordForm {
     }
 
     fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
-        if first_render && !self.fetched_kerberos {
+        if first_render {
             self.common.call_graphql::<GetKerberosInfo, _>(
                 ctx,
                 get_kerberos_info::Variables {},
                 Msg::KerberosInfoResponse,
                 "Failed to load Kerberos info",
             );
-            self.fetched_kerberos = true;
         }
     }
 }

@@ -1,3 +1,5 @@
+use crate::components::fragments::icons::checkmark;
+use crate::infra::queries::{GetGroupAttributesSchema, get_group_attributes_schema};
 use crate::{
     components::{
         delete_group_attribute::DeleteGroupAttribute,
@@ -5,24 +7,12 @@ use crate::{
         router::{AppRoute, Link},
     },
     infra::{
-        attributes::group,
+        attributes::resolve_attribute_description,
         common_component::{CommonComponent, CommonComponentParts},
-        schema::AttributeType,
     },
 };
 use anyhow::{Error, Result};
-use graphql_client::GraphQLQuery;
 use yew::prelude::*;
-
-#[derive(GraphQLQuery)]
-#[graphql(
-    schema_path = "../schema.graphql",
-    query_path = "queries/get_group_attributes_schema.graphql",
-    response_derives = "Debug,Clone,PartialEq,Eq",
-    custom_scalars_module = "crate::infra::graphql",
-    extern_enums("AttributeType")
-)]
-pub struct GetGroupAttributesSchema;
 
 pub type Attribute =
     get_group_attributes_schema::GetGroupAttributesSchemaSchemaGroupSchemaAttributes;
@@ -131,28 +121,14 @@ impl GroupSchemaTable {
     }
 
     fn view_attribute(&self, ctx: &Context<Self>, attribute: &Attribute) -> Html {
-        let desc = group::resolve_group_attribute_description_or_default(
-            &attribute.name,
-            &attribute.aliases,
-        );
-
-        let aliases: Vec<&str> = attribute.aliases.iter().map(|s| s.as_str()).collect();
-
-        let mut desc_with_aliases = desc;
-        desc_with_aliases.aliases = aliases;
-
-        let checkmark = html! {
-            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-check" viewBox="0 0 16 16">
-            <path d="M10.97 4.97a.75.75 0 0 1 1.07 1.05l-3.99 4.99a.75.75 0 0 1-1.08.02L4.324 8.384a.75.75 0 1 1 1.06-1.06l2.094 2.093 3.473-4.425z"></path>
-            </svg>
-        };
+        let desc = resolve_attribute_description(&attribute.name, &attribute.aliases);
 
         html! {
             <tr key={attribute.name.clone()}>
             <td>
             {render_attribute_name(
                 ctx.props().hardcoded,
-                                   &desc_with_aliases
+                                   &desc
             )}
             </td>
             <td>
@@ -162,7 +138,7 @@ impl GroupSchemaTable {
                 attribute.attribute_type.to_string()
             }}
             </td>
-            <td>{if attribute.is_visible { checkmark } else {html!{}}}</td>
+            <td>{if attribute.is_visible { checkmark() } else {html!{}}}</td>
             {
                 if !attribute.is_hardcoded {
                     html!{

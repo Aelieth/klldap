@@ -76,8 +76,6 @@ impl<C: Component + CommonComponent<C>> CommonComponentParts<C> {
 
     /// Call `method` from the backend with the given `request`, and pass the `callback` for the
     /// result.
-    ///
-    /// NOTE: `Req` is removed entirely — we never use it. This eliminates all inference problems.
     pub fn call_backend<Resp, Fut, Cb>(&mut self, ctx: &Context<C>, fut: Fut, callback: Cb)
     where
         Fut: Future<Output = Result<Resp>> + 'static,

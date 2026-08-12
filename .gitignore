@@ -12,7 +12,7 @@
 *.db-shm
 *.db-wal
 
-# Output of `npm install rollup`
+# npm/wasm-pack residue
 node_modules/
 package-lock.json
 package.json

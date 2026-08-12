@@ -13,7 +13,7 @@ use lldap_domain::deserialize::deserialize_attribute_value;
 use lldap_domain::public_schema::PublicSchema;
 use lldap_domain::types::{AttributeName, AttributeType, UserId};
 use lldap_domain_handlers::handler::{GroupRequestFilter, UserRequestFilter};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::core::utils::LdapInfo;
 
@@ -159,9 +159,8 @@ pub fn convert_user_filter(
                 ),
                 crate::core::utils::UserFieldType::NoMatch => {
                     if !ldap_info.ignored_user_attributes.contains(&field) {
-                        warn!(
-                            r#"Ignoring unknown user attribute "{}" in filter.\n\
-                                      To disable this warning, add it to "ignored_user_attributes" in the config"#,
+                        debug!(
+                            r#"Ignoring unknown user attribute "{}" in filter. Add to "ignored_user_attributes" to silence."#,
                             field
                         );
                     }
@@ -456,9 +455,8 @@ pub fn convert_group_filter(
                 }
                 crate::core::utils::GroupFieldType::NoMatch => {
                     if !ldap_info.ignored_group_attributes.contains(&field) {
-                        warn!(
-                            r#"Ignoring unknown group attribute "{}" in filter.\n\
-                                To disable this warning, add it to "ignored_group_attributes" in the config."#,
+                        debug!(
+                            r#"Ignoring unknown group attribute "{}" in filter. Add to "ignored_group_attributes" to silence."#,
                             field
                         );
                     }

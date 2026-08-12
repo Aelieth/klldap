@@ -12,6 +12,21 @@ use lldap_domain::{
     public_schema::PublicSchema,
     types::{Attribute, AttributeName, AttributeValue, Cardinality, Group, GroupDetails, User},
 };
+use std::collections::HashSet;
+use std::sync::LazyLock;
+
+fn schema_attribute_names(attrs: &[lldap_schema::schema::AttributeSchema]) -> HashSet<String> {
+    attrs
+        .iter()
+        .flat_map(|a| std::iter::once(a.name.clone()).chain(a.aliases.iter().cloned()))
+        .collect()
+}
+
+static USER_SCHEMA_ATTRIBUTE_NAMES: LazyLock<HashSet<String>> =
+    LazyLock::new(|| schema_attribute_names(&PublicSchema::shared().user_attributes().attributes));
+
+static GROUP_SCHEMA_ATTRIBUTE_NAMES: LazyLock<HashSet<String>> =
+    LazyLock::new(|| schema_attribute_names(&PublicSchema::shared().group_attributes().attributes));
 
 // ============================================================================
 // LOW-LEVEL HELPERS MOVED HERE (single source of truth for attribute handling)
@@ -490,20 +505,10 @@ pub fn make_ldap_search_user_result_entry(
     schema: &PublicSchema,
 ) -> LdapSearchResultEntry {
     if expanded_attributes.include_custom_attributes {
-        let standardized: std::collections::HashSet<String> = schema
-            .user_attributes()
-            .attributes
-            .iter()
-            .flat_map(|a| {
-                let mut names = vec![a.name.to_string()];
-                names.extend(a.aliases.iter().map(|al| al.to_string()));
-                names
-            })
-            .collect();
         let custom_to_add: Vec<_> = user
             .attributes
             .iter()
-            .filter(|a| !standardized.contains(a.name.as_str()))
+            .filter(|a| !USER_SCHEMA_ATTRIBUTE_NAMES.contains(a.name.as_str()))
             .map(|a| (a.name.clone(), a.name.to_string()))
             .collect();
         expanded_attributes.attribute_keys.extend(custom_to_add);
@@ -554,20 +559,10 @@ pub fn make_ldap_search_group_result_entry(
     schema: &PublicSchema,
 ) -> LdapSearchResultEntry {
     if expanded_attributes.include_custom_attributes {
-        let standardized: std::collections::HashSet<String> = schema
-            .group_attributes()
-            .attributes
-            .iter()
-            .flat_map(|a| {
-                let mut names = vec![a.name.to_string()];
-                names.extend(a.aliases.iter().map(|al| al.to_string()));
-                names
-            })
-            .collect();
         let custom_to_add: Vec<_> = group
             .attributes
             .iter()
-            .filter(|a| !standardized.contains(a.name.as_str()))
+            .filter(|a| !GROUP_SCHEMA_ATTRIBUTE_NAMES.contains(a.name.as_str()))
             .map(|a| (a.name.clone(), a.name.to_string()))
             .collect();
         expanded_attributes.attribute_keys.extend(custom_to_add);
@@ -606,5 +601,57 @@ pub fn make_ldap_search_group_result_entry(
             attrs.retain(|attr| seen.insert(attr.atype.clone()));
             attrs
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::utils::ExpandedAttributes;
+    use lldap_domain::types::UserId;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn cached_schema_names_include_canonical_names_and_aliases() {
+        assert!(USER_SCHEMA_ATTRIBUTE_NAMES.contains("mail"));
+        assert!(USER_SCHEMA_ATTRIBUTE_NAMES.contains("email"));
+        assert!(!USER_SCHEMA_ATTRIBUTE_NAMES.contains("mycustomattr"));
+        assert!(GROUP_SCHEMA_ATTRIBUTE_NAMES.contains("displayname"));
+        assert!(GROUP_SCHEMA_ATTRIBUTE_NAMES.contains("cn"));
+        assert!(!GROUP_SCHEMA_ATTRIBUTE_NAMES.contains("mycustomattr"));
+    }
+
+    #[test]
+    fn result_entry_emits_custom_attribute_and_hides_schema_named_one() {
+        let user = User {
+            user_id: UserId::new("bob"),
+            email: "bob@example.com".into(),
+            attributes: vec![
+                Attribute {
+                    name: AttributeName::from("mycustomattr"),
+                    value: vec!["hello".to_string()].into(),
+                },
+                Attribute {
+                    name: AttributeName::from("mail"),
+                    value: vec!["skip".to_string()].into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let expanded = ExpandedAttributes {
+            attribute_keys: BTreeMap::new(),
+            include_custom_attributes: true,
+            include_operational_attributes: false,
+        };
+        let entry = make_ldap_search_user_result_entry(
+            user,
+            "dc=example,dc=com",
+            expanded,
+            None,
+            &[],
+            PublicSchema::shared(),
+        );
+        assert!(entry.attributes.iter().any(|a| a.atype == "mycustomattr"));
+        assert!(!entry.attributes.iter().any(|a| a.atype == "mail"));
     }
 }

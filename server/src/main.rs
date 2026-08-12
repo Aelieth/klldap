@@ -115,7 +115,7 @@ async fn setup_sql_tables(database_url: &DatabaseUrl) -> Result<DatabaseConnecti
         } else {
             5
         };
-        let mut sql_opt = sea_orm::ConnectOptions::new(database_url.to_string());
+        let mut sql_opt = sea_orm::ConnectOptions::new(database_url.to_connect_string());
         sql_opt
             .max_connections(num_connections)
             .sqlx_logging(true)

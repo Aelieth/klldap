@@ -737,7 +737,28 @@ where
             "DEPRECATED: smtp_options.tls_required field is deprecated, it never did anything. You can replace it with smtp_options.smtp_encryption."
         );
     }
+    if config.smtp_options.enable_password_reset {
+        println!(
+            "Password reset is enabled; reset-email links will use base URL: {}",
+            config.http_url.0
+        );
+        if is_loopback_url(&config.http_url.0) {
+            println!(
+                "WARNING: http_url is unset or loopback ({}); password-reset emails will link to an address recipients cannot reach. Set LLDAP_HTTP_URL to your real UI URL (e.g. https://ldap.example.com).",
+                config.http_url.0
+            );
+        }
+    }
     Ok(config)
+}
+
+fn is_loopback_url(url: &Url) -> bool {
+    match url.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(addr)) => addr.is_loopback(),
+        Some(url::Host::Ipv6(addr)) => addr.is_loopback(),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -747,6 +768,22 @@ mod tests {
     use clap::Parser;
     use figment::Jail;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn loopback_url_detection() {
+        for base in ["http://localhost", "http://127.0.0.1:17170", "http://[::1]"] {
+            assert!(
+                is_loopback_url(&Url::parse(base).unwrap()),
+                "{base} should be loopback"
+            );
+        }
+        for base in ["https://ldap.example.com", "http://10.10.10.100:17170"] {
+            assert!(
+                !is_loopback_url(&Url::parse(base).unwrap()),
+                "{base} should not be loopback"
+            );
+        }
+    }
 
     #[test]
     fn check_generated_server_key() {

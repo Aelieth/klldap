@@ -79,6 +79,16 @@ async fn send_email(
     }
 }
 
+fn build_reset_url(server_url: &url::Url, token: &str) -> url::Url {
+    let mut reset_url = server_url.clone();
+    reset_url
+        .path_segments_mut()
+        .expect("http(s) base URL is always a valid base")
+        .pop_if_empty()
+        .extend(["reset-password", "step2", token]);
+    reset_url
+}
+
 pub async fn send_password_reset_email(
     display_name: &str,
     username: &str,
@@ -88,11 +98,7 @@ pub async fn send_password_reset_email(
     options: &MailOptions,
 ) -> Result<()> {
     let to = to.parse()?;
-    let mut reset_url = server_url.clone();
-    reset_url
-        .path_segments_mut()
-        .unwrap()
-        .extend(["reset-password", "step2", token]);
+    let reset_url = build_reset_url(server_url, token);
     let body = format!(
         "Hello {display_name},
 
@@ -129,4 +135,37 @@ pub async fn send_test_email(to: Mailbox, options: &MailOptions) -> Result<()> {
         &url::Url::parse("http://localhost").unwrap(),
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_reset_url;
+
+    fn reset(base: &str) -> String {
+        build_reset_url(&url::Url::parse(base).unwrap(), "TOK123").to_string()
+    }
+
+    #[test]
+    fn reset_url_for_root_bases() {
+        assert_eq!(
+            reset("http://localhost"),
+            "http://localhost/reset-password/step2/TOK123"
+        );
+        assert_eq!(
+            reset("https://ui.example.com"),
+            "https://ui.example.com/reset-password/step2/TOK123"
+        );
+    }
+
+    #[test]
+    fn reset_url_for_subpath_bases_has_no_double_slash() {
+        assert_eq!(
+            reset("https://host/lldap"),
+            "https://host/lldap/reset-password/step2/TOK123"
+        );
+        assert_eq!(
+            reset("https://host/lldap/"),
+            "https://host/lldap/reset-password/step2/TOK123"
+        );
+    }
 }

@@ -30,7 +30,10 @@
 ## administration.
 #http_port = 17170
 
-## The public URL of the server, for password reset links.
+## The public URL of the server, for password reset links. Required when
+## smtp_options.enable_password_reset is true: the emailed link is built from it,
+## so a loopback value (the default) is unreachable by recipients. Set it to your
+## real UI URL, e.g. https://ldap.example.com (env: LLDAP_HTTP_URL).
 #http_url = "http://localhost"
 
 ## The path to the front-end assets (relative to the working directory).

@@ -43,7 +43,7 @@ pub enum Msg {
     AuthenticationRefreshResponse(Result<(String, bool)>),
     AuthenticationStartResponse(
         (
-            opaque::client::login::ClientLogin,
+            Box<opaque::client::login::ClientLogin>,
             Result<Box<login::ServerLoginStartResponse>>,
         ),
     ),
@@ -74,7 +74,7 @@ impl CommonComponent<LoginForm> for LoginForm {
                 };
                 self.common
                     .call_backend(ctx, HostService::login_start(req), move |r| {
-                        Msg::AuthenticationStartResponse((state, r))
+                        Msg::AuthenticationStartResponse((Box::new(state), r))
                     });
                 Ok(true)
             }
@@ -88,7 +88,7 @@ impl CommonComponent<LoginForm> for LoginForm {
                     }
                 };
                 let login_finish = match opaque::client::login::finish_login(
-                    login_start,
+                    *login_start,
                     self.form.model().password.as_bytes(), // ← fixed
                     res.credential_response,
                     &mut rand::rngs::OsRng,

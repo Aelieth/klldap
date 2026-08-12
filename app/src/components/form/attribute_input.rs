@@ -25,7 +25,7 @@ fn attribute_input(props: &AttributeInputProps) -> Html {
             && props
                 .value
                 .as_ref()
-                .map_or(true, |v| v.is_empty() || *v == "Auto-assign")
+                .is_none_or(|v| v.is_empty() || *v == "Auto-assign")
         {
             "Auto-assign".to_string()
         } else {

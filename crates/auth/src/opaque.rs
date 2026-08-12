@@ -66,7 +66,6 @@ impl opaque_ke::ksf::Ksf for ArgonKsf {
 
 /// The ciphersuite trait allows to specify the underlying primitives
 /// that will be used in the OPAQUE protocol
-#[allow(dead_code)]
 pub struct DefaultSuite;
 impl CipherSuite for DefaultSuite {
     type OprfCs = opaque_ke::Ristretto255;

@@ -48,12 +48,12 @@ pub fn render_attribute_name(
     hardcoded: bool,
     attribute_description: &AttributeDescription,
 ) -> Html {
-    let friendly = get_friendly_name(&attribute_description.attribute_name);
+    let friendly = get_friendly_name(attribute_description.attribute_name);
     html! {
       <>
       {friendly}
       {if hardcoded { render_attribute_aliases(attribute_description) } else { html!{} }}
-      {render_attribute_validation_warnings(&attribute_description.attribute_name)}
+      {render_attribute_validation_warnings(attribute_description.attribute_name)}
       </>
     }
 }

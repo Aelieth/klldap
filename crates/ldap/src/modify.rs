@@ -1,9 +1,3 @@
-// crates/ldap/src/modify.rs
-// LDAP Modify — supports password changes (userPassword Replace) + profile attributes
-// (givenName/sn/cn/mail/avatar/sshPublicKey) for self-service / admin updates.
-// Mirrors the GraphQL update_user path using UpdateUserRequest + writeable handler.
-// All other operations still return UnwillingToPerform (single source of truth in GraphQL layer).
-
 use crate::{
     core::{
         error::{LdapError, LdapResult},
@@ -72,15 +66,8 @@ async fn handle_modify_change(
                     }
                 };
 
-                let sync_enabled = user.attributes.iter().any(|attr| {
-                    attr.name.as_str() == "kerberossync"
-                        && matches!(
-                            &attr.value,
-                            lldap_domain::types::AttributeValue::Integer(
-                                lldap_domain::types::Cardinality::Singleton(1)
-                            )
-                        )
-                });
+                let sync_enabled =
+                    lldap_domain::types::kerberos_sync_enabled(&user.attributes, "kerberossync");
 
                 if let Err(e) = lldap_kerberos::sync_kerberos_if_enabled(
                     sync_enabled,
@@ -612,7 +599,7 @@ mod tests {
     }
 
     // ========================================================================
-    // EXISTING PASSWORD TESTS (unchanged behavior)
+    // PASSWORD TESTS
     // ========================================================================
 
     #[tokio::test]

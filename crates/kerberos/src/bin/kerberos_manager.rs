@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use lldap_kerberos::derive_realm_from_base_dn;
+use lldap_kerberos::{derive_realm_from_base_dn, domain_from_base_dn};
 use minijinja::{Environment, context};
 use serde::Deserialize;
 use std::env;
@@ -72,19 +72,13 @@ fn main() -> Result<()> {
         .try_into()
         .context("Failed to deserialize [kerberos]")?;
 
-    // Realm derivation (shared helper — no duplication)
     let realm_name = derive_realm_from_base_dn();
     config.realm_name = realm_name.clone();
 
     let base_dn = env::var("LLDAP_LDAP_BASE_DN").unwrap_or_else(|_| config.base_dn.clone());
     config.base_dn = base_dn.clone();
 
-    let domain = base_dn
-        .split(',')
-        .filter_map(|part| part.strip_prefix("dc="))
-        .collect::<Vec<_>>()
-        .join(".")
-        .to_lowercase();
+    let domain = domain_from_base_dn(&base_dn);
 
     println!("Calculated DOMAIN: {}", domain);
     println!("Effective REALM_NAME: {}", config.realm_name);
@@ -310,7 +304,7 @@ fn render_template(
 /// 2. If unreadable or bad permissions → repair permissions (0644 + lldap:lldap).
 /// 3. Ensure the local admin/admin@REALM has the default full (*) permissions (add/upgrade if needed).
 /// 4. If structure looks wrong, best-effort repair (preserve other entries + comments); fall back to template remake if too garbled.
-/// 5. If the file is present, readable, correctly permissioned, has the admin grant, and looks structurally valid → do nothing (no message, per review).
+/// 5. If the file is present, readable, correctly permissioned, has the admin grant, and looks structurally valid → do nothing.
 fn ensure_kadm5_acl(
     acl_path: &str,
     template_path: &str,
@@ -345,7 +339,6 @@ fn ensure_kadm5_acl(
     let sane = acl_structure_looks_valid(&original_content);
 
     if has_admin && sane {
-        // 5. File is fine. Per review feedback: no message, just continue normal operation.
         return Ok(());
     }
 

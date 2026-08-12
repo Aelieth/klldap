@@ -1,6 +1,3 @@
-// crates/ldap/src/create.rs
-// LDAP ADD for users/groups → our clean EAV backend
-// Uses the new attributes.rs + SchemaManager pipeline for canonical name handling
 use crate::{
     core::{
         error::{LdapError, LdapResult},
@@ -22,7 +19,7 @@ use lldap_domain::{
     types::{Attribute, AttributeType, Email, GroupName, UserId},
 };
 use std::collections::HashMap;
-use tracing::instrument;
+use tracing::{instrument, warn};
 
 #[instrument(skip_all, level = "debug")]
 pub(crate) async fn create_user_or_group(
@@ -139,7 +136,7 @@ async fn create_user(
                 &[avatar],
                 AttributeType::Avatar,
                 false,
-            ) // ← TOTAL RIP-OUT: was JpegPhoto
+            )
             .map_err(|e| LdapError {
                 code: LdapResultCode::ConstraintViolation,
                 message: format!("Invalid avatar value: {e}"),
@@ -162,8 +159,7 @@ async fn create_user(
         })?,
     });
 
-    // kerberossync handling (respect client-provided value, default to 0 only if missing)
-    let kerberossync_enabled = if let Some(ksync_str) = get_attribute("kerberossync").transpose()? {
+    if let Some(ksync_str) = get_attribute("kerberossync").transpose()? {
         new_user_attributes.push(Attribute {
             name: "kerberossync".into(),
             value: deserialize::deserialize_attribute_value(
@@ -176,7 +172,6 @@ async fn create_user(
                 message: format!("Invalid kerberossync value: {e}"),
             })?,
         });
-        ksync_str == "1"
     } else {
         new_user_attributes.push(Attribute {
             name: "kerberossync".into(),
@@ -190,8 +185,9 @@ async fn create_user(
                 message: format!("Invalid default kerberossync value: {e}"),
             })?,
         });
-        false
-    };
+    }
+    let kerberossync_enabled =
+        lldap_domain::types::kerberos_sync_enabled(&new_user_attributes, "kerberossync");
 
     backend_handler
         .create_user(CreateUserRequest {
@@ -217,8 +213,12 @@ async fn create_user(
             .get("userpassword")
             .or_else(|| attributes.get("userPassword"))
         && let Ok(plain) = std::str::from_utf8(pw_bytes)
+        && let Err(e) = lldap_kerberos::sync_kerberos_principal(user_id.as_str(), plain)
     {
-        let _ = lldap_kerberos::sync_kerberos_principal(user_id.as_str(), plain);
+        warn!(
+            "Kerberos principal sync failed after LDAP user create: {}",
+            e
+        );
     }
 
     Ok(vec![make_add_response(
@@ -325,7 +325,6 @@ mod tests {
             .with(eq(CreateGroupRequest {
                 display_name: GroupName::new("bob"),
                 attributes: vec![ou_attr],
-                ..Default::default()
             }))
             .times(1)
             .return_once(|_| Ok(GroupId(5)));

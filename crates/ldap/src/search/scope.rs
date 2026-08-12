@@ -2,7 +2,7 @@
 
 use crate::dn::{is_container_dn, is_subtree};
 use ldap3_proto::{LdapPartialAttribute, LdapSearchResultEntry, LdapSearchScope, proto::LdapOp};
-use uuid::Uuid; //commented out to test entryUUID issues with keycloak
+use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchScope {

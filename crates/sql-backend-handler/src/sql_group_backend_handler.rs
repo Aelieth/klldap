@@ -1,4 +1,7 @@
-use crate::sql_backend_handler::SqlBackendHandler;
+use crate::sql_backend_handler::{
+    SqlBackendHandler, attribute_value_to_db_bytes, bool_to_expr, get_repeated_filter,
+    is_backend_writable_readonly_attribute,
+};
 use async_trait::async_trait;
 use lldap_domain::{
     is_builtin_group,
@@ -22,29 +25,6 @@ use sea_orm::{
     sea_query::{Alias, Cond, Expr, Func, IntoCondition, OnConflict, SimpleExpr},
 };
 use tracing::instrument;
-
-// Helper: Convert AttributeValue to raw bytes for the EAV value BLOB column
-fn attribute_value_to_db_bytes(value: &AttributeValue) -> Vec<u8> {
-    match value {
-        AttributeValue::String(Cardinality::Singleton(s)) => s.as_bytes().to_vec(),
-        AttributeValue::String(Cardinality::Unbounded(list)) => {
-            serde_json::to_vec(list).unwrap_or_else(|_| b"[]".to_vec())
-        }
-        AttributeValue::Integer(Cardinality::Singleton(i)) => i.to_string().as_bytes().to_vec(),
-        AttributeValue::Avatar(Cardinality::Singleton(p)) => p.0.clone(),
-        AttributeValue::DateTime(Cardinality::Singleton(dt)) => {
-            dt.and_utc().timestamp().to_string().as_bytes().to_vec()
-        }
-        _ => vec![],
-    }
-}
-
-fn is_backend_writable_readonly_attribute(name: &str) -> bool {
-    matches!(
-        name,
-        "ou" | "kerberossync" | "allowedous" | "krb_principal_name"
-    )
-}
 
 fn attribute_condition(name: AttributeName, value: Option<&AttributeValue>) -> Cond {
     Expr::in_subquery(
@@ -85,27 +65,11 @@ fn attribute_substring_condition(name: AttributeName, filter: &SubStringFilter) 
 fn get_group_filter_expr(filter: GroupRequestFilter) -> Cond {
     use GroupRequestFilter::*;
     let group_table = Alias::new("groups");
-    fn bool_to_expr(b: bool) -> Cond {
-        SimpleExpr::Value(b.into()).into_condition()
-    }
-    fn get_repeated_filter(
-        fs: Vec<GroupRequestFilter>,
-        condition: Cond,
-        default_value: bool,
-    ) -> Cond {
-        if fs.is_empty() {
-            bool_to_expr(default_value)
-        } else {
-            fs.into_iter()
-                .map(get_group_filter_expr)
-                .fold(condition, Cond::add)
-        }
-    }
     match filter {
         True => bool_to_expr(true),
         False => bool_to_expr(false),
-        And(fs) => get_repeated_filter(fs, Cond::all(), true),
-        Or(fs) => get_repeated_filter(fs, Cond::any(), false),
+        And(fs) => get_repeated_filter(fs, Cond::all(), true, get_group_filter_expr),
+        Or(fs) => get_repeated_filter(fs, Cond::any(), false, get_group_filter_expr),
         Not(f) => get_group_filter_expr(*f).not(),
         DisplayName(name) => GroupColumn::LowercaseDisplayName
             .eq(name.as_str().to_lowercase())
@@ -130,7 +94,6 @@ fn get_group_filter_expr(filter: GroupRequestFilter) -> Cond {
         AttributeEquality(name, value) => attribute_condition(name, Some(&value)),
         CustomAttributePresent(name) => attribute_condition(name, None),
 
-        // NEW: GreaterOrEqual / LessOrEqual for timestamps (group side) — closes #1308
         GreaterOrEqual(column, value) => {
             let col = column.to_ascii_lowercase();
             match col.as_str() {
@@ -902,7 +865,6 @@ mod tests {
 
         assert_eq!(group_details.display_name, "New Group".into());
 
-        // NEW BEHAVIOR: "ou" is now automatically injected (central enforcement)
         assert_eq!(
             group_details.attributes,
             vec![

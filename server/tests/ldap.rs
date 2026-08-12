@@ -114,7 +114,6 @@ fn admin_search() {
     ldap.unbind().expect("failed to unbind");
 }
 
-/// NEW: Validates that nested/child OUs work correctly
 #[test]
 #[file_serial]
 fn nested_ou_test() {
@@ -151,7 +150,6 @@ fn nested_ou_test() {
         users.contains_key(&user_name),
         "user not found under nested OU structure"
     );
-    assert!(users.get(&user_name).unwrap().is_empty() || true); // membership not critical here
 
     ldap.unbind().expect("failed to unbind");
 }

@@ -1,7 +1,5 @@
 #![forbid(unsafe_code)]
 #![forbid(non_ascii_idents)]
-// TODO: Remove next line when it stops warning about async functions.
-#![allow(clippy::blocks_in_conditions)]
 
 mod auth_service;
 mod cli;
@@ -38,7 +36,7 @@ use std::time::Duration;
 use tracing::{Instrument, Level, debug, error, info, instrument, span, warn};
 
 use lldap_domain::requests::{CreateGroupRequest, CreateUserRequest};
-use lldap_domain::types::Attribute; // ← Exact domain type required by requests.rs
+use lldap_domain::types::{Attribute, BUILTIN_GROUPS};
 
 use lldap_domain_handlers::handler::{
     GroupBackendHandler, GroupListerBackendHandler, GroupRequestFilter, UserBackendHandler,
@@ -162,11 +160,9 @@ async fn set_up_server(config: Configuration) -> Result<(ServerBuilder, Database
     }
     let backend_handler =
         SqlBackendHandler::new(config.get_server_setup().clone(), sql_pool.clone());
-    ensure_group_exists(&backend_handler, "lldap_admin").await?;
-    ensure_group_exists(&backend_handler, "lldap_password_manager").await?;
-    ensure_group_exists(&backend_handler, "lldap_strict_readonly").await?;
-    ensure_group_exists(&backend_handler, "lldap_disabled").await?;
-    ensure_group_exists(&backend_handler, "lldap_sudohost").await?;
+    for group in BUILTIN_GROUPS {
+        ensure_group_exists(&backend_handler, group).await?;
+    }
     let admin_present = if let Ok(admins) = backend_handler
         .list_users(
             Some(UserRequestFilter::MemberOf("lldap_admin".into())),

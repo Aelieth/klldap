@@ -40,7 +40,7 @@ pub struct Schema {
     pub user_attributes: AttributeList,
     pub group_attributes: AttributeList,
     pub system_attributes: AttributeList,
-    pub posix_settings: PosixSettings, // ← NEW: full POSIX settings
+    pub posix_settings: PosixSettings,
     pub extra_user_object_classes: Vec<String>,
     pub extra_group_object_classes: Vec<String>,
 }

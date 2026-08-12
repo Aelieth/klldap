@@ -201,8 +201,8 @@ pub fn get_preferred_ldap_name(attr: &lldap_schema::AttributeSchema) -> String {
 
 /// 0-argument versions for GraphQL + public API (returns LdapObjectClass).
 pub fn get_default_user_object_classes() -> Vec<lldap_domain::types::LdapObjectClass> {
-    let schema = PublicSchema::get();
-    get_default_user_object_classes_bytes(&schema)
+    let schema = PublicSchema::shared();
+    get_default_user_object_classes_bytes(schema)
         .into_iter()
         .map(|b| {
             lldap_domain::types::LdapObjectClass::from(String::from_utf8_lossy(&b).to_string())
@@ -211,8 +211,8 @@ pub fn get_default_user_object_classes() -> Vec<lldap_domain::types::LdapObjectC
 }
 
 pub fn get_default_group_object_classes() -> Vec<lldap_domain::types::LdapObjectClass> {
-    let schema = PublicSchema::get();
-    get_default_group_object_classes_bytes(&schema)
+    let schema = PublicSchema::shared();
+    get_default_group_object_classes_bytes(schema)
         .into_iter()
         .map(|b| {
             lldap_domain::types::LdapObjectClass::from(String::from_utf8_lossy(&b).to_string())
@@ -332,14 +332,20 @@ pub fn get_user_attribute(
             "*" => panic!("Matched {attribute}, * should have been expanded"),
             // Virtual attributes driven purely by built-in group membership
             s if s.eq_ignore_ascii_case("logindisabled") => {
-                if groups.map_or(false, |gs| gs.iter().any(|g| g.display_name.as_str() == "lldap_disabled")) {
+                if groups.is_some_and(|gs| {
+                    gs.iter()
+                        .any(|g| g.display_name.as_str() == "lldap_disabled")
+                }) {
                     vec![b"TRUE".to_vec()]
                 } else {
                     return None;
                 }
             }
             s if s.eq_ignore_ascii_case("sudohost") => {
-                if groups.map_or(false, |gs| gs.iter().any(|g| g.display_name.as_str() == "lldap_sudohost")) {
+                if groups.is_some_and(|gs| {
+                    gs.iter()
+                        .any(|g| g.display_name.as_str() == "lldap_sudohost")
+                }) {
                     vec![b"ALL".to_vec()]
                 } else {
                     return None;

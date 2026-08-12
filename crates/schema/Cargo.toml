@@ -1,16 +1,18 @@
 [package]
 name = "lldap_schema"
 version = "0.2.2"
-edition.workspace = true
+description = "Attribute schema single source of truth for KLLDAP"
 authors.workspace = true
+edition.workspace = true
+homepage.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 
 [dependencies]
 derive_more = { workspace = true, features = ["display"] }
 juniper = { workspace = true }
-sea-orm = { workspace = true, features = ["macros"] }   # ← only macros for WASM
-sea-query = { version = "0.32", default-features = false, features = ["thread-safe"] }
+sea-orm = { workspace = true, features = ["macros"] }
 serde = { workspace = true, features = ["derive", "std"] }
 strum = { workspace = true }
 

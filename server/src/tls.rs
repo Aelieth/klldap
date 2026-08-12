@@ -1,4 +1,3 @@
-#![forbid(unsafe_code)]
 use anyhow::{Context, Result, anyhow};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 

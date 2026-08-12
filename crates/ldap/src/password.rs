@@ -1,7 +1,3 @@
-// crates/ldap/src/password.rs
-// LDAP Bind + Password Modify (extended operation) + Kerberos sync support
-// Uses the new attributes.rs / SchemaManager pipeline indirectly via user details
-
 use crate::{
     core::{
         error::{LdapError, LdapResult},
@@ -154,15 +150,10 @@ pub(crate) async fn do_password_modification<Handler: BackendHandler + OpaqueHan
                                     message: format!("Failed to fetch user for Kerberos sync: {e}"),
                                 })?;
 
-                        let sync_enabled = user_details.attributes.iter().any(|a| {
-                            a.name.as_str() == "kerberossync"
-                                && matches!(
-                                    &a.value,
-                                    lldap_domain::types::AttributeValue::Integer(
-                                        lldap_domain::types::Cardinality::Singleton(1)
-                                    )
-                                )
-                        });
+                        let sync_enabled = lldap_domain::types::kerberos_sync_enabled(
+                            &user_details.attributes,
+                            "kerberossync",
+                        );
 
                         if sync_enabled {
                             if let Err(e) = sync_kerberos_principal(uid.as_str(), password.as_str())
@@ -178,11 +169,16 @@ pub(crate) async fn do_password_modification<Handler: BackendHandler + OpaqueHan
                                 );
                             }
 
-                            // ←←← Use unsafe_get_handler to reach the concrete BackendHandler (same pattern as GraphQL)
                             let inner = backend_handler.unsafe_get_handler();
-                            let _ = inner
+                            if let Err(e) = inner
                                 .ensure_kerberos_principal_consistency(&uid, true)
-                                .await;
+                                .await
+                            {
+                                warn!(
+                                    "Failed to record Kerberos principal name for {}: {}",
+                                    uid, e
+                                );
+                            }
                         }
 
                         Ok(vec![make_extended_response(
@@ -307,12 +303,6 @@ pub mod tests {
 
         assert_eq!(ldap_handler.do_bind(&request).await, make_bind_success());
     }
-
-    // ========================================================================
-    // FUNDAMENTAL REWRITE FOR test_bind_invalid_dn
-    // We no longer rely on exact string matching of error messages.
-    // We verify the important behavior: invalid DN → NamingViolation.
-    // ========================================================================
 
     #[tokio::test]
     async fn test_bind_invalid_dn() {

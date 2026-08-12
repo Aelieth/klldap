@@ -1,6 +1,7 @@
 [package]
 name = "lldap_test_utils"
 version = "0.1.1"
+description = "Test helpers for KLLDAP"
 authors.workspace = true
 edition.workspace = true
 homepage.workspace = true
@@ -11,10 +12,7 @@ rust-version.workspace = true
 [dependencies]
 async-trait = { workspace = true }
 chrono = { workspace = true }
-ldap3_proto = { workspace = true }
 mockall = { workspace = true }
-tracing = { workspace = true }
-uuid = { workspace = true }
 lldap_schema = { workspace = true }
 
 [dependencies.lldap_access_control]
@@ -31,4 +29,3 @@ path = "../domain-model"
 
 [dependencies.lldap_opaque_handler]
 path = "../opaque-handler"
-features = ["test"]

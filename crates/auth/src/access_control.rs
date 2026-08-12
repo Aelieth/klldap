@@ -16,14 +16,6 @@ pub struct ValidationResults {
 }
 
 impl ValidationResults {
-    #[cfg(feature = "test")]
-    pub fn admin() -> Self {
-        Self {
-            user: UserId::new("admin"),
-            permission: Permission::Admin,
-        }
-    }
-
     #[must_use]
     pub fn is_admin(&self) -> bool {
         self.permission == Permission::Admin

@@ -1,11 +1,9 @@
-// crates/graphql-server/src/query/mod.rs
 pub mod attribute;
 pub mod filters;
 pub mod group;
 pub mod schema;
-pub mod user; // moved AFTER user so the cycle breaks
+pub mod user;
 
-// Re-export public types
 pub use attribute::{AttributeSchema, AttributeValue, serialize_attribute_to_graphql};
 pub use filters::{EqualityConstraint, RequestFilter};
 pub use group::Group;
@@ -21,7 +19,6 @@ use lldap_access_control::{
 };
 use lldap_domain::types::{GroupId, UserId};
 use lldap_domain_handlers::handler::{BackendHandler, ReadSchemaBackendHandler};
-use lldap_kerberos;
 use lldap_kerberos::get_keycloak_suggested_config;
 use lldap_opaque_handler::OpaqueHandler;
 use lldap_schema::PublicSchema;
@@ -206,8 +203,16 @@ impl<Handler: FullHandler + OpaqueHandler> Query<Handler> {
     }
 
     async fn keycloak_suggested_config(
-        _context: &Context<Handler>,
+        context: &Context<Handler>,
     ) -> FieldResult<KeycloakSuggestedConfig> {
+        let span = debug_span!("[GraphQL query] keycloak_suggested_config");
+        context
+            .get_admin_handler()
+            .ok_or_else(field_error_callback(
+                &span,
+                "Unauthorized to read Keycloak config",
+            ))?;
+
         let cfg = get_keycloak_suggested_config();
         Ok(KeycloakSuggestedConfig {
             url: cfg.url,
@@ -217,7 +222,15 @@ impl<Handler: FullHandler + OpaqueHandler> Query<Handler> {
         })
     }
 
-    async fn keycloak_config(_context: &Context<Handler>) -> FieldResult<KeycloakConfigResponse> {
+    async fn keycloak_config(context: &Context<Handler>) -> FieldResult<KeycloakConfigResponse> {
+        let span = debug_span!("[GraphQL query] keycloak_config");
+        context
+            .get_admin_handler()
+            .ok_or_else(field_error_callback(
+                &span,
+                "Unauthorized to read Keycloak config",
+            ))?;
+
         let cfg = lldap_kerberos::load_keycloak_config().unwrap_or_else(|_| {
             lldap_kerberos::KeycloakConfig {
                 url: "http://keycloak:8080".to_string(),
@@ -337,7 +350,6 @@ mod tests {
 
     #[tokio::test]
     async fn get_user_by_id() {
-        // Updated query: removed "name" from attributes (AttributeValue no longer exposes it)
         const QUERY: &str = r#"{
             user(userId: "bob") {
                 id
@@ -514,7 +526,7 @@ mod tests {
                         ),
                     ],
                 ))),
-                eq(true), // ← Fixed: must be true
+                eq(true),
             )
             .return_once(|_, _| {
                 Ok(vec![

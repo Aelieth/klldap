@@ -65,13 +65,6 @@ mod tests {
     use lldap_test_utils::{MockTestBackendHandler, setup_default_ldap_mock};
     use pretty_assertions::assert_eq;
 
-    // ========================================================================
-    // FUNDAMENTAL REWRITE
-    // We no longer assert on internal list_* filters or get_groups flag.
-    // The new production code routes compare through the full search pipeline.
-    // Tests now only verify the final Compare result.
-    // ========================================================================
-
     #[tokio::test]
     async fn test_compare_user() {
         let mut mock = MockTestBackendHandler::new();

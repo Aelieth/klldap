@@ -10,12 +10,15 @@ default-members = ["server"]
 resolver = "2"
 
 [workspace.package]
-authors = ["Paul Tomlin <shaiaelieth@gmail.com> Valentin Tolmer <valentin@tolmer.fr>"]
-documentation = "https://github.com/lldap-with-kerberos/klldap"
+authors = [
+    "Paul Tomlin <shaiaelieth@gmail.com>",
+    "Valentin Tolmer <valentin@tolmer.fr>",
+]
+documentation = "https://github.com/Aelieth/klldap"
 edition = "2024"
-homepage = "https://github.com/lldap-with-kerberos/klldap"
-license = "GPL-3.0-only"
-repository = "https://github.com/lldap-with-kerberos/klldap"
+homepage = "https://github.com/Aelieth/klldap"
+license = "AGPL-3.0-only"
+repository = "https://github.com/Aelieth/klldap"
 rust-version = "1.95.0"
 
 [profile.release]

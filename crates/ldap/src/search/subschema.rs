@@ -361,12 +361,14 @@ mod tests {
                 .join(" ");
             assert!(
                 attr_types_blob.contains("1.3.6.1.4.1.15953.9.1.2")
-                    && (attr_types_blob.contains("'sudoHost'") || attr_types_blob.contains("sudoHost")),
+                    && (attr_types_blob.contains("'sudoHost'")
+                        || attr_types_blob.contains("sudoHost")),
                 "sudoHost (sudoers schema) attributeType missing from subschema"
             );
             assert!(
                 attr_types_blob.contains("2.16.840.1.113719.1.1.4.1.7")
-                    && (attr_types_blob.contains("'loginDisabled'") || attr_types_blob.contains("loginDisabled")),
+                    && (attr_types_blob.contains("'loginDisabled'")
+                        || attr_types_blob.contains("loginDisabled")),
                 "loginDisabled (NDS/eDirectory/SSSD) attributeType missing from subschema"
             );
         } else {

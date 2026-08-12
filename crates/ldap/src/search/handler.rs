@@ -31,7 +31,7 @@ where
     };
 
     let scope = get_search_scope(base_dn, &dn_parts, &request.scope, allowed_ous);
-    let schema = PublicSchema::get();
+    let schema = PublicSchema::shared();
     let include_op = request.attrs.iter().any(|a| {
         a == "+"
             || a.eq_ignore_ascii_case("hassubordinates")
@@ -103,7 +103,6 @@ where
             } else {
                 top_level_ous.clone()
             };
-            // FIX: apply OU filter so (ou=office) returns only office, not all (Problem 2)
             let ous_to_add: Vec<String> = ous_to_add
                 .into_iter()
                 .filter(|ou| ou_matches_filter(ou, &request.filter))
@@ -117,14 +116,14 @@ where
                     true,
                     &request.base,
                     backend,
-                    &schema,
+                    schema,
                 )
                 .await?;
                 results.extend(convert_users_to_ldap_op(
                     user_results,
                     &request.attrs,
                     ldap_info,
-                    &schema,
+                    schema,
                 ));
 
                 let group_results = crate::core::group::get_groups_list(
@@ -132,7 +131,7 @@ where
                     &request.filter,
                     &request.base,
                     backend,
-                    &schema,
+                    schema,
                 )
                 .await?;
                 results.extend(convert_groups_to_ldap_op(
@@ -140,7 +139,7 @@ where
                     &request.attrs,
                     ldap_info,
                     &None,
-                    &schema,
+                    schema,
                 ));
             }
 
@@ -152,7 +151,6 @@ where
             let internal_ou = crate::dn::get_internal_ou_from_dn_parts(&dn_parts);
 
             if request.scope == LdapSearchScope::Base {
-                // FIX: only include the OU entry if it matches the filter (Problem 2)
                 if ou_matches_filter(&internal_ou, &request.filter) {
                     let ou_entry = make_ou_entry(&internal_ou, &ldap_info.base_dn_str, include_op);
                     results.push(LdapOp::SearchResultEntry(ou_entry));
@@ -171,7 +169,6 @@ where
                         .cloned()
                         .collect()
                 };
-                // FIX: filter child OUs by the client filter (Problem 2)
                 let child_ous: Vec<String> = child_ous
                     .into_iter()
                     .filter(|ou| ou_matches_filter(ou, &request.filter))
@@ -190,11 +187,11 @@ where
                     true,
                     &request.base,
                     backend,
-                    &schema,
+                    schema,
                 )
                 .await?;
                 let mut user_ops: Vec<LdapOp> =
-                    convert_users_to_ldap_op(user_results, &request.attrs, ldap_info, &schema)
+                    convert_users_to_ldap_op(user_results, &request.attrs, ldap_info, schema)
                         .collect();
 
                 let group_results = crate::core::group::get_groups_list(
@@ -202,7 +199,7 @@ where
                     &request.filter,
                     &request.base,
                     backend,
-                    &schema,
+                    schema,
                 )
                 .await?;
                 let mut group_ops: Vec<LdapOp> = convert_groups_to_ldap_op(
@@ -210,7 +207,7 @@ where
                     &request.attrs,
                     ldap_info,
                     &None,
-                    &schema,
+                    schema,
                 )
                 .collect();
 
@@ -270,7 +267,6 @@ where
                 Ok(id) => id,
                 Err(_) => return Ok(vec![make_search_success()]),
             };
-            // FIX: existence check with specific filter (preserves NoSuchObject behavior)
             let specific_filter =
                 ldap3_proto::LdapFilter::Equality("uid".to_string(), user_id.to_string());
             let exists_users = crate::core::user::get_user_list(
@@ -279,7 +275,7 @@ where
                 true,
                 &request.base,
                 backend,
-                &schema,
+                schema,
             )
             .await?;
             if exists_users.is_empty() {
@@ -295,11 +291,11 @@ where
                 true,
                 &request.base,
                 backend,
-                &schema,
+                schema,
             )
             .await?;
             let mut results: Vec<LdapOp> =
-                convert_users_to_ldap_op(users, &request.attrs, ldap_info, &schema).collect();
+                convert_users_to_ldap_op(users, &request.attrs, ldap_info, schema).collect();
             // Post-filter to exact base DN (consistent with Container pattern, reusable)
             let base_lower = request.base.to_ascii_lowercase();
             results.retain(|op| {
@@ -339,7 +335,7 @@ where
                 &specific_filter,
                 &request.base,
                 backend,
-                &schema,
+                schema,
             )
             .await?;
             if exists_groups.is_empty() {
@@ -357,11 +353,11 @@ where
                 &request.filter,
                 &request.base,
                 backend,
-                &schema,
+                schema,
             )
             .await?;
             let mut results: Vec<LdapOp> =
-                convert_groups_to_ldap_op(groups, &request.attrs, ldap_info, &None, &schema)
+                convert_groups_to_ldap_op(groups, &request.attrs, ldap_info, &None, schema)
                     .collect();
 
             let base_lower = request.base.to_ascii_lowercase();

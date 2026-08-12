@@ -13,16 +13,9 @@ use lldap_domain::{
     },
 };
 use lldap_domain_handlers::handler::{
-    BackendHandler,
-    GroupBackendHandler,
-    GroupListerBackendHandler,
-    GroupRequestFilter,
-    PasswordHandler, // ← NEW: supertrait for own-password + editable attributes
-    ReadSchemaBackendHandler,
-    SchemaBackendHandler,
-    UserBackendHandler,
-    UserListerBackendHandler,
-    UserRequestFilter,
+    BackendHandler, GroupBackendHandler, GroupListerBackendHandler, GroupRequestFilter,
+    PasswordHandler, ReadSchemaBackendHandler, SchemaBackendHandler, UserBackendHandler,
+    UserListerBackendHandler, UserRequestFilter,
 };
 use lldap_domain_model::error::Result;
 use lldap_opaque_handler::OpaqueHandler;
@@ -55,11 +48,7 @@ pub trait UserWriteableBackendHandler: UserReadableBackendHandler {
 
 #[async_trait]
 pub trait AdminBackendHandler:
-    UserWriteableBackendHandler
-    + ReadonlyBackendHandler
-    + UserWriteableBackendHandler
-    + SchemaBackendHandler
-    + OpaqueHandler
+    UserWriteableBackendHandler + ReadonlyBackendHandler + SchemaBackendHandler + OpaqueHandler
 {
     async fn create_user(&self, request: CreateUserRequest) -> Result<()>;
     async fn delete_user(&self, user_id: &UserId) -> Result<()>;

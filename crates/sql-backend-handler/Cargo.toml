@@ -9,9 +9,6 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-[features]
-test = []
-
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
@@ -19,7 +16,6 @@ base64 = { workspace = true }
 bincode = { workspace = true }
 chrono = { workspace = true }
 itertools = { workspace = true }
-ldap3_proto = { workspace = true }
 orion = { workspace = true }
 rand = { workspace = true }
 secstr = { workspace = true }

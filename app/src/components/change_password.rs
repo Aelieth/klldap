@@ -40,8 +40,8 @@ pub struct SyncKerberosPassword;
 enum OpaqueData {
     #[default]
     None,
-    Login(opaque::client::login::ClientLogin),
-    Registration(opaque::client::registration::ClientRegistration),
+    Login(Box<opaque::client::login::ClientLogin>),
+    Registration(Box<opaque::client::registration::ClientRegistration>),
 }
 
 impl OpaqueData {
@@ -128,7 +128,7 @@ impl CommonComponent<ChangePasswordForm> for ChangePasswordForm {
                         username: ctx.props().username.clone().into(),
                         login_start_request: login_start.message,
                     };
-                    self.opaque_data = OpaqueData::Login(login_start.state);
+                    self.opaque_data = OpaqueData::Login(Box::new(login_start.state));
                     self.common.call_backend(
                         ctx,
                         HostService::login_start(req),
@@ -140,7 +140,7 @@ impl CommonComponent<ChangePasswordForm> for ChangePasswordForm {
             Msg::LoginStartResponse(res) => {
                 let res = res.context("Old password verification failed")?;
                 let login_state = match self.opaque_data.take() {
-                    OpaqueData::Login(s) => s,
+                    OpaqueData::Login(s) => *s,
                     _ => bail!("Invalid state"),
                 };
                 let login_finish = opaque::client::login::finish_login(
@@ -196,7 +196,8 @@ impl CommonComponent<ChangePasswordForm> for ChangePasswordForm {
                     username: ctx.props().username.clone().into(),
                     registration_start_request: registration_start_request.message,
                 };
-                self.opaque_data = OpaqueData::Registration(registration_start_request.state);
+                self.opaque_data =
+                    OpaqueData::Registration(Box::new(registration_start_request.state));
                 self.common.call_backend(
                     ctx,
                     HostService::register_start(req),
@@ -207,7 +208,7 @@ impl CommonComponent<ChangePasswordForm> for ChangePasswordForm {
             Msg::RegistrationStartResponse(res) => {
                 let res = res.context("Could not initiate registration")?;
                 let registration = match self.opaque_data.take() {
-                    OpaqueData::Registration(r) => r,
+                    OpaqueData::Registration(r) => *r,
                     _ => bail!("Invalid state"),
                 };
                 let registration_finish = opaque::client::registration::finish_registration(

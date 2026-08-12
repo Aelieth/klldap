@@ -151,7 +151,7 @@ impl Component for UserDetailsForm {
                         }
                     }
                     Err(e) => {
-                        self.common.error = Some(e.into());
+                        self.common.error = Some(e);
                     }
                 }
                 true
@@ -266,13 +266,12 @@ impl UserDetailsForm {
                 continue;
             }
 
-            if name_lower == "avatar" {
-                if attr.values.is_empty()
-                    || attr.values.first().map_or(true, |s| s.trim().is_empty())
-                {
-                    to_remove.push(attr.name.clone());
-                    continue;
-                }
+            if name_lower == "avatar"
+                && (attr.values.is_empty()
+                    || attr.values.first().is_none_or(|s| s.trim().is_empty()))
+            {
+                to_remove.push(attr.name.clone());
+                continue;
             }
 
             if attr.values.is_empty() {
@@ -338,12 +337,12 @@ impl UserDetailsForm {
         let user_input = update_user::UpdateUserInput {
             id: self.user.id.clone(),
             email: None,
-            display_name: display_name,
+            display_name,
             first_name: None,
             last_name: None,
             avatar,
-            remove_attributes: remove_attributes,
-            insert_attributes: insert_attributes,
+            remove_attributes,
+            insert_attributes,
         };
 
         let req = update_user::Variables { user: user_input };

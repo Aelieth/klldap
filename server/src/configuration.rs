@@ -1,4 +1,3 @@
-#![forbid(unsafe_code)]
 use crate::{
     cli::{
         GeneralConfigOpts, HealthcheckOpts, LdapsOpts, RunOpts, SmtpEncryption, SmtpOpts,
@@ -742,6 +741,7 @@ where
 }
 
 #[cfg(test)]
+#[allow(clippy::result_large_err)]
 mod tests {
     use super::*;
     use clap::Parser;
@@ -820,7 +820,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::result_large_err)]
     fn figment_location_extraction_key_file() {
         Jail::expect_with(|jail| {
             jail.create_file("lldap_config.toml", r#"key_file = "test""#)?;
@@ -853,7 +852,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::result_large_err)]
     fn check_server_setup_key_extraction_seed_success_with_nonexistant_file() {
         Jail::expect_with(|jail| {
             jail.create_file("lldap_config.toml", r#"key_file = "test""#)?;
@@ -866,7 +864,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::result_large_err)]
     fn check_server_setup_key_extraction_seed_failure_with_existing_file() {
         Jail::expect_with(|jail| {
             jail.create_file("lldap_config.toml", r#"key_file = "test""#)?;
@@ -880,7 +877,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::result_large_err)]
     fn check_server_setup_key_extraction_file_success_with_existing_file() {
         Jail::expect_with(|jail| {
             jail.create_file("lldap_config.toml", r#"key_file = "test""#)?;
@@ -898,7 +894,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::result_large_err)]
     fn check_server_setup_key_extraction_file_success_with_nonexistent_file() {
         Jail::expect_with(|jail| {
             jail.create_file("lldap_config.toml", r#"key_file = "test""#)?;
@@ -924,9 +919,7 @@ mod tests {
         let k1 = generate_random_private_key();
         let k2 = generate_random_private_key();
         let hash = |k: &ServerSetup| {
-            PrivateKeyHash(stable_hash(
-                k.keypair().private().serialize().as_ref(),
-            ))
+            PrivateKeyHash(stable_hash(k.keypair().private().serialize().as_ref()))
         };
         let info1 = PrivateKeyInfo {
             private_key_hash: hash(&k1),
@@ -936,7 +929,9 @@ mod tests {
             private_key_hash: hash(&k2),
             private_key_location: loc,
         };
-        let err = compare_private_key_hashes(Some(&info1), &info2).unwrap_err().to_string();
+        let err = compare_private_key_hashes(Some(&info1), &info2)
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("The contents of the private key file from \"test\" have changed"),
             "{err}"
@@ -944,7 +939,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::result_large_err)]
     fn check_server_setup_key_extraction_file_to_seed() {
         Jail::expect_with(|jail| {
             jail.clear_env();
@@ -963,7 +957,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::result_large_err)]
     fn check_server_setup_key_extraction_file_to_seed_removed_file() {
         Jail::expect_with(|jail| {
             jail.clear_env();

@@ -488,16 +488,16 @@ impl SchemaManager {
     // ========================================================================
 
     pub fn get_all_user_attributes(&self) -> Vec<lldap_schema::AttributeSchema> {
-        PublicSchema::get().user_attributes().attributes.clone()
+        PublicSchema::shared().user_attributes().attributes.clone()
     }
 
     pub fn get_all_group_attributes(&self) -> Vec<lldap_schema::AttributeSchema> {
-        PublicSchema::get().group_attributes().attributes.clone()
+        PublicSchema::shared().group_attributes().attributes.clone()
     }
 }
 
 impl Default for SchemaManager {
     fn default() -> Self {
-        Self::new(&PublicSchema::get())
+        Self::new(PublicSchema::shared())
     }
 }

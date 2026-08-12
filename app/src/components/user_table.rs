@@ -180,7 +180,7 @@ impl UserTable {
     fn get_kerberos_sync(user: &User) -> bool {
         Self::get_attribute_value(user, "kerberossync")
             .and_then(|v| v.parse::<i64>().ok())
-            .map_or(false, |i| i != 0)
+            .is_some_and(|i| i != 0)
     }
 
     fn get_ou(user: &User) -> String {

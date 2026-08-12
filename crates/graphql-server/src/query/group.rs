@@ -1,6 +1,6 @@
 use super::attribute::AttributeValue;
 use crate::api::{Context, field_error_callback};
-use crate::query::user::User; // ← absolute crate-root path (breaks cycle 100%)
+use crate::query::user::User;
 use chrono::TimeZone;
 use juniper::{FieldResult, graphql_object};
 use lldap_access_control::ReadonlyBackendHandler;
@@ -20,7 +20,7 @@ pub struct Group<Handler: BackendHandler> {
     creation_date: chrono::NaiveDateTime,
     uuid: String,
     attributes: Vec<AttributeValue<Handler>>,
-    pub member_count: i32, // ← NEW: real member count for group_table.rs
+    pub member_count: i32,
     pub schema: Arc<PublicSchema>,
     _phantom: std::marker::PhantomData<Box<Handler>>,
 }
@@ -38,7 +38,7 @@ impl<Handler: BackendHandler> Group<Handler> {
             creation_date: group.creation_date,
             uuid: group.uuid.into_string(),
             attributes,
-            member_count: group.users.len() as i32, // ← computed from existing users vector
+            member_count: group.users.len() as i32,
             schema,
             _phantom: std::marker::PhantomData,
         })

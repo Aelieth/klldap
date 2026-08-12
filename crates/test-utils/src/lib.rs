@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 use async_trait::async_trait;
 use lldap_domain::{
     requests::{

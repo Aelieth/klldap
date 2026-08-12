@@ -57,8 +57,6 @@ impl KeycloakClient {
         );
         let token = self.acquire_token().await?;
 
-        // 1. Check if realm already exists — error out to prevent accidental overwrite / data loss.
-        // Professional safeguard: explicit existence check before any mutation.
         if self.realm_exists(&token).await? {
             return Err(anyhow::anyhow!(
                 "Realm '{}' already exists. Delete the realm manually in Keycloak admin console to proceed.",
@@ -66,29 +64,15 @@ impl KeycloakClient {
             ));
         }
 
-        // 2. Create the realm (clean slate)
         self.create_realm(&token, enable_hsts, enable_brute_force)
             .await?;
 
-        // 3. Create LDAP + Kerberos component and retrieve its ID for mapper parenting
         let provider_id = self
             .create_ldap_kerberos_component(&token, &lldap_url, &sync_username, &sync_password)
             .await?;
 
-        // 4. Clear ALL default "dumb" Keycloak auto-created mappers (firstName<->cn oddities, generic ones, etc.)
-        // This gives us a pristine provider to attach our schema-aligned custom mappers.
         self.clear_default_mappers(&token, &provider_id).await?;
-
-        // 5. Create precise, standards-based custom mappers
-        //    - LDAP inetOrgPerson / core: givenName→firstName, sn→lastName, mail→email, uid→username, cn→displayName
-        //    - POSIX: uidNumber, gidNumber, homeDirectory, loginShell
-        //    - Kerberos: krbPrincipalName
-        //    - Extras from our schema: sshPublicKey (multivalued), ou, kerberossync
-        // Uses exact Keycloak component JSON syntax (config values as string arrays).
-        // userObjectClasses kept as single comma-separated string inside array element (proven working syntax).
         self.create_custom_mappers(&token, &provider_id).await?;
-
-        // 6. Add lldap-web public client (unchanged)
         self.add_lldap_web_client(&token).await?;
 
         let msg = format!(
@@ -301,9 +285,6 @@ impl KeycloakClient {
         Ok(provider_id)
     }
 
-    /// Deletes every auto-created default mapper under the LDAP provider.
-    /// This removes Keycloak's generic/dumb mappings (e.g. cn → firstName weirdness) so our
-    /// schema-precise ones take full control.
     async fn clear_default_mappers(&self, token: &str, provider_id: &str) -> Result<()> {
         info!("   → Clearing default Keycloak mappers...");
 
@@ -362,18 +343,10 @@ impl KeycloakClient {
         Ok(())
     }
 
-    /// Creates our custom, exact, standards-compliant attribute mappers.
-    /// Built directly from LLDAP PublicSchema + preferred LDAP names + POSIX/Kerberos standards.
-    /// - Fixes firstName/lastName mapping (givenName/sn instead of cn weirdness)
-    /// - Exposes POSIX, SSH (multivalued), OU, Kerberos principal, kerberossync as first-class user attributes
-    /// - All mappers marked read-only + always read from LDAP (correct for our READ_ONLY federation)
     async fn create_custom_mappers(&self, token: &str, provider_id: &str) -> Result<()> {
         info!("   → Creating custom schema-aligned mappers...");
 
-        // Exact Keycloak component JSON for user-attribute-ldap-mapper.
-        // config values are always Vec<String>. multivalued supported for sshPublicKey etc.
         let custom_mappers = vec![
-            // === Core identity (prevents cn→firstName oddball) ===
             json!({
                 "name": "first name",
                 "providerId": "user-attribute-ldap-mapper",
@@ -439,7 +412,6 @@ impl KeycloakClient {
                     "is.mandatory.in.ldap": ["false"]
                 }
             }),
-            // === POSIX (RFC2307) for scripts, home dirs, shells, numeric IDs in SSO/tokens ===
             json!({
                 "name": "uid number",
                 "providerId": "user-attribute-ldap-mapper",
@@ -492,7 +464,6 @@ impl KeycloakClient {
                     "is.mandatory.in.ldap": ["false"]
                 }
             }),
-            // === Kerberos principal (for SPNEGO / SSO) ===
             json!({
                 "name": "krb principal name",
                 "providerId": "user-attribute-ldap-mapper",
@@ -506,7 +477,6 @@ impl KeycloakClient {
                     "is.mandatory.in.ldap": ["false"]
                 }
             }),
-            // === SSH public keys (multivalued, from our schema) ===
             json!({
                 "name": "ssh public key",
                 "providerId": "user-attribute-ldap-mapper",
@@ -521,7 +491,6 @@ impl KeycloakClient {
                     "multivalued": ["true"]
                 }
             }),
-            // === OU (for custom/nested OU awareness in tokens or downstream apps) ===
             json!({
                 "name": "ou",
                 "providerId": "user-attribute-ldap-mapper",
@@ -535,7 +504,6 @@ impl KeycloakClient {
                     "is.mandatory.in.ldap": ["false"]
                 }
             }),
-            // === kerberossync flag (used by our search filter; exposed for completeness) ===
             json!({
                 "name": "kerberos sync",
                 "providerId": "user-attribute-ldap-mapper",

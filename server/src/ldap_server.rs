@@ -1,4 +1,3 @@
-#![forbid(unsafe_code)]
 use crate::configuration::{Configuration, LdapsOptions};
 use crate::tls;
 use actix_rt::net::TcpStream;

@@ -42,7 +42,7 @@ mod error_tests {
     #[test]
     fn ldap_result_type_works() {
         let ok: LdapResult<i32> = Ok(42);
-        assert_eq!(ok.unwrap(), 42);
+        assert!(matches!(ok, Ok(42)));
 
         let err: LdapResult<()> = Err(LdapError {
             code: LdapResultCode::Other,

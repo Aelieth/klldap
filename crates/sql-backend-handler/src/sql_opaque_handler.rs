@@ -437,6 +437,9 @@ mod tests {
             .await
             .unwrap_err();
         let msg = format!("{err}");
-        assert!(msg.contains("disabled") || msg.contains("Account disabled"), "unexpected error: {msg}");
+        assert!(
+            msg.contains("disabled") || msg.contains("Account disabled"),
+            "unexpected error: {msg}"
+        );
     }
 }

@@ -78,10 +78,10 @@ pub fn ou_selector(props: &OuSelectorProps) -> Html {
         <select
             class="form-select"
             onchange={props.on_ou_changed.reform(|e: Event| {
-                let value = e.target().unwrap()
+
+                e.target().unwrap()
                     .dyn_into::<web_sys::HtmlSelectElement>().unwrap()
-                    .value();
-                value
+                    .value()
             })}>
             { for display_ous.iter().map(|(display, value)| html! {
                 <option value={value.clone()} selected={value == &props.current_ou}>

@@ -1,4 +1,3 @@
-// crates/graphql-server/src/query/user.rs
 use super::attribute::AttributeValue;
 use super::group::Group;
 use crate::api::Context;
@@ -93,8 +92,6 @@ impl<Handler: BackendHandler + OpaqueHandler> User<Handler> {
     }
 
     fn avatar(&self) -> Option<String> {
-        // Use the same serialization as the attributes list (proper base64 via avatar_to_graphql_base64)
-        // This ensures the top-level avatar field returns clean JPEG base64, matching what the attributes[] list produces.
         self.attributes
             .iter()
             .find(|a| a.name() == "avatar")

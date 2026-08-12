@@ -1,4 +1,3 @@
-#![forbid(unsafe_code)]
 use crate::{
     tcp_backend_handler::*,
     tcp_server::{AppState, TcpError, TcpResult, error_to_http_response},
@@ -91,7 +90,12 @@ fn get_refresh_token(request: HttpRequest) -> TcpResult<(u64, UserId)> {
         request.headers().get("refresh-token"),
     ) {
         (Some(c), _) => parse_refresh_token(c.value()),
-        (_, Some(t)) => parse_refresh_token(t.to_str().unwrap()),
+        (_, Some(t)) => match t.to_str() {
+            Ok(t) => parse_refresh_token(t),
+            Err(_) => {
+                Err(DomainError::AuthenticationError("Invalid refresh token".to_string()).into())
+            }
+        },
         (None, None) => {
             Err(DomainError::AuthenticationError("Missing refresh token".to_string()).into())
         }

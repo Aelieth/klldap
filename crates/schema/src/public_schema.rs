@@ -1,11 +1,22 @@
 use crate::schema::{AttributeList, AttributeSchema, AttributeType, PosixSettings, Schema};
 use serde::{Deserialize, Serialize};
+use std::sync::LazyLock;
 
 #[derive(PartialEq, Eq, Debug, Serialize, Deserialize, Clone)]
 pub struct PublicSchema(pub Schema);
 
 impl PublicSchema {
     pub fn get() -> Self {
+        Self::shared().clone()
+    }
+
+    /// Shared static instance — the schema is a compile-time constant.
+    pub fn shared() -> &'static Self {
+        static SCHEMA: LazyLock<PublicSchema> = LazyLock::new(PublicSchema::build);
+        &SCHEMA
+    }
+
+    fn build() -> Self {
         PublicSchema(Schema {
             user_attributes: AttributeList {
                 attributes: vec![
@@ -268,7 +279,7 @@ impl PublicSchema {
                     },
                 ],
             },
-            // ==================== NEW SYSTEM SECTION ====================
+            // ==================== SYSTEM ATTRIBUTES ====================
             system_attributes: AttributeList {
                 attributes: vec![AttributeSchema {
                     name: "allowedous".into(),

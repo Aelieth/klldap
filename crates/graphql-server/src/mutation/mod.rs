@@ -26,7 +26,7 @@ use lldap_domain::{
 use lldap_domain_handlers::handler::{BackendHandler, ReadSchemaBackendHandler, UserRequestFilter};
 use lldap_kerberos::{decrypt_password, sync_kerberos_principal};
 use lldap_opaque_handler::OpaqueHandler;
-use lldap_schema::PublicSchema;
+use lldap_schema::schema::AttributeList;
 use lldap_validation::attributes::{ALLOWED_CHARACTERS_DESCRIPTION, validate_attribute_name};
 use std::sync::Arc;
 use tracing::{Instrument, debug, debug_span, info, warn};
@@ -124,28 +124,6 @@ impl<Handler: BackendHandler + OpaqueHandler> Default for Mutation<Handler> {
             _phantom: std::marker::PhantomData,
         }
     }
-}
-
-fn extract_kerberos_sync(schema: &PublicSchema, attrs: &[lldap_domain::types::Attribute]) -> bool {
-    let kerb_name = schema
-        .user_attributes()
-        .get_by_name_or_alias("kerberossync")
-        .map(|a| a.name.as_str())
-        .unwrap_or("kerberossync");
-
-    attrs
-        .iter()
-        .find(|a| a.name.as_str() == kerb_name)
-        .and_then(|a| match &a.value {
-            lldap_domain::types::AttributeValue::Integer(
-                lldap_domain::types::Cardinality::Singleton(i),
-            ) if *i == 1 => Some(true),
-            lldap_domain::types::AttributeValue::String(
-                lldap_domain::types::Cardinality::Singleton(s),
-            ) if s == "1" || s.to_lowercase() == "true" => Some(true),
-            _ => None,
-        })
-        .unwrap_or(false)
 }
 
 #[graphql_object(context = Context<Handler>)]
@@ -267,8 +245,8 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             .get_user_details(&target_user_id)
             .await
             .context("Failed to fetch user for Kerberos sync check")?;
-        let schema = handler.get_schema().await?;
-        let sync_enabled = extract_kerberos_sync(&schema, &user.attributes);
+        let sync_enabled =
+            lldap_domain::types::kerberos_sync_enabled(&user.attributes, "kerberossync");
 
         // Real Kerberos sync
         if let Err(e) = lldap_kerberos::sync_kerberos_if_enabled(sync_enabled, &user_id, &password)
@@ -282,9 +260,15 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         }
 
         let inner = UserWriteableBackendHandler::unsafe_get_handler(handler);
-        let _ = inner
+        if let Err(e) = inner
             .ensure_kerberos_principal_consistency(&target_user_id, sync_enabled)
-            .await;
+            .await
+        {
+            warn!(
+                "Failed to record Kerberos principal name for {}: {}",
+                target_user_id, e
+            );
+        }
 
         Ok(Success::new())
     }
@@ -390,20 +374,12 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             })
         });
 
-        // Name-based protection for all built-in groups (replaces fragile id==1 check)
-        if new_display_name.is_some() {
-            if let Ok(details) = handler.get_group_details(GroupId(group.id)).await {
-                if is_builtin_group(details.display_name.as_str()) {
-                    span.in_scope(|| {
-                        debug!("Cannot rename built-in group '{}'", details.display_name)
-                    });
-                    return Err(format!(
-                        "Cannot rename built-in group '{}'",
-                        details.display_name
-                    )
-                    .into());
-                }
-            }
+        if new_display_name.is_some()
+            && let Ok(details) = handler.get_group_details(GroupId(group.id)).await
+            && is_builtin_group(details.display_name.as_str())
+        {
+            span.in_scope(|| debug!("Cannot rename built-in group '{}'", details.display_name));
+            return Err(format!("Cannot rename built-in group '{}'", details.display_name).into());
         }
 
         let schema = handler.get_schema().await?;
@@ -486,16 +462,12 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         if is_lldap_admin {
             // Prevent emptying the admin group entirely (last member protection)
             if let Ok(members) = handler
-                .list_users(
-                    Some(UserRequestFilter::MemberOfId(target_group_id)),
-                    false,
-                )
+                .list_users(Some(UserRequestFilter::MemberOfId(target_group_id)), false)
                 .await
+                && members.len() <= 1
             {
-                if members.len() <= 1 {
-                    span.in_scope(|| debug!("Cannot remove the last member of lldap_admin"));
-                    return Err("Cannot remove the last member of lldap_admin".into());
-                }
+                span.in_scope(|| debug!("Cannot remove the last member of lldap_admin"));
+                return Err("Cannot remove the last member of lldap_admin".into());
             }
 
             // Preserve existing UX: a user cannot remove their own admin rights (when >1 admins)
@@ -527,7 +499,6 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             return Err("Cannot delete current user".into());
         }
 
-        // The SQL backend now owns Kerberos principal cleanup (delete_user guard).
         handler
             .delete_user(&user_id_typed)
             .instrument(span.clone())
@@ -552,12 +523,11 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             .get_admin_handler()
             .ok_or_else(field_error_callback(&span, "Unauthorized group deletion"))?;
 
-        // Name-based protection for all built-in groups (replaces fragile id==1 check)
-        if let Ok(details) = handler.get_group_details(GroupId(group_id)).await {
-            if is_builtin_group(details.display_name.as_str()) {
-                span.in_scope(|| debug!("Cannot delete built-in group '{}'", details.display_name));
-                return Err(format!("Cannot delete built-in group '{}'", details.display_name).into());
-            }
+        if let Ok(details) = handler.get_group_details(GroupId(group_id)).await
+            && is_builtin_group(details.display_name.as_str())
+        {
+            span.in_scope(|| debug!("Cannot delete built-in group '{}'", details.display_name));
+            return Err(format!("Cannot delete built-in group '{}'", details.display_name).into());
         }
 
         handler
@@ -929,28 +899,7 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             ))?;
 
         let schema = handler.get_schema().await?;
-
-        // === STRICTER #1202 FIX: No duplicate names at all across user/group ===
-        if schema
-            .group_attributes()
-            .get_by_name_or_alias(&name)
-            .is_some()
-        {
-            return Err(anyhow!(
-                "Attribute '{}' already exists in the group schema. Duplicate names are not allowed across user and group attributes.",
-                name
-            ).into());
-        }
-
-        validate_attribute_name(&name).map_err(|invalid_chars: Vec<char>| -> FieldError {
-            let chars = String::from_iter(invalid_chars);
-            anyhow!(
-                "Cannot create attribute with invalid name. Valid characters: {}. Invalid chars found: {}",
-                ALLOWED_CHARACTERS_DESCRIPTION,
-                chars
-            )
-            .into()
-        })?;
+        validate_new_attribute_name(&name, schema.group_attributes(), "group")?;
 
         handler
             .add_user_attribute(CreateAttributeRequest {
@@ -984,28 +933,7 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             ))?;
 
         let schema = handler.get_schema().await?;
-
-        // === STRICTER #1202 FIX: No duplicate names at all across user/group ===
-        if schema
-            .user_attributes()
-            .get_by_name_or_alias(&name)
-            .is_some()
-        {
-            return Err(anyhow!(
-                "Attribute '{}' already exists in the user schema. Duplicate names are not allowed across user and group attributes.",
-                name
-            ).into());
-        }
-
-        validate_attribute_name(&name).map_err(|invalid_chars: Vec<char>| -> FieldError {
-            let chars = String::from_iter(invalid_chars);
-            anyhow!(
-                "Cannot create attribute with invalid name. Valid characters: {}. Invalid chars found: {}",
-                ALLOWED_CHARACTERS_DESCRIPTION,
-                chars
-            )
-            .into()
-        })?;
+        validate_new_attribute_name(&name, schema.user_attributes(), "user")?;
 
         handler
             .add_group_attribute(CreateAttributeRequest {
@@ -1035,7 +963,7 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
                 "Unauthorized attribute deletion",
             ))?;
 
-        let schema = handler.get_schema().await?; // live PublicSchema — 17+ attributes (custom + POSIX + Kerberos)
+        let schema = handler.get_schema().await?;
 
         let attribute_schema = schema
             .user_attributes()
@@ -1067,7 +995,7 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
                 "Unauthorized attribute deletion",
             ))?;
 
-        let schema = handler.get_schema().await?; // live PublicSchema — 17+ attributes (custom + POSIX + Kerberos)
+        let schema = handler.get_schema().await?;
 
         let attribute_schema = schema
             .group_attributes()
@@ -1200,8 +1128,8 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
                 )
             })?;
 
-        let schema = handler.get_schema().await?;
-        let sync_enabled = extract_kerberos_sync(&schema, &user.attributes);
+        let sync_enabled =
+            lldap_domain::types::kerberos_sync_enabled(&user.attributes, "kerberossync");
 
         if sync_enabled {
             sync_kerberos_principal(&user_id, &plain_password).map_err(|e| {
@@ -1222,19 +1150,29 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         }
 
         let inner = UserWriteableBackendHandler::unsafe_get_handler(handler);
-        let _ = inner
+        if let Err(e) = inner
             .ensure_kerberos_principal_consistency(&target_user_id, sync_enabled)
-            .await;
+            .await
+        {
+            warn!(
+                "Failed to record Kerberos principal name for {}: {}",
+                target_user_id, e
+            );
+        }
 
         Ok(true)
     }
 
     async fn export_keytab_for_keycloak(
-        _context: &Context<Handler>,
+        context: &Context<Handler>,
         hostname: String,
     ) -> FieldResult<ExportKeytabForKeycloakResponse> {
         let span = debug_span!("[GraphQL mutation] export_keytab_for_keycloak");
         span.in_scope(|| debug!("Hostname input: {}", &hostname));
+
+        context
+            .get_admin_handler()
+            .ok_or_else(field_error_callback(&span, "Unauthorized keytab export"))?;
 
         match lldap_kerberos::export_keytab_for_keycloak(&hostname) {
             Ok(path) => Ok(ExportKeytabForKeycloakResponse {
@@ -1254,9 +1192,17 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
     }
 
     async fn test_keycloak_connection(
-        _context: &Context<Handler>,
+        context: &Context<Handler>,
         input: TestKeycloakConnectionInput,
     ) -> FieldResult<TestKeycloakConnectionResponse> {
+        let span = debug_span!("[GraphQL mutation] test_keycloak_connection");
+        context
+            .get_admin_handler()
+            .ok_or_else(field_error_callback(
+                &span,
+                "Unauthorized Keycloak connection test",
+            ))?;
+
         let client = lldap_kerberos::KeycloakClient::from_test_input(
             input.url,
             input.realm,
@@ -1274,9 +1220,17 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
     }
 
     async fn save_keycloak_config(
-        _context: &Context<Handler>,
+        context: &Context<Handler>,
         input: SaveKeycloakConfigInput,
     ) -> FieldResult<SaveKeycloakConfigResponse> {
+        let span = debug_span!("[GraphQL mutation] save_keycloak_config");
+        context
+            .get_admin_handler()
+            .ok_or_else(field_error_callback(
+                &span,
+                "Unauthorized Keycloak config change",
+            ))?;
+
         let config = lldap_kerberos::KeycloakConfig {
             url: input.url,
             realm: input.realm,
@@ -1296,9 +1250,17 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
     }
 
     async fn push_realm_to_keycloak(
-        _context: &Context<Handler>,
+        context: &Context<Handler>,
         input: PushRealmToKeycloakInput,
     ) -> FieldResult<PushRealmResponse> {
+        let span = debug_span!("[GraphQL mutation] push_realm_to_keycloak");
+        context
+            .get_admin_handler()
+            .ok_or_else(field_error_callback(
+                &span,
+                "Unauthorized Keycloak realm push",
+            ))?;
+
         let client = lldap_kerberos::KeycloakClient::from_test_input(
             input.url,
             input.realm,
@@ -1414,17 +1376,11 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
 
         let inner = AdminBackendHandler::unsafe_get_handler(handler);
 
-        inner.reassign_user_uid_numbers().await.map_err(|e| {
-            FieldError::new(
-                "Failed to reassign user uidNumbers",
-                graphql_value!({ "details": (e.to_string()) }),
-            )
-        })?;
-
-        Ok(PosixSettingsResponse {
-            success: true,
-            message: "✅ All user uidNumbers have been reassigned".to_string(),
-        })
+        posix_reassign_response(
+            inner.reassign_user_uid_numbers().await,
+            "Failed to reassign user uidNumbers",
+            "✅ All user uidNumbers have been reassigned",
+        )
     }
 
     async fn reassign_user_gid_numbers(
@@ -1442,17 +1398,11 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
 
         let inner = AdminBackendHandler::unsafe_get_handler(handler);
 
-        inner.reassign_user_gid_numbers().await.map_err(|e| {
-            FieldError::new(
-                "Failed to reassign user gidNumbers",
-                graphql_value!({ "details": (e.to_string()) }),
-            )
-        })?;
-
-        Ok(PosixSettingsResponse {
-            success: true,
-            message: "✅ All user gidNumbers have been reassigned".to_string(),
-        })
+        posix_reassign_response(
+            inner.reassign_user_gid_numbers().await,
+            "Failed to reassign user gidNumbers",
+            "✅ All user gidNumbers have been reassigned",
+        )
     }
 
     async fn reassign_user_homedirectories(
@@ -1470,17 +1420,11 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
 
         let inner = AdminBackendHandler::unsafe_get_handler(handler);
 
-        inner.reassign_user_homedirectories().await.map_err(|e| {
-            FieldError::new(
-                "Failed to reassign user homeDirectories",
-                graphql_value!({ "details": (e.to_string()) }),
-            )
-        })?;
-
-        Ok(PosixSettingsResponse {
-            success: true,
-            message: "✅ All user homeDirectories have been reassigned".to_string(),
-        })
+        posix_reassign_response(
+            inner.reassign_user_homedirectories().await,
+            "Failed to reassign user homeDirectories",
+            "✅ All user homeDirectories have been reassigned",
+        )
     }
 
     async fn reassign_user_loginshells(
@@ -1498,17 +1442,11 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
 
         let inner = AdminBackendHandler::unsafe_get_handler(handler);
 
-        inner.reassign_user_loginshells().await.map_err(|e| {
-            FieldError::new(
-                "Failed to reassign user loginShells",
-                graphql_value!({ "details": (e.to_string()) }),
-            )
-        })?;
-
-        Ok(PosixSettingsResponse {
-            success: true,
-            message: "✅ All user loginShells have been reassigned".to_string(),
-        })
+        posix_reassign_response(
+            inner.reassign_user_loginshells().await,
+            "Failed to reassign user loginShells",
+            "✅ All user loginShells have been reassigned",
+        )
     }
 
     async fn reassign_gid_numbers(
@@ -1526,18 +1464,51 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
 
         let inner = AdminBackendHandler::unsafe_get_handler(handler);
 
-        inner.reassign_gid_numbers().await.map_err(|e| {
-            FieldError::new(
-                "Failed to reassign gidNumbers",
-                graphql_value!({ "details": (e.to_string()) }),
-            )
-        })?;
-
-        Ok(PosixSettingsResponse {
-            success: true,
-            message: "✅ All group gidNumbers have been reassigned".to_string(),
-        })
+        posix_reassign_response(
+            inner.reassign_gid_numbers().await,
+            "Failed to reassign gidNumbers",
+            "✅ All group gidNumbers have been reassigned",
+        )
     }
+}
+
+fn posix_reassign_response<E: std::fmt::Display>(
+    result: Result<(), E>,
+    failure_msg: &str,
+    success_msg: &str,
+) -> FieldResult<PosixSettingsResponse> {
+    result.map_err(|e| {
+        FieldError::new(failure_msg, graphql_value!({ "details": (e.to_string()) }))
+    })?;
+    Ok(PosixSettingsResponse {
+        success: true,
+        message: success_msg.to_string(),
+    })
+}
+
+fn validate_new_attribute_name(
+    name: &str,
+    other_schema: &AttributeList,
+    other_side: &str,
+) -> FieldResult<()> {
+    if other_schema.get_by_name_or_alias(name).is_some() {
+        return Err(anyhow!(
+            "Attribute '{}' already exists in the {} schema. Duplicate names are not allowed across user and group attributes.",
+            name,
+            other_side
+        )
+        .into());
+    }
+    validate_attribute_name(name).map_err(|invalid_chars: Vec<char>| -> FieldError {
+        let chars = String::from_iter(invalid_chars);
+        anyhow!(
+            "Cannot create attribute with invalid name. Valid characters: {}. Invalid chars found: {}",
+            ALLOWED_CHARACTERS_DESCRIPTION,
+            chars
+        )
+        .into()
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]

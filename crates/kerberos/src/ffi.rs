@@ -40,6 +40,18 @@ pub(crate) struct Kadm5Handle {
     pub context: krb5_context,
 }
 
+// SAFETY: fetches the krb5 error message for a return code and frees it exactly once.
+fn krb5_error_string(context: krb5_context, ret: i64) -> String {
+    let msg_ptr = unsafe { krb5_get_error_message(context, ret as i32) };
+    if msg_ptr.is_null() {
+        format!("code {}", ret)
+    } else {
+        let s = unsafe { CStr::from_ptr(msg_ptr).to_string_lossy().into_owned() };
+        unsafe { krb5_free_error_message(context, msg_ptr) };
+        s
+    }
+}
+
 impl Kadm5Handle {
     pub fn init_with_keytab(keytab_path: &str, admin_principal: &str, realm: &str) -> Result<Self> {
         let mut context: krb5_context = ptr::null_mut();
@@ -87,15 +99,7 @@ impl Kadm5Handle {
         }
 
         if ret != 0 {
-            let code = ret as i32;
-            let msg_ptr = unsafe { krb5_get_error_message(context, code) };
-            let err_msg = if msg_ptr.is_null() {
-                format!("code {}", ret)
-            } else {
-                let s = unsafe { CStr::from_ptr(msg_ptr).to_string_lossy().into_owned() };
-                unsafe { krb5_free_error_message(context, msg_ptr) };
-                s
-            };
+            let err_msg = krb5_error_string(context, ret as i64);
             warn!("kadm5_init_with_skey failed with code {}: {}", ret, err_msg);
             unsafe { krb5_free_context(context) };
             return Err(anyhow::anyhow!("kadm5_init_with_skey failed: {}", err_msg));
@@ -133,15 +137,7 @@ impl Kadm5Handle {
         unsafe { krb5_free_principal(self.context, princ) };
 
         if ret != 0 {
-            let code = ret as i32;
-            let msg_ptr = unsafe { krb5_get_error_message(self.context, code) };
-            let err_msg = if msg_ptr.is_null() {
-                format!("code {}", ret)
-            } else {
-                let s = unsafe { CStr::from_ptr(msg_ptr).to_string_lossy().into_owned() };
-                unsafe { krb5_free_error_message(self.context, msg_ptr) };
-                s
-            };
+            let err_msg = krb5_error_string(self.context, ret as i64);
             warn!(
                 "kadm5_create_principal failed with code {}: {}",
                 ret, err_msg
@@ -174,15 +170,7 @@ impl Kadm5Handle {
         unsafe { krb5_free_principal(self.context, princ) };
 
         if ret != 0 {
-            let code = ret as i32;
-            let msg_ptr = unsafe { krb5_get_error_message(self.context, code) };
-            let err_msg = if msg_ptr.is_null() {
-                format!("code {}", ret)
-            } else {
-                let s = unsafe { CStr::from_ptr(msg_ptr).to_string_lossy().into_owned() };
-                unsafe { krb5_free_error_message(self.context, msg_ptr) };
-                s
-            };
+            let err_msg = krb5_error_string(self.context, ret as i64);
             return Err(anyhow::anyhow!(
                 "kadm5_chpass_principal failed: {}",
                 err_msg
@@ -256,15 +244,7 @@ impl Kadm5Handle {
             unsafe { kadm5_randkey_principal(self.handle, princ, &mut keyblocks, &mut n_keys) };
 
         if ret != 0 {
-            let code = ret as i32;
-            let msg_ptr = unsafe { krb5_get_error_message(self.context, code) };
-            let err_msg = if msg_ptr.is_null() {
-                format!("code {}", ret)
-            } else {
-                let s = unsafe { CStr::from_ptr(msg_ptr).to_string_lossy().into_owned() };
-                unsafe { krb5_free_error_message(self.context, msg_ptr) };
-                s
-            };
+            let err_msg = krb5_error_string(self.context, ret as i64);
 
             let principal_not_found = ret == KADM5_UNK_PRINC as i64
                 || err_msg.contains("Principal does not exist")
@@ -274,9 +254,7 @@ impl Kadm5Handle {
                 let mut ent: kadm5_principal_ent_rec = unsafe { mem::zeroed() };
                 ent.principal = princ;
 
-                const KADM5_PRINCIPAL: c_long = 0x00000001;
-                const KADM5_KEY: c_long = 0x00000020;
-                let mask = (KADM5_PRINCIPAL | KADM5_KEY) as c_long;
+                let mask = (KADM5_PRINCIPAL | KADM5_MAX_LIFE) as c_long;
 
                 let ret =
                     unsafe { kadm5_create_principal(self.handle, &mut ent, mask, ptr::null_mut()) };

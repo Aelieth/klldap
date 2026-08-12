@@ -1,4 +1,3 @@
-#![forbid(unsafe_code)]
 use crate::sql_tables::DbConnection;
 use actix::prelude::{Actor, AsyncContext, Context};
 use cron::Schedule;

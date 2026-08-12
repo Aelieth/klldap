@@ -9,9 +9,6 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-[features]
-test = []
-
 [dependencies]
 async-trait = { workspace = true }
 
@@ -24,6 +21,3 @@ path = "../domain"
 
 [dependencies.lldap_domain_model]
 path = "../domain-model"
-
-[dev-dependencies]
-mockall = { workspace = true }

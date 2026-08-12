@@ -1,6 +1,3 @@
-// crates/domain/src/types.rs
-// KLLDAP 7.0 — Avatar refactor complete (centralized in images.rs)
-
 use base64::Engine;
 use base64::engine::general_purpose;
 use bytes::Bytes;
@@ -627,6 +624,34 @@ impl From<&GroupId> for Value {
     }
 }
 
+/// Shared kerberossync detection: Integer(1) or the string forms "1"/"true" enable sync.
+/// `name_or_alias` is resolved through PublicSchema so `kerberos_sync` / `kerberosSync` match.
+pub fn kerberos_sync_enabled(attrs: &[Attribute], name_or_alias: &str) -> bool {
+    let schema_attr = crate::public_schema::PublicSchema::shared()
+        .user_attributes()
+        .get_by_name_or_alias(name_or_alias);
+    attrs
+        .iter()
+        .find(|a| match schema_attr {
+            Some(schema_attr) => {
+                a.name.as_str() == schema_attr.name
+                    || schema_attr
+                        .aliases
+                        .iter()
+                        .any(|alias| alias.eq_ignore_ascii_case(a.name.as_str()))
+            }
+            None => a.name.as_str() == name_or_alias,
+        })
+        .map(|a| match &a.value {
+            AttributeValue::Integer(Cardinality::Singleton(i)) => *i == 1,
+            AttributeValue::String(Cardinality::Singleton(s)) => {
+                s == "1" || s.to_lowercase() == "true"
+            }
+            _ => false,
+        })
+        .unwrap_or(false)
+}
+
 /// Built-in groups whose exact names are load-bearing invariants of lldap.
 /// They must not be renamed or deleted.
 pub const BUILTIN_GROUPS: &[&str] = &[
@@ -639,5 +664,5 @@ pub const BUILTIN_GROUPS: &[&str] = &[
 
 /// Returns true if `name` matches one of the built-in protected group names.
 pub fn is_builtin_group(name: &str) -> bool {
-    BUILTIN_GROUPS.iter().any(|&g| g == name)
+    BUILTIN_GROUPS.contains(&name)
 }

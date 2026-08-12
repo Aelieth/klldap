@@ -331,9 +331,9 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
 
                 let user = create_user::CreateUserInput {
                     id: model.username,
-                    display_name: display_name,
-                    first_name: first_name,
-                    last_name: last_name,
+                    display_name,
+                    first_name,
+                    last_name,
                     avatar,
                     email,
                     attributes: Some(attributes),
@@ -460,86 +460,84 @@ impl Component for CreateUserForm {
 
     fn view(&self, ctx: &YewContext<Self>) -> Html {
         let link = ctx.link();
-        if self.attributes_schema.is_none()
-            || self.kerberos_info.is_none()
-            || !self.posix_config_loaded
-        {
-            html! { <div>{"Loading schema, Kerberos info and POSIX config..."}</div> }
-        } else {
-            let attrs = self.attributes_schema.as_ref().unwrap();
+        let Some(attrs) = self
+            .attributes_schema
+            .as_ref()
+            .filter(|_| self.kerberos_info.is_some() && self.posix_config_loaded)
+        else {
+            return html! { <div>{"Loading schema, Kerberos info and POSIX config..."}</div> };
+        };
 
-            let should_show = |a: &Attribute| !a.is_readonly && a.name != "kerberossync";
+        let should_show = |a: &Attribute| !a.is_readonly && a.name != "kerberossync";
 
-            let mut visible_attrs: Vec<&Attribute> =
-                attrs.iter().filter(|a| should_show(a)).collect();
-            visible_attrs.sort_by_key(|a| attribute_priority(&a.name));
+        let mut visible_attrs: Vec<&Attribute> = attrs.iter().filter(|a| should_show(a)).collect();
+        visible_attrs.sort_by_key(|a| attribute_priority(&a.name));
 
-            html! {
-                <div class="row justify-content-center">
-                <form class="form py-3" ref={self.form_ref.clone()}>
+        html! {
+            <div class="row justify-content-center">
+            <form class="form py-3" ref={self.form_ref.clone()}>
+            <Field<CreateUserModel>
+            form={&self.form}
+            required=true
+            label="User name"
+            field_name="username"
+            oninput={link.callback(|_| Msg::Update)} />
+
+            { visible_attrs.iter()
+                .map(|&a| get_custom_attribute_input(
+                    a,
+                    self.user_uidnumber_assign,
+                    self.user_gidnumber_assign,
+                    self.user_loginshell_assign,
+                    self.user_homedirectory_assign
+                ))
+                .collect::<Vec<Html>>() }
+
+                <KerberosSwitch
+                enabled={self.kerberossync_enabled}
+                on_toggle={link.callback(Msg::ToggleKerberosSync)}
+                show_banner={false}
+                />
+
+                <div class="mb-3 row">
+                <label class="form-label col-4 col-form-label">{"Organizational Unit :"}
+                <button data-bs-placement="right" title="user_ou" type="button" class="btn btn-sm btn-link" aria-label="User OU Info">
+                <i aria-label="Info" class="bi bi-info-circle"></i>
+                </button>
+                </label>
+                <div class="col-8">
+                <OuSelector
+                ous={self.ous.clone()}
+                current_ou={self.selected_ou.clone()}
+                on_ou_changed={link.callback(Msg::OuChanged)}
+                show_all={false} />
+                </div>
+                </div>
+
                 <Field<CreateUserModel>
                 form={&self.form}
-                required=true
-                label="User name"
-                field_name="username"
+                label="Password"
+                field_name="password"
+                input_type="password"
+                autocomplete="new-password"
+                oninput={link.callback(|_| Msg::Update)} />
+                <Field<CreateUserModel>
+                form={&self.form}
+                label="Confirm password"
+                field_name="confirm_password"
+                input_type="password"
+                autocomplete="new-password"
                 oninput={link.callback(|_| Msg::Update)} />
 
-                { visible_attrs.iter()
-                    .map(|&a| get_custom_attribute_input(
-                        a,
-                        self.user_uidnumber_assign,
-                        self.user_gidnumber_assign,
-                        self.user_loginshell_assign,
-                        self.user_homedirectory_assign
-                    ))
-                    .collect::<Vec<Html>>() }
+                <Submit
+                disabled={self.common.is_task_running()}
+                onclick={link.callback(|e: MouseEvent| {e.prevent_default(); Msg::SubmitForm})} />
+                </form>
 
-                    <KerberosSwitch
-                    enabled={self.kerberossync_enabled}
-                    on_toggle={link.callback(Msg::ToggleKerberosSync)}
-                    show_banner={false}
-                    />
-
-                    <div class="mb-3 row">
-                    <label class="form-label col-4 col-form-label">{"Organizational Unit :"}
-                    <button data-bs-placement="right" title="user_ou" type="button" class="btn btn-sm btn-link" aria-label="User OU Info">
-                    <i aria-label="Info" class="bi bi-info-circle"></i>
-                    </button>
-                    </label>
-                    <div class="col-8">
-                    <OuSelector
-                    ous={self.ous.clone()}
-                    current_ou={self.selected_ou.clone()}
-                    on_ou_changed={link.callback(Msg::OuChanged)}
-                    show_all={false} />
-                    </div>
-                    </div>
-
-                    <Field<CreateUserModel>
-                    form={&self.form}
-                    label="Password"
-                    field_name="password"
-                    input_type="password"
-                    autocomplete="new-password"
-                    oninput={link.callback(|_| Msg::Update)} />
-                    <Field<CreateUserModel>
-                    form={&self.form}
-                    label="Confirm password"
-                    field_name="confirm_password"
-                    input_type="password"
-                    autocomplete="new-password"
-                    oninput={link.callback(|_| Msg::Update)} />
-
-                    <Submit
-                    disabled={self.common.is_task_running()}
-                    onclick={link.callback(|e: MouseEvent| {e.prevent_default(); Msg::SubmitForm})} />
-                    </form>
-
-                    { if let Some(e) = &self.common.error {
-                        html! { <div class="alert alert-danger">{e.to_string()}</div> }
-                    } else { html! {} }}
-                    </div>
-            }
+                { if let Some(e) = &self.common.error {
+                    html! { <div class="alert alert-danger">{e.to_string()}</div> }
+                } else { html! {} }}
+                </div>
         }
     }
 

@@ -1,4 +1,3 @@
-#![forbid(unsafe_code)]
 use crate::{auth_service::check_if_token_is_valid, tcp_server::AppState};
 use actix_web::FromRequest;
 use actix_web::HttpMessage;
@@ -36,18 +35,20 @@ struct GetGraphQLRequest {
     variables: Option<String>,
 }
 
-impl<S> From<GetGraphQLRequest> for GraphQLRequest<S>
+impl<S> TryFrom<GetGraphQLRequest> for GraphQLRequest<S>
 where
     S: ScalarValue,
 {
-    fn from(get_req: GetGraphQLRequest) -> Self {
+    type Error = serde_json::Error;
+
+    fn try_from(get_req: GetGraphQLRequest) -> Result<Self, Self::Error> {
         let GetGraphQLRequest {
             query,
             operation_name,
             variables,
         } = get_req;
-        let variables = variables.map(|s| serde_json::from_str(&s).unwrap());
-        Self::new(query, operation_name, variables)
+        let variables = variables.map(|s| serde_json::from_str(&s)).transpose()?;
+        Ok(Self::new(query, operation_name, variables))
     }
 }
 
@@ -68,7 +69,8 @@ where
     S: ScalarValue + Send + Sync,
 {
     let get_req = web::Query::<GetGraphQLRequest>::from_query(req.query_string())?;
-    let req = GraphQLRequest::from(get_req.into_inner());
+    let req = GraphQLRequest::try_from(get_req.into_inner())
+        .map_err(actix_web::error::ErrorBadRequest)?;
     let gql_response = req.execute(schema, context).await;
     let body_response = serde_json::to_string(&gql_response)?;
     let mut response = match gql_response.is_ok() {

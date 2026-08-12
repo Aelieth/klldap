@@ -1,4 +1,3 @@
-#![forbid(unsafe_code)]
 use crate::tcp_backend_handler::TcpBackendHandler;
 use async_trait::async_trait;
 use chrono::NaiveDateTime;

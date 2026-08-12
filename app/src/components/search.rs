@@ -17,8 +17,8 @@ pub fn search_controls(props: &Props) -> Html {
         <>
             <div class="col-md-2 ms-auto">
                 <select class="form-select" onchange={props.on_search_field_changed.reform(|e: Event| {
-                    let value = e.target().unwrap().dyn_into::<web_sys::HtmlSelectElement>().unwrap().value();
-                    value
+
+                    e.target().unwrap().dyn_into::<web_sys::HtmlSelectElement>().unwrap().value()
                 })}>
                     { for props.search_fields.iter().map(|f| html! {
                         <option value={f.clone()} selected={f == &props.search_field}>{f}</option>
@@ -28,8 +28,8 @@ pub fn search_controls(props: &Props) -> Html {
             <div class="col-md-4">
                 <input type="text" class="form-control" placeholder="Type to search..." value={props.search_term.clone()}
                 oninput={props.on_search_term_changed.reform(|e: InputEvent| {
-                    let value = e.target().unwrap().dyn_into::<web_sys::HtmlInputElement>().unwrap().value();
-                    value
+
+                    e.target().unwrap().dyn_into::<web_sys::HtmlInputElement>().unwrap().value()
                 })} />
             </div>
         </>

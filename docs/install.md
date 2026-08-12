@@ -11,7 +11,7 @@ This is a personal hobby project / half-brother fork of LLDAP developed for my o
 
 ### With Docker
 
-The image is (or will be) available at `aelieth/lldap-with-kerberos`.
+The image is available at `aelieth/klldap`.
 
 You should persist two folders:
 - `/data` — contains LLDAP config, users, groups, and keycloak_config.toml
@@ -29,9 +29,9 @@ volumes:
     driver: local
 
 services:
-  kllldap:
-    image: aelieth/lldap-with-kerberos:latest
-    container_name: kllldap
+  klldap:
+    image: aelieth/klldap:latest
+    container_name: klldap
     restart: unless-stopped
     ports:
       # LDAP (not recommended to expose publicly)
@@ -74,7 +74,9 @@ services:
       # - LLDAP_SMTP_OPTIONS__USER=no-reply@example.com
       # - LLDAP_SMTP_OPTIONS__PASSWORD=PasswordGoesHere
       # - LLDAP_SMTP_OPTIONS__FROM=no-reply <no-reply@example.com>
-      # - LLDAP_SMTP_OPTIONS__TO=admin <admin@example.com>
+      # - LLDAP_SMTP_OPTIONS__REPLY_TO=Do not reply <no-reply@example.com>
+      # Required for working password-reset links (the emailed URL is built from it):
+      # - LLDAP_HTTP_URL=https://your-real-ui-url
 ```
 
 After first start:

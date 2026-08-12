@@ -1,4 +1,3 @@
-#![forbid(unsafe_code)]
 use crate::{
     auth_service,
     configuration::{Configuration, MailOptions},

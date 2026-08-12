@@ -1656,7 +1656,7 @@ pub(crate) async fn migrate_from_version(
 mod tests {
     use super::*;
     use crate::sql_backend_handler::SqlBackendHandler;
-    use crate::sql_tables::{init_table, LAST_SCHEMA_VERSION, SchemaVersion};
+    use crate::sql_tables::{LAST_SCHEMA_VERSION, SchemaVersion, init_table};
     use chrono::prelude::*;
     use lldap_auth::opaque::server::generate_random_private_key;
     use lldap_domain::requests::UpdateUserRequest;
@@ -1822,22 +1822,22 @@ mod tests {
                 .await;
 
             // Insert users (modern columns required for v6+)
-            pool.execute(raw_statement(&format!(
+            pool.execute(raw_statement(
                 r#"INSERT INTO users (user_id, email, lowercase_email, display_name, creation_date, uuid, modified_date, password_modified_date)
-                   VALUES ("bob", "bob@bob.com", "bob@bob.com", "Bob Display", "1970-01-01 00:00:00", "a02eaf13-48a7-30f6-a3d4-040ff7c52b04", "1970-01-01 00:00:00", "1970-01-01 00:00:00")"#
-            ))).await?;
-            pool.execute(raw_statement(&format!(
+                   VALUES ("bob", "bob@bob.com", "bob@bob.com", "Bob Display", "1970-01-01 00:00:00", "a02eaf13-48a7-30f6-a3d4-040ff7c52b04", "1970-01-01 00:00:00", "1970-01-01 00:00:00")"#,
+            )).await?;
+            pool.execute(raw_statement(
                 r#"INSERT INTO users (user_id, email, lowercase_email, display_name, creation_date, uuid, modified_date, password_modified_date)
-                   VALUES ("pat", "pat@pat.com", "pat@pat.com", "Patrícia", "1971-01-01 00:00:00", "986765a5-3f03-389e-b47b-536b2d6e1bec", "1971-01-01 00:00:00", "1971-01-01 00:00:00")"#
-            ))).await?;
-            pool.execute(raw_statement(&format!(
+                   VALUES ("pat", "pat@pat.com", "pat@pat.com", "Patrícia", "1971-01-01 00:00:00", "986765a5-3f03-389e-b47b-536b2d6e1bec", "1971-01-01 00:00:00", "1971-01-01 00:00:00")"#,
+            )).await?;
+            pool.execute(raw_statement(
                 r#"INSERT INTO users (user_id, email, lowercase_email, display_name, creation_date, uuid, modified_date, password_modified_date)
-                   VALUES ("unicode-ü", "u@u.com", "u@u.com", "Üsér", "1972-01-01 00:00:00", "11111111-1111-1111-1111-111111111111", "1972-01-01 00:00:00", "1972-01-01 00:00:00")"#
-            ))).await?;
-            pool.execute(raw_statement(&format!(
+                   VALUES ("unicode-ü", "u@u.com", "u@u.com", "Üsér", "1972-01-01 00:00:00", "11111111-1111-1111-1111-111111111111", "1972-01-01 00:00:00", "1972-01-01 00:00:00")"#,
+            )).await?;
+            pool.execute(raw_statement(
                 r#"INSERT INTO users (user_id, email, lowercase_email, display_name, creation_date, uuid, modified_date, password_modified_date)
-                   VALUES ("emptyattrs", "e@e.com", "e@e.com", NULL, "1973-01-01 00:00:00", "22222222-2222-2222-2222-222222222222", "1973-01-01 00:00:00", "1973-01-01 00:00:00")"#
-            ))).await?;
+                   VALUES ("emptyattrs", "e@e.com", "e@e.com", NULL, "1973-01-01 00:00:00", "22222222-2222-2222-2222-222222222222", "1973-01-01 00:00:00", "1973-01-01 00:00:00")"#,
+            )).await?;
 
             // Groups (v6+ requires lowercase)
             pool.execute(raw_statement(
@@ -1882,11 +1882,7 @@ mod tests {
                             UserAttributes::UserAttributeName,
                             UserAttributes::UserAttributeValue,
                         ])
-                        .values_panic([
-                            "bob".into(),
-                            legacy_first.into(),
-                            bob_first_val.into(),
-                        ])
+                        .values_panic(["bob".into(), legacy_first.into(), bob_first_val.into()])
                         .values_panic(["bob".into(), legacy_last.into(), bob_last_val.into()]),
                 ),
             )
@@ -1914,8 +1910,10 @@ mod tests {
 
             // A custom string list (sshpublickey is the stock example, but we also add a custom "tags")
             // Use json encoding for list (current storage contract post-v5)
-            let ssh_list: Vec<String> =
-                vec!["ssh-rsa AAAAB3... bob@laptop".into(), "ssh-ed25519 AAAAC3... bob@phone".into()];
+            let ssh_list: Vec<String> = vec![
+                "ssh-rsa AAAAB3... bob@laptop".into(),
+                "ssh-ed25519 AAAAC3... bob@phone".into(),
+            ];
             let ssh_json = serde_json::to_vec(&ssh_list).unwrap();
             pool.execute(
                 builder.build(
@@ -1971,11 +1969,7 @@ mod tests {
                             UserAttributes::UserAttributeName,
                             UserAttributes::UserAttributeValue,
                         ])
-                        .values_panic([
-                            "bob".into(),
-                            "tags".into(),
-                            Serialized(tags_json).into(),
-                        ]),
+                        .values_panic(["bob".into(), "tags".into(), Serialized(tags_json).into()]),
                 ),
             )
             .await?;
@@ -2387,11 +2381,7 @@ mod tests {
                             UserAttributes::UserAttributeName,
                             UserAttributes::UserAttributeValue,
                         ])
-                        .values_panic([
-                            "bob".into(),
-                            "tags".into(),
-                            Serialized(tags_json).into(),
-                        ]),
+                        .values_panic(["bob".into(), "tags".into(), Serialized(tags_json).into()]),
                 ),
             )
             .await;
@@ -2433,11 +2423,7 @@ mod tests {
                             UserAttributes::UserAttributeName,
                             UserAttributes::UserAttributeValue,
                         ])
-                        .values_panic([
-                            "unicode-ü".into(),
-                            "lastlogin".into(),
-                            dt_bytes.into(),
-                        ]),
+                        .values_panic(["unicode-ü".into(), "lastlogin".into(), dt_bytes.into()]),
                 ),
             )
             .await;
@@ -2545,7 +2531,6 @@ mod tests {
         // In a real test we would apply v1..v11 then v12.
         // For now we just verify the function compiles and the PublicSchema load works.
         let _public = PublicSchema::get();
-        assert!(true, "v12 migration module compiles and PublicSchema loads");
     }
 
     #[test]
@@ -2566,13 +2551,12 @@ mod tests {
     /// Checks structural sanity + rich data we inserted in populate_*.
     async fn assert_full_rich_data_integrity(pool: &DbConnection, at_version: SchemaVersion) {
         // Version
-        let ver = JustSchemaVersion::find_by_statement(raw_statement(
-            r#"SELECT version FROM metadata"#,
-        ))
-        .one(pool)
-        .await
-        .unwrap()
-        .unwrap();
+        let ver =
+            JustSchemaVersion::find_by_statement(raw_statement(r#"SELECT version FROM metadata"#))
+                .one(pool)
+                .await
+                .unwrap()
+                .unwrap();
         assert_eq!(ver.version, at_version, "schema version mismatch");
 
         // Always have users + groups from our rich set
@@ -2580,22 +2564,24 @@ mod tests {
         struct CountRow {
             c: i64,
         }
-        let user_count: CountRow = CountRow::find_by_statement(raw_statement(
-            r#"SELECT COUNT(*) as c FROM users"#,
-        ))
-        .one(pool)
-        .await
-        .unwrap()
-        .unwrap();
-        assert!(user_count.c >= 3, "expected at least 3 users, got {}", user_count.c);
+        let user_count: CountRow =
+            CountRow::find_by_statement(raw_statement(r#"SELECT COUNT(*) as c FROM users"#))
+                .one(pool)
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(
+            user_count.c >= 3,
+            "expected at least 3 users, got {}",
+            user_count.c
+        );
 
-        let group_count: CountRow = CountRow::find_by_statement(raw_statement(
-            r#"SELECT COUNT(*) as c FROM groups"#,
-        ))
-        .one(pool)
-        .await
-        .unwrap()
-        .unwrap();
+        let group_count: CountRow =
+            CountRow::find_by_statement(raw_statement(r#"SELECT COUNT(*) as c FROM groups"#))
+                .one(pool)
+                .await
+                .unwrap()
+                .unwrap();
         assert!(group_count.c >= 3, "expected at least 3 groups");
 
         // Hoisted for use in v5+ and v12 blocks
@@ -2640,9 +2626,7 @@ mod tests {
             );
 
             // Legacy name "first_name" should only survive until v12 normalization
-            let has_legacy_first = attrs
-                .iter()
-                .any(|a| a.user_attribute_name == "first_name");
+            let has_legacy_first = attrs.iter().any(|a| a.user_attribute_name == "first_name");
             if at_version.0 < 12 {
                 // Before v12 step we may still have it (depending on populate point)
             } else {
@@ -2660,10 +2644,8 @@ mod tests {
 
             // String list (sshpublickey) present
             assert!(
-                attrs
-                    .iter()
-                    .any(|a| a.user_attribute_name == "sshpublickey"
-                        && a.user_attribute_value.starts_with(b"[")),
+                attrs.iter().any(|a| a.user_attribute_name == "sshpublickey"
+                    && a.user_attribute_value.starts_with(b"[")),
                 "sshpublickey list should be stored as json bytes"
             );
 
@@ -2692,7 +2674,10 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-                assert!(uoc.c >= 1, "user_object_classes should be populated for v9+");
+                assert!(
+                    uoc.c >= 1,
+                    "user_object_classes should be populated for v9+"
+                );
             }
         }
 
@@ -2715,9 +2700,7 @@ mod tests {
                 .await
                 .expect("date columns must exist >=v11");
             let _ = pool
-                .query_one(raw_statement(
-                    r#"SELECT modified_date FROM groups LIMIT 1"#,
-                ))
+                .query_one(raw_statement(r#"SELECT modified_date FROM groups LIMIT 1"#))
                 .await
                 .expect("group modified_date >=v11");
         }
@@ -2750,7 +2733,8 @@ mod tests {
             assert!(
                 kerb_attrs
                     .iter()
-                    .any(|a| a.user_attribute_name == "kerberossync" && a.user_attribute_value == b"0"),
+                    .any(|a| a.user_attribute_name == "kerberossync"
+                        && a.user_attribute_value == b"0"),
                 "kerberossync default '0' (bytes) must be injected by v12 for users"
             );
             assert!(
@@ -2838,7 +2822,9 @@ mod tests {
             let target_ver = SchemaVersion(target);
             migrate_from_version(&pool, SchemaVersion(target - 1), target_ver)
                 .await
-                .unwrap_or_else(|e| panic!("migration from {} to {} failed: {e}", target - 1, target));
+                .unwrap_or_else(|e| {
+                    panic!("migration from {} to {} failed: {e}", target - 1, target)
+                });
 
             // Keep modern EAV richness topped up after v5 (ssh, customs, lists, obj classes etc).
             // Safe to call repeatedly; obj class inserts will only succeed once v9 migration has created the tables.
@@ -2851,7 +2837,9 @@ mod tests {
         }
 
         // Final: full init should be idempotent
-        init_table(&pool).await.expect("re-init after full migration must succeed");
+        init_table(&pool)
+            .await
+            .expect("re-init after full migration must succeed");
         assert_full_rich_data_integrity(&pool, LAST_SCHEMA_VERSION).await;
 
         // === Live handler validation on the migrated rich DB ===
@@ -2870,10 +2858,7 @@ mod tests {
             .await
             .expect("get_user_details(bob) must work");
         // avatar roundtrip (via the attribute path)
-        let has_avatar = bob
-            .attributes
-            .iter()
-            .any(|a| a.name.as_str() == "avatar");
+        let has_avatar = bob.attributes.iter().any(|a| a.name.as_str() == "avatar");
         assert!(has_avatar, "bob must have avatar attribute after migration");
 
         // ssh list preserved
@@ -2883,7 +2868,10 @@ mod tests {
             .find(|a| a.name.as_str() == "sshpublickey")
             .expect("sshpublickey must be queryable");
         if let AttributeValue::String(Cardinality::Unbounded(list)) = &ssh_attr.value {
-            assert!(list.len() >= 2, "sshpublickey list must have preserved 2 entries");
+            assert!(
+                list.len() >= 2,
+                "sshpublickey list must have preserved 2 entries"
+            );
         } else {
             panic!("sshpublickey should be a string list");
         }

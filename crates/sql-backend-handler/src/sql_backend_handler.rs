@@ -1,8 +1,47 @@
 use crate::sql_tables::DbConnection;
 use lldap_auth::opaque::server::ServerSetup;
-use lldap_domain::types::AttributeName;
-use lldap_domain_handlers::handler::ReadSchemaBackendHandler;
+use lldap_domain::types::{AttributeName, AttributeValue, Cardinality};
 use lldap_schema::PublicSchema;
+use sea_orm::sea_query::{Cond, IntoCondition, SimpleExpr};
+
+pub(crate) fn bool_to_expr(b: bool) -> Cond {
+    SimpleExpr::Value(b.into()).into_condition()
+}
+
+pub(crate) fn get_repeated_filter<F>(
+    fs: Vec<F>,
+    condition: Cond,
+    default_value: bool,
+    to_expr: fn(F) -> Cond,
+) -> Cond {
+    if fs.is_empty() {
+        bool_to_expr(default_value)
+    } else {
+        fs.into_iter().map(to_expr).fold(condition, Cond::add)
+    }
+}
+
+pub(crate) fn is_backend_writable_readonly_attribute(name: &str) -> bool {
+    matches!(
+        name,
+        "ou" | "kerberossync" | "allowedous" | "krb_principal_name"
+    )
+}
+
+pub(crate) fn attribute_value_to_db_bytes(value: &AttributeValue) -> Vec<u8> {
+    match value {
+        AttributeValue::String(Cardinality::Singleton(s)) => s.as_bytes().to_vec(),
+        AttributeValue::String(Cardinality::Unbounded(list)) => {
+            serde_json::to_vec(list).unwrap_or_else(|_| b"[]".to_vec())
+        }
+        AttributeValue::Integer(Cardinality::Singleton(i)) => i.to_string().as_bytes().to_vec(),
+        AttributeValue::Avatar(Cardinality::Singleton(p)) => p.0.clone(),
+        AttributeValue::DateTime(Cardinality::Singleton(dt)) => {
+            dt.and_utc().timestamp().to_string().as_bytes().to_vec()
+        }
+        _ => vec![],
+    }
+}
 
 #[derive(Clone)]
 pub struct SqlBackendHandler {
@@ -22,58 +61,24 @@ impl SqlBackendHandler {
         &self.sql_pool
     }
 
-    /// Resolves any user attribute name or alias to its canonical form.
-    /// Falls back to the original name if it cannot be resolved.
-    pub async fn resolve_canonical_user_attribute_name(&self, name: &str) -> AttributeName {
-        match self.get_schema().await {
-            Ok(schema) => schema
-                .resolve_user_canonical_name(name)
-                .map(AttributeName::from)
-                .unwrap_or_else(|| AttributeName::from(name)),
-            Err(_) => AttributeName::from(name),
-        }
-    }
-
-    /// Resolves any group attribute name or alias to its canonical form.
-    /// Falls back to the original name if it cannot be resolved.
-    pub async fn resolve_canonical_group_attribute_name(&self, name: &str) -> AttributeName {
-        match self.get_schema().await {
-            Ok(schema) => schema
-                .resolve_group_canonical_name(name)
-                .map(AttributeName::from)
-                .unwrap_or_else(|| AttributeName::from(name)),
-            Err(_) => AttributeName::from(name),
-        }
-    }
-
-    /// Internal helper for when you already have the schema.
-    /// Preferred for hot paths inside transactions.
-    ///
-    /// ROBUST VERSION: First tries the passed schema (DB-loaded). If it cannot
-    /// resolve (e.g. alias not present in that schema object for any reason),
-    /// falls back to the static PublicSchema::get(). This guarantees we always
-    /// return canonical form for known hardcoded attributes, eliminating the
-    /// exact alias leakage seen in tests.
-    /// Always resolves using the static PublicSchema::get() (authoritative source).
-    /// This guarantees correct canonical form even if the DB-loaded schema
-    /// has incomplete alias data.
+    /// Resolves a user attribute name or alias via the static PublicSchema.
+    /// `_schema` is unused; hardcoded aliases live in PublicSchema, not the DB copy.
     pub(crate) fn canonical_user_attribute_name(
         _schema: &PublicSchema,
         name: &str,
     ) -> AttributeName {
-        PublicSchema::get()
+        PublicSchema::shared()
             .user_attributes()
             .get_by_name_or_alias(name)
             .map(|s| s.name.clone().into())
             .unwrap_or_else(|| AttributeName::from(name))
     }
 
-    /// Group equivalent (for symmetry and future use in group paths).
     pub(crate) fn canonical_group_attribute_name(
         _schema: &PublicSchema,
         name: &str,
     ) -> AttributeName {
-        PublicSchema::get()
+        PublicSchema::shared()
             .group_attributes()
             .get_by_name_or_alias(name)
             .map(|s| s.name.clone().into())

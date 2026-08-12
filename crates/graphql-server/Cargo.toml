@@ -11,16 +11,13 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
-async-trait = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
 juniper = { workspace = true }
 rand = { workspace = true }
-reqwest = { workspace = true, features = ["json"] }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 urlencoding = { workspace = true }
-uuid = { workspace = true }
 
 [dependencies.lldap_access_control]
 path = "../access-control"
@@ -69,15 +66,3 @@ path = "../test-utils"
 [dev-dependencies.tokio]
 features = ["full"]
 version = "1.25"
-
-#[dev-dependencies.lldap_auth]
-#path = "../auth"
-#features = ["test"]
-#
-#[dev-dependencies.lldap_opaque_handler]
-#path = "../opaque-handler"
-#features = ["test"]
-
-#[dev-dependencies.lldap_sql_backend_handler]
-#path = "../sql-backend-handler"
-#features = ["test"]

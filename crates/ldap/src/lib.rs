@@ -22,21 +22,6 @@ pub use schema::{
     get_schema_manager,
 };
 
-// Thin shims for graphql-server compatibility (will be removed once graphql-server is updated)
-pub fn map_user_field(
-    field: &lldap_domain::types::AttributeName,
-    schema: &lldap_domain::public_schema::PublicSchema,
-) -> UserFieldType {
-    get_schema_manager().map_user_field(field, schema)
-}
-
-pub fn map_group_field(
-    field: &lldap_domain::types::AttributeName,
-    schema: &lldap_domain::public_schema::PublicSchema,
-) -> GroupFieldType {
-    get_schema_manager().map_group_field(field, schema)
-}
-
 pub use attributes::{
     get_default_group_object_classes_bytes, get_default_user_object_classes_bytes,
     get_group_attribute, get_group_ou, get_user_attribute, get_user_ou,

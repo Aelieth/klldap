@@ -1,4 +1,3 @@
-#![forbid(unsafe_code)]
 use crate::{configuration::LdapsOptions, tls};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use futures_util::SinkExt;

@@ -1,4 +1,7 @@
-use crate::sql_backend_handler::SqlBackendHandler;
+use crate::sql_backend_handler::{
+    SqlBackendHandler, attribute_value_to_db_bytes, bool_to_expr, get_repeated_filter,
+    is_backend_writable_readonly_attribute,
+};
 use async_trait::async_trait;
 use itertools::Itertools;
 use lldap_domain::{
@@ -28,22 +31,6 @@ use sea_orm::{
 };
 use std::collections::HashSet;
 use tracing::{debug, instrument};
-
-// Helper: Convert AttributeValue to raw bytes for the EAV value BLOB column
-fn attribute_value_to_db_bytes(value: &AttributeValue) -> Vec<u8> {
-    match value {
-        AttributeValue::String(Cardinality::Singleton(s)) => s.as_bytes().to_vec(),
-        AttributeValue::String(Cardinality::Unbounded(list)) => {
-            serde_json::to_vec(list).unwrap_or_else(|_| b"[]".to_vec())
-        }
-        AttributeValue::Integer(Cardinality::Singleton(i)) => i.to_string().as_bytes().to_vec(),
-        AttributeValue::Avatar(Cardinality::Singleton(p)) => p.0.clone(),
-        AttributeValue::DateTime(Cardinality::Singleton(dt)) => {
-            dt.and_utc().timestamp().to_string().as_bytes().to_vec()
-        }
-        _ => vec![],
-    }
-}
 
 fn attribute_condition(name: AttributeName, value: Option<&AttributeValue>) -> Cond {
     Expr::in_subquery(
@@ -97,27 +84,11 @@ fn user_id_subcondition(filter: Cond) -> Cond {
 fn get_user_filter_expr(filter: UserRequestFilter) -> Cond {
     use UserRequestFilter::*;
     let group_table = Alias::new("r1");
-    fn bool_to_expr(b: bool) -> Cond {
-        SimpleExpr::Value(b.into()).into_condition()
-    }
-    fn get_repeated_filter(
-        fs: Vec<UserRequestFilter>,
-        condition: Cond,
-        default_value: bool,
-    ) -> Cond {
-        if fs.is_empty() {
-            bool_to_expr(default_value)
-        } else {
-            fs.into_iter()
-                .map(get_user_filter_expr)
-                .fold(condition, Cond::add)
-        }
-    }
     match filter {
         True => bool_to_expr(true),
         False => bool_to_expr(false),
-        And(fs) => get_repeated_filter(fs, Cond::all(), true),
-        Or(fs) => get_repeated_filter(fs, Cond::any(), false),
+        And(fs) => get_repeated_filter(fs, Cond::all(), true, get_user_filter_expr),
+        Or(fs) => get_repeated_filter(fs, Cond::any(), false, get_user_filter_expr),
         Not(f) => get_user_filter_expr(*f).not(),
         UserId(user_id) => ColumnTrait::eq(&UserColumn::UserId, user_id).into_condition(),
         Equality(column, value) => {
@@ -151,7 +122,6 @@ fn get_user_filter_expr(filter: UserRequestFilter) -> Cond {
         }
         CustomAttributePresent(name) => attribute_condition(name, None),
 
-        // NEW: GreaterOrEqual / LessOrEqual for timestamps (user side) — closes #1308
         GreaterOrEqual(column, value) => match column {
             UserColumn::CreationDate
             | UserColumn::ModifiedDate
@@ -197,13 +167,6 @@ fn to_value(opt_name: &Option<String>) -> ActiveValue<Option<String>> {
             Some(name.to_owned())
         }),
     }
-}
-
-fn is_backend_writable_readonly_attribute(name: &str) -> bool {
-    matches!(
-        name,
-        "ou" | "kerberossync" | "allowedous" | "krb_principal_name"
-    )
 }
 
 #[async_trait]
@@ -395,13 +358,11 @@ impl SqlBackendHandler {
                     )));
                 }
 
-                if name == "uidnumber" {
-                    if Self::is_uidnumber_taken(transaction, value).await? {
-                        return Err(DomainError::InternalError(format!(
-                            "Number {} is already assigned to another user/group",
-                            value
-                        )));
-                    }
+                if name == "uidnumber" && Self::is_uidnumber_taken(transaction, value).await? {
+                    return Err(DomainError::InternalError(format!(
+                        "Number {} is already assigned to another user/group",
+                        value
+                    )));
                 }
                 // NOTE: gidnumber on *users* deliberately allows duplicates
             }
@@ -548,6 +509,46 @@ impl SystemConfigBackendHandler for SqlBackendHandler {
 }
 
 // === FULL POSIX SETTINGS (single source of truth - matches PublicSchema) ===
+async fn posix_upsert_user_attribute(
+    tx: &DatabaseTransaction,
+    user_id: UserId,
+    attribute: &str,
+    value: Vec<u8>,
+) -> Result<()> {
+    let attr = model::user_attributes::ActiveModel {
+        user_id: Set(user_id.clone()),
+        attribute_name: Set(AttributeName::from(attribute)),
+        value: Set(Serialized(value)),
+    };
+    model::UserAttributes::insert(attr)
+        .on_conflict(
+            OnConflict::columns([
+                model::user_attributes::Column::UserId,
+                model::user_attributes::Column::AttributeName,
+            ])
+            .update_column(model::user_attributes::Column::Value)
+            .to_owned(),
+        )
+        .exec(tx)
+        .await?;
+    model::users::ActiveModel {
+        user_id: Set(user_id),
+        modified_date: Set(chrono::Utc::now().naive_utc()),
+        ..Default::default()
+    }
+    .update(tx)
+    .await?;
+    Ok(())
+}
+
+async fn posix_clear_user_attribute(tx: &DatabaseTransaction, attribute: &str) -> Result<()> {
+    model::UserAttributes::delete_many()
+        .filter(model::user_attributes::Column::AttributeName.eq(attribute))
+        .exec(tx)
+        .await?;
+    Ok(())
+}
+
 impl SqlBackendHandler {
     pub async fn get_posix_settings(&self) -> Result<PosixSettings> {
         let config = system_config::Entity::find()
@@ -728,37 +729,16 @@ impl SqlBackendHandler {
                             .await?;
                         for (next, user) in (settings.user_uidnumber_start..).zip(users.into_iter())
                         {
-                            let uid_value = next.to_string().into_bytes();
-                            let attr = model::user_attributes::ActiveModel {
-                                user_id: Set(user.user_id.clone()),
-                                attribute_name: Set(AttributeName::from("uidnumber")),
-                                value: Set(Serialized(uid_value)),
-                            };
-                            model::UserAttributes::insert(attr)
-                                .on_conflict(
-                                    OnConflict::columns([
-                                        model::user_attributes::Column::UserId,
-                                        model::user_attributes::Column::AttributeName,
-                                    ])
-                                    .update_column(model::user_attributes::Column::Value)
-                                    .to_owned(),
-                                )
-                                .exec(tx)
-                                .await?;
-                            let now = chrono::Utc::now().naive_utc();
-                            model::users::ActiveModel {
-                                user_id: Set(user.user_id),
-                                modified_date: Set(now),
-                                ..Default::default()
-                            }
-                            .update(tx)
+                            posix_upsert_user_attribute(
+                                tx,
+                                user.user_id,
+                                "uidnumber",
+                                next.to_string().into_bytes(),
+                            )
                             .await?;
                         }
                     } else {
-                        model::UserAttributes::delete_many()
-                            .filter(model::user_attributes::Column::AttributeName.eq("uidnumber"))
-                            .exec(tx)
-                            .await?;
+                        posix_clear_user_attribute(tx, "uidnumber").await?;
                     }
                     Ok(())
                 })
@@ -774,41 +754,19 @@ impl SqlBackendHandler {
             .transaction::<_, (), DomainError>(|tx| {
                 Box::pin(async move {
                     if settings.user_gidnumber_assign {
-                        // STATIC assignment — every user gets the exact same gidNumber from config
+                        // Static assignment: every user gets the same gidNumber from config.
                         let users = model::User::find().all(tx).await?;
                         for user in users {
-                            let gid_value = settings.user_gidnumber_start.to_string().into_bytes();
-                            let attr = model::user_attributes::ActiveModel {
-                                user_id: Set(user.user_id.clone()),
-                                attribute_name: Set(AttributeName::from("gidnumber")),
-                                value: Set(Serialized(gid_value)),
-                            };
-                            model::UserAttributes::insert(attr)
-                                .on_conflict(
-                                    OnConflict::columns([
-                                        model::user_attributes::Column::UserId,
-                                        model::user_attributes::Column::AttributeName,
-                                    ])
-                                    .update_column(model::user_attributes::Column::Value)
-                                    .to_owned(),
-                                )
-                                .exec(tx)
-                                .await?;
-                            let now = chrono::Utc::now().naive_utc();
-                            model::users::ActiveModel {
-                                user_id: Set(user.user_id),
-                                modified_date: Set(now),
-                                ..Default::default()
-                            }
-                            .update(tx)
+                            posix_upsert_user_attribute(
+                                tx,
+                                user.user_id,
+                                "gidnumber",
+                                settings.user_gidnumber_start.to_string().into_bytes(),
+                            )
                             .await?;
                         }
                     } else {
-                        // Toggle OFF → delete gidnumber from all users
-                        model::UserAttributes::delete_many()
-                            .filter(model::user_attributes::Column::AttributeName.eq("gidnumber"))
-                            .exec(tx)
-                            .await?;
+                        posix_clear_user_attribute(tx, "gidnumber").await?;
                     }
                     Ok(())
                 })
@@ -828,38 +786,16 @@ impl SqlBackendHandler {
                         for user in users {
                             let home =
                                 format!("{}/{}", settings.user_homedirectory_prefix, user.user_id);
-                            let attr = model::user_attributes::ActiveModel {
-                                user_id: Set(user.user_id.clone()),
-                                attribute_name: Set(AttributeName::from("homedirectory")),
-                                value: Set(Serialized(home.into_bytes())),
-                            };
-                            model::UserAttributes::insert(attr)
-                                .on_conflict(
-                                    OnConflict::columns([
-                                        model::user_attributes::Column::UserId,
-                                        model::user_attributes::Column::AttributeName,
-                                    ])
-                                    .update_column(model::user_attributes::Column::Value)
-                                    .to_owned(),
-                                )
-                                .exec(tx)
-                                .await?;
-                            let now = chrono::Utc::now().naive_utc();
-                            model::users::ActiveModel {
-                                user_id: Set(user.user_id),
-                                modified_date: Set(now),
-                                ..Default::default()
-                            }
-                            .update(tx)
+                            posix_upsert_user_attribute(
+                                tx,
+                                user.user_id,
+                                "homedirectory",
+                                home.into_bytes(),
+                            )
                             .await?;
                         }
                     } else {
-                        model::UserAttributes::delete_many()
-                            .filter(
-                                model::user_attributes::Column::AttributeName.eq("homedirectory"),
-                            )
-                            .exec(tx)
-                            .await?;
+                        posix_clear_user_attribute(tx, "homedirectory").await?;
                     }
                     Ok(())
                 })
@@ -877,38 +813,16 @@ impl SqlBackendHandler {
                     if settings.user_loginshell_assign {
                         let users = model::User::find().all(tx).await?;
                         for user in users {
-                            let attr = model::user_attributes::ActiveModel {
-                                user_id: Set(user.user_id.clone()),
-                                attribute_name: Set(AttributeName::from("loginshell")),
-                                value: Set(Serialized(
-                                    settings.user_loginshell_default.clone().into_bytes(),
-                                )),
-                            };
-                            model::UserAttributes::insert(attr)
-                                .on_conflict(
-                                    OnConflict::columns([
-                                        model::user_attributes::Column::UserId,
-                                        model::user_attributes::Column::AttributeName,
-                                    ])
-                                    .update_column(model::user_attributes::Column::Value)
-                                    .to_owned(),
-                                )
-                                .exec(tx)
-                                .await?;
-                            let now = chrono::Utc::now().naive_utc();
-                            model::users::ActiveModel {
-                                user_id: Set(user.user_id),
-                                modified_date: Set(now),
-                                ..Default::default()
-                            }
-                            .update(tx)
+                            posix_upsert_user_attribute(
+                                tx,
+                                user.user_id,
+                                "loginshell",
+                                settings.user_loginshell_default.clone().into_bytes(),
+                            )
                             .await?;
                         }
                     } else {
-                        model::UserAttributes::delete_many()
-                            .filter(model::user_attributes::Column::AttributeName.eq("loginshell"))
-                            .exec(tx)
-                            .await?;
+                        posix_clear_user_attribute(tx, "loginshell").await?;
                     }
                     Ok(())
                 })
@@ -1018,13 +932,13 @@ impl UserBackendHandler for SqlBackendHandler {
                                 )));
                             }
 
-                            if name == "uidnumber" {
-                                if Self::is_uidnumber_taken(transaction, value).await? {
-                                    return Err(DomainError::InternalError(format!(
-                                        "Number {} is already assigned to another user/group",
-                                        value
-                                    )));
-                                }
+                            if name == "uidnumber"
+                                && Self::is_uidnumber_taken(transaction, value).await?
+                            {
+                                return Err(DomainError::InternalError(format!(
+                                    "Number {} is already assigned to another user/group",
+                                    value
+                                )));
                             }
                             // NOTE: gidnumber on *users* deliberately allows duplicates
                         }
@@ -1235,20 +1149,18 @@ impl UserBackendHandler for SqlBackendHandler {
                 Box::pin(async move {
                     // === LAST ADMIN PROTECTION (backend layer) ===
                     // Prevent removing the final member of lldap_admin, regardless of caller.
-                    let group_details = model::Group::find_by_id(group_id)
-                        .one(transaction)
-                        .await?;
-                    if let Some(g) = &group_details {
-                        if g.display_name.as_str() == "lldap_admin" {
-                            let current_count = model::Membership::find()
-                                .filter(model::MembershipColumn::GroupId.eq(group_id))
-                                .count(transaction)
-                                .await?;
-                            if current_count <= 1 {
-                                return Err(sea_orm::DbErr::Custom(
-                                    "Cannot remove the last member of lldap_admin".to_string(),
-                                ));
-                            }
+                    let group_details = model::Group::find_by_id(group_id).one(transaction).await?;
+                    if let Some(g) = &group_details
+                        && g.display_name.as_str() == "lldap_admin"
+                    {
+                        let current_count = model::Membership::find()
+                            .filter(model::MembershipColumn::GroupId.eq(group_id))
+                            .count(transaction)
+                            .await?;
+                        if current_count <= 1 {
+                            return Err(sea_orm::DbErr::Custom(
+                                "Cannot remove the last member of lldap_admin".to_string(),
+                            ));
                         }
                     }
 
@@ -1360,7 +1272,7 @@ mod tests {
         let users = get_user_names(
             &fixture.handler,
             Some(UserRequestFilter::AttributeEquality(
-                AttributeName::from("firstname"), // ← canonical name
+                AttributeName::from("firstname"),
                 "first bob".to_string().into(),
             )),
         )
@@ -1707,7 +1619,7 @@ mod tests {
                 .into_iter()
                 .map(|g| g.group_id)
                 .collect::<Vec<_>>();
-            groups.sort_by(|g1, g2| g1.0.cmp(&g2.0));
+            groups.sort_by_key(|g| g.0);
             groups
         };
         assert_eq!(get_group_ids("bob").await, vec![fixture.groups[0]]);
@@ -2100,10 +2012,7 @@ mod tests {
         // The membership should still exist
         let still_member = fixture
             .handler
-            .list_users(
-                Some(UserRequestFilter::MemberOfId(admin_gid)),
-                false,
-            )
+            .list_users(Some(UserRequestFilter::MemberOfId(admin_gid)), false)
             .await
             .unwrap();
         assert_eq!(still_member.len(), 1);

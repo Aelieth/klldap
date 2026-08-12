@@ -1,4 +1,3 @@
-#![forbid(unsafe_code)]
 use std::str::FromStr;
 
 use clap::{Parser, builder::EnumValueParser};

@@ -6,7 +6,6 @@ use lldap_ldap::{get_default_group_object_classes, get_default_user_object_class
 use lldap_opaque_handler::OpaqueHandler;
 use serde::{Deserialize, Serialize};
 
-// Single source of truth for GraphQL schema wrapper (user + group + system + POSIX + Kerberos)
 use lldap_schema::{AttributeList as SchemaAttributeList, PublicSchema};
 
 #[derive(PartialEq, Eq, Debug, Serialize, Deserialize)]
@@ -117,7 +116,6 @@ impl<Handler: BackendHandler + OpaqueHandler> Schema<Handler> {
         )
     }
 
-    // NEW: Dedicated system schema section (allowedous and future system attributes)
     fn system_schema(&self) -> AttributeList<Handler> {
         AttributeList::<Handler>::new(
             self.schema.system_attributes().clone(),

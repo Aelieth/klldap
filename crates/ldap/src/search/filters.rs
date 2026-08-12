@@ -291,8 +291,6 @@ pub fn convert_user_filter(
                 ) => Ok(UserRequestFilter::UserIdSubString(
                     substring_filter.clone().into(),
                 )),
-                // === NEW: Support substring on custom String attributes ===
-                // This fixes Keycloak admin searches on givenName, sn, displayName, etc.
                 crate::core::utils::UserFieldType::Attribute(
                     name,
                     lldap_schema::AttributeType::String,
@@ -425,7 +423,10 @@ pub fn convert_group_filter(
                     )
                     .map(GroupRequestFilter::Member)
                     .unwrap_or_else(|e| {
-                        warn!("Invalid member/uniqueMember/memberOf filter on group: {}", e);
+                        warn!(
+                            "Invalid member/uniqueMember/memberOf filter on group: {}",
+                            e
+                        );
                         GroupRequestFilter::False
                     }))
                 }
@@ -598,7 +599,6 @@ pub fn convert_group_filter(
                 crate::core::utils::GroupFieldType::DisplayName => Ok(
                     GroupRequestFilter::DisplayNameSubString(substring_filter.clone().into()),
                 ),
-                // NEW: Support substring filters on custom String attributes for groups
                 crate::core::utils::GroupFieldType::Attribute(name, AttributeType::String, _) => {
                     Ok(GroupRequestFilter::AttributeSubString(
                         name,

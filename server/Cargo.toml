@@ -36,7 +36,6 @@ futures-util = "0"
 hmac = "0.12"
 juniper = { workspace = true }
 jwt = { workspace = true }
-keycloak = "~26.5"
 ldap3_proto = { workspace = true }
 lettre = { version = "0.11.19", features = ["builder", "serde", "smtp-transport", "tokio1-rustls-tls"], default-features = false }
 log = { workspace = true }
@@ -61,14 +60,11 @@ tokio-stream = "0"
 tokio-util = "0.7"
 tracing = { workspace = true }
 tracing-actix-web = "0.7"
-tracing-attributes = "^0.1.21"
 tracing-forest = { version = "0.3", features = ["smallvec", "chrono", "tokio"] }
 tracing-log = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = { version = "2", features = ["serde"] }
-urlencoding = { workspace = true }
 uuid = { workspace = true, features = ["v1", "v3", "v4", "serde"] }
-webpki-roots = "1"
 
 [dependencies.lldap_access_control]
 path = "../crates/access-control"
@@ -115,7 +111,6 @@ uuid = { workspace = true }
 
 [dev-dependencies.lldap_auth]
 path = "../crates/auth"
-features = ["test"]
 
 [dev-dependencies.lldap_domain]
 path = "../crates/domain"
@@ -123,11 +118,9 @@ features = ["test"]
 
 [dev-dependencies.lldap_opaque_handler]
 path = "../crates/opaque-handler"
-features = ["test"]
 
 [dev-dependencies.lldap_sql_backend_handler]
 path = "../crates/sql-backend-handler"
-features = ["test"]
 
 [dev-dependencies.lldap_test_utils]
 path = "../crates/test-utils"

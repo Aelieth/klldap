@@ -298,12 +298,23 @@ impl SchemaManager {
 
         let mut attributes_out: BTreeMap<AttributeName, String> = BTreeMap::new();
 
+        // displayName is a distinct emitted wire name for the display_name value.
+        const DISPLAY_NAME_WIRE: &str = "displayName";
+
         for s in ldap_attributes.iter().filter(|&s| {
             let lower = s.to_ascii_lowercase();
             lower != "*" && lower != "+" && lower != "1.1" && !ignore_set.contains(lower.as_str())
         }) {
-            let canonical = self.get_canonical_name(s);
-            attributes_out.insert(AttributeName::from(&canonical), canonical);
+            // Keep displayName apart from cn so an explicit displayName request returns displayName.
+            if s.eq_ignore_ascii_case(DISPLAY_NAME_WIRE) {
+                attributes_out.insert(
+                    AttributeName::from(DISPLAY_NAME_WIRE),
+                    DISPLAY_NAME_WIRE.to_string(),
+                );
+            } else {
+                let canonical = self.get_canonical_name(s);
+                attributes_out.insert(AttributeName::from(&canonical), canonical);
+            }
         }
 
         let has_star = ldap_attributes.iter().any(|x| x == "*") || ldap_attributes.is_empty();
@@ -314,6 +325,13 @@ impl SchemaManager {
             include_custom_attributes = true;
             for s in &standard_keys {
                 attributes_out.insert(AttributeName::from(s), s.clone());
+            }
+            // Wildcard searches also emit displayName alongside cn (AD-compat).
+            if standard_keys.iter().any(|k| k.eq_ignore_ascii_case("cn")) {
+                attributes_out.insert(
+                    AttributeName::from(DISPLAY_NAME_WIRE),
+                    DISPLAY_NAME_WIRE.to_string(),
+                );
             }
         }
 
@@ -434,6 +452,30 @@ mod tests {
         assert!(!exp.include_custom_attributes);
         assert!(!exp.include_operational_attributes);
         assert!(exp.attribute_keys.is_empty());
+    }
+
+    #[test]
+    fn expand_display_name_hybrid_emission() {
+        // explicit displayName → displayName only; explicit cn → cn only; * → both.
+        let dn = expand(&["displayName"]);
+        let dn_vals: Vec<&str> = dn.attribute_keys.values().map(String::as_str).collect();
+        assert!(dn_vals.contains(&"displayName"), "{dn_vals:?}");
+        assert!(
+            !keys(&dn).contains("cn"),
+            "explicit displayName must not add cn"
+        );
+
+        let cn = expand(&["cn"]);
+        assert!(keys(&cn).contains("cn"));
+        assert!(
+            !keys(&cn).contains("displayname"),
+            "explicit cn must not add displayName"
+        );
+
+        let star = expand(&["*"]);
+        let star_vals: Vec<&str> = star.attribute_keys.values().map(String::as_str).collect();
+        assert!(star_vals.contains(&"cn"), "{star_vals:?}");
+        assert!(star_vals.contains(&"displayName"), "{star_vals:?}");
     }
 
     #[test]

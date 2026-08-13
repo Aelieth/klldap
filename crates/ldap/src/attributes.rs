@@ -742,4 +742,77 @@ mod tests {
         assert!(plus.contains("creatorsname"));
         assert!(plus.contains("entryuuid"));
     }
+
+    fn user_entry(attrs: &[&str]) -> LdapSearchResultEntry {
+        let schema = PublicSchema::shared();
+        let expanded = crate::schema::SchemaManager::default().expand_attribute_wildcards(
+            &attrs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
+            schema,
+        );
+        make_ldap_search_user_result_entry(
+            sample_user(),
+            "dc=example,dc=com",
+            expanded,
+            None,
+            &[],
+            schema,
+        )
+    }
+
+    fn group_entry(attrs: &[&str]) -> LdapSearchResultEntry {
+        let schema = PublicSchema::shared();
+        let expanded = crate::schema::SchemaManager::default().expand_attribute_wildcards(
+            &attrs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
+            schema,
+        );
+        make_ldap_search_group_result_entry(
+            sample_group(),
+            "dc=example,dc=com",
+            expanded,
+            &None,
+            &[],
+            schema,
+        )
+    }
+
+    fn atype_vals<'a>(entry: &'a LdapSearchResultEntry, atype: &str) -> Option<&'a Vec<Vec<u8>>> {
+        entry
+            .attributes
+            .iter()
+            .find(|a| a.atype == atype)
+            .map(|a| &a.vals)
+    }
+
+    #[test]
+    fn display_name_hybrid_emission() {
+        // * emits both cn and displayName (same value); explicit displayName → displayName only;
+        // explicit cn → cn only; for users and groups.
+        let star = user_entry(&["*"]);
+        assert_eq!(atype_vals(&star, "cn"), Some(&vec![b"Bob".to_vec()]));
+        assert_eq!(
+            atype_vals(&star, "displayName"),
+            Some(&vec![b"Bob".to_vec()])
+        );
+
+        let dn = user_entry(&["displayName"]);
+        assert_eq!(atype_vals(&dn, "displayName"), Some(&vec![b"Bob".to_vec()]));
+        assert!(
+            atype_vals(&dn, "cn").is_none(),
+            "explicit displayName must not emit cn"
+        );
+
+        let cn = user_entry(&["cn"]);
+        assert_eq!(atype_vals(&cn, "cn"), Some(&vec![b"Bob".to_vec()]));
+        assert!(
+            atype_vals(&cn, "displayName").is_none(),
+            "explicit cn must not emit displayName"
+        );
+
+        let gstar = group_entry(&["*"]);
+        assert_eq!(atype_vals(&gstar, "cn"), Some(&vec![b"admins".to_vec()]));
+        assert_eq!(
+            atype_vals(&gstar, "displayName"),
+            Some(&vec![b"admins".to_vec()])
+        );
+    }
 }

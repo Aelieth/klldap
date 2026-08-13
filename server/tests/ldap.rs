@@ -271,6 +271,72 @@ fn cn_substring_matches_display_name() {
     ldap.unbind().expect("failed to unbind");
 }
 
+#[test]
+#[file_serial]
+fn display_name_emitted_for_cn_and_display_name() {
+    // A wildcard search returns both cn and displayName (same value); an explicit displayName
+    // request returns displayName over the wire.
+    let mut fixture = LLDAPFixture::new();
+    let prefix = "ldap-displayname-";
+    let user_name = new_id(Some(prefix));
+    let display = "Ninameow Aelieth";
+    fixture.load_state(&vec![
+        User::new(&user_name, vec![]).with_display_name(display),
+    ]);
+
+    let mut ldap =
+        LdapConn::new(env::ldap_url().as_str()).expect("failed to create ldap connection");
+    let base_dn = env::base_dn();
+    let bind_dn = format!("uid={},ou=people,{}", env::admin_dn(), base_dn);
+    ldap.simple_bind(&bind_dn, env::admin_password().as_str())
+        .expect("failed to bind to ldap");
+
+    let filter = format!("(uid={})", user_name);
+
+    // Wildcard: both cn and displayName present with the same value.
+    let star = attrs_for_user(
+        ldap.search(&base_dn, Scope::Subtree, &filter, vec!["*"])
+            .expect("search failed"),
+        &user_name,
+    );
+    assert_eq!(star.get("cn").map(String::as_str), Some(display), "cn on *");
+    assert_eq!(
+        star.get("displayname").map(String::as_str),
+        Some(display),
+        "displayName on *"
+    );
+
+    // Explicit displayName request returns displayName.
+    let explicit = attrs_for_user(
+        ldap.search(&base_dn, Scope::Subtree, &filter, vec!["displayName"])
+            .expect("search failed"),
+        &user_name,
+    );
+    assert_eq!(
+        explicit.get("displayname").map(String::as_str),
+        Some(display),
+        "explicit displayName"
+    );
+
+    ldap.unbind().expect("failed to unbind");
+}
+
+/// First value of each attribute (lowercased atype) for the entry whose DN carries `uid=<uid>`.
+fn attrs_for_user(results: SearchResult, uid: &str) -> HashMap<String, String> {
+    let needle = format!("uid={}", uid).to_ascii_lowercase();
+    for entry in results.success().expect("search failed").0 {
+        let parsed = SearchEntry::construct(entry);
+        if parsed.dn.to_ascii_lowercase().contains(&needle) {
+            return parsed
+                .attrs
+                .iter()
+                .filter_map(|(k, v)| v.first().map(|val| (k.to_ascii_lowercase(), val.clone())))
+                .collect();
+        }
+    }
+    HashMap::new()
+}
+
 /// Count returned entries whose objectClass includes organizationalUnit.
 fn count_ou_entries(results: SearchResult) -> usize {
     let entries = results.success().expect("search failed").0;

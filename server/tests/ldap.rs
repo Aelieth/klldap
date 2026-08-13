@@ -236,6 +236,41 @@ fn ou_entries_respect_filter() {
     ldap.unbind().expect("failed to unbind");
 }
 
+#[test]
+#[file_serial]
+fn cn_substring_matches_display_name() {
+    // uid is random and does not contain the substring, so a match is via display_name.
+    let mut fixture = LLDAPFixture::new();
+    let prefix = "ldap-cn-substr-";
+    let user_name = new_id(Some(prefix));
+    fixture.load_state(&vec![
+        User::new(&user_name, vec![]).with_display_name("Shaia Aelieth Meow"),
+    ]);
+
+    let mut ldap =
+        LdapConn::new(env::ldap_url().as_str()).expect("failed to create ldap connection");
+    let base_dn = env::base_dn();
+    let bind_dn = format!("uid={},ou=people,{}", env::admin_dn(), base_dn);
+    ldap.simple_bind(&bind_dn, env::admin_password().as_str())
+        .expect("failed to bind to ldap");
+
+    let found = parse_ldap_users(
+        ldap.search(
+            &base_dn,
+            Scope::Subtree,
+            "(&(objectclass=person)(cn=*aelieth*))",
+            vec!["uid"],
+        )
+        .expect("failed to search"),
+    );
+    assert!(
+        found.contains_key(&user_name),
+        "cn substring did not match the user's display_name (bug #5)"
+    );
+
+    ldap.unbind().expect("failed to unbind");
+}
+
 /// Count returned entries whose objectClass includes organizationalUnit.
 fn count_ou_entries(results: SearchResult) -> usize {
     let entries = results.success().expect("search failed").0;

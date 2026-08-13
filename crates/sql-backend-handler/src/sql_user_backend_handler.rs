@@ -97,6 +97,11 @@ fn get_user_filter_expr(filter: UserRequestFilter) -> Cond {
             } else if column == UserColumn::Email {
                 ColumnTrait::eq(&UserColumn::LowercaseEmail, value.as_str().to_lowercase())
                     .into_condition()
+            } else if column == UserColumn::DisplayName {
+                // cn/displayName is caseIgnoreMatch: lower both sides (as the substring path does).
+                SimpleExpr::FunctionCall(Func::lower(Expr::col(column.as_column_ref())))
+                    .eq(value.to_lowercase())
+                    .into_condition()
             } else {
                 ColumnTrait::eq(&column, value).into_condition()
             }
@@ -1260,6 +1265,20 @@ mod tests {
             Some(UserRequestFilter::Equality(
                 UserColumn::DisplayName,
                 "display bob".to_string(),
+            )),
+        )
+        .await;
+        assert_eq!(users, vec!["bob"]);
+    }
+
+    #[tokio::test]
+    async fn test_list_users_display_name_filter_is_case_insensitive() {
+        let fixture = TestFixture::new().await;
+        let users = get_user_names(
+            &fixture.handler,
+            Some(UserRequestFilter::Equality(
+                UserColumn::DisplayName,
+                "DISPLAY BOB".to_string(),
             )),
         )
         .await;

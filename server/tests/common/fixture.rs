@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 use crate::common::{
     auth::get_token,
     env,
@@ -68,13 +69,23 @@ fn post_graphql<T: graphql_client::GraphQLQuery + 'static>(
 pub struct User {
     pub username: String,
     pub groups: Vec<String>,
+    pub display_name: Option<String>,
 }
 
 impl User {
     pub fn new(username: &str, groups: Vec<&str>) -> Self {
         let username = username.to_owned();
         let groups = groups.iter().map(|g| g.to_string()).collect();
-        Self { username, groups }
+        Self {
+            username,
+            groups,
+            display_name: None,
+        }
+    }
+
+    pub fn with_display_name(mut self, display_name: &str) -> Self {
+        self.display_name = Some(display_name.to_owned());
+        self
     }
 }
 
@@ -138,48 +149,51 @@ impl LLDAPFixture {
     }
 
     pub fn load_state(&mut self, state: &Vec<User>) {
-        let mut users: HashSet<String> = HashSet::new();
+        let mut seen: HashSet<String> = HashSet::new();
         let mut groups: HashSet<String> = HashSet::new();
 
         for user in state {
-            users.insert(user.username.clone());
+            if seen.insert(user.username.clone()) {
+                self.add_user(user);
+            }
             groups.extend(user.groups.clone());
         }
 
-        for user in &users {
-            self.add_user(user);
-        }
         for group in &groups {
             self.add_group(group);
         }
-        for User { username, groups } in state {
+        for User {
+            username, groups, ..
+        } in state
+        {
             for group in groups {
                 self.add_user_to_group(username, group);
             }
         }
     }
 
-    fn add_user(&mut self, user: &String) {
+    fn add_user(&mut self, user: &User) {
+        let username = &user.username;
         let response = post_graphql::<CreateUser>(
             &self.client,
             &self.token,
             create_user::Variables {
                 user: create_user::CreateUserInput {
-                    id: user.clone(),
-                    email: Some(format!("{user}@lldap.test")),
+                    id: username.clone(),
+                    email: Some(format!("{username}@lldap.test")),
                     avatar: None,
-                    display_name: None,
+                    display_name: user.display_name.clone(),
                     first_name: None,
                     last_name: None,
                     attributes: None,
                 },
             },
         )
-        .unwrap_or_else(|e| panic!("failed to add user '{}': {}", user, e));
+        .unwrap_or_else(|e| panic!("failed to add user '{}': {}", username, e));
 
         // We don't actually need the response data here, just success
         let _ = response;
-        self.users.insert(user.clone());
+        self.users.insert(username.clone());
     }
 
     fn add_group(&mut self, group: &str) {

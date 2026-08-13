@@ -17,6 +17,52 @@ use lldap_domain::{
 use lldap_opaque_handler::OpaqueHandler;
 use tracing::warn;
 
+// The profile attribute an LDAP Modify targets, after folding wire-name aliases (sn, cn, surname,
+// jpegphoto, ...) to the schema canonical name. Bridges canonical → DB attribute name / field.
+enum ModifyTarget {
+    FirstName,
+    LastName,
+    DisplayName,
+    Email,
+    Avatar,
+    SshPublicKey,
+    Ou,
+    Unsupported,
+}
+
+fn modify_target(atype_lower: &str) -> ModifyTarget {
+    let canonical = lldap_domain::public_schema::PublicSchema::shared()
+        .resolve_user_canonical_name(atype_lower)
+        .unwrap_or(atype_lower);
+    match canonical {
+        "firstname" => ModifyTarget::FirstName,
+        "lastname" => ModifyTarget::LastName,
+        "displayname" => ModifyTarget::DisplayName,
+        "mail" => ModifyTarget::Email,
+        "avatar" => ModifyTarget::Avatar,
+        "sshpublickey" => ModifyTarget::SshPublicKey,
+        "ou" => ModifyTarget::Ou,
+        _ => ModifyTarget::Unsupported,
+    }
+}
+
+fn typed_insert_attribute(
+    name: &str,
+    vals: &[String],
+    typ: AttributeType,
+    is_list: bool,
+) -> LdapResult<Attribute> {
+    Ok(Attribute {
+        name: name.into(),
+        value: deserialize::deserialize_attribute_value(vals, typ, is_list).map_err(|e| {
+            LdapError {
+                code: LdapResultCode::ConstraintViolation,
+                message: format!("Invalid {name} value: {e}"),
+            }
+        })?,
+    })
+}
+
 async fn handle_modify_change(
     readable_handler: &impl UserReadableBackendHandler,
     writeable_handler: &impl UserWriteableBackendHandler,
@@ -99,13 +145,12 @@ async fn handle_modify_change(
             });
         }
 
-        // Protect mail and displayname from deletion
+        // Protect mail (Email) and cn/displayname (DisplayName) from deletion.
         if change.operation == LdapModifyType::Delete
-            && (atype_lower == "mail"
-                || atype_lower == "email"
-                || atype_lower == "cn"
-                || atype_lower == "displayname"
-                || atype_lower == "commonname")
+            && matches!(
+                modify_target(&atype_lower),
+                ModifyTarget::Email | ModifyTarget::DisplayName
+            )
         {
             return Err(LdapError {
                 code: LdapResultCode::InsufficentAccessRights,
@@ -137,70 +182,34 @@ async fn handle_modify_change(
                     });
                 }
 
-                match atype_lower.as_str() {
-                    "givenname" | "given_name" => {
-                        insert_attributes.push(Attribute {
-                            name: "first_name".into(),
-                            value: deserialize::deserialize_attribute_value(
-                                &vals,
-                                AttributeType::String,
-                                false,
-                            )
-                            .map_err(|e| LdapError {
-                                code: LdapResultCode::ConstraintViolation,
-                                message: format!("Invalid first_name value: {e}"),
-                            })?,
-                        });
-                    }
-                    "sn" | "surname" => {
-                        insert_attributes.push(Attribute {
-                            name: "last_name".into(),
-                            value: deserialize::deserialize_attribute_value(
-                                &vals,
-                                AttributeType::String,
-                                false,
-                            )
-                            .map_err(|e| LdapError {
-                                code: LdapResultCode::ConstraintViolation,
-                                message: format!("Invalid last_name value: {e}"),
-                            })?,
-                        });
-                    }
-                    "cn" | "commonname" | "displayname" => {
-                        display_name = Some(vals[0].clone());
-                    }
-                    "mail" | "email" => {
-                        email = Some(Email::from(vals[0].clone()));
-                    }
-                    "avatar" | "jpegphoto" | "jpeg_photo" => {
-                        insert_attributes.push(Attribute {
-                            name: "avatar".into(),
-                            value: deserialize::deserialize_attribute_value(
-                                &vals,
-                                AttributeType::Avatar,
-                                false,
-                            )
-                            .map_err(|e| LdapError {
-                                code: LdapResultCode::ConstraintViolation,
-                                message: format!("Invalid avatar value: {e}"),
-                            })?,
-                        });
-                    }
-                    "sshpublickey" | "ssh_public_key" => {
-                        insert_attributes.push(Attribute {
-                            name: "sshpublickey".into(),
-                            value: deserialize::deserialize_attribute_value(
-                                &vals,
-                                AttributeType::String,
-                                true,
-                            )
-                            .map_err(|e| LdapError {
-                                code: LdapResultCode::ConstraintViolation,
-                                message: format!("Invalid sshPublicKey value: {e}"),
-                            })?,
-                        });
-                    }
-                    "ou" => {
+                match modify_target(&atype_lower) {
+                    ModifyTarget::FirstName => insert_attributes.push(typed_insert_attribute(
+                        "first_name",
+                        &vals,
+                        AttributeType::String,
+                        false,
+                    )?),
+                    ModifyTarget::LastName => insert_attributes.push(typed_insert_attribute(
+                        "last_name",
+                        &vals,
+                        AttributeType::String,
+                        false,
+                    )?),
+                    ModifyTarget::DisplayName => display_name = Some(vals[0].clone()),
+                    ModifyTarget::Email => email = Some(Email::from(vals[0].clone())),
+                    ModifyTarget::Avatar => insert_attributes.push(typed_insert_attribute(
+                        "avatar",
+                        &vals,
+                        AttributeType::Avatar,
+                        false,
+                    )?),
+                    ModifyTarget::SshPublicKey => insert_attributes.push(typed_insert_attribute(
+                        "sshpublickey",
+                        &vals,
+                        AttributeType::String,
+                        true,
+                    )?),
+                    ModifyTarget::Ou => {
                         return Err(LdapError {
                             code: LdapResultCode::UnwillingToPerform,
                             message:
@@ -208,7 +217,7 @@ async fn handle_modify_change(
                                     .to_string(),
                         });
                     }
-                    _ => {
+                    ModifyTarget::Unsupported => {
                         return Err(LdapError {
                             code: LdapResultCode::UnwillingToPerform,
                             message: format!(
@@ -235,7 +244,7 @@ async fn handle_modify_change(
                     });
                 }
 
-                if atype_lower == "sshpublickey" || atype_lower == "ssh_public_key" {
+                if matches!(modify_target(&atype_lower), ModifyTarget::SshPublicKey) {
                     let user = readable_handler
                         .get_user_details(&user_id)
                         .await
@@ -278,55 +287,27 @@ async fn handle_modify_change(
                         })?,
                     });
                 } else {
-                    match atype_lower.as_str() {
-                        "givenname" | "given_name" => {
-                            insert_attributes.push(Attribute {
-                                name: "first_name".into(),
-                                value: deserialize::deserialize_attribute_value(
-                                    &new_vals,
-                                    AttributeType::String,
-                                    false,
-                                )
-                                .map_err(|e| LdapError {
-                                    code: LdapResultCode::ConstraintViolation,
-                                    message: format!("Invalid first_name value: {e}"),
-                                })?,
-                            });
-                        }
-                        "sn" | "surname" => {
-                            insert_attributes.push(Attribute {
-                                name: "last_name".into(),
-                                value: deserialize::deserialize_attribute_value(
-                                    &new_vals,
-                                    AttributeType::String,
-                                    false,
-                                )
-                                .map_err(|e| LdapError {
-                                    code: LdapResultCode::ConstraintViolation,
-                                    message: format!("Invalid last_name value: {e}"),
-                                })?,
-                            });
-                        }
-                        "cn" | "commonname" | "displayname" => {
-                            display_name = Some(new_vals[0].clone());
-                        }
-                        "mail" | "email" => {
-                            email = Some(Email::from(new_vals[0].clone()));
-                        }
-                        "avatar" | "jpegphoto" | "jpeg_photo" => {
-                            insert_attributes.push(Attribute {
-                                name: "avatar".into(),
-                                value: deserialize::deserialize_attribute_value(
-                                    &new_vals,
-                                    AttributeType::Avatar,
-                                    false,
-                                )
-                                .map_err(|e| LdapError {
-                                    code: LdapResultCode::ConstraintViolation,
-                                    message: format!("Invalid avatar value: {e}"),
-                                })?,
-                            });
-                        }
+                    match modify_target(&atype_lower) {
+                        ModifyTarget::FirstName => insert_attributes.push(typed_insert_attribute(
+                            "first_name",
+                            &new_vals,
+                            AttributeType::String,
+                            false,
+                        )?),
+                        ModifyTarget::LastName => insert_attributes.push(typed_insert_attribute(
+                            "last_name",
+                            &new_vals,
+                            AttributeType::String,
+                            false,
+                        )?),
+                        ModifyTarget::DisplayName => display_name = Some(new_vals[0].clone()),
+                        ModifyTarget::Email => email = Some(Email::from(new_vals[0].clone())),
+                        ModifyTarget::Avatar => insert_attributes.push(typed_insert_attribute(
+                            "avatar",
+                            &new_vals,
+                            AttributeType::Avatar,
+                            false,
+                        )?),
                         _ => {
                             return Err(LdapError {
                                 code: LdapResultCode::UnwillingToPerform,
@@ -348,7 +329,7 @@ async fn handle_modify_change(
                     .filter_map(|v| std::str::from_utf8(v).ok().map(|s| s.to_string()))
                     .collect();
 
-                if atype_lower == "sshpublickey" || atype_lower == "ssh_public_key" {
+                if matches!(modify_target(&atype_lower), ModifyTarget::SshPublicKey) {
                     if delete_vals.is_empty() {
                         // No specific values → delete whole attribute
                         delete_attributes.push(AttributeName::from("sshpublickey"));
@@ -402,14 +383,14 @@ async fn handle_modify_change(
                     }
                 } else {
                     // Non-sshPublicKey delete (whole attribute)
-                    match atype_lower.as_str() {
-                        "givenname" | "given_name" => {
+                    match modify_target(&atype_lower) {
+                        ModifyTarget::FirstName => {
                             delete_attributes.push(AttributeName::from("first_name"))
                         }
-                        "sn" | "surname" => {
+                        ModifyTarget::LastName => {
                             delete_attributes.push(AttributeName::from("last_name"))
                         }
-                        "avatar" | "jpegphoto" | "jpeg_photo" => {
+                        ModifyTarget::Avatar => {
                             delete_attributes.push(AttributeName::from("avatar"))
                         }
                         _ => {
@@ -909,6 +890,162 @@ mod tests {
                 LdapResultCode::UnwillingToPerform,
                 "Unsupported attribute for LDAP Modify: title (supported: givenName, sn, cn, mail, avatar, sshPublicKey, userPassword)"
             )
+        );
+    }
+
+    fn make_delete_modify_request(user: &str, atype: &str) -> LdapModifyRequest {
+        LdapModifyRequest {
+            dn: format!("uid={user},ou=people,dc=example,dc=com"),
+            changes: vec![LdapModify {
+                operation: LdapModifyType::Delete,
+                modification: ldap3_proto::LdapPartialAttribute {
+                    atype: atype.to_string(),
+                    vals: vec![],
+                },
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn test_modify_delete_of_protected_attributes_rejected() {
+        for atype in ["mail", "email", "cn", "displayname", "commonname"] {
+            let mut mock = MockTestBackendHandler::new();
+            setup_default_ldap_mock(&mut mock);
+            let ldap_handler = setup_bound_admin_handler(mock).await;
+            assert_eq!(
+                ldap_handler
+                    .do_modify_request(&make_delete_modify_request("bob", atype))
+                    .await,
+                make_modify_failure_response(
+                    LdapResultCode::InsufficentAccessRights,
+                    &format!(
+                        "Deletion of `{atype}` is not allowed via LDAP Modify (use GraphQL or protected path)"
+                    )
+                )
+            );
+        }
+    }
+
+    fn make_add_modify_request(user: &str, atype: &str, value: &str) -> LdapModifyRequest {
+        LdapModifyRequest {
+            dn: format!("uid={user},ou=people,dc=example,dc=com"),
+            changes: vec![LdapModify {
+                operation: LdapModifyType::Add,
+                modification: ldap3_proto::LdapPartialAttribute {
+                    atype: atype.to_string(),
+                    vals: vec![value.as_bytes().to_vec()],
+                },
+            }],
+        }
+    }
+
+    // Pins that the 5 non-schema wire-names (schema aliases since Stage 1) still route to the
+    // right sink on Replace — guards the ModifyTarget collapse.
+    #[tokio::test]
+    async fn test_modify_replace_non_schema_wire_names() {
+        async fn check(
+            atype: &str,
+            value: &str,
+            pred: fn(&lldap_domain::requests::UpdateUserRequest) -> bool,
+        ) {
+            let mut mock = MockTestBackendHandler::new();
+            setup_default_ldap_mock(&mut mock);
+            mock.expect_update_user()
+                .with(mockall::predicate::function(
+                    move |req: &lldap_domain::requests::UpdateUserRequest| {
+                        req.user_id == UserId::new("bob") && pred(req)
+                    },
+                ))
+                .times(1)
+                .return_once(|_| Ok(()));
+            let ldap_handler = setup_bound_admin_handler(mock).await;
+            let request = make_profile_modify_request("bob", atype, value);
+            assert_eq!(
+                ldap_handler.do_modify_request(&request).await,
+                make_modify_success_response()
+            );
+        }
+
+        const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
+        check("surname", "Smith", |r| {
+            r.insert_attributes
+                .iter()
+                .any(|a| a.name.as_str() == "last_name")
+        })
+        .await;
+        check("commonname", "Bob", |r| {
+            r.display_name == Some("Bob".to_string())
+        })
+        .await;
+        check("given_name", "Alice", |r| {
+            r.insert_attributes
+                .iter()
+                .any(|a| a.name.as_str() == "first_name")
+        })
+        .await;
+        check("jpeg_photo", PNG, |r| {
+            r.insert_attributes
+                .iter()
+                .any(|a| a.name.as_str() == "avatar")
+        })
+        .await;
+        check(
+            "ssh_public_key",
+            "ssh-rsa AAAAB3NzaC1yc2E testuser@host",
+            |r| {
+                r.insert_attributes
+                    .iter()
+                    .any(|a| a.name.as_str() == "sshpublickey")
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_modify_add_givenname_inserts_first_name() {
+        let mut mock = MockTestBackendHandler::new();
+        setup_default_ldap_mock(&mut mock);
+        mock.expect_update_user()
+            .with(mockall::predicate::function(
+                |req: &lldap_domain::requests::UpdateUserRequest| {
+                    req.user_id == UserId::new("bob")
+                        && req
+                            .insert_attributes
+                            .iter()
+                            .any(|a| a.name.as_str() == "first_name")
+                },
+            ))
+            .times(1)
+            .return_once(|_| Ok(()));
+        let ldap_handler = setup_bound_admin_handler(mock).await;
+        let request = make_add_modify_request("bob", "givenName", "Alice");
+        assert_eq!(
+            ldap_handler.do_modify_request(&request).await,
+            make_modify_success_response()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_modify_delete_givenname_deletes_first_name() {
+        let mut mock = MockTestBackendHandler::new();
+        setup_default_ldap_mock(&mut mock);
+        mock.expect_update_user()
+            .with(mockall::predicate::function(
+                |req: &lldap_domain::requests::UpdateUserRequest| {
+                    req.user_id == UserId::new("bob")
+                        && req
+                            .delete_attributes
+                            .iter()
+                            .any(|a| a.as_str() == "first_name")
+                },
+            ))
+            .times(1)
+            .return_once(|_| Ok(()));
+        let ldap_handler = setup_bound_admin_handler(mock).await;
+        let request = make_delete_modify_request("bob", "givenName");
+        assert_eq!(
+            ldap_handler.do_modify_request(&request).await,
+            make_modify_success_response()
         );
     }
 }

@@ -17,282 +17,98 @@ impl PublicSchema {
     }
 
     fn build() -> Self {
+        use AttributeSchema as A;
+        use AttributeType::{Avatar, DateTime, Integer, String};
+
+        #[rustfmt::skip]
+        let user_attributes = vec![
+            // --- Core (LLDAP-descended) ---
+            A::editable("avatar", Avatar)
+                .aliases(&["jpegphoto", "jpegPhoto", "jpeg_photo"]),
+            A::readonly("creationdate", DateTime)
+                .aliases(&["creation_date", "createTimestamp"]),
+            A::editable("displayname", String)
+                .aliases(&["display_name", "cn", "commonname"]),
+            A::editable("firstname", String)
+                .aliases(&["first_name", "givenName", "given_name"]),
+            A::editable("lastname", String)
+                .aliases(&["last_name", "sn", "surname"]),
+            A::editable("mail", String)
+                .aliases(&["email"]),
+            A::readonly("modifieddate", DateTime)
+                .aliases(&["modified_date", "modifyTimestamp"]),
+            A::readonly("passwordmodifieddate", DateTime)
+                .aliases(&["password_modified_date", "pwdChangedTime"]),
+            A::readonly("userid", String)
+                .aliases(&["user_id", "uid", "id"]),
+            A::readonly("uuid", String)
+                .aliases(&["entryUUID", "entryuuid"]),
+
+            // --- POSIX ---
+            A::generated("uidnumber", Integer)
+                .aliases(&["uid_number", "uidNumber"]),
+            A::generated("gidnumber", Integer)
+                .aliases(&["gid_number", "gidNumber"]),
+            A::generated("homedirectory", String)
+                .aliases(&["home_directory", "homeDirectory"]),
+            A::generated("loginshell", String)
+                .aliases(&["login_shell", "loginShell"]),
+
+            // --- Kerberos ---
+            A::generated("kerberossync", Integer)
+                .aliases(&["kerberos_sync", "kerberosSync"]),
+            A::hidden("krbprincipalname", String)
+                .aliases(&["krb_principal_name", "krbPrincipalName"]),
+
+            // --- SSH ---
+            A::editable("sshpublickey", String)
+                .aliases(&["sshPublicKey", "ssHPublicKey", "ssh_public_key"])
+                .list(),
+
+            // --- OU ---
+            A::readonly("ou", String)
+                .aliases(&["organizationalunit", "organizationalUnit"]),
+        ];
+
+        #[rustfmt::skip]
+        let group_attributes = vec![
+            // --- Core ---
+            A::readonly("groupid", Integer)
+                .aliases(&["group_id"]),
+            A::readonly("creationdate", DateTime)
+                .aliases(&["creation_date", "createTimestamp"]),
+            A::readonly("modifieddate", DateTime)
+                .aliases(&["modified_date", "modifyTimestamp"]),
+            A::readonly("uuid", String)
+                .aliases(&["entryUUID", "entryuuid"]),
+            A::editable("displayname", String)
+                .aliases(&["display_name", "cn", "commonname"]),
+
+            // --- OU ---
+            A::readonly("ou", String)
+                .aliases(&["organizationalunit", "organizationalUnit"]),
+
+            // --- POSIX ---
+            A::generated("gidnumber", Integer)
+                .aliases(&["gid_number", "gidNumber"]),
+        ];
+
+        let system_attributes = vec![
+            A::hidden("allowedous", String)
+                .aliases(&["allowedOUs", "AllowedOUs"])
+                .list(),
+        ];
+
         PublicSchema(Schema {
             user_attributes: AttributeList {
-                attributes: vec![
-                    // ==================== CORE LLDAP ATTRIBUTES ====================
-                    AttributeSchema {
-                        name: "avatar".into(),
-                        aliases: vec!["jpegphoto".into(), "jpegPhoto".into()],
-                        attribute_type: AttributeType::Avatar,
-                        is_list: false,
-                        is_visible: true,
-                        is_editable: true,
-                        is_hardcoded: true,
-                        is_readonly: false,
-                    },
-                    AttributeSchema {
-                        name: "creationdate".into(),
-                        aliases: vec!["creation_date".into(), "createTimestamp".into()],
-                        attribute_type: AttributeType::DateTime,
-                        is_list: false,
-                        is_visible: true,
-                        is_editable: false,
-                        is_hardcoded: true,
-                        is_readonly: true,
-                    },
-                    AttributeSchema {
-                        name: "displayname".into(),
-                        aliases: vec!["display_name".into(), "cn".into()],
-                        attribute_type: AttributeType::String,
-                        is_list: false,
-                        is_visible: true,
-                        is_editable: true,
-                        is_hardcoded: true,
-                        is_readonly: false,
-                    },
-                    AttributeSchema {
-                        name: "firstname".into(),
-                        aliases: vec!["first_name".into(), "givenName".into()],
-                        attribute_type: AttributeType::String,
-                        is_list: false,
-                        is_visible: true,
-                        is_editable: true,
-                        is_hardcoded: true,
-                        is_readonly: false,
-                    },
-                    AttributeSchema {
-                        name: "lastname".into(),
-                        aliases: vec!["last_name".into(), "sn".into()],
-                        attribute_type: AttributeType::String,
-                        is_list: false,
-                        is_visible: true,
-                        is_editable: true,
-                        is_hardcoded: true,
-                        is_readonly: false,
-                    },
-                    AttributeSchema {
-                        name: "mail".into(),
-                        aliases: vec!["email".into()],
-                        attribute_type: AttributeType::String,
-                        is_list: false,
-                        is_visible: true,
-                        is_editable: true,
-                        is_hardcoded: true,
-                        is_readonly: false,
-                    },
-                    AttributeSchema {
-                        name: "modifieddate".into(),
-                        aliases: vec!["modified_date".into(), "modifyTimestamp".into()],
-                        attribute_type: AttributeType::DateTime,
-                        is_list: false,
-                        is_visible: true,
-                        is_editable: false,
-                        is_hardcoded: true,
-                        is_readonly: true,
-                    },
-                    AttributeSchema {
-                        name: "passwordmodifieddate".into(),
-                        aliases: vec!["password_modified_date".into(), "pwdChangedTime".into()],
-                        attribute_type: AttributeType::DateTime,
-                        is_list: false,
-                        is_visible: true,
-                        is_editable: false,
-                        is_hardcoded: true,
-                        is_readonly: true,
-                    },
-                    AttributeSchema {
-                        name: "userid".into(),
-                        aliases: vec!["user_id".into(), "uid".into(), "id".into()],
-                        attribute_type: AttributeType::String,
-                        is_list: false,
-                        is_visible: true,
-                        is_editable: false,
-                        is_hardcoded: true,
-                        is_readonly: true,
-                    },
-                    AttributeSchema {
-                        name: "uuid".into(),
-                        aliases: vec!["entryuuid".into(), "entryUUID".into()],
-                        attribute_type: AttributeType::String,
-                        is_list: false,
-                        is_visible: true,
-                        is_editable: false,
-                        is_hardcoded: true,
-                        is_readonly: true,
-                    },
-                    // POSIX, Kerberos, SSH, ou (still visible on users/groups)
-                    AttributeSchema {
-                        name: "uidnumber".into(),
-                        aliases: vec!["uid_number".into(), "uidNumber".into()],
-                        attribute_type: AttributeType::Integer,
-                        is_list: false,
-                        is_visible: true,
-                        is_editable: false,
-                        is_hardcoded: true,
-                        is_readonly: false,
-                    },
-                    AttributeSchema {
-                        name: "gidnumber".into(),
-                        aliases: vec!["gid_number".into(), "gidNumber".into()],
-                        attribute_type: AttributeType::Integer,
-                        is_list: false,
-                        is_visible: true,
-                        is_editable: false,
-                        is_hardcoded: true,
-                        is_readonly: false,
-                    },
-                    AttributeSchema {
-                        name: "homedirectory".into(),
-                        aliases: vec!["home_directory".into(), "homeDirectory".into()],
-                        attribute_type: AttributeType::String,
-                        is_list: false,
-                        is_visible: true,
-                        is_editable: false,
-                        is_hardcoded: true,
-                        is_readonly: false,
-                    },
-                    AttributeSchema {
-                        name: "loginshell".into(),
-                        aliases: vec!["login_shell".into(), "loginShell".into()],
-                        attribute_type: AttributeType::String,
-                        is_list: false,
-                        is_visible: true,
-                        is_editable: false,
-                        is_hardcoded: true,
-                        is_readonly: false,
-                    },
-                    AttributeSchema {
-                        name: "kerberossync".into(),
-                        aliases: vec!["kerberos_sync".into(), "kerberosSync".into()],
-                        attribute_type: AttributeType::Integer,
-                        is_list: false,
-                        is_visible: true,
-                        is_editable: false,
-                        is_hardcoded: true,
-                        is_readonly: false,
-                    },
-                    AttributeSchema {
-                        name: "krbprincipalname".into(),
-                        aliases: vec!["krb_principal_name".into(), "krbPrincipalName".into()],
-                        attribute_type: AttributeType::String,
-                        is_list: false,
-                        is_visible: false,
-                        is_editable: false,
-                        is_hardcoded: true,
-                        is_readonly: true,
-                    },
-                    AttributeSchema {
-                        name: "sshpublickey".into(),
-                        aliases: vec!["sshPublicKey".into(), "ssHPublicKey".into()],
-                        attribute_type: AttributeType::String,
-                        is_list: true,
-                        is_visible: true,
-                        is_editable: true,
-                        is_hardcoded: true,
-                        is_readonly: false,
-                    },
-                    AttributeSchema {
-                        name: "ou".into(),
-                        aliases: vec!["organizationalunit".into(), "organizationalUnit".into()],
-                        attribute_type: AttributeType::String,
-                        is_list: false,
-                        is_visible: true,
-                        is_editable: false,
-                        is_hardcoded: true,
-                        is_readonly: true,
-                    },
-                ],
+                attributes: user_attributes,
             },
             group_attributes: AttributeList {
-                attributes: vec![
-                    AttributeSchema {
-                        name: "groupid".into(),
-                        aliases: vec!["group_id".into()],
-                        attribute_type: AttributeType::Integer,
-                        is_list: false,
-                        is_visible: true,
-                        is_editable: false,
-                        is_hardcoded: true,
-                        is_readonly: true,
-                    },
-                    AttributeSchema {
-                        name: "creationdate".into(),
-                        aliases: vec!["creation_date".into(), "createTimestamp".into()],
-                        attribute_type: AttributeType::DateTime,
-                        is_list: false,
-                        is_visible: true,
-                        is_editable: false,
-                        is_hardcoded: true,
-                        is_readonly: true,
-                    },
-                    AttributeSchema {
-                        name: "modifieddate".into(),
-                        aliases: vec!["modified_date".into(), "modifyTimestamp".into()],
-                        attribute_type: AttributeType::DateTime,
-                        is_list: false,
-                        is_visible: true,
-                        is_editable: false,
-                        is_hardcoded: true,
-                        is_readonly: true,
-                    },
-                    AttributeSchema {
-                        name: "uuid".into(),
-                        aliases: vec!["entryuuid".into(), "entryUUID".into()],
-                        attribute_type: AttributeType::String,
-                        is_list: false,
-                        is_visible: true,
-                        is_editable: false,
-                        is_hardcoded: true,
-                        is_readonly: true,
-                    },
-                    AttributeSchema {
-                        name: "displayname".into(),
-                        aliases: vec!["display_name".into(), "cn".into()],
-                        attribute_type: AttributeType::String,
-                        is_list: false,
-                        is_visible: true,
-                        is_editable: true,
-                        is_hardcoded: true,
-                        is_readonly: false,
-                    },
-                    AttributeSchema {
-                        name: "ou".into(),
-                        aliases: vec!["organizationalunit".into(), "organizationalUnit".into()],
-                        attribute_type: AttributeType::String,
-                        is_list: false,
-                        is_visible: true,
-                        is_editable: false,
-                        is_hardcoded: true,
-                        is_readonly: true,
-                    },
-                    // POSIX
-                    AttributeSchema {
-                        name: "gidnumber".into(),
-                        aliases: vec!["gid_number".into(), "gidNumber".into()],
-                        attribute_type: AttributeType::Integer,
-                        is_list: false,
-                        is_visible: true,
-                        is_editable: false,
-                        is_hardcoded: true,
-                        is_readonly: false,
-                    },
-                ],
+                attributes: group_attributes,
             },
-            // ==================== SYSTEM ATTRIBUTES ====================
             system_attributes: AttributeList {
-                attributes: vec![AttributeSchema {
-                    name: "allowedous".into(),
-                    aliases: vec!["allowedOUs".into(), "AllowedOUs".into()],
-                    attribute_type: AttributeType::String,
-                    is_list: true,
-                    is_visible: false,
-                    is_editable: false,
-                    is_hardcoded: true,
-                    is_readonly: true,
-                }],
+                attributes: system_attributes,
             },
-            // === Full POSIX settings  ===
             posix_settings: PosixSettings {
                 user_uidnumber_assign: false,
                 user_uidnumber_start: 3001,
@@ -307,7 +123,6 @@ impl PublicSchema {
                 group_gidnumber_start: 3001,
                 group_gidnumber_max: 3999,
             },
-
             extra_user_object_classes: vec![
                 "inetOrgPerson".into(),
                 "posixAccount".into(),

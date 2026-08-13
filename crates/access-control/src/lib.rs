@@ -286,6 +286,15 @@ pub struct UserRestrictedListerBackendHandler<'a, Handler> {
     user_filter: Option<UserId>,
 }
 
+fn restrict_to_visible_attributes(schema: &mut PublicSchema) {
+    schema.0.user_attributes.attributes.retain(|a| a.is_visible);
+    schema
+        .0
+        .group_attributes
+        .attributes
+        .retain(|a| a.is_visible);
+}
+
 #[async_trait]
 impl<Handler: ReadSchemaBackendHandler + Sync> ReadSchemaBackendHandler
     for UserRestrictedListerBackendHandler<'_, Handler>
@@ -293,13 +302,7 @@ impl<Handler: ReadSchemaBackendHandler + Sync> ReadSchemaBackendHandler
     async fn get_schema(&self) -> Result<PublicSchema> {
         let mut public_schema = self.handler.get_schema().await?;
         if self.user_filter.is_some() {
-            let filter_attributes =
-                |attributes: &mut Vec<lldap_domain::schema::AttributeSchema>| {
-                    attributes.retain(|a| a.is_visible);
-                };
-            let inner = &mut public_schema.0;
-            filter_attributes(&mut inner.user_attributes.attributes);
-            filter_attributes(&mut inner.group_attributes.attributes);
+            restrict_to_visible_attributes(&mut public_schema);
         }
         Ok(public_schema)
     }
@@ -388,5 +391,51 @@ impl<Inner: OpaqueHandler + Send + Sync> OpaqueHandler for AccessControlledBacke
         request: registration::ClientRegistrationFinishRequest,
     ) -> Result<()> {
         self.handler.registration_finish(request).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restrict_to_visible_attributes_drops_hidden_entries() {
+        let mut schema = PublicSchema::get();
+        assert!(
+            schema
+                .user_attributes()
+                .get_by_name_or_alias("krbprincipalname")
+                .is_some(),
+            "precondition: krbprincipalname is in the full schema"
+        );
+        restrict_to_visible_attributes(&mut schema);
+        assert!(
+            schema
+                .user_attributes()
+                .get_by_name_or_alias("krbprincipalname")
+                .is_none(),
+            "hidden krbprincipalname must be dropped for restricted users"
+        );
+        assert!(
+            schema
+                .user_attributes()
+                .get_by_name_or_alias("mail")
+                .is_some(),
+            "visible mail must be retained"
+        );
+        assert!(
+            schema
+                .user_attributes()
+                .attributes
+                .iter()
+                .all(|a| a.is_visible)
+        );
+        assert!(
+            schema
+                .group_attributes()
+                .attributes
+                .iter()
+                .all(|a| a.is_visible)
+        );
     }
 }

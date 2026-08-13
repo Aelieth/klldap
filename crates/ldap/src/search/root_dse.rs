@@ -4,20 +4,28 @@ use ldap3_proto::proto::{
     LdapOp, LdapSearchRequest, LdapSearchScope, OID_PASSWORD_MODIFY, OID_WHOAMI,
 };
 
+pub(crate) fn kerberos_realm_name(base_dn: &str, env_realm: Option<&str>) -> String {
+    env_realm
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_ascii_uppercase())
+        .unwrap_or_else(|| {
+            base_dn
+                .split(',')
+                .filter_map(|part| part.strip_prefix("dc="))
+                .collect::<Vec<_>>()
+                .join(".")
+                .to_ascii_uppercase()
+        })
+}
+
 pub fn root_dse_response(base_dn: &str) -> LdapOp {
-    let realm = {
-        let domain = base_dn
-            .split(',')
-            .filter_map(|part| part.strip_prefix("dc="))
-            .collect::<Vec<_>>()
-            .join(".")
-            .to_lowercase();
+    let realm = kerberos_realm_name(
+        base_dn,
         std::env::var("LLDAP_KERB_REALM_NAME")
             .ok()
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| domain.to_uppercase())
-            .to_uppercase()
-    };
+            .as_deref(),
+    );
 
     let realm_bytes = realm.into_bytes();
     let full_subschema_dn = format!("cn=Subschema,{}", base_dn);
@@ -136,4 +144,45 @@ pub fn is_subschema_entry_request(request: &LdapSearchRequest) -> bool {
         _ => true,
     };
     base_matches && scope_ok && filter_ok
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kerberos_realm_name_from_base_dn_and_env() {
+        assert_eq!(
+            kerberos_realm_name("dc=example,dc=com", None),
+            "EXAMPLE.COM"
+        );
+        assert_eq!(
+            kerberos_realm_name("dc=example,dc=com", Some("")),
+            "EXAMPLE.COM"
+        );
+        assert_eq!(
+            kerberos_realm_name("dc=example,dc=com", Some("test.realm")),
+            "TEST.REALM"
+        );
+    }
+
+    #[test]
+    fn root_dse_always_emits_subschema_and_realm() {
+        let LdapOp::SearchResultEntry(entry) = root_dse_response("dc=example,dc=com") else {
+            panic!("expected SearchResultEntry");
+        };
+        let names: Vec<&str> = entry.attributes.iter().map(|a| a.atype.as_str()).collect();
+        assert!(names.contains(&"subschemaSubentry"));
+        assert!(names.contains(&"krb5RealmName"));
+        assert!(names.contains(&"namingContexts"));
+        let subschema = entry
+            .attributes
+            .iter()
+            .find(|a| a.atype == "subschemaSubentry")
+            .unwrap();
+        assert_eq!(
+            subschema.vals,
+            vec![b"cn=Subschema,dc=example,dc=com".to_vec()]
+        );
+    }
 }

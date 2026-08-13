@@ -58,6 +58,67 @@ pub struct AttributeSchema {
     pub is_readonly: bool,
 }
 
+impl AttributeSchema {
+    fn new(name: &str, attribute_type: AttributeType) -> Self {
+        Self {
+            name: name.to_owned(),
+            aliases: Vec::new(),
+            attribute_type,
+            is_list: false,
+            is_visible: true,
+            is_editable: false,
+            is_hardcoded: true,
+            is_readonly: false,
+        }
+    }
+
+    pub fn editable(name: &str, attribute_type: AttributeType) -> Self {
+        Self {
+            is_editable: true,
+            ..Self::new(name, attribute_type)
+        }
+    }
+
+    pub fn readonly(name: &str, attribute_type: AttributeType) -> Self {
+        Self {
+            is_readonly: true,
+            ..Self::new(name, attribute_type)
+        }
+    }
+
+    /// POSIX/Kerberos assigned: is_editable=false / is_readonly=false — do not normalize.
+    pub fn generated(name: &str, attribute_type: AttributeType) -> Self {
+        Self::new(name, attribute_type)
+    }
+
+    pub fn hidden(name: &str, attribute_type: AttributeType) -> Self {
+        Self {
+            is_visible: false,
+            is_readonly: true,
+            ..Self::new(name, attribute_type)
+        }
+    }
+
+    pub fn aliases(mut self, aliases: &[&str]) -> Self {
+        self.aliases = aliases.iter().map(|a| a.to_string()).collect();
+        self
+    }
+
+    pub fn list(mut self) -> Self {
+        self.is_list = true;
+        self
+    }
+
+    /// The first alias that is a recognized standard LDAP name, else the canonical name.
+    pub fn preferred_ldap_name(&self) -> &str {
+        self.aliases
+            .iter()
+            .find(|alias| is_standard_ldap_name(&alias.to_ascii_lowercase()))
+            .map(String::as_str)
+            .unwrap_or(&self.name)
+    }
+}
+
 #[derive(PartialEq, Eq, Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AttributeList {
@@ -89,9 +150,6 @@ pub struct PosixSettings {
 
 impl AttributeList {
     pub fn get_by_name_or_alias(&self, name: &str) -> Option<&AttributeSchema> {
-        // Case-insensitive match on both canonical name and aliases.
-        // This fixes resolution when AttributeName::as_str() or loaded aliases
-        // have subtle casing differences from CaseInsensitiveString.
         self.attributes.iter().find(|a| {
             a.name.eq_ignore_ascii_case(name)
                 || a.aliases
@@ -100,8 +158,14 @@ impl AttributeList {
         })
     }
 
-    pub fn get_attribute_schema(&self, name: &str) -> Option<&AttributeSchema> {
-        self.get_by_name_or_alias(name)
+    pub fn contains_name_or_alias(&self, name: &str) -> bool {
+        self.get_by_name_or_alias(name).is_some()
+    }
+
+    pub fn all_names_and_aliases(&self) -> impl Iterator<Item = &str> {
+        self.attributes.iter().flat_map(|a| {
+            std::iter::once(a.name.as_str()).chain(a.aliases.iter().map(String::as_str))
+        })
     }
 
     pub fn get_attribute_type(&self, name: &str) -> Option<(AttributeType, bool)> {
@@ -121,4 +185,25 @@ impl AttributeList {
         self.get_by_name_or_alias(name_or_alias)
             .map(|a| a.name.as_str())
     }
+
+    pub fn preferred_ldap_name(&self, name_or_alias: &str) -> Option<&str> {
+        self.get_by_name_or_alias(name_or_alias)
+            .map(AttributeSchema::preferred_ldap_name)
+    }
+}
+
+// Standard LDAP attribute names. When an attribute carries one of these as an alias, it is
+// advertised as the wire name (see AttributeSchema::preferred_ldap_name).
+#[rustfmt::skip]
+const STANDARD_LDAP_NAMES: &[&str] = &[
+    "cn", "sn", "givenname", "uid", "mail", "ou", "dc", "o", "c", "l", "st",
+    "title", "description", "member", "uniquemember", "memberof",
+    "createtimestamp", "modifytimestamp", "pwdchangedtime", "entryuuid",
+    "hassubordinates", "structuralobjectclass", "subschemasubentry",
+    "uidnumber", "gidnumber", "homedirectory", "loginshell", "sshpublickey",
+    "krbprincipalname", "jpegphoto", "avatar",
+];
+
+fn is_standard_ldap_name(name: &str) -> bool {
+    STANDARD_LDAP_NAMES.contains(&name)
 }

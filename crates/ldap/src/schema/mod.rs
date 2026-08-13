@@ -1,5 +1,6 @@
 pub mod definitions;
 pub mod manager;
+pub mod operational;
 
 pub use definitions::{ExpandedAttributes, GroupFieldType, LogicalAttr, UserFieldType};
 pub use manager::SchemaManager;

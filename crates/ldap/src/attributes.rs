@@ -15,18 +15,21 @@ use lldap_domain::{
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
-fn schema_attribute_names(attrs: &[lldap_schema::schema::AttributeSchema]) -> HashSet<String> {
-    attrs
-        .iter()
-        .flat_map(|a| std::iter::once(a.name.clone()).chain(a.aliases.iter().cloned()))
+static USER_SCHEMA_ATTRIBUTE_NAMES: LazyLock<HashSet<String>> = LazyLock::new(|| {
+    PublicSchema::shared()
+        .user_attributes()
+        .all_names_and_aliases()
+        .map(str::to_owned)
         .collect()
-}
+});
 
-static USER_SCHEMA_ATTRIBUTE_NAMES: LazyLock<HashSet<String>> =
-    LazyLock::new(|| schema_attribute_names(&PublicSchema::shared().user_attributes().attributes));
-
-static GROUP_SCHEMA_ATTRIBUTE_NAMES: LazyLock<HashSet<String>> =
-    LazyLock::new(|| schema_attribute_names(&PublicSchema::shared().group_attributes().attributes));
+static GROUP_SCHEMA_ATTRIBUTE_NAMES: LazyLock<HashSet<String>> = LazyLock::new(|| {
+    PublicSchema::shared()
+        .group_attributes()
+        .all_names_and_aliases()
+        .map(str::to_owned)
+        .collect()
+});
 
 // ============================================================================
 // LOW-LEVEL HELPERS MOVED HERE (single source of truth for attribute handling)
@@ -165,53 +168,6 @@ pub fn get_default_group_object_classes_bytes(schema: &PublicSchema) -> Vec<Vec<
             .map(|c| c.as_str().as_bytes().to_vec()),
     );
     classes
-}
-
-/// Returns the preferred LDAP attribute name for a schema attribute.
-pub fn get_preferred_ldap_name(attr: &lldap_schema::AttributeSchema) -> String {
-    const STANDARD_LDAP_NAMES: &[&str] = &[
-        "cn",
-        "sn",
-        "givenname",
-        "uid",
-        "mail",
-        "ou",
-        "dc",
-        "o",
-        "c",
-        "l",
-        "st",
-        "title",
-        "description",
-        "member",
-        "uniquemember",
-        "memberof",
-        "createtimestamp",
-        "modifytimestamp",
-        "pwdchangedtime",
-        "entryuuid",
-        "hassubordinates",
-        "structuralobjectclass",
-        "subschemasubentry",
-        "uidnumber",
-        "gidnumber",
-        "homedirectory",
-        "loginshell",
-        "sshpublickey",
-        "krbprincipalname",
-        "jpegphoto",
-        "avatar",
-        "loginDisabled",
-        "sudoHost",
-    ];
-
-    for alias in &attr.aliases {
-        let lower = alias.to_ascii_lowercase();
-        if STANDARD_LDAP_NAMES.contains(&lower.as_str()) {
-            return alias.clone();
-        }
-    }
-    attr.name.clone()
 }
 
 /// 0-argument versions for GraphQL + public API (returns LdapObjectClass).
@@ -609,7 +565,7 @@ mod tests {
     use super::*;
     use crate::core::utils::ExpandedAttributes;
     use lldap_domain::types::UserId;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashSet};
 
     #[test]
     fn cached_schema_names_include_canonical_names_and_aliases() {
@@ -653,5 +609,137 @@ mod tests {
         );
         assert!(entry.attributes.iter().any(|a| a.atype == "mycustomattr"));
         assert!(!entry.attributes.iter().any(|a| a.atype == "mail"));
+    }
+
+    fn sample_user() -> User {
+        let epoch = chrono::Utc.timestamp_opt(0, 0).unwrap().naive_utc();
+        User {
+            user_id: UserId::new("bob"),
+            email: "bob@example.com".into(),
+            display_name: Some("Bob".to_string()),
+            creation_date: epoch,
+            modified_date: epoch,
+            password_modified_date: epoch,
+            uuid: lldap_domain::types::Uuid::from_name_and_date("bob", &epoch),
+            attributes: vec![],
+            krb_principal_name: None,
+        }
+    }
+
+    fn sample_group() -> Group {
+        let epoch = chrono::Utc.timestamp_opt(0, 0).unwrap().naive_utc();
+        Group {
+            id: lldap_domain::types::GroupId(1),
+            display_name: "admins".into(),
+            creation_date: epoch,
+            uuid: lldap_domain::types::Uuid::from_name_and_date("admins", &epoch),
+            users: vec![],
+            attributes: vec![],
+            modified_date: epoch,
+        }
+    }
+
+    fn emitted(entry: &LdapSearchResultEntry) -> HashSet<String> {
+        entry
+            .attributes
+            .iter()
+            .map(|a| a.atype.to_ascii_lowercase())
+            .collect()
+    }
+
+    fn expand_and_user(attrs: &[&str]) -> HashSet<String> {
+        let schema = PublicSchema::shared();
+        let expanded = crate::schema::SchemaManager::default().expand_attribute_wildcards(
+            &attrs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
+            schema,
+        );
+        emitted(&make_ldap_search_user_result_entry(
+            sample_user(),
+            "dc=example,dc=com",
+            expanded,
+            None,
+            &[],
+            schema,
+        ))
+    }
+
+    fn expand_and_group(attrs: &[&str]) -> HashSet<String> {
+        let schema = PublicSchema::shared();
+        let expanded = crate::schema::SchemaManager::default().expand_attribute_wildcards(
+            &attrs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
+            schema,
+        );
+        emitted(&make_ldap_search_group_result_entry(
+            sample_group(),
+            "dc=example,dc=com",
+            expanded,
+            &None,
+            &[],
+            schema,
+        ))
+    }
+
+    #[test]
+    fn user_result_star_excludes_operational_and_plus_injects() {
+        let star = expand_and_user(&["*"]);
+        assert!(star.contains("uid"));
+        assert!(star.contains("mail"));
+        assert!(star.contains("objectclass"));
+        for op in [
+            "createtimestamp",
+            "hassubordinates",
+            "creatorsname",
+            "entryuuid",
+            "entrydn",
+        ] {
+            assert!(!star.contains(op), "* {op}");
+        }
+
+        let plus = expand_and_user(&["+"]);
+        assert!(plus.contains("uid"));
+        assert!(plus.contains("createtimestamp"));
+        assert!(plus.contains("modifytimestamp"));
+        assert!(plus.contains("pwdchangedtime"));
+        assert!(plus.contains("entryuuid"));
+        assert!(plus.contains("entrydn"));
+        assert!(plus.contains("hassubordinates"));
+        assert!(plus.contains("structuralobjectclass"));
+        assert!(plus.contains("subschemasubentry"));
+        assert!(plus.contains("creatorsname"));
+        assert!(plus.contains("modifiersname"));
+        assert!(!plus.contains("logindisabled"));
+    }
+
+    #[test]
+    fn user_result_explicit_login_disabled_omits_injected_ops() {
+        // Explicit loginDisabled/sudoHost must NOT trigger the 5 injected operational attrs
+        // (include_operational stays off — the Stage-2 correction; guards the Stage-4c flip).
+        for virt in ["loginDisabled", "sudoHost"] {
+            let e = expand_and_user(&[virt]);
+            for op in [
+                "hassubordinates",
+                "structuralobjectclass",
+                "subschemasubentry",
+                "creatorsname",
+                "modifiersname",
+            ] {
+                assert!(!e.contains(op), "{virt}: {op}");
+            }
+        }
+    }
+
+    #[test]
+    fn group_result_star_excludes_operational_and_plus_injects() {
+        let star = expand_and_group(&["*"]);
+        assert!(star.contains("cn"));
+        assert!(!star.contains("createtimestamp"));
+        assert!(!star.contains("hassubordinates"));
+
+        let plus = expand_and_group(&["+"]);
+        assert!(plus.contains("cn"));
+        assert!(plus.contains("createtimestamp"));
+        assert!(plus.contains("hassubordinates"));
+        assert!(plus.contains("creatorsname"));
+        assert!(plus.contains("entryuuid"));
     }
 }

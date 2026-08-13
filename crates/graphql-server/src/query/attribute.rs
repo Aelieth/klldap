@@ -126,19 +126,16 @@ pub fn serialize_attribute_to_graphql(attribute_value: &DomainAttributeValue) ->
     }
 }
 
+// Callers pass the canonical schema name (s.name); alias arms would be unreachable.
 fn get_hardcoded_user_value(user: &DomainUser, name: &str) -> Option<DomainAttributeValue> {
     match name {
-        "userid" | "user_id" | "uid" => Some(user.user_id.clone().into_string().into()),
-        "creationdate" | "creation_date" => Some(user.creation_date.into()),
-        "modifieddate" | "modified_date" => Some(user.modified_date.into()),
-        "passwordmodifieddate" | "password_modified_date" => {
-            Some(user.password_modified_date.into())
-        }
+        "userid" => Some(user.user_id.clone().into_string().into()),
+        "creationdate" => Some(user.creation_date.into()),
+        "modifieddate" => Some(user.modified_date.into()),
+        "passwordmodifieddate" => Some(user.password_modified_date.into()),
         "mail" => Some(user.email.clone().into_string().into()),
         "uuid" => Some(user.uuid.clone().into_string().into()),
-        "displayname" | "display_name" | "cn" => {
-            user.display_name.as_ref().map(|d| d.clone().into())
-        }
+        "displayname" => user.display_name.as_ref().map(|d| d.clone().into()),
         _ => None,
     }
 }
@@ -146,12 +143,10 @@ fn get_hardcoded_user_value(user: &DomainUser, name: &str) -> Option<DomainAttri
 fn get_hardcoded_group_value(group: &DomainGroup, name: &str) -> Option<DomainAttributeValue> {
     match name {
         "groupid" => Some((group.id.0 as i64).into()),
-        "creationdate" | "creation_date" => Some(group.creation_date.into()),
-        "modifieddate" | "modified_date" => Some(group.modified_date.into()),
+        "creationdate" => Some(group.creation_date.into()),
+        "modifieddate" => Some(group.modified_date.into()),
         "uuid" => Some(group.uuid.clone().into_string().into()),
-        "displayname" | "display_name" | "cn" => {
-            Some(group.display_name.clone().into_string().into())
-        }
+        "displayname" => Some(group.display_name.clone().into_string().into()),
         _ => None,
     }
 }
@@ -162,12 +157,10 @@ fn get_hardcoded_group_details_value(
 ) -> Option<DomainAttributeValue> {
     match name {
         "groupid" => Some((group.group_id.0 as i64).into()),
-        "creationdate" | "creation_date" => Some(group.creation_date.into()),
-        "modifieddate" | "modified_date" => Some(group.modified_date.into()),
+        "creationdate" => Some(group.creation_date.into()),
+        "modifieddate" => Some(group.modified_date.into()),
         "uuid" => Some(group.uuid.clone().into_string().into()),
-        "displayname" | "display_name" | "cn" => {
-            Some(group.display_name.clone().into_string().into())
-        }
+        "displayname" => Some(group.display_name.clone().into_string().into()),
         _ => None,
     }
 }
@@ -267,5 +260,105 @@ impl<Handler: BackendHandler> AttributeValue<Handler> {
             .for_each(|v| all.push(v));
 
         all
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+    use lldap_domain::types::{GroupId, UserId, Uuid};
+
+    fn ts() -> chrono::NaiveDateTime {
+        Utc.timestamp_opt(42, 0).unwrap().naive_utc()
+    }
+
+    #[test]
+    fn hardcoded_user_values_resolve_canonical_only() {
+        let user = DomainUser {
+            user_id: UserId::new("bob"),
+            email: "bob@example.com".into(),
+            display_name: Some("Bob".to_string()),
+            creation_date: ts(),
+            uuid: Uuid::from_name_and_date("bob", &ts()),
+            attributes: vec![],
+            modified_date: ts(),
+            password_modified_date: ts(),
+            krb_principal_name: None,
+        };
+        for name in [
+            "userid",
+            "creationdate",
+            "modifieddate",
+            "passwordmodifieddate",
+            "mail",
+            "uuid",
+            "displayname",
+        ] {
+            assert!(
+                get_hardcoded_user_value(&user, name).is_some(),
+                "canonical {name}"
+            );
+        }
+        for alias in ["uid", "user_id", "creation_date", "display_name", "cn"] {
+            assert!(
+                get_hardcoded_user_value(&user, alias).is_none(),
+                "alias {alias}"
+            );
+        }
+        assert!(get_hardcoded_user_value(&user, "nope").is_none());
+    }
+
+    #[test]
+    fn hardcoded_group_values_resolve_canonical_only() {
+        let group = DomainGroup {
+            id: GroupId(1),
+            display_name: "group".into(),
+            creation_date: ts(),
+            uuid: Uuid::from_name_and_date("group", &ts()),
+            users: vec![],
+            attributes: vec![],
+            modified_date: ts(),
+        };
+        for name in [
+            "groupid",
+            "creationdate",
+            "modifieddate",
+            "uuid",
+            "displayname",
+        ] {
+            assert!(
+                get_hardcoded_group_value(&group, name).is_some(),
+                "canonical {name}"
+            );
+        }
+        for alias in ["creation_date", "display_name", "cn"] {
+            assert!(
+                get_hardcoded_group_value(&group, alias).is_none(),
+                "alias {alias}"
+            );
+        }
+
+        let details = GroupDetails {
+            group_id: GroupId(1),
+            display_name: "group".into(),
+            creation_date: ts(),
+            uuid: Uuid::from_name_and_date("group", &ts()),
+            attributes: vec![],
+            modified_date: ts(),
+        };
+        for name in [
+            "groupid",
+            "creationdate",
+            "modifieddate",
+            "uuid",
+            "displayname",
+        ] {
+            assert!(
+                get_hardcoded_group_details_value(&details, name).is_some(),
+                "canonical {name}"
+            );
+        }
+        assert!(get_hardcoded_group_details_value(&details, "display_name").is_none());
     }
 }

@@ -688,4 +688,133 @@ mod tests {
             other => panic!("Expected Member for member group filter, got {:?}", other),
         }
     }
+
+    fn info() -> LdapInfo {
+        LdapInfo {
+            base_dn: vec![],
+            base_dn_str: "dc=example,dc=com".to_string(),
+            ignored_user_attributes: vec![],
+            ignored_group_attributes: vec![],
+        }
+    }
+
+    fn user_eq(name: &str, value: &str) -> UserRequestFilter {
+        let filter = LdapFilter::Equality(name.to_string(), value.to_string());
+        convert_user_filter(&info(), &filter, &PublicSchema::get()).unwrap()
+    }
+
+    fn group_eq(name: &str, value: &str) -> GroupRequestFilter {
+        let filter = LdapFilter::Equality(name.to_string(), value.to_string());
+        convert_group_filter(&info(), &filter, &PublicSchema::get()).unwrap()
+    }
+
+    // After the SchemaManager fix, the schema canonical name resolves to its primary field just
+    // like its aliases (issues #2/#5) — previously the canonical name fell to the custom path.
+    #[test]
+    fn user_filter_canonical_and_aliases_resolve_to_primary() {
+        for name in ["userid", "user_id", "uid", "id"] {
+            assert!(
+                matches!(user_eq(name, "Bob"), UserRequestFilter::UserId(_)),
+                "{name}"
+            );
+        }
+        for name in ["mail", "email"] {
+            assert!(
+                matches!(user_eq(name, "a@b.co"), UserRequestFilter::Equality(_, _)),
+                "{name}"
+            );
+        }
+        for name in ["displayname", "display_name", "cn", "commonname"] {
+            assert!(
+                matches!(user_eq(name, "Bob"), UserRequestFilter::Equality(_, _)),
+                "{name}"
+            );
+        }
+        for name in ["creationdate", "createTimestamp", "modifieddate"] {
+            assert!(
+                matches!(
+                    user_eq(name, "20200101000000Z"),
+                    UserRequestFilter::Equality(_, _)
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_filter_cn_substring_maps_to_display_name() {
+        for name in ["cn", "displayname", "display_name"] {
+            let filter = LdapFilter::Substring(
+                name.to_string(),
+                LdapSubstringFilter {
+                    initial: None,
+                    any: vec!["ae".to_string()],
+                    final_: None,
+                },
+            );
+            let got = convert_user_filter(&info(), &filter, &PublicSchema::get()).unwrap();
+            assert!(
+                matches!(
+                    got,
+                    UserRequestFilter::SubString(
+                        lldap_domain_model::model::UserColumn::DisplayName,
+                        _
+                    )
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn user_filter_virtuals_objectclass_and_unknown_are_pinned() {
+        assert!(matches!(
+            user_eq("loginDisabled", "TRUE"),
+            UserRequestFilter::MemberOf(_)
+        ));
+        assert!(matches!(
+            user_eq("loginDisabled", "nope"),
+            UserRequestFilter::False
+        ));
+        assert!(matches!(
+            user_eq("sudoHost", "ALL"),
+            UserRequestFilter::MemberOf(_)
+        ));
+        assert!(matches!(
+            user_eq("sudoHost", "nope"),
+            UserRequestFilter::False
+        ));
+        assert!(matches!(
+            user_eq("objectclass", "inetOrgPerson"),
+            UserRequestFilter::True
+        ));
+        assert!(matches!(
+            user_eq("objectclass", "bogusClass"),
+            UserRequestFilter::False
+        ));
+        assert!(matches!(
+            user_eq("no_such_attr", "x"),
+            UserRequestFilter::False
+        ));
+    }
+
+    #[test]
+    fn group_filter_resolution_is_pinned() {
+        for n in ["memberof", "member", "uniquemember", "ismemberof"] {
+            assert!(
+                matches!(group_eq(n, "bar"), GroupRequestFilter::Member(_)),
+                "{n}"
+            );
+        }
+        for name in ["displayname", "display_name", "cn", "commonname"] {
+            assert!(
+                matches!(group_eq(name, "admins"), GroupRequestFilter::DisplayName(_)),
+                "{name}"
+            );
+        }
+        assert!(matches!(
+            group_eq("no_such_attr", "x"),
+            GroupRequestFilter::False
+        ));
+    }
 }

@@ -109,6 +109,20 @@ pub fn make_ou_entry(
             atype: "entryUUID".to_string(),
             vals: vec![ou_uuid.to_string().into_bytes()],
         });
+
+        // entryDN is the OU's own DN; creators/modifiers use the default admin DN (same as inject).
+        attributes.push(LdapPartialAttribute {
+            atype: "entryDN".to_string(),
+            vals: vec![dn.as_bytes().to_vec()],
+        });
+        attributes.push(LdapPartialAttribute {
+            atype: "creatorsName".to_string(),
+            vals: vec![format!("cn=admin,ou=people,{}", base_dn_str).into_bytes()],
+        });
+        attributes.push(LdapPartialAttribute {
+            atype: "modifiersName".to_string(),
+            vals: vec![format!("cn=admin,ou=people,{}", base_dn_str).into_bytes()],
+        });
     }
 
     LdapSearchResultEntry { dn, attributes }
@@ -344,18 +358,22 @@ mod tests {
     #[test]
     fn test_make_ou_entry_with_operational() {
         let entry = make_ou_entry("office", "dc=example,dc=com", true);
-        assert!(
-            entry
-                .attributes
-                .iter()
-                .any(|a| a.atype == "hasSubordinates")
-        );
-        assert!(
-            entry
-                .attributes
-                .iter()
-                .any(|a| a.atype == "structuralObjectClass")
-        );
+        let names: Vec<&str> = entry.attributes.iter().map(|a| a.atype.as_str()).collect();
+        assert!(names.contains(&"hasSubordinates"));
+        assert!(names.contains(&"structuralObjectClass"));
+        assert!(names.contains(&"subschemaSubentry"));
+        assert!(names.contains(&"entryUUID"));
+        // Normalized: OU `+` now emits entryDN (the OU's own DN) + creators/modifiers, like user/group.
+        assert!(names.contains(&"entryDN"));
+        assert!(names.contains(&"creatorsName"));
+        assert!(names.contains(&"modifiersName"));
+        assert!(!names.contains(&"memberOf"));
+        let entry_dn = entry
+            .attributes
+            .iter()
+            .find(|a| a.atype == "entryDN")
+            .unwrap();
+        assert_eq!(entry_dn.vals, vec![entry.dn.clone().into_bytes()]);
     }
 
     #[test]

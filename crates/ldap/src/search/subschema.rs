@@ -1,4 +1,3 @@
-use crate::attributes::get_preferred_ldap_name;
 use crate::schema::SchemaManager;
 use chrono::Utc;
 use ldap3_proto::{LdapPartialAttribute, LdapSearchResultEntry, proto::LdapOp};
@@ -87,10 +86,6 @@ pub fn make_ldap_subschema_entry(schema_manager: &SchemaManager, base_dn_str: &s
         "krbprincipalname",
         "sshpublickey",
         "ou",
-        // The two virtual synthesized attrs (loginDisabled/sudoHost) are published via hardcoded
-        // op_entries above (RFC OIDs + standards).
-        "logindisabled",
-        "sudohost",
     ]
     .iter()
     .cloned()
@@ -105,7 +100,7 @@ pub fn make_ldap_subschema_entry(schema_manager: &SchemaManager, base_dn_str: &s
             continue;
         }
 
-        let preferred = get_preferred_ldap_name(attr);
+        let preferred = attr.preferred_ldap_name();
         let (syntax, is_single, is_operational) = attr_type_to_ldap_syntax(attr);
         let single_str = if is_single { " SINGLE-VALUE" } else { "" };
         let op_str = if is_operational {
@@ -126,7 +121,7 @@ pub fn make_ldap_subschema_entry(schema_manager: &SchemaManager, base_dn_str: &s
         } else {
             let mut names = vec![format!("'{}'", preferred)];
             for a in &attr.aliases {
-                if a != &preferred {
+                if a != preferred {
                     names.push(format!("'{}'", a));
                 }
             }
@@ -160,23 +155,13 @@ pub fn make_ldap_subschema_entry(schema_manager: &SchemaManager, base_dn_str: &s
         seen_attr_oids.insert(oid);
     }
 
-    let op_entries: Vec<(&str, Vec<u8>)> = vec![
-        ("1.3.6.1.1.16.4", b"( 1.3.6.1.1.16.4 NAME ( 'entryUUID' 'uuid' ) DESC 'UUID' EQUALITY UUIDMatch ORDERING UUIDOrderingMatch SYNTAX 1.3.6.1.1.16.1 SINGLE-VALUE NO-USER-MODIFICATION USAGE directoryOperation )".to_vec()),
-        ("2.5.18.1", b"( 2.5.18.1 NAME ( 'createTimestamp' 'creationdate' 'creation_date' 'creationTimestamp' ) DESC 'RFC4512' EQUALITY generalizedTimeMatch ORDERING generalizedTimeOrderingMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.24 SINGLE-VALUE NO-USER-MODIFICATION USAGE directoryOperation )".to_vec()),
-        ("2.5.18.2", b"( 2.5.18.2 NAME ( 'modifyTimestamp' 'modifieddate' 'modified_date' 'modifydate' 'modifyTimestamp' ) DESC 'RFC4512' EQUALITY generalizedTimeMatch ORDERING generalizedTimeOrderingMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.24 SINGLE-VALUE NO-USER-MODIFICATION USAGE directoryOperation )".to_vec()),
-        ("2.5.18.3", b"( 2.5.18.3 NAME 'creatorsName' DESC 'RFC4512' EQUALITY distinguishedNameMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.12 SINGLE-VALUE NO-USER-MODIFICATION USAGE directoryOperation )".to_vec()),
-        ("2.5.18.4", b"( 2.5.18.4 NAME 'modifiersName' DESC 'RFC4512' EQUALITY distinguishedNameMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.12 SINGLE-VALUE NO-USER-MODIFICATION USAGE directoryOperation )".to_vec()),
-        ("1.2.840.113556.1.2.102", b"( 1.2.840.113556.1.2.102 NAME 'memberOf' DESC 'Group membership' EQUALITY distinguishedNameMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.12 NO-USER-MODIFICATION USAGE dSAOperation )".to_vec()),
-        ("1.3.6.1.4.1.1466.101.120.6", b"( 1.3.6.1.4.1.1466.101.120.6 NAME 'hasSubordinates' DESC 'X.500 Has Subordinates' EQUALITY booleanMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.7 SINGLE-VALUE NO-USER-MODIFICATION USAGE directoryOperation )".to_vec()),
-        ("2.5.21.1", b"( 2.5.21.1 NAME 'structuralObjectClass' DESC 'X.500 Structural Object Class' EQUALITY objectIdentifierMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.38 SINGLE-VALUE NO-USER-MODIFICATION USAGE directoryOperation )".to_vec()),
-        ("2.5.21.2", b"( 2.5.21.2 NAME 'subschemaSubentry' DESC 'X.500 Subschema Subentry' EQUALITY distinguishedNameMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.12 SINGLE-VALUE NO-USER-MODIFICATION USAGE directoryOperation )".to_vec()),
-        ("1.3.6.1.4.1.42.2.27.8.1.16", b"( 1.3.6.1.4.1.42.2.27.8.1.16 NAME ( 'pwdChangedTime' 'passwordmodifieddate' 'password_modified_date' ) DESC 'Password last changed time' EQUALITY generalizedTimeMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.24 SINGLE-VALUE NO-USER-MODIFICATION USAGE dSAOperation )".to_vec()),
-        ("1.3.6.1.4.1.15953.9.1.2", b"( 1.3.6.1.4.1.15953.9.1.2 NAME ( 'sudoHost' 'sudohost' ) DESC 'Host(s) who may run sudo (from sudoers LDAP schema; synthesized by lldap_sudohost group membership)' EQUALITY caseExactIA5Match SUBSTR caseExactIA5SubstringsMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.26 NO-USER-MODIFICATION USAGE directoryOperation )".to_vec()),
-        ("2.16.840.1.113719.1.1.4.1.7", b"( 2.16.840.1.113719.1.1.4.1.7 NAME ( 'loginDisabled' 'logindisabled' ) DESC 'NDS/eDirectory loginDisabled (SSSD nds policy / account disable; synthesized by lldap_disabled group membership)' EQUALITY caseIgnoreMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 SINGLE-VALUE NO-USER-MODIFICATION USAGE directoryOperation )".to_vec()),
-    ];
-    for (oid, entry) in op_entries {
-        if seen_attr_oids.insert(oid.to_string()) {
-            dynamic_attr_types.push(entry);
+    // Operational attributeType definitions are generated from the single operational source.
+    for op in crate::schema::operational::all() {
+        if let Some(entry) = op.to_attribute_type_definition() {
+            let oid = op.published.as_ref().unwrap().oid;
+            if seen_attr_oids.insert(oid.to_string()) {
+                dynamic_attr_types.push(entry);
+            }
         }
     }
 
@@ -191,35 +176,25 @@ pub fn make_ldap_subschema_entry(schema_manager: &SchemaManager, base_dn_str: &s
         }
     }
 
-    let operational_names: HashSet<&str> = [
-        "createtimestamp",
-        "creationdate",
-        "creation_date",
-        "modifytimestamp",
-        "modifieddate",
-        "modified_date",
-        "pwdchangedtime",
-        "passwordmodifieddate",
-        "password_modified_date",
-        "entryuuid",
-        "uuid",
-        "memberof",
-        "hassubordinates",
-        "structuralobjectclass",
-        "subschemasubentry",
-    ]
-    .iter()
-    .cloned()
-    .collect();
+    // Names excluded from the inetOrgPerson MAY list: the operational attrs + their published
+    // aliases, from the single operational source.
+    let operational_names: HashSet<String> = crate::schema::operational::all()
+        .iter()
+        .filter(|o| o.always_operational)
+        .flat_map(|o| {
+            std::iter::once(o.key()).chain(o.aliases.iter().map(|a| a.to_ascii_lowercase()))
+        })
+        .collect();
 
     for attr in schema_manager.get_all_user_attributes() {
-        let pref = get_preferred_ldap_name(&attr);
+        let pref = attr.preferred_ldap_name();
         let lower = pref.to_ascii_lowercase();
         if !operational_names.contains(lower.as_str()) && seen.insert(lower) {
-            inet_may.push(pref);
+            inet_may.push(pref.to_string());
         }
     }
 
+    // inetOrgPerson MAY deliberately re-includes these operational names for client compatibility.
     for extra in [
         "createTimestamp",
         "modifyTimestamp",
@@ -374,5 +349,35 @@ mod tests {
         } else {
             panic!("expected SearchResultEntry");
         }
+    }
+
+    #[test]
+    fn op_entries_match_the_operational_source() {
+        // Byte fidelity of the blobs is owned by operational.rs's own test; here we assert the
+        // subschema emits exactly what the generator produces (no second handwritten copy).
+        let schema = SchemaManager::default();
+        let LdapOp::SearchResultEntry(entry) =
+            make_ldap_subschema_entry(&schema, "dc=example,dc=com")
+        else {
+            panic!("expected SearchResultEntry");
+        };
+        let blobs: HashSet<String> = entry
+            .attributes
+            .iter()
+            .find(|a| a.atype == "attributeTypes")
+            .unwrap()
+            .vals
+            .iter()
+            .map(|v| String::from_utf8_lossy(v).into_owned())
+            .collect();
+        for op in crate::schema::operational::all() {
+            if let Some(def) = op.to_attribute_type_definition() {
+                let expected = String::from_utf8(def).unwrap();
+                assert!(blobs.contains(&expected), "missing op_entry: {expected}");
+            }
+        }
+        let names: Vec<&str> = entry.attributes.iter().map(|a| a.atype.as_str()).collect();
+        assert!(names.contains(&"createTimestamp"));
+        assert!(names.contains(&"modifyTimestamp"));
     }
 }

@@ -96,3 +96,54 @@ pub struct EqualityConstraint {
     field: String,
     value: String,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn eq_filter(field: &str, value: &str) -> RequestFilter {
+        RequestFilter {
+            any: None,
+            all: None,
+            not: None,
+            eq: Some(EqualityConstraint {
+                field: field.to_string(),
+                value: value.to_string(),
+            }),
+            member_of: None,
+            member_of_id: None,
+        }
+    }
+
+    // Regression for #2/#5: KLLDAP canonical names resolve to their primary column in GraphQL
+    // equality filters, matching their aliases (previously they fell to AttributeEquality on a
+    // nonexistent custom attribute).
+    #[test]
+    fn canonical_and_aliases_resolve_to_primary() {
+        let schema = PublicSchema::get();
+        for field in ["userid", "uid", "user_id", "id"] {
+            let f = eq_filter(field, "bob")
+                .try_into_domain_filter(&schema)
+                .unwrap();
+            assert!(matches!(f, DomainRequestFilter::UserId(_)), "{field}");
+        }
+        for field in ["displayname", "display_name", "cn", "commonname"] {
+            let f = eq_filter(field, "Bob")
+                .try_into_domain_filter(&schema)
+                .unwrap();
+            assert!(
+                matches!(f, DomainRequestFilter::Equality(UserColumn::DisplayName, _)),
+                "{field}"
+            );
+        }
+        for field in ["mail", "email"] {
+            let f = eq_filter(field, "a@b.co")
+                .try_into_domain_filter(&schema)
+                .unwrap();
+            assert!(
+                matches!(f, DomainRequestFilter::Equality(UserColumn::Email, _)),
+                "{field}"
+            );
+        }
+    }
+}

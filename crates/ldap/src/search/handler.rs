@@ -1,4 +1,4 @@
-//! Main LDAP search handler (now uses SchemaManager as primary).
+//! Main LDAP search handler.
 
 use crate::core::{
     error::{LdapError, LdapResult},
@@ -12,8 +12,65 @@ use crate::search::{
 };
 use ldap3_proto::LdapResultCode;
 use ldap3_proto::proto::{LdapOp, LdapSearchRequest, LdapSearchScope};
+use ldap3_proto::{LdapPartialAttribute, LdapSearchResultEntry};
 use lldap_access_control::UserAndGroupListerBackendHandler;
 use lldap_domain::public_schema::PublicSchema;
+
+pub(crate) fn include_operational(attrs: &[String]) -> bool {
+    // "+" or any requested attribute that is operational (== always_operational), from the table.
+    attrs
+        .iter()
+        .any(|a| a == "+" || crate::schema::operational::is_operational(a))
+}
+
+pub(crate) fn root_base_entry(
+    base_dn: &[(String, String)],
+    base_dn_str: &str,
+) -> LdapSearchResultEntry {
+    let dc_val = base_dn
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("dc"))
+        .map(|(_, v)| v.as_bytes().to_vec())
+        .unwrap_or_else(|| b"lldap".to_vec());
+    let o_val = base_dn
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("o"))
+        .map(|(_, v)| v.as_bytes().to_vec())
+        .unwrap_or_else(|| b"lldap Directory".to_vec());
+    LdapSearchResultEntry {
+        dn: base_dn_str.to_string(),
+        attributes: vec![
+            LdapPartialAttribute {
+                atype: "objectClass".to_string(),
+                vals: vec![
+                    b"top".to_vec(),
+                    b"dcObject".to_vec(),
+                    b"organization".to_vec(),
+                ],
+            },
+            LdapPartialAttribute {
+                atype: "dc".to_string(),
+                vals: vec![dc_val],
+            },
+            LdapPartialAttribute {
+                atype: "o".to_string(),
+                vals: vec![o_val],
+            },
+            LdapPartialAttribute {
+                atype: "hasSubordinates".to_string(),
+                vals: vec![b"TRUE".to_vec()],
+            },
+            LdapPartialAttribute {
+                atype: "structuralObjectClass".to_string(),
+                vals: vec![b"organization".to_vec()],
+            },
+            LdapPartialAttribute {
+                atype: "subschemaSubentry".to_string(),
+                vals: vec![format!("cn=Subschema,{}", base_dn_str).into_bytes()],
+            },
+        ],
+    }
+}
 
 pub async fn do_search<Backend>(
     backend: &Backend,
@@ -32,68 +89,13 @@ where
 
     let scope = get_search_scope(base_dn, &dn_parts, &request.scope, allowed_ous);
     let schema = PublicSchema::shared();
-    let include_op = request.attrs.iter().any(|a| {
-        a == "+"
-            || a.eq_ignore_ascii_case("hassubordinates")
-            || a.eq_ignore_ascii_case("structuralobjectclass")
-            || a.eq_ignore_ascii_case("subschemasubentry")
-            || a.eq_ignore_ascii_case("createtimestamp")
-            || a.eq_ignore_ascii_case("modifytimestamp")
-            || a.eq_ignore_ascii_case("pwdchangedtime")
-            || a.eq_ignore_ascii_case("entryuuid")
-            || a.eq_ignore_ascii_case("memberof")
-    });
+    let include_op = include_operational(&request.attrs);
 
     match scope {
         crate::search::scope::SearchScope::Root => {
             if request.scope == LdapSearchScope::Base {
-                let dc_val = base_dn
-                    .iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case("dc"))
-                    .map(|(_, v)| v.as_bytes().to_vec())
-                    .unwrap_or_else(|| b"lldap".to_vec());
-                let o_val = base_dn
-                    .iter()
-                    .find(|(k, _)| k.eq_ignore_ascii_case("o"))
-                    .map(|(_, v)| v.as_bytes().to_vec())
-                    .unwrap_or_else(|| b"lldap Directory".to_vec());
-                let root_entry = ldap3_proto::LdapSearchResultEntry {
-                    dn: ldap_info.base_dn_str.clone(),
-                    attributes: vec![
-                        ldap3_proto::LdapPartialAttribute {
-                            atype: "objectClass".to_string(),
-                            vals: vec![
-                                b"top".to_vec(),
-                                b"dcObject".to_vec(),
-                                b"organization".to_vec(),
-                            ],
-                        },
-                        ldap3_proto::LdapPartialAttribute {
-                            atype: "dc".to_string(),
-                            vals: vec![dc_val],
-                        },
-                        ldap3_proto::LdapPartialAttribute {
-                            atype: "o".to_string(),
-                            vals: vec![o_val],
-                        },
-                        ldap3_proto::LdapPartialAttribute {
-                            atype: "hasSubordinates".to_string(),
-                            vals: vec![b"TRUE".to_vec()],
-                        },
-                        ldap3_proto::LdapPartialAttribute {
-                            atype: "structuralObjectClass".to_string(),
-                            vals: vec![b"organization".to_vec()],
-                        },
-                        ldap3_proto::LdapPartialAttribute {
-                            atype: "subschemaSubentry".to_string(),
-                            vals: vec![
-                                format!("cn=Subschema,{}", ldap_info.base_dn_str).into_bytes(),
-                            ],
-                        },
-                    ],
-                };
                 return Ok(vec![
-                    LdapOp::SearchResultEntry(root_entry),
+                    LdapOp::SearchResultEntry(root_base_entry(base_dn, &ldap_info.base_dn_str)),
                     make_search_success(),
                 ]);
             }
@@ -377,5 +379,69 @@ where
         crate::search::scope::SearchScope::Invalid | crate::search::scope::SearchScope::Unknown => {
             Ok(vec![make_search_success()])
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn include_operational_is_plus_or_any_always_operational() {
+        assert!(!include_operational(&[]));
+        assert!(!include_operational(&["*".into()]));
+        assert!(!include_operational(&["uid".into()]));
+        // loginDisabled/sudoHost are explicit-only virtuals — not operational for gating.
+        assert!(!include_operational(&["loginDisabled".into()]));
+        assert!(!include_operational(&["sudoHost".into()]));
+        assert!(include_operational(&["+".into()]));
+        for name in [
+            "hasSubordinates",
+            "structuralObjectClass",
+            "subschemaSubentry",
+            "createTimestamp",
+            "modifyTimestamp",
+            "pwdChangedTime",
+            "entryUUID",
+            "memberOf",
+            "entryDN",
+            "creatorsName",
+            "modifiersName",
+        ] {
+            assert!(include_operational(&[name.into()]), "{name}");
+        }
+    }
+
+    #[test]
+    fn root_base_entry_always_emits_three_operational_attrs() {
+        let base_dn = vec![("dc".into(), "example".into()), ("dc".into(), "com".into())];
+        let entry = root_base_entry(&base_dn, "dc=example,dc=com");
+        assert_eq!(entry.dn, "dc=example,dc=com");
+        let names: Vec<&str> = entry.attributes.iter().map(|a| a.atype.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "objectClass",
+                "dc",
+                "o",
+                "hasSubordinates",
+                "structuralObjectClass",
+                "subschemaSubentry",
+            ]
+        );
+        assert!(!names.contains(&"entryDN"));
+        assert!(!names.contains(&"entryUUID"));
+        assert!(!names.contains(&"creatorsName"));
+        let dc = entry.attributes.iter().find(|a| a.atype == "dc").unwrap();
+        assert_eq!(dc.vals, vec![b"example".to_vec()]);
+        let subschema = entry
+            .attributes
+            .iter()
+            .find(|a| a.atype == "subschemaSubentry")
+            .unwrap();
+        assert_eq!(
+            subschema.vals,
+            vec![b"cn=Subschema,dc=example,dc=com".to_vec()]
+        );
     }
 }

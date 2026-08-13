@@ -512,10 +512,9 @@ mod tests {
             .with(
                 eq(Some(lldap_domain_handlers::handler::UserRequestFilter::Or(
                     vec![
-                        lldap_domain_handlers::handler::UserRequestFilter::AttributeEquality(
-                            AttributeName::from("userid"),
-                            "bob".to_string().into(),
-                        ),
+                        lldap_domain_handlers::handler::UserRequestFilter::UserId(UserId::new(
+                            "bob",
+                        )),
                         lldap_domain_handlers::handler::UserRequestFilter::Equality(
                             UserColumn::Email,
                             "robert@bobbers.on".to_owned(),

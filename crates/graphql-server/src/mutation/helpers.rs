@@ -202,7 +202,7 @@ pub fn deserialize_attribute(
     let attribute_name = AttributeName::from(canonical_name.as_str());
 
     let attr_schema = attribute_schema
-        .get_attribute_schema(attribute_name.as_str())
+        .get_by_name_or_alias(attribute_name.as_str())
         .ok_or_else(|| anyhow!("Attribute {} is not defined in the schema", attribute.name))?;
 
     if attr_schema.is_readonly {

@@ -1,7 +1,7 @@
 //! SchemaManager - For all attribute handling.
 
 use super::definitions::{ExpandedAttributes, LogicalAttr};
-use crate::attributes::get_preferred_ldap_name;
+use super::operational;
 use crate::core::utils::{GroupFieldType, UserFieldType};
 use lldap_domain::public_schema::PublicSchema;
 use lldap_domain::types::AttributeName;
@@ -21,9 +21,16 @@ impl SchemaManager {
 
         // Helper to register an attribute + all its aliases
         let mut register =
-            |_internal_name: &str, logical: LogicalAttr, canonical: &str, aliases: &[String]| {
+            |internal_name: &str, logical: LogicalAttr, canonical: &str, aliases: &[String]| {
                 let lower_canonical = canonical.to_ascii_lowercase();
                 attribute_map.insert(lower_canonical.clone(), (logical, canonical.to_string()));
+
+                // Also key on the schema canonical name (userid, displayname, creationdate, ...)
+                // so filters on the internal name resolve like their aliases do.
+                let lower_internal = internal_name.to_ascii_lowercase();
+                if lower_internal != lower_canonical {
+                    attribute_map.insert(lower_internal, (logical, canonical.to_string()));
+                }
 
                 for alias in aliases {
                     let lower_alias = alias.to_ascii_lowercase();
@@ -33,132 +40,46 @@ impl SchemaManager {
                 }
             };
 
-        // Register core operational / structural attributes (these are not in PublicSchema)
-        let core_attrs: Vec<(&str, LogicalAttr, &str, Vec<String>)> = vec![
-            (
-                "objectclass",
-                LogicalAttr::ObjectClass,
-                "objectClass",
-                vec![],
-            ),
-            (
-                "memberof",
-                LogicalAttr::MemberOf,
-                "memberOf",
-                vec!["ismemberof".into()],
-            ),
-            (
-                "dn",
-                LogicalAttr::Dn,
-                "dn",
-                vec!["distinguishedname".into()],
-            ),
-            ("entrydn", LogicalAttr::EntryDn, "entryDN", vec![]),
-            (
-                "hassubordinates",
-                LogicalAttr::Operational,
-                "hasSubordinates",
-                vec![],
-            ),
-            (
-                "structuralobjectclass",
-                LogicalAttr::Operational,
-                "structuralObjectClass",
-                vec![],
-            ),
-            (
-                "subschemasubentry",
-                LogicalAttr::Operational,
-                "subschemaSubentry",
-                vec![],
-            ),
-            (
-                "createtimestamp",
-                LogicalAttr::Operational,
-                "createTimestamp",
-                vec![
-                    "creationdate".into(),
-                    "creation_date".into(),
-                    "creationtimestamp".into(),
-                ],
-            ),
-            (
-                "modifytimestamp",
-                LogicalAttr::Operational,
-                "modifyTimestamp",
-                vec![
-                    "modifieddate".into(),
-                    "modified_date".into(),
-                    "modifydate".into(),
-                ],
-            ),
-            (
-                "pwdchangedtime",
-                LogicalAttr::Operational,
-                "pwdChangedTime",
-                vec![
-                    "passwordmodifieddate".into(),
-                    "password_modified_date".into(),
-                ],
-            ),
-            (
-                "creatorsname",
-                LogicalAttr::Operational,
-                "creatorsName",
-                vec![],
-            ),
-            (
-                "modifiersname",
-                LogicalAttr::Operational,
-                "modifiersName",
-                vec![],
-            ),
-            (
-                "entryuuid",
-                LogicalAttr::Operational,
-                "entryUUID",
-                vec!["uuid".into()],
-            ),
-            (
-                "logindisabled",
-                LogicalAttr::Operational,
-                "loginDisabled",
-                vec!["loginDisabled".into()],
-            ),
-            (
-                "sudohost",
-                LogicalAttr::Operational,
-                "sudoHost",
-                vec!["sudoHost".into()],
-            ),
-        ];
-
-        for (name, logical, canonical, aliases) in core_attrs {
-            register(name, logical, canonical, &aliases);
+        // Register core operational / structural attributes from the single operational source.
+        for op in operational::all() {
+            let logical = match op.logical {
+                operational::OpLogical::ObjectClass => LogicalAttr::ObjectClass,
+                operational::OpLogical::Dn => LogicalAttr::Dn,
+                operational::OpLogical::EntryDn => LogicalAttr::EntryDn,
+                operational::OpLogical::MemberOf => LogicalAttr::MemberOf,
+                operational::OpLogical::Operational => LogicalAttr::Operational,
+            };
+            let aliases: Vec<String> = op
+                .aliases
+                .iter()
+                .chain(op.resolver_aliases.iter())
+                .map(|s| s.to_string())
+                .collect();
+            register(&op.key(), logical, op.wire_name, &aliases);
         }
 
         // Register all user attributes from PublicSchema
         for attr in schema.user_attributes().attributes.iter() {
-            let preferred = get_preferred_ldap_name(attr);
-            let logical = Self::determine_logical_attr(attr, &preferred);
+            let preferred = attr.preferred_ldap_name();
+            let logical = Self::determine_logical_attr(attr, attr.name.as_str());
 
             register(
                 &attr.name.as_str().to_lowercase(),
                 logical,
-                &preferred,
+                preferred,
                 &attr.aliases,
             );
         }
 
         // Register all group attributes from PublicSchema
         for attr in schema.group_attributes().attributes.iter() {
-            let preferred = get_preferred_ldap_name(attr);
-            let logical = Self::determine_logical_attr(attr, &preferred);
+            let preferred = attr.preferred_ldap_name();
+            let logical = Self::determine_logical_attr(attr, attr.name.as_str());
 
             register(
                 &attr.name.as_str().to_lowercase(),
                 logical,
-                &preferred,
+                preferred,
                 &attr.aliases,
             );
         }
@@ -167,46 +88,24 @@ impl SchemaManager {
     }
 
     /// Determines whether an attribute is a known Primary column, Operational, or a Custom attribute.
-    fn determine_logical_attr(
-        attr: &lldap_schema::AttributeSchema,
-        preferred: &str,
-    ) -> LogicalAttr {
-        let lower = preferred.to_ascii_lowercase();
+    fn determine_logical_attr(attr: &lldap_schema::AttributeSchema, name: &str) -> LogicalAttr {
+        use lldap_domain_model::model::UserColumn;
+        let lower = name.to_ascii_lowercase();
 
-        // Operational attributes — must be hidden in "*" and only shown in "+"
-        if matches!(
-            lower.as_str(),
-            "hassubordinates"
-                | "structuralobjectclass"
-                | "subschemasubentry"
-                | "entryuuid"
-                | "uuid"
-                | "memberof"
-                | "ismemberof"
-        ) {
+        // uuid is operational — hidden in "*", shown only in "+".
+        if lower == "uuid" {
             return LogicalAttr::Operational;
         }
 
+        // Keyed on the schema canonical name; aliases are folded in by `register`.
         match lower.as_str() {
-            "uid" | "user_id" | "id" | "userid" => {
-                LogicalAttr::Primary(lldap_domain_model::model::UserColumn::UserId)
-            }
-            "mail" | "email" => LogicalAttr::Primary(lldap_domain_model::model::UserColumn::Email),
-            "cn" | "displayname" | "display_name" => {
-                LogicalAttr::Primary(lldap_domain_model::model::UserColumn::DisplayName)
-            }
-            "krbprincipalname" | "krb_principal_name" => {
-                LogicalAttr::Primary(lldap_domain_model::model::UserColumn::KrbPrincipalName)
-            }
-            "createtimestamp" | "creationdate" | "creation_date" | "creationtimestamp" => {
-                LogicalAttr::Primary(lldap_domain_model::model::UserColumn::CreationDate)
-            }
-            "modifytimestamp" | "modifieddate" | "modified_date" | "modifydate" => {
-                LogicalAttr::Primary(lldap_domain_model::model::UserColumn::ModifiedDate)
-            }
-            "pwdchangedtime" | "passwordmodifieddate" | "password_modified_date" => {
-                LogicalAttr::Primary(lldap_domain_model::model::UserColumn::PasswordModifiedDate)
-            }
+            "userid" => LogicalAttr::Primary(UserColumn::UserId),
+            "mail" => LogicalAttr::Primary(UserColumn::Email),
+            "displayname" => LogicalAttr::Primary(UserColumn::DisplayName),
+            "krbprincipalname" => LogicalAttr::Primary(UserColumn::KrbPrincipalName),
+            "creationdate" => LogicalAttr::Primary(UserColumn::CreationDate),
+            "modifieddate" => LogicalAttr::Primary(UserColumn::ModifiedDate),
+            "passwordmodifieddate" => LogicalAttr::Primary(UserColumn::PasswordModifiedDate),
             _ => LogicalAttr::Custom(
                 Box::leak(attr.name.as_str().to_string().into_boxed_str()),
                 attr.attribute_type,
@@ -220,7 +119,6 @@ impl SchemaManager {
     // ========================================================================
 
     /// Resolves an attribute name (case-insensitive) to its LogicalAttr and canonical LDAP name.
-    /// Now fully dynamic — powered by the maps built from PublicSchema.
     pub fn resolve_attribute(&self, name: &str) -> Option<(LogicalAttr, String)> {
         let lower = name.to_ascii_lowercase();
         self.attribute_map.get(&lower).cloned()
@@ -233,10 +131,8 @@ impl SchemaManager {
     }
 
     pub fn is_operational(&self, name: &str) -> bool {
-        matches!(
-            self.resolve_attribute(name),
-            Some((LogicalAttr::Operational, _))
-        )
+        // Single operational-gating predicate for the whole crate (RFC 4512: `+`/explicit, not `*`).
+        operational::is_operational(name)
     }
 
     // ========================================================================
@@ -324,7 +220,7 @@ impl SchemaManager {
     }
 
     // ========================================================================
-    // EXPAND ATTRIBUTE WILDCARDS (FULL LOGIC - COMPLETED)
+    // EXPAND ATTRIBUTE WILDCARDS
     // ========================================================================
 
     pub fn expand_attribute_wildcards(
@@ -337,46 +233,16 @@ impl SchemaManager {
         let mut standard_keys: Vec<String> = Vec::new();
         let mut operational_keys: Vec<String> = Vec::new();
 
-        let always_operational: HashSet<&str> = [
-            "hassubordinates",
-            "structuralobjectclass",
-            "subschemasubentry",
-            "createtimestamp",
-            "modifytimestamp",
-            "pwdchangedtime",
-            "entryuuid",
-            "entrydn",
-            "memberof",
-            "creatorsname",
-            "modifiersname",
-        ]
-        .iter()
-        .cloned()
-        .collect();
+        let always_operational: HashSet<String> = operational::all()
+            .iter()
+            .filter(|o| o.always_operational)
+            .map(|o| o.key())
+            .collect();
 
-        let _ignore_on_plus: HashSet<&str> = [
-            "attributetypes",
-            "objectclasses",
-            "matchingrules",
-            "ldapsyntaxes",
-            "matchingruleuse",
-            "creatorsname",
-            "modifiersname",
-            "namingcontexts",
-            "supportedcontrol",
-            "supportedextension",
-            "supportedfeatures",
-            "supportedldapversion",
-            "supportedsaslmechanisms",
-            "vendorname",
-            "vendorversion",
-            "altserver",
-            "ref",
-            "queryid",
-        ]
-        .iter()
-        .cloned()
-        .collect();
+        let ignore_set: HashSet<&str> = operational::SUBSCHEMA_PUBLISHED_NAMES
+            .iter()
+            .copied()
+            .collect();
 
         for attr in schema
             .user_attributes()
@@ -384,29 +250,25 @@ impl SchemaManager {
             .iter()
             .chain(schema.group_attributes().attributes.iter())
         {
-            let preferred_name = get_preferred_ldap_name(attr);
+            let preferred_name = attr.preferred_ldap_name();
 
-            if let Some((logical, _)) = self.resolve_attribute(&preferred_name) {
-                let is_always_op =
-                    always_operational.contains(preferred_name.to_ascii_lowercase().as_str());
-                let target = if matches!(logical, LogicalAttr::Operational) || is_always_op {
+            if self.resolve_attribute(preferred_name).is_some() {
+                let target = if operational::is_operational(preferred_name) {
                     &mut operational_keys
                 } else {
                     &mut standard_keys
                 };
                 if !target
                     .iter()
-                    .any(|k| k.eq_ignore_ascii_case(&preferred_name))
+                    .any(|k| k.eq_ignore_ascii_case(preferred_name))
                 {
-                    target.push(preferred_name);
+                    target.push(preferred_name.to_string());
                 }
-            } else {
-                if !standard_keys
-                    .iter()
-                    .any(|k| k.eq_ignore_ascii_case(&preferred_name))
-                {
-                    standard_keys.push(preferred_name);
-                }
+            } else if !standard_keys
+                .iter()
+                .any(|k| k.eq_ignore_ascii_case(preferred_name))
+            {
+                standard_keys.push(preferred_name.to_string());
             }
         }
 
@@ -419,8 +281,7 @@ impl SchemaManager {
             }
         }
 
-        let always_operational_set: HashSet<&str> = always_operational.iter().cloned().collect();
-        standard_keys.retain(|k| !always_operational_set.contains(k.to_ascii_lowercase().as_str()));
+        standard_keys.retain(|k| !always_operational.contains(k.to_ascii_lowercase().as_str()));
 
         // objectClass is always included for standard searches
         if !standard_keys
@@ -435,22 +296,15 @@ impl SchemaManager {
         seen.clear();
         operational_keys.retain(|k| seen.insert(k.to_ascii_lowercase()));
 
-        let ignore_set: HashSet<String> = _ignore_on_plus
-            .iter()
-            .map(|s| s.to_ascii_lowercase())
-            .collect();
-
         let mut attributes_out: BTreeMap<AttributeName, String> = BTreeMap::new();
 
         for s in ldap_attributes.iter().filter(|&s| {
             let lower = s.to_ascii_lowercase();
-            lower != "*" && lower != "+" && lower != "1.1" && !ignore_set.contains(&lower)
+            lower != "*" && lower != "+" && lower != "1.1" && !ignore_set.contains(lower.as_str())
         }) {
             let canonical = self.get_canonical_name(s);
             attributes_out.insert(AttributeName::from(&canonical), canonical);
         }
-
-        operational_keys.retain(|k| !_ignore_on_plus.contains(k.as_str()));
 
         let has_star = ldap_attributes.iter().any(|x| x == "*") || ldap_attributes.is_empty();
         let has_plus = ldap_attributes.iter().any(|x| x == "+");
@@ -471,10 +325,9 @@ impl SchemaManager {
 
         // If any explicitly requested attribute is operational, include operational attrs
         // (per LDAP spec: explicitly requested operational attrs must be returned)
-        let has_explicit_operational = attributes_out.keys().any(|k| {
-            self.is_operational(k.as_str())
-                || always_operational.contains(k.as_str().to_ascii_lowercase().as_str())
-        });
+        let has_explicit_operational = attributes_out
+            .keys()
+            .any(|k| self.is_operational(k.as_str()));
 
         ExpandedAttributes {
             attribute_keys: attributes_out,
@@ -499,5 +352,217 @@ impl SchemaManager {
 impl Default for SchemaManager {
     fn default() -> Self {
         Self::new(PublicSchema::shared())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lldap_domain_model::model::UserColumn;
+    use std::collections::HashSet;
+
+    fn keys(exp: &ExpandedAttributes) -> HashSet<String> {
+        exp.attribute_keys
+            .values()
+            .map(|s| s.to_ascii_lowercase())
+            .collect()
+    }
+
+    fn expand(attrs: &[&str]) -> ExpandedAttributes {
+        SchemaManager::default().expand_attribute_wildcards(
+            &attrs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
+            PublicSchema::shared(),
+        )
+    }
+
+    #[test]
+    fn expand_star_and_empty_are_user_attributes_only() {
+        for attrs in [&["*"][..], &[][..]] {
+            let exp = expand(attrs);
+            assert!(exp.include_custom_attributes, "{attrs:?}");
+            assert!(!exp.include_operational_attributes, "{attrs:?}");
+            let k = keys(&exp);
+            assert!(k.contains("uid"), "{attrs:?}");
+            assert!(k.contains("mail"), "{attrs:?}");
+            assert!(k.contains("objectclass"), "{attrs:?}");
+            for op in [
+                "createtimestamp",
+                "modifytimestamp",
+                "pwdchangedtime",
+                "entryuuid",
+                "hassubordinates",
+                "entrydn",
+                "memberof",
+                "creatorsname",
+                "modifiersname",
+            ] {
+                assert!(!k.contains(op), "{attrs:?} {op}");
+            }
+        }
+    }
+
+    #[test]
+    fn expand_plus_adds_all_always_operational() {
+        let exp = expand(&["+"]);
+        assert!(exp.include_custom_attributes);
+        assert!(exp.include_operational_attributes);
+        let k = keys(&exp);
+        assert!(k.contains("uid"));
+        for op in [
+            "createtimestamp",
+            "modifytimestamp",
+            "pwdchangedtime",
+            "entryuuid",
+            "hassubordinates",
+            "structuralobjectclass",
+            "subschemasubentry",
+            "entrydn",
+            "memberof",
+            "creatorsname",
+            "modifiersname",
+        ] {
+            assert!(k.contains(op), "{op}");
+        }
+        // loginDisabled/sudoHost stay explicit-only (not always_operational).
+        assert!(!k.contains("logindisabled"));
+        assert!(!k.contains("sudohost"));
+    }
+
+    #[test]
+    fn expand_one_one_is_empty() {
+        let exp = expand(&["1.1"]);
+        assert!(!exp.include_custom_attributes);
+        assert!(!exp.include_operational_attributes);
+        assert!(exp.attribute_keys.is_empty());
+    }
+
+    #[test]
+    fn expand_explicit_operational_requests_are_pinned() {
+        let ts = expand(&["createTimestamp"]);
+        assert!(ts.include_operational_attributes);
+        assert!(!ts.include_custom_attributes);
+        assert!(keys(&ts).contains("createtimestamp"));
+
+        let uuid = expand(&["entryUUID"]);
+        assert!(uuid.include_operational_attributes);
+        assert!(keys(&uuid).contains("entryuuid"));
+
+        let entry_dn = expand(&["entryDN"]);
+        assert!(entry_dn.include_operational_attributes);
+        assert!(keys(&entry_dn).contains("entrydn"));
+
+        // creatorsName/modifiersName are now standard operational — explicit request works.
+        let creators = expand(&["creatorsName"]);
+        assert!(creators.include_operational_attributes);
+        assert!(keys(&creators).contains("creatorsname"));
+
+        // loginDisabled/sudoHost are explicit-only virtuals: requesting them must NOT set
+        // include_operational (that would dump the 5 injected ops). The key is present (returned
+        // via the per-attribute path), but the operational bucket stays off.
+        let ld = expand(&["loginDisabled"]);
+        assert!(!ld.include_operational_attributes);
+        assert!(keys(&ld).contains("logindisabled"));
+        let sh = expand(&["sudoHost"]);
+        assert!(!sh.include_operational_attributes);
+        assert!(keys(&sh).contains("sudohost"));
+    }
+
+    #[test]
+    fn resolve_and_is_operational_normalized() {
+        let sm = SchemaManager::default();
+        let cases: &[(&str, bool, &str, Option<LogicalAttr>)] = &[
+            (
+                "objectclass",
+                false,
+                "objectClass",
+                Some(LogicalAttr::ObjectClass),
+            ),
+            ("memberof", true, "memberOf", Some(LogicalAttr::MemberOf)),
+            ("dn", false, "dn", Some(LogicalAttr::Dn)),
+            ("entrydn", true, "entryDN", Some(LogicalAttr::EntryDn)),
+            (
+                "hassubordinates",
+                true,
+                "hasSubordinates",
+                Some(LogicalAttr::Operational),
+            ),
+            (
+                "createtimestamp",
+                true,
+                "createTimestamp",
+                Some(LogicalAttr::Primary(UserColumn::CreationDate)),
+            ),
+            (
+                "creationdate",
+                true,
+                "createTimestamp",
+                Some(LogicalAttr::Primary(UserColumn::CreationDate)),
+            ),
+            (
+                "creationtimestamp",
+                true,
+                "createTimestamp",
+                Some(LogicalAttr::Operational),
+            ),
+            (
+                "modifytimestamp",
+                true,
+                "modifyTimestamp",
+                Some(LogicalAttr::Primary(UserColumn::ModifiedDate)),
+            ),
+            (
+                "modifydate",
+                true,
+                "modifyTimestamp",
+                Some(LogicalAttr::Operational),
+            ),
+            (
+                "pwdchangedtime",
+                true,
+                "pwdChangedTime",
+                Some(LogicalAttr::Primary(UserColumn::PasswordModifiedDate)),
+            ),
+            (
+                "creatorsname",
+                true,
+                "creatorsName",
+                Some(LogicalAttr::Operational),
+            ),
+            (
+                "entryuuid",
+                true,
+                "entryUUID",
+                Some(LogicalAttr::Operational),
+            ),
+            ("uuid", true, "entryUUID", Some(LogicalAttr::Operational)),
+            (
+                "logindisabled",
+                false,
+                "loginDisabled",
+                Some(LogicalAttr::Operational),
+            ),
+            (
+                "sudohost",
+                false,
+                "sudoHost",
+                Some(LogicalAttr::Operational),
+            ),
+            (
+                "userid",
+                false,
+                "uid",
+                Some(LogicalAttr::Primary(UserColumn::UserId)),
+            ),
+        ];
+        for &(name, operational, canon, ref logical) in cases {
+            assert_eq!(
+                sm.is_operational(name),
+                operational,
+                "is_operational({name})"
+            );
+            assert_eq!(sm.get_canonical_name(name), canon, "canonical({name})");
+            let resolved = sm.resolve_attribute(name).map(|(l, _)| l);
+            assert_eq!(resolved, *logical, "logical({name})");
+        }
     }
 }

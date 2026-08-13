@@ -967,7 +967,7 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
 
         let attribute_schema = schema
             .user_attributes()
-            .get_attribute_schema(name.as_str())
+            .get_by_name_or_alias(name.as_str())
             .ok_or_else(|| anyhow!("Attribute {} is not defined in the schema", name))?;
 
         if attribute_schema.is_hardcoded {
@@ -999,7 +999,7 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
 
         let attribute_schema = schema
             .group_attributes()
-            .get_attribute_schema(name.as_str())
+            .get_by_name_or_alias(name.as_str())
             .ok_or_else(|| anyhow!("Attribute {} is not defined in the schema", name))?;
 
         if attribute_schema.is_hardcoded {

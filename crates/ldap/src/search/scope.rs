@@ -36,7 +36,10 @@ pub fn get_search_scope(
         return SearchScope::Container;
     }
 
-    if matches!(ldap_scope, LdapSearchScope::Base) && dn_parts.len() > base_dn.len() {
+    // Base/Subtree at a leaf DN is the entry itself (RFC 4511 §4.5.1.2). OneLevel is not.
+    if matches!(ldap_scope, LdapSearchScope::Base | LdapSearchScope::Subtree)
+        && dn_parts.len() > base_dn.len()
+    {
         let full_dn = dn_parts
             .iter()
             .map(|(k, v)| format!("{}={}", k, v))
@@ -145,21 +148,23 @@ pub fn build_ou_entries(
         .collect()
 }
 
-// Production-grade, reusable OU filter matcher.
-// Supports equality on ou/objectClass, Present, And/Or/Not.
-// Extensible for future filters. Zero assumptions on complex cases (defaults to include).
+// Filter a synthetic OU against the attributes it actually carries (`ou` leaf, objectClass).
 pub fn ou_matches_filter(ou_str: &str, filter: &ldap3_proto::LdapFilter) -> bool {
     match filter {
         ldap3_proto::LdapFilter::Equality(field, value) => {
             let f = field.to_ascii_lowercase();
             let v = value.to_ascii_lowercase();
             if f == "ou" {
-                ou_str.to_ascii_lowercase() == v
+                ou_leaf(ou_str).eq_ignore_ascii_case(&v)
             } else if f == "objectclass" {
                 v == "organizationalunit" || v == "top"
             } else {
-                true // unknown field on OU — include (client will filter further if needed)
+                false
             }
+        }
+        ldap3_proto::LdapFilter::Substring(field, sub) => {
+            field.eq_ignore_ascii_case("ou")
+                && substring_matches(&ou_leaf(ou_str).to_ascii_lowercase(), sub)
         }
         ldap3_proto::LdapFilter::Present(field) => {
             let f = field.to_ascii_lowercase();
@@ -175,8 +180,33 @@ pub fn ou_matches_filter(ou_str: &str, filter: &ldap3_proto::LdapFilter) -> bool
             filters.iter().any(|f| ou_matches_filter(ou_str, f))
         }
         ldap3_proto::LdapFilter::Not(f) => !ou_matches_filter(ou_str, f),
-        // Substring/Greater/etc not applicable to OU synthetic entries — include
-        _ => true,
+        _ => false,
+    }
+}
+
+fn ou_leaf(ou_str: &str) -> &str {
+    ou_str.rsplit('\\').next().unwrap_or(ou_str)
+}
+
+fn substring_matches(haystack: &str, sub: &ldap3_proto::proto::LdapSubstringFilter) -> bool {
+    let mut pos = 0;
+    if let Some(initial) = &sub.initial {
+        let initial = initial.to_ascii_lowercase();
+        if !haystack[pos..].starts_with(&initial) {
+            return false;
+        }
+        pos += initial.len();
+    }
+    for any in &sub.any {
+        let any = any.to_ascii_lowercase();
+        match haystack[pos..].find(&any) {
+            Some(i) => pos += i + any.len(),
+            None => return false,
+        }
+    }
+    match &sub.final_ {
+        Some(final_) => haystack[pos..].ends_with(&final_.to_ascii_lowercase()),
+        None => true,
     }
 }
 
@@ -251,6 +281,47 @@ mod tests {
             &["people".to_string(), "groups".to_string()],
         );
         assert_eq!(scope, SearchScope::LeafGroup);
+    }
+
+    #[test]
+    fn test_search_scope_leaf_user_subtree() {
+        let base_dn = make_dn("dc=example,dc=com");
+        let dn = make_dn("uid=alice,ou=people,dc=example,dc=com");
+
+        let scope = get_search_scope(
+            &base_dn,
+            &dn,
+            &LdapSearchScope::Subtree,
+            &["people".to_string(), "groups".to_string()],
+        );
+        assert_eq!(scope, SearchScope::LeafUser);
+    }
+
+    #[test]
+    fn test_search_scope_leaf_group_subtree() {
+        let base_dn = make_dn("dc=example,dc=com");
+        let dn = make_dn("cn=admins,ou=groups,dc=example,dc=com");
+
+        let scope = get_search_scope(
+            &base_dn,
+            &dn,
+            &LdapSearchScope::Subtree,
+            &["people".to_string(), "groups".to_string()],
+        );
+        assert_eq!(scope, SearchScope::LeafGroup);
+    }
+
+    #[test]
+    fn test_search_scope_leaf_user_onelevel() {
+        let base_dn = make_dn("dc=example,dc=com");
+        let dn = make_dn("uid=alice,ou=people,dc=example,dc=com");
+        let scope = get_search_scope(
+            &base_dn,
+            &dn,
+            &LdapSearchScope::OneLevel,
+            &["people".to_string(), "groups".to_string()],
+        );
+        assert_ne!(scope, SearchScope::LeafUser);
     }
 
     #[test]
@@ -342,10 +413,53 @@ mod tests {
     }
 
     #[test]
-    fn test_ou_matches_filter_default_true_for_unsupported() {
-        // GreaterOrEqual (and similar) are not handled by ou_matches_filter → should default to true
+    fn test_ou_matches_filter_rejects_unsupported() {
         let filter = ldap3_proto::LdapFilter::GreaterOrEqual("cn".to_string(), "a".to_string());
-        assert!(ou_matches_filter("office", &filter));
+        assert!(!ou_matches_filter("office", &filter));
+    }
+
+    #[test]
+    fn test_ou_matches_filter_substring_cn_excluded() {
+        let filter = ldap3_proto::LdapFilter::Substring(
+            "cn".to_string(),
+            ldap3_proto::proto::LdapSubstringFilter {
+                initial: None,
+                any: vec!["aelieth".to_string()],
+                final_: None,
+            },
+        );
+        assert!(!ou_matches_filter("family", &filter));
+    }
+
+    #[test]
+    fn test_ou_matches_filter_substring_ou() {
+        let filter = ldap3_proto::LdapFilter::Substring(
+            "ou".to_string(),
+            ldap3_proto::proto::LdapSubstringFilter {
+                initial: None,
+                any: vec!["fam".to_string()],
+                final_: None,
+            },
+        );
+        assert!(ou_matches_filter("family", &filter));
+        assert!(ou_matches_filter("people\\family", &filter));
+        assert!(!ou_matches_filter("groups", &filter));
+    }
+
+    #[test]
+    fn test_ou_matches_filter_unknown_equality_excluded() {
+        let filter = ldap3_proto::LdapFilter::Equality("cn".to_string(), "aelieth".to_string());
+        assert!(!ou_matches_filter("family", &filter));
+    }
+
+    #[test]
+    fn test_ou_matches_filter_nested_leaf_name() {
+        let eq = ldap3_proto::LdapFilter::Equality("ou".to_string(), "family".to_string());
+        assert!(ou_matches_filter("people\\family", &eq));
+        assert!(!ou_matches_filter(
+            "people\\family",
+            &ldap3_proto::LdapFilter::Equality("ou".to_string(), "people".to_string(),)
+        ));
     }
 
     #[test]

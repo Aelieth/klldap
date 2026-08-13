@@ -154,6 +154,110 @@ fn nested_ou_test() {
     ldap.unbind().expect("failed to unbind");
 }
 
+#[test]
+#[file_serial]
+fn subtree_search_at_leaf_returns_entry() {
+    // #4: RFC 4511 §4.5.1.2 — wholeSubtree includes the base entry, so a subtree search
+    // based at a user's own DN must return that user, not zero entries.
+    let mut fixture = LLDAPFixture::new();
+    let prefix = "ldap-subtree-leaf-";
+    let user_name = new_id(Some(prefix));
+    fixture.load_state(&vec![User::new(&user_name, vec![])]);
+
+    let mut ldap =
+        LdapConn::new(env::ldap_url().as_str()).expect("failed to create ldap connection");
+    let base_dn = env::base_dn();
+    let bind_dn = format!("uid={},ou=people,{}", env::admin_dn(), base_dn);
+    ldap.simple_bind(&bind_dn, env::admin_password().as_str())
+        .expect("failed to bind to ldap");
+
+    let user_dn = format!("uid={},ou=people,{}", user_name, base_dn);
+    let search_result = ldap
+        .search(
+            &user_dn,
+            Scope::Subtree,
+            "(objectclass=person)",
+            vec!["uid"],
+        )
+        .expect("failed to search at leaf");
+
+    let found = parse_ldap_users(search_result);
+    assert!(
+        found.contains_key(&user_name),
+        "subtree search at leaf DN {} returned no entry (bug #4)",
+        user_dn
+    );
+
+    ldap.unbind().expect("failed to unbind");
+}
+
+#[test]
+#[file_serial]
+fn ou_entries_respect_filter() {
+    // #3: a filter an OU can't satisfy (a cn substring) must not return phantom OU entries,
+    // while an objectClass filter that does match still returns them.
+    let mut _fixture = LLDAPFixture::new();
+
+    let mut ldap =
+        LdapConn::new(env::ldap_url().as_str()).expect("failed to create ldap connection");
+    let base_dn = env::base_dn();
+    let bind_dn = format!("uid={},ou=people,{}", env::admin_dn(), base_dn);
+    ldap.simple_bind(&bind_dn, env::admin_password().as_str())
+        .expect("failed to bind to ldap");
+
+    let phantom = ldap
+        .search(
+            &base_dn,
+            Scope::Subtree,
+            "(cn=*zzzznosuchthing*)",
+            vec!["ou", "objectClass"],
+        )
+        .expect("failed to search");
+    assert_eq!(
+        count_ou_entries(phantom),
+        0,
+        "cn substring returned phantom OU entries (bug #3)"
+    );
+
+    // Positive control: the OUs are still discoverable by objectClass.
+    let real = ldap
+        .search(
+            &base_dn,
+            Scope::Subtree,
+            "(objectClass=organizationalUnit)",
+            vec!["ou", "objectClass"],
+        )
+        .expect("failed to search");
+    assert!(
+        count_ou_entries(real) >= 1,
+        "objectClass=organizationalUnit should still return OU entries"
+    );
+
+    ldap.unbind().expect("failed to unbind");
+}
+
+/// Count returned entries whose objectClass includes organizationalUnit.
+fn count_ou_entries(results: SearchResult) -> usize {
+    let entries = results.success().expect("search failed").0;
+    let mut count = 0;
+    for entry in entries {
+        let parsed = SearchEntry::construct(entry);
+        let is_ou = parsed
+            .attrs
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("objectclass"))
+            .map(|(_, v)| {
+                v.iter()
+                    .any(|c| c.eq_ignore_ascii_case("organizationalUnit"))
+            })
+            .unwrap_or(false);
+        if is_ou {
+            count += 1;
+        }
+    }
+    count
+}
+
 /// Case-insensitive + robust parser for the new OU model
 fn parse_ldap_users(results: SearchResult) -> HashMap<String, HashSet<String>> {
     let entries = results.success().expect("search failed").0;

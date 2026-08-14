@@ -1,16 +1,14 @@
 use super::inputs::AttributeValue;
 use crate::api::{Context, field_error_callback};
 use anyhow::anyhow;
-use base64::{Engine as _, engine::general_purpose};
 use juniper::FieldResult;
 use lldap_access_control::{AdminBackendHandler, ReadonlyBackendHandler};
 use lldap_domain::{
-    images::process_avatar_input,
+    deserialize::deserialize_attribute_value,
     requests::CreateGroupRequest,
-    types::{Attribute as DomainAttribute, AttributeName, Email, Serialized},
+    types::{Attribute as DomainAttribute, AttributeName, Email},
 };
 use lldap_domain_handlers::handler::{BackendHandler, ReadSchemaBackendHandler};
-use lldap_domain_model::model::deserialize::deserialize_attribute_value;
 use lldap_opaque_handler::OpaqueHandler;
 use lldap_schema::{PublicSchema, schema::AttributeList};
 use std::{collections::BTreeMap, sync::Arc};
@@ -228,44 +226,76 @@ pub fn deserialize_attribute(
         }
     }
 
-    let is_avatar = canonical_name.eq_ignore_ascii_case("avatar");
-    // jpegphoto (and variants) resolve to canonical "avatar" via resolve_canonical_name above
-
-    let serialized = if is_avatar && !attr_schema.is_list {
-        let val = attribute
-            .value
-            .first()
-            .cloned()
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-
-        if val.is_empty() {
-            Serialized(vec![])
-        } else {
-            match general_purpose::STANDARD.decode(&val) {
-                Ok(raw_bytes) => match process_avatar_input(&raw_bytes) {
-                    Ok(jpeg) => Serialized(jpeg),
-                    Err(e) => return Err(anyhow!("Invalid avatar upload: {}", e).into()),
-                },
-                Err(e) => {
-                    tracing::error!(target: "avatar_debug", "Avatar base64 decode FAILED: {}", e);
-                    return Err(anyhow!("Invalid base64 avatar data: {}", e).into());
-                }
-            }
+    let value = match deserialize_attribute_value(
+        &attribute.value,
+        attr_schema.attribute_type,
+        attr_schema.is_list,
+    ) {
+        Ok(value) => value,
+        Err(e) => {
+            return Err(anyhow!("Invalid value for attribute {}: {:#}", attribute.name, e).into());
         }
-    } else if attr_schema.is_list {
-        Serialized(serde_json::to_vec(&attribute.value).unwrap_or_else(|_| b"[]".to_vec()))
-    } else {
-        let val = attribute.value.first().cloned().unwrap_or_default();
-        Serialized(val.into_bytes())
     };
-
-    let value =
-        deserialize_attribute_value(&serialized, attr_schema.attribute_type, attr_schema.is_list);
 
     Ok(DomainAttribute {
         name: attribute_name,
         value,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lldap_domain::types::{AttributeType, AttributeValue as DomainValue, Cardinality};
+    use lldap_schema::schema::{AttributeList, AttributeSchema};
+
+    fn attr_input(name: &str, values: &[&str]) -> AttributeValue {
+        AttributeValue {
+            name: name.to_string(),
+            value: values.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn schema_of(attr: AttributeSchema) -> AttributeList {
+        AttributeList {
+            attributes: vec![attr],
+        }
+    }
+
+    #[test]
+    fn datetime_input_parses_rfc3339() {
+        let schema = schema_of(AttributeSchema::editable("mydate", AttributeType::DateTime));
+        let attr = deserialize_attribute(
+            &schema,
+            attr_input("mydate", &["2024-05-01T12:00:00Z"]),
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            attr.value,
+            DomainValue::DateTime(Cardinality::Singleton(
+                "2024-05-01T12:00:00".parse().unwrap()
+            ))
+        );
+    }
+
+    #[test]
+    fn integer_list_input_parses_numbers() {
+        let schema = schema_of(AttributeSchema::editable("myints", AttributeType::Integer).list());
+        let attr =
+            deserialize_attribute(&schema, attr_input("myints", &["1", "-2"]), false).unwrap();
+        assert_eq!(
+            attr.value,
+            DomainValue::Integer(Cardinality::Unbounded(vec![1, -2]))
+        );
+    }
+
+    #[test]
+    fn non_list_rejects_empty_and_invalid_input() {
+        let schema = schema_of(AttributeSchema::editable("mydate", AttributeType::DateTime));
+        assert!(deserialize_attribute(&schema, attr_input("mydate", &[]), false).is_err());
+        assert!(
+            deserialize_attribute(&schema, attr_input("mydate", &["not-a-date"]), false).is_err()
+        );
+    }
 }

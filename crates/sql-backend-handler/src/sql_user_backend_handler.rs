@@ -18,7 +18,7 @@ use lldap_domain_handlers::handler::{
 };
 use lldap_domain_model::{
     error::{DomainError, Result},
-    model::{self, GroupColumn, UserColumn, deserialize, system_config},
+    model::{self, GroupColumn, UserColumn, codec, system_config},
 };
 use lldap_kerberos::delete_kerberos_principal;
 use lldap_schema::PublicSchema;
@@ -223,11 +223,7 @@ impl UserListerBackendHandler for SqlBackendHandler {
             let mut attrs: Vec<_> = attributes_iter
                 .take_while_ref(|u| u.user_id == user.user.user_id)
                 .map(|a| {
-                    deserialize::deserialize_attribute(
-                        a.attribute_name,
-                        &a.value,
-                        schema.user_attributes(),
-                    )
+                    codec::decode_attribute(a.attribute_name, &a.value, schema.user_attributes())
                 })
                 .collect::<Result<Vec<_>>>()?;
 
@@ -888,11 +884,8 @@ impl UserBackendHandler for SqlBackendHandler {
         user.attributes = attributes
             .into_iter()
             .map(|a| {
-                let mut attr = deserialize::deserialize_attribute(
-                    a.attribute_name,
-                    &a.value,
-                    schema.user_attributes(),
-                )?;
+                let mut attr =
+                    codec::decode_attribute(a.attribute_name, &a.value, schema.user_attributes())?;
 
                 // Force canonical name on output (defensive against any legacy alias data)
                 attr.name = Self::canonical_user_attribute_name(&schema, attr.name.as_str());

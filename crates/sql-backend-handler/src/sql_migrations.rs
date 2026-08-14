@@ -6,8 +6,8 @@ use sea_orm::{
     ConnectionTrait, DatabaseTransaction, DbErr, DeriveIden, FromQueryResult, Iden, Order,
     Statement, TransactionTrait,
     sea_query::{
-        Alias, BinOper, ColumnDef, Expr, ForeignKey, ForeignKeyAction, Func, Index, Query,
-        SimpleExpr, Table, Value, all,
+        Alias, BinOper, ColumnDef, DynIden, Expr, ForeignKey, ForeignKeyAction, Func, Index,
+        IntoIden, OnConflict, Query, SimpleExpr, Table, Value, all,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -1171,61 +1171,170 @@ async fn migrate_to_v11(transaction: DatabaseTransaction) -> Result<DatabaseTran
     Ok(transaction)
 }
 
+struct AttributeTables {
+    attr_table: DynIden,
+    attr_id_col: DynIden,
+    attr_name_col: DynIden,
+    attr_value_col: DynIden,
+    entity_table: DynIden,
+    entity_id_col: DynIden,
+}
+
+fn user_attribute_tables() -> AttributeTables {
+    AttributeTables {
+        attr_table: UserAttributes::Table.into_iden(),
+        attr_id_col: UserAttributes::UserAttributeUserId.into_iden(),
+        attr_name_col: UserAttributes::UserAttributeName.into_iden(),
+        attr_value_col: UserAttributes::UserAttributeValue.into_iden(),
+        entity_table: Users::Table.into_iden(),
+        entity_id_col: Users::UserId.into_iden(),
+    }
+}
+
+fn group_attribute_tables() -> AttributeTables {
+    AttributeTables {
+        attr_table: GroupAttributes::Table.into_iden(),
+        attr_id_col: GroupAttributes::GroupAttributeGroupId.into_iden(),
+        attr_name_col: GroupAttributes::GroupAttributeName.into_iden(),
+        attr_value_col: GroupAttributes::GroupAttributeValue.into_iden(),
+        entity_table: Groups::Table.into_iden(),
+        entity_id_col: Groups::GroupId.into_iden(),
+    }
+}
+
+fn attribute_default_insert(
+    t: &AttributeTables,
+    attr_name: &str,
+    value: Vec<u8>,
+) -> Result<sea_orm::sea_query::InsertStatement, DbErr> {
+    let attr_table = t.attr_table.clone();
+    let attr_id_col = t.attr_id_col.clone();
+    let attr_name_col = t.attr_name_col.clone();
+    let attr_value_col = t.attr_value_col.clone();
+    let entity_table = t.entity_table.clone();
+    let entity_id_col = t.entity_id_col.clone();
+    let missing = Query::select()
+        .column((entity_table.clone(), entity_id_col.clone()))
+        .expr(Expr::val(attr_name))
+        .expr(Expr::val(value))
+        .from(entity_table.clone())
+        .and_where(
+            Expr::exists(
+                Query::select()
+                    .expr(Expr::val(1))
+                    .from(attr_table.clone())
+                    .and_where(
+                        Expr::col((attr_table.clone(), attr_id_col.clone()))
+                            .equals((entity_table, entity_id_col)),
+                    )
+                    .and_where(Expr::col((attr_table.clone(), attr_name_col.clone())).eq(attr_name))
+                    .take(),
+            )
+            .not(),
+        )
+        .take();
+    let mut insert = Query::insert();
+    insert
+        .into_table(attr_table)
+        .columns([attr_id_col, attr_name_col, attr_value_col])
+        .select_from(missing)
+        .map_err(|e| DbErr::Custom(format!("v12 attribute default seed: {e}")))?;
+    Ok(insert)
+}
+
+// Alias data rows are folded into their canonical name: rows whose canonical twin already
+// exists for the same entity are deleted (canonical wins), the rest are renamed. The
+// duplicate scan goes through a derived table so MySQL accepts a subquery on the
+// delete target.
+fn alias_duplicate_delete(
+    t: &AttributeTables,
+    canonical: &str,
+    alias: &str,
+) -> sea_orm::sea_query::DeleteStatement {
+    let attr_table = t.attr_table.clone();
+    let attr_id_col = t.attr_id_col.clone();
+    let attr_name_col = t.attr_name_col.clone();
+    let canonical_ids = Query::select()
+        .column((attr_table.clone(), attr_id_col.clone()))
+        .from(attr_table.clone())
+        .and_where(Expr::col((attr_table.clone(), attr_name_col.clone())).eq(canonical))
+        .take();
+    let wrapped = Query::select()
+        .column((Alias::new("dup"), attr_id_col.clone()))
+        .from_subquery(canonical_ids, Alias::new("dup"))
+        .take();
+    let mut delete = Query::delete();
+    delete
+        .from_table(attr_table)
+        .and_where(Expr::col(attr_name_col).eq(alias))
+        .and_where(Expr::col(attr_id_col).in_subquery(wrapped));
+    delete
+}
+
+fn alias_rename_update(
+    t: &AttributeTables,
+    canonical: &str,
+    alias: &str,
+) -> sea_orm::sea_query::UpdateStatement {
+    let attr_table = t.attr_table.clone();
+    let attr_name_col = t.attr_name_col.clone();
+    let mut update = Query::update();
+    update
+        .table(attr_table)
+        .value(attr_name_col.clone(), canonical)
+        .and_where(Expr::col(attr_name_col).eq(alias));
+    update
+}
+
 async fn migrate_to_v12(transaction: DatabaseTransaction) -> Result<DatabaseTransaction, DbErr> {
     let backend = transaction.get_database_backend();
 
-    info!(
-        "KLLDAP v12 migration starting – safe additive upgrade (preserves custom attributes + stock LLDAP compatibility)"
-    );
+    info!("KLLDAP v12 migration starting");
 
-    // === 1. Safely add KLLDAP extension columns (idempotent) ===
-    let _ = transaction
+    // Plain add_column: the version gate guarantees these never pre-exist, and MySQL
+    // rejects ADD COLUMN IF NOT EXISTS.
+    transaction
         .execute(
             backend.build(
-                Table::alter()
-                    .table(UserAttributeSchema::Table)
-                    .add_column_if_not_exists(
-                        ColumnDef::new(UserAttributeSchema::Aliases)
-                            .string_len(1024)
-                            .default("[]"),
-                    ),
+                Table::alter().table(UserAttributeSchema::Table).add_column(
+                    ColumnDef::new(UserAttributeSchema::Aliases)
+                        .string_len(1024)
+                        .default("[]"),
+                ),
             ),
         )
-        .await;
-    let _ = transaction
+        .await?;
+    transaction
         .execute(
             backend.build(
-                Table::alter()
-                    .table(UserAttributeSchema::Table)
-                    .add_column_if_not_exists(
-                        ColumnDef::new(UserAttributeSchema::UserAttributeSchemaIsReadonly)
-                            .boolean()
-                            .not_null()
-                            .default(false),
-                    ),
+                Table::alter().table(UserAttributeSchema::Table).add_column(
+                    ColumnDef::new(UserAttributeSchema::UserAttributeSchemaIsReadonly)
+                        .boolean()
+                        .not_null()
+                        .default(false),
+                ),
             ),
         )
-        .await;
-
-    let _ = transaction
+        .await?;
+    transaction
         .execute(
             backend.build(
                 Table::alter()
                     .table(GroupAttributeSchema::Table)
-                    .add_column_if_not_exists(
+                    .add_column(
                         ColumnDef::new(GroupAttributeSchema::Aliases)
                             .string_len(1024)
                             .default("[]"),
                     ),
             ),
         )
-        .await;
-    let _ = transaction
+        .await?;
+    transaction
         .execute(
             backend.build(
                 Table::alter()
                     .table(GroupAttributeSchema::Table)
-                    .add_column_if_not_exists(
+                    .add_column(
                         ColumnDef::new(GroupAttributeSchema::GroupAttributeSchemaIsReadonly)
                             .boolean()
                             .not_null()
@@ -1233,10 +1342,9 @@ async fn migrate_to_v12(transaction: DatabaseTransaction) -> Result<DatabaseTran
                     ),
             ),
         )
-        .await;
+        .await?;
 
-    // === 2. system_config table for allowedous + future system settings ===
-    let _ = transaction
+    transaction
         .execute(
             backend.build(
                 Table::create()
@@ -1251,10 +1359,10 @@ async fn migrate_to_v12(transaction: DatabaseTransaction) -> Result<DatabaseTran
                     .col(ColumnDef::new(Alias::new("value")).text().not_null()),
             ),
         )
-        .await;
+        .await?;
 
-    // Seed default allowedous (idempotent)
-    let _ = transaction
+    // Config data: seed the default only where no row exists — never overwrite user edits.
+    transaction
         .execute(
             backend.build(
                 Query::insert()
@@ -1265,39 +1373,40 @@ async fn migrate_to_v12(transaction: DatabaseTransaction) -> Result<DatabaseTran
                         serde_json::to_string(&serde_json::json!(["people", "groups"]))
                             .unwrap()
                             .into(),
-                    ]),
+                    ])
+                    .on_conflict(
+                        OnConflict::column(Alias::new("key"))
+                            .do_nothing_on([Alias::new("key")])
+                            .to_owned(),
+                    ),
             ),
         )
-        .await
-        .ok();
+        .await?;
 
-    // === 3. krb_principal_name column on users (for Kerberos principal exposure) ===
-    let _ = transaction
+    transaction
         .execute(
             backend.build(
-                Table::alter().table(Users::Table).add_column_if_not_exists(
+                Table::alter().table(Users::Table).add_column(
                     ColumnDef::new(Alias::new("krb_principal_name"))
                         .string_len(255)
                         .null(),
                 ),
             ),
         )
-        .await;
+        .await?;
 
-    // === 4. Upsert hardcoded attributes from PublicSchema (NEVER delete custom ones) ===
+    // Hardcoded attributes are source-of-truthed by PublicSchema: insert or update in
+    // place so pre-existing rows (e.g. v5's avatar) gain aliases/flags/type.
     let public_schema = PublicSchema::get();
     let schema = public_schema.get_schema();
 
-    let mut seeded_user = 0usize;
     for attr in &schema.user_attributes.attributes {
         if !attr.is_hardcoded {
             continue;
         }
-        let name = attr.name.as_str();
         let aliases_json =
             serde_json::to_string(&attr.aliases).unwrap_or_else(|_| "[]".to_string());
-
-        let res = transaction
+        transaction
             .execute(
                 backend.build(
                     Query::insert()
@@ -1313,7 +1422,7 @@ async fn migrate_to_v12(transaction: DatabaseTransaction) -> Result<DatabaseTran
                             UserAttributeSchema::Aliases,
                         ])
                         .values_panic([
-                            name.into(),
+                            attr.name.as_str().into(),
                             attr.attribute_type.into(),
                             attr.is_list.into(),
                             attr.is_visible.into(),
@@ -1321,26 +1430,32 @@ async fn migrate_to_v12(transaction: DatabaseTransaction) -> Result<DatabaseTran
                             true.into(),
                             attr.is_readonly.into(),
                             aliases_json.into(),
-                        ]),
+                        ])
+                        .on_conflict(
+                            OnConflict::column(UserAttributeSchema::UserAttributeSchemaName)
+                                .update_columns([
+                                    UserAttributeSchema::UserAttributeSchemaType,
+                                    UserAttributeSchema::UserAttributeSchemaIsList,
+                                    UserAttributeSchema::UserAttributeSchemaIsUserVisible,
+                                    UserAttributeSchema::UserAttributeSchemaIsUserEditable,
+                                    UserAttributeSchema::UserAttributeSchemaIsHardcoded,
+                                    UserAttributeSchema::UserAttributeSchemaIsReadonly,
+                                    UserAttributeSchema::Aliases,
+                                ])
+                                .to_owned(),
+                        ),
                 ),
             )
-            .await;
-
-        if res.is_ok() {
-            seeded_user += 1;
-        }
+            .await?;
     }
 
-    let mut seeded_group = 0usize;
     for attr in &schema.group_attributes.attributes {
         if !attr.is_hardcoded {
             continue;
         }
-        let name = attr.name.as_str();
         let aliases_json =
             serde_json::to_string(&attr.aliases).unwrap_or_else(|_| "[]".to_string());
-
-        let res = transaction
+        transaction
             .execute(
                 backend.build(
                     Query::insert()
@@ -1356,7 +1471,7 @@ async fn migrate_to_v12(transaction: DatabaseTransaction) -> Result<DatabaseTran
                             GroupAttributeSchema::Aliases,
                         ])
                         .values_panic([
-                            name.into(),
+                            attr.name.as_str().into(),
                             attr.attribute_type.into(),
                             attr.is_list.into(),
                             attr.is_visible.into(),
@@ -1364,24 +1479,44 @@ async fn migrate_to_v12(transaction: DatabaseTransaction) -> Result<DatabaseTran
                             true.into(),
                             attr.is_readonly.into(),
                             aliases_json.into(),
-                        ]),
+                        ])
+                        .on_conflict(
+                            OnConflict::column(GroupAttributeSchema::GroupAttributeSchemaName)
+                                .update_columns([
+                                    GroupAttributeSchema::GroupAttributeSchemaType,
+                                    GroupAttributeSchema::GroupAttributeSchemaIsList,
+                                    GroupAttributeSchema::GroupAttributeSchemaIsGroupVisible,
+                                    GroupAttributeSchema::GroupAttributeSchemaIsGroupEditable,
+                                    GroupAttributeSchema::GroupAttributeSchemaIsHardcoded,
+                                    GroupAttributeSchema::GroupAttributeSchemaIsReadonly,
+                                    GroupAttributeSchema::Aliases,
+                                ])
+                                .to_owned(),
+                        ),
                 ),
             )
-            .await;
-
-        if res.is_ok() {
-            seeded_group += 1;
-        }
+            .await?;
     }
 
+    let user_hardcoded = schema
+        .user_attributes
+        .attributes
+        .iter()
+        .filter(|a| a.is_hardcoded)
+        .count();
+    let group_hardcoded = schema
+        .group_attributes
+        .attributes
+        .iter()
+        .filter(|a| a.is_hardcoded)
+        .count();
     info!(
         "v12: Ensured {} user + {} group hardcoded attributes (custom attributes preserved)",
-        seeded_user, seeded_group
+        user_hardcoded, group_hardcoded
     );
 
-    // === Legacy repair: migrate old JpegPhoto schema type → Avatar (data integrity for upgrades) ===
-    // The actual JPEG bytes in user_attributes are left untouched.
-    let _ = transaction
+    // Legacy repair: any remaining JpegPhoto-typed avatar row from upstream v5.
+    transaction
         .execute(
             backend.build(
                 Query::update()
@@ -1398,201 +1533,165 @@ async fn migrate_to_v12(transaction: DatabaseTransaction) -> Result<DatabaseTran
                     ),
             ),
         )
-        .await;
+        .await?;
 
-    // === 5. kerberossync defaults + legacy string → Integer normalization ===
-    // Insert default Integer 0 only for users missing the attribute
-    let insert_kerb_default = format!(
-        "INSERT INTO {} ({}, {}, {})
-         SELECT u.{}, 'kerberossync', ?
-         FROM {} u
-         WHERE NOT EXISTS (
-             SELECT 1 FROM {} ua WHERE ua.{} = u.{} AND ua.{} = 'kerberossync'
-         )",
-        UserAttributes::Table.to_string(),
-        UserAttributes::UserAttributeUserId.to_string(),
-        UserAttributes::UserAttributeName.to_string(),
-        UserAttributes::UserAttributeValue.to_string(),
-        Users::UserId.to_string(),
-        Users::Table.to_string(),
-        UserAttributes::Table.to_string(),
-        UserAttributes::UserAttributeUserId.to_string(),
-        Users::UserId.to_string(),
-        UserAttributes::UserAttributeName.to_string()
-    );
+    // kerberossync: Integer 0 default for users missing it, stored as "0" bytes.
+    transaction
+        .execute(backend.build(&attribute_default_insert(
+            &user_attribute_tables(),
+            "kerberossync",
+            b"0".to_vec(),
+        )?))
+        .await?;
 
-    // Insert as BLOB (the column type). We store "0" as bytes for compatibility.
-    // The extraction logic tolerates both string and integer forms.
-    let kerb_zero: sea_orm::Value = sea_orm::Value::from(b"0".to_vec());
-    let _ = transaction
-        .execute(sea_orm::Statement::from_sql_and_values(
-            backend,
-            insert_kerb_default,
-            vec![kerb_zero.clone()],
-        ))
-        .await;
+    // Preserve true/false as 1/0. Compare as bytes — lower() on a blob is invalid on Postgres.
+    for (target, variants) in [
+        (b"1".to_vec(), ["true", "True", "TRUE"]),
+        (b"0".to_vec(), ["false", "False", "FALSE"]),
+    ] {
+        let byte_variants: Vec<Value> = variants
+            .iter()
+            .map(|v| Value::from(v.as_bytes().to_vec()))
+            .collect();
+        transaction
+            .execute(
+                backend.build(
+                    Query::update()
+                        .table(UserAttributes::Table)
+                        .value(UserAttributes::UserAttributeValue, target)
+                        .cond_where(Expr::col(UserAttributes::UserAttributeName).eq("kerberossync"))
+                        .cond_where(
+                            Expr::col(UserAttributes::UserAttributeValue).is_in(byte_variants),
+                        ),
+                ),
+            )
+            .await?;
+    }
 
-    // Normalize legacy string representations to the canonical "0" bytes form.
-    // This keeps everything consistent as BLOB without type conflicts.
-    let normalize_kerb = format!(
-        "UPDATE {} SET {} = ?
-         WHERE {} = 'kerberossync'
-           AND ({} = '0' OR {} = '1' OR lower({}) = 'true')",
-        UserAttributes::Table.to_string(),
-        UserAttributes::UserAttributeValue.to_string(),
-        UserAttributes::UserAttributeName.to_string(),
-        UserAttributes::UserAttributeValue.to_string(),
-        UserAttributes::UserAttributeValue.to_string(),
-        UserAttributes::UserAttributeValue.to_string()
-    );
-    let _ = transaction
-        .execute(sea_orm::Statement::from_sql_and_values(
-            backend,
-            normalize_kerb,
-            vec![kerb_zero],
-        ))
-        .await;
+    info!("v12: kerberossync defaults + normalization complete");
 
-    info!("v12: kerberossync defaults + string→Integer normalization complete");
-
-    // === 6. krb_principal_name default + ou defaults (idempotent) ===
-    let _ = transaction
-        .execute(sea_orm::Statement::from_string(
-            backend,
-            format!(
-                "UPDATE {} SET krb_principal_name = '' WHERE krb_principal_name IS NULL",
-                Users::Table.to_string()
+    transaction
+        .execute(
+            backend.build(
+                Query::update()
+                    .table(Users::Table)
+                    .value(Alias::new("krb_principal_name"), "")
+                    .cond_where(Expr::col(Alias::new("krb_principal_name")).is_null()),
             ),
-        ))
-        .await;
+        )
+        .await?;
 
-    // ou defaults for users (people) and groups (groups) — only if missing
-    let ou_users_sql = format!(
-        "INSERT INTO {} ({}, {}, {})
-         SELECT u.{}, 'ou', 'people'
-         FROM {} u
-         WHERE NOT EXISTS (
-             SELECT 1 FROM {} ua WHERE ua.{} = u.{} AND ua.{} = 'ou'
-         )",
-        UserAttributes::Table.to_string(),
-        UserAttributes::UserAttributeUserId.to_string(),
-        UserAttributes::UserAttributeName.to_string(),
-        UserAttributes::UserAttributeValue.to_string(),
-        Users::UserId.to_string(),
-        Users::Table.to_string(),
-        UserAttributes::Table.to_string(),
-        UserAttributes::UserAttributeUserId.to_string(),
-        Users::UserId.to_string(),
-        UserAttributes::UserAttributeName.to_string()
-    );
-    let _ = transaction
-        .execute(sea_orm::Statement::from_string(backend, ou_users_sql))
-        .await;
+    // ou defaults, bound as bytes (the value column is a blob; text literals abort on
+    // Postgres).
+    transaction
+        .execute(backend.build(&attribute_default_insert(
+            &user_attribute_tables(),
+            "ou",
+            b"people".to_vec(),
+        )?))
+        .await?;
+    transaction
+        .execute(backend.build(&attribute_default_insert(
+            &group_attribute_tables(),
+            "ou",
+            b"groups".to_vec(),
+        )?))
+        .await?;
 
-    let ou_groups_sql = format!(
-        "INSERT INTO {} ({}, {}, {})
-         SELECT g.{}, 'ou', 'groups'
-         FROM {} g
-         WHERE NOT EXISTS (
-             SELECT 1 FROM {} ga WHERE ga.{} = g.{} AND ga.{} = 'ou'
-         )",
-        GroupAttributes::Table.to_string(),
-        GroupAttributes::GroupAttributeGroupId.to_string(),
-        GroupAttributes::GroupAttributeName.to_string(),
-        GroupAttributes::GroupAttributeValue.to_string(),
-        Groups::GroupId.to_string(),
-        Groups::Table.to_string(),
-        GroupAttributes::Table.to_string(),
-        GroupAttributes::GroupAttributeGroupId.to_string(),
-        Groups::GroupId.to_string(),
-        GroupAttributes::GroupAttributeName.to_string()
-    );
-    let _ = transaction
-        .execute(sea_orm::Statement::from_string(backend, ou_groups_sql))
-        .await;
-
-    // === 7. Legacy attribute name normalization + deduplication (alias → canonical) ===
-    // This is the authoritative cleanup. It migrates any data stored under alias names
-    // to the canonical name, then deletes the old alias rows so they cannot exist.
-    // Combined with the robust canonical_*_attribute_name helpers (with static fallback)
-    // and resolve logic on all write paths, alias rows should never be re-introduced.
     for attr in &schema.user_attributes.attributes {
-        if attr.aliases.is_empty() {
-            continue;
-        }
         let canonical = attr.name.as_str();
-
         for alias in &attr.aliases {
-            // Migrate data (parameterized for robustness)
-            let migrate_sql = format!(
-                "UPDATE {} SET {} = ? WHERE {} = ?",
-                UserAttributes::Table.to_string(),
-                UserAttributes::UserAttributeName.to_string(),
-                UserAttributes::UserAttributeName.to_string()
-            );
-            let _ = transaction
-                .execute(sea_orm::Statement::from_sql_and_values(
-                    backend,
-                    migrate_sql,
-                    vec![canonical.into(), alias.into()],
-                ))
-                .await;
-
-            // Hard delete of any remaining alias rows (parameterized)
-            let delete_sql = format!(
-                "DELETE FROM {} WHERE {} = ?",
-                UserAttributes::Table.to_string(),
-                UserAttributes::UserAttributeName.to_string()
-            );
-            let _ = transaction
-                .execute(sea_orm::Statement::from_sql_and_values(
-                    backend,
-                    delete_sql,
-                    vec![alias.into()],
-                ))
-                .await;
+            transaction
+                .execute(backend.build(&alias_duplicate_delete(
+                    &user_attribute_tables(),
+                    canonical,
+                    alias,
+                )))
+                .await?;
+            transaction
+                .execute(backend.build(&alias_rename_update(
+                    &user_attribute_tables(),
+                    canonical,
+                    alias,
+                )))
+                .await?;
         }
     }
 
     for attr in &schema.group_attributes.attributes {
-        if attr.aliases.is_empty() {
-            continue;
-        }
         let canonical = attr.name.as_str();
-
         for alias in &attr.aliases {
-            let migrate_sql = format!(
-                "UPDATE {} SET {} = ? WHERE {} = ?",
-                GroupAttributes::Table.to_string(),
-                GroupAttributes::GroupAttributeName.to_string(),
-                GroupAttributes::GroupAttributeName.to_string()
-            );
-            let _ = transaction
-                .execute(sea_orm::Statement::from_sql_and_values(
-                    backend,
-                    migrate_sql,
-                    vec![canonical.into(), alias.into()],
-                ))
-                .await;
-
-            let delete_sql = format!(
-                "DELETE FROM {} WHERE {} = ?",
-                GroupAttributes::Table.to_string(),
-                GroupAttributes::GroupAttributeName.to_string()
-            );
-            let _ = transaction
-                .execute(sea_orm::Statement::from_sql_and_values(
-                    backend,
-                    delete_sql,
-                    vec![alias.into()],
-                ))
-                .await;
+            transaction
+                .execute(backend.build(&alias_duplicate_delete(
+                    &group_attribute_tables(),
+                    canonical,
+                    alias,
+                )))
+                .await?;
+            transaction
+                .execute(backend.build(&alias_rename_update(
+                    &group_attribute_tables(),
+                    canonical,
+                    alias,
+                )))
+                .await?;
         }
     }
 
-    info!(
-        "v12 migration completed successfully – safe for stock LLDAP upgrades and custom attributes"
-    );
+    // v5 hardcoded schema rows under alias spellings (first_name, last_name). Custom
+    // attributes may legally reuse an alias name (email, cn); only drop hardcoded ghosts
+    // or CASCADE would wipe those rows and their EAV values.
+    let user_alias_names: Vec<String> = schema
+        .user_attributes
+        .attributes
+        .iter()
+        .filter(|a| a.is_hardcoded)
+        .flat_map(|a| a.aliases.iter().cloned())
+        .collect();
+    if !user_alias_names.is_empty() {
+        transaction
+            .execute(
+                backend.build(
+                    Query::delete()
+                        .from_table(UserAttributeSchema::Table)
+                        .and_where(
+                            Expr::col(UserAttributeSchema::UserAttributeSchemaName)
+                                .is_in(user_alias_names),
+                        )
+                        .and_where(
+                            Expr::col(UserAttributeSchema::UserAttributeSchemaIsHardcoded).eq(true),
+                        ),
+                ),
+            )
+            .await?;
+    }
+    let group_alias_names: Vec<String> = schema
+        .group_attributes
+        .attributes
+        .iter()
+        .filter(|a| a.is_hardcoded)
+        .flat_map(|a| a.aliases.iter().cloned())
+        .collect();
+    if !group_alias_names.is_empty() {
+        transaction
+            .execute(
+                backend.build(
+                    Query::delete()
+                        .from_table(GroupAttributeSchema::Table)
+                        .and_where(
+                            Expr::col(GroupAttributeSchema::GroupAttributeSchemaName)
+                                .is_in(group_alias_names),
+                        )
+                        .and_where(
+                            Expr::col(GroupAttributeSchema::GroupAttributeSchemaIsHardcoded)
+                                .eq(true),
+                        ),
+                ),
+            )
+            .await?;
+    }
+
+    info!("v12 migration completed");
 
     Ok(transaction)
 }
@@ -1666,12 +1765,6 @@ mod tests {
     };
     use pretty_assertions::assert_eq;
     use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, FromQueryResult};
-
-    async fn create_test_db() -> DatabaseConnection {
-        let db = Database::connect("sqlite::memory:").await.unwrap();
-        // We don't run full migrations here; this is a smoke test for v12 logic
-        db
-    }
 
     fn raw_statement(sql: &str) -> sea_orm::Statement {
         sea_orm::Statement::from_string(DbBackend::Sqlite, sql.to_owned())
@@ -2525,12 +2618,260 @@ mod tests {
         Ok(pool)
     }
 
+    #[derive(FromQueryResult)]
+    struct CountRow {
+        c: i64,
+    }
+    #[derive(FromQueryResult)]
+    struct BytesRow {
+        v: Vec<u8>,
+    }
+    #[derive(FromQueryResult)]
+    struct TextRow {
+        t: String,
+    }
+
+    async fn count(pool: &DbConnection, sql: &str) -> i64 {
+        CountRow::find_by_statement(raw_statement(sql))
+            .one(pool)
+            .await
+            .unwrap()
+            .unwrap()
+            .c
+    }
+
+    async fn bytes(pool: &DbConnection, sql: &str) -> Vec<u8> {
+        BytesRow::find_by_statement(raw_statement(sql))
+            .one(pool)
+            .await
+            .unwrap()
+            .unwrap()
+            .v
+    }
+
+    async fn text(pool: &DbConnection, sql: &str) -> String {
+        TextRow::find_by_statement(raw_statement(sql))
+            .one(pool)
+            .await
+            .unwrap()
+            .unwrap()
+            .t
+    }
+
+    async fn insert_user_attr(pool: &DbConnection, user: &str, name: &str, value: &[u8]) {
+        pool.execute(
+            pool.get_database_backend().build(
+                Query::insert()
+                    .into_table(UserAttributes::Table)
+                    .columns([
+                        UserAttributes::UserAttributeUserId,
+                        UserAttributes::UserAttributeName,
+                        UserAttributes::UserAttributeValue,
+                    ])
+                    .values_panic([user.into(), name.into(), Serialized(value.to_vec()).into()]),
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
     #[tokio::test]
-    async fn test_v12_migration_is_idempotent_and_adds_columns() {
-        let _db = create_test_db().await;
-        // In a real test we would apply v1..v11 then v12.
-        // For now we just verify the function compiles and the PublicSchema load works.
-        let _public = PublicSchema::get();
+    async fn test_v12_via_version_gate_is_idempotent_and_repairs() {
+        let pool = get_in_memory_db().await;
+        upgrade_to_v1(&pool).await.unwrap();
+        migrate_from_version(&pool, SchemaVersion(1), SchemaVersion(11))
+            .await
+            .unwrap();
+
+        // v11 state: v5 already seeded the first_name/last_name/avatar schema ghosts.
+        pool.execute(raw_statement(
+            r#"INSERT INTO users (user_id, email, lowercase_email, creation_date, uuid, modified_date, password_modified_date)
+               VALUES ("bob", "bob@ex.com", "bob@ex.com", "1970-01-01 00:00:00", "a02eaf13-48a7-30f6-a3d4-040ff7c52b04", "1970-01-01 00:00:00", "1970-01-01 00:00:00")"#,
+        ))
+        .await
+        .unwrap();
+        pool.execute(raw_statement(
+            r#"INSERT INTO groups (group_id, display_name, lowercase_display_name, creation_date, uuid, modified_date)
+               VALUES (7, "devs", "devs", "1970-01-01 00:00:00", "33333333-3333-3333-3333-333333333333", "1970-01-01 00:00:00")"#,
+        ))
+        .await
+        .unwrap();
+        // A real v11 schema only knows the alias spellings, so the canonical twin and the
+        // kerberossync row are inserted with FK checks off — they model rows a partially
+        // upgraded DB could hold, exercising the duplicate guard and the normalization.
+        pool.execute(raw_statement("PRAGMA foreign_keys = OFF"))
+            .await
+            .unwrap();
+        insert_user_attr(&pool, "bob", "firstname", b"Bob").await;
+        insert_user_attr(&pool, "bob", "first_name", b"ALIAS").await;
+        insert_user_attr(&pool, "bob", "kerberossync", b"true").await;
+        pool.execute(raw_statement("PRAGMA foreign_keys = ON"))
+            .await
+            .unwrap();
+        // Pre-existing config row must survive the seed untouched.
+        pool.execute(raw_statement(
+            r#"CREATE TABLE system_config ("key" varchar NOT NULL PRIMARY KEY, "value" text NOT NULL)"#,
+        ))
+        .await
+        .unwrap();
+        pool.execute(raw_statement(
+            r#"INSERT INTO system_config ("key", "value") VALUES ('allowedous', '["custom"]')"#,
+        ))
+        .await
+        .unwrap();
+        // Custom attr whose name collides with a hardcoded alias must survive ghost cleanup.
+        pool.execute(raw_statement(
+            r#"INSERT INTO user_attribute_schema
+               (user_attribute_schema_name, user_attribute_schema_type,
+                user_attribute_schema_is_list, user_attribute_schema_is_user_visible,
+                user_attribute_schema_is_user_editable, user_attribute_schema_is_hardcoded)
+               VALUES ("email", "String", false, true, true, false)"#,
+        ))
+        .await
+        .unwrap();
+
+        migrate_from_version(&pool, SchemaVersion(11), SchemaVersion(12))
+            .await
+            .unwrap();
+
+        let assert_v12_state = |pool: DbConnection| async move {
+            let ver = JustSchemaVersion::find_by_statement(raw_statement(
+                r#"SELECT version FROM metadata"#,
+            ))
+            .one(&pool)
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(ver.version, SchemaVersion(12));
+
+            // New columns are queryable.
+            count(
+                &pool,
+                r#"SELECT COUNT(aliases) as c FROM user_attribute_schema"#,
+            )
+            .await;
+            count(
+                &pool,
+                r#"SELECT COUNT(user_attribute_schema_is_readonly) as c FROM user_attribute_schema"#,
+            )
+            .await;
+            count(&pool, r#"SELECT COUNT(krb_principal_name) as c FROM users"#).await;
+
+            // The v5-era avatar row was upserted in place: type repaired, aliases applied.
+            assert_eq!(
+                text(
+                    &pool,
+                    r#"SELECT user_attribute_schema_type as t FROM user_attribute_schema
+                       WHERE user_attribute_schema_name = "avatar""#
+                )
+                .await,
+                "Avatar"
+            );
+            let avatar_aliases = text(
+                &pool,
+                r#"SELECT aliases as t FROM user_attribute_schema
+                   WHERE user_attribute_schema_name = "avatar""#,
+            )
+            .await;
+            assert_ne!(avatar_aliases, "[]");
+
+            // v5's ghost schema rows are gone.
+            assert_eq!(
+                count(
+                    &pool,
+                    r#"SELECT COUNT(*) as c FROM user_attribute_schema
+                       WHERE user_attribute_schema_name IN ("first_name", "last_name")"#
+                )
+                .await,
+                0
+            );
+
+            // Alias data folded: exactly one canonical row, the canonical value won.
+            assert_eq!(
+                count(
+                    &pool,
+                    r#"SELECT COUNT(*) as c FROM user_attributes
+                       WHERE user_attribute_user_id = "bob" AND user_attribute_name = "firstname""#
+                )
+                .await,
+                1
+            );
+            assert_eq!(
+                bytes(
+                    &pool,
+                    r#"SELECT user_attribute_value as v FROM user_attributes
+                       WHERE user_attribute_user_id = "bob" AND user_attribute_name = "firstname""#
+                )
+                .await,
+                b"Bob"
+            );
+            assert_eq!(
+                count(
+                    &pool,
+                    r#"SELECT COUNT(*) as c FROM user_attributes
+                       WHERE user_attribute_name = "first_name""#
+                )
+                .await,
+                0
+            );
+
+            // Defaults are byte-bound blobs; kerberossync "true" canonicalized to "1".
+            assert_eq!(
+                bytes(
+                    &pool,
+                    r#"SELECT user_attribute_value as v FROM user_attributes
+                       WHERE user_attribute_user_id = "bob" AND user_attribute_name = "ou""#
+                )
+                .await,
+                b"people"
+            );
+            assert_eq!(
+                bytes(
+                    &pool,
+                    r#"SELECT group_attribute_value as v FROM group_attributes
+                       WHERE group_attribute_group_id = 7 AND group_attribute_name = "ou""#
+                )
+                .await,
+                b"groups"
+            );
+            assert_eq!(
+                bytes(
+                    &pool,
+                    r#"SELECT user_attribute_value as v FROM user_attributes
+                       WHERE user_attribute_user_id = "bob" AND user_attribute_name = "kerberossync""#
+                )
+                .await,
+                b"1"
+            );
+
+            // The pre-existing config row survived the seed.
+            assert_eq!(
+                text(
+                    &pool,
+                    r#"SELECT "value" as t FROM system_config WHERE "key" = "allowedous""#
+                )
+                .await,
+                r#"["custom"]"#
+            );
+            assert_eq!(
+                count(
+                    &pool,
+                    r#"SELECT COUNT(*) as c FROM user_attribute_schema
+                       WHERE user_attribute_schema_name = "email"
+                         AND user_attribute_schema_is_hardcoded = 0"#
+                )
+                .await,
+                1
+            );
+            pool
+        };
+
+        let pool = assert_v12_state(pool).await;
+
+        // Idempotency runs through the version gate: a second init is a no-op at 12
+        // (the v12 body itself must not re-run — plain add_column would fail).
+        init_table(&pool).await.unwrap();
+        assert_v12_state(pool).await;
     }
 
     #[test]

@@ -17,7 +17,7 @@ use lldap_domain_handlers::handler::{
 };
 use lldap_domain_model::{
     error::{DomainError, Result},
-    model::{self, GroupColumn, MembershipColumn, deserialize},
+    model::{self, GroupColumn, MembershipColumn, codec},
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder,
@@ -261,11 +261,7 @@ impl GroupListerBackendHandler for SqlBackendHandler {
             let mut attrs: Vec<_> = attributes_iter
                 .take_while_ref(|u| u.group_id == group.id)
                 .map(|a| {
-                    deserialize::deserialize_attribute(
-                        a.attribute_name,
-                        &a.value,
-                        schema.group_attributes(),
-                    )
+                    codec::decode_attribute(a.attribute_name, &a.value, schema.group_attributes())
                 })
                 .collect::<Result<Vec<_>>>()?;
 
@@ -299,11 +295,8 @@ impl GroupBackendHandler for SqlBackendHandler {
         group_details.attributes = attributes
             .into_iter()
             .map(|a| {
-                let mut attr = deserialize::deserialize_attribute(
-                    a.attribute_name,
-                    &a.value,
-                    schema.group_attributes(),
-                )?;
+                let mut attr =
+                    codec::decode_attribute(a.attribute_name, &a.value, schema.group_attributes())?;
 
                 // Defensive canonical remap (consistent with user side)
                 attr.name =

@@ -98,41 +98,6 @@ impl std::fmt::Debug for Serialized {
     }
 }
 
-impl<'a, T: Serialize + ?Sized> From<&'a T> for Serialized {
-    fn from(t: &'a T) -> Self {
-        Self(bincode::serialize(&t).expect("bincode serialize should never fail for our types"))
-    }
-}
-
-impl Serialized {
-    pub fn unwrap<'a, T: Deserialize<'a> + Default>(&'a self) -> T {
-        self.convert_to().unwrap_or_default()
-    }
-
-    pub fn expect<'a, T: Deserialize<'a>>(&'a self, message: &str) -> T {
-        self.convert_to().expect(message)
-    }
-
-    fn convert_to<'a, T: Deserialize<'a>>(&'a self) -> bincode::Result<T> {
-        bincode::deserialize(&self.0)
-    }
-}
-
-impl From<AttributeValue> for Serialized {
-    fn from(val: AttributeValue) -> Serialized {
-        match &val {
-            AttributeValue::String(Cardinality::Singleton(s)) => Serialized::from(s),
-            AttributeValue::String(Cardinality::Unbounded(l)) => Serialized::from(l),
-            AttributeValue::Integer(Cardinality::Singleton(i)) => Serialized::from(i),
-            AttributeValue::Integer(Cardinality::Unbounded(l)) => Serialized::from(l),
-            AttributeValue::Avatar(Cardinality::Singleton(p)) => Serialized::from(p),
-            AttributeValue::Avatar(Cardinality::Unbounded(l)) => Serialized::from(l),
-            AttributeValue::DateTime(Cardinality::Singleton(dt)) => Serialized::from(dt),
-            AttributeValue::DateTime(Cardinality::Unbounded(l)) => Serialized::from(l),
-        }
-    }
-}
-
 // ==================== CASE-INSENSITIVE STRINGS ====================
 fn compare_str_case_insensitive(s1: &str, s2: &str) -> Ordering {
     let mut it_1 = s1.chars().flat_map(|c| c.to_lowercase());

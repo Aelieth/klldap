@@ -10,7 +10,10 @@ pub fn deserialize_attribute_value(
     is_list: bool,
 ) -> Result<AttributeValue> {
     if !is_list && value.len() != 1 {
-        bail!("Attribute is not a list, but multiple values were provided");
+        bail!(
+            "Attribute is not a list: expected exactly one value, got {}",
+            value.len()
+        );
     }
     let parse_int = |value: &String| -> Result<i64> {
         value
@@ -23,6 +26,7 @@ pub fn deserialize_attribute_value(
             .naive_utc())
     };
     let parse_avatar = |value: &String| -> Result<Avatar> {
+        let value = value.trim();
         if value.is_empty() {
             return Ok(Avatar::null());
         }

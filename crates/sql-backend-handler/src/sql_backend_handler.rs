@@ -1,6 +1,6 @@
 use crate::sql_tables::DbConnection;
 use lldap_auth::opaque::server::ServerSetup;
-use lldap_domain::types::{AttributeName, AttributeValue, Cardinality};
+use lldap_domain::types::{AttributeName, AttributeValue};
 use lldap_schema::PublicSchema;
 use sea_orm::sea_query::{Cond, IntoCondition, SimpleExpr};
 
@@ -29,18 +29,7 @@ pub(crate) fn is_backend_writable_readonly_attribute(name: &str) -> bool {
 }
 
 pub(crate) fn attribute_value_to_db_bytes(value: &AttributeValue) -> Vec<u8> {
-    match value {
-        AttributeValue::String(Cardinality::Singleton(s)) => s.as_bytes().to_vec(),
-        AttributeValue::String(Cardinality::Unbounded(list)) => {
-            serde_json::to_vec(list).unwrap_or_else(|_| b"[]".to_vec())
-        }
-        AttributeValue::Integer(Cardinality::Singleton(i)) => i.to_string().as_bytes().to_vec(),
-        AttributeValue::Avatar(Cardinality::Singleton(p)) => p.0.clone(),
-        AttributeValue::DateTime(Cardinality::Singleton(dt)) => {
-            dt.and_utc().timestamp().to_string().as_bytes().to_vec()
-        }
-        _ => vec![],
-    }
+    lldap_domain_model::model::codec::encode_attribute_value(value)
 }
 
 #[derive(Clone)]

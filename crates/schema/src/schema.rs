@@ -1,5 +1,4 @@
 use derive_more::Display;
-use juniper::GraphQLEnum;
 use serde::{Deserialize, Serialize};
 use strum::{EnumIter, EnumString, IntoStaticStr};
 
@@ -16,7 +15,6 @@ use strum::{EnumIter, EnumString, IntoStaticStr};
     EnumIter,
     EnumString,
     IntoStaticStr,
-    GraphQLEnum,
     Display,
 )]
 #[sea_orm(rs_type = "String", db_type = "Text")]

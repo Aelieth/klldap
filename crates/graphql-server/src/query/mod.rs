@@ -4,7 +4,9 @@ pub mod group;
 pub mod schema;
 pub mod user;
 
-pub use attribute::{AttributeSchema, AttributeValue, serialize_attribute_to_graphql};
+pub use attribute::{
+    AttributeSchema, AttributeValue, GraphQLAttributeType, serialize_attribute_to_graphql,
+};
 pub use filters::{EqualityConstraint, RequestFilter};
 pub use group::Group;
 pub use schema::{AttributeList, ObjectClassInfo, Schema};
@@ -123,12 +125,22 @@ impl<Handler: FullHandler + OpaqueHandler> Query<Handler> {
     async fn users(
         &self,
         context: &Context<Handler>,
-        #[graphql(name = "where")] filters: Option<RequestFilter>,
+        #[graphql(name = "where")] where_filters: Option<RequestFilter>,
+        filters: Option<RequestFilter>,
     ) -> FieldResult<Vec<User<Handler>>> {
         let span = debug_span!("[GraphQL query] users");
         span.in_scope(|| {
-            debug!(?filters);
+            debug!(?where_filters, ?filters);
         });
+        let filters = match (where_filters, filters) {
+            (Some(_), Some(_)) => {
+                return Err(field_error_callback(
+                    &span,
+                    "users accepts only one of `where` and `filters`",
+                )());
+            }
+            (w, f) => w.or(f),
+        };
         let handler = context
             .get_readonly_handler()
             .ok_or_else(field_error_callback(

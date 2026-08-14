@@ -151,12 +151,16 @@ fn try_login(
         );
     }
     let login_start_response = response.json::<lldap_auth::login::ServerLoginStartResponse>()?;
-    let _login_finish = finish_login(
+    let login_finish = finish_login(
         state,
         password.as_bytes(),
         login_start_response.credential_response,
         &mut rng,
     )?;
+    let req = ClientLoginFinishRequest {
+        server_data: login_start_response.server_data,
+        credential_finalization: login_finish.message,
+    };
     let response = client
         .post(format!("{}/auth/opaque/login/finish", lldap_server))
         .json(&req)

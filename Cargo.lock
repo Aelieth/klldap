@@ -3226,7 +3226,6 @@ name = "lldap_schema"
 version = "0.2.2"
 dependencies = [
  "derive_more",
- "juniper",
  "sea-orm",
  "serde",
  "strum",

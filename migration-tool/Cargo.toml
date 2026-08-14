@@ -18,7 +18,7 @@ rand = { workspace = true }
 reqwest = { workspace = true, features = ["json", "blocking", "rustls-tls"] }
 requestty = "0.6.3"
 serde_json = { workspace = true }
-smallvec = "*"
+smallvec = "1"
 
 [dependencies.lldap_auth]
 path = "../crates/auth"

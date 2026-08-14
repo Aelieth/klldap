@@ -8,6 +8,7 @@ enum AttributeType {
   INTEGER
   AVATAR
   DATE_TIME
+  JPEG_PHOTO @deprecated(reason: "Legacy alias for AVATAR")
 }
 
 input AttributeValueInput {
@@ -184,6 +185,7 @@ type AttributeSchema {
 }
 
 type AttributeValue {
+  name: String!
   value: [String!]!
   schema: AttributeSchema!
 }
@@ -229,7 +231,7 @@ type KeycloakSuggestedConfig {
 type Mutation {
   createUser(user: CreateUserInput!): User!
   setUserPassword(userId: String!, password: String!): Success!
-  createGroup(group: CreateGroupInput!): Group!
+  createGroup(name: String, group: CreateGroupInput): Group!
   createGroupWithDetails(request: CreateGroupInput!): Group!
   updateUser(user: UpdateUserInput!): Success!
   updateGroup(group: UpdateGroupInput!): Success!
@@ -295,7 +297,7 @@ type PushRealmResponse {
 type Query {
   apiVersion: String!
   user(userId: String!): User!
-  users(where: RequestFilter): [User!]!
+  users(where: RequestFilter, filters: RequestFilter): [User!]!
   groups: [Group!]!
   group(groupId: Int!): Group!
   schema: Schema!

@@ -7,6 +7,7 @@ pub use inputs::{
 };
 
 use crate::api::{Context, FullHandler, field_error_callback};
+use crate::query::GraphQLAttributeType;
 use anyhow::anyhow;
 use helpers::{
     UnpackedAttributes, consolidate_attributes, create_group_with_details, deserialize_attribute,
@@ -20,7 +21,6 @@ use lldap_access_control::{
 use lldap_domain::{
     is_builtin_group,
     requests::{CreateAttributeRequest, CreateUserRequest, UpdateGroupRequest, UpdateUserRequest},
-    schema::AttributeType,
     types::{AttributeName, Email, GroupId, LdapObjectClass, UserId},
 };
 use lldap_domain_handlers::handler::{BackendHandler, ReadSchemaBackendHandler, UserRequestFilter};
@@ -285,12 +285,26 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
 
     async fn create_group(
         context: &Context<Handler>,
-        group: CreateGroupInput,
+        name: Option<String>,
+        group: Option<CreateGroupInput>,
     ) -> FieldResult<super::query::Group<Handler>> {
         let span = debug_span!("[GraphQL mutation] create_group");
         span.in_scope(|| {
-            debug!(?group);
+            debug!(?name, ?group);
         });
+        let group = match (name, group) {
+            (Some(display_name), None) => CreateGroupInput {
+                display_name,
+                attributes: None,
+            },
+            (None, Some(group)) => group,
+            _ => {
+                return Err(field_error_callback(
+                    &span,
+                    "createGroup requires exactly one of `name` and `group`",
+                )());
+            }
+        };
         create_group_with_details(context, group, span).await
     }
 
@@ -893,7 +907,7 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
     async fn add_user_attribute(
         context: &Context<Handler>,
         name: String,
-        attribute_type: AttributeType,
+        attribute_type: GraphQLAttributeType,
         is_list: bool,
         is_visible: bool,
         is_editable: bool,
@@ -914,7 +928,7 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         handler
             .add_user_attribute(CreateAttributeRequest {
                 name: name.into(),
-                attribute_type,
+                attribute_type: attribute_type.into(),
                 is_list,
                 is_visible,
                 is_editable,
@@ -927,7 +941,7 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
     async fn add_group_attribute(
         context: &Context<Handler>,
         name: String,
-        attribute_type: AttributeType,
+        attribute_type: GraphQLAttributeType,
         is_list: bool,
         is_visible: bool,
         is_editable: bool,
@@ -948,7 +962,7 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         handler
             .add_group_attribute(CreateAttributeRequest {
                 name: name.into(),
-                attribute_type,
+                attribute_type: attribute_type.into(),
                 is_list,
                 is_visible,
                 is_editable,
@@ -1889,5 +1903,254 @@ mod tests {
                 },
             ]
         );
+    }
+
+    // === lldap-cli compatibility replays (exact upstream client shapes) ===
+
+    use lldap_domain::requests::CreateGroupRequest;
+    use lldap_domain::types::{
+        Attribute as DomainAttr, AttributeValue as DomainAttributeValue, Cardinality, GroupDetails,
+        User, UserAndGroups, Uuid,
+    };
+
+    fn epoch() -> chrono::NaiveDateTime {
+        chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc()
+    }
+
+    fn sample_user(id: &str, attributes: Vec<DomainAttr>) -> User {
+        User {
+            user_id: UserId::new(id),
+            email: Email::from(format!("{id}@example.com")),
+            display_name: None,
+            creation_date: epoch(),
+            uuid: Uuid::from_name_and_date(id, &epoch()),
+            attributes,
+            modified_date: epoch(),
+            password_modified_date: epoch(),
+            krb_principal_name: None,
+        }
+    }
+
+    fn schema_with_user_attr(attr: lldap_schema::AttributeSchema) -> PublicSchema {
+        PublicSchema(lldap_schema::Schema {
+            user_attributes: lldap_schema::AttributeList {
+                attributes: vec![attr],
+            },
+            group_attributes: lldap_schema::AttributeList { attributes: vec![] },
+            system_attributes: lldap_schema::AttributeList { attributes: vec![] },
+            posix_settings: lldap_schema::schema::PosixSettings::default(),
+            extra_user_object_classes: vec![],
+            extra_group_object_classes: vec![],
+        })
+    }
+
+    fn admin_context(mock: MockTestBackendHandler) -> Context<MockTestBackendHandler> {
+        Context::<MockTestBackendHandler>::new_for_tests(
+            mock,
+            ValidationResults {
+                user: UserId::new("admin"),
+                permission: Permission::Admin,
+            },
+        )
+    }
+
+    fn root_schema() -> RootNode<
+        Query<MockTestBackendHandler>,
+        Mutation<MockTestBackendHandler>,
+        EmptySubscription<Context<MockTestBackendHandler>>,
+    > {
+        mutation_schema(
+            Query::<MockTestBackendHandler>::new(),
+            Mutation::<MockTestBackendHandler>::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn lldap_cli_create_group_by_name() {
+        const QUERY: &str = r#"
+            mutation CreateGroup($group: String!) {
+                createGroup(name: $group) { id }
+            }
+        "#;
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_get_schema()
+            .returning(|| Ok(make_test_schema()));
+        mock.expect_create_group()
+            .with(eq(CreateGroupRequest {
+                display_name: "cli-group".into(),
+                attributes: vec![DomainAttr {
+                    name: AttributeName::from("ou"),
+                    value: DomainAttributeValue::String(Cardinality::Singleton(
+                        "groups".to_string(),
+                    )),
+                }],
+            }))
+            .return_once(|_| Ok(GroupId(42)));
+        mock.expect_get_group_details()
+            .with(eq(GroupId(42)))
+            .return_once(|_| {
+                Ok(GroupDetails {
+                    group_id: GroupId(42),
+                    display_name: "cli-group".into(),
+                    creation_date: epoch(),
+                    uuid: Uuid::from_name_and_date("cli-group", &epoch()),
+                    attributes: vec![],
+                    modified_date: epoch(),
+                })
+            });
+        let context = admin_context(mock);
+        let vars = Variables::from([("group".to_string(), InputValue::scalar("cli-group"))]);
+        let (value, errors) = execute(QUERY, None, &root_schema(), &vars, &context)
+            .await
+            .unwrap();
+        assert_eq!(errors.len(), 0, "unexpected errors: {errors:?}");
+        assert_eq!(value, graphql_value!({"createGroup": {"id": 42}}));
+    }
+
+    #[tokio::test]
+    async fn create_group_requires_exactly_one_form() {
+        for query in [
+            r#"mutation { createGroup { id } }"#,
+            r#"mutation {
+                createGroup(name: "a", group: { displayName: "a" }) { id }
+            }"#,
+        ] {
+            let context = admin_context(MockTestBackendHandler::new());
+            let (_, errors) = execute(query, None, &root_schema(), &Variables::new(), &context)
+                .await
+                .unwrap();
+            assert_eq!(errors.len(), 1, "expected one-of error for {query}");
+            assert!(
+                errors[0]
+                    .error()
+                    .message()
+                    .contains("exactly one of `name` and `group`"),
+                "unexpected error for {query}: {errors:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn lldap_cli_attribute_value_name_field() {
+        const QUERY: &str = r#"
+            query GetUser($id: String!) {
+                user(userId: $id) { id attributes { name value } }
+            }
+        "#;
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_get_schema().returning(|| {
+            Ok(schema_with_user_attr(
+                lldap_schema::AttributeSchema::editable(
+                    "foo",
+                    lldap_domain::types::AttributeType::String,
+                ),
+            ))
+        });
+        mock.expect_get_user_details().return_once(|_| {
+            Ok(sample_user(
+                "bob",
+                vec![DomainAttr {
+                    name: AttributeName::from("foo"),
+                    value: DomainAttributeValue::String(Cardinality::Singleton("bar".to_string())),
+                }],
+            ))
+        });
+        let context = admin_context(mock);
+        let vars = Variables::from([("id".to_string(), InputValue::scalar("bob"))]);
+        let (value, errors) = execute(QUERY, None, &root_schema(), &vars, &context)
+            .await
+            .unwrap();
+        assert_eq!(errors.len(), 0, "unexpected errors: {errors:?}");
+        assert_eq!(
+            value,
+            graphql_value!({"user": {"id": "bob", "attributes": [{"name": "foo", "value": ["bar"]}]}})
+        );
+    }
+
+    #[tokio::test]
+    async fn users_accepts_filters_alias_and_bare_form() {
+        for query in [
+            r#"query Q($f: RequestFilter) { users(filters: $f) { id } }"#,
+            r#"query { users { id } }"#,
+        ] {
+            let mut mock = MockTestBackendHandler::new();
+            mock.expect_get_schema()
+                .returning(|| Ok(make_test_schema()));
+            mock.expect_list_users()
+                .with(eq(None), eq(true))
+                .return_once(|_, _| {
+                    Ok(vec![UserAndGroups {
+                        user: sample_user("bob", vec![]),
+                        groups: None,
+                    }])
+                });
+            let context = admin_context(mock);
+            let (value, errors) = execute(query, None, &root_schema(), &Variables::new(), &context)
+                .await
+                .unwrap();
+            assert_eq!(errors.len(), 0, "unexpected errors for {query}: {errors:?}");
+            assert_eq!(value, graphql_value!({"users": [{"id": "bob"}]}));
+        }
+    }
+
+    #[tokio::test]
+    async fn users_rejects_both_filter_arguments() {
+        let context = admin_context(MockTestBackendHandler::new());
+        let (_, errors) = execute(
+            r#"query { users(where: {}, filters: {}) { id } }"#,
+            None,
+            &root_schema(),
+            &Variables::new(),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert_eq!(errors.len(), 1);
+        assert!(
+            errors[0]
+                .error()
+                .message()
+                .contains("only one of `where` and `filters`"),
+            "unexpected error: {errors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lldap_cli_jpeg_photo_maps_to_avatar() {
+        const QUERY: &str = r#"
+            mutation CreateUserAttribute($name: String!, $attributeType: AttributeType!, $isList: Boolean!, $isVisible: Boolean!, $isEditable: Boolean!) {
+                addUserAttribute(name: $name, attributeType: $attributeType, isList: $isList, isVisible: $isVisible, isEditable: $isEditable) {
+                    ok
+                }
+            }
+        "#;
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_get_schema()
+            .returning(|| Ok(make_test_schema()));
+        mock.expect_add_user_attribute()
+            .with(eq(CreateAttributeRequest {
+                name: AttributeName::new("legacyphoto"),
+                attribute_type: AttributeType::Avatar,
+                is_list: false,
+                is_visible: true,
+                is_editable: false,
+            }))
+            .return_once(|_| Ok(()));
+        let context = admin_context(mock);
+        let vars = Variables::from([
+            ("name".to_string(), InputValue::scalar("legacyphoto")),
+            (
+                "attributeType".to_string(),
+                InputValue::enum_value("JPEG_PHOTO"),
+            ),
+            ("isList".to_string(), InputValue::scalar(false)),
+            ("isVisible".to_string(), InputValue::scalar(true)),
+            ("isEditable".to_string(), InputValue::scalar(false)),
+        ]);
+        let (value, errors) = execute(QUERY, None, &root_schema(), &vars, &context)
+            .await
+            .unwrap();
+        assert_eq!(errors.len(), 0, "unexpected errors: {errors:?}");
+        assert_eq!(value, graphql_value!({"addUserAttribute": {"ok": true}}));
     }
 }

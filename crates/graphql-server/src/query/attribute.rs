@@ -10,6 +10,43 @@ use lldap_opaque_handler::OpaqueHandler;
 use lldap_schema::{AttributeSchema as SchemaAttributeSchema, PublicSchema};
 use serde::{Deserialize, Serialize};
 
+// GraphQL-facing projection of lldap_schema::AttributeType. The shared enum doubles as a
+// sea-orm value, so the deprecated JPEG_PHOTO alias lives only here and never becomes a
+// legal DB value; output conversion never emits it.
+#[derive(PartialEq, Eq, Debug, Clone, Copy, juniper::GraphQLEnum)]
+#[graphql(name = "AttributeType")]
+pub enum GraphQLAttributeType {
+    String,
+    Integer,
+    Avatar,
+    DateTime,
+    #[graphql(deprecated = "Legacy alias for AVATAR")]
+    JpegPhoto,
+}
+
+impl From<GraphQLAttributeType> for lldap_domain::types::AttributeType {
+    fn from(t: GraphQLAttributeType) -> Self {
+        match t {
+            GraphQLAttributeType::String => Self::String,
+            GraphQLAttributeType::Integer => Self::Integer,
+            GraphQLAttributeType::Avatar | GraphQLAttributeType::JpegPhoto => Self::Avatar,
+            GraphQLAttributeType::DateTime => Self::DateTime,
+        }
+    }
+}
+
+impl From<lldap_domain::types::AttributeType> for GraphQLAttributeType {
+    fn from(t: lldap_domain::types::AttributeType) -> Self {
+        use lldap_domain::types::AttributeType;
+        match t {
+            AttributeType::String => Self::String,
+            AttributeType::Integer => Self::Integer,
+            AttributeType::Avatar => Self::Avatar,
+            AttributeType::DateTime => Self::DateTime,
+        }
+    }
+}
+
 #[derive(PartialEq, Eq, Debug, Serialize, Deserialize, Clone)]
 pub struct AttributeSchema<Handler: BackendHandler> {
     schema: SchemaAttributeSchema,
@@ -35,8 +72,8 @@ impl<Handler: BackendHandler + OpaqueHandler> AttributeSchema<Handler> {
         self.schema.aliases.clone()
     }
 
-    fn attribute_type(&self) -> lldap_domain::types::AttributeType {
-        self.schema.attribute_type
+    fn attribute_type(&self) -> GraphQLAttributeType {
+        self.schema.attribute_type.into()
     }
 
     fn is_list(&self) -> bool {
@@ -69,6 +106,10 @@ pub struct AttributeValue<Handler: BackendHandler> {
 
 #[graphql_object(context = Context<Handler>)]
 impl<Handler: BackendHandler + OpaqueHandler> AttributeValue<Handler> {
+    pub(crate) fn name(&self) -> &str {
+        self.attribute.name.as_str()
+    }
+
     fn value(&self) -> FieldResult<Vec<String>> {
         Ok(serialize_attribute_to_graphql(&self.attribute.value))
     }
@@ -79,10 +120,6 @@ impl<Handler: BackendHandler + OpaqueHandler> AttributeValue<Handler> {
 }
 
 impl<Handler: BackendHandler> AttributeValue<Handler> {
-    pub(crate) fn name(&self) -> &str {
-        self.attribute.name.as_str()
-    }
-
     fn from_value(attr: DomainAttribute, schema: SchemaAttributeSchema) -> Self {
         Self {
             attribute: attr,

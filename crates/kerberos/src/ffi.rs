@@ -35,6 +35,11 @@ mod bindings {
 
 pub use bindings::*; // Re-export for use inside FFI methods only
 
+// KDB principal-attribute flag DISALLOW_ALL_TIX (MIT krb5 `krb5/kdb.h`). Bindgen doesn't emit it
+// (allowlist_var covers KADM5_* only, and kdb.h isn't included), so it's defined here. Setting it is
+// exactly `kadmin modprinc -allow_tix`; clearing it is `+allow_tix`. Stable on-disk KDB value.
+const KRB5_KDB_DISALLOW_ALL_TIX: krb5_flags = 0x0040;
+
 pub(crate) struct Kadm5Handle {
     pub handle: *mut c_void,
     pub context: krb5_context,
@@ -296,6 +301,81 @@ impl Kadm5Handle {
         }
 
         unsafe { krb5_free_principal(self.context, princ) };
+        Ok(())
+    }
+
+    /// Enable or disable ticket issuance for a user principal by toggling the KDB DISALLOW_ALL_TIX
+    /// attribute — the FFI equivalent of `kadmin modprinc ∓allow_tix`. Read-modify-write so every
+    /// other principal attribute is preserved (`chpass` and friends are untouched). `allow == true`
+    /// clears the flag (`+allow_tix`); `false` sets it (`-allow_tix`). A principal that does not
+    /// exist is idempotent success (mirrors `delete_principal`).
+    pub fn set_principal_allow_tickets(
+        &self,
+        username: &str,
+        realm: &str,
+        allow: bool,
+    ) -> Result<()> {
+        let principal_name = format!("{}@{}", username, realm);
+        let principal_cstr = CString::new(principal_name.clone())?;
+
+        let mut princ: krb5_principal = ptr::null_mut();
+        let ret = unsafe { krb5_parse_name(self.context, principal_cstr.as_ptr(), &mut princ) };
+        if ret != 0 {
+            return Err(anyhow::anyhow!("krb5_parse_name failed with code {}", ret));
+        }
+
+        // Read the current principal so we preserve all other attribute flags.
+        let mut ent: kadm5_principal_ent_rec = unsafe { mem::zeroed() };
+        let ret = unsafe {
+            kadm5_get_principal(
+                self.handle,
+                princ,
+                &mut ent,
+                KADM5_PRINCIPAL_NORMAL_MASK as c_long,
+            )
+        };
+        if ret == KADM5_UNK_PRINC as i64 {
+            unsafe { krb5_free_principal(self.context, princ) };
+            info!(
+                "Principal {} does not exist, skipping allow_tix update",
+                principal_name
+            );
+            return Ok(());
+        }
+        if ret != 0 {
+            let err_msg = krb5_error_string(self.context, ret as i64);
+            unsafe { krb5_free_principal(self.context, princ) };
+            return Err(anyhow::anyhow!("kadm5_get_principal failed: {}", err_msg));
+        }
+
+        // Toggle just the DISALLOW_ALL_TIX bit.
+        if allow {
+            ent.attributes &= !KRB5_KDB_DISALLOW_ALL_TIX;
+        } else {
+            ent.attributes |= KRB5_KDB_DISALLOW_ALL_TIX;
+        }
+
+        let ret =
+            unsafe { kadm5_modify_principal(self.handle, &mut ent, KADM5_ATTRIBUTES as c_long) };
+
+        // Free what kadm5_get_principal allocated into `ent` (including its own principal copy),
+        // then our separately-parsed lookup principal. Distinct pointers → no double free.
+        unsafe { kadm5_free_principal_ent(self.handle, &mut ent) };
+        unsafe { krb5_free_principal(self.context, princ) };
+
+        if ret != 0 {
+            let err_msg = krb5_error_string(self.context, ret as i64);
+            warn!(
+                "kadm5_modify_principal (allow_tix) failed with code {}: {}",
+                ret, err_msg
+            );
+            return Err(anyhow::anyhow!(
+                "kadm5_modify_principal failed: {}",
+                err_msg
+            ));
+        }
+
+        info!("Set allow_tix={} for principal {}", allow, principal_name);
         Ok(())
     }
 }

@@ -122,6 +122,16 @@ async fn handle_modify_change(
                 ) {
                     warn!("Kerberos sync failed after LDAP password change: {}", e);
                 }
+
+                // A first password for an already-disabled user would otherwise mint a live principal.
+                if sync_enabled
+                    && let Ok(groups) = readable_handler.get_user_groups(&user_id).await
+                    && groups
+                        .iter()
+                        .any(|g| g.display_name == "lldap_disabled".into())
+                {
+                    lldap_kerberos::reassert_kerberos_disabled(user_id.as_str());
+                }
             }
             Ok(())
         } else {
@@ -1045,6 +1055,65 @@ mod tests {
         let request = make_delete_modify_request("bob", "givenName");
         assert_eq!(
             ldap_handler.do_modify_request(&request).await,
+            make_modify_success_response()
+        );
+    }
+
+    // Setting a password for a kerberossync=1 user already in lldap_disabled must still
+    // succeed — re-asserting -allow_tix is best-effort and no-ops without a KDC.
+    #[tokio::test]
+    async fn test_modify_password_born_disabled_reasserts_and_succeeds() {
+        use mockall::predicate::eq;
+        let mut mock = MockTestBackendHandler::new();
+        setup_default_ldap_mock(&mut mock);
+        setup_password_change_expectations(&mut mock, "bob");
+
+        // bob is kerberossync-managed …
+        mock.expect_get_user_details()
+            .with(eq(UserId::new("bob")))
+            .returning(|uid| {
+                Ok(lldap_domain::types::User {
+                    user_id: uid.clone(),
+                    email: format!("{}@example.com", uid.as_str()).into(),
+                    display_name: None,
+                    creation_date: chrono::Utc::now().naive_utc(),
+                    modified_date: chrono::Utc::now().naive_utc(),
+                    password_modified_date: chrono::Utc::now().naive_utc(),
+                    uuid: lldap_domain::types::Uuid::from_name_and_date(
+                        uid.as_str(),
+                        &chrono::Utc::now().naive_utc(),
+                    ),
+                    attributes: vec![Attribute {
+                        name: "kerberossync".into(),
+                        value: 1i64.into(),
+                    }],
+                    krb_principal_name: None,
+                })
+            });
+        // … and already disabled.
+        mock.expect_get_user_groups()
+            .with(eq(UserId::new("bob")))
+            .returning(|_| {
+                let mut set = HashSet::new();
+                set.insert(GroupDetails {
+                    group_id: GroupId(2),
+                    display_name: "lldap_disabled".into(),
+                    creation_date: chrono::Utc::now().naive_utc(),
+                    modified_date: chrono::Utc::now().naive_utc(),
+                    uuid: lldap_domain::types::Uuid::from_name_and_date(
+                        "lldap_disabled",
+                        &chrono::Utc::now().naive_utc(),
+                    ),
+                    attributes: vec![],
+                });
+                Ok(set)
+            });
+
+        let ldap_handler = setup_bound_admin_handler(mock).await;
+        assert_eq!(
+            ldap_handler
+                .do_modify_request(&make_password_modify_request("bob"))
+                .await,
             make_modify_success_response()
         );
     }

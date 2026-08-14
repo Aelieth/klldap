@@ -179,6 +179,15 @@ pub(crate) async fn do_password_modification<Handler: BackendHandler + OpaqueHan
                                     uid, e
                                 );
                             }
+
+                            // A first password for an already-disabled user would otherwise mint a live principal.
+                            if let Ok(groups) = readable.get_user_groups(&uid).await
+                                && groups
+                                    .iter()
+                                    .any(|g| g.display_name == "lldap_disabled".into())
+                            {
+                                lldap_kerberos::reassert_kerberos_disabled(uid.as_str());
+                            }
                         }
 
                         Ok(vec![make_extended_response(

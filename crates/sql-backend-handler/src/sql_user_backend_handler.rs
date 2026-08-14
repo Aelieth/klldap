@@ -835,6 +835,36 @@ impl SqlBackendHandler {
             .await?;
         Ok(())
     }
+
+    /// Best-effort: mirror `lldap_disabled` group membership onto the user's Kerberos principal via
+    /// DISALLOW_ALL_TIX, but only for kerberossync-managed users. Never fails the caller — Kerberos
+    /// is advisory here, exactly like `delete_user` and the sync-off branch of update. `disabled`
+    /// true sets `-allow_tix`; false restores `+allow_tix`.
+    async fn reflect_kerberos_disabled(&self, user_id: &UserId, disabled: bool) {
+        let synced = match self.get_user_details(user_id).await {
+            Ok(u) => lldap_domain::types::kerberos_sync_enabled(&u.attributes, "kerberossync"),
+            Err(e) => {
+                tracing::warn!(
+                    "Kerberos disable-sync: could not load user {} ({}); skipping",
+                    user_id,
+                    e
+                );
+                return;
+            }
+        };
+        if !synced {
+            return; // no KLLDAP-managed principal to touch
+        }
+        if let Err(e) = lldap_kerberos::set_kerberos_principal_enabled(user_id.as_str(), !disabled)
+        {
+            tracing::warn!(
+                "Failed to {} Kerberos principal for {} (non-fatal): {}",
+                if disabled { "disable" } else { "enable" },
+                user_id,
+                e
+            );
+        }
+    }
 }
 
 #[async_trait]
@@ -1122,6 +1152,11 @@ impl UserBackendHandler for SqlBackendHandler {
             ));
         }
 
+        // Capture the disable transition before the user_id shadow so post-commit reflect
+        // can still use the original id.
+        let disabled_target = target_name == "lldap_disabled";
+        let kerb_uid = user_id.clone();
+
         let user_id = user_id.clone();
         self.sql_pool
             .transaction::<_, _, sea_orm::DbErr>(|transaction| {
@@ -1143,11 +1178,25 @@ impl UserBackendHandler for SqlBackendHandler {
                 })
             })
             .await?;
+
+        // On disable, revoke KDC ticket issuance for kerberossync-managed users (best-effort).
+        if disabled_target {
+            self.reflect_kerberos_disabled(&kerb_uid, true).await;
+        }
         Ok(())
     }
 
     #[instrument(skip_all, level = "debug", err, fields(user_id = ?user_id.as_str(), group_id))]
     async fn remove_user_from_group(&self, user_id: &UserId, group_id: GroupId) -> Result<()> {
+        // Resolve whether this removes the user from lldap_disabled before the user_id
+        // shadow; a lookup failure just skips the best-effort reflect.
+        let disabled_target = self
+            .get_group_details(group_id)
+            .await
+            .map(|g| g.display_name.as_str() == "lldap_disabled")
+            .unwrap_or(false);
+        let kerb_uid = user_id.clone();
+
         let user_id = user_id.clone();
         self.sql_pool
             .transaction::<_, _, sea_orm::DbErr>(|transaction| {
@@ -1199,6 +1248,11 @@ impl UserBackendHandler for SqlBackendHandler {
                 sea_orm::TransactionError::Connection(e) => DomainError::DatabaseError(e),
                 sea_orm::TransactionError::Transaction(e) => DomainError::DatabaseError(e),
             })?;
+
+        // On re-enable, restore KDC ticket issuance for kerberossync-managed users (best-effort).
+        if disabled_target {
+            self.reflect_kerberos_disabled(&kerb_uid, false).await;
+        }
         Ok(())
     }
 }
@@ -1992,6 +2046,66 @@ mod tests {
             )
             .await,
             vec!["patrick"]
+        );
+    }
+
+    // Toggling lldap_disabled fires a best-effort Kerberos enable/disable. With no KDC
+    // the reflect no-ops, so add/remove still succeed and never become a hard error.
+    #[tokio::test]
+    async fn test_toggle_lldap_disabled_runs_kerberos_hook_cleanly() {
+        let fixture = TestFixture::new().await;
+
+        fixture
+            .handler
+            .create_user(CreateUserRequest {
+                user_id: UserId::new("ksync"),
+                email: "ksync@example.com".into(),
+                display_name: Some("Ksync".to_string()),
+                attributes: vec![Attribute {
+                    name: "kerberossync".into(),
+                    value: 1i64.into(),
+                }],
+            })
+            .await
+            .unwrap();
+
+        let disabled_gid = fixture
+            .handler
+            .create_group(CreateGroupRequest {
+                display_name: "lldap_disabled".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        // Disable transition.
+        fixture
+            .handler
+            .add_user_to_group(&UserId::new("ksync"), disabled_gid)
+            .await
+            .unwrap();
+        assert_eq!(
+            get_user_names(
+                &fixture.handler,
+                Some(UserRequestFilter::MemberOfId(disabled_gid)),
+            )
+            .await,
+            vec!["ksync"]
+        );
+
+        // Re-enable transition.
+        fixture
+            .handler
+            .remove_user_from_group(&UserId::new("ksync"), disabled_gid)
+            .await
+            .unwrap();
+        assert!(
+            get_user_names(
+                &fixture.handler,
+                Some(UserRequestFilter::MemberOfId(disabled_gid)),
+            )
+            .await
+            .is_empty()
         );
     }
 

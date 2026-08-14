@@ -96,6 +96,32 @@ pub fn delete_kerberos_principal(username: &str) -> Result<()> {
     handle.delete_principal(&full_principal)
 }
 
+/// Enable or disable Kerberos ticket issuance for a user's principal:
+/// `enabled == false` sets DISALLOW_ALL_TIX (`kadmin modprinc -allow_tix`), `true` clears it
+/// (`+allow_tix`). Mirrors `delete_kerberos_principal`'s graceful degradation — if the admin handle
+/// can't init (Kerberos disabled or not yet bootstrapped) it's an idempotent no-op.
+pub fn set_kerberos_principal_enabled(username: &str, enabled: bool) -> Result<()> {
+    let realm_upper = derive_realm_from_base_dn();
+    let admin_principal = format!("admin/admin@{}", realm_upper);
+    let keytab_path = "/data/kadm5.keytab";
+
+    let handle = match Kadm5Handle::init_with_keytab(keytab_path, &admin_principal, &realm_upper) {
+        Ok(h) => h,
+        Err(e) => {
+            info!(
+                "Kerberos admin handle unavailable to {} principal for user {} ({}). \
+                 Treating as no-op (Kerberos disabled or not yet bootstrapped).",
+                if enabled { "enable" } else { "disable" },
+                username,
+                e
+            );
+            return Ok(());
+        }
+    };
+
+    handle.set_principal_allow_tickets(username, &realm_upper, enabled)
+}
+
 pub fn sync_kerberos_principal(username: &str, plain_password: &str) -> Result<()> {
     let full_principal = get_kerberos_principal_name(username);
     info!("Kerberos sync started for principal: {}", full_principal);
@@ -214,5 +240,16 @@ pub fn sync_kerberos_if_enabled(
     } else {
         info!("Kerberos sync disabled for user {}; skipping", user_id);
         Ok(())
+    }
+}
+
+/// After a password sync that may have minted a live principal, re-assert DISALLOW_ALL_TIX
+/// for a user already in `lldap_disabled`. Best-effort.
+pub fn reassert_kerberos_disabled(username: &str) {
+    if let Err(e) = set_kerberos_principal_enabled(username, false) {
+        warn!(
+            "Failed to re-assert Kerberos disable for {} after password set: {}",
+            username, e
+        );
     }
 }

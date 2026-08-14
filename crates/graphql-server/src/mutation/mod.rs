@@ -270,6 +270,16 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             );
         }
 
+        // A first password for an already-disabled user would otherwise mint a live principal.
+        if sync_enabled
+            && let Ok(groups) = handler.get_user_groups(&target_user_id).await
+            && groups
+                .iter()
+                .any(|g| g.display_name == "lldap_disabled".into())
+        {
+            lldap_kerberos::reassert_kerberos_disabled(&user_id);
+        }
+
         Ok(Success::new())
     }
 
@@ -1142,6 +1152,15 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
                 "Kerberos principal synced for user {} (password change by self or admin)",
                 user_id
             );
+
+            // A first password for an already-disabled user would otherwise mint a live principal.
+            if let Ok(groups) = handler.get_user_groups(&target_user_id).await
+                && groups
+                    .iter()
+                    .any(|g| g.display_name == "lldap_disabled".into())
+            {
+                lldap_kerberos::reassert_kerberos_disabled(&user_id);
+            }
         } else {
             info!(
                 "Kerberos sync disabled for user {} (kerberossync != '1'), skipping",

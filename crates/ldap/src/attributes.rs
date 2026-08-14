@@ -323,7 +323,7 @@ pub fn get_user_attribute(
                 }
             }
             _ => {
-                if ignored_user_attributes.contains(&attribute) {
+                if crate::core::utils::is_ignored_attribute(&attribute, ignored_user_attributes) {
                     return None;
                 }
                 let is_unknown = crate::schema::get_schema_manager()
@@ -338,7 +338,11 @@ pub fn get_user_attribute(
             }
         },
     };
-    if attribute_values.len() == 1 && attribute_values[0].is_empty() {
+    // Omit an attribute with no values (e.g. member/uniqueMember/memberUid on a memberless group, or
+    // memberOf for a user in no groups) — an attribute with zero values is malformed LDAP.
+    if attribute_values.is_empty()
+        || (attribute_values.len() == 1 && attribute_values[0].is_empty())
+    {
         None
     } else {
         Some(attribute_values)
@@ -411,6 +415,21 @@ pub fn get_group_attribute(
                 .collect();
             members.into_iter().map(|s| s.into_bytes()).collect()
         }
+        crate::core::utils::GroupFieldType::MemberUid => {
+            // RFC 2307 posixGroup membership: bare login names (SSSD's default rfc2307 group member).
+            let members: std::collections::BTreeSet<_> = group
+                .users
+                .iter()
+                .filter(|u| {
+                    user_filter
+                        .as_ref()
+                        .map(|f| u.user_id == *f)
+                        .unwrap_or(true)
+                })
+                .map(|u| u.user_id.to_string())
+                .collect();
+            members.into_iter().map(|s| s.into_bytes()).collect()
+        }
         crate::core::utils::GroupFieldType::MemberOf => {
             // memberOf is a user operational/virtual attribute (groups a user belongs to).
             // For group entries we never emit it; use "member" / "uniqueMember" instead.
@@ -426,7 +445,7 @@ pub fn get_group_attribute(
             "+" => return None,
             "*" => panic!("Matched {attribute}, * should have been expanded"),
             _ => {
-                if ignored_group_attributes.contains(attribute) {
+                if crate::core::utils::is_ignored_attribute(attribute, ignored_group_attributes) {
                     return None;
                 }
                 let is_unknown = crate::schema::get_schema_manager()
@@ -441,7 +460,11 @@ pub fn get_group_attribute(
             }
         },
     };
-    if attribute_values.len() == 1 && attribute_values[0].is_empty() {
+    // Omit an attribute with no values (e.g. member/uniqueMember/memberUid on a memberless group, or
+    // memberOf for a user in no groups) — an attribute with zero values is malformed LDAP.
+    if attribute_values.is_empty()
+        || (attribute_values.len() == 1 && attribute_values[0].is_empty())
+    {
         None
     } else {
         Some(attribute_values)
@@ -468,6 +491,10 @@ pub fn make_ldap_search_user_result_entry(
             .map(|a| (a.name.clone(), a.name.to_string()))
             .collect();
         expanded_attributes.attribute_keys.extend(custom_to_add);
+        // posixAccount MAY: gecos is the POSIX full name (same value as displayName / cn).
+        expanded_attributes
+            .attribute_keys
+            .insert(AttributeName::from("gecos"), "gecos".to_string());
     }
 
     LdapSearchResultEntry {
@@ -522,6 +549,12 @@ pub fn make_ldap_search_group_result_entry(
             .map(|a| (a.name.clone(), a.name.to_string()))
             .collect();
         expanded_attributes.attribute_keys.extend(custom_to_add);
+        // posixGroup / groupOf(Unique)Names membership — group entries only.
+        for wire in ["member", "uniqueMember", "memberUid"] {
+            expanded_attributes
+                .attribute_keys
+                .insert(AttributeName::from(wire), wire.to_string());
+        }
     }
 
     LdapSearchResultEntry {
@@ -814,5 +847,101 @@ mod tests {
             atype_vals(&gstar, "displayName"),
             Some(&vec![b"admins".to_vec()])
         );
+    }
+
+    #[test]
+    fn member_uid_emits_login_names() {
+        // RFC 2307 posixGroup: memberUid = bare login names (sorted/deduped), on explicit and `*`.
+        let mut group = sample_group();
+        group.users = vec![
+            lldap_domain::types::GroupMember {
+                user_id: UserId::new("bob"),
+                ou: "people".into(),
+            },
+            lldap_domain::types::GroupMember {
+                user_id: UserId::new("alice"),
+                ou: "people".into(),
+            },
+        ];
+        let schema = PublicSchema::shared();
+        let entry = |attrs: &[&str]| {
+            let expanded = crate::schema::SchemaManager::default().expand_attribute_wildcards(
+                &attrs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
+                schema,
+            );
+            make_ldap_search_group_result_entry(
+                group.clone(),
+                "dc=example,dc=com",
+                expanded,
+                &None,
+                &[],
+                schema,
+            )
+        };
+
+        let expected = vec![b"alice".to_vec(), b"bob".to_vec()];
+        assert_eq!(
+            atype_vals(&entry(&["memberUid"]), "memberUid"),
+            Some(&expected)
+        );
+        assert_eq!(atype_vals(&entry(&["*"]), "memberUid"), Some(&expected));
+
+        // member still emits DNs, not bare uids.
+        let member_entry = entry(&["member"]);
+        let dns = atype_vals(&member_entry, "member").unwrap();
+        assert!(dns.iter().all(|v| v.starts_with(b"uid=")));
+
+        // On `*`, member and uniqueMember (DNs) ride along too (groupOf(Unique)Names MUST).
+        let star = entry(&["*"]);
+        for atype in ["member", "uniqueMember"] {
+            let vals = atype_vals(&star, atype).unwrap_or_else(|| panic!("* missing {atype}"));
+            assert!(
+                vals.iter().all(|v| v.starts_with(b"uid=")),
+                "{atype} not DNs"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_group_omits_membership_on_star() {
+        // A memberless group must not emit empty member/uniqueMember/memberUid on `*`.
+        let star = group_entry(&["*"]);
+        assert!(atype_vals(&star, "member").is_none());
+        assert!(atype_vals(&star, "uniqueMember").is_none());
+        assert!(atype_vals(&star, "memberUid").is_none());
+    }
+
+    #[test]
+    fn star_does_not_cross_object_class_wires() {
+        // Membership is group-only; gecos is user-only. Shared expand must not
+        // leak them onto the other class (that logged as unknown on every `*`).
+        let ustar = user_entry(&["*"]);
+        assert!(atype_vals(&ustar, "member").is_none());
+        assert!(atype_vals(&ustar, "uniqueMember").is_none());
+        assert!(atype_vals(&ustar, "memberUid").is_none());
+        assert!(atype_vals(&ustar, "gecos").is_some());
+
+        let gstar = group_entry(&["*"]);
+        assert!(atype_vals(&gstar, "gecos").is_none());
+    }
+
+    #[test]
+    fn gecos_emits_display_name() {
+        // gecos = display_name (POSIX GECOS), on explicit + `*`; a null display_name omits it.
+        let expected = vec![b"Bob".to_vec()];
+        assert_eq!(
+            atype_vals(&user_entry(&["gecos"]), "gecos"),
+            Some(&expected)
+        );
+        assert_eq!(atype_vals(&user_entry(&["*"]), "gecos"), Some(&expected));
+
+        let mut u = sample_user();
+        u.display_name = None;
+        let schema = PublicSchema::shared();
+        let exp = crate::schema::SchemaManager::default()
+            .expand_attribute_wildcards(&["gecos".to_string()], schema);
+        let entry =
+            make_ldap_search_user_result_entry(u, "dc=example,dc=com", exp, None, &[], schema);
+        assert!(atype_vals(&entry, "gecos").is_none());
     }
 }

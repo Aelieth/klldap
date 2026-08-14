@@ -305,6 +305,11 @@ fn display_name_emitted_for_cn_and_display_name() {
         Some(display),
         "displayName on *"
     );
+    assert_eq!(
+        star.get("gecos").map(String::as_str),
+        Some(display),
+        "gecos on *"
+    );
 
     // Explicit displayName request returns displayName.
     let explicit = attrs_for_user(
@@ -331,6 +336,102 @@ fn attrs_for_user(results: SearchResult, uid: &str) -> HashMap<String, String> {
                 .attrs
                 .iter()
                 .filter_map(|(k, v)| v.first().map(|val| (k.to_ascii_lowercase(), val.clone())))
+                .collect();
+        }
+    }
+    HashMap::new()
+}
+
+#[test]
+#[file_serial]
+fn member_uid_lists_group_members() {
+    // memberUid (RFC 2307 posixGroup): a wildcard group search exposes member login names, and
+    // (memberUid=<user>) resolves the user's groups — the SSSD default rfc2307 membership path.
+    let mut fixture = LLDAPFixture::new();
+    let prefix = "ldap-memberuid-";
+    let user_name = new_id(Some(prefix));
+    let group_name = new_id(Some(prefix));
+    fixture.load_state(&vec![User::new(&user_name, vec![&group_name])]);
+
+    let mut ldap =
+        LdapConn::new(env::ldap_url().as_str()).expect("failed to create ldap connection");
+    let base_dn = env::base_dn();
+    let bind_dn = format!("uid={},ou=people,{}", env::admin_dn(), base_dn);
+    ldap.simple_bind(&bind_dn, env::admin_password().as_str())
+        .expect("failed to bind to ldap");
+
+    let group_needle = format!("cn={}", group_name);
+
+    // Wildcard group search returns memberUid = the member's login name.
+    let group_attrs = attrs_multi_for_dn(
+        ldap.search(
+            &base_dn,
+            Scope::Subtree,
+            &format!("(cn={})", group_name),
+            vec!["*"],
+        )
+        .expect("group search failed"),
+        &group_needle,
+    );
+    assert!(
+        group_attrs
+            .get("memberuid")
+            .map(|v| v.contains(&user_name))
+            .unwrap_or(false),
+        "memberUid missing member {} (got {:?})",
+        user_name,
+        group_attrs.get("memberuid")
+    );
+
+    // member/uniqueMember (DNs) also ride the wildcard fetch (RFC groupOf(Unique)Names MUST).
+    let user_dn_frag = format!("uid={}", user_name);
+    assert!(
+        group_attrs
+            .get("member")
+            .map(|v| v
+                .iter()
+                .any(|dn| dn.to_ascii_lowercase().contains(&user_dn_frag)))
+            .unwrap_or(false),
+        "member missing {} (got {:?})",
+        user_name,
+        group_attrs.get("member")
+    );
+    assert!(
+        group_attrs.contains_key("uniquemember"),
+        "uniqueMember missing on wildcard group fetch"
+    );
+
+    // (memberUid=<user>) resolves the user's groups.
+    let found = attrs_multi_for_dn(
+        ldap.search(
+            &base_dn,
+            Scope::Subtree,
+            &format!("(memberUid={})", user_name),
+            vec!["cn"],
+        )
+        .expect("memberUid filter search failed"),
+        &group_needle,
+    );
+    assert!(
+        !found.is_empty(),
+        "(memberUid={}) did not return group {}",
+        user_name,
+        group_name
+    );
+
+    ldap.unbind().expect("failed to unbind");
+}
+
+/// All values of each attribute (lowercased atype) for the entry whose DN contains `dn_needle`.
+fn attrs_multi_for_dn(results: SearchResult, dn_needle: &str) -> HashMap<String, Vec<String>> {
+    let needle = dn_needle.to_ascii_lowercase();
+    for entry in results.success().expect("search failed").0 {
+        let parsed = SearchEntry::construct(entry);
+        if parsed.dn.to_ascii_lowercase().contains(&needle) {
+            return parsed
+                .attrs
+                .iter()
+                .map(|(k, v)| (k.to_ascii_lowercase(), v.clone()))
                 .collect();
         }
     }

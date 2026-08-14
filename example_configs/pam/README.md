@@ -125,6 +125,8 @@ cache_credentials = True
 # ldap provider
 ldap_uri = ldaps://ldap.example.com/
 ldap_schema = rfc2307bis
+# rfc2307 (SSSD default) also works: KLLDAP emits memberUid (login names)
+# and gecos (= displayName). rfc2307bis uses member/uniqueMember DNs.
 ldap_search_base = dc=example,dc=com
 
 ldap_default_bind_dn = uid=binduser,ou=people,dc=example,dc=com
@@ -140,7 +142,7 @@ ldap_tls_reqcert = demand
 ldap_user_search_base = ou=people,dc=example,dc=com?subtree?(uidNumber=*)
 ldap_user_object_class = posixAccount
 ldap_user_name = uid
-ldap_user_gecos = cn
+ldap_user_gecos = gecos
 ldap_user_uid_number = uidNumber
 ldap_user_gid_number = gidNumber
 ldap_user_home_directory = homeDirectory

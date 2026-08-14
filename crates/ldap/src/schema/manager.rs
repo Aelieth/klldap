@@ -160,6 +160,12 @@ impl SchemaManager {
             };
         }
 
+        // gecos (RFC 2307 posixAccount MAY) is the POSIX full-name field — back it with display_name,
+        // so it filters and emits (under its own wire name) like the other display_name spellings.
+        if field.as_str().eq_ignore_ascii_case("gecos") {
+            return UserFieldType::PrimaryField(lldap_domain_model::model::UserColumn::DisplayName);
+        }
+
         schema
             .get_schema()
             .user_attributes
@@ -209,6 +215,10 @@ impl SchemaManager {
         }
         if field.as_str().eq_ignore_ascii_case("uniquemember") {
             return GroupFieldType::UniqueMember;
+        }
+        // memberUid (RFC 2307 posixGroup) — SSSD's default rfc2307 group-member attribute.
+        if field.as_str().eq_ignore_ascii_case("memberuid") {
+            return GroupFieldType::MemberUid;
         }
 
         schema
@@ -476,6 +486,35 @@ mod tests {
         let star_vals: Vec<&str> = star.attribute_keys.values().map(String::as_str).collect();
         assert!(star_vals.contains(&"cn"), "{star_vals:?}");
         assert!(star_vals.contains(&"displayName"), "{star_vals:?}");
+    }
+
+    #[test]
+    fn expand_membership_explicit_only() {
+        // Membership wires are group-builder inserts on `*`, not shared expand.
+        for wire in ["member", "uniquemember", "memberuid"] {
+            assert!(
+                !keys(&expand(&["*"])).contains(wire),
+                "* expand must not inject {wire} (user entries would log unknown)"
+            );
+        }
+        assert!(keys(&expand(&["memberUid"])).contains("memberuid"));
+        assert!(!keys(&expand(&["uid"])).contains("memberuid"));
+    }
+
+    #[test]
+    fn gecos_backs_display_name() {
+        // gecos resolves to the display_name column; explicit keeps the wire name.
+        // `*` insert is user-builder only (posixAccount), not shared expand.
+        let sm = SchemaManager::default();
+        assert_eq!(
+            sm.map_user_field(&AttributeName::from("gecos"), PublicSchema::shared()),
+            UserFieldType::PrimaryField(UserColumn::DisplayName)
+        );
+        assert!(
+            !keys(&expand(&["*"])).contains("gecos"),
+            "* expand must not inject gecos (group entries would log unknown)"
+        );
+        assert!(keys(&expand(&["gecos"])).contains("gecos"));
     }
 
     #[test]

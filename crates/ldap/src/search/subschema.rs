@@ -54,6 +54,8 @@ pub fn make_ldap_subschema_entry(schema_manager: &SchemaManager, base_dn_str: &s
         ("1.3.6.1.1.1.1.8", b"( 1.3.6.1.1.1.1.8 NAME ( 'sshPublicKey' 'sshpublickey' 'sshPublicKey' 'ssHPublicKey' ) DESC 'OpenSSH/LDAP sshPublicKey' EQUALITY caseIgnoreMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15 )".to_vec()),
         ("1.3.6.1.4.1.5322.1.1.2", b"( 1.3.6.1.4.1.5322.1.1.2 NAME ( 'krbPrincipalName' 'krb_principal_name' 'krbPrincipalName' ) DESC 'Kerberos principal name' EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15{256} SINGLE-VALUE NO-USER-MODIFICATION USAGE directoryOperation )".to_vec()),
         ("0.9.2342.19200300.100.1.60", b"( 0.9.2342.19200300.100.1.60 NAME ( 'jpegPhoto' 'jpegphoto' 'avatar' ) DESC 'RFC2798 jpegPhoto' EQUALITY caseIgnoreMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.28 )".to_vec()),
+        ("1.3.6.1.1.1.1.12", b"( 1.3.6.1.1.1.1.12 NAME ( 'memberUid' 'memberuid' ) DESC 'RFC2307 memberUid' EQUALITY caseExactIA5Match SUBSTR caseExactIA5SubstringsMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.26 )".to_vec()),
+        ("1.3.6.1.1.1.1.2", b"( 1.3.6.1.1.1.1.2 NAME 'gecos' DESC 'RFC2307 gecos (POSIX full name; synthesized from displayName)' EQUALITY caseIgnoreIA5Match SUBSTR caseIgnoreIA5SubstringsMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.26 SINGLE-VALUE )".to_vec()),
     ];
     for (oid, entry) in std_entries {
         if seen_attr_oids.insert(oid.to_string()) {
@@ -345,6 +347,15 @@ mod tests {
                     && (attr_types_blob.contains("'loginDisabled'")
                         || attr_types_blob.contains("loginDisabled")),
                 "loginDisabled (NDS/eDirectory/SSSD) attributeType missing from subschema"
+            );
+            assert!(
+                attr_types_blob.contains("1.3.6.1.1.1.1.12")
+                    && attr_types_blob.contains("memberUid"),
+                "memberUid (RFC2307 posixGroup) attributeType missing from subschema"
+            );
+            assert!(
+                attr_types_blob.contains("1.3.6.1.1.1.1.2") && attr_types_blob.contains("'gecos'"),
+                "gecos (RFC2307 posixAccount) attributeType missing from subschema"
             );
         } else {
             panic!("expected SearchResultEntry");

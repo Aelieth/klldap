@@ -36,10 +36,78 @@ impl LdapInfo {
     }
 }
 
+/// Attributes SSSD (rfc2307) and similar clients routinely request but KLLDAP will never model.
+/// Recognized as silent no-ops so they don't produce "unknown attribute" debug noise — operators
+/// need not list them in `ignored_user_attributes` / `ignored_group_attributes`.
+pub const BUILTIN_IGNORED_ATTRIBUTES: &[&str] = &[
+    "shadowlastchange",
+    "shadowmin",
+    "shadowmax",
+    "shadowwarning",
+    "shadowinactive",
+    "shadowexpire",
+    "authorizedservice",
+    "host",
+    "rhost",
+    "userpassword",
+];
+
+/// True if `name` is a configured-ignored attribute or one of the built-in expected-absent names.
+pub fn is_ignored_attribute(name: &AttributeName, configured: &[AttributeName]) -> bool {
+    configured.contains(name)
+        || BUILTIN_IGNORED_ATTRIBUTES
+            .iter()
+            .any(|a| name.as_str().eq_ignore_ascii_case(a))
+}
+
+/// True when a NoMatch name should emit the "unknown attribute" debug line.
+/// Known names used on the wrong object class (e.g. `uid` on a group) stay silent.
+pub fn is_unrecognized_attribute(name: &AttributeName, configured: &[AttributeName]) -> bool {
+    !is_ignored_attribute(name, configured)
+        && crate::schema::get_schema_manager()
+            .resolve_attribute(name.as_str())
+            .is_none()
+}
+
 #[cfg(test)]
 mod utils_tests {
     use super::super::utils::LdapInfo;
     use lldap_domain::types::AttributeName;
+
+    #[test]
+    fn builtin_ignored_attributes_recognized() {
+        use super::is_ignored_attribute;
+        let none: Vec<AttributeName> = vec![];
+        assert!(is_ignored_attribute(
+            &AttributeName::from("shadowLastChange"),
+            &none
+        ));
+        assert!(is_ignored_attribute(
+            &AttributeName::from("userPassword"),
+            &none
+        ));
+        assert!(!is_ignored_attribute(&AttributeName::from("uid"), &none));
+        use super::is_unrecognized_attribute;
+        // uid is a known user attr — group-side NoMatch must not log.
+        assert!(!is_unrecognized_attribute(
+            &AttributeName::from("uid"),
+            &none
+        ));
+        assert!(!is_unrecognized_attribute(
+            &AttributeName::from("shadowLastChange"),
+            &none
+        ));
+        assert!(is_unrecognized_attribute(
+            &AttributeName::from("definitelyNotAnAttribute"),
+            &none
+        ));
+        // configured names still work (and AttributeName matching is case-insensitive).
+        let cfg = vec![AttributeName::from("sAMAccountName")];
+        assert!(is_ignored_attribute(
+            &AttributeName::from("samaccountname"),
+            &cfg
+        ));
+    }
 
     #[test]
     fn ldap_info_new_valid_base_dn() {

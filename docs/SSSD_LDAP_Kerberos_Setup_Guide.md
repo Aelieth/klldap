@@ -129,6 +129,9 @@ filter_groups = root,bin,daemon,sys,adm,disk,mem,kmem,wheel
     ldap_group_object_class = posixGroup
     ldap_group_name = cn
     ldap_group_gid_number = gidNumber
+    # rfc2307 (SSSD default) also works: KLLDAP emits memberUid (login names)
+    # and gecos (= displayName). Set ldap_user_uuid = entryUUID only if you
+    # want UUIDs; not required for getent/login.
 
     ldap_default_bind_dn = uid=admin,ou=people,dc=testlabby,dc=local
     ldap_default_authtok = YourSecureAdminPassword
@@ -199,6 +202,7 @@ filter_groups = root,bin,daemon,sys,adm,disk,mem,kmem,wheel
     ldap_group_object_class = posixGroup
     ldap_group_name = cn
     ldap_group_gid_number = gidNumber
+    # rfc2307 (SSSD default) also works: KLLDAP emits memberUid and gecos.
 
     ldap_default_bind_dn = uid=binduser,ou=service,dc=example,dc=com
     ldap_default_authtok = YourSecureBindPassword

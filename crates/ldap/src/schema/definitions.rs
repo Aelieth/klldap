@@ -46,6 +46,7 @@ pub enum GroupFieldType {
     EntryUuid,
     UniqueMember,
     Member,
+    MemberUid,
     MemberOf,
     Uuid,
     Attribute(AttributeName, AttributeType, bool),

@@ -121,10 +121,10 @@ database_url = "sqlite:////data/users.db?mode=rwc"
 key_seed = "RanD0m STR1ng"
 
 ## Ignored attributes.
-## Some services will request attributes that are not present in LLDAP. When it
-## is the case, LLDAP will warn about the attribute being unknown. If you want
-## to ignore the attribute and the service works without, you can add it to this
-## list to silence the warning.
+## Some services (e.g. SSSD enumeration) request attributes KLLDAP doesn't model. Common ones
+## (shadow*, authorizedService, host, rhost, userPassword) are recognized as built-in no-ops and
+## never logged. Anything else is quietly dropped and logged only at debug level; add such names
+## here to suppress that debug line too.
 #ignored_user_attributes = [ "sAMAccountName" ]
 #ignored_group_attributes = [ "mail", "userPrincipalName" ]
 

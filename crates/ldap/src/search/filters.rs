@@ -158,7 +158,10 @@ pub fn convert_user_filter(
                     get_user_attribute_equality_filter(&field, typ, is_list, value),
                 ),
                 crate::core::utils::UserFieldType::NoMatch => {
-                    if !ldap_info.ignored_user_attributes.contains(&field) {
+                    if crate::core::utils::is_unrecognized_attribute(
+                        &field,
+                        &ldap_info.ignored_user_attributes,
+                    ) {
                         debug!(
                             r#"Ignoring unknown user attribute "{}" in filter. Add to "ignored_user_attributes" to silence."#,
                             field
@@ -411,6 +414,7 @@ pub fn convert_group_filter(
                 }
                 crate::core::utils::GroupFieldType::Member
                 | crate::core::utils::GroupFieldType::UniqueMember
+                | crate::core::utils::GroupFieldType::MemberUid
                 | crate::core::utils::GroupFieldType::MemberOf => {
                     // "member" and "uniqueMember" are the standards; "memberof"/"ismemberof"
                     // are accepted as aliases pointing to the same membership filter semantics
@@ -454,7 +458,10 @@ pub fn convert_group_filter(
                         })
                 }
                 crate::core::utils::GroupFieldType::NoMatch => {
-                    if !ldap_info.ignored_group_attributes.contains(&field) {
+                    if crate::core::utils::is_unrecognized_attribute(
+                        &field,
+                        &ldap_info.ignored_group_attributes,
+                    ) {
                         debug!(
                             r#"Ignoring unknown group attribute "{}" in filter. Add to "ignored_group_attributes" to silence."#,
                             field
@@ -687,6 +694,40 @@ mod tests {
             }
             other => panic!("Expected Member for member group filter, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn group_filter_member_uid_resolves_to_member() {
+        // (memberUid=alice) finds groups containing alice (SSSD rfc2307 initgroups path).
+        match group_eq("memberUid", "alice") {
+            GroupRequestFilter::Member(uid) => assert_eq!(uid.as_str(), "alice"),
+            other => panic!("expected Member for memberUid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_filter_gecos_maps_to_display_name() {
+        // gecos (POSIX GECOS = the full name) filters on display_name.
+        match user_eq("gecos", "bob") {
+            UserRequestFilter::Equality(lldap_domain_model::model::UserColumn::DisplayName, v) => {
+                assert_eq!(v, "bob");
+            }
+            other => panic!("expected DisplayName equality for gecos, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn group_filter_uid_is_false_not_unknown() {
+        // (uid=…) on a group search: uid is known (user-side); group NoMatch is
+        // False without treating it as unrecognized.
+        match group_eq("uid", "bob") {
+            GroupRequestFilter::False => {}
+            other => panic!("expected False for uid-on-group, got {other:?}"),
+        }
+        assert!(!crate::core::utils::is_unrecognized_attribute(
+            &AttributeName::from("uid"),
+            &[]
+        ));
     }
 
     fn info() -> LdapInfo {

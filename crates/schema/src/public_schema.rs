@@ -1,3 +1,27 @@
+//! Built-in attribute schema for users, groups, and system data.
+//!
+//! Attributes are declared with the `A::{editable, readonly, generated, hidden}` builders. Each sets
+//! a combination of the five `AttributeSchema` flags: four inherited from upstream LLDAP — `is_list`,
+//! `is_visible`, `is_editable`, `is_hardcoded` — plus KLLDAP's own `is_readonly` (no upstream analog;
+//! it is also what makes an attribute advertise `NO-USER-MODIFICATION` over LDAP).
+//!
+//! Every builder sets `is_hardcoded = true` (built-in: undeletable, value read from a typed field,
+//! never a stored custom attribute) and `is_list = false` unless `.list()` is chained.
+//!
+//! - `editable`  — `is_editable = true`. Visible to all; writable by regular users *and* admins.
+//!   (mail, displayName, firstName, lastName, avatar, sshPublicKey)
+//! - `generated` — all defaults (`is_editable = false`, `is_readonly = false`). Visible to all; a
+//!   regular user cannot set it, but an **admin can override** it. For server-assigned POSIX/Kerberos
+//!   values (uidNumber, gidNumber, homeDirectory, loginShell, kerberos sync).
+//! - `readonly`  — `is_readonly = true`. Visible to all; **write-blocked for everyone, admins
+//!   included**, and advertised `NO-USER-MODIFICATION` in the LDAP schema. (userId, uuid, timestamps,
+//!   ou, groupId)
+//! - `hidden`    — `is_visible = false` (+ `is_readonly = true`). **Admin-only**: stripped from both
+//!   the schema and the returned values for non-admins; also write-blocked. (krbPrincipalName;
+//!   system allowedOUs)
+//!
+//! Enforcement (`graphql-server` mutation path): `is_readonly` is checked before `is_editable`, so
+//! `readonly` freezes a value for all while `generated` blocks only regular users.
 use crate::schema::{AttributeList, AttributeSchema, AttributeType, PosixSettings, Schema};
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
@@ -93,7 +117,9 @@ impl PublicSchema {
                 .aliases(&["gid_number", "gidNumber"]),
         ];
 
+        #[rustfmt::skip]
         let system_attributes = vec![
+            // --- Access control ---
             A::hidden("allowedous", String)
                 .aliases(&["allowedOUs", "AllowedOUs"])
                 .list(),

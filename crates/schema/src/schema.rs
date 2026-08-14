@@ -72,6 +72,7 @@ impl AttributeSchema {
         }
     }
 
+    /// Visible to all; writable by regular users and admins (`is_editable`).
     pub fn editable(name: &str, attribute_type: AttributeType) -> Self {
         Self {
             is_editable: true,
@@ -79,6 +80,8 @@ impl AttributeSchema {
         }
     }
 
+    /// Visible to all; immutable for everyone including admins (KLLDAP `is_readonly`);
+    /// advertised `NO-USER-MODIFICATION` over LDAP.
     pub fn readonly(name: &str, attribute_type: AttributeType) -> Self {
         Self {
             is_readonly: true,
@@ -86,11 +89,14 @@ impl AttributeSchema {
         }
     }
 
-    /// POSIX/Kerberos assigned: is_editable=false / is_readonly=false — do not normalize.
+    /// Visible to all; server-assigned — not user-editable, but admin-overridable
+    /// (`is_editable = false`, `is_readonly = false`). Used for POSIX/Kerberos values.
     pub fn generated(name: &str, attribute_type: AttributeType) -> Self {
         Self::new(name, attribute_type)
     }
 
+    /// Admin-only (`is_visible = false`) and immutable (`is_readonly`); stripped from the
+    /// schema and values for non-admins.
     pub fn hidden(name: &str, attribute_type: AttributeType) -> Self {
         Self {
             is_visible: false,

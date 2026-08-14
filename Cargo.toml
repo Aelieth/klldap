@@ -10,6 +10,7 @@ default-members = ["server"]
 resolver = "2"
 
 [workspace.package]
+version = "0.7.4"
 authors = [
     "Paul Tomlin <shaiaelieth@gmail.com>",
     "Valentin Tolmer <valentin@tolmer.fr>",

@@ -1,6 +1,6 @@
 [package]
 name = "lldap_ldap"
-version = "0.7.2"
+version.workspace = true
 description = "LDAP operations support"
 authors.workspace = true
 edition.workspace = true

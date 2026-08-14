@@ -2,13 +2,14 @@ name: Rust
 
 on:
   push:
-    branches: [ main ]
+    # 0.7.4 is the current development line; drop it when this tree lands on main.
+    branches: [ main, 0.7.4 ]
   pull_request:
     types: [opened, reopened, synchronize]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
-  MSRV: "1.89.0"
 
 jobs:
   pre_job:
@@ -22,7 +23,7 @@ jobs:
         with:
           concurrent_skipping: 'outdated_runs'
           skip_after_successful_duplicate: 'true'
-          paths_ignore: '["**/*.md", "**/docs/**", "example_configs/**", "*.sh", ".dockerignore", ".gitignore", "lldap_config.docker_template.toml", "Dockerfile"]'
+          paths_ignore: '["**/*.md", "docs/**", "example_configs/**", "screenshot.png"]'
           do_not_skip: '["workflow_dispatch", "schedule"]'
           cancel_others: true
 
@@ -31,25 +32,22 @@ jobs:
     needs: pre_job
     if: ${{ needs.pre_job.outputs.should_skip != 'true' }}
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout sources
         uses: actions/checkout@v6.0.1
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev clang pkg-config
       - name: Install Rust
-        id: toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-            toolchain: "${{ env.MSRV }}"
+        run: rustup show
       - uses: Swatinem/rust-cache@v2
       - name: Build
-        run: cargo +${{steps.toolchain.outputs.name}} build --verbose --workspace
+        run: cargo build --verbose --workspace
       - name: Run tests
-        run: cargo +${{steps.toolchain.outputs.name}} test --verbose --workspace
+        run: cargo test --verbose --workspace
       - name: Generate GraphQL schema
-        run: cargo +${{steps.toolchain.outputs.name}} run -- export_graphql_schema -o generated_schema.graphql
+        run: cargo run -- export_graphql_schema -o generated_schema.graphql
       - name: Check schema
-        run: diff schema.graphql generated_schema.graphql || (echo "The schema file is out of date. Please run `./export_schema.sh`" && false)
-
+        run: diff schema.graphql generated_schema.graphql || (echo 'The schema file is out of date. Please run ./export_schema.sh' && false)
 
   clippy:
     name: cargo clippy
@@ -59,14 +57,12 @@ jobs:
     steps:
       - name: Checkout sources
         uses: actions/checkout@v6.0.1
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev clang pkg-config
       - name: Install Rust
-        id: toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-            toolchain: "${{ env.MSRV }}"
-            components: clippy
+        run: rustup show
       - uses: Swatinem/rust-cache@v2
-      - run: cargo +${{steps.toolchain.outputs.name}} clippy --tests --workspace -- -D warnings
+      - run: cargo clippy --tests --all -- -D warnings
 
   format:
     name: cargo fmt
@@ -77,40 +73,19 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v6.0.1
       - name: Install Rust
-        id: toolchain
-        uses: dtolnay/rust-toolchain@master
-        with:
-            toolchain: "${{ env.MSRV }}"
-            components: rustfmt
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo +${{steps.toolchain.outputs.name}} fmt --check --all
+        run: rustup show
+      - run: cargo fmt --check --all
 
-  coverage:
-    name: Code coverage
-    needs:
-      - pre_job
-      - test
-    if: ${{ needs.pre_job.outputs.should_skip != 'true' || (github.event_name == 'push' && github.ref == 'refs/heads/main') }}
+  shellcheck:
+    name: shellcheck
+    needs: pre_job
+    if: ${{ needs.pre_job.outputs.should_skip != 'true' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout sources
         uses: actions/checkout@v6.0.1
-
-      - name: Install Rust
-        run: rustup toolchain install nightly --component llvm-tools-preview && rustup component add llvm-tools-preview --toolchain stable-x86_64-unknown-linux-gnu
-
-      - uses: taiki-e/install-action@cargo-llvm-cov
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Generate code coverage for unit test
-        run: cargo llvm-cov  --workspace --no-report
-      - name: Aggregate reports
-        run: cargo llvm-cov --no-run --lcov --output-path lcov.info
-      - name: Upload coverage to Codecov (main)
-        uses: codecov/codecov-action@v4
-        with:
-          files: lcov.info
-          fail_ci_if_error: true
-          codecov_yml_path: .github/codecov.yml
-          token: ${{ secrets.CODECOV_TOKEN }}
+      - name: Shellcheck boot and release scripts
+        run: >
+          shellcheck --severity=error
+          entrypoint.sh start-lldap.sh generate_secrets.sh export_schema.sh
+          prepare-release.sh app/build.sh scripts/*.sh

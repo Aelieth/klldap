@@ -3,7 +3,7 @@
 tables=("users" "groups" "memberships" "jwt_refresh_storage" "jwt_storage" "password_reset_tokens" "group_attribute_schema" "group_attributes")
 echo ".header on"
 
-for table in ${tables[@]}; do
+for table in "${tables[@]}"; do
     echo ".mode insert $table"
     echo "select * from $table;"
 done

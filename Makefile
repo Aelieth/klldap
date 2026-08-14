@@ -9,6 +9,9 @@
 
 .PHONY: prepare-release prepare-release-docker docker-build test test-run clean
 
+# Single-sourced from [workspace.package] in Cargo.toml (first version line in the file).
+VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+
 # Native prepare-release (run directly — needs Rust, cross, Docker, and system deps like krb5-devel)
 prepare-release:
 	./prepare-release.sh
@@ -52,8 +55,9 @@ docker-build:
 	docker buildx build \
 		--file Dockerfile \
 		--platform $(PLATFORMS) \
+		--build-arg VERSION=$(VERSION) \
 		--tag aelieth/klldap:latest \
-		--tag aelieth/klldap:0.7.2 \
+		--tag aelieth/klldap:$(VERSION) \
 		--push .
 
 # Local test image from this tree. Tag is just klldap-test (no version).
@@ -65,6 +69,7 @@ docker-build:
 test:
 	docker build \
 		--file Dockerfile \
+		--build-arg VERSION=$(VERSION)-test \
 		--build-arg CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=native" \
 		--build-arg CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=native" \
 		--tag klldap-test \

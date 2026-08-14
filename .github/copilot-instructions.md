@@ -1,13 +1,15 @@
-# LLDAP - Light LDAP implementation for authentication
+# KLLDAP - Light LDAP implementation with an integrated MIT Kerberos KDC
 
-LLDAP is a lightweight LDAP authentication server written in Rust with a WebAssembly frontend. It provides an opinionated, simplified LDAP interface for authentication and integrates with many popular services.
+KLLDAP is a hard fork of LLDAP: a lightweight LDAP authentication server written in Rust
+with a WebAssembly frontend, plus an integrated MIT Kerberos KDC, admin-controlled OUs,
+POSIX/SSSD support, and Keycloak federation.
 
 **ALWAYS reference these instructions first and fallback to search or bash commands only when you encounter unexpected information that does not match the info here.**
 
 ## Working Effectively
 
 ### Bootstrap and Build the Repository
-- Install dependencies: `sudo apt-get update && sudo apt-get install -y curl gzip binaryen`
+- Install dependencies: `sudo apt-get update && sudo apt-get install -y curl gzip binaryen libkrb5-dev clang pkg-config` (the Kerberos FFI needs the krb5 headers + clang, or nothing builds)
 - Install Rust if not available: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh` then `source ~/.cargo/env`
 - Install wasm-pack for frontend: `cargo install wasm-pack` -- takes 90 seconds. NEVER CANCEL. Set timeout to 180+ seconds.
 - Build entire workspace: `cargo build --workspace` -- takes 3-4 minutes. NEVER CANCEL. Set timeout to 300+ seconds.
@@ -32,7 +34,7 @@ LLDAP is a lightweight LDAP authentication server written in Rust with a WebAsse
 
 ### Manual Validation Requirements
 - **ALWAYS test both LDAP and web interfaces after making changes.**
-- Test web interface: `curl -s http://localhost:17170/` should return HTML with "LLDAP Administration" title.
+- Test web interface: `curl -s http://localhost:17170/` should return HTML with "KLLDAP" in the title.
 - Test GraphQL API: `curl -s -X POST -H "Content-Type: application/json" -d '{"query": "query { __schema { queryType { name } } }"}' http://localhost:17170/api/graphql`
 - Run healthcheck: `cargo run -- healthcheck --config-file <config_file>` (requires running server)
 - **ALWAYS ensure server starts without errors and serves the web interface before considering changes complete.**
@@ -107,7 +109,7 @@ The repository uses GitHub Actions (`.github/workflows/rust.yml`):
 - **Test job**: Runs full test suite  
 - **Clippy job**: Linting with warnings as errors
 - **Format job**: Code formatting validation
-- **Coverage job**: Code coverage analysis
+- **Shellcheck job**: Error-severity check of boot and release scripts
 
 **ALWAYS ensure your changes pass all CI checks by running equivalent commands locally.**
 

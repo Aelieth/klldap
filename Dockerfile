@@ -141,6 +141,7 @@ ENTRYPOINT ["/entrypoint.sh"]
 CMD ["run", "--config-file", "/data/lldap_config.toml"]
 HEALTHCHECK CMD ["/app/lldap", "healthcheck", "--config-file", "/data/lldap_config.toml"]
 
+ARG VERSION=dev
 LABEL maintainer="Aelieth <https://github.com/Aelieth>" \
-      version="0.7.2" \
+      version="${VERSION}" \
       description="KLLDAP"

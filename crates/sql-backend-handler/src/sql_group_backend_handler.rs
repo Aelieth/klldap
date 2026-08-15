@@ -377,7 +377,7 @@ impl GroupBackendHandler for SqlBackendHandler {
                             }
 
                             let taken = if name == "uidnumber" {
-                                Self::is_uidnumber_taken(transaction, value).await?
+                                Self::is_uidnumber_taken(transaction, value, None).await?
                             } else {
                                 Self::is_gidnumber_taken(transaction, value).await?
                             };
@@ -541,7 +541,7 @@ impl SqlBackendHandler {
                 }
 
                 let taken = if name == "uidnumber" {
-                    Self::is_uidnumber_taken(transaction, value).await?
+                    Self::is_uidnumber_taken(transaction, value, None).await?
                 } else {
                     Self::is_gidnumber_taken(transaction, value).await?
                 };

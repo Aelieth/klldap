@@ -5,7 +5,7 @@ use lldap_access_control::{
     UserReadableBackendHandler, UserWriteableBackendHandler,
 };
 use lldap_auth::{access_control::ValidationResults, types::UserId};
-use lldap_domain_handlers::handler::{BackendHandler, PasswordHandler};
+use lldap_domain_handlers::handler::BackendHandler;
 use lldap_opaque_handler::OpaqueHandler;
 use tracing::debug;
 
@@ -50,7 +50,7 @@ impl<Handler: FullHandler> Context<Handler> {
     pub fn get_writeable_handler(
         &self,
         user_id: UserId,
-    ) -> Option<&(impl UserWriteableBackendHandler + PasswordHandler + '_)> {
+    ) -> Option<&(impl UserWriteableBackendHandler + OpaqueHandler + '_)> {
         self.handler
             .get_writeable_handler(&self.validation_result, user_id)
     }

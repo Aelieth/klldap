@@ -16,11 +16,11 @@ use crate::api::FullHandler;
 use crate::api::{Context, field_error_callback};
 use juniper::GraphQLObject;
 use juniper::{FieldError, FieldResult, graphql_object, graphql_value};
-use lldap_access_control::{
-    AdminBackendHandler, ReadonlyBackendHandler, UserReadableBackendHandler,
-};
+use lldap_access_control::{ReadonlyBackendHandler, UserReadableBackendHandler};
 use lldap_domain::types::{GroupId, UserId};
-use lldap_domain_handlers::handler::{BackendHandler, ReadSchemaBackendHandler};
+use lldap_domain_handlers::handler::{
+    BackendHandler, PosixBackendHandler, ReadSchemaBackendHandler, SystemConfigBackendHandler,
+};
 use lldap_keycloak::{KeycloakConfig, SUGGESTED_HOSTNAME};
 use lldap_opaque_handler::OpaqueHandler;
 use lldap_schema::PublicSchema;
@@ -264,8 +264,7 @@ impl<Handler: FullHandler + OpaqueHandler> Query<Handler> {
             .get_admin_handler()
             .ok_or_else(field_error_callback(&span, "Unauthorized to read OUs"))?;
 
-        let inner = AdminBackendHandler::unsafe_get_handler(handler);
-        let ous = inner.get_allowed_ous().await.map_err(|e| {
+        let ous = handler.get_allowed_ous().await.map_err(|e| {
             FieldError::new(
                 "Failed to load allowedous",
                 graphql_value!({ "details": (e.to_string()) }),
@@ -286,9 +285,7 @@ impl<Handler: FullHandler + OpaqueHandler> Query<Handler> {
                 "Unauthorized to read POSIX settings",
             ))?;
 
-        let inner = AdminBackendHandler::unsafe_get_handler(handler);
-
-        let settings = inner.get_posix_settings().await.map_err(|e| {
+        let settings = handler.get_posix_settings().await.map_err(|e| {
             FieldError::new(
                 "Failed to load posix_settings",
                 graphql_value!({ "details": (e.to_string()) }),

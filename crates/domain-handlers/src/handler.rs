@@ -11,10 +11,9 @@ use lldap_domain::{
     },
 };
 use lldap_domain_model::{error::Result, model::UserColumn};
-use lldap_opaque_handler::OpaqueHandler;
 use lldap_schema::PublicSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet; // needed for PasswordHandler supertrait
+use std::collections::HashSet;
 
 #[derive(PartialEq, Eq, Debug, Serialize, Deserialize, Clone)]
 pub struct BindRequest {
@@ -157,6 +156,11 @@ pub trait UserBackendHandler: ReadSchemaBackendHandler {
     async fn add_user_to_group(&self, user_id: &UserId, group_id: GroupId) -> Result<()>;
     async fn remove_user_from_group(&self, user_id: &UserId, group_id: GroupId) -> Result<()>;
     async fn get_user_groups(&self, user_id: &UserId) -> Result<HashSet<GroupDetails>>;
+    async fn ensure_kerberos_principal_consistency(
+        &self,
+        user_id: &UserId,
+        enabled: bool,
+    ) -> Result<()>;
 }
 
 #[async_trait]
@@ -178,23 +182,9 @@ pub trait SchemaBackendHandler: ReadSchemaBackendHandler {
 }
 
 #[async_trait]
-pub trait PasswordHandler: BackendHandler + OpaqueHandler {
-    // no extra methods — just a marker
-}
-
-#[async_trait]
-impl<Handler: BackendHandler + OpaqueHandler> PasswordHandler for Handler {}
-
-#[async_trait]
 pub trait SystemConfigBackendHandler: Send + Sync {
     async fn get_allowed_ous(&self) -> Result<Vec<String>>;
     async fn set_system_config(&self, key: &str, value: String) -> Result<()>;
-
-    async fn ensure_kerberos_principal_consistency(
-        &self,
-        user_id: &UserId,
-        enabled: bool,
-    ) -> Result<()>;
 }
 
 #[async_trait]

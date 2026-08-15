@@ -1,5 +1,9 @@
 pub mod helpers;
 pub mod inputs;
+mod kerberos;
+mod keycloak;
+mod ou;
+mod posix;
 
 // Re-export public types
 pub use inputs::{
@@ -14,6 +18,11 @@ use helpers::{
     unpack_attributes,
 };
 use juniper::{FieldError, FieldResult, graphql_object, graphql_value};
+use kerberos::ExportKeytabForKeycloakResponse;
+use keycloak::{
+    PushRealmResponse, PushRealmToKeycloakInput, SaveKeycloakConfigInput,
+    SaveKeycloakConfigResponse, TestKeycloakConnectionInput, TestKeycloakConnectionResponse,
+};
 use lldap_access_control::{
     AdminBackendHandler, ReadonlyBackendHandler, UserReadableBackendHandler,
     UserWriteableBackendHandler,
@@ -25,93 +34,12 @@ use lldap_domain::{
 };
 use lldap_domain_handlers::handler::{BackendHandler, ReadSchemaBackendHandler, UserRequestFilter};
 use lldap_domain_handlers::kerberos::kerberos_backend;
-use lldap_keycloak::{KeycloakClient, KeycloakConfig};
 use lldap_opaque_handler::OpaqueHandler;
 use lldap_schema::schema::AttributeList;
 use lldap_validation::attributes::{ALLOWED_CHARACTERS_DESCRIPTION, validate_attribute_name};
+use posix::{PosixSettingsInput, PosixSettingsResponse};
 use std::sync::Arc;
 use tracing::{Instrument, debug, debug_span, info, warn};
-
-#[derive(juniper::GraphQLObject)]
-struct ExportKeytabForKeycloakResponse {
-    ok: bool,
-    path: String,
-    error_msg: String,
-}
-
-#[derive(juniper::GraphQLInputObject)]
-struct TestKeycloakConnectionInput {
-    url: String,
-    realm: String,
-    admin_user: String,
-    admin_pass: String,
-}
-
-#[derive(juniper::GraphQLObject)]
-struct TestKeycloakConnectionResponse {
-    ok: bool,
-    message: String,
-}
-
-#[derive(juniper::GraphQLInputObject)]
-struct SaveKeycloakConfigInput {
-    url: String,
-    realm: String,
-    admin_user: String,
-}
-
-#[derive(juniper::GraphQLObject)]
-struct SaveKeycloakConfigResponse {
-    ok: bool,
-    message: String,
-}
-
-#[derive(juniper::GraphQLObject)]
-struct PushRealmResponse {
-    ok: bool,
-    message: String,
-}
-
-#[derive(juniper::GraphQLInputObject, Debug)]
-struct PosixSettingsInput {
-    // === Users ===
-    pub user_uidnumber_assign: bool,
-    pub user_uidnumber_start: i32,
-    pub user_uidnumber_max: i32,
-
-    pub user_gidnumber_assign: bool,
-    pub user_gidnumber_start: i32,
-
-    pub user_loginshell_assign: bool,
-    pub user_loginshell_default: String,
-
-    pub user_homedirectory_assign: bool,
-    pub user_homedirectory_prefix: String,
-
-    // === Groups ===
-    pub group_gidnumber_assign: bool,
-    pub group_gidnumber_start: i32,
-    pub group_gidnumber_max: i32,
-}
-
-#[derive(juniper::GraphQLObject)]
-struct PosixSettingsResponse {
-    success: bool,
-    message: String,
-}
-
-#[derive(juniper::GraphQLInputObject, Debug)]
-struct PushRealmToKeycloakInput {
-    url: String,
-    realm: String,
-    admin_user: String,
-    admin_pass: String,
-    lldap_url: String,
-    sync_username: String,
-    sync_password: String,
-    enable_hsts: bool,
-    enable_brute_force: bool,
-}
 
 #[derive(PartialEq, Eq, Debug)]
 /// The top-level GraphQL mutation type.
@@ -209,39 +137,15 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             .get_writeable_handler(target_user_id.clone())
             .ok_or_else(field_error_callback(&span, "Unauthorized password set"))?;
 
-        // OPAQUE registration
         use anyhow::Context as AnyhowContext;
-        use lldap_auth::{opaque, registration};
-        use rand::rngs::OsRng;
-        let mut rng = OsRng;
-        let registration_start_request =
-            opaque::client::registration::start_registration(password.as_bytes(), &mut rng)
-                .context("Could not initiate password registration")?;
-        let req = registration::ClientRegistrationStartRequest {
-            username: target_user_id.clone(),
-            registration_start_request: registration_start_request.message,
-        };
-        let start_response = handler
-            .registration_start(req)
-            .await
-            .context("Registration start failed")?;
-        let registration_finish = opaque::client::registration::finish_registration(
-            registration_start_request.state,
+        lldap_opaque_handler::register_password(
+            handler,
+            target_user_id.clone(),
             password.as_bytes(),
-            start_response.registration_response,
-            &mut rng,
         )
-        .context("Error during password registration finish")?;
-        let req = registration::ClientRegistrationFinishRequest {
-            server_data: start_response.server_data,
-            registration_upload: registration_finish.message,
-        };
-        handler
-            .registration_finish(req)
-            .await
-            .context("Registration finish failed")?;
+        .await
+        .context("Password registration failed")?;
 
-        // Fetch for sync check
         let user = handler
             .get_user_details(&target_user_id)
             .await
@@ -258,8 +162,7 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             );
         }
 
-        let inner = UserWriteableBackendHandler::unsafe_get_handler(handler);
-        if let Err(e) = inner
+        if let Err(e) = handler
             .ensure_kerberos_principal_consistency(&target_user_id, sync_enabled)
             .await
         {
@@ -561,253 +464,11 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
     }
 
     async fn create_ou(context: &Context<Handler>, name: String) -> FieldResult<Success> {
-        let span = debug_span!("[GraphQL mutation] create_ou");
-        span.in_scope(|| debug!(?name));
-
-        let handler = context
-            .get_admin_handler()
-            .ok_or_else(field_error_callback(&span, "Unauthorized OU creation"))?;
-
-        let name_lower = name.trim().to_lowercase();
-        if name_lower.is_empty()
-            || name_lower == "all"
-            || name_lower == "people"
-            || name_lower == "groups"
-        {
-            return Err("Invalid OU name (cannot be empty or built-in)".into());
-        }
-
-        let parts: Vec<&str> = name.splitn(2, '\\').collect();
-        let (primary, secondary) = match parts.len() {
-            1 => (name.as_str(), None),
-            2 => (parts[0], Some(parts[1])),
-            _ => {
-                return Err(FieldError::new(
-                    "Invalid OU format: only one level of secondary OU allowed (primary\\secondary)",
-                    juniper::Value::null(),
-                ));
-            }
-        };
-
-        if primary.len() < 2
-            || primary.len() > 64
-            || !primary
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            || primary.starts_with('-')
-            || primary.starts_with('_')
-            || primary.ends_with('-')
-            || primary.ends_with('_')
-        {
-            return Err(FieldError::new(
-                "Invalid primary OU name: 2-64 characters, only a-z A-Z 0-9 - _ allowed. No spaces or special characters.",
-                juniper::Value::null(),
-            ));
-        }
-        if let Some(sec) = secondary
-            && (sec.trim().is_empty()
-                || sec.len() < 2
-                || sec.len() > 64
-                || !sec
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-                || sec.starts_with('-')
-                || sec.starts_with('_')
-                || sec.ends_with('-')
-                || sec.ends_with('_'))
-        {
-            return Err(FieldError::new(
-                "Invalid secondary OU name: 2-64 characters, only a-z A-Z 0-9 - _ allowed. No spaces or special characters.",
-                juniper::Value::null(),
-            ));
-        }
-
-        let inner = AdminBackendHandler::unsafe_get_handler(handler);
-        let mut current_ous = inner
-            .get_allowed_ous()
-            .await
-            .map_err(|_e| FieldError::new("Failed to load allowedous", juniper::Value::null()))?;
-
-        let name_lower = name.to_lowercase();
-        if current_ous
-            .iter()
-            .any(|existing| existing.to_lowercase() == name_lower)
-        {
-            return Err(FieldError::new(
-                format!("Organizational Unit '{}' already exists", name),
-                juniper::Value::null(),
-            ));
-        }
-
-        if secondary.is_some()
-            && !current_ous
-                .iter()
-                .any(|p| p.to_lowercase() == primary.to_lowercase())
-        {
-            return Err(FieldError::new(
-                format!(
-                    "Primary OU '{}' does not exist. Create it first before adding a secondary.",
-                    primary
-                ),
-                juniper::Value::null(),
-            ));
-        }
-
-        current_ous.push(name.clone());
-        current_ous.sort();
-
-        inner
-            .set_system_config("allowedous", serde_json::to_string(&current_ous).unwrap())
-            .await
-            .map_err(|_e| {
-                FieldError::new("Failed to save updated OU list", juniper::Value::null())
-            })?;
-
-        Ok(Success::new())
+        ou::create_ou(context, name).await
     }
 
     async fn delete_ou(context: &Context<Handler>, name: String) -> FieldResult<Success> {
-        let span = debug_span!("[GraphQL mutation] delete_ou");
-        span.in_scope(|| debug!(?name));
-
-        let handler = context
-            .get_admin_handler()
-            .ok_or_else(field_error_callback(&span, "Unauthorized OU deletion"))?;
-
-        let name_lower = name.trim().to_lowercase();
-        if name_lower == "people" || name_lower == "groups" || name_lower == "all" {
-            return Err("Cannot delete built-in OU 'people', 'groups', or 'All'".into());
-        }
-
-        let inner = AdminBackendHandler::unsafe_get_handler(handler);
-        let mut current_ous = inner
-            .get_allowed_ous()
-            .await
-            .map_err(|_e| FieldError::new("Failed to load allowedous", juniper::Value::null()))?;
-
-        let has_children = current_ous.iter().any(|ou| {
-            let parts: Vec<&str> = ou.splitn(2, '\\').collect();
-            parts.len() == 2 && parts[0].to_lowercase() == name_lower
-        });
-
-        if has_children {
-            return Err(FieldError::new(
-                format!(
-                    "Cannot delete primary OU '{}' because it still contains secondary OUs. Delete the secondary OUs first.",
-                    name
-                ),
-                juniper::Value::null(),
-            ));
-        }
-
-        // === Reassign users and groups still in this OU to default OUs ===
-        // This ensures no user/group is left pointing to a deleted OU.
-        // Best-effort reassignment using the same pattern as change_user_ou / change_group_ou.
-
-        // Reassign users still using this OU → move to "people"
-        if let Ok(users) = inner.list_users(None, false).await {
-            for user_and_groups in users {
-                let current_ou = user_and_groups
-                    .user
-                    .attributes
-                    .iter()
-                    .find(|attr| attr.name.as_str() == "ou")
-                    .and_then(|attr| match &attr.value {
-                        lldap_domain::types::AttributeValue::String(
-                            lldap_domain::types::Cardinality::Singleton(s),
-                        ) => Some(s.clone()),
-                        _ => None,
-                    })
-                    .unwrap_or_default();
-
-                if current_ou.to_lowercase() == name_lower {
-                    let insert_attributes = vec![lldap_domain::types::Attribute {
-                        name: AttributeName::from("ou"),
-                        value: lldap_domain::types::AttributeValue::String(
-                            lldap_domain::types::Cardinality::Singleton("people".to_string()),
-                        ),
-                    }];
-
-                    let update_req = UpdateUserRequest {
-                        user_id: user_and_groups.user.user_id.clone(),
-                        email: None,
-                        display_name: None,
-                        delete_attributes: vec![],
-                        insert_attributes,
-                    };
-
-                    if let Err(e) = inner.update_user(update_req).await {
-                        warn!(
-                            "Failed to reassign user {} from deleted OU '{}': {}",
-                            user_and_groups.user.user_id, name, e
-                        );
-                    } else {
-                        info!(
-                            "Reassigned user {} from deleted OU '{}' to 'people'",
-                            user_and_groups.user.user_id, name
-                        );
-                    }
-                }
-            }
-        }
-
-        // Reassign groups still using this OU → move to "groups"
-        if let Ok(groups) = inner.list_groups(None).await {
-            for group in groups {
-                let current_ou = group
-                    .attributes
-                    .iter()
-                    .find(|attr| attr.name.as_str() == "ou")
-                    .and_then(|attr| match &attr.value {
-                        lldap_domain::types::AttributeValue::String(
-                            lldap_domain::types::Cardinality::Singleton(s),
-                        ) => Some(s.clone()),
-                        _ => None,
-                    })
-                    .unwrap_or_default();
-
-                if current_ou.to_lowercase() == name_lower {
-                    let insert_attributes = vec![lldap_domain::types::Attribute {
-                        name: AttributeName::from("ou"),
-                        value: lldap_domain::types::AttributeValue::String(
-                            lldap_domain::types::Cardinality::Singleton("groups".to_string()),
-                        ),
-                    }];
-
-                    let update_req = UpdateGroupRequest {
-                        group_id: group.id,
-                        display_name: None,
-                        delete_attributes: vec![],
-                        insert_attributes,
-                    };
-
-                    if let Err(e) = inner.update_group(update_req).await {
-                        warn!(
-                            "Failed to reassign group {} from deleted OU '{}': {}",
-                            group.id.0, name, e
-                        );
-                    } else {
-                        info!(
-                            "Reassigned group {} from deleted OU '{}' to 'groups'",
-                            group.id.0, name
-                        );
-                    }
-                }
-            }
-        }
-
-        // Now safe to remove the OU from the allowed list
-        current_ous.retain(|o| o.to_lowercase() != name_lower);
-
-        inner
-            .set_system_config("allowedous", serde_json::to_string(&current_ous).unwrap())
-            .await
-            .map_err(|_e| {
-                FieldError::new("Failed to save updated OU list", juniper::Value::null())
-            })?;
-
-        info!("Organizational Unit '{}' deleted.", name);
-        Ok(Success::new())
+        ou::delete_ou(context, name).await
     }
 
     async fn change_user_ou(
@@ -815,46 +476,7 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         user_ids: Vec<String>,
         new_ou: String,
     ) -> FieldResult<Success> {
-        let span = debug_span!("[GraphQL mutation] change_user_ou");
-        span.in_scope(|| debug!(?user_ids, ?new_ou));
-
-        let handler = context
-            .get_admin_handler()
-            .ok_or_else(field_error_callback(&span, "Unauthorized OU change"))?;
-
-        let name_lower = new_ou.trim().to_lowercase();
-        if name_lower == "all" {
-            return Err("Cannot move users to built-in OU 'All'".into());
-        }
-
-        for user_id_str in user_ids {
-            let user_id = lldap_domain::types::UserId::new(&user_id_str);
-
-            let insert_attributes = vec![lldap_domain::types::Attribute {
-                name: lldap_domain::types::AttributeName::from("ou"),
-                value: lldap_domain::types::AttributeValue::String(
-                    lldap_domain::types::Cardinality::Singleton(new_ou.clone()),
-                ),
-            }];
-
-            let update_req = lldap_domain::requests::UpdateUserRequest {
-                user_id: user_id.clone(),
-                email: None,
-                display_name: None,
-                delete_attributes: vec![],
-                insert_attributes,
-            };
-
-            handler.update_user(update_req).await.map_err(|e| {
-                FieldError::new(
-                    format!("Failed to change OU for user {}", user_id_str),
-                    graphql_value!({ "details": (e.to_string()) }),
-                )
-            })?;
-            info!("Changed OU for user {} to '{}'", user_id_str, new_ou);
-        }
-
-        Ok(Success::new())
+        ou::change_user_ou(context, user_ids, new_ou).await
     }
 
     async fn change_group_ou(
@@ -862,45 +484,7 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         group_ids: Vec<i32>,
         new_ou: String,
     ) -> FieldResult<Success> {
-        let span = debug_span!("[GraphQL mutation] change_group_ou");
-        span.in_scope(|| debug!(?group_ids, ?new_ou));
-
-        let handler = context
-            .get_admin_handler()
-            .ok_or_else(field_error_callback(&span, "Unauthorized OU change"))?;
-
-        let name_lower = new_ou.trim().to_lowercase();
-        if name_lower == "all" {
-            return Err("Cannot move groups to built-in OU 'All'".into());
-        }
-
-        for group_id in group_ids {
-            let group_id_typed = GroupId(group_id);
-
-            let insert_attributes = vec![lldap_domain::types::Attribute {
-                name: lldap_domain::types::AttributeName::from("ou"),
-                value: lldap_domain::types::AttributeValue::String(
-                    lldap_domain::types::Cardinality::Singleton(new_ou.clone()),
-                ),
-            }];
-
-            let update_req = lldap_domain::requests::UpdateGroupRequest {
-                group_id: group_id_typed,
-                display_name: None,
-                delete_attributes: vec![],
-                insert_attributes,
-            };
-
-            handler.update_group(update_req).await.map_err(|e| {
-                FieldError::new(
-                    format!("Failed to change OU for group {}", group_id),
-                    graphql_value!({ "details": (e.to_string()) }),
-                )
-            })?;
-            info!("Changed OU for group {} to '{}'", group_id, new_ou);
-        }
-
-        Ok(Success::new())
+        ou::change_group_ou(context, group_ids, new_ou).await
     }
 
     async fn add_user_attribute(
@@ -1124,400 +708,73 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         user_id: String,
         encrypted_password: String,
     ) -> FieldResult<bool> {
-        let span = debug_span!("[GraphQL mutation] sync_kerberos_password");
-        let _guard = span.enter();
-
-        let target_user_id = UserId::new(&user_id);
-
-        // Allow regular users to sync their OWN Kerberos principal after password change
-        let handler = context
-            .get_writeable_handler(target_user_id.clone())
-            .ok_or_else(field_error_callback(&span, "Unauthorized Kerberos sync"))?;
-
-        let plain_password = crate::kerberos_transport::decrypt_password(&encrypted_password)
-            .map_err(|e| {
-                FieldError::new(
-                    "Kerberos password decryption failed",
-                    graphql_value!({ "details": (e.to_string()) }),
-                )
-            })?;
-
-        let user = handler
-            .get_user_details(&target_user_id)
-            .await
-            .map_err(|e| {
-                FieldError::new(
-                    "Failed to fetch user for Kerberos sync check",
-                    graphql_value!({ "details": (e.to_string()) }),
-                )
-            })?;
-
-        let sync_enabled = lldap_domain::types::kerberos_sync_enabled(&user.attributes);
-
-        if sync_enabled {
-            kerberos_backend()
-                .sync_principal(&user_id, &plain_password)
-                .map_err(|e| {
-                    FieldError::new("Kerberos sync failed", graphql_value!({ "details": e }))
-                })?;
-            info!(
-                "Kerberos principal synced for user {} (password change by self or admin)",
-                user_id
-            );
-
-            // A first password for an already-disabled user would otherwise mint a live principal.
-            if let Ok(groups) = handler.get_user_groups(&target_user_id).await
-                && groups
-                    .iter()
-                    .any(|g| g.display_name == "lldap_disabled".into())
-            {
-                kerberos_backend().reassert_disabled(&user_id);
-            }
-        } else {
-            info!(
-                "Kerberos sync disabled for user {} (kerberossync != '1'), skipping",
-                user_id
-            );
-        }
-
-        let inner = UserWriteableBackendHandler::unsafe_get_handler(handler);
-        if let Err(e) = inner
-            .ensure_kerberos_principal_consistency(&target_user_id, sync_enabled)
-            .await
-        {
-            warn!(
-                "Failed to record Kerberos principal name for {}: {}",
-                target_user_id, e
-            );
-        }
-
-        Ok(true)
+        kerberos::sync_kerberos_password(context, user_id, encrypted_password).await
     }
 
     async fn export_keytab_for_keycloak(
         context: &Context<Handler>,
         hostname: String,
     ) -> FieldResult<ExportKeytabForKeycloakResponse> {
-        let span = debug_span!("[GraphQL mutation] export_keytab_for_keycloak");
-        span.in_scope(|| debug!("Hostname input: {}", &hostname));
-
-        context
-            .get_admin_handler()
-            .ok_or_else(field_error_callback(&span, "Unauthorized keytab export"))?;
-
-        match kerberos_backend().export_keytab_for_keycloak(&hostname) {
-            Ok(path) => Ok(ExportKeytabForKeycloakResponse {
-                ok: true,
-                path,
-                error_msg: "".to_string(),
-            }),
-            Err(e) => {
-                warn!("Keytab export failed: {}", e);
-                Ok(ExportKeytabForKeycloakResponse {
-                    ok: false,
-                    path: "".to_string(),
-                    error_msg: e.to_string(),
-                })
-            }
-        }
+        kerberos::export_keytab_for_keycloak(context, hostname).await
     }
 
     async fn test_keycloak_connection(
         context: &Context<Handler>,
         input: TestKeycloakConnectionInput,
     ) -> FieldResult<TestKeycloakConnectionResponse> {
-        let span = debug_span!("[GraphQL mutation] test_keycloak_connection");
-        context
-            .get_admin_handler()
-            .ok_or_else(field_error_callback(
-                &span,
-                "Unauthorized Keycloak connection test",
-            ))?;
-
-        let client = KeycloakClient::from_test_input(
-            input.url,
-            input.realm,
-            input.admin_user,
-            input.admin_pass,
-        );
-
-        match client.test_connection().await {
-            Ok(message) => Ok(TestKeycloakConnectionResponse { ok: true, message }),
-            Err(e) => Ok(TestKeycloakConnectionResponse {
-                ok: false,
-                message: format!("❌ {}", e),
-            }),
-        }
+        keycloak::test_keycloak_connection(context, input).await
     }
 
     async fn save_keycloak_config(
         context: &Context<Handler>,
         input: SaveKeycloakConfigInput,
     ) -> FieldResult<SaveKeycloakConfigResponse> {
-        let span = debug_span!("[GraphQL mutation] save_keycloak_config");
-        context
-            .get_admin_handler()
-            .ok_or_else(field_error_callback(
-                &span,
-                "Unauthorized Keycloak config change",
-            ))?;
-
-        let config = KeycloakConfig {
-            url: input.url,
-            realm: input.realm,
-            admin_user: input.admin_user,
-        };
-
-        match config.save() {
-            Ok(path) => Ok(SaveKeycloakConfigResponse {
-                ok: true,
-                message: format!(
-                    "✅ Keycloak settings saved to {} (password remains in-memory/env only)",
-                    path.display()
-                ),
-            }),
-            Err(e) => Ok(SaveKeycloakConfigResponse {
-                ok: false,
-                message: format!("❌ Failed to save config: {}", e),
-            }),
-        }
+        keycloak::save_keycloak_config(context, input).await
     }
 
     async fn push_realm_to_keycloak(
         context: &Context<Handler>,
         input: PushRealmToKeycloakInput,
     ) -> FieldResult<PushRealmResponse> {
-        let span = debug_span!("[GraphQL mutation] push_realm_to_keycloak");
-        context
-            .get_admin_handler()
-            .ok_or_else(field_error_callback(
-                &span,
-                "Unauthorized Keycloak realm push",
-            ))?;
-
-        let client = KeycloakClient::from_test_input(
-            input.url,
-            input.realm,
-            input.admin_user,
-            input.admin_pass,
-        );
-
-        let enable_hsts = input.enable_hsts;
-        let enable_brute_force = input.enable_brute_force;
-
-        let message = client
-            .setup_realm(
-                input.lldap_url,
-                input.sync_username,
-                input.sync_password,
-                enable_hsts,
-                enable_brute_force,
-            )
-            .await
-            .map_err(|e| juniper::FieldError::new(e.to_string(), juniper::Value::null()))?;
-
-        Ok(PushRealmResponse { ok: true, message })
+        keycloak::push_realm_to_keycloak(context, input).await
     }
 
     async fn set_posix_settings(
         context: &Context<Handler>,
         input: PosixSettingsInput,
     ) -> FieldResult<PosixSettingsResponse> {
-        let span = debug_span!("[GraphQL mutation] set_posix_settings");
-        span.in_scope(|| debug!(?input));
-
-        // === CONDITIONAL range enforcement — only check fields that are actually enabled ===
-        if input.user_uidnumber_assign
-            && (input.user_uidnumber_start < 3000
-                || input.user_uidnumber_start > 60000
-                || input.user_uidnumber_max < 3000
-                || input.user_uidnumber_max > 60000)
-        {
-            return Err(FieldError::new(
-                "user_uidnumber must be between 3000 and 60000",
-                juniper::Value::null(),
-            ));
-        }
-        if input.user_gidnumber_assign
-            && (input.user_gidnumber_start < 3000 || input.user_gidnumber_start > 60000)
-        {
-            return Err(FieldError::new(
-                "user_gidnumber_start must be between 3000 and 60000",
-                juniper::Value::null(),
-            ));
-        }
-        if input.group_gidnumber_assign
-            && (input.group_gidnumber_start < 3000
-                || input.group_gidnumber_start > 60000
-                || input.group_gidnumber_max < 3000
-                || input.group_gidnumber_max > 60000)
-        {
-            return Err(FieldError::new(
-                "group_gidnumber must be between 3000 and 60000",
-                juniper::Value::null(),
-            ));
-        }
-
-        let handler = context
-            .get_admin_handler()
-            .ok_or_else(field_error_callback(
-                &span,
-                "Unauthorized POSIX settings change",
-            ))?;
-
-        let inner = AdminBackendHandler::unsafe_get_handler(handler);
-
-        let settings = lldap_domain_handlers::handler::PosixSettings {
-            user_uidnumber_assign: input.user_uidnumber_assign,
-            user_uidnumber_start: input.user_uidnumber_start as i64,
-            user_uidnumber_max: input.user_uidnumber_max as i64,
-            user_gidnumber_assign: input.user_gidnumber_assign,
-            user_gidnumber_start: input.user_gidnumber_start as i64,
-            user_loginshell_assign: input.user_loginshell_assign,
-            user_loginshell_default: input.user_loginshell_default,
-            user_homedirectory_assign: input.user_homedirectory_assign,
-            user_homedirectory_prefix: input.user_homedirectory_prefix,
-            group_gidnumber_assign: input.group_gidnumber_assign,
-            group_gidnumber_start: input.group_gidnumber_start as i64,
-            group_gidnumber_max: input.group_gidnumber_max as i64,
-        };
-
-        inner.set_posix_settings(settings).await.map_err(|e| {
-            FieldError::new(
-                "Failed to save POSIX settings",
-                graphql_value!({ "details": (e.to_string()) }),
-            )
-        })?;
-
-        Ok(PosixSettingsResponse {
-            success: true,
-            message: "✅ POSIX settings saved (toggles and ranges updated)".to_string(),
-        })
+        posix::set_posix_settings(context, input).await
     }
 
     async fn reassign_user_uid_numbers(
         context: &Context<Handler>,
     ) -> FieldResult<PosixSettingsResponse> {
-        let span = debug_span!("[GraphQL mutation] reassign_user_uid_numbers");
-        span.in_scope(|| debug!("Reassigning all user uidNumbers"));
-
-        let handler = context
-            .get_admin_handler()
-            .ok_or_else(field_error_callback(
-                &span,
-                "Unauthorized uidNumber reassign",
-            ))?;
-
-        let inner = AdminBackendHandler::unsafe_get_handler(handler);
-
-        posix_reassign_response(
-            inner.reassign_user_uid_numbers().await,
-            "Failed to reassign user uidNumbers",
-            "✅ All user uidNumbers have been reassigned",
-        )
+        posix::reassign_user_uid_numbers(context).await
     }
 
     async fn reassign_user_gid_numbers(
         context: &Context<Handler>,
     ) -> FieldResult<PosixSettingsResponse> {
-        let span = debug_span!("[GraphQL mutation] reassign_user_gid_numbers");
-        span.in_scope(|| debug!("Reassigning all user gidNumbers"));
-
-        let handler = context
-            .get_admin_handler()
-            .ok_or_else(field_error_callback(
-                &span,
-                "Unauthorized gidNumber reassign",
-            ))?;
-
-        let inner = AdminBackendHandler::unsafe_get_handler(handler);
-
-        posix_reassign_response(
-            inner.reassign_user_gid_numbers().await,
-            "Failed to reassign user gidNumbers",
-            "✅ All user gidNumbers have been reassigned",
-        )
+        posix::reassign_user_gid_numbers(context).await
     }
 
     async fn reassign_user_homedirectories(
         context: &Context<Handler>,
     ) -> FieldResult<PosixSettingsResponse> {
-        let span = debug_span!("[GraphQL mutation] reassign_user_homedirectories");
-        span.in_scope(|| debug!("Reassigning all user homeDirectories"));
-
-        let handler = context
-            .get_admin_handler()
-            .ok_or_else(field_error_callback(
-                &span,
-                "Unauthorized homeDirectory reassign",
-            ))?;
-
-        let inner = AdminBackendHandler::unsafe_get_handler(handler);
-
-        posix_reassign_response(
-            inner.reassign_user_homedirectories().await,
-            "Failed to reassign user homeDirectories",
-            "✅ All user homeDirectories have been reassigned",
-        )
+        posix::reassign_user_homedirectories(context).await
     }
 
     async fn reassign_user_loginshells(
         context: &Context<Handler>,
     ) -> FieldResult<PosixSettingsResponse> {
-        let span = debug_span!("[GraphQL mutation] reassign_user_loginshells");
-        span.in_scope(|| debug!("Reassigning all user loginShells"));
-
-        let handler = context
-            .get_admin_handler()
-            .ok_or_else(field_error_callback(
-                &span,
-                "Unauthorized loginShell reassign",
-            ))?;
-
-        let inner = AdminBackendHandler::unsafe_get_handler(handler);
-
-        posix_reassign_response(
-            inner.reassign_user_loginshells().await,
-            "Failed to reassign user loginShells",
-            "✅ All user loginShells have been reassigned",
-        )
+        posix::reassign_user_loginshells(context).await
     }
 
     async fn reassign_gid_numbers(
         context: &Context<Handler>,
     ) -> FieldResult<PosixSettingsResponse> {
-        let span = debug_span!("[GraphQL mutation] reassign_gid_numbers");
-        span.in_scope(|| debug!("Reassigning all group gidNumbers"));
-
-        let handler = context
-            .get_admin_handler()
-            .ok_or_else(field_error_callback(
-                &span,
-                "Unauthorized gidNumber reassign",
-            ))?;
-
-        let inner = AdminBackendHandler::unsafe_get_handler(handler);
-
-        posix_reassign_response(
-            inner.reassign_gid_numbers().await,
-            "Failed to reassign gidNumbers",
-            "✅ All group gidNumbers have been reassigned",
-        )
+        posix::reassign_gid_numbers(context).await
     }
-}
-
-fn posix_reassign_response<E: std::fmt::Display>(
-    result: Result<(), E>,
-    failure_msg: &str,
-    success_msg: &str,
-) -> FieldResult<PosixSettingsResponse> {
-    result.map_err(|e| {
-        FieldError::new(failure_msg, graphql_value!({ "details": (e.to_string()) }))
-    })?;
-    Ok(PosixSettingsResponse {
-        success: true,
-        message: success_msg.to_string(),
-    })
 }
 
 fn validate_new_attribute_name(

@@ -74,7 +74,12 @@ async fn create_admin_user(handler: &SqlBackendHandler, config: &Configuration) 
             register_password(
                 handler,
                 config.ldap_user_dn.clone(),
-                config.ldap_user_pass.as_ref().unwrap(),
+                config
+                    .ldap_user_pass
+                    .as_ref()
+                    .unwrap()
+                    .unsecure()
+                    .as_bytes(),
             )
         })
         .await
@@ -203,7 +208,9 @@ async fn set_up_server(config: Configuration) -> Result<(ServerBuilder, Database
             config
                 .ldap_user_pass
                 .as_ref()
-                .expect(ADMIN_PASSWORD_MISSING_ERROR),
+                .expect(ADMIN_PASSWORD_MISSING_ERROR)
+                .unsecure()
+                .as_bytes(),
         )
         .instrument(span)
         .await

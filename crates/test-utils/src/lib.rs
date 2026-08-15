@@ -54,6 +54,7 @@ mockall::mock! {
         async fn get_user_groups(&self, user_id: &UserId) -> Result<HashSet<GroupDetails>>;
         async fn add_user_to_group(&self, user_id: &UserId, group_id: GroupId) -> Result<()>;
         async fn remove_user_from_group(&self, user_id: &UserId, group_id: GroupId) -> Result<()>;
+        async fn ensure_kerberos_principal_consistency(&self, user_id: &UserId, enabled: bool) -> Result<()>;
     }
     #[async_trait]
     impl ReadSchemaBackendHandler for TestBackendHandler {
@@ -100,9 +101,6 @@ mockall::mock! {
     impl SystemConfigBackendHandler for TestBackendHandler {
         async fn get_allowed_ous(&self) -> Result<Vec<String>>;
         async fn set_system_config(&self, key: &str, value: String) -> Result<()>;
-        async fn ensure_kerberos_principal_consistency(
-            &self, user_id: &UserId, enabled: bool,
-        ) -> Result<()>;
     }
 }
 

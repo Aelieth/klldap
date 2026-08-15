@@ -93,10 +93,7 @@ impl BackendHandler for SqlBackendHandler {}
 pub mod tests {
     use super::*;
     use crate::sql_tables::init_table;
-    use lldap_auth::{
-        opaque::{self, server::generate_random_private_key},
-        registration,
-    };
+    use lldap_auth::opaque::server::generate_random_private_key;
     use lldap_domain::{
         requests::{CreateGroupRequest, CreateUserRequest},
         types::{Attribute as DomainAttribute, GroupId, UserId},
@@ -124,30 +121,8 @@ pub mod tests {
     }
 
     pub async fn insert_user(handler: &SqlBackendHandler, name: &str, pass: &str) {
-        use lldap_opaque_handler::OpaqueHandler;
         insert_user_no_password(handler, name).await;
-        let mut rng = rand::rngs::OsRng;
-        let client_registration_start =
-            opaque::client::registration::start_registration(pass.as_bytes(), &mut rng).unwrap();
-        let response = handler
-            .registration_start(registration::ClientRegistrationStartRequest {
-                username: name.into(),
-                registration_start_request: client_registration_start.message,
-            })
-            .await
-            .unwrap();
-        let registration_upload = opaque::client::registration::finish_registration(
-            client_registration_start.state,
-            pass.as_bytes(),
-            response.registration_response,
-            &mut rng,
-        )
-        .unwrap();
-        handler
-            .registration_finish(registration::ClientRegistrationFinishRequest {
-                server_data: response.server_data,
-                registration_upload: registration_upload.message,
-            })
+        lldap_opaque_handler::register_password(handler, name.into(), pass.as_bytes())
             .await
             .unwrap();
     }

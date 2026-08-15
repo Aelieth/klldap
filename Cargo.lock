@@ -3279,6 +3279,7 @@ dependencies = [
  "lldap_auth",
  "lldap_domain",
  "lldap_domain_model",
+ "rand 0.8.6",
 ]
 
 [[package]]
@@ -3344,7 +3345,6 @@ dependencies = [
  "pretty_assertions",
  "rand 0.8.6",
  "sea-orm",
- "secstr",
  "serde",
  "serde_json",
  "serial_test",

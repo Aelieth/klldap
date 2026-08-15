@@ -14,8 +14,8 @@ use lldap_domain::{
 };
 use lldap_domain_handlers::handler::{
     BackendHandler, GroupBackendHandler, GroupListerBackendHandler, GroupRequestFilter,
-    PasswordHandler, ReadSchemaBackendHandler, SchemaBackendHandler, UserBackendHandler,
-    UserListerBackendHandler, UserRequestFilter,
+    PosixBackendHandler, ReadSchemaBackendHandler, SchemaBackendHandler,
+    SystemConfigBackendHandler, UserBackendHandler, UserListerBackendHandler, UserRequestFilter,
 };
 use lldap_domain_model::error::Result;
 use lldap_opaque_handler::OpaqueHandler;
@@ -43,12 +43,21 @@ pub trait ReadonlyBackendHandler: UserReadableBackendHandler {
 #[async_trait]
 pub trait UserWriteableBackendHandler: UserReadableBackendHandler {
     async fn update_user(&self, request: UpdateUserRequest) -> Result<()>;
-    fn unsafe_get_handler(&self) -> &dyn BackendHandler;
+    async fn ensure_kerberos_principal_consistency(
+        &self,
+        user_id: &UserId,
+        enabled: bool,
+    ) -> Result<()>;
 }
 
 #[async_trait]
 pub trait AdminBackendHandler:
-    UserWriteableBackendHandler + ReadonlyBackendHandler + SchemaBackendHandler + OpaqueHandler
+    UserWriteableBackendHandler
+    + ReadonlyBackendHandler
+    + SchemaBackendHandler
+    + SystemConfigBackendHandler
+    + PosixBackendHandler
+    + OpaqueHandler
 {
     async fn create_user(&self, request: CreateUserRequest) -> Result<()>;
     async fn delete_user(&self, user_id: &UserId) -> Result<()>;
@@ -65,7 +74,6 @@ pub trait AdminBackendHandler:
     async fn add_group_object_class(&self, name: &LdapObjectClass) -> Result<()>;
     async fn delete_user_object_class(&self, name: &LdapObjectClass) -> Result<()>;
     async fn delete_group_object_class(&self, name: &LdapObjectClass) -> Result<()>;
-    fn unsafe_get_handler(&self) -> &dyn BackendHandler;
 }
 
 #[async_trait]
@@ -100,8 +108,15 @@ impl<Handler: BackendHandler> UserWriteableBackendHandler for Handler {
     async fn update_user(&self, request: UpdateUserRequest) -> Result<()> {
         <Handler as UserBackendHandler>::update_user(self, request).await
     }
-    fn unsafe_get_handler(&self) -> &dyn BackendHandler {
-        self
+    async fn ensure_kerberos_principal_consistency(
+        &self,
+        user_id: &UserId,
+        enabled: bool,
+    ) -> Result<()> {
+        <Handler as UserBackendHandler>::ensure_kerberos_principal_consistency(
+            self, user_id, enabled,
+        )
+        .await
     }
 }
 
@@ -152,9 +167,6 @@ impl<Handler: BackendHandler + OpaqueHandler> AdminBackendHandler for Handler {
     async fn delete_group_object_class(&self, name: &LdapObjectClass) -> Result<()> {
         <Handler as SchemaBackendHandler>::delete_group_object_class(self, name).await
     }
-    fn unsafe_get_handler(&self) -> &dyn BackendHandler {
-        self
-    }
 }
 
 pub struct AccessControlledBackendHandler<Handler> {
@@ -175,9 +187,7 @@ impl<Handler> AccessControlledBackendHandler<Handler> {
     }
 }
 
-impl<Handler: BackendHandler + OpaqueHandler + PasswordHandler>
-    AccessControlledBackendHandler<Handler>
-{
+impl<Handler: BackendHandler + OpaqueHandler> AccessControlledBackendHandler<Handler> {
     pub fn new(handler: Handler) -> Self {
         Self { handler }
     }
@@ -207,7 +217,7 @@ impl<Handler: BackendHandler + OpaqueHandler + PasswordHandler>
         &'a self,
         validation_result: &ValidationResults,
         user_id: UserId, // owned UserId (no &)
-    ) -> Option<&'a (impl UserWriteableBackendHandler + PasswordHandler + 'a)> {
+    ) -> Option<&'a (impl UserWriteableBackendHandler + OpaqueHandler + 'a)> {
         validation_result
             .can_write(&user_id)
             .then_some(&self.handler)
@@ -267,9 +277,7 @@ impl<Handler: BackendHandler + OpaqueHandler + PasswordHandler>
         }
     }
 
-    /// Delegates the Kerberos principal consistency method to the inner handler.
-    /// This makes the method available on &AccessControlledBackendHandler (used in LDAP password.rs)
-    /// while keeping the permission layer intact. Proper long-term design — no hacks.
+    /// LDAP password.rs already checked can_change_password; this avoids unsafe_get_handler.
     pub async fn ensure_kerberos_principal_consistency(
         &self,
         user_id: &UserId,

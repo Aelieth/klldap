@@ -18,7 +18,6 @@ chrono = { workspace = true }
 itertools = { workspace = true }
 orion = { workspace = true }
 rand = { workspace = true }
-secstr = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }

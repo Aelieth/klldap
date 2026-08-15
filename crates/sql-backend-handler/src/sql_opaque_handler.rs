@@ -10,7 +10,6 @@ use lldap_domain_model::{
 };
 use lldap_opaque_handler::{OpaqueHandler, login, registration};
 use sea_orm::{ActiveModelTrait, ActiveValue, EntityTrait, QuerySelect};
-use secstr::SecUtf8;
 use tracing::{debug, info, instrument, warn};
 
 type SqlOpaqueHandler = SqlBackendHandler;
@@ -329,37 +328,6 @@ impl OpaqueHandler for SqlOpaqueHandler {
     }
 }
 
-/// Convenience function to set a user's password.
-#[instrument(skip_all, level = "debug", err, fields(username = %username.as_str()))]
-pub async fn register_password(
-    opaque_handler: &SqlOpaqueHandler,
-    username: UserId,
-    password: &SecUtf8,
-) -> Result<()> {
-    let mut rng = rand::rngs::OsRng;
-    use registration::*;
-    let registration_start =
-        opaque::client::registration::start_registration(password.unsecure().as_bytes(), &mut rng)?;
-    let start_response = opaque_handler
-        .registration_start(ClientRegistrationStartRequest {
-            username,
-            registration_start_request: registration_start.message,
-        })
-        .await?;
-    let registration_finish = opaque::client::registration::finish_registration(
-        registration_start.state,
-        password.unsecure().as_bytes(),
-        start_response.registration_response,
-        &mut rng,
-    )?;
-    opaque_handler
-        .registration_finish(ClientRegistrationFinishRequest {
-            server_data: start_response.server_data,
-            registration_upload: registration_finish.message,
-        })
-        .await
-}
-
 #[cfg(test)]
 mod tests {
     use self::opaque::server::generate_random_private_key;
@@ -368,6 +336,7 @@ mod tests {
     use crate::sql_backend_handler::tests::{
         get_initialized_db, insert_group, insert_membership, insert_user, insert_user_no_password,
     };
+    use lldap_opaque_handler::register_password;
 
     async fn attempt_login(
         opaque_handler: &SqlOpaqueHandler,
@@ -408,12 +377,7 @@ mod tests {
         attempt_login(&backend_handler, "bob", "bob00")
             .await
             .unwrap_err();
-        register_password(
-            &backend_handler,
-            UserId::new("bob"),
-            &secstr::SecUtf8::from("bob00"),
-        )
-        .await?;
+        register_password(&backend_handler, UserId::new("bob"), b"bob00").await?;
         attempt_login(&backend_handler, "bob", "wrong_password")
             .await
             .unwrap_err();

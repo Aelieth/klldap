@@ -12,9 +12,8 @@ use lldap_domain::{
     },
 };
 use lldap_domain_handlers::handler::{
-    GroupBackendHandler, PosixBackendHandler, PosixSettings, ReadSchemaBackendHandler,
-    SubStringFilter, SystemConfigBackendHandler, UserBackendHandler, UserListerBackendHandler,
-    UserRequestFilter,
+    GroupBackendHandler, ReadSchemaBackendHandler, SubStringFilter, SystemConfigBackendHandler,
+    UserBackendHandler, UserListerBackendHandler, UserRequestFilter,
 };
 use lldap_domain_handlers::kerberos::{kerberos_backend, principal_name};
 use lldap_domain_model::{
@@ -336,40 +335,18 @@ impl SqlBackendHandler {
         let lower_email = request.email.as_ref().map(|s| s.as_str().to_lowercase());
         let now = chrono::Utc::now().naive_utc();
 
-        // === POSIX RANGE + DUPLICATE CHECKS (uidnumber on users; gidnumber uniqueness is group-only) ===
-        let _settings = Self::get_posix_settings_with_transaction(transaction).await?;
-
-        for attr in &update_user_attributes {
-            let name = match &attr.attribute_name {
-                ActiveValue::Set(n) => n.as_str(),
-                _ => continue,
-            };
-
-            let value = match &attr.value {
-                ActiveValue::Set(Serialized(bytes)) => match String::from_utf8(bytes.clone()) {
-                    Ok(s) => s.trim().parse::<i64>().unwrap_or(0),
-                    Err(_) => continue,
-                },
-                _ => continue,
-            };
-
-            if name == "uidnumber" || name == "gidnumber" {
-                if !(3000..=60000).contains(&value) {
-                    return Err(DomainError::InternalError(format!(
-                        "{} must be between 3000 and 60000",
-                        name
-                    )));
+        let posix_numbers: Vec<(String, i64)> = update_user_attributes
+            .iter()
+            .filter_map(|attr| match (&attr.attribute_name, &attr.value) {
+                (ActiveValue::Set(name), ActiveValue::Set(Serialized(bytes))) => {
+                    String::from_utf8(bytes.clone())
+                        .ok()
+                        .map(|s| (name.as_str().to_owned(), s.trim().parse().unwrap_or(0)))
                 }
-
-                if name == "uidnumber" && Self::is_uidnumber_taken(transaction, value).await? {
-                    return Err(DomainError::InternalError(format!(
-                        "Number {} is already assigned to another user/group",
-                        value
-                    )));
-                }
-                // NOTE: gidnumber on *users* deliberately allows duplicates
-            }
-        }
+                _ => None,
+            })
+            .collect();
+        Self::validate_posix_numbers(transaction, &posix_numbers, Some(&request.user_id)).await?;
 
         let update_user = model::users::ActiveModel {
             user_id: ActiveValue::Set(request.user_id.clone()),
@@ -448,379 +425,9 @@ impl SystemConfigBackendHandler for SqlBackendHandler {
 
         Ok(())
     }
-
-    #[instrument(skip(self), level = "debug", err)]
-    async fn ensure_kerberos_principal_consistency(
-        &self,
-        user_id: &UserId,
-        enabled: bool,
-    ) -> Result<()> {
-        use chrono::Utc;
-
-        let now = Utc::now().naive_utc();
-
-        if enabled {
-            let principal = principal_name(user_id.as_str());
-            tracing::info!(
-                "Kerberos sync succeeded → injecting protected krbPrincipalName = {} for user {}",
-                principal,
-                user_id
-            );
-
-            let update = model::users::ActiveModel {
-                user_id: ActiveValue::Set(user_id.clone()),
-                krb_principal_name: ActiveValue::Set(Some(principal)),
-                modified_date: ActiveValue::Set(now),
-                ..Default::default()
-            };
-            update
-                .update(&self.sql_pool)
-                .await
-                .map_err(lldap_domain_model::error::DomainError::DatabaseError)?;
-        } else {
-            tracing::info!(
-                "Kerberos sync disabled → clearing krbPrincipalName for user {}",
-                user_id
-            );
-
-            let update = model::users::ActiveModel {
-                user_id: ActiveValue::Set(user_id.clone()),
-                krb_principal_name: ActiveValue::Set(None),
-                modified_date: ActiveValue::Set(now),
-                ..Default::default()
-            };
-            update
-                .update(&self.sql_pool)
-                .await
-                .map_err(lldap_domain_model::error::DomainError::DatabaseError)?;
-        }
-        Ok(())
-    }
-}
-
-// === FULL POSIX SETTINGS (single source of truth - matches PublicSchema) ===
-async fn posix_upsert_user_attribute(
-    tx: &DatabaseTransaction,
-    user_id: UserId,
-    attribute: &str,
-    value: Vec<u8>,
-) -> Result<()> {
-    let attr = model::user_attributes::ActiveModel {
-        user_id: Set(user_id.clone()),
-        attribute_name: Set(AttributeName::from(attribute)),
-        value: Set(Serialized(value)),
-    };
-    model::UserAttributes::insert(attr)
-        .on_conflict(
-            OnConflict::columns([
-                model::user_attributes::Column::UserId,
-                model::user_attributes::Column::AttributeName,
-            ])
-            .update_column(model::user_attributes::Column::Value)
-            .to_owned(),
-        )
-        .exec(tx)
-        .await?;
-    model::users::ActiveModel {
-        user_id: Set(user_id),
-        modified_date: Set(chrono::Utc::now().naive_utc()),
-        ..Default::default()
-    }
-    .update(tx)
-    .await?;
-    Ok(())
-}
-
-async fn posix_clear_user_attribute(tx: &DatabaseTransaction, attribute: &str) -> Result<()> {
-    model::UserAttributes::delete_many()
-        .filter(model::user_attributes::Column::AttributeName.eq(attribute))
-        .exec(tx)
-        .await?;
-    Ok(())
 }
 
 impl SqlBackendHandler {
-    pub async fn get_posix_settings(&self) -> Result<PosixSettings> {
-        let config = system_config::Entity::find()
-            .filter(system_config::Column::Key.eq("posix_settings"))
-            .one(&self.sql_pool)
-            .await?;
-
-        let json_str = config
-            .map(|c| c.value)
-            .unwrap_or_else(|| serde_json::to_string(&PosixSettings::default()).unwrap());
-
-        serde_json::from_str(&json_str).map_err(|e| {
-            DomainError::InternalError(format!("Failed to parse posix_settings JSON: {}", e))
-        })
-    }
-
-    pub async fn set_posix_settings(&self, settings: PosixSettings) -> Result<()> {
-        let json = serde_json::to_string(&settings).map_err(|e| {
-            DomainError::InternalError(format!("Failed to serialize posix_settings: {}", e))
-        })?;
-        self.set_system_config("posix_settings", json).await
-    }
-
-    // Private transaction-safe helpers
-    pub(crate) async fn get_posix_settings_with_transaction(
-        transaction: &DatabaseTransaction,
-    ) -> Result<PosixSettings> {
-        let config = system_config::Entity::find()
-            .filter(system_config::Column::Key.eq("posix_settings"))
-            .one(transaction)
-            .await?;
-
-        let json_str = config
-            .map(|c| c.value)
-            .unwrap_or_else(|| serde_json::to_string(&PosixSettings::default()).unwrap());
-
-        serde_json::from_str(&json_str).map_err(|e| {
-            DomainError::InternalError(format!("Failed to parse posix_settings JSON: {}", e))
-        })
-    }
-
-    // === NEXT AVAILABLE POSIX NUMBER HELPERS (respect admin overrides + skip collisions) ===
-    pub(crate) async fn next_available_uid_number(
-        transaction: &DatabaseTransaction,
-        start: i64,
-        max: i64,
-    ) -> Result<i64> {
-        if start > max {
-            return Err(DomainError::InternalError(format!(
-                "uidNumber start ({}) > max ({})",
-                start, max
-            )));
-        }
-        let mut candidate = start;
-        while candidate <= max {
-            if !Self::is_uidnumber_taken(transaction, candidate).await? {
-                return Ok(candidate);
-            }
-            candidate += 1;
-        }
-        Err(DomainError::InternalError(format!(
-            "No available uidNumber in range {}-{} (all taken)",
-            start, max
-        )))
-    }
-
-    pub(crate) async fn next_available_gid_number(
-        transaction: &DatabaseTransaction,
-        start: i64,
-        max: i64,
-    ) -> Result<i64> {
-        if start > max {
-            return Err(DomainError::InternalError(format!(
-                "gidNumber start ({}) > max ({})",
-                start, max
-            )));
-        }
-        let mut candidate = start;
-        while candidate <= max {
-            if !Self::is_gidnumber_taken(transaction, candidate).await? {
-                return Ok(candidate);
-            }
-            candidate += 1;
-        }
-        Err(DomainError::InternalError(format!(
-            "No available gidNumber in range {}-{} (all taken)",
-            start, max
-        )))
-    }
-
-    // === DUPLICATE NUMBER ENFORCEMENT HELPERS (uidnumber uniqueness for users; gidnumber uniqueness for groups) ===
-    pub(crate) async fn is_uidnumber_taken(
-        transaction: &DatabaseTransaction,
-        uid: i64,
-    ) -> Result<bool> {
-        let count = model::UserAttributes::find()
-            .filter(model::UserAttributesColumn::AttributeName.eq("uidnumber"))
-            .filter(model::UserAttributesColumn::Value.eq(uid.to_string().into_bytes()))
-            .count(transaction)
-            .await?;
-        Ok(count > 0)
-    }
-
-    pub(crate) async fn is_gidnumber_taken(
-        transaction: &DatabaseTransaction,
-        gid: i64,
-    ) -> Result<bool> {
-        let count = model::GroupAttributes::find()
-            .filter(model::GroupAttributesColumn::AttributeName.eq("gidnumber"))
-            .filter(model::GroupAttributesColumn::Value.eq(gid.to_string().into_bytes()))
-            .count(transaction)
-            .await?;
-        Ok(count > 0)
-    }
-
-    #[instrument(skip(self), level = "info", err)]
-    pub async fn reassign_gid_numbers(&self) -> Result<()> {
-        let settings = self.get_posix_settings().await?;
-        self.sql_pool
-            .transaction::<_, (), DomainError>(|transaction| {
-                Box::pin(async move {
-                    if settings.group_gidnumber_assign {
-                        let groups = model::Group::find()
-                            .order_by_asc(model::groups::Column::CreationDate)
-                            .all(transaction)
-                            .await?;
-                        for (next_gid, group) in
-                            (settings.group_gidnumber_start..).zip(groups.into_iter())
-                        {
-                            let gid_value = next_gid.to_string().into_bytes();
-                            let attr = model::group_attributes::ActiveModel {
-                                group_id: Set(group.group_id),
-                                attribute_name: Set(AttributeName::from("gidnumber")),
-                                value: Set(Serialized(gid_value)),
-                            };
-                            model::GroupAttributes::insert(attr)
-                                .on_conflict(
-                                    OnConflict::columns([
-                                        model::group_attributes::Column::GroupId,
-                                        model::group_attributes::Column::AttributeName,
-                                    ])
-                                    .update_column(model::group_attributes::Column::Value)
-                                    .to_owned(),
-                                )
-                                .exec(transaction)
-                                .await?;
-                            let now = chrono::Utc::now().naive_utc();
-                            let update = model::groups::ActiveModel {
-                                group_id: Set(group.group_id),
-                                modified_date: Set(now),
-                                ..Default::default()
-                            };
-                            update.update(transaction).await?;
-                        }
-                    } else {
-                        model::GroupAttributes::delete_many()
-                            .filter(model::group_attributes::Column::AttributeName.eq("gidnumber"))
-                            .exec(transaction)
-                            .await?;
-                    }
-                    Ok(())
-                })
-            })
-            .await?;
-        Ok(())
-    }
-
-    #[instrument(skip(self), level = "info", err)]
-    pub async fn reassign_user_uid_numbers(&self) -> Result<()> {
-        let settings = self.get_posix_settings().await?;
-        self.sql_pool
-            .transaction::<_, (), DomainError>(|tx| {
-                Box::pin(async move {
-                    if settings.user_uidnumber_assign {
-                        let users = model::User::find()
-                            .order_by_asc(model::users::Column::CreationDate)
-                            .all(tx)
-                            .await?;
-                        for (next, user) in (settings.user_uidnumber_start..).zip(users.into_iter())
-                        {
-                            posix_upsert_user_attribute(
-                                tx,
-                                user.user_id,
-                                "uidnumber",
-                                next.to_string().into_bytes(),
-                            )
-                            .await?;
-                        }
-                    } else {
-                        posix_clear_user_attribute(tx, "uidnumber").await?;
-                    }
-                    Ok(())
-                })
-            })
-            .await?;
-        Ok(())
-    }
-
-    #[instrument(skip(self), level = "info", err)]
-    pub async fn reassign_user_gid_numbers(&self) -> Result<()> {
-        let settings = self.get_posix_settings().await?;
-        self.sql_pool
-            .transaction::<_, (), DomainError>(|tx| {
-                Box::pin(async move {
-                    if settings.user_gidnumber_assign {
-                        // Static assignment: every user gets the same gidNumber from config.
-                        let users = model::User::find().all(tx).await?;
-                        for user in users {
-                            posix_upsert_user_attribute(
-                                tx,
-                                user.user_id,
-                                "gidnumber",
-                                settings.user_gidnumber_start.to_string().into_bytes(),
-                            )
-                            .await?;
-                        }
-                    } else {
-                        posix_clear_user_attribute(tx, "gidnumber").await?;
-                    }
-                    Ok(())
-                })
-            })
-            .await?;
-        Ok(())
-    }
-
-    #[instrument(skip(self), level = "info", err)]
-    pub async fn reassign_user_homedirectories(&self) -> Result<()> {
-        let settings = self.get_posix_settings().await?;
-        self.sql_pool
-            .transaction::<_, (), DomainError>(|tx| {
-                Box::pin(async move {
-                    if settings.user_homedirectory_assign {
-                        let users = model::User::find().all(tx).await?;
-                        for user in users {
-                            let home =
-                                format!("{}/{}", settings.user_homedirectory_prefix, user.user_id);
-                            posix_upsert_user_attribute(
-                                tx,
-                                user.user_id,
-                                "homedirectory",
-                                home.into_bytes(),
-                            )
-                            .await?;
-                        }
-                    } else {
-                        posix_clear_user_attribute(tx, "homedirectory").await?;
-                    }
-                    Ok(())
-                })
-            })
-            .await?;
-        Ok(())
-    }
-
-    #[instrument(skip(self), level = "info", err)]
-    pub async fn reassign_user_loginshells(&self) -> Result<()> {
-        let settings = self.get_posix_settings().await?;
-        self.sql_pool
-            .transaction::<_, (), DomainError>(|tx| {
-                Box::pin(async move {
-                    if settings.user_loginshell_assign {
-                        let users = model::User::find().all(tx).await?;
-                        for user in users {
-                            posix_upsert_user_attribute(
-                                tx,
-                                user.user_id,
-                                "loginshell",
-                                settings.user_loginshell_default.clone().into_bytes(),
-                            )
-                            .await?;
-                        }
-                    } else {
-                        posix_clear_user_attribute(tx, "loginshell").await?;
-                    }
-                    Ok(())
-                })
-            })
-            .await?;
-        Ok(())
-    }
-
     /// Best-effort: mirror `lldap_disabled` group membership onto the user's Kerberos principal via
     /// DISALLOW_ALL_TIX, but only for kerberossync-managed users. Never fails the caller — Kerberos
     /// is advisory here, exactly like `delete_user` and the sync-off branch of update. `disabled`
@@ -930,100 +537,29 @@ impl UserBackendHandler for SqlBackendHandler {
                 Box::pin(async move {
                     let schema = Self::get_schema_with_transaction(transaction).await?;
 
-                    // === POSIX RANGE + DUPLICATE CHECKS (uidnumber on users; gidnumber uniqueness is group-only) ===
                     let settings = Self::get_posix_settings_with_transaction(transaction).await?;
-
-                    for attr in &request.attributes {
-                        let name = attr.name.as_str();
-                        let value = match &attr.value {
-                            AttributeValue::Integer(Cardinality::Singleton(v)) => *v,
-                            _ => continue,
-                        };
-
-                        if name == "uidnumber" || name == "gidnumber" {
-                            if value != 0 && !(3000..=60000).contains(&value) {
-                                return Err(DomainError::InternalError(format!(
-                                    "{} must be between 3000 and 60000",
-                                    name
-                                )));
-                            }
-
-                            if name == "uidnumber"
-                                && Self::is_uidnumber_taken(transaction, value).await?
+                    let posix_numbers: Vec<(String, i64)> = request
+                        .attributes
+                        .iter()
+                        .filter_map(|attr| match &attr.value {
+                            AttributeValue::Integer(Cardinality::Singleton(value))
+                                if *value != 0 =>
                             {
-                                return Err(DomainError::InternalError(format!(
-                                    "Number {} is already assigned to another user/group",
-                                    value
-                                )));
+                                Some((attr.name.as_str().to_owned(), *value))
                             }
-                            // NOTE: gidnumber on *users* deliberately allows duplicates
-                        }
-                    }
+                            _ => None,
+                        })
+                        .collect();
+                    Self::validate_posix_numbers(transaction, &posix_numbers, None).await?;
 
-                    // === POSIX auto-assign for users (uidNumber + gidNumber + loginShell + homeDirectory) ===
                     let mut final_attributes = request.attributes;
-
-                    if settings.user_uidnumber_assign {
-                        let already_has_uid = final_attributes
-                            .iter()
-                            .any(|a| a.name.as_str() == "uidnumber");
-                        if !already_has_uid {
-                            let next_uid = Self::next_available_uid_number(
-                                transaction,
-                                settings.user_uidnumber_start,
-                                settings.user_uidnumber_max,
-                            )
-                            .await?;
-                            final_attributes.push(Attribute {
-                                name: "uidnumber".into(),
-                                value: AttributeValue::Integer(Cardinality::Singleton(next_uid)),
-                            });
-                        }
-                    }
-
-                    if settings.user_gidnumber_assign {
-                        let already_has_gid = final_attributes
-                            .iter()
-                            .any(|a| a.name.as_str() == "gidnumber");
-                        if !already_has_gid {
-                            final_attributes.push(Attribute {
-                                name: "gidnumber".into(),
-                                value: AttributeValue::Integer(Cardinality::Singleton(
-                                    settings.user_gidnumber_start,
-                                )),
-                            });
-                        }
-                    }
-
-                    if settings.user_loginshell_assign {
-                        let already_has_shell = final_attributes
-                            .iter()
-                            .any(|a| a.name.as_str() == "loginshell");
-                        if !already_has_shell {
-                            final_attributes.push(Attribute {
-                                name: "loginshell".into(),
-                                value: AttributeValue::String(Cardinality::Singleton(
-                                    settings.user_loginshell_default.clone(),
-                                )),
-                            });
-                        }
-                    }
-
-                    if settings.user_homedirectory_assign {
-                        let already_has_home = final_attributes
-                            .iter()
-                            .any(|a| a.name.as_str() == "homedirectory");
-                        if !already_has_home {
-                            let home_dir = format!(
-                                "{}/{}",
-                                settings.user_homedirectory_prefix, request.user_id
-                            );
-                            final_attributes.push(Attribute {
-                                name: "homedirectory".into(),
-                                value: AttributeValue::String(Cardinality::Singleton(home_dir)),
-                            });
-                        }
-                    }
+                    Self::assign_posix_defaults(
+                        transaction,
+                        &settings,
+                        &request.user_id,
+                        &mut final_attributes,
+                    )
+                    .await?;
 
                     let new_user = model::users::ActiveModel {
                         user_id: Set(request.user_id.clone()),
@@ -1246,30 +782,53 @@ impl UserBackendHandler for SqlBackendHandler {
         }
         Ok(())
     }
-}
 
-#[async_trait]
-impl PosixBackendHandler for SqlBackendHandler {
-    async fn get_posix_settings(&self) -> Result<PosixSettings> {
-        self.get_posix_settings().await
-    }
-    async fn set_posix_settings(&self, settings: PosixSettings) -> Result<()> {
-        self.set_posix_settings(settings).await
-    }
-    async fn reassign_gid_numbers(&self) -> Result<()> {
-        self.reassign_gid_numbers().await
-    }
-    async fn reassign_user_uid_numbers(&self) -> Result<()> {
-        self.reassign_user_uid_numbers().await
-    }
-    async fn reassign_user_gid_numbers(&self) -> Result<()> {
-        self.reassign_user_gid_numbers().await
-    }
-    async fn reassign_user_homedirectories(&self) -> Result<()> {
-        self.reassign_user_homedirectories().await
-    }
-    async fn reassign_user_loginshells(&self) -> Result<()> {
-        self.reassign_user_loginshells().await
+    #[instrument(skip(self), level = "debug", err)]
+    async fn ensure_kerberos_principal_consistency(
+        &self,
+        user_id: &UserId,
+        enabled: bool,
+    ) -> Result<()> {
+        use chrono::Utc;
+
+        let now = Utc::now().naive_utc();
+
+        if enabled {
+            let principal = principal_name(user_id.as_str());
+            tracing::info!(
+                "Kerberos sync succeeded → injecting protected krbPrincipalName = {} for user {}",
+                principal,
+                user_id
+            );
+
+            let update = model::users::ActiveModel {
+                user_id: ActiveValue::Set(user_id.clone()),
+                krb_principal_name: ActiveValue::Set(Some(principal)),
+                modified_date: ActiveValue::Set(now),
+                ..Default::default()
+            };
+            update
+                .update(&self.sql_pool)
+                .await
+                .map_err(lldap_domain_model::error::DomainError::DatabaseError)?;
+        } else {
+            tracing::info!(
+                "Kerberos sync disabled → clearing krbPrincipalName for user {}",
+                user_id
+            );
+
+            let update = model::users::ActiveModel {
+                user_id: ActiveValue::Set(user_id.clone()),
+                krb_principal_name: ActiveValue::Set(None),
+                modified_date: ActiveValue::Set(now),
+                ..Default::default()
+            };
+            update
+                .update(&self.sql_pool)
+                .await
+                .map_err(lldap_domain_model::error::DomainError::DatabaseError)?;
+        }
+        Ok(())
     }
 }
 

@@ -70,28 +70,7 @@ pub(crate) async fn change_password<B: OpaqueHandler>(
     user: UserId,
     password: &[u8],
 ) -> Result<()> {
-    use lldap_auth::*;
-    let mut rng = rand::rngs::OsRng;
-    let registration_start_request =
-        opaque::client::registration::start_registration(password, &mut rng)?;
-    let req = registration::ClientRegistrationStartRequest {
-        username: user.clone(),
-        registration_start_request: registration_start_request.message,
-    };
-    let registration_start_response = backend_handler.registration_start(req).await?;
-    let registration_finish = opaque::client::registration::finish_registration(
-        registration_start_request.state,
-        password,
-        registration_start_response.registration_response,
-        &mut rng,
-    )?;
-    let req = registration::ClientRegistrationFinishRequest {
-        server_data: registration_start_response.server_data,
-        registration_upload: registration_finish.message,
-    };
-    backend_handler.registration_finish(req).await?;
-
-    Ok(())
+    Ok(lldap_opaque_handler::register_password(backend_handler, user, password).await?)
 }
 
 pub(crate) async fn do_password_modification<Handler: BackendHandler + OpaqueHandler>(
@@ -169,8 +148,7 @@ pub(crate) async fn do_password_modification<Handler: BackendHandler + OpaqueHan
                                 );
                             }
 
-                            let inner = backend_handler.unsafe_get_handler();
-                            if let Err(e) = inner
+                            if let Err(e) = backend_handler
                                 .ensure_kerberos_principal_consistency(&uid, true)
                                 .await
                             {

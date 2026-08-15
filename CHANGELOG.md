@@ -43,6 +43,8 @@
 - LDAP group entries expose `groupid` again and `(groupid=N)` filters match on the group
   id, as in upstream LLDAP. The Keycloak realm push now builds the LDAP provider's
   `usersDn`/`groupsDn`/`bindDn` from LLDAP's base DN instead of the Keycloak realm name.
+- Fixed: re-submitting a user's own `uidNumber` on update was rejected as "already assigned".
+  `setPosixSettings` now checks authorization before validating ranges.
 
 ## [0.7.2] 2026-06-16
 

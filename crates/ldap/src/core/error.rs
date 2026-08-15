@@ -17,12 +17,13 @@ impl std::error::Error for LdapError {}
 pub type LdapResult<T> = std::result::Result<T, LdapError>;
 
 #[cfg(test)]
-mod error_tests {
-    use super::super::error::{LdapError, LdapResult};
+mod tests {
+    use super::*;
     use ldap3_proto::LdapResultCode;
+    use pretty_assertions::assert_eq;
 
     #[test]
-    fn ldap_error_displays_message() {
+    fn test_ldap_error_displays_message() {
         let err = LdapError {
             code: LdapResultCode::Other,
             message: "something went wrong".to_string(),
@@ -31,7 +32,7 @@ mod error_tests {
     }
 
     #[test]
-    fn ldap_error_is_error_trait() {
+    fn test_ldap_error_is_error_trait() {
         let err: Box<dyn std::error::Error> = Box::new(LdapError {
             code: LdapResultCode::NoSuchObject,
             message: "not found".into(),
@@ -40,7 +41,7 @@ mod error_tests {
     }
 
     #[test]
-    fn ldap_result_type_works() {
+    fn test_ldap_result_type_works() {
         let ok: LdapResult<i32> = Ok(42);
         assert!(matches!(ok, Ok(42)));
 

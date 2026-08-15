@@ -19,7 +19,6 @@ pub use crate::images::{
     process_avatar_input, validate_stored_avatar_bytes,
 };
 
-// ==================== UUID ====================
 #[derive(
     PartialEq,
     Hash,
@@ -72,7 +71,6 @@ impl<'a> std::convert::TryFrom<&'a str> for Uuid {
     }
 }
 
-// ==================== SERIALIZED ====================
 #[derive(Clone, PartialEq, Eq, Hash, Serialize, Deserialize, DeriveValueType)]
 #[sea_orm(
     column_type = "Custom(SeaRc::new(MySqlType::LongBlob))",
@@ -98,7 +96,6 @@ impl std::fmt::Debug for Serialized {
     }
 }
 
-// ==================== CASE-INSENSITIVE STRINGS ====================
 fn compare_str_case_insensitive(s1: &str, s2: &str) -> Ordering {
     let mut it_1 = s1.chars().flat_map(|c| c.to_lowercase());
     let mut it_2 = s2.chars().flat_map(|c| c.to_lowercase());
@@ -253,32 +250,26 @@ impl TryFromU64 for AttributeName {
     }
 }
 
-// ==================== AVATAR (delegates to images.rs) ====================
-// All validation, exact 512x512 dimension enforcement, PNG/BMP→JPEG conversion,
-// and quality control (JPEG_QUALITY) now live in crates/domain/src/images.rs.
-// This struct is a thin wrapper around Vec<u8> containing only JPEG bytes.
 #[derive(PartialEq, Eq, Clone, Serialize, Deserialize, DeriveValueType, Hash)]
 #[sea_orm(column_type = "Blob", array_type = "Bytes")]
 pub struct Avatar(pub Vec<u8>);
 
 impl Avatar {
-    /// Canonical constructor — ALWAYS converts PNG/BMP → JPEG via process_avatar_input.
+    /// Converts PNG/BMP to JPEG; unprocessable input yields an empty avatar.
     pub fn new(bytes: Vec<u8>) -> Self {
         match images::process_avatar_input(&bytes) {
             Ok(jpeg) => Self(jpeg),
             Err(e) => {
                 tracing::error!(
                     target: "avatar_critical",
-                    "Avatar processing FAILED: {} — REJECTING upload (no fallback)",
+                    "Avatar processing failed, rejecting the upload: {}",
                     e
                 );
-                // Return empty avatar instead of storing invalid data
                 Self(vec![])
             }
         }
     }
 
-    /// Creates Avatar from raw bytes (for internal use with already-validated stored data).
     pub fn from_bytes(bytes: Bytes) -> Self {
         let _ = images::validate_stored_avatar_bytes(&bytes);
         Self::new(bytes.into())
@@ -294,7 +285,6 @@ impl Avatar {
         Bytes::from(self.0)
     }
 
-    /// Returns the raw JPEG bytes (for serialization / LDAP responses).
     pub fn as_bytes(&self) -> &[u8] {
         &self.0
     }
@@ -329,10 +319,9 @@ impl TryFrom<&[u8]> for Avatar {
             return Ok(Self::null());
         }
 
-        // Defense-in-depth: validate any bytes entering the Avatar struct
+        // Any bytes entering the struct are validated and processed.
         images::validate_stored_avatar_bytes(bytes).map_err(|e| anyhow::anyhow!("{}", e))?;
 
-        // For new uploads this will also enforce full processing + conversion.
         let jpeg_bytes =
             images::process_avatar_input(bytes).map_err(|e| anyhow::anyhow!("{}", e))?;
 
@@ -390,7 +379,6 @@ impl IntoActiveValue<Avatar> for Avatar {
     }
 }
 
-// ==================== ATTRIBUTE VALUE ====================
 #[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize, Hash)]
 pub enum Cardinality<T: Clone> {
     Singleton(T),
@@ -487,14 +475,12 @@ impl From<Vec<NaiveDateTime>> for AttributeValue {
     }
 }
 
-// ==================== ATTRIBUTE ====================
 #[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize, Hash)]
 pub struct Attribute {
     pub name: AttributeName,
     pub value: AttributeValue,
 }
 
-// ==================== USER / GROUP ====================
 #[derive(PartialEq, Eq, Debug, Clone, Serialize, Deserialize)]
 pub struct User {
     pub user_id: UserId,
@@ -607,8 +593,7 @@ pub fn kerberos_sync_enabled(attrs: &[Attribute]) -> bool {
         .unwrap_or(false)
 }
 
-/// Built-in groups whose exact names are load-bearing invariants of lldap.
-/// They must not be renamed or deleted.
+/// Built-in groups whose exact names are load-bearing; never renamed or deleted.
 pub const BUILTIN_GROUPS: &[&str] = &[
     "lldap_admin",
     "lldap_password_manager",
@@ -617,7 +602,6 @@ pub const BUILTIN_GROUPS: &[&str] = &[
     "lldap_sudohost",
 ];
 
-/// Returns true if `name` matches one of the built-in protected group names.
 pub fn is_builtin_group(name: &str) -> bool {
     BUILTIN_GROUPS.contains(&name)
 }

@@ -22,7 +22,7 @@ input AttributeValueInput {
     Integers (signed 64 bits) are represented as strings.
     Dates are represented as strings in RFC3339 format, e.g. "2019-10-12T07:20:50.52Z".
     Avatars are represented as base64 encoded strings. Maximum size 512x512
-    (PNG, BMP, or JPEG — automatically converted to optimized JPEG on storage).
+    (PNG, BMP, or JPEG; converted to JPEG on storage).
   """ value: [String!]!
 }
 
@@ -201,11 +201,11 @@ type Group {
   displayName: String!
   creationDate: DateTime!
   uuid: String!
-  "Single-layer OU (defaults to \"groups\" — editable by admin only)"
+  "The OU of the group, \"groups\" by default. Admin-editable."
   ou: String!
-  "Real member count (used by group_table.rs)"
+  "The number of members."
   memberCount: Int!
-  "User-defined attributes (includes ou for legacy clients)."
+  "User-defined attributes, including ou for legacy clients."
   attributes: [AttributeValue!]!
   "The users that belong to this group."
   users: [User!]!
@@ -335,15 +335,15 @@ type User {
   firstName: String!
   lastName: String!
   avatar: String
-  "Single-layer OU (defaults to \"people\" — editable by admin only)"
+  "The OU of the user, \"people\" by default. Admin-editable."
   ou: String!
-  "SSH public keys (multi-value list — exactly like authorized_keys)"
+  "SSH public keys, one per authorized_keys line."
   sshPublicKeys: [String!]!
   creationDate: DateTime!
   uuid: String!
-  "Whether the user is disabled (member of the built-in lldap_disabled group)."
+  "Whether the user is a member of the built-in lldap_disabled group."
   isDisabled: Boolean!
-  "User-defined attributes (includes ou + sshpublickey for legacy clients)."
+  "User-defined attributes, including ou and sshpublickey for legacy clients."
   attributes: [AttributeValue!]!
   "The groups to which this user belongs."
   groups: [Group!]!

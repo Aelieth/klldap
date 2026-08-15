@@ -47,12 +47,8 @@ impl std::fmt::Display for AvatarError {
 
 impl std::error::Error for AvatarError {}
 
-/// THE single entry point for creating Avatars from user input (GraphQL, LDAP, etc.).
-///
-/// Guarantees:
-/// - Output is always valid JPEG (even if input was PNG/BMP).
-/// - Output respects size and dimension limits.
-/// - Never stores raw PNG/BMP in the database.
+/// The one path from user input (GraphQL, LDAP) to stored avatar bytes: the output is always
+/// a size-limited JPEG, so raw PNG/BMP never reaches the database.
 pub fn process_avatar_input(input: &[u8]) -> Result<Vec<u8>, AvatarError> {
     if input.is_empty() {
         return Ok(vec![]);
@@ -122,7 +118,6 @@ pub fn process_avatar_input(input: &[u8]) -> Result<Vec<u8>, AvatarError> {
     Ok(jpeg_bytes)
 }
 
-/// Converts stored avatar bytes (always JPEG) to GraphQL base64.
 pub fn avatar_to_graphql_base64(jpeg_bytes: &[u8]) -> String {
     if jpeg_bytes.is_empty() {
         return String::new();
@@ -130,11 +125,7 @@ pub fn avatar_to_graphql_base64(jpeg_bytes: &[u8]) -> String {
     general_purpose::STANDARD.encode(jpeg_bytes)
 }
 
-/// Defense-in-depth validation for data coming FROM the database.
-/// Accepts:
-/// - Valid JPEG (current format)
-/// - Valid input formats (for legacy data that may still be PNG/BMP)
-/// - Never fails on legacy data — lets the read path re-process if needed.
+/// Accepts JPEG and, for legacy rows, PNG/BMP, so the read path can re-process them.
 pub fn validate_stored_avatar_bytes(bytes: &[u8]) -> Result<(), AvatarError> {
     if bytes.is_empty() {
         return Ok(());
@@ -143,12 +134,10 @@ pub fn validate_stored_avatar_bytes(bytes: &[u8]) -> Result<(), AvatarError> {
         return Err(AvatarError::TooLarge { size: bytes.len() });
     }
 
-    // Accept current JPEGs
     if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xD8 {
         return Ok(());
     }
 
-    // Accept legacy PNG/BMP (will be re-processed on read if needed)
     if bytes.len() >= 4 {
         let is_png = bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47]);
         let is_bmp = bytes.starts_with(&[0x42, 0x4D]);
@@ -206,6 +195,7 @@ pub fn make_test_avatar_value() -> crate::types::AttributeValue {
 mod tests {
     use super::*;
     use image::{ImageBuffer, Rgb, RgbImage};
+    use pretty_assertions::assert_eq;
 
     fn make_test_jpeg(size: u32) -> Vec<u8> {
         let img: RgbImage = ImageBuffer::from_fn(size, size, |x, y| {

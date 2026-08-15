@@ -862,8 +862,7 @@ async fn migrate_to_v5(transaction: DatabaseTransaction) -> Result<DatabaseTrans
         {
             if let Some(name) = &user.first_name {
                 any_user = true;
-                // Use alias name + raw bytes for v5 migration test compatibility
-                // (test expects exact b"first bob" bytes).
+                // Alias name and raw bytes, as a v5-era database holds them.
                 user_statement.values_panic([
                     user.user_id.clone().into(),
                     "first_name".into(),
@@ -880,8 +879,7 @@ async fn migrate_to_v5(transaction: DatabaseTransaction) -> Result<DatabaseTrans
             }
             if let Some(avatar) = &user.avatar {
                 any_user = true;
-                // Store raw JPEG bytes during v5 historical migration so tests expecting
-                // make_test_jpeg_bytes() continue to pass.
+                // Raw JPEG bytes, as a v5-era database holds them.
                 let raw_bytes: Vec<u8> = avatar.0.clone();
                 user_statement.values_panic([
                     user.user_id.clone().into(),
@@ -1308,7 +1306,7 @@ async fn ensure_system_config(
         )
         .await?;
 
-    // Config data: seed the default only where no row exists — never overwrite user edits.
+    // Config data: seed the default only where no row exists, never overwrite user edits.
     transaction
         .execute(
             backend.build(
@@ -1503,7 +1501,7 @@ fn parse_iso_datetime(s: &str) -> Option<chrono::NaiveDateTime> {
 }
 
 // Some(new_bytes) when the value is a recognized LLDAP bincode form; None leaves the row
-// untouched (native raw values, and anything unrecognized — which is only warned about).
+// untouched (native raw values, and anything unrecognized, which is only warned about).
 fn reencode_value(
     bytes: &[u8],
     typ: AttributeType,
@@ -1684,9 +1682,8 @@ async fn reencode_attribute_rows(
     Ok(rewritten)
 }
 
-// LLDAP-only repair + re-encode: bincode values and JpegPhoto schema rows arriving from an
-// upstream database become KLLDAP's raw formats; native rows are detector no-ops, so the
-// migration is idempotent and safe on fresh chains.
+// Re-encodes bincode values and JpegPhoto schema rows arriving from an upstream database
+// into KLLDAP's raw formats; native rows are no-ops, so it is idempotent on fresh chains.
 async fn migrate_to_v13(transaction: DatabaseTransaction) -> Result<DatabaseTransaction, DbErr> {
     let backend = transaction.get_database_backend();
 
@@ -2042,7 +2039,7 @@ async fn migrate_to_v12(transaction: DatabaseTransaction) -> Result<DatabaseTran
         )?))
         .await?;
 
-    // Preserve true/false as 1/0. Compare as bytes — lower() on a blob is invalid on Postgres.
+    // Preserve true/false as 1/0. Compare as bytes: lower() on a blob is invalid on Postgres.
     for (target, variants) in [
         (b"1".to_vec(), ["true", "True", "TRUE"]),
         (b"0".to_vec(), ["false", "False", "FALSE"]),

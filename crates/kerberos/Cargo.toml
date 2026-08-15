@@ -27,3 +27,6 @@ pkg-config = "0.3.30"
 [[bin]]
 name = "kerberos_manager"
 path = "src/bin/kerberos_manager.rs"
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

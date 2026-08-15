@@ -1,5 +1,3 @@
-//! Schema-related type definitions.
-
 use lldap_domain::types::{AttributeName, AttributeType};
 use std::collections::BTreeMap;
 
@@ -51,5 +49,3 @@ pub enum GroupFieldType {
     Uuid,
     Attribute(AttributeName, AttributeType, bool),
 }
-
-// UserFieldType and GroupFieldType are defined above (single source of truth — no Copy because AttributeName is not Copy)

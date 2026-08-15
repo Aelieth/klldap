@@ -8,9 +8,6 @@ use ldap3::{LdapConn, Scope, SearchEntry, SearchResult};
 use serial_test::file_serial;
 mod common;
 
-/// Production-grade LDAP tests for KLLDAP
-/// Validates unlimited nested OUs, correct DNs, leaf semantics, and attribute casing.
-
 #[test]
 #[file_serial]
 fn basic_users_search() {
@@ -50,7 +47,6 @@ fn basic_users_search() {
 
     let found_users = parse_ldap_users(search_result);
 
-    // Validations
     assert!(found_users.contains_key(&user1_name), "user1 missing");
     let g1 = found_users.get(&user1_name).unwrap();
     assert!(
@@ -116,13 +112,12 @@ fn admin_search() {
 
 #[test]
 #[file_serial]
-fn nested_ou_test() {
+fn test_nested_ou_test() {
     let mut fixture = LLDAPFixture::new();
     let prefix = "nested-ou-test-";
     let user_name = new_id(Some(prefix));
     let group_name = new_id(Some(prefix));
 
-    // Create user under a nested OU path (simulated via attributes)
     let initial_state = vec![User::new(&user_name, vec![&group_name])];
     fixture.load_state(&initial_state);
 
@@ -134,7 +129,7 @@ fn nested_ou_test() {
     ldap.simple_bind(&bind_dn, env::admin_password().as_str())
         .expect("failed to bind to ldap");
 
-    // Search from root — should find the user even if under nested OUs
+    // A search from the root finds the user even under nested OUs.
     let search_result = ldap
         .search(
             &base_dn,
@@ -156,8 +151,8 @@ fn nested_ou_test() {
 
 #[test]
 #[file_serial]
-fn subtree_search_at_leaf_returns_entry() {
-    // #4: RFC 4511 §4.5.1.2 — wholeSubtree includes the base entry, so a subtree search
+fn test_subtree_search_at_leaf_returns_entry() {
+    // RFC 4511 §4.5.1.2: wholeSubtree includes the base entry, so a subtree search
     // based at a user's own DN must return that user, not zero entries.
     let mut fixture = LLDAPFixture::new();
     let prefix = "ldap-subtree-leaf-";
@@ -193,8 +188,8 @@ fn subtree_search_at_leaf_returns_entry() {
 
 #[test]
 #[file_serial]
-fn ou_entries_respect_filter() {
-    // #3: a filter an OU can't satisfy (a cn substring) must not return phantom OU entries,
+fn test_ou_entries_respect_filter() {
+    // A filter an OU cannot satisfy (a cn substring) must not return phantom OU entries,
     // while an objectClass filter that does match still returns them.
     let mut _fixture = LLDAPFixture::new();
 
@@ -238,7 +233,7 @@ fn ou_entries_respect_filter() {
 
 #[test]
 #[file_serial]
-fn cn_substring_matches_display_name() {
+fn test_cn_substring_matches_display_name() {
     // uid is random and does not contain the substring, so a match is via display_name.
     let mut fixture = LLDAPFixture::new();
     let prefix = "ldap-cn-substr-";
@@ -273,7 +268,7 @@ fn cn_substring_matches_display_name() {
 
 #[test]
 #[file_serial]
-fn display_name_emitted_for_cn_and_display_name() {
+fn test_display_name_emitted_for_cn_and_display_name() {
     // A wildcard search returns both cn and displayName (same value); an explicit displayName
     // request returns displayName over the wire.
     let mut fixture = LLDAPFixture::new();
@@ -293,7 +288,6 @@ fn display_name_emitted_for_cn_and_display_name() {
 
     let filter = format!("(uid={})", user_name);
 
-    // Wildcard: both cn and displayName present with the same value.
     let star = attrs_for_user(
         ldap.search(&base_dn, Scope::Subtree, &filter, vec!["*"])
             .expect("search failed"),
@@ -311,7 +305,6 @@ fn display_name_emitted_for_cn_and_display_name() {
         "gecos on *"
     );
 
-    // Explicit displayName request returns displayName.
     let explicit = attrs_for_user(
         ldap.search(&base_dn, Scope::Subtree, &filter, vec!["displayName"])
             .expect("search failed"),
@@ -344,9 +337,9 @@ fn attrs_for_user(results: SearchResult, uid: &str) -> HashMap<String, String> {
 
 #[test]
 #[file_serial]
-fn member_uid_lists_group_members() {
+fn test_member_uid_lists_group_members() {
     // memberUid (RFC 2307 posixGroup): a wildcard group search exposes member login names, and
-    // (memberUid=<user>) resolves the user's groups — the SSSD default rfc2307 membership path.
+    // (memberUid=<user>) resolves the user's groups: the SSSD default rfc2307 membership path.
     let mut fixture = LLDAPFixture::new();
     let prefix = "ldap-memberuid-";
     let user_name = new_id(Some(prefix));
@@ -362,7 +355,6 @@ fn member_uid_lists_group_members() {
 
     let group_needle = format!("cn={}", group_name);
 
-    // Wildcard group search returns memberUid = the member's login name.
     let group_attrs = attrs_multi_for_dn(
         ldap.search(
             &base_dn,
@@ -401,7 +393,6 @@ fn member_uid_lists_group_members() {
         "uniqueMember missing on wildcard group fetch"
     );
 
-    // (memberUid=<user>) resolves the user's groups.
     let found = attrs_multi_for_dn(
         ldap.search(
             &base_dn,
@@ -438,7 +429,6 @@ fn attrs_multi_for_dn(results: SearchResult, dn_needle: &str) -> HashMap<String,
     HashMap::new()
 }
 
-/// Count returned entries whose objectClass includes organizationalUnit.
 fn count_ou_entries(results: SearchResult) -> usize {
     let entries = results.success().expect("search failed").0;
     let mut count = 0;
@@ -460,7 +450,6 @@ fn count_ou_entries(results: SearchResult) -> usize {
     count
 }
 
-/// Case-insensitive + robust parser for the new OU model
 fn parse_ldap_users(results: SearchResult) -> HashMap<String, HashSet<String>> {
     let entries = results.success().expect("search failed").0;
     let mut users = HashMap::new();
@@ -469,7 +458,6 @@ fn parse_ldap_users(results: SearchResult) -> HashMap<String, HashSet<String>> {
         let parsed = SearchEntry::construct(entry);
         let attrs = &parsed.attrs;
 
-        // Case-insensitive lookup for uid
         let uid = attrs
             .iter()
             .find(|(k, _)| k.eq_ignore_ascii_case("uid"))
@@ -477,7 +465,6 @@ fn parse_ldap_users(results: SearchResult) -> HashMap<String, HashSet<String>> {
             .cloned();
 
         if let Some(uid) = uid {
-            // Case-insensitive lookup for memberOf
             let member_of: HashSet<String> = attrs
                 .iter()
                 .find(|(k, _)| k.eq_ignore_ascii_case("memberof"))

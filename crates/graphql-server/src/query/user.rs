@@ -102,7 +102,7 @@ impl<Handler: BackendHandler + OpaqueHandler> User<Handler> {
             })
     }
 
-    /// Single-layer OU (defaults to "people" — editable by admin only)
+    /// The OU of the user, "people" by default. Admin-editable.
     fn ou(&self) -> String {
         let canonical = self
             .schema
@@ -116,7 +116,7 @@ impl<Handler: BackendHandler + OpaqueHandler> User<Handler> {
             .to_string()
     }
 
-    /// SSH public keys (multi-value list — exactly like authorized_keys)
+    /// SSH public keys, one per authorized_keys line.
     fn ssh_public_keys(&self) -> Vec<String> {
         let canonical = self
             .schema
@@ -137,14 +137,14 @@ impl<Handler: BackendHandler + OpaqueHandler> User<Handler> {
         self.user.uuid.as_str()
     }
 
-    /// Whether the user is disabled (member of the built-in lldap_disabled group).
+    /// Whether the user is a member of the built-in lldap_disabled group.
     fn is_disabled(&self) -> bool {
         self.groups
             .as_ref()
             .is_some_and(|groups| groups.iter().any(|g| g.display_name == "lldap_disabled"))
     }
 
-    /// User-defined attributes (includes ou + sshpublickey for legacy clients).
+    /// User-defined attributes, including ou and sshpublickey for legacy clients.
     fn attributes(&self) -> &[AttributeValue<Handler>] {
         &self.attributes
     }

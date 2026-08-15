@@ -2,12 +2,8 @@ use crate::core::error::LdapResult;
 use ldap3_proto::proto::{LdapCompareRequest, LdapOp, LdapResult as LdapResultOp, LdapResultCode};
 use lldap_domain::types::AttributeName;
 
-/// Performs an LDAP Compare operation against a previously executed search result.
-///
-/// This function is generic and works for users, groups, and organizationalUnit containers.
-///
-/// It uses **exact DN matching** so that the new search layer (which may return OUs + the target entry)
-/// does not break compare semantics. Only the entry whose DN exactly matches the request is considered.
+/// Compares against the entry whose DN matches the request exactly, so the OUs the search
+/// layer returns alongside the target do not affect the result.
 pub fn compare(
     request: LdapCompareRequest,
     search_results: Vec<LdapOp>,
@@ -15,7 +11,6 @@ pub fn compare(
 ) -> LdapResult<Vec<LdapOp>> {
     let attr_name = AttributeName::from(&request.atype);
 
-    // Extract only real entries; ignore SearchResultDone, references, etc.
     let entries: Vec<_> = search_results
         .into_iter()
         .filter_map(|op| match op {
@@ -24,8 +19,7 @@ pub fn compare(
         })
         .collect();
 
-    // Find the *exact* target by DN (case-insensitive per LDAP rules).
-    // This allows the new search layer to return OUs + target without breaking compare.
+    // Exact DN match, case-insensitive per LDAP rules.
     let matching_entry = entries
         .iter()
         .find(|e| e.dn.eq_ignore_ascii_case(&request.dn));

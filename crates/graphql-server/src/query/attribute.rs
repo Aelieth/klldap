@@ -311,7 +311,7 @@ mod tests {
     }
 
     #[test]
-    fn hardcoded_user_values_resolve_canonical_only() {
+    fn test_hardcoded_user_values_resolve_canonical_only() {
         let user = DomainUser {
             user_id: UserId::new("bob"),
             email: "bob@example.com".into(),
@@ -347,7 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn hardcoded_group_values_resolve_canonical_only() {
+    fn test_hardcoded_group_values_resolve_canonical_only() {
         let group = DomainGroup {
             id: GroupId(1),
             display_name: "group".into(),

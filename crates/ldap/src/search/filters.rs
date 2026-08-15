@@ -1,33 +1,29 @@
-//! Filter conversion logic
-//!
-//! This module handles conversion of LDAP filters to domain-specific request filters.
-//! Kept here so search/handler.rs can orchestrate cleanly while core/ stays slim.
-
-use crate::core::error::{LdapError, LdapResult};
-use crate::dn::{
-    get_group_id_from_distinguished_name_or_plain_name,
-    get_user_id_from_distinguished_name_or_plain_name,
+use crate::{
+    attributes::{get_default_group_object_classes_bytes, get_default_user_object_classes_bytes},
+    core::{
+        error::{LdapError, LdapResult},
+        utils::{LdapInfo, is_unrecognized_attribute},
+    },
+    dn::{
+        get_group_id_from_distinguished_name_or_plain_name,
+        get_user_id_from_distinguished_name_or_plain_name,
+    },
+    schema::{GroupFieldType, UserFieldType},
 };
 use ldap3_proto::LdapFilter;
-use lldap_domain::deserialize::deserialize_attribute_value;
-use lldap_domain::types::{AttributeName, AttributeType, UserId};
+use lldap_domain::{
+    deserialize::deserialize_attribute_value,
+    types::{AttributeName, AttributeType, GroupId, UserId, Uuid},
+};
 use lldap_domain_handlers::handler::{GroupRequestFilter, UserRequestFilter};
 use lldap_schema::PublicSchema;
 use tracing::{debug, warn};
-
-use crate::attributes::{
-    get_default_group_object_classes_bytes, get_default_user_object_classes_bytes,
-};
-use crate::core::utils::{LdapInfo, is_unrecognized_attribute};
-use crate::schema::{GroupFieldType, UserFieldType};
 
 fn is_object_class(value: &str, classes: &[Vec<u8>]) -> bool {
     classes
         .iter()
         .any(|class| class.eq_ignore_ascii_case(value.as_bytes()))
 }
-
-// USER FILTER CONVERSION
 
 fn get_user_attribute_equality_filter(
     field: &AttributeName,
@@ -115,11 +111,8 @@ pub fn convert_user_filter(
             let field = AttributeName::from(field.as_str());
             let value_lc = value.to_ascii_lowercase();
 
-            // RFC/standards-mapped virtual attributes (loginDisabled, sudoHost).
-            // These are synthesized from lldap_* group membership (see attributes.rs + subschema.rs).
-            // Translate filters on the standardized names into the equivalent MemberOf on the
-            // source built-in group. This makes (loginDisabled=TRUE) etc. work for "proper search"
-            // and avoids the generic "unknown attribute" warning + False for these now-published attrs.
+            // loginDisabled/sudoHost are synthesized from lldap_* group membership, so filters
+            // on them become MemberOf on the built-in group.
             let fname = field.as_str();
             if fname.eq_ignore_ascii_case("logindisabled") {
                 if value_lc == "true" || value_lc == "1" || value_lc == "yes" {
@@ -129,7 +122,7 @@ pub fn convert_user_filter(
                 }
             }
             if fname.eq_ignore_ascii_case("sudohost") {
-                // Support common "has the flag" assertions (clients may send *, ALL, or true-ish).
+                // Clients send *, ALL or a true-ish value for "has the flag".
                 if value_lc == "*" || value_lc == "all" || value_lc == "true" || value_lc == "1" {
                     return Ok(UserRequestFilter::MemberOf("lldap_sudohost".into()));
                 } else {
@@ -185,19 +178,16 @@ pub fn convert_user_filter(
                         UserRequestFilter::False
                     }))
                 }
-                UserFieldType::EntryUuid => {
-                    // entryUUID maps to the internal user uuid column
-                    match lldap_domain::types::Uuid::try_from(value.as_str()) {
-                        Ok(_) => Ok(UserRequestFilter::Equality(
-                            lldap_domain_model::model::UserColumn::Uuid,
-                            value.to_string(),
-                        )),
-                        Err(e) => Err(LdapError {
-                            code: ldap3_proto::LdapResultCode::Other,
-                            message: format!("Invalid UUID in filter: {e:#}"),
-                        }),
-                    }
-                }
+                UserFieldType::EntryUuid => match Uuid::try_from(value.as_str()) {
+                    Ok(_) => Ok(UserRequestFilter::Equality(
+                        lldap_domain_model::model::UserColumn::Uuid,
+                        value.to_string(),
+                    )),
+                    Err(e) => Err(LdapError {
+                        code: ldap3_proto::LdapResultCode::Other,
+                        message: format!("Invalid UUID in filter: {e:#}"),
+                    }),
+                },
             }
         }
         LdapFilter::GreaterOrEqual(field, value) => {
@@ -247,8 +237,7 @@ pub fn convert_user_filter(
         LdapFilter::Present(field) => {
             let field = AttributeName::from(field.as_str());
 
-            // Same virtual attr translation as Equality: presence of loginDisabled/sudoHost
-            // means "member of the corresponding lldap_* built-in group".
+            // Presence of loginDisabled/sudoHost means membership in the built-in group.
             let fname = field.as_str();
             if fname.eq_ignore_ascii_case("logindisabled") {
                 return Ok(UserRequestFilter::MemberOf("lldap_disabled".into()));
@@ -276,7 +265,6 @@ pub fn convert_user_filter(
                 UserFieldType::Attribute(name, lldap_schema::AttributeType::String, _) => Ok(
                     UserRequestFilter::AttributeSubString(name, substring_filter.clone().into()),
                 ),
-                // Non-string custom attributes still get rejected (makes sense)
                 UserFieldType::Attribute(_, _, _) => Err(LdapError {
                     code: ldap3_proto::LdapResultCode::UnwillingToPerform,
                     message: format!("Unsupported user attribute for substring filter: {field:?}"),
@@ -316,8 +304,6 @@ pub fn convert_user_filter(
         }),
     }
 }
-
-// GROUP FILTER CONVERSION
 
 fn get_group_attribute_equality_filter(
     field: &AttributeName,
@@ -366,7 +352,7 @@ pub fn convert_group_filter(
             match crate::schema::get_schema_manager().map_group_field(&field, schema) {
                 GroupFieldType::GroupId => Ok(value_lc
                     .parse::<i32>()
-                    .map(|id| GroupRequestFilter::GroupId(lldap_domain::types::GroupId(id)))
+                    .map(|id| GroupRequestFilter::GroupId(GroupId(id)))
                     .unwrap_or_else(|_| {
                         warn!("Given group id is not a valid integer: {}", value_lc);
                         GroupRequestFilter::False
@@ -382,9 +368,8 @@ pub fn convert_group_filter(
                 | GroupFieldType::UniqueMember
                 | GroupFieldType::MemberUid
                 | GroupFieldType::MemberOf => {
-                    // "member" and "uniqueMember" are the standards; "memberof"/"ismemberof"
-                    // are accepted as aliases pointing to the same membership filter semantics
-                    // for groups (enables client compatibility + faster lookups).
+                    // member/uniqueMember are the standard names; memberof/ismemberof are
+                    // accepted as aliases of the same membership filter.
                     Ok(get_user_id_from_distinguished_name_or_plain_name(
                         &value_lc,
                         &ldap_info.base_dn,
@@ -444,9 +429,7 @@ pub fn convert_group_filter(
             let field = AttributeName::from(field.as_str());
             match crate::schema::get_schema_manager().map_group_field(&field, schema) {
                 GroupFieldType::CreationDate | GroupFieldType::ModifiedDate => {
-                    // Use the authoritative PublicSchema (passed in) + resolve_group_canonical_name
-                    // so aliases ("createTimestamp", "modifyTimestamp", "creation_date", etc.)
-                    // are properly translated to the internal canonical names ("creationdate"/"modifieddate").
+                    // Aliases (createTimestamp, creation_date, ...) resolve to the canonical name.
                     let canonical = schema
                         .resolve_group_canonical_name(field.as_str())
                         .map(|s| s.to_string())
@@ -472,8 +455,6 @@ pub fn convert_group_filter(
             let field = AttributeName::from(field.as_str());
             match crate::schema::get_schema_manager().map_group_field(&field, schema) {
                 GroupFieldType::CreationDate | GroupFieldType::ModifiedDate => {
-                    // Use the authoritative PublicSchema (passed in) + resolve_group_canonical_name
-                    // (see GreaterOrEqual comment for full rationale)
                     let canonical = schema
                         .resolve_group_canonical_name(field.as_str())
                         .map(|s| s.to_string())
@@ -578,6 +559,7 @@ mod tests {
     use super::*;
     use ldap3_proto::proto::LdapSubstringFilter;
     use lldap_schema::PublicSchema;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn test_convert_user_filter_substring_on_custom_string_attribute() {
@@ -601,7 +583,6 @@ mod tests {
         let result = convert_user_filter(&ldap_info, &filter, &schema);
         assert!(result.is_ok());
 
-        // Should produce AttributeSubString (not an error)
         match result.unwrap() {
             UserRequestFilter::AttributeSubString(name, _) => {
                 assert_eq!(name.as_str(), "firstname"); // canonical name
@@ -620,7 +601,7 @@ mod tests {
             ignored_group_attributes: vec![],
         };
 
-        // memberof (and ismemberof) on group filter should point to Member semantics
+        // memberof/ismemberof on a group filter mean Member.
         let filter = LdapFilter::Equality("memberof".to_string(), "someuser".to_string());
         let result = convert_group_filter(&ldap_info, &filter, &schema);
         assert!(result.is_ok());
@@ -631,7 +612,6 @@ mod tests {
             other => panic!("Expected Member for memberof group filter, got {:?}", other),
         }
 
-        // Also via the standard "member" name (plain value is accepted and lowercased)
         let filter2 = LdapFilter::Equality("member".to_string(), "bar".to_string());
         let result2 = convert_group_filter(&ldap_info, &filter2, &schema);
         assert!(result2.is_ok());
@@ -644,7 +624,7 @@ mod tests {
     }
 
     #[test]
-    fn group_filter_member_uid_resolves_to_member() {
+    fn test_group_filter_member_uid_resolves_to_member() {
         // (memberUid=alice) finds groups containing alice (SSSD rfc2307 initgroups path).
         match group_eq("memberUid", "alice") {
             GroupRequestFilter::Member(uid) => assert_eq!(uid.as_str(), "alice"),
@@ -653,7 +633,7 @@ mod tests {
     }
 
     #[test]
-    fn user_filter_gecos_maps_to_display_name() {
+    fn test_user_filter_gecos_maps_to_display_name() {
         // gecos (POSIX GECOS = the full name) filters on display_name.
         match user_eq("gecos", "bob") {
             UserRequestFilter::Equality(lldap_domain_model::model::UserColumn::DisplayName, v) => {
@@ -664,9 +644,8 @@ mod tests {
     }
 
     #[test]
-    fn group_filter_uid_is_false_not_unknown() {
-        // (uid=…) on a group search: uid is known (user-side); group NoMatch is
-        // False without treating it as unrecognized.
+    fn test_group_filter_uid_is_false_not_unknown() {
+        // uid on a group search is a known user attribute: False, not unrecognized.
         match group_eq("uid", "bob") {
             GroupRequestFilter::False => {}
             other => panic!("expected False for uid-on-group, got {other:?}"),
@@ -693,10 +672,8 @@ mod tests {
         convert_group_filter(&info(), &filter, &PublicSchema::get()).unwrap()
     }
 
-    // After the SchemaManager fix, the schema canonical name resolves to its primary field just
-    // like its aliases (issues #2/#5) — previously the canonical name fell to the custom path.
     #[test]
-    fn user_filter_canonical_and_aliases_resolve_to_primary() {
+    fn test_user_filter_canonical_and_aliases_resolve_to_primary() {
         for name in ["userid", "user_id", "uid", "id"] {
             assert!(
                 matches!(user_eq(name, "Bob"), UserRequestFilter::UserId(_)),
@@ -727,7 +704,7 @@ mod tests {
     }
 
     #[test]
-    fn user_filter_cn_substring_maps_to_display_name() {
+    fn test_user_filter_cn_substring_maps_to_display_name() {
         for name in ["cn", "displayname", "display_name"] {
             let filter = LdapFilter::Substring(
                 name.to_string(),
@@ -752,7 +729,7 @@ mod tests {
     }
 
     #[test]
-    fn user_filter_virtuals_objectclass_and_unknown_are_pinned() {
+    fn test_user_filter_virtuals_objectclass_and_unknown_are_pinned() {
         assert!(matches!(
             user_eq("loginDisabled", "TRUE"),
             UserRequestFilter::MemberOf(_)
@@ -784,7 +761,7 @@ mod tests {
     }
 
     #[test]
-    fn group_filter_resolution_is_pinned() {
+    fn test_group_filter_resolution_is_pinned() {
         for n in ["memberof", "member", "uniquemember", "ismemberof"] {
             assert!(
                 matches!(group_eq(n, "bar"), GroupRequestFilter::Member(_)),
@@ -804,7 +781,7 @@ mod tests {
     }
 
     #[test]
-    fn group_filter_groupid_targets_the_primary_id() {
+    fn test_group_filter_groupid_targets_the_primary_id() {
         for name in ["groupid", "group_id", "groupId"] {
             assert_eq!(
                 group_eq(name, "7"),

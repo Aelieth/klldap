@@ -66,6 +66,7 @@ impl std::fmt::Debug for DatabaseUrl {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     #[test]
     fn test_database_url_debug() {
@@ -81,7 +82,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_three_slash_data_path_gets_four_slashes_and_mode() {
+    fn test_sqlite_three_slash_data_path_gets_four_slashes_and_mode() {
         assert_eq!(
             normalize_sqlite_connect_url("sqlite:///data/custom.db"),
             "sqlite:////data/custom.db?mode=rwc"
@@ -93,7 +94,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_already_correct_is_unchanged() {
+    fn test_sqlite_already_correct_is_unchanged() {
         assert_eq!(
             normalize_sqlite_connect_url("sqlite:////data/users.db?mode=rwc"),
             "sqlite:////data/users.db?mode=rwc"
@@ -101,7 +102,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_memory_is_unchanged() {
+    fn test_sqlite_memory_is_unchanged() {
         assert_eq!(
             normalize_sqlite_connect_url("sqlite::memory:"),
             "sqlite::memory:"
@@ -109,7 +110,7 @@ mod tests {
     }
 
     #[test]
-    fn sqlite_relative_gets_mode_only() {
+    fn test_sqlite_relative_gets_mode_only() {
         assert_eq!(
             normalize_sqlite_connect_url("sqlite://users.db"),
             "sqlite://users.db?mode=rwc"
@@ -117,7 +118,7 @@ mod tests {
     }
 
     #[test]
-    fn postgres_is_unchanged() {
+    fn test_postgres_is_unchanged() {
         assert_eq!(
             normalize_sqlite_connect_url("postgres://u:p@h/db"),
             "postgres://u:p@h/db"

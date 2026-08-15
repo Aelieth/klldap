@@ -49,7 +49,7 @@ fn kinit(principal: &str, password: &str) -> bool {
 
 #[test]
 #[ignore = "needs a live KDC: run through gate/kdc-sandbox.sh (make test-kdc)"]
-fn live_create_chpass_disable_delete() {
+fn test_live_create_chpass_disable_delete() {
     require_live_kdc();
     let principal = principal_name("livebob");
     assert_eq!(
@@ -94,7 +94,7 @@ fn live_create_chpass_disable_delete() {
 
 #[test]
 #[ignore = "needs a live KDC: run through gate/kdc-sandbox.sh (make test-kdc)"]
-fn live_export_keytab_for_keycloak() {
+fn test_live_export_keytab_for_keycloak() {
     require_live_kdc();
     let path = export_keytab_for_keycloak("kc.sandbox.test").expect("export");
     assert_eq!(

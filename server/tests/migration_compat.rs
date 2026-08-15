@@ -13,10 +13,9 @@ use std::process::Child as ChildProcess;
 use std::{thread, time::Duration};
 mod common;
 
-// End-to-end proof of goal 3: a genuine stock lldap 0.6.3 (schema v11) database and
-// server_key — committed under fixtures/, produced by scripts/generate_lldap_fixture.sh —
-// boot into KLLDAP, migrate through v12+v13, and keep data and passwords intact.
-// Constants below mirror fixtures/fixture.md; change them everywhere or not at all.
+// A stock lldap 0.6.3 (schema v11) database and server_key, produced by
+// scripts/generate_lldap_fixture.sh, boot into KLLDAP, migrate through v12+v13, and keep data
+// and passwords intact. The constants mirror fixtures/fixture.md.
 
 const LLDAP_V11_SQL: &str = include_str!("fixtures/lldap_v11.sql");
 const SERVER_KEY_B64: &str = include_str!("fixtures/server_key.b64");
@@ -34,9 +33,7 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("tokio runtime")
 }
 
-/// Replays the python-iterdump fixture into a fresh SQLite file. Statements are one per
-/// line-run ending in `;` (BLOBs are single-line hex literals); the dump's transaction
-/// markers are skipped and each statement runs in autocommit on a single connection.
+// The dump's transaction markers are skipped; each statement runs in autocommit.
 fn load_fixture_dump(db_url: &str) {
     runtime().block_on(async {
         let mut opts = sea_orm::ConnectOptions::new(db_url.to_owned());
@@ -201,7 +198,7 @@ fn attribute_values<'a>(attributes: &'a Value, name: &str) -> Option<&'a Value> 
 
 #[test]
 #[file_serial]
-fn stock_lldap_database_migrates_with_data_and_passwords() {
+fn test_stock_lldap_database_migrates_with_data_and_passwords() {
     let run_id = uuid::Uuid::new_v4().simple().to_string();
     let db_path = std::env::temp_dir().join(format!("klldap_migration_{run_id}.db"));
     let key_path = std::env::temp_dir().join(format!("klldap_migration_{run_id}_server_key"));

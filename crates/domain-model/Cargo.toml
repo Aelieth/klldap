@@ -34,6 +34,9 @@ features = ["macros"]
 [dependencies.serde]
 workspace = true
 
+[dev-dependencies]
+pretty_assertions = { workspace = true }
+
 [dev-dependencies.lldap_domain]
 path = "../domain"
 features = ["test"]

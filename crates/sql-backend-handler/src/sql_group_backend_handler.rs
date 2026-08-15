@@ -98,8 +98,7 @@ fn get_group_filter_expr(filter: GroupRequestFilter) -> Cond {
             let col = column.to_ascii_lowercase();
             match col.as_str() {
                 "creationdate" => {
-                    // Use table alias to avoid ambiguous column error when the filter
-                    // expression is evaluated inside a joined subquery (find_also_linked).
+                    // A table alias, or the filter is ambiguous inside find_also_linked's join.
                     Expr::col((group_table.clone(), GroupColumn::CreationDate))
                         .gte(value)
                         .into_condition()
@@ -183,13 +182,11 @@ impl GroupListerBackendHandler for SqlBackendHandler {
             .filter(filters.clone())
             .all(&self.sql_pool)
             .await?;
-        // Step 1: Collect all user IDs across all groups first
         let all_user_ids: Vec<UserId> = results
             .iter()
             .flat_map(|(_, memberships)| memberships.iter().map(|m| m.user_id.clone()))
             .collect();
 
-        // Step 2: Fetch OU for all users in one query (efficient)
         let member_ous: std::collections::HashMap<UserId, String> = if all_user_ids.is_empty() {
             std::collections::HashMap::new()
         } else {
@@ -209,13 +206,11 @@ impl GroupListerBackendHandler for SqlBackendHandler {
                 .collect()
         };
 
-        // Step 3: Build groups with real GroupMember data
         let mut groups: Vec<_> = results
             .into_iter()
             .map(|(group, memberships)| {
                 use std::collections::BTreeSet;
 
-                // Deduplicate by user_id (sufficient for uniquemember)
                 let mut seen = BTreeSet::new();
                 let mut unique_users = Vec::new();
 
@@ -239,7 +234,7 @@ impl GroupListerBackendHandler for SqlBackendHandler {
                 }
             })
             .collect();
-
+        // TODO: should be wrapped in a transaction
         let schema = self.get_schema().await?;
         let attributes = model::GroupAttributes::find()
             .filter(
@@ -265,7 +260,6 @@ impl GroupListerBackendHandler for SqlBackendHandler {
                 })
                 .collect::<Result<Vec<_>>>()?;
 
-            // Defensive canonical remap on group read path (symmetry with user side)
             for attr in &mut attrs {
                 attr.name =
                     SqlBackendHandler::canonical_group_attribute_name(&schema, attr.name.as_str());
@@ -298,7 +292,6 @@ impl GroupBackendHandler for SqlBackendHandler {
                 let mut attr =
                     codec::decode_attribute(a.attribute_name, &a.value, schema.group_attributes())?;
 
-                // Defensive canonical remap (consistent with user side)
                 attr.name =
                     SqlBackendHandler::canonical_group_attribute_name(&schema, attr.name.as_str());
                 Ok(attr)
@@ -309,7 +302,6 @@ impl GroupBackendHandler for SqlBackendHandler {
 
     #[instrument(skip(self), level = "debug", err, fields(group_id = ?request.group_id))]
     async fn update_group(&self, request: UpdateGroupRequest) -> Result<()> {
-        // === Protect built-in groups from rename (defense in depth) ===
         if request.display_name.is_some() {
             let current = self.get_group_details(request.group_id).await?;
             if is_builtin_group(current.display_name.as_str()) {
@@ -345,7 +337,6 @@ impl GroupBackendHandler for SqlBackendHandler {
             ..Default::default()
         };
 
-        // Get default OU from allowed OUs (or fall back to "groups")
         let allowed_ous = self.get_allowed_ous().await?;
         let default_ou = allowed_ous
             .into_iter()
@@ -375,7 +366,6 @@ impl GroupBackendHandler for SqlBackendHandler {
 
                     let mut final_attributes = request.attributes;
 
-                    // === GUARANTEE OU ATTRIBUTE (central enforcement) ===
                     if !final_attributes.iter().any(|a| a.name.as_str() == "ou") {
                         final_attributes.push(Attribute {
                             name: "ou".into(),
@@ -383,7 +373,6 @@ impl GroupBackendHandler for SqlBackendHandler {
                         });
                     }
 
-                    // === POSIX GID AUTO-ASSIGNMENT (restored exactly as original) ===
                     if settings.group_gidnumber_assign {
                         let already_has_gid = final_attributes
                             .iter()
@@ -846,7 +835,6 @@ mod tests {
 
         let group_id = fixture.groups[0];
 
-        // Insert custom attribute
         let attributes = vec![Attribute {
             name: "new_attribute".into(),
             value: 42i64.into(),
@@ -865,7 +853,6 @@ mod tests {
 
         let details = fixture.handler.get_group_details(group_id).await.unwrap();
 
-        // Should contain both the custom attribute + the mandatory "ou"
         assert!(
             details
                 .attributes
@@ -874,7 +861,6 @@ mod tests {
         );
         assert!(details.attributes.iter().any(|a| a.name.as_str() == "ou"));
 
-        // Delete the custom attribute (ou should remain)
         fixture
             .handler
             .update_group(UpdateGroupRequest {
@@ -920,7 +906,6 @@ mod tests {
     #[tokio::test]
     async fn test_cannot_delete_builtin_group_by_name() {
         let fixture = TestFixture::new().await;
-        // Create a group that uses one of the protected names
         let gid = fixture
             .handler
             .create_group(CreateGroupRequest {
@@ -981,7 +966,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Rename should succeed
         fixture
             .handler
             .update_group(UpdateGroupRequest {
@@ -996,7 +980,6 @@ mod tests {
         let details = fixture.handler.get_group_details(gid).await.unwrap();
         assert_eq!(details.display_name.as_str(), "my-custom-renamed");
 
-        // Delete should succeed
         fixture.handler.delete_group(gid).await.unwrap();
     }
 }

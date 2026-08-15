@@ -1,10 +1,12 @@
 # shellcheck shell=bash
 # Phase: LDAP write matrix — ldapadd a user (with a custom attribute: it must persist
-# or be cleanly rejected, never silently dropped), attribute modifies, and the wire
-# userPassword replace on a kerberossync user proving password.rs → OPAQUE + KDC sync.
+# or be cleanly rejected, never silently dropped) and a group (its gidNumber must
+# persist), attribute modifies, and the wire userPassword replace on a kerberossync
+# user proving password.rs → OPAQUE + KDC sync.
 
 D="$(phase_dir)"
 LDIF_USER="gateldif"
+LDIF_GROUP="gateldifgroup"
 WIRE_SYNC_USER="gatewire"
 WIRE_PASS="GateWirePass2026!"
 WIRE_NEW_PASS="GateWireNewPass2026!"
@@ -36,6 +38,26 @@ if lmodify -f "$D/add-user.ldif" >"$D/ldapadd.log" 2>&1; then
     fi
 else
     p_bad "ldapadd failed (see ldapadd.log)"
+fi
+
+cat >"$D/add-group.ldif" <<EOF
+dn: cn=$LDIF_GROUP,ou=groups,$BASE_DN
+changetype: add
+objectClass: groupOfUniqueNames
+objectClass: posixGroup
+cn: $LDIF_GROUP
+gidNumber: 4242
+EOF
+if lmodify -f "$D/add-group.ldif" >"$D/ldapadd-group.log" 2>&1; then
+    p_ok "ldapadd creates a group over the wire"
+    if lsearch -b "cn=$LDIF_GROUP,ou=groups,$BASE_DN" -s base "(objectClass=*)" gidNumber \
+        2>>"$D/ldapadd-group.log" | grep -qi "^gidNumber: 4242"; then
+        p_ok "gidNumber from group ldapadd persists"
+    else
+        p_bad "gidNumber silently dropped by group ldapadd"
+    fi
+else
+    p_bad "group ldapadd failed (see ldapadd-group.log)"
 fi
 
 cat >"$D/add-ssh.ldif" <<EOF
@@ -127,3 +149,11 @@ graphql 'mutation($id: String!) { deleteUser(userId: $id) { ok } }' \
     '{"id": "'"$LDIF_USER"'"}' >"$D/cleanup-ldif.json" 2>&1 || p_bad "cleanup $LDIF_USER failed"
 graphql 'mutation($id: String!) { deleteUser(userId: $id) { ok } }' \
     '{"id": "'"$WIRE_SYNC_USER"'"}' >"$D/cleanup-wire.json" 2>&1 || p_bad "cleanup $WIRE_SYNC_USER failed"
+graphql '{ groups { id displayName } }' >"$D/groups.json" 2>&1 \
+    && GROUP_ID="$(GROUP_NAME="$LDIF_GROUP" python3 -c '
+import json, os, sys
+groups = json.load(sys.stdin)["groups"]
+print(next(g["id"] for g in groups if g["displayName"] == os.environ["GROUP_NAME"]))' <"$D/groups.json")" \
+    && graphql 'mutation($id: Int!) { deleteGroup(groupId: $id) { ok } }' \
+        '{"id": '"$GROUP_ID"'}' >"$D/cleanup-group.json" 2>&1 \
+    || p_bad "cleanup $LDIF_GROUP failed"

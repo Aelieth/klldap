@@ -37,10 +37,11 @@ pub fn decrypt_password(encrypted: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
     use rsa::pkcs1::DecodeRsaPublicKey;
 
     #[test]
-    fn frontend_envelope_round_trips() {
+    fn test_frontend_envelope_round_trips() {
         let der = STANDARD.decode(public_key_der_base64()).unwrap();
         let public_key = RsaPublicKey::from_pkcs1_der(&der).unwrap();
         let wire = STANDARD.encode(

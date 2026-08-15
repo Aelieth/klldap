@@ -12,7 +12,7 @@ use ldap3_proto::proto::{
 };
 use lldap_access_control::{AccessControlledBackendHandler, UserReadableBackendHandler};
 use lldap_auth::access_control::ValidationResults;
-use lldap_domain::types::UserId;
+use lldap_domain::types::{UserId, kerberos_sync_enabled};
 use lldap_domain_handlers::handler::{BackendHandler, BindRequest, LoginHandler};
 use lldap_domain_handlers::kerberos::kerberos_backend;
 use lldap_opaque_handler::OpaqueHandler;
@@ -73,6 +73,38 @@ pub(crate) async fn change_password<B: OpaqueHandler>(
     Ok(lldap_opaque_handler::register_password(backend_handler, user, password).await?)
 }
 
+/// Pushes the new password to the KDC when the user has kerberossync on, and returns whether
+/// it is on. A first password for an already-disabled user would otherwise mint a live
+/// principal, so the disabled state is reasserted.
+pub(crate) async fn sync_kerberos_after_password_change(
+    handler: &impl UserReadableBackendHandler,
+    user_id: &UserId,
+    password: &str,
+) -> bool {
+    let user = match handler.get_user_details(user_id).await {
+        Ok(user) => user,
+        Err(e) => {
+            warn!("Failed to fetch user for Kerberos sync check: {e}");
+            return false;
+        }
+    };
+    let sync_enabled = kerberos_sync_enabled(&user.attributes);
+    if let Err(e) = kerberos_backend().sync_if_enabled(sync_enabled, user_id.as_str(), password) {
+        warn!("Kerberos sync failed after LDAP password change: {e}");
+    } else if sync_enabled {
+        info!("Kerberos principal synced for user {user_id} (LDAP password change)");
+    }
+    if sync_enabled
+        && let Ok(groups) = handler.get_user_groups(user_id).await
+        && groups
+            .iter()
+            .any(|g| g.display_name == "lldap_disabled".into())
+    {
+        kerberos_backend().reassert_disabled(user_id.as_str());
+    }
+    sync_enabled
+}
+
 pub(crate) async fn do_password_modification<Handler: BackendHandler + OpaqueHandler>(
     credentials: &ValidationResults,
     ldap_info: &LdapInfo,
@@ -117,57 +149,16 @@ pub(crate) async fn do_password_modification<Handler: BackendHandler + OpaqueHan
                             message: format!("Error while changing the password: {e:#?}"),
                         })
                     } else {
-                        // Kerberos sync for LDAP-native password changes (OS/PAM/ldapmodify support)
                         let readable = backend_handler
                             .get_readable_handler(credentials, uid.clone())
                             .expect("Unexpected permission error");
-                        let user_details =
-                            readable
-                                .get_user_details(&uid)
-                                .await
-                                .map_err(|e| LdapError {
-                                    code: LdapResultCode::OperationsError,
-                                    message: format!("Failed to fetch user for Kerberos sync: {e}"),
-                                })?;
-
-                        let sync_enabled =
-                            lldap_domain::types::kerberos_sync_enabled(&user_details.attributes);
-
-                        if sync_enabled {
-                            if let Err(e) =
-                                kerberos_backend().sync_principal(uid.as_str(), password.as_str())
-                            {
-                                warn!(
-                                    "Kerberos principal sync failed after LDAP password change: {}",
-                                    e
-                                );
-                            } else {
-                                info!(
-                                    "Kerberos principal synced for user {} (LDAP password change)",
-                                    uid
-                                );
-                            }
-
-                            if let Err(e) = backend_handler
+                        if sync_kerberos_after_password_change(readable, &uid, password).await
+                            && let Err(e) = backend_handler
                                 .ensure_kerberos_principal_consistency(&uid, true)
                                 .await
-                            {
-                                warn!(
-                                    "Failed to record Kerberos principal name for {}: {}",
-                                    uid, e
-                                );
-                            }
-
-                            // A first password for an already-disabled user would otherwise mint a live principal.
-                            if let Ok(groups) = readable.get_user_groups(&uid).await
-                                && groups
-                                    .iter()
-                                    .any(|g| g.display_name == "lldap_disabled".into())
-                            {
-                                kerberos_backend().reassert_disabled(uid.as_str());
-                            }
+                        {
+                            warn!("Failed to record Kerberos principal name for {uid}: {e}");
                         }
-
                         Ok(vec![make_extended_response(
                             LdapResultCode::Success,
                             "".to_string(),
@@ -204,7 +195,6 @@ pub mod tests {
     use mockall::predicate::eq;
     use pretty_assertions::assert_eq;
     use std::collections::HashSet;
-
     pub fn make_bind_result(code: LdapResultCode, message: &str) -> Vec<LdapOp> {
         vec![LdapOp::BindResponse(LdapBindResponse {
             res: LdapResultOp {
@@ -221,15 +211,10 @@ pub mod tests {
         make_bind_result(LdapResultCode::Success, "")
     }
 
-    // ========================================================================
-    // BIND TESTS
-    // ========================================================================
-
     #[tokio::test]
     async fn test_bind() {
         let mut mock = MockTestBackendHandler::new();
         setup_default_ldap_mock(&mut mock);
-
         mock.expect_bind()
             .with(eq(lldap_domain_handlers::handler::BindRequest {
                 name: UserId::new("bob"),
@@ -237,14 +222,11 @@ pub mod tests {
             }))
             .times(1)
             .return_once(|_| Ok(()));
-
         let mut ldap_handler = LdapHandler::new_for_tests(mock, "dc=example,dc=com");
-
         let request = LdapOp::BindRequest(LdapBindRequest {
             dn: "uid=bob,ou=people,dc=example,dc=com".to_string(),
             cred: LdapBindCred::Simple("pass".to_string()),
         });
-
         assert_eq!(
             ldap_handler.handle_ldap_message(request).await.unwrap(),
             make_bind_success()
@@ -255,7 +237,6 @@ pub mod tests {
     async fn test_admin_bind() {
         let mut mock = MockTestBackendHandler::new();
         setup_default_ldap_mock(&mut mock);
-
         mock.expect_bind()
             .with(eq(lldap_domain_handlers::handler::BindRequest {
                 name: UserId::new("test"),
@@ -263,7 +244,6 @@ pub mod tests {
             }))
             .times(1)
             .return_once(|_| Ok(()));
-
         let mut admin_groups = HashSet::new();
         admin_groups.insert(GroupDetails {
             group_id: GroupId(1),
@@ -276,18 +256,14 @@ pub mod tests {
             attributes: vec![],
             modified_date: chrono::Utc.timestamp_opt(0, 0).unwrap().naive_utc(),
         });
-
         mock.expect_get_user_groups()
             .with(eq(UserId::new("test")))
             .return_once(move |_| Ok(admin_groups));
-
         let mut ldap_handler = LdapHandler::new_for_tests(mock, "dc=example,dc=com");
-
         let request = LdapBindRequest {
             dn: "uid=test,ou=people,dc=example,dc=com".to_string(),
             cred: LdapBindCred::Simple("pass".to_string()),
         };
-
         assert_eq!(ldap_handler.do_bind(&request).await, make_bind_success());
     }
 
@@ -295,13 +271,8 @@ pub mod tests {
     async fn test_bind_invalid_dn() {
         let mut mock = MockTestBackendHandler::new();
         setup_default_ldap_mock(&mut mock);
-
-        // Valid cases reach bind(), so provide a successful expectation
         mock.expect_bind().returning(|_| Ok(()));
-
         let mut ldap_handler = LdapHandler::new_for_tests(mock, "dc=example,dc=com");
-
-        // INVALID: wrong base DN → should be rejected with NamingViolation
         let request = LdapBindRequest {
             dn: "cn=bob,ou=people,dc=place,dc=com".to_string(),
             cred: LdapBindCred::Simple("pass".to_string()),
@@ -313,7 +284,6 @@ pub mod tests {
                 "Not a subtree of the base tree"
             ),
         );
-
         let request = LdapBindRequest {
             dn: "cn=bob,ou=people,dc=other,dc=com".to_string(),
             cred: LdapBindCred::Simple("pass".to_string()),
@@ -325,16 +295,11 @@ pub mod tests {
                 "Not a subtree of the base tree"
             ),
         );
-
-        // VALID: correct base DN + uid= RDN type → Success (POSIX style)
         let request = LdapBindRequest {
             dn: "uid=bob,ou=people,dc=example,dc=com".to_string(),
             cred: LdapBindCred::Simple("pass".to_string()),
         };
         assert_eq!(ldap_handler.do_bind(&request).await, make_bind_success());
-
-        // VALID: correct base DN + cn= RDN type for user in people OU → Success (dual resolution)
-        // Both uid= and cn= must succeed and return the user "bob"
         let request = LdapBindRequest {
             dn: "cn=bob,ou=people,dc=example,dc=com".to_string(),
             cred: LdapBindCred::Simple("pass".to_string()),
@@ -342,39 +307,28 @@ pub mod tests {
         assert_eq!(ldap_handler.do_bind(&request).await, make_bind_success());
     }
 
-    // ========================================================================
-    // PASSWORD CHANGE TESTS (Self-Service + Admin + Password Manager)
-    // ========================================================================
-
-    fn setup_password_change_expectations(mock: &mut MockTestBackendHandler, user: &str) {
+    pub fn expect_password_change(mock: &mut MockTestBackendHandler, user: &str) {
         use lldap_auth::{opaque, registration};
-
         let mut rng = rand::rngs::OsRng;
         let registration_start_request =
             opaque::client::registration::start_registration("password".as_bytes(), &mut rng)
                 .unwrap();
-
         let request = registration::ClientRegistrationStartRequest {
             username: user.into(),
             registration_start_request: registration_start_request.message,
         };
-
         let start_response = opaque::server::registration::start_registration(
             &opaque::server::ServerSetup::new(&mut rng),
             request.registration_start_request,
             &request.username,
         )
         .unwrap();
-
-        mock.expect_registration_start()
-            .times(1)
-            .return_once(move |_| {
-                Ok(registration::ServerRegistrationStartResponse {
-                    server_data: "".to_string(),
-                    registration_response: start_response.message,
-                })
-            });
-
+        mock.expect_registration_start().times(1).return_once(|_| {
+            Ok(registration::ServerRegistrationStartResponse {
+                server_data: "".to_string(),
+                registration_response: start_response.message,
+            })
+        });
         mock.expect_registration_finish()
             .times(1)
             .return_once(|_| Ok(()));
@@ -384,10 +338,8 @@ pub mod tests {
     async fn test_self_service_password_change() {
         let mut mock = MockTestBackendHandler::new();
         setup_default_ldap_mock(&mut mock);
-        setup_password_change_expectations(&mut mock, "bob");
-
+        expect_password_change(&mut mock, "bob");
         let mut ldap_handler = setup_bound_admin_handler(mock).await;
-
         let request = LdapOp::ExtendedRequest(
             LdapPasswordModifyRequest {
                 user_identity: Some("uid=bob,ou=people,dc=example,dc=com".to_string()),
@@ -396,7 +348,6 @@ pub mod tests {
             }
             .into(),
         );
-
         assert_eq!(
             ldap_handler.handle_ldap_message(request).await,
             Some(vec![make_extended_response(
@@ -410,10 +361,8 @@ pub mod tests {
     async fn test_admin_changes_user_password() {
         let mut mock = MockTestBackendHandler::new();
         setup_default_ldap_mock(&mut mock);
-        setup_password_change_expectations(&mut mock, "bob");
-
+        expect_password_change(&mut mock, "bob");
         let mut ldap_handler = setup_bound_admin_handler(mock).await;
-
         let request = LdapOp::ExtendedRequest(
             LdapPasswordModifyRequest {
                 user_identity: Some("uid=bob,ou=people,dc=example,dc=com".to_string()),
@@ -422,7 +371,6 @@ pub mod tests {
             }
             .into(),
         );
-
         assert_eq!(
             ldap_handler.handle_ldap_message(request).await,
             Some(vec![make_extended_response(
@@ -436,10 +384,8 @@ pub mod tests {
     async fn test_password_manager_changes_user_password() {
         let mut mock = MockTestBackendHandler::new();
         setup_default_ldap_mock(&mut mock);
-        setup_password_change_expectations(&mut mock, "bob");
-
+        expect_password_change(&mut mock, "bob");
         let mut ldap_handler = setup_bound_password_manager_handler(mock).await;
-
         let request = LdapOp::ExtendedRequest(
             LdapPasswordModifyRequest {
                 user_identity: Some("uid=bob,ou=people,dc=example,dc=com".to_string()),
@@ -448,7 +394,6 @@ pub mod tests {
             }
             .into(),
         );
-
         assert_eq!(
             ldap_handler.handle_ldap_message(request).await,
             Some(vec![make_extended_response(
@@ -462,9 +407,7 @@ pub mod tests {
     async fn test_password_change_unauthorized_readonly() {
         let mut mock = MockTestBackendHandler::new();
         setup_default_ldap_mock(&mut mock);
-
         let mut ldap_handler = setup_bound_readonly_handler(mock).await;
-
         let request = LdapOp::ExtendedRequest(
             LdapPasswordModifyRequest {
                 user_identity: Some("uid=bob,ou=people,dc=example,dc=com".to_string()),
@@ -473,7 +416,6 @@ pub mod tests {
             }
             .into(),
         );
-
         assert_eq!(
             ldap_handler.handle_ldap_message(request).await,
             Some(vec![make_extended_response(
@@ -487,9 +429,7 @@ pub mod tests {
     async fn test_password_change_errors() {
         let mut mock = MockTestBackendHandler::new();
         setup_default_ldap_mock(&mut mock);
-
         let mut ldap_handler = setup_bound_admin_handler(mock).await;
-
         let request = LdapOp::ExtendedRequest(
             LdapPasswordModifyRequest {
                 user_identity: None,

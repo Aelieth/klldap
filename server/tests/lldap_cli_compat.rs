@@ -60,7 +60,7 @@ fn gql(client: &Client, token: &str, query: &str, variables: Value) -> Value {
 
 #[test]
 #[file_serial]
-fn lldap_cli_operation_sequence() {
+fn test_lldap_cli_operation_sequence() {
     let mut _fixture = LLDAPFixture::new();
     let client = make_client();
     let base_url = env::http_url();

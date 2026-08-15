@@ -9,8 +9,6 @@ use lldap_domain_handlers::handler::BackendHandler;
 use lldap_opaque_handler::OpaqueHandler;
 use tracing::debug;
 
-/// Combined trait for handlers that can be used with the full GraphQL layer.
-/// This is the long-term, explicit contract.
 pub trait FullHandler: BackendHandler + OpaqueHandler {}
 
 impl<T: BackendHandler + OpaqueHandler> FullHandler for T {}

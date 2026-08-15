@@ -1,27 +1,17 @@
-//! Built-in attribute schema for users, groups, and system data.
+//! The built-in attribute schema. Attributes are declared with the `AttributeSchema::{editable,
+//! generated, readonly, hidden}` builders; every one is hardcoded and single-valued unless
+//! `.list()` is chained.
 //!
-//! Attributes are declared with the `A::{editable, readonly, generated, hidden}` builders. Each sets
-//! a combination of the five `AttributeSchema` flags: four inherited from upstream LLDAP — `is_list`,
-//! `is_visible`, `is_editable`, `is_hardcoded` — plus KLLDAP's own `is_readonly` (no upstream analog;
-//! it is also what makes an attribute advertise `NO-USER-MODIFICATION` over LDAP).
+//! - `editable`: visible to all, writable by users and admins (mail, displayName, avatar, ...).
+//! - `generated`: visible to all, settable only by admins; the server assigns the value
+//!   (uidNumber, gidNumber, homeDirectory, loginShell, kerberosSync).
+//! - `readonly`: visible to all, writable by nobody, advertised NO-USER-MODIFICATION over LDAP
+//!   (userId, uuid, timestamps, ou, groupId).
+//! - `hidden`: readonly and stripped from the schema and values for non-admins
+//!   (krbPrincipalName, allowedOUs).
 //!
-//! Every builder sets `is_hardcoded = true` (built-in: undeletable, value read from a typed field,
-//! never a stored custom attribute) and `is_list = false` unless `.list()` is chained.
-//!
-//! - `editable`  — `is_editable = true`. Visible to all; writable by regular users *and* admins.
-//!   (mail, displayName, firstName, lastName, avatar, sshPublicKey)
-//! - `generated` — all defaults (`is_editable = false`, `is_readonly = false`). Visible to all; a
-//!   regular user cannot set it, but an **admin can override** it. For server-assigned POSIX/Kerberos
-//!   values (uidNumber, gidNumber, homeDirectory, loginShell, kerberos sync).
-//! - `readonly`  — `is_readonly = true`. Visible to all; **write-blocked for everyone, admins
-//!   included**, and advertised `NO-USER-MODIFICATION` in the LDAP schema. (userId, uuid, timestamps,
-//!   ou, groupId)
-//! - `hidden`    — `is_visible = false` (+ `is_readonly = true`). **Admin-only**: stripped from both
-//!   the schema and the returned values for non-admins; also write-blocked. (krbPrincipalName;
-//!   system allowedOUs)
-//!
-//! Enforcement (`graphql-server` mutation path): `is_readonly` is checked before `is_editable`, so
-//! `readonly` freezes a value for all while `generated` blocks only regular users.
+//! The mutation path checks `is_readonly` before `is_editable`, so `readonly` freezes a value
+//! for everyone while `generated` blocks only regular users.
 use crate::schema::{AttributeList, AttributeSchema, AttributeType, PosixSettings, Schema};
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
@@ -37,7 +27,6 @@ impl PublicSchema {
         Self::shared().clone()
     }
 
-    /// Shared static instance — the schema is a compile-time constant.
     pub fn shared() -> &'static Self {
         static SCHEMA: LazyLock<PublicSchema> = LazyLock::new(PublicSchema::build);
         &SCHEMA
@@ -47,81 +36,42 @@ impl PublicSchema {
         use AttributeSchema as A;
         use AttributeType::{Avatar, DateTime, Integer, String};
 
-        #[rustfmt::skip]
         let user_attributes = vec![
-            // --- Core (LLDAP-descended) ---
-            A::editable("avatar", Avatar)
-                .aliases(&["jpegphoto", "jpegPhoto", "jpeg_photo"]),
-            A::readonly("creationdate", DateTime)
-                .aliases(&["creation_date", "createTimestamp"]),
-            A::editable("displayname", String)
-                .aliases(&["display_name", "cn", "commonname"]),
-            A::editable("firstname", String)
-                .aliases(&["first_name", "givenName", "given_name"]),
-            A::editable("lastname", String)
-                .aliases(&["last_name", "sn", "surname"]),
-            A::editable("mail", String)
-                .aliases(&["email"]),
-            A::readonly("modifieddate", DateTime)
-                .aliases(&["modified_date", "modifyTimestamp"]),
+            A::editable("avatar", Avatar).aliases(&["jpegphoto", "jpegPhoto", "jpeg_photo"]),
+            A::readonly("creationdate", DateTime).aliases(&["creation_date", "createTimestamp"]),
+            A::editable("displayname", String).aliases(&["display_name", "cn", "commonname"]),
+            A::editable("firstname", String).aliases(&["first_name", "givenName", "given_name"]),
+            A::editable("lastname", String).aliases(&["last_name", "sn", "surname"]),
+            A::editable("mail", String).aliases(&["email"]),
+            A::readonly("modifieddate", DateTime).aliases(&["modified_date", "modifyTimestamp"]),
             A::readonly("passwordmodifieddate", DateTime)
                 .aliases(&["password_modified_date", "pwdChangedTime"]),
-            A::readonly("userid", String)
-                .aliases(&["user_id", "uid", "id"]),
-            A::readonly("uuid", String)
-                .aliases(&["entryUUID", "entryuuid"]),
-
-            // --- POSIX ---
-            A::generated("uidnumber", Integer)
-                .aliases(&["uid_number", "uidNumber"]),
-            A::generated("gidnumber", Integer)
-                .aliases(&["gid_number", "gidNumber"]),
-            A::generated("homedirectory", String)
-                .aliases(&["home_directory", "homeDirectory"]),
-            A::generated("loginshell", String)
-                .aliases(&["login_shell", "loginShell"]),
-
-            // --- Kerberos ---
+            A::readonly("userid", String).aliases(&["user_id", "uid", "id"]),
+            A::readonly("uuid", String).aliases(&["entryUUID", "entryuuid"]),
+            A::generated("uidnumber", Integer).aliases(&["uid_number", "uidNumber"]),
+            A::generated("gidnumber", Integer).aliases(&["gid_number", "gidNumber"]),
+            A::generated("homedirectory", String).aliases(&["home_directory", "homeDirectory"]),
+            A::generated("loginshell", String).aliases(&["login_shell", "loginShell"]),
             A::generated(KERBEROS_SYNC, Integer).aliases(&["kerberos_sync", "kerberosSync"]),
             A::hidden("krbprincipalname", String)
                 .aliases(&["krb_principal_name", "krbPrincipalName"]),
-
-            // --- SSH ---
             A::editable("sshpublickey", String)
                 .aliases(&["sshPublicKey", "ssHPublicKey", "ssh_public_key"])
                 .list(),
-
-            // --- OU ---
-            A::readonly("ou", String)
-                .aliases(&["organizationalunit", "organizationalUnit"]),
+            A::readonly("ou", String).aliases(&["organizationalunit", "organizationalUnit"]),
         ];
 
-        #[rustfmt::skip]
         let group_attributes = vec![
-            // --- Core ---
-            A::readonly("groupid", Integer)
-                .aliases(&["group_id"]),
-            A::readonly("creationdate", DateTime)
-                .aliases(&["creation_date", "createTimestamp"]),
-            A::readonly("modifieddate", DateTime)
-                .aliases(&["modified_date", "modifyTimestamp"]),
-            A::readonly("uuid", String)
-                .aliases(&["entryUUID", "entryuuid"]),
-            A::editable("displayname", String)
-                .aliases(&["display_name", "cn", "commonname"]),
-
-            // --- OU ---
-            A::readonly("ou", String)
-                .aliases(&["organizationalunit", "organizationalUnit"]),
-
-            // --- POSIX ---
-            A::generated("gidnumber", Integer)
-                .aliases(&["gid_number", "gidNumber"]),
+            A::readonly("groupid", Integer).aliases(&["group_id"]),
+            A::readonly("creationdate", DateTime).aliases(&["creation_date", "createTimestamp"]),
+            A::readonly("modifieddate", DateTime).aliases(&["modified_date", "modifyTimestamp"]),
+            A::readonly("uuid", String).aliases(&["entryUUID", "entryuuid"]),
+            A::editable("displayname", String).aliases(&["display_name", "cn", "commonname"]),
+            A::readonly("ou", String).aliases(&["organizationalunit", "organizationalUnit"]),
+            A::generated("gidnumber", Integer).aliases(&["gid_number", "gidNumber"]),
         ];
 
-        #[rustfmt::skip]
         let system_attributes = vec![
-            // --- Access control ---
             A::hidden("allowedous", String)
                 .aliases(&["allowedOUs", "AllowedOUs"])
                 .list(),

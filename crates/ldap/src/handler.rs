@@ -169,7 +169,6 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
         let (code, message) = {
             match password::do_bind(self.ldap_info, request, self.get_login_handler()).await {
                 Ok(user_id) => {
-                    // Strict OU enforcement
                     let inner = self.backend_handler.unsafe_get_handler();
                     match inner.get_user_details(&user_id).await {
                         Ok(user) => {
@@ -403,50 +402,39 @@ pub mod tests {
     use lldap_domain::types::UserId;
     use lldap_test_utils::MockTestBackendHandler;
 
-    pub async fn setup_bound_admin_handler(
-        mock: MockTestBackendHandler,
-    ) -> LdapHandler<MockTestBackendHandler> {
-        let mut handler = LdapHandler::new_for_tests(mock, "dc=example,dc=com");
-        handler.user_info = Some(ValidationResults {
-            user: UserId::new("test"),
-            permission: Permission::Admin,
-        });
-        handler
-    }
-
-    pub async fn setup_bound_password_manager_handler(
-        mock: MockTestBackendHandler,
-    ) -> LdapHandler<MockTestBackendHandler> {
-        let handler = setup_bound_admin_handler(mock).await;
-        // In real impl this would have password-manager group; for test we reuse admin-like
-        handler
-    }
-
-    pub async fn setup_bound_readonly_handler(
-        mock: MockTestBackendHandler,
-    ) -> LdapHandler<MockTestBackendHandler> {
-        let mut handler = LdapHandler::new_for_tests(mock, "dc=example,dc=com");
-        handler.user_info = Some(ValidationResults {
-            user: UserId::new("test"),
-            permission: Permission::Readonly,
-        });
-        handler
-    }
-
     pub async fn setup_bound_handler_with_group(
         mock: MockTestBackendHandler,
         group: &str,
     ) -> LdapHandler<MockTestBackendHandler> {
-        let mut handler = LdapHandler::new_for_tests(mock, "dc=example,dc=com");
-        let permission = if group.eq_ignore_ascii_case("regular") {
-            Permission::Readonly // non-admin; self-changes still allowed by can_change_password policy
-        } else {
-            Permission::Admin
+        let permission = match group {
+            "lldap_admin" => Permission::Admin,
+            "lldap_password_manager" => Permission::PasswordManager,
+            "lldap_strict_readonly" => Permission::Readonly,
+            _ => Permission::Regular,
         };
+        let mut handler = LdapHandler::new_for_tests(mock, "dc=example,dc=com");
         handler.user_info = Some(ValidationResults {
             user: UserId::new("test"),
             permission,
         });
         handler
+    }
+
+    pub async fn setup_bound_admin_handler(
+        mock: MockTestBackendHandler,
+    ) -> LdapHandler<MockTestBackendHandler> {
+        setup_bound_handler_with_group(mock, "lldap_admin").await
+    }
+
+    pub async fn setup_bound_password_manager_handler(
+        mock: MockTestBackendHandler,
+    ) -> LdapHandler<MockTestBackendHandler> {
+        setup_bound_handler_with_group(mock, "lldap_password_manager").await
+    }
+
+    pub async fn setup_bound_readonly_handler(
+        mock: MockTestBackendHandler,
+    ) -> LdapHandler<MockTestBackendHandler> {
+        setup_bound_handler_with_group(mock, "lldap_strict_readonly").await
     }
 }

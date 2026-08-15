@@ -1,30 +1,12 @@
-//! DN and Organizational Unit (OU) utilities.
-//!
-//! This module centralizes all Distinguished Name parsing, OU hierarchy handling,
-//! and user/group ID extraction from DNs.
-//!
-//! Custom groups are now fully supported under any allowed OU (not just the default "groups" OU).
-//! The leaf detection logic was updated to be symmetric with users while preserving
-//! backward compatibility for classic deployments.
-
 use crate::core::error::{LdapError, LdapResult};
 use ldap3_proto::LdapResultCode;
 use lldap_domain::types::{GroupName, UserId};
 use tracing::{debug, warn};
 
-// ============================================================================
-// CONSTANTS
-// ============================================================================
-
 pub const DEFAULT_PRIMARY_USER_OU: &str = "people";
 pub const DEFAULT_PRIMARY_GROUP_OU: &str = "groups";
 
-// ============================================================================
-// OU & DN UTILITIES
-// ============================================================================
-
-/// Returns the internal OU string (e.g. "people\home" or "office\floor1")
-/// from DN parts by collecting all `ou=` RDNs in order and joining with `\`.
+/// The internal OU string ("people\\home") from a DN's `ou=` RDNs, in order.
 pub fn get_internal_ou_from_dn_parts(dn_parts: &[(String, String)]) -> String {
     let ou_chain: Vec<(String, String)> = dn_parts
         .iter()
@@ -34,8 +16,7 @@ pub fn get_internal_ou_from_dn_parts(dn_parts: &[(String, String)]) -> String {
     ldap_rdn_chain_to_internal_ou(&ou_chain)
 }
 
-/// Returns only the *direct* child OUs (exactly one level deeper in the hierarchy)
-/// for the given `parent_internal_ou` from the full `allowed_ous` list.
+/// The OUs exactly one level below `parent_internal_ou`.
 pub fn get_direct_child_ous(parent_internal_ou: &str, allowed_ous: &[String]) -> Vec<String> {
     let parent_l = parent_internal_ou.to_ascii_lowercase();
     allowed_ous
@@ -55,7 +36,6 @@ pub fn get_direct_child_ous(parent_internal_ou: &str, allowed_ous: &[String]) ->
         .collect()
 }
 
-/// Convert internal OU string ("people" or "people\home") into clean hierarchical LDAP RDN chain.
 pub fn internal_ou_to_ldap_rdn_chain(ou: &str) -> Vec<(String, String)> {
     if ou.trim().is_empty() {
         return vec![];
@@ -71,7 +51,6 @@ pub fn internal_ou_to_ldap_rdn_chain(ou: &str) -> Vec<(String, String)> {
     chain
 }
 
-/// Reverse of `internal_ou_to_ldap_rdn_chain` — reconstruct internal OU string from LDAP RDN chain.
 pub fn ldap_rdn_chain_to_internal_ou(rdn_chain: &[(String, String)]) -> String {
     let ous: Vec<String> = rdn_chain
         .iter()
@@ -86,7 +65,6 @@ pub fn ldap_rdn_chain_to_internal_ou(rdn_chain: &[(String, String)]) -> String {
     }
 }
 
-/// Returns true if `dn_parts` represents an allowed OU container (any depth).
 pub fn is_container_dn(
     dn_parts: &[(String, String)],
     base_dn: &[(String, String)],
@@ -104,7 +82,6 @@ pub fn is_container_dn(
     is_allowed && dn_parts.len() == base_dn.len() + ou_chain.len()
 }
 
-/// Returns true if `subtree` is a subtree of (or equal to) `base_tree`.
 pub fn is_subtree(subtree: &[(String, String)], base_tree: &[(String, String)]) -> bool {
     if base_tree.is_empty() {
         return true;
@@ -123,10 +100,6 @@ pub fn is_subtree(subtree: &[(String, String)], base_tree: &[(String, String)]) 
     }
     true
 }
-
-// ============================================================================
-// DISTINGUISHED NAME PARSING
-// ============================================================================
 
 fn make_dn_pair<I>(mut iter: I) -> LdapResult<(String, String)>
 where
@@ -161,14 +134,10 @@ pub fn parse_distinguished_name(dn: &str) -> LdapResult<Vec<(String, String)>> {
         .collect();
 
     if let Err(e) = &result {
-        warn!(?dn, error = ?e, "Invalid DN syntax received from client (Directory Studio / ldapsearch?)");
+        warn!(?dn, error = ?e, "Invalid DN syntax received from client");
     }
     result
 }
-
-// ============================================================================
-// USER / GROUP ID EXTRACTION FROM DN
-// ============================================================================
 
 pub enum UserOrGroupName {
     User(UserId),
@@ -195,12 +164,8 @@ impl UserOrGroupName {
     }
 }
 
-/// Determines whether a DN refers to a user or a group by inspecting the RDN and the
-/// primary (leaf) OU.
-///
-/// Users are recognized by `uid=` or `cn=` when the primary OU is `people` (or empty).
-/// Groups are recognized by `cn=` under **any other OU**. This enables full support for
-/// custom and nested OUs for groups while keeping classic behavior for the default `groups` OU.
+/// `uid=` or `cn=` under `people` (or no OU) is a user; `cn=` under any other OU is a
+/// group, so groups may live under custom and nested OUs.
 pub fn get_user_or_group_id_from_distinguished_name(
     dn: &str,
     base_tree: &[(String, String)],
@@ -293,10 +258,6 @@ pub fn get_group_id_from_distinguished_name_or_plain_name(
     }
 }
 
-/// Builds a full user Distinguished Name from the user_id, internal_ou hierarchy string
-/// (e.g. "service" or "office\\floor1"), and base_dn_str.
-/// This centralizes DN construction logic, eliminates duplication, and fixes the latent
-/// correctness bug where ou_part == "" produced an invalid "uid=foo,,dc=..." DN.
 pub fn build_user_dn(user_id: &UserId, internal_ou: &str, base_dn_str: &str) -> String {
     let rdn_chain = internal_ou_to_ldap_rdn_chain(internal_ou);
     let ou_part = rdn_chain
@@ -311,7 +272,6 @@ pub fn build_user_dn(user_id: &UserId, internal_ou: &str, base_dn_str: &str) -> 
     }
 }
 
-/// Builds a full group Distinguished Name. Symmetric to build_user_dn for consistency and reuse.
 pub fn build_group_dn(group_name: &GroupName, internal_ou: &str, base_dn_str: &str) -> String {
     let rdn_chain = internal_ou_to_ldap_rdn_chain(internal_ou);
     let ou_part = rdn_chain

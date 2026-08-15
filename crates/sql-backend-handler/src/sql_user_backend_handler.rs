@@ -8,7 +8,7 @@ use lldap_domain::{
     requests::{CreateUserRequest, UpdateUserRequest},
     types::{
         Attribute, AttributeName, AttributeValue, Cardinality, GroupDetails, GroupId, Serialized,
-        User, UserAndGroups, UserId, Uuid,
+        User, UserAndGroups, UserId, Uuid, kerberos_sync_enabled,
     },
 };
 use lldap_domain_handlers::handler::{
@@ -179,6 +179,7 @@ impl UserListerBackendHandler for SqlBackendHandler {
     async fn list_users(
         &self,
         filters: Option<UserRequestFilter>,
+        // To simplify the query, we always fetch groups. TODO: cleanup.
         _get_groups: bool,
     ) -> Result<Vec<UserAndGroups>> {
         let filters = filters
@@ -217,6 +218,7 @@ impl UserListerBackendHandler for SqlBackendHandler {
             .await?;
 
         let mut attributes_iter = attributes.into_iter().peekable();
+        // TODO: should be wrapped in a transaction
         let schema = self.get_schema().await?;
         for user in users.iter_mut() {
             let mut attrs: Vec<_> = attributes_iter
@@ -226,9 +228,7 @@ impl UserListerBackendHandler for SqlBackendHandler {
                 })
                 .collect::<Result<Vec<_>>>()?;
 
-            // Defensive canonical remap on read path (matches get_user_details).
-            // Ensures AttributeEquality filters and list output always use canonical names,
-            // even if legacy alias data exists. Reuses the shared helper.
+            // Canonical names on the read path, whatever alias legacy rows carry.
             for attr in &mut attrs {
                 attr.name = Self::canonical_user_attribute_name(&schema, attr.name.as_str());
             }
@@ -252,7 +252,6 @@ impl SqlBackendHandler {
         Option<bool>,
     )> {
         let mut update_user_attributes = Vec::new();
-        // Resolve delete names to canonical too (supports alias in delete requests + keeps storage invariant)
         let mut remove_user_attributes: Vec<AttributeName> = delete_attributes
             .into_iter()
             .map(|name| SqlBackendHandler::canonical_user_attribute_name(schema, name.as_str()))
@@ -268,20 +267,17 @@ impl SqlBackendHandler {
 
             if attribute.name.as_str() == KERBEROS_SYNC {
                 kerb_sync_enabled = match &attribute.value {
-                    // Frontend (user_details_form + kerberos_switch) sends String "0"/"1"
                     AttributeValue::String(Cardinality::Singleton(s)) => match s.trim() {
                         "1" | "true" | "TRUE" => Some(true),
                         "0" | "false" | "FALSE" => Some(false),
                         _ => Some(false),
                     },
-                    // Support the old Integer style too (for safety)
                     AttributeValue::Integer(Cardinality::Singleton(1)) => Some(true),
                     AttributeValue::Integer(Cardinality::Singleton(0)) => Some(false),
                     _ => Some(false),
                 };
             }
 
-            // === BACKEND BYPASS FOR READONLY ATTRIBUTES USED BY OU OPERATIONS ===
             let attr_name = attribute.name.as_str();
             if schema
                 .user_attributes()
@@ -429,12 +425,11 @@ impl SystemConfigBackendHandler for SqlBackendHandler {
 
 impl SqlBackendHandler {
     /// Best-effort: mirror `lldap_disabled` group membership onto the user's Kerberos principal via
-    /// DISALLOW_ALL_TIX, but only for kerberossync-managed users. Never fails the caller — Kerberos
-    /// is advisory here, exactly like `delete_user` and the sync-off branch of update. `disabled`
-    /// true sets `-allow_tix`; false restores `+allow_tix`.
+    /// Best-effort: mirror `lldap_disabled` membership onto the principal's DISALLOW_ALL_TIX,
+    /// only for kerberossync-managed users. Kerberos is advisory here, like `delete_user`.
     async fn reflect_kerberos_disabled(&self, user_id: &UserId, disabled: bool) {
         let synced = match self.get_user_details(user_id).await {
-            Ok(u) => lldap_domain::types::kerberos_sync_enabled(&u.attributes),
+            Ok(u) => kerberos_sync_enabled(&u.attributes),
             Err(e) => {
                 tracing::warn!(
                     "Kerberos disable-sync: could not load user {} ({}); skipping",
@@ -482,7 +477,6 @@ impl UserBackendHandler for SqlBackendHandler {
                 let mut attr =
                     codec::decode_attribute(a.attribute_name, &a.value, schema.user_attributes())?;
 
-                // Force canonical name on output (defensive against any legacy alias data)
                 attr.name = Self::canonical_user_attribute_name(&schema, attr.name.as_str());
 
                 if attr.name.as_str() == "avatar" {
@@ -635,9 +629,7 @@ impl UserBackendHandler for SqlBackendHandler {
 
     #[instrument(skip_all, level = "debug", err, fields(user_id = ?user_id.as_str()))]
     async fn delete_user(&self, user_id: &UserId) -> Result<()> {
-        // Kerberos principal must be removed when the user ceases to exist.
-        // We do this *before* the hard delete so the row still exists if anything
-        // downstream needs it, and because delete_kerberos_principal is idempotent.
+        // Removed before the row delete, and idempotent, so a missing principal is fine.
         if let Err(e) = kerberos_backend().delete_principal(user_id.as_str()) {
             tracing::warn!(
                 "Failed to delete Kerberos principal for user {} during deletion (non-fatal): {}",
@@ -659,7 +651,6 @@ impl UserBackendHandler for SqlBackendHandler {
 
     #[instrument(skip_all, level = "debug", err, fields(user_id = ?user_id.as_str(), group_id))]
     async fn add_user_to_group(&self, user_id: &UserId, group_id: GroupId) -> Result<()> {
-        // === CORE GROUP MUTUAL EXCLUSION ===
         let user_groups = self.get_user_groups(user_id).await?;
         let target_group_details = self.get_group_details(group_id).await?;
 
@@ -679,8 +670,7 @@ impl UserBackendHandler for SqlBackendHandler {
             ));
         }
 
-        // Capture the disable transition before the user_id shadow so post-commit reflect
-        // can still use the original id.
+        // Captured before the user_id shadow so the post-commit reflect keeps the original id.
         let disabled_target = target_name == "lldap_disabled";
         let kerb_uid = user_id.clone();
 
@@ -715,8 +705,7 @@ impl UserBackendHandler for SqlBackendHandler {
 
     #[instrument(skip_all, level = "debug", err, fields(user_id = ?user_id.as_str(), group_id))]
     async fn remove_user_from_group(&self, user_id: &UserId, group_id: GroupId) -> Result<()> {
-        // Resolve whether this removes the user from lldap_disabled before the user_id
-        // shadow; a lookup failure just skips the best-effort reflect.
+        // Resolved before the user_id shadow; a lookup failure skips the best-effort reflect.
         let disabled_target = self
             .get_group_details(group_id)
             .await
@@ -728,8 +717,7 @@ impl UserBackendHandler for SqlBackendHandler {
         self.sql_pool
             .transaction::<_, _, sea_orm::DbErr>(|transaction| {
                 Box::pin(async move {
-                    // === LAST ADMIN PROTECTION (backend layer) ===
-                    // Prevent removing the final member of lldap_admin, regardless of caller.
+                    // The last member of lldap_admin cannot be removed, whoever asks.
                     let group_details = model::Group::find_by_id(group_id).one(transaction).await?;
                     if let Some(g) = &group_details
                         && g.display_name.as_str() == "lldap_admin"
@@ -1214,7 +1202,6 @@ mod tests {
             vec!["john", "nogroup", "patrick"]
         );
 
-        // Insert new user and remove two
         insert_user_no_password(&fixture.handler, "NewBoi").await;
         fixture
             .handler
@@ -1294,7 +1281,6 @@ mod tests {
         assert_eq!(user.email, "email".into());
         assert_eq!(user.display_name.unwrap(), "display_name");
 
-        // Canonical names + ou + avatar type check (no exact bytes)
         assert!(
             user.attributes.iter().any(
                 |a| a.name.as_str() == "avatar" && matches!(a.value, AttributeValue::Avatar(_))
@@ -1341,7 +1327,6 @@ mod tests {
 
         assert_eq!(user.display_name.unwrap(), "display bob");
 
-        // Verify canonical names + correct types (image conversion verified in images.rs)
         assert!(
             user.attributes.iter().any(
                 |a| a.name.as_str() == "avatar" && matches!(a.value, AttributeValue::Avatar(_))
@@ -1485,7 +1470,6 @@ mod tests {
     async fn test_update_user_delete_avatar() {
         let fixture = TestFixture::new().await;
 
-        // First insert an avatar
         fixture
             .handler
             .update_user(UpdateUserRequest {
@@ -1506,7 +1490,6 @@ mod tests {
             .unwrap();
         assert!(user.attributes.iter().any(|a| a.name.as_str() == "avatar"));
 
-        // Now delete it
         fixture
             .handler
             .update_user(UpdateUserRequest {
@@ -1602,8 +1585,8 @@ mod tests {
         );
     }
 
-    // Toggling lldap_disabled fires a best-effort Kerberos enable/disable. With no KDC
-    // the reflect no-ops, so add/remove still succeed and never become a hard error.
+    // Toggling lldap_disabled fires a best-effort Kerberos enable/disable that never
+    // becomes a hard error.
     #[tokio::test]
     #[serial]
     async fn test_toggle_lldap_disabled_runs_kerberos_hook_cleanly() {
@@ -1633,7 +1616,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Disable transition.
         fixture
             .handler
             .add_user_to_group(&UserId::new("ksync"), disabled_gid)
@@ -1655,7 +1637,6 @@ mod tests {
             }]
         );
 
-        // Re-enable transition.
         fixture
             .handler
             .remove_user_from_group(&UserId::new("ksync"), disabled_gid)
@@ -1682,7 +1663,6 @@ mod tests {
     async fn test_cannot_remove_last_member_of_lldap_admin() {
         let fixture = TestFixture::new().await;
 
-        // Create a group that matches the protected admin name
         let admin_gid = fixture
             .handler
             .create_group(CreateGroupRequest {
@@ -1692,14 +1672,12 @@ mod tests {
             .await
             .unwrap();
 
-        // Add exactly one user to it
         fixture
             .handler
             .add_user_to_group(&UserId::new("bob"), admin_gid)
             .await
             .unwrap();
 
-        // Attempting to remove that last member must be rejected by the backend guard
         let err = fixture
             .handler
             .remove_user_from_group(&UserId::new("bob"), admin_gid)
@@ -1711,7 +1689,6 @@ mod tests {
             err
         );
 
-        // The membership should still exist
         let still_member = fixture
             .handler
             .list_users(Some(UserRequestFilter::MemberOfId(admin_gid)), false)

@@ -19,3 +19,6 @@ tracing = { workspace = true }
 
 [dependencies.lldap_domain_handlers]
 path = "../domain-handlers"
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

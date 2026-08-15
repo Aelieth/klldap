@@ -44,7 +44,6 @@ fn validate_ssh_public_key(key: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Resolve an attribute name (which may be an alias) to its canonical name using the schema.
 fn resolve_canonical_name(attribute_list: &AttributeList, name: &str) -> String {
     attribute_list
         .resolve_canonical_name(name)
@@ -115,9 +114,8 @@ pub fn consolidate_attributes(
         })
         .collect::<BTreeMap<_, _>>();
 
-    // Special fields (deprecated top-level) are merged using alias names for .name,
-    // but keyed by (lowercased) canonical to deduplicate aliases like "first_name" + "firstname".
-    // This ensures attributes list takes precedence and no duplicate canonical entries.
+    // Keyed by canonical name, so the deprecated top-level fields never duplicate an alias
+    // already given in the attribute list.
     let field_attrs = [
         ("first_name", first_name),
         ("last_name", last_name),
@@ -173,9 +171,7 @@ pub async fn create_group_with_details<Handler: BackendHandler + OpaqueHandler>(
     let mut final_attributes = attributes;
     final_attributes.push(DomainAttribute {
         name: AttributeName::from("ou"),
-        value: lldap_domain::types::AttributeValue::String(
-            lldap_domain::types::Cardinality::Singleton(ou_value),
-        ),
+        value: ou_value.into(),
     });
 
     let request = CreateGroupRequest {
@@ -193,9 +189,7 @@ pub fn deserialize_attribute(
     attribute: AttributeValue,
     is_admin: bool,
 ) -> FieldResult<DomainAttribute> {
-    // Resolve to canonical name so that aliases defined in PublicSchema
-    // are normalized before being stored. This prevents duplicates like
-    // firstname + first_name.
+    // Stored under the canonical name, never an alias.
     let canonical_name = resolve_canonical_name(attribute_schema, &attribute.name);
     let attribute_name = AttributeName::from(canonical_name.as_str());
 
@@ -226,17 +220,12 @@ pub fn deserialize_attribute(
         }
     }
 
-    let value = match deserialize_attribute_value(
+    let value = deserialize_attribute_value(
         &attribute.value,
         attr_schema.attribute_type,
         attr_schema.is_list,
-    ) {
-        Ok(value) => value,
-        Err(e) => {
-            return Err(anyhow!("Invalid value for attribute {}: {:#}", attribute.name, e).into());
-        }
-    };
-
+    )
+    .map_err(|e| anyhow!("Invalid value for attribute {}: {:#}", attribute.name, e))?;
     Ok(DomainAttribute {
         name: attribute_name,
         value,
@@ -248,6 +237,7 @@ mod tests {
     use super::*;
     use lldap_domain::types::{AttributeType, AttributeValue as DomainValue, Cardinality};
     use lldap_schema::schema::{AttributeList, AttributeSchema};
+    use pretty_assertions::assert_eq;
 
     fn attr_input(name: &str, values: &[&str]) -> AttributeValue {
         AttributeValue {
@@ -263,7 +253,7 @@ mod tests {
     }
 
     #[test]
-    fn datetime_input_parses_rfc3339() {
+    fn test_datetime_input_parses_rfc3339() {
         let schema = schema_of(AttributeSchema::editable("mydate", AttributeType::DateTime));
         let attr = deserialize_attribute(
             &schema,
@@ -280,7 +270,7 @@ mod tests {
     }
 
     #[test]
-    fn integer_list_input_parses_numbers() {
+    fn test_integer_list_input_parses_numbers() {
         let schema = schema_of(AttributeSchema::editable("myints", AttributeType::Integer).list());
         let attr =
             deserialize_attribute(&schema, attr_input("myints", &["1", "-2"]), false).unwrap();
@@ -291,7 +281,7 @@ mod tests {
     }
 
     #[test]
-    fn non_list_rejects_empty_and_invalid_input() {
+    fn test_non_list_rejects_empty_and_invalid_input() {
         let schema = schema_of(AttributeSchema::editable("mydate", AttributeType::DateTime));
         assert!(deserialize_attribute(&schema, attr_input("mydate", &[]), false).is_err());
         assert!(

@@ -78,9 +78,10 @@ impl KerberosPaths {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     #[test]
-    fn default_matches_container_layout() {
+    fn test_default_matches_container_layout() {
         let paths = KerberosPaths::default();
         assert_eq!(paths.admin_keytab, PathBuf::from("/data/kadm5.keytab"));
         assert_eq!(
@@ -91,7 +92,7 @@ mod tests {
     }
 
     #[test]
-    fn lookup_overrides_non_empty_values_only() {
+    fn test_lookup_overrides_non_empty_values_only() {
         let paths = KerberosPaths::from_lookup(|key| match key {
             "LLDAP_KERB_ADMIN_KEYTAB" => Some("/tmp/sandbox/kadm5.keytab".to_owned()),
             "LLDAP_KERB_KDC_DIR" => Some(String::new()),
@@ -107,7 +108,7 @@ mod tests {
     }
 
     #[test]
-    fn unparsable_port_falls_back_to_default() {
+    fn test_unparsable_port_falls_back_to_default() {
         let paths = KerberosPaths::from_lookup(|key| {
             (key == "LLDAP_KERB_KDC_PORT").then(|| "kdc".to_owned())
         });

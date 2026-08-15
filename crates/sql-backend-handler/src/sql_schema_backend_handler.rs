@@ -115,10 +115,8 @@ impl SqlBackendHandler {
     pub(crate) async fn get_schema_with_transaction(
         transaction: &DatabaseTransaction,
     ) -> Result<PublicSchema> {
-        // === Start from the authoritative definition (has correct aliases) ===
         let mut full = PublicSchema::get().0; // inner Schema
 
-        // Load only truly dynamic (custom) attributes from DB
         let dynamic_user_attrs: Vec<_> = Self::get_user_attributes(transaction)
             .await?
             .into_iter()
@@ -131,7 +129,6 @@ impl SqlBackendHandler {
             .filter(|a| !a.is_hardcoded)
             .collect();
 
-        // Merge dynamic attributes (avoid duplicates by canonical name)
         for attr in dynamic_user_attrs {
             if !full
                 .user_attributes
@@ -154,7 +151,6 @@ impl SqlBackendHandler {
             }
         }
 
-        // Live POSIX settings (keep your current logic)
         full.posix_settings = {
             let s = Self::get_posix_settings_with_transaction(transaction).await?;
             lldap_schema::schema::PosixSettings {
@@ -173,7 +169,6 @@ impl SqlBackendHandler {
             }
         };
 
-        // Object classes
         full.extra_user_object_classes = Self::get_user_object_classes(transaction)
             .await?
             .into_iter()
@@ -471,15 +466,13 @@ mod tests {
 
         let user_attrs = schema.user_attributes();
 
-        // Collect all top-level attribute names
         let top_level_names: Vec<&str> = user_attrs
             .attributes
             .iter()
             .map(|a| a.name.as_str())
             .collect();
 
-        // These must NEVER appear as top-level names.
-        // They should only exist inside the `aliases` vector of their canonical attribute.
+        // Aliases must never appear as top-level names.
         let forbidden_alias_names = ["first_name", "last_name", "givenName", "sn"];
 
         for forbidden in forbidden_alias_names {
@@ -491,7 +484,6 @@ mod tests {
             );
         }
 
-        // Sanity check: the canonical names must be present
         assert!(
             top_level_names.contains(&"firstname"),
             "Canonical name 'firstname' must be present"
@@ -501,7 +493,6 @@ mod tests {
             "Canonical name 'lastname' must be present"
         );
 
-        // Extra safety: no top-level name should appear in another attribute's aliases list
         for attr in &user_attrs.attributes {
             for alias in &attr.aliases {
                 assert!(

@@ -1,5 +1,3 @@
-//! Root DSE and subschema request handling.
-
 use ldap3_proto::proto::{
     LdapOp, LdapSearchRequest, LdapSearchScope, OID_PASSWORD_MODIFY, OID_WHOAMI,
 };
@@ -149,9 +147,10 @@ pub fn is_subschema_entry_request(request: &LdapSearchRequest) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     #[test]
-    fn kerberos_realm_name_from_base_dn_and_env() {
+    fn test_kerberos_realm_name_from_base_dn_and_env() {
         assert_eq!(
             kerberos_realm_name("dc=example,dc=com", None),
             "EXAMPLE.COM"
@@ -167,7 +166,7 @@ mod tests {
     }
 
     #[test]
-    fn root_dse_always_emits_subschema_and_realm() {
+    fn test_root_dse_always_emits_subschema_and_realm() {
         let LdapOp::SearchResultEntry(entry) = root_dse_response("dc=example,dc=com") else {
             panic!("expected SearchResultEntry");
         };

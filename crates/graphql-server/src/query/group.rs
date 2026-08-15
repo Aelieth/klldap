@@ -80,7 +80,7 @@ impl<Handler: BackendHandler + OpaqueHandler> Group<Handler> {
         self.uuid.clone()
     }
 
-    /// Single-layer OU (defaults to "groups" — editable by admin only)
+    /// The OU of the group, "groups" by default. Admin-editable.
     fn ou(&self) -> String {
         let canonical = self
             .schema
@@ -94,12 +94,12 @@ impl<Handler: BackendHandler + OpaqueHandler> Group<Handler> {
             .to_string()
     }
 
-    /// Real member count (used by group_table.rs)
+    /// The number of members.
     fn member_count(&self) -> i32 {
         self.member_count
     }
 
-    /// User-defined attributes (includes ou for legacy clients).
+    /// User-defined attributes, including ou for legacy clients.
     fn attributes(&self) -> &[AttributeValue<Handler>] {
         &self.attributes
     }

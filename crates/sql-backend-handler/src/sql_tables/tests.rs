@@ -21,7 +21,6 @@ async fn test_init_table() {
     let sql_pool = get_in_memory_db().await;
     init_table(&sql_pool).await.unwrap();
 
-    // Verify we reached the current schema version with PublicSchema seeding
     assert_eq!(
         sql_migrations::JustSchemaVersion::find_by_statement(raw_statement(
             r#"SELECT version FROM metadata"#
@@ -35,7 +34,6 @@ async fn test_init_table() {
         }
     );
 
-    // Insert a user using current table columns (lowercase_email etc are required in modern schema)
     sql_pool
         .execute(raw_statement(
             r#"INSERT INTO users
@@ -45,12 +43,12 @@ async fn test_init_table() {
         .await
         .unwrap();
 
-    // Use *canonical* name from PublicSchema (not alias "first_name") — this is the new contract
+    // Stored under the canonical name, never the alias.
     sql_pool
         .execute(raw_statement(
             r#"INSERT INTO user_attributes
                (user_attribute_user_id, user_attribute_name, user_attribute_value)
-               VALUES ("bôb", "firstname", x'426f62')"#, // raw bytes "Bob" — matches v5+ raw storage philosophy
+               VALUES ("bôb", "firstname", x'426f62')"#, // raw bytes, as v5+ stores them
         ))
         .await
         .unwrap();
@@ -92,7 +90,6 @@ async fn test_migrate_tables() {
 
     let sql_pool = get_in_memory_db().await;
 
-    // Create old schema
     sql_pool
         .execute(raw_statement(
             r#"CREATE TABLE users ( user_id TEXT PRIMARY KEY, display_name TEXT, first_name TEXT NOT NULL, last_name TEXT, avatar BLOB, creation_date TEXT, email TEXT);"#,
@@ -141,7 +138,7 @@ async fn test_migrate_tables() {
         .await
         .unwrap();
 
-    // We only check display_name here because UUIDs are generated
+    // Only display_name: UUIDs are generated.
     #[derive(FromQueryResult, PartialEq, Eq, Debug)]
     struct SimpleUser {
         display_name: Option<String>,
@@ -162,10 +159,6 @@ async fn test_migrate_tables() {
         ]
     );
 
-    // This test now validates the v12 migration guarantees:
-    // - Successful full upgrade to LAST_SCHEMA_VERSION
-    // - PublicSchema seeding + normalization of legacy names
-    // - Presence of core system attributes (kerberossync, ou)
     #[derive(FromQueryResult, PartialEq, Eq, Debug)]
     struct UserAttribute {
         user_attribute_user_id: String,
@@ -181,11 +174,6 @@ async fn test_migrate_tables() {
     .await
     .unwrap();
 
-    // v12 guarantees (what this test now validates):
-    // - Full upgrade to LAST_SCHEMA_VERSION succeeds without errors/FK violations
-    // - PublicSchema seeding (18 user + 7 group attributes)
-    // - Normalization step runs cleanly (legacy names → canonical)
-    // - Core system attributes (kerberossync, ou) are present for all users
     assert!(
         attrs
             .iter()
@@ -391,10 +379,6 @@ async fn test_migration_to_v5() {
         .await
         .unwrap_err();
 
-    // v5 migration test: verifies legacy columns (first/last/avatar) are moved to EAV as *raw bytes*
-    // (per the "no bincode" refactor). Note: at v5 we still have legacy names ("first_name");
-    // v12 later normalizes everything to PublicSchema canonical names. This test remains valuable
-    // as a regression guard for the critical EAV conversion step.
     #[derive(FromQueryResult, PartialEq, Eq, Debug)]
     pub struct UserAttribute {
         user_attribute_user_id: String,

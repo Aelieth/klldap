@@ -62,14 +62,12 @@ async fn delete_user(
             code: LdapResultCode::OperationsError,
             message: format!("Error while deleting user: {e:?}"),
         })?;
-    // Clean up Kerberos principal (idempotent/safe if none exists)
     if let Err(e) = kerberos_backend().delete_principal(user_id.as_str()) {
         tracing::warn!(
             "Failed to delete Kerberos principal for deleted user {}: {}",
             user_id,
             e
         );
-        // Non-fatal—user already deleted from LLDAP
     }
     Ok(vec![make_del_response(
         LdapResultCode::Success,

@@ -2,7 +2,6 @@ use derive_more::Display;
 use serde::{Deserialize, Serialize};
 use strum::{EnumIter, EnumString, IntoStaticStr};
 
-// ==================== ATTRIBUTE TYPE (SINGLE SOURCE OF TRUTH) ====================
 #[derive(
     Clone,
     Copy,
@@ -31,7 +30,6 @@ pub enum AttributeType {
     DateTime,
 }
 
-// ==================== SCHEMA STRUCTS ====================
 #[derive(PartialEq, Eq, Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Schema {
@@ -70,7 +68,7 @@ impl AttributeSchema {
         }
     }
 
-    /// Visible to all; writable by regular users and admins (`is_editable`).
+    /// Visible to all; writable by users and admins.
     pub fn editable(name: &str, attribute_type: AttributeType) -> Self {
         Self {
             is_editable: true,
@@ -78,8 +76,7 @@ impl AttributeSchema {
         }
     }
 
-    /// Visible to all; immutable for everyone including admins (KLLDAP `is_readonly`);
-    /// advertised `NO-USER-MODIFICATION` over LDAP.
+    /// Visible to all; writable by nobody, advertised NO-USER-MODIFICATION over LDAP.
     pub fn readonly(name: &str, attribute_type: AttributeType) -> Self {
         Self {
             is_readonly: true,
@@ -87,14 +84,12 @@ impl AttributeSchema {
         }
     }
 
-    /// Visible to all; server-assigned — not user-editable, but admin-overridable
-    /// (`is_editable = false`, `is_readonly = false`). Used for POSIX/Kerberos values.
+    /// Visible to all; server-assigned, admins may override.
     pub fn generated(name: &str, attribute_type: AttributeType) -> Self {
         Self::new(name, attribute_type)
     }
 
-    /// Admin-only (`is_visible = false`) and immutable (`is_readonly`); stripped from the
-    /// schema and values for non-admins.
+    /// Admin-only and readonly.
     pub fn hidden(name: &str, attribute_type: AttributeType) -> Self {
         Self {
             is_visible: false,
@@ -132,7 +127,6 @@ pub struct AttributeList {
 #[derive(PartialEq, Eq, Debug, Serialize, Deserialize, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct PosixSettings {
-    // === Users ===
     pub user_uidnumber_assign: bool,
     pub user_uidnumber_start: i64,
     pub user_uidnumber_max: i64,
@@ -146,7 +140,6 @@ pub struct PosixSettings {
     pub user_homedirectory_assign: bool,
     pub user_homedirectory_prefix: String,
 
-    // === Groups ===
     pub group_gidnumber_assign: bool,
     pub group_gidnumber_start: i64,
     pub group_gidnumber_max: i64,
@@ -198,14 +191,38 @@ impl AttributeList {
 
 // Standard LDAP attribute names. When an attribute carries one of these as an alias, it is
 // advertised as the wire name (see AttributeSchema::preferred_ldap_name).
-#[rustfmt::skip]
 const STANDARD_LDAP_NAMES: &[&str] = &[
-    "cn", "sn", "givenname", "uid", "mail", "ou", "dc", "o", "c", "l", "st",
-    "title", "description", "member", "uniquemember", "memberof",
-    "createtimestamp", "modifytimestamp", "pwdchangedtime", "entryuuid",
-    "hassubordinates", "structuralobjectclass", "subschemasubentry",
-    "uidnumber", "gidnumber", "homedirectory", "loginshell", "sshpublickey",
-    "krbprincipalname", "jpegphoto", "avatar",
+    "cn",
+    "sn",
+    "givenname",
+    "uid",
+    "mail",
+    "ou",
+    "dc",
+    "o",
+    "c",
+    "l",
+    "st",
+    "title",
+    "description",
+    "member",
+    "uniquemember",
+    "memberof",
+    "createtimestamp",
+    "modifytimestamp",
+    "pwdchangedtime",
+    "entryuuid",
+    "hassubordinates",
+    "structuralobjectclass",
+    "subschemasubentry",
+    "uidnumber",
+    "gidnumber",
+    "homedirectory",
+    "loginshell",
+    "sshpublickey",
+    "krbprincipalname",
+    "jpegphoto",
+    "avatar",
 ];
 
 fn is_standard_ldap_name(name: &str) -> bool {

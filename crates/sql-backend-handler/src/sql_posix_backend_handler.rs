@@ -483,7 +483,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_keeps_the_users_own_uidnumber() {
+    async fn test_update_keeps_the_users_own_uidnumber() {
         let fixture = TestFixture::new().await;
         for _ in 0..2 {
             fixture
@@ -499,7 +499,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_rejects_another_users_uidnumber() {
+    async fn test_update_rejects_another_users_uidnumber() {
         let fixture = TestFixture::new().await;
         fixture
             .handler
@@ -542,7 +542,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn group_gidnumber_is_unique_and_ranged_but_may_be_resubmitted() {
+    async fn test_group_gidnumber_is_unique_and_ranged_but_may_be_resubmitted() {
         let fixture = TestFixture::new().await;
         for _ in 0..2 {
             fixture
@@ -588,7 +588,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_assigns_the_configured_posix_defaults() {
+    async fn test_create_assigns_the_configured_posix_defaults() {
         let fixture = TestFixture::new().await;
         fixture
             .handler

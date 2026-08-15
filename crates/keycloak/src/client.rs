@@ -71,25 +71,20 @@ impl KeycloakClient {
             self.config.realm, lldap_url
         );
         let token = self.acquire_token().await?;
-
         if self.realm_exists(&token).await? {
             return Err(anyhow::anyhow!(
                 "Realm '{}' already exists. Delete the realm manually in Keycloak admin console to proceed.",
                 self.config.realm
             ));
         }
-
         self.create_realm(&token, enable_hsts, enable_brute_force)
             .await?;
-
         let provider_id = self
             .create_ldap_kerberos_component(&token, &lldap_url, &sync_username, &sync_password)
             .await?;
-
         self.clear_default_mappers(&token, &provider_id).await?;
         self.create_custom_mappers(&token, &provider_id).await?;
         self.add_lldap_web_client(&token).await?;
-
         let msg = format!(
             "✅ Realm '{}' set up with LLDAP + Kerberos! Custom attribute mappers applied. SSO ready!",
             self.config.realm
@@ -106,9 +101,7 @@ impl KeycloakClient {
             .bearer_auth(token)
             .send()
             .await
-            .context("Failed to check realm existence")?;
-
-        // 200/204 = exists; 404 = does not exist. Other codes treated as error by caller context.
+            .context("while checking whether the realm exists")?;
         Ok(resp.status().is_success())
     }
 
@@ -128,14 +121,12 @@ impl KeycloakClient {
             ])
             .send()
             .await
-            .context("Failed to connect to Keycloak")?;
-
+            .context("while connecting to Keycloak")?;
         let json: serde_json::Value = resp.json().await.context("Invalid token response")?;
         let token = json["access_token"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("No access_token in response (wrong admin password?)"))?
             .to_string();
-
         info!("   → Token acquired successfully");
         Ok(token)
     }
@@ -173,7 +164,6 @@ impl KeycloakClient {
             },
             "bruteForceProtected": enable_brute_force
         });
-
         let resp = self
             .http_client
             .post(format!("{}/admin/realms", self.config.url))
@@ -182,7 +172,6 @@ impl KeycloakClient {
             .json(&realm_json)
             .send()
             .await?;
-
         let status = resp.status();
         if status.is_success() || status.as_u16() == 409 {
             info!("   → Realm created (or already reported created)");
@@ -197,8 +186,7 @@ impl KeycloakClient {
         }
     }
 
-    /// Creates the LLDAP + Kerberos LDAP User Storage Provider component.
-    /// Returns the internal Keycloak component ID of the provider (required for parenting custom mappers).
+    /// Returns the component ID of the new provider; custom mappers are parented to it.
     async fn create_ldap_kerberos_component(
         &self,
         token: &str,
@@ -246,7 +234,6 @@ impl KeycloakClient {
                 "connectionTrace": ["false"]
             }
         });
-
         let resp = self
             .http_client
             .post(format!(
@@ -258,7 +245,6 @@ impl KeycloakClient {
             .json(&component_json)
             .send()
             .await?;
-
         let status = resp.status();
         if !(status.is_success() || status.as_u16() == 409) {
             let body = resp.text().await.unwrap_or_default();
@@ -269,7 +255,7 @@ impl KeycloakClient {
             ));
         }
 
-        // Retrieve the freshly created component's ID (Keycloak does not always echo it in POST body)
+        // Keycloak does not always echo the new component's ID in the POST body.
         let list_url = format!(
             "{}/admin/realms/{}/components?providerId=ldap&name=lldap-with-kerberos",
             self.config.url, self.config.realm
@@ -280,11 +266,10 @@ impl KeycloakClient {
             .bearer_auth(token)
             .send()
             .await
-            .context("Failed to query created LDAP component")?
+            .context("while querying the created LDAP component")?
             .json()
             .await
             .context("Invalid component list JSON")?;
-
         let provider_id = components
             .iter()
             .find(|c| c.get("name").and_then(|n| n.as_str()) == Some("lldap-with-kerberos"))
@@ -295,30 +280,26 @@ impl KeycloakClient {
                 )
             })?
             .to_string();
-
         info!("   → LDAP+Kerberos component ready (ID: {})", provider_id);
         Ok(provider_id)
     }
 
     async fn clear_default_mappers(&self, token: &str, provider_id: &str) -> Result<()> {
         info!("   → Clearing default Keycloak mappers...");
-
         let url = format!(
             "{}/admin/realms/{}/components?parent={}&type=org.keycloak.storage.ldap.mappers.LDAPStorageMapper",
             self.config.url, self.config.realm, provider_id
         );
-
         let mappers: Vec<serde_json::Value> = self
             .http_client
             .get(&url)
             .bearer_auth(token)
             .send()
             .await
-            .context("Failed to list default mappers")?
+            .context("while listing the default mappers")?
             .json()
             .await
             .context("Invalid mappers list JSON")?;
-
         let mut deleted = 0;
         for mapper in mappers {
             if let Some(id) = mapper.get("id").and_then(|v| v.as_str()) {
@@ -360,7 +341,6 @@ impl KeycloakClient {
 
     async fn create_custom_mappers(&self, token: &str, provider_id: &str) -> Result<()> {
         info!("   → Creating custom schema-aligned mappers...");
-
         let custom_mappers = vec![
             json!({
                 "name": "first name",
@@ -533,7 +513,6 @@ impl KeycloakClient {
                 }
             }),
         ];
-
         for mapper in custom_mappers {
             let name = mapper
                 .get("name")
@@ -550,7 +529,6 @@ impl KeycloakClient {
                 .json(&mapper)
                 .send()
                 .await?;
-
             let status = resp.status();
             if status.is_success() || status.as_u16() == 409 {
                 info!("     ✓ Created custom mapper: {}", name);
@@ -562,7 +540,6 @@ impl KeycloakClient {
                 );
             }
         }
-
         info!(
             "   → All custom mappers created. Attribute resolution for KLLDAP schema implemented."
         );
@@ -583,7 +560,6 @@ impl KeycloakClient {
             "redirectUris": ["*"],
             "webOrigins": ["+"]
         });
-
         let resp = self
             .http_client
             .post(format!(
@@ -595,7 +571,6 @@ impl KeycloakClient {
             .json(&client_json)
             .send()
             .await?;
-
         let status = resp.status();
         if status.is_success() || status.as_u16() == 409 {
             Ok(())
@@ -621,10 +596,9 @@ impl KeycloakClient {
             .bearer_auth(token)
             .send()
             .await?;
-
         if resp.status().is_success() {
             let msg = format!(
-                "✅ Connected to Keycloak at {} — realm '{}' is ready",
+                "✅ Connected to Keycloak at {}, realm '{}' is ready",
                 self.config.url, self.config.realm
             );
             info!("{}", msg);
@@ -638,9 +612,10 @@ impl KeycloakClient {
 #[cfg(test)]
 mod tests {
     use super::lldap_provider_dns;
+    use pretty_assertions::assert_eq;
 
     #[test]
-    fn provider_dns_uses_the_lldap_base_dn() {
+    fn test_provider_dns_uses_the_lldap_base_dn() {
         let dns = lldap_provider_dns("dc=gate,dc=test", "syncuser");
         assert_eq!(dns.bind_dn, "uid=syncuser,ou=people,dc=gate,dc=test");
         assert_eq!(dns.users_dn, "ou=people,dc=gate,dc=test");

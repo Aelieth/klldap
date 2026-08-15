@@ -1,4 +1,3 @@
-// Unsafe stays quarantined in ffi.rs (the only place allowed to hold it).
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 #![warn(clippy::undocumented_unsafe_blocks)]
@@ -55,7 +54,6 @@ pub fn delete_kerberos_principal(username: &str) -> Result<()> {
             return Ok(());
         }
     };
-
     handle.delete_principal(&full_principal)
 }
 
@@ -76,7 +74,6 @@ pub fn set_kerberos_principal_enabled(username: &str, enabled: bool) -> Result<(
             return Ok(());
         }
     };
-
     handle.set_principal_allow_tickets(username, &realm, enabled)
 }
 
@@ -84,10 +81,9 @@ pub fn sync_kerberos_principal(username: &str, plain_password: &str) -> Result<(
     let realm = derive_realm_from_base_dn();
     let full_principal = format!("{username}@{realm}");
     info!("Kerberos sync started for principal: {}", full_principal);
-
     let handle = admin_handle(&realm)?;
 
-    // Try change password first (most common case after user already exists)
+    // Usually the principal already exists.
     if handle
         .chpass_principal(username, plain_password, &realm)
         .is_ok()
@@ -99,12 +95,10 @@ pub fn sync_kerberos_principal(username: &str, plain_password: &str) -> Result<(
         return Ok(());
     }
 
-    warn!("Change password failed (likely principal does not exist)—creating new principal...");
-
+    warn!("Change password failed (likely principal does not exist), creating new principal...");
     handle
         .create_principal(username, plain_password, &realm)
-        .context("Failed to create new Kerberos principal")?;
-
+        .context("while creating the Kerberos principal")?;
     info!(
         "✅ Kerberos principal created and password set for {}",
         full_principal
@@ -120,7 +114,6 @@ pub fn export_keytab_for_keycloak(hostname_input: &str) -> Result<String> {
     };
     let principal = format!("HTTP/{hostname}@{realm}");
     info!("Generating Keycloak keytab for principal: {}", principal);
-
     let paths = KerberosPaths::from_env();
     let handle = admin_handle(&realm)?;
     let keytab_path = &paths.keycloak_keytab;
@@ -141,7 +134,7 @@ pub fn export_keytab_for_keycloak(hostname_input: &str) -> Result<String> {
         .arg("-q")
         .arg(&query)
         .output()
-        .context("Failed to execute kadmin.local")?;
+        .context("while running kadmin.local")?;
     if !output.status.success() {
         anyhow::bail!(
             "kadmin.local ktadd failed: {}",

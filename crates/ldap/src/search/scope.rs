@@ -1,5 +1,3 @@
-//! Search scope resolution and OU/container handling.
-
 use crate::dn::{is_container_dn, is_subtree};
 use ldap3_proto::{LdapPartialAttribute, LdapSearchResultEntry, LdapSearchScope, proto::LdapOp};
 use uuid::Uuid;
@@ -106,14 +104,14 @@ pub fn make_ou_entry(
             vals: vec![format!("cn=Subschema,{}", base_dn_str).into_bytes()],
         });
 
-        // Stable synthetic entryUUID — only when client requests operational attributes.
+        // A stable synthetic entryUUID, only under operational requests.
         let ou_uuid = Uuid::new_v5(&Uuid::NAMESPACE_DNS, dn.as_bytes());
         attributes.push(LdapPartialAttribute {
             atype: "entryUUID".to_string(),
             vals: vec![ou_uuid.to_string().into_bytes()],
         });
 
-        // entryDN is the OU's own DN; creators/modifiers use the default admin DN (same as inject).
+        // entryDN is the OU's own DN; creators/modifiers use the admin DN like inject.
         attributes.push(LdapPartialAttribute {
             atype: "entryDN".to_string(),
             vals: vec![dn.as_bytes().to_vec()],
@@ -214,6 +212,7 @@ fn substring_matches(haystack: &str, sub: &ldap3_proto::proto::LdapSubstringFilt
 mod tests {
     use super::*;
     use ldap3_proto::LdapSearchScope;
+    use pretty_assertions::assert_eq;
 
     fn make_dn(dn: &str) -> Vec<(String, String)> {
         dn.split(',')
@@ -477,7 +476,7 @@ mod tests {
         assert!(names.contains(&"structuralObjectClass"));
         assert!(names.contains(&"subschemaSubentry"));
         assert!(names.contains(&"entryUUID"));
-        // Normalized: OU `+` now emits entryDN (the OU's own DN) + creators/modifiers, like user/group.
+        // OU `+` emits entryDN and creators/modifiers like users and groups.
         assert!(names.contains(&"entryDN"));
         assert!(names.contains(&"creatorsName"));
         assert!(names.contains(&"modifiersName"));

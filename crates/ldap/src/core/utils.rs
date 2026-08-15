@@ -1,8 +1,28 @@
-use crate::core::error::LdapResult;
+use crate::core::error::{LdapError, LdapResult};
 use itertools::join;
-use lldap_domain::types::AttributeName;
+use ldap3_proto::LdapResultCode;
+use lldap_domain::{
+    deserialize::deserialize_attribute_value,
+    types::{Attribute, AttributeName, AttributeType},
+};
 
-/// LdapInfo — shared configuration for the LDAP layer (base DN + ignored attributes).
+pub(crate) fn typed_attribute(
+    name: &str,
+    values: &[String],
+    attribute_type: AttributeType,
+    is_list: bool,
+) -> LdapResult<Attribute> {
+    Ok(Attribute {
+        name: name.into(),
+        value: deserialize_attribute_value(values, attribute_type, is_list).map_err(|e| {
+            LdapError {
+                code: LdapResultCode::ConstraintViolation,
+                message: format!("Invalid {name} value: {e}"),
+            }
+        })?,
+    })
+}
+
 pub struct LdapInfo {
     pub base_dn: Vec<(String, String)>,
     pub base_dn_str: String,
@@ -27,9 +47,8 @@ impl LdapInfo {
     }
 }
 
-/// Attributes SSSD (rfc2307) and similar clients routinely request but KLLDAP will never model.
-/// Recognized as silent no-ops so they don't produce "unknown attribute" debug noise — operators
-/// need not list them in `ignored_user_attributes` / `ignored_group_attributes`.
+/// Attributes SSSD (rfc2307) and similar clients request but KLLDAP never models; silent
+/// no-ops, so operators need not list them in `ignored_*_attributes`.
 pub const BUILTIN_IGNORED_ATTRIBUTES: &[&str] = &[
     "shadowlastchange",
     "shadowmin",
@@ -43,7 +62,6 @@ pub const BUILTIN_IGNORED_ATTRIBUTES: &[&str] = &[
     "userpassword",
 ];
 
-/// True if `name` is a configured-ignored attribute or one of the built-in expected-absent names.
 pub fn is_ignored_attribute(name: &AttributeName, configured: &[AttributeName]) -> bool {
     configured.contains(name)
         || BUILTIN_IGNORED_ATTRIBUTES
@@ -61,13 +79,13 @@ pub fn is_unrecognized_attribute(name: &AttributeName, configured: &[AttributeNa
 }
 
 #[cfg(test)]
-mod utils_tests {
-    use super::super::utils::LdapInfo;
+mod tests {
+    use super::*;
     use lldap_domain::types::AttributeName;
+    use pretty_assertions::assert_eq;
 
     #[test]
-    fn builtin_ignored_attributes_recognized() {
-        use super::is_ignored_attribute;
+    fn test_builtin_ignored_attributes_recognized() {
         let none: Vec<AttributeName> = vec![];
         assert!(is_ignored_attribute(
             &AttributeName::from("shadowLastChange"),
@@ -78,8 +96,7 @@ mod utils_tests {
             &none
         ));
         assert!(!is_ignored_attribute(&AttributeName::from("uid"), &none));
-        use super::is_unrecognized_attribute;
-        // uid is a known user attr — group-side NoMatch must not log.
+        // uid is a known user attribute: a group-side NoMatch must not log.
         assert!(!is_unrecognized_attribute(
             &AttributeName::from("uid"),
             &none
@@ -92,7 +109,6 @@ mod utils_tests {
             &AttributeName::from("definitelyNotAnAttribute"),
             &none
         ));
-        // configured names still work (and AttributeName matching is case-insensitive).
         let cfg = vec![AttributeName::from("sAMAccountName")];
         assert!(is_ignored_attribute(
             &AttributeName::from("samaccountname"),
@@ -101,7 +117,7 @@ mod utils_tests {
     }
 
     #[test]
-    fn ldap_info_new_valid_base_dn() {
+    fn test_ldap_info_new_valid_base_dn() {
         let info = LdapInfo::new(
             "dc=example,dc=com",
             vec![AttributeName::from("mail")],
@@ -122,18 +138,15 @@ mod utils_tests {
     }
 
     #[test]
-    fn ldap_info_new_lowercases_and_trims() {
+    fn test_ldap_info_new_lowercases_and_trims() {
         let info = LdapInfo::new("DC=Example, DC=COM", vec![], vec![]).unwrap();
         assert_eq!(info.base_dn_str, "dc=example,dc=com");
     }
 
     #[test]
-    fn ldap_info_new_rejects_malformed_dn() {
-        // Missing value
+    fn test_ldap_info_new_rejects_malformed_dn() {
         assert!(LdapInfo::new("dc=example,dc", vec![], vec![]).is_err());
-        // Empty element
         assert!(LdapInfo::new("dc=example,,dc=com", vec![], vec![]).is_err());
-        // Too many =
         assert!(LdapInfo::new("dc=example=foo,dc=com", vec![], vec![]).is_err());
     }
 }

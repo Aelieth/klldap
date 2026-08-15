@@ -277,7 +277,7 @@ impl<Handler: BackendHandler + OpaqueHandler> AccessControlledBackendHandler<Han
         }
     }
 
-    /// LDAP password.rs already checked can_change_password; this avoids unsafe_get_handler.
+    /// No permission check: the LDAP password path calls this only after `can_change_password`.
     pub async fn ensure_kerberos_principal_consistency(
         &self,
         user_id: &UserId,
@@ -407,7 +407,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn restrict_to_visible_attributes_drops_hidden_entries() {
+    fn test_restrict_to_visible_attributes_drops_hidden_entries() {
         let mut schema = PublicSchema::get();
         assert!(
             schema

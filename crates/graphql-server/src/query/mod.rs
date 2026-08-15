@@ -12,10 +12,10 @@ pub use group::Group;
 pub use schema::{AttributeList, ObjectClassInfo, Schema};
 pub use user::User;
 
-use crate::api::FullHandler;
-use crate::api::{Context, field_error_callback};
-use juniper::GraphQLObject;
-use juniper::{FieldError, FieldResult, graphql_object, graphql_value};
+use crate::api::{Context, FullHandler, field_error_callback};
+use crate::kerberos_transport::public_key_der_base64;
+use anyhow::anyhow;
+use juniper::{FieldResult, GraphQLObject, graphql_object};
 use lldap_access_control::{ReadonlyBackendHandler, UserReadableBackendHandler};
 use lldap_domain::types::{GroupId, UserId};
 use lldap_domain_handlers::handler::{
@@ -58,21 +58,15 @@ pub struct KeycloakConfigResponse {
 
 #[derive(GraphQLObject, Default)]
 pub struct PosixSettings {
-    // === Users ===
     pub user_uidnumber_assign: bool,
     pub user_uidnumber_start: i32,
     pub user_uidnumber_max: i32,
-
     pub user_gidnumber_assign: bool,
     pub user_gidnumber_start: i32,
-
     pub user_loginshell_assign: bool,
     pub user_loginshell_default: String,
-
     pub user_homedirectory_assign: bool,
     pub user_homedirectory_prefix: String,
-
-    // === Groups ===
     pub group_gidnumber_assign: bool,
     pub group_gidnumber_start: i32,
     pub group_gidnumber_max: i32,
@@ -209,7 +203,7 @@ impl<Handler: FullHandler + OpaqueHandler> Query<Handler> {
 
     fn kerberos_info(&self, _context: &Context<Handler>) -> FieldResult<KerberosInfo> {
         Ok(KerberosInfo {
-            public_key_der_base64: Some(crate::kerberos_transport::public_key_der_base64()),
+            public_key_der_base64: Some(public_key_der_base64()),
         })
     }
 
@@ -223,7 +217,6 @@ impl<Handler: FullHandler + OpaqueHandler> Query<Handler> {
                 &span,
                 "Unauthorized to read Keycloak config",
             ))?;
-
         let cfg = KeycloakConfig::suggested();
         Ok(KeycloakSuggestedConfig {
             url: cfg.url,
@@ -241,14 +234,8 @@ impl<Handler: FullHandler + OpaqueHandler> Query<Handler> {
                 &span,
                 "Unauthorized to read Keycloak config",
             ))?;
-
-        let cfg = KeycloakConfig::load().map_err(|e| {
-            FieldError::new(
-                format!("Could not read the Keycloak config: {e:#}"),
-                juniper::Value::null(),
-            )
-        })?;
-
+        let cfg = KeycloakConfig::load()
+            .map_err(|e| anyhow!("Could not read the Keycloak config: {e:#}"))?;
         Ok(KeycloakConfigResponse {
             url: cfg.url,
             realm: cfg.realm,
@@ -258,40 +245,27 @@ impl<Handler: FullHandler + OpaqueHandler> Query<Handler> {
 
     async fn list_ous(context: &Context<Handler>) -> FieldResult<Vec<String>> {
         let span = debug_span!("[GraphQL query] list_ous");
-        span.in_scope(|| debug!("Fetching global allowedous list (single source of truth)"));
-
         let handler = context
             .get_admin_handler()
             .ok_or_else(field_error_callback(&span, "Unauthorized to read OUs"))?;
-
-        let ous = handler.get_allowed_ous().await.map_err(|e| {
-            FieldError::new(
-                "Failed to load allowedous",
-                graphql_value!({ "details": (e.to_string()) }),
-            )
-        })?;
-
-        Ok(ous)
+        Ok(handler
+            .get_allowed_ous()
+            .await
+            .map_err(|e| anyhow!("Failed to load allowedous: {e}"))?)
     }
 
     async fn posix_settings(context: &Context<Handler>) -> FieldResult<PosixSettings> {
         let span = debug_span!("[GraphQL query] posix_settings");
-        span.in_scope(|| debug!("Fetching full POSIX settings (single source of truth)"));
-
         let handler = context
             .get_admin_handler()
             .ok_or_else(field_error_callback(
                 &span,
                 "Unauthorized to read POSIX settings",
             ))?;
-
-        let settings = handler.get_posix_settings().await.map_err(|e| {
-            FieldError::new(
-                "Failed to load posix_settings",
-                graphql_value!({ "details": (e.to_string()) }),
-            )
-        })?;
-
+        let settings = handler
+            .get_posix_settings()
+            .await
+            .map_err(|e| anyhow!("Failed to load posix_settings: {e}"))?;
         Ok(PosixSettings {
             user_uidnumber_assign: settings.user_uidnumber_assign,
             user_uidnumber_start: settings.user_uidnumber_start as i32,

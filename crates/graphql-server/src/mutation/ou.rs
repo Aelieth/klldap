@@ -1,16 +1,57 @@
 use crate::api::{Context, FullHandler, field_error_callback};
 use crate::mutation::Success;
-use juniper::{FieldError, FieldResult, graphql_value};
+use anyhow::anyhow;
+use juniper::FieldResult;
 use lldap_access_control::{
     AdminBackendHandler, ReadonlyBackendHandler, UserWriteableBackendHandler,
 };
 use lldap_domain::{
     requests::{UpdateGroupRequest, UpdateUserRequest},
-    types::{AttributeName, GroupId},
+    types::{Attribute, GroupId, UserId},
 };
 use lldap_domain_handlers::handler::SystemConfigBackendHandler;
 use lldap_opaque_handler::OpaqueHandler;
 use tracing::{debug, debug_span, info, warn};
+
+const OU_NAME_RULES: &str =
+    "2-64 characters, only a-z A-Z 0-9 - _ allowed. No spaces or special characters.";
+
+fn is_valid_ou_component(name: &str) -> bool {
+    (2..=64).contains(&name.len())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        && !name.starts_with(['-', '_'])
+        && !name.ends_with(['-', '_'])
+}
+
+fn ou_attribute(ou: &str) -> Attribute {
+    Attribute {
+        name: "ou".into(),
+        value: ou.to_owned().into(),
+    }
+}
+
+fn is_in_ou(attributes: &[Attribute], ou_lower: &str) -> bool {
+    attributes.iter().any(|attribute| {
+        attribute.name.as_str() == "ou"
+            && attribute
+                .value
+                .as_str()
+                .is_some_and(|ou| ou.to_lowercase() == ou_lower)
+    })
+}
+
+async fn set_allowed_ous(
+    handler: &impl SystemConfigBackendHandler,
+    ous: &[String],
+) -> FieldResult<()> {
+    handler
+        .set_system_config("allowedous", serde_json::to_string(ous)?)
+        .await
+        .map_err(|e| anyhow!("Failed to save updated OU list: {e}"))?;
+    Ok(())
+}
 
 pub(super) async fn create_ou<Handler: FullHandler + OpaqueHandler>(
     context: &Context<Handler>,
@@ -18,103 +59,42 @@ pub(super) async fn create_ou<Handler: FullHandler + OpaqueHandler>(
 ) -> FieldResult<Success> {
     let span = debug_span!("[GraphQL mutation] create_ou");
     span.in_scope(|| debug!(?name));
-
     let handler = context
         .get_admin_handler()
         .ok_or_else(field_error_callback(&span, "Unauthorized OU creation"))?;
-
     let name_lower = name.trim().to_lowercase();
-    if name_lower.is_empty()
-        || name_lower == "all"
-        || name_lower == "people"
-        || name_lower == "groups"
-    {
+    if name_lower.is_empty() || ["all", "people", "groups"].contains(&name_lower.as_str()) {
         return Err("Invalid OU name (cannot be empty or built-in)".into());
     }
-
-    let parts: Vec<&str> = name.splitn(2, '\\').collect();
-    let (primary, secondary) = match parts.len() {
-        1 => (name.as_str(), None),
-        2 => (parts[0], Some(parts[1])),
-        _ => {
-            return Err(FieldError::new(
-                "Invalid OU format: only one level of secondary OU allowed (primary\\secondary)",
-                juniper::Value::null(),
-            ));
-        }
+    let (primary, secondary) = match name.split_once('\\') {
+        Some((primary, secondary)) => (primary, Some(secondary)),
+        None => (name.as_str(), None),
     };
-
-    if primary.len() < 2
-        || primary.len() > 64
-        || !primary
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        || primary.starts_with('-')
-        || primary.starts_with('_')
-        || primary.ends_with('-')
-        || primary.ends_with('_')
-    {
-        return Err(FieldError::new(
-            "Invalid primary OU name: 2-64 characters, only a-z A-Z 0-9 - _ allowed. No spaces or special characters.",
-            juniper::Value::null(),
-        ));
+    if !is_valid_ou_component(primary) {
+        return Err(anyhow!("Invalid primary OU name: {OU_NAME_RULES}").into());
     }
-    if let Some(sec) = secondary
-        && (sec.trim().is_empty()
-            || sec.len() < 2
-            || sec.len() > 64
-            || !sec
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-            || sec.starts_with('-')
-            || sec.starts_with('_')
-            || sec.ends_with('-')
-            || sec.ends_with('_'))
-    {
-        return Err(FieldError::new(
-            "Invalid secondary OU name: 2-64 characters, only a-z A-Z 0-9 - _ allowed. No spaces or special characters.",
-            juniper::Value::null(),
-        ));
+    if secondary.is_some_and(|secondary| !is_valid_ou_component(secondary)) {
+        return Err(anyhow!("Invalid secondary OU name: {OU_NAME_RULES}").into());
     }
-
-    let mut current_ous = handler
+    let mut ous = handler
         .get_allowed_ous()
         .await
-        .map_err(|_e| FieldError::new("Failed to load allowedous", juniper::Value::null()))?;
-
-    let name_lower = name.to_lowercase();
-    if current_ous
+        .map_err(|e| anyhow!("Failed to load allowedous: {e}"))?;
+    if ous
         .iter()
         .any(|existing| existing.to_lowercase() == name_lower)
     {
-        return Err(FieldError::new(
-            format!("Organizational Unit '{}' already exists", name),
-            juniper::Value::null(),
-        ));
+        return Err(anyhow!("Organizational Unit '{name}' already exists").into());
     }
-
-    if secondary.is_some()
-        && !current_ous
-            .iter()
-            .any(|p| p.to_lowercase() == primary.to_lowercase())
-    {
-        return Err(FieldError::new(
-            format!(
-                "Primary OU '{}' does not exist. Create it first before adding a secondary.",
-                primary
-            ),
-            juniper::Value::null(),
-        ));
+    if secondary.is_some() && !ous.iter().any(|ou| ou.eq_ignore_ascii_case(primary)) {
+        return Err(anyhow!(
+            "Primary OU '{primary}' does not exist. Create it first before adding a secondary."
+        )
+        .into());
     }
-
-    current_ous.push(name.clone());
-    current_ous.sort();
-
-    handler
-        .set_system_config("allowedous", serde_json::to_string(&current_ous).unwrap())
-        .await
-        .map_err(|_e| FieldError::new("Failed to save updated OU list", juniper::Value::null()))?;
-
+    ous.push(name);
+    ous.sort();
+    set_allowed_ous(handler, &ous).await?;
     Ok(Success::new())
 }
 
@@ -124,141 +104,75 @@ pub(super) async fn delete_ou<Handler: FullHandler + OpaqueHandler>(
 ) -> FieldResult<Success> {
     let span = debug_span!("[GraphQL mutation] delete_ou");
     span.in_scope(|| debug!(?name));
-
     let handler = context
         .get_admin_handler()
         .ok_or_else(field_error_callback(&span, "Unauthorized OU deletion"))?;
-
     let name_lower = name.trim().to_lowercase();
-    if name_lower == "people" || name_lower == "groups" || name_lower == "all" {
+    if ["people", "groups", "all"].contains(&name_lower.as_str()) {
         return Err("Cannot delete built-in OU 'people', 'groups', or 'All'".into());
     }
-
-    let mut current_ous = handler
+    let mut ous = handler
         .get_allowed_ous()
         .await
-        .map_err(|_e| FieldError::new("Failed to load allowedous", juniper::Value::null()))?;
-
-    let has_children = current_ous.iter().any(|ou| {
-        let parts: Vec<&str> = ou.splitn(2, '\\').collect();
-        parts.len() == 2 && parts[0].to_lowercase() == name_lower
-    });
-
-    if has_children {
-        return Err(FieldError::new(
-            format!(
-                "Cannot delete primary OU '{}' because it still contains secondary OUs. Delete the secondary OUs first.",
-                name
-            ),
-            juniper::Value::null(),
-        ));
+        .map_err(|e| anyhow!("Failed to load allowedous: {e}"))?;
+    if ous.iter().any(|ou| {
+        ou.split_once('\\')
+            .is_some_and(|(primary, _)| primary.to_lowercase() == name_lower)
+    }) {
+        return Err(anyhow!(
+            "Cannot delete primary OU '{name}' because it still contains secondary OUs. Delete the secondary OUs first."
+        )
+        .into());
     }
-
-    // === Reassign users and groups still in this OU to default OUs ===
-    // This ensures no user/group is left pointing to a deleted OU.
-    // Best-effort reassignment using the same pattern as change_user_ou / change_group_ou.
-
-    // Reassign users still using this OU → move to "people"
+    // Members of the deleted OU fall back to the default OUs, best effort.
     if let Ok(users) = handler.list_users(None, false).await {
-        for user_and_groups in users {
-            let current_ou = user_and_groups
-                .user
-                .attributes
-                .iter()
-                .find(|attr| attr.name.as_str() == "ou")
-                .and_then(|attr| match &attr.value {
-                    lldap_domain::types::AttributeValue::String(
-                        lldap_domain::types::Cardinality::Singleton(s),
-                    ) => Some(s.clone()),
-                    _ => None,
-                })
-                .unwrap_or_default();
-
-            if current_ou.to_lowercase() == name_lower {
-                let insert_attributes = vec![lldap_domain::types::Attribute {
-                    name: AttributeName::from("ou"),
-                    value: lldap_domain::types::AttributeValue::String(
-                        lldap_domain::types::Cardinality::Singleton("people".to_string()),
-                    ),
-                }];
-
-                let update_req = UpdateUserRequest {
-                    user_id: user_and_groups.user.user_id.clone(),
-                    email: None,
-                    display_name: None,
-                    delete_attributes: vec![],
-                    insert_attributes,
-                };
-
-                if let Err(e) = handler.update_user(update_req).await {
-                    warn!(
-                        "Failed to reassign user {} from deleted OU '{}': {}",
-                        user_and_groups.user.user_id, name, e
-                    );
-                } else {
-                    info!(
-                        "Reassigned user {} from deleted OU '{}' to 'people'",
-                        user_and_groups.user.user_id, name
-                    );
-                }
+        for user in users.into_iter().map(|u| u.user) {
+            if !is_in_ou(&user.attributes, &name_lower) {
+                continue;
+            }
+            let request = UpdateUserRequest {
+                user_id: user.user_id.clone(),
+                insert_attributes: vec![ou_attribute("people")],
+                ..Default::default()
+            };
+            match handler.update_user(request).await {
+                Ok(()) => info!(
+                    "Reassigned user {} from deleted OU '{name}' to 'people'",
+                    user.user_id
+                ),
+                Err(e) => warn!(
+                    "Failed to reassign user {} from deleted OU '{name}': {e}",
+                    user.user_id
+                ),
             }
         }
     }
-
-    // Reassign groups still using this OU → move to "groups"
     if let Ok(groups) = handler.list_groups(None).await {
         for group in groups {
-            let current_ou = group
-                .attributes
-                .iter()
-                .find(|attr| attr.name.as_str() == "ou")
-                .and_then(|attr| match &attr.value {
-                    lldap_domain::types::AttributeValue::String(
-                        lldap_domain::types::Cardinality::Singleton(s),
-                    ) => Some(s.clone()),
-                    _ => None,
-                })
-                .unwrap_or_default();
-
-            if current_ou.to_lowercase() == name_lower {
-                let insert_attributes = vec![lldap_domain::types::Attribute {
-                    name: AttributeName::from("ou"),
-                    value: lldap_domain::types::AttributeValue::String(
-                        lldap_domain::types::Cardinality::Singleton("groups".to_string()),
-                    ),
-                }];
-
-                let update_req = UpdateGroupRequest {
-                    group_id: group.id,
-                    display_name: None,
-                    delete_attributes: vec![],
-                    insert_attributes,
-                };
-
-                if let Err(e) = handler.update_group(update_req).await {
-                    warn!(
-                        "Failed to reassign group {} from deleted OU '{}': {}",
-                        group.id.0, name, e
-                    );
-                } else {
-                    info!(
-                        "Reassigned group {} from deleted OU '{}' to 'groups'",
-                        group.id.0, name
-                    );
-                }
+            if !is_in_ou(&group.attributes, &name_lower) {
+                continue;
+            }
+            let request = UpdateGroupRequest {
+                group_id: group.id,
+                display_name: None,
+                delete_attributes: vec![],
+                insert_attributes: vec![ou_attribute("groups")],
+            };
+            match handler.update_group(request).await {
+                Ok(()) => info!(
+                    "Reassigned group {} from deleted OU '{name}' to 'groups'",
+                    group.id.0
+                ),
+                Err(e) => warn!(
+                    "Failed to reassign group {} from deleted OU '{name}': {e}",
+                    group.id.0
+                ),
             }
         }
     }
-
-    // Now safe to remove the OU from the allowed list
-    current_ous.retain(|o| o.to_lowercase() != name_lower);
-
-    handler
-        .set_system_config("allowedous", serde_json::to_string(&current_ous).unwrap())
-        .await
-        .map_err(|_e| FieldError::new("Failed to save updated OU list", juniper::Value::null()))?;
-
-    info!("Organizational Unit '{}' deleted.", name);
+    ous.retain(|ou| ou.to_lowercase() != name_lower);
+    set_allowed_ous(handler, &ous).await?;
+    info!("Organizational Unit '{name}' deleted.");
     Ok(Success::new())
 }
 
@@ -269,43 +183,24 @@ pub(super) async fn change_user_ou<Handler: FullHandler + OpaqueHandler>(
 ) -> FieldResult<Success> {
     let span = debug_span!("[GraphQL mutation] change_user_ou");
     span.in_scope(|| debug!(?user_ids, ?new_ou));
-
     let handler = context
         .get_admin_handler()
         .ok_or_else(field_error_callback(&span, "Unauthorized OU change"))?;
-
-    let name_lower = new_ou.trim().to_lowercase();
-    if name_lower == "all" {
+    if new_ou.trim().eq_ignore_ascii_case("all") {
         return Err("Cannot move users to built-in OU 'All'".into());
     }
-
-    for user_id_str in user_ids {
-        let user_id = lldap_domain::types::UserId::new(&user_id_str);
-
-        let insert_attributes = vec![lldap_domain::types::Attribute {
-            name: lldap_domain::types::AttributeName::from("ou"),
-            value: lldap_domain::types::AttributeValue::String(
-                lldap_domain::types::Cardinality::Singleton(new_ou.clone()),
-            ),
-        }];
-
-        let update_req = lldap_domain::requests::UpdateUserRequest {
-            user_id: user_id.clone(),
-            email: None,
-            display_name: None,
-            delete_attributes: vec![],
-            insert_attributes,
+    for user_id in user_ids {
+        let request = UpdateUserRequest {
+            user_id: UserId::new(&user_id),
+            insert_attributes: vec![ou_attribute(&new_ou)],
+            ..Default::default()
         };
-
-        handler.update_user(update_req).await.map_err(|e| {
-            FieldError::new(
-                format!("Failed to change OU for user {}", user_id_str),
-                graphql_value!({ "details": (e.to_string()) }),
-            )
-        })?;
-        info!("Changed OU for user {} to '{}'", user_id_str, new_ou);
+        handler
+            .update_user(request)
+            .await
+            .map_err(|e| anyhow!("Failed to change OU for user {user_id}: {e}"))?;
+        info!("Changed OU for user {user_id} to '{new_ou}'");
     }
-
     Ok(Success::new())
 }
 
@@ -316,41 +211,24 @@ pub(super) async fn change_group_ou<Handler: FullHandler + OpaqueHandler>(
 ) -> FieldResult<Success> {
     let span = debug_span!("[GraphQL mutation] change_group_ou");
     span.in_scope(|| debug!(?group_ids, ?new_ou));
-
     let handler = context
         .get_admin_handler()
         .ok_or_else(field_error_callback(&span, "Unauthorized OU change"))?;
-
-    let name_lower = new_ou.trim().to_lowercase();
-    if name_lower == "all" {
+    if new_ou.trim().eq_ignore_ascii_case("all") {
         return Err("Cannot move groups to built-in OU 'All'".into());
     }
-
     for group_id in group_ids {
-        let group_id_typed = GroupId(group_id);
-
-        let insert_attributes = vec![lldap_domain::types::Attribute {
-            name: lldap_domain::types::AttributeName::from("ou"),
-            value: lldap_domain::types::AttributeValue::String(
-                lldap_domain::types::Cardinality::Singleton(new_ou.clone()),
-            ),
-        }];
-
-        let update_req = lldap_domain::requests::UpdateGroupRequest {
-            group_id: group_id_typed,
+        let request = UpdateGroupRequest {
+            group_id: GroupId(group_id),
             display_name: None,
             delete_attributes: vec![],
-            insert_attributes,
+            insert_attributes: vec![ou_attribute(&new_ou)],
         };
-
-        handler.update_group(update_req).await.map_err(|e| {
-            FieldError::new(
-                format!("Failed to change OU for group {}", group_id),
-                graphql_value!({ "details": (e.to_string()) }),
-            )
-        })?;
-        info!("Changed OU for group {} to '{}'", group_id, new_ou);
+        handler
+            .update_group(request)
+            .await
+            .map_err(|e| anyhow!("Failed to change OU for group {group_id}: {e}"))?;
+        info!("Changed OU for group {group_id} to '{new_ou}'");
     }
-
     Ok(Success::new())
 }

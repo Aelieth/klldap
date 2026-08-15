@@ -23,7 +23,7 @@ pub struct Model {
     pub uuid: Uuid,
     pub modified_date: chrono::NaiveDateTime,
     pub password_modified_date: chrono::NaiveDateTime,
-    // Only backend code ever sets it — tied strictly to kerberossync = 1
+    // Only backend code sets it, and only while kerberossync = 1.
     pub krb_principal_name: Option<String>,
 }
 

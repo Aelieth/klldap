@@ -1,5 +1,3 @@
-//! Result conversion for users and groups.
-
 use crate::attributes::{make_ldap_search_group_result_entry, make_ldap_search_user_result_entry};
 use crate::core::utils::LdapInfo;
 use ldap3_proto::proto::LdapOp;

@@ -1,157 +1,174 @@
-use crate::public_schema::PublicSchema;
-use crate::schema::{AttributeList, AttributeType as AT};
+use crate::{
+    public_schema::PublicSchema,
+    schema::{
+        AttributeList, AttributeSchema,
+        AttributeType::{self as AT, Avatar, DateTime, Integer, String},
+        PosixSettings,
+    },
+};
+use pretty_assertions::assert_eq;
 
-struct E {
-    name: &'static str,
-    aliases: &'static [&'static str],
-    t: AT,
-    is_list: bool,
-    is_visible: bool,
-    is_editable: bool,
-    is_hardcoded: bool,
-    is_readonly: bool,
-}
-
-#[allow(clippy::too_many_arguments)]
-fn e(
-    name: &'static str,
-    aliases: &'static [&'static str],
-    t: AT,
-    is_list: bool,
-    is_visible: bool,
-    is_editable: bool,
-    is_hardcoded: bool,
-    is_readonly: bool,
-) -> E {
-    E {
-        name,
-        aliases,
-        t,
-        is_list,
-        is_visible,
-        is_editable,
-        is_hardcoded,
-        is_readonly,
+fn attr(name: &str, aliases: &[&str], attribute_type: AT) -> AttributeSchema {
+    AttributeSchema {
+        name: name.to_owned(),
+        aliases: aliases.iter().map(|a| a.to_string()).collect(),
+        attribute_type,
+        is_list: false,
+        is_visible: true,
+        is_editable: false,
+        is_hardcoded: true,
+        is_readonly: false,
     }
 }
 
-fn check(list: &AttributeList, expected: &[E]) {
-    assert_eq!(list.attributes.len(), expected.len(), "attribute count");
-    for (actual, x) in list.attributes.iter().zip(expected) {
-        assert_eq!(actual.name, x.name, "name");
-        let aliases: Vec<&str> = actual.aliases.iter().map(String::as_str).collect();
-        assert_eq!(aliases.as_slice(), x.aliases, "aliases for {}", x.name);
-        assert_eq!(actual.attribute_type, x.t, "type for {}", x.name);
-        assert_eq!(actual.is_list, x.is_list, "is_list for {}", x.name);
-        assert_eq!(actual.is_visible, x.is_visible, "is_visible for {}", x.name);
-        assert_eq!(
-            actual.is_editable, x.is_editable,
-            "is_editable for {}",
-            x.name
-        );
-        assert_eq!(
-            actual.is_hardcoded, x.is_hardcoded,
-            "is_hardcoded for {}",
-            x.name
-        );
-        assert_eq!(
-            actual.is_readonly, x.is_readonly,
-            "is_readonly for {}",
-            x.name
-        );
+fn editable(name: &str, aliases: &[&str], attribute_type: AT) -> AttributeSchema {
+    AttributeSchema {
+        is_editable: true,
+        ..attr(name, aliases, attribute_type)
+    }
+}
+
+fn readonly(name: &str, aliases: &[&str], attribute_type: AT) -> AttributeSchema {
+    AttributeSchema {
+        is_readonly: true,
+        ..attr(name, aliases, attribute_type)
     }
 }
 
 #[test]
-fn user_schema_is_pinned() {
-    #[rustfmt::skip]
-    let expected = [
-        e("avatar", &["jpegphoto", "jpegPhoto", "jpeg_photo"], AT::Avatar, false, true, true, true, false),
-        e("creationdate", &["creation_date", "createTimestamp"], AT::DateTime, false, true, false, true, true),
-        e("displayname", &["display_name", "cn", "commonname"], AT::String, false, true, true, true, false),
-        e("firstname", &["first_name", "givenName", "given_name"], AT::String, false, true, true, true, false),
-        e("lastname", &["last_name", "sn", "surname"], AT::String, false, true, true, true, false),
-        e("mail", &["email"], AT::String, false, true, true, true, false),
-        e("modifieddate", &["modified_date", "modifyTimestamp"], AT::DateTime, false, true, false, true, true),
-        e("passwordmodifieddate", &["password_modified_date", "pwdChangedTime"], AT::DateTime, false, true, false, true, true),
-        e("userid", &["user_id", "uid", "id"], AT::String, false, true, false, true, true),
-        e("uuid", &["entryUUID", "entryuuid"], AT::String, false, true, false, true, true),
-        e("uidnumber", &["uid_number", "uidNumber"], AT::Integer, false, true, false, true, false),
-        e("gidnumber", &["gid_number", "gidNumber"], AT::Integer, false, true, false, true, false),
-        e("homedirectory", &["home_directory", "homeDirectory"], AT::String, false, true, false, true, false),
-        e("loginshell", &["login_shell", "loginShell"], AT::String, false, true, false, true, false),
-        e("kerberossync", &["kerberos_sync", "kerberosSync"], AT::Integer, false, true, false, true, false),
-        e("krbprincipalname", &["krb_principal_name", "krbPrincipalName"], AT::String, false, false, false, true, true),
-        e("sshpublickey", &["sshPublicKey", "ssHPublicKey", "ssh_public_key"], AT::String, true, true, true, true, false),
-        e("ou", &["organizationalunit", "organizationalUnit"], AT::String, false, true, false, true, true),
-    ];
-    check(PublicSchema::shared().user_attributes(), &expected);
+fn test_user_schema_is_pinned() {
+    assert_eq!(
+        *PublicSchema::shared().user_attributes(),
+        AttributeList {
+            attributes: vec![
+                editable("avatar", &["jpegphoto", "jpegPhoto", "jpeg_photo"], Avatar),
+                readonly(
+                    "creationdate",
+                    &["creation_date", "createTimestamp"],
+                    DateTime
+                ),
+                editable("displayname", &["display_name", "cn", "commonname"], String),
+                editable(
+                    "firstname",
+                    &["first_name", "givenName", "given_name"],
+                    String
+                ),
+                editable("lastname", &["last_name", "sn", "surname"], String),
+                editable("mail", &["email"], String),
+                readonly(
+                    "modifieddate",
+                    &["modified_date", "modifyTimestamp"],
+                    DateTime
+                ),
+                readonly(
+                    "passwordmodifieddate",
+                    &["password_modified_date", "pwdChangedTime"],
+                    DateTime,
+                ),
+                readonly("userid", &["user_id", "uid", "id"], String),
+                readonly("uuid", &["entryUUID", "entryuuid"], String),
+                attr("uidnumber", &["uid_number", "uidNumber"], Integer),
+                attr("gidnumber", &["gid_number", "gidNumber"], Integer),
+                attr(
+                    "homedirectory",
+                    &["home_directory", "homeDirectory"],
+                    String
+                ),
+                attr("loginshell", &["login_shell", "loginShell"], String),
+                attr("kerberossync", &["kerberos_sync", "kerberosSync"], Integer),
+                AttributeSchema {
+                    is_visible: false,
+                    is_readonly: true,
+                    ..attr(
+                        "krbprincipalname",
+                        &["krb_principal_name", "krbPrincipalName"],
+                        String,
+                    )
+                },
+                AttributeSchema {
+                    is_list: true,
+                    ..editable(
+                        "sshpublickey",
+                        &["sshPublicKey", "ssHPublicKey", "ssh_public_key"],
+                        String,
+                    )
+                },
+                readonly("ou", &["organizationalunit", "organizationalUnit"], String),
+            ],
+        }
+    );
 }
 
 #[test]
-fn group_schema_is_pinned() {
-    #[rustfmt::skip]
-    let expected = [
-        e("groupid", &["group_id"], AT::Integer, false, true, false, true, true),
-        e("creationdate", &["creation_date", "createTimestamp"], AT::DateTime, false, true, false, true, true),
-        e("modifieddate", &["modified_date", "modifyTimestamp"], AT::DateTime, false, true, false, true, true),
-        e("uuid", &["entryUUID", "entryuuid"], AT::String, false, true, false, true, true),
-        e("displayname", &["display_name", "cn", "commonname"], AT::String, false, true, true, true, false),
-        e("ou", &["organizationalunit", "organizationalUnit"], AT::String, false, true, false, true, true),
-        e("gidnumber", &["gid_number", "gidNumber"], AT::Integer, false, true, false, true, false),
-    ];
-    check(PublicSchema::shared().group_attributes(), &expected);
+fn test_group_schema_is_pinned() {
+    assert_eq!(
+        *PublicSchema::shared().group_attributes(),
+        AttributeList {
+            attributes: vec![
+                readonly("groupid", &["group_id"], Integer),
+                readonly(
+                    "creationdate",
+                    &["creation_date", "createTimestamp"],
+                    DateTime
+                ),
+                readonly(
+                    "modifieddate",
+                    &["modified_date", "modifyTimestamp"],
+                    DateTime
+                ),
+                readonly("uuid", &["entryUUID", "entryuuid"], String),
+                editable("displayname", &["display_name", "cn", "commonname"], String),
+                readonly("ou", &["organizationalunit", "organizationalUnit"], String),
+                attr("gidnumber", &["gid_number", "gidNumber"], Integer),
+            ],
+        }
+    );
 }
 
 #[test]
-fn system_schema_is_pinned() {
-    let expected = [e(
-        "allowedous",
-        &["allowedOUs", "AllowedOUs"],
-        AT::String,
-        true,
-        false,
-        false,
-        true,
-        true,
-    )];
-    check(PublicSchema::shared().system_attributes(), &expected);
+fn test_system_schema_is_pinned() {
+    assert_eq!(
+        *PublicSchema::shared().system_attributes(),
+        AttributeList {
+            attributes: vec![AttributeSchema {
+                is_list: true,
+                is_visible: false,
+                is_readonly: true,
+                ..attr("allowedous", &["allowedOUs", "AllowedOUs"], String)
+            }],
+        }
+    );
 }
 
 #[test]
-fn posix_settings_and_object_classes_are_pinned() {
-    let s = PublicSchema::shared();
-    let p = s.posix_settings();
-    assert!(!p.user_uidnumber_assign);
-    assert_eq!(p.user_uidnumber_start, 3001);
-    assert_eq!(p.user_uidnumber_max, 3999);
-    assert!(!p.user_gidnumber_assign);
-    assert_eq!(p.user_gidnumber_start, 3001);
-    assert!(!p.user_loginshell_assign);
-    assert_eq!(p.user_loginshell_default, "/bin/bash");
-    assert!(!p.user_homedirectory_assign);
-    assert_eq!(p.user_homedirectory_prefix, "/home");
-    assert!(!p.group_gidnumber_assign);
-    assert_eq!(p.group_gidnumber_start, 3001);
-    assert_eq!(p.group_gidnumber_max, 3999);
-
-    let sch = s.get_schema();
-    let user_oc: Vec<&str> = sch
-        .extra_user_object_classes
-        .iter()
-        .map(String::as_str)
-        .collect();
-    assert_eq!(user_oc, ["inetOrgPerson", "posixAccount", "ldapPublicKey"]);
-    let group_oc: Vec<&str> = sch
-        .extra_group_object_classes
-        .iter()
-        .map(String::as_str)
-        .collect();
-    assert_eq!(group_oc, ["posixGroup"]);
+fn test_posix_settings_and_object_classes_are_pinned() {
+    let schema = PublicSchema::shared().get_schema();
+    assert_eq!(
+        schema.posix_settings,
+        PosixSettings {
+            user_uidnumber_assign: false,
+            user_uidnumber_start: 3001,
+            user_uidnumber_max: 3999,
+            user_gidnumber_assign: false,
+            user_gidnumber_start: 3001,
+            user_loginshell_assign: false,
+            user_loginshell_default: "/bin/bash".to_owned(),
+            user_homedirectory_assign: false,
+            user_homedirectory_prefix: "/home".to_owned(),
+            group_gidnumber_assign: false,
+            group_gidnumber_start: 3001,
+            group_gidnumber_max: 3999,
+        }
+    );
+    assert_eq!(
+        schema.extra_user_object_classes,
+        ["inetOrgPerson", "posixAccount", "ldapPublicKey"]
+    );
+    assert_eq!(schema.extra_group_object_classes, ["posixGroup"]);
 }
 
 #[test]
-fn ldap_description_order_is_pinned() {
+fn test_ldap_description_order_is_pinned() {
     let s = PublicSchema::shared();
     assert_eq!(
         s.user_attributes().format_for_ldap_schema_description(),
@@ -166,7 +183,7 @@ fn ldap_description_order_is_pinned() {
 }
 
 #[test]
-fn alias_resolution_is_case_insensitive_and_list_scoped() {
+fn test_alias_resolution_is_case_insensitive_and_list_scoped() {
     let s = PublicSchema::shared();
     let u = s.user_attributes();
     assert_eq!(u.resolve_canonical_name("displayname"), Some("displayname"));
@@ -194,7 +211,7 @@ fn alias_resolution_is_case_insensitive_and_list_scoped() {
 }
 
 #[test]
-fn get_attribute_type_is_pinned() {
+fn test_get_attribute_type_is_pinned() {
     let u = PublicSchema::shared().user_attributes();
     assert_eq!(
         u.get_attribute_type("sshpublickey"),
@@ -213,7 +230,7 @@ fn get_attribute_type_is_pinned() {
 }
 
 #[test]
-fn generated_attributes_are_neither_editable_nor_readonly() {
+fn test_generated_attributes_are_neither_editable_nor_readonly() {
     let s = PublicSchema::shared();
     let u = s.user_attributes();
     for name in [
@@ -234,14 +251,14 @@ fn generated_attributes_are_neither_editable_nor_readonly() {
 }
 
 #[test]
-fn attribute_type_string_projections_disagree_by_design() {
+fn test_attribute_type_string_projections_disagree_by_design() {
     assert_eq!(AT::DateTime.to_string(), "DateTime");
     assert_eq!(<&'static str>::from(AT::DateTime), "DATE_TIME");
     assert_eq!("DATE_TIME".parse::<AT>().unwrap(), AT::DateTime);
 }
 
 #[test]
-fn name_membership_and_flatten() {
+fn test_name_membership_and_flatten() {
     let u = PublicSchema::shared().user_attributes();
     assert!(u.contains_name_or_alias("userid"));
     assert!(u.contains_name_or_alias("uid"));
@@ -257,7 +274,7 @@ fn name_membership_and_flatten() {
 }
 
 #[test]
-fn preferred_ldap_name_parity() {
+fn test_preferred_ldap_name_parity() {
     let s = PublicSchema::shared();
     let expect = |list: &AttributeList, name: &str, want: &str| {
         assert_eq!(list.preferred_ldap_name(name), Some(want), "attr {name}");

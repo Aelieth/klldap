@@ -140,13 +140,14 @@ pub async fn send_test_email(to: Mailbox, options: &MailOptions) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::build_reset_url;
+    use pretty_assertions::assert_eq;
 
     fn reset(base: &str) -> String {
         build_reset_url(&url::Url::parse(base).unwrap(), "TOK123").to_string()
     }
 
     #[test]
-    fn reset_url_for_root_bases() {
+    fn test_reset_url_for_root_bases() {
         assert_eq!(
             reset("http://localhost"),
             "http://localhost/reset-password/step2/TOK123"
@@ -158,7 +159,7 @@ mod tests {
     }
 
     #[test]
-    fn reset_url_for_subpath_bases_has_no_double_slash() {
+    fn test_reset_url_for_subpath_bases_has_no_double_slash() {
         assert_eq!(
             reset("https://host/lldap"),
             "https://host/lldap/reset-password/step2/TOK123"

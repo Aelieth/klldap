@@ -301,11 +301,9 @@ impl Kadm5Handle {
         Ok(())
     }
 
-    /// Enable or disable ticket issuance for a user principal by toggling the KDB DISALLOW_ALL_TIX
-    /// attribute — the FFI equivalent of `kadmin modprinc ∓allow_tix`. Read-modify-write so every
-    /// other principal attribute is preserved. `allow == true` clears the flag (`+allow_tix`);
-    /// `false` sets it (`-allow_tix`). A principal that does not exist is idempotent success
-    /// (mirrors `delete_principal`).
+    /// `kadmin modprinc +allow_tix` (`allow == true`) / `-allow_tix` (`false`) through the KDB
+    /// DISALLOW_ALL_TIX attribute; read-modify-write so every other attribute is preserved.
+    /// A principal that does not exist is idempotent success, like `delete_principal`.
     pub fn set_principal_allow_tickets(
         &self,
         username: &str,

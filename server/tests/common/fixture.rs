@@ -18,53 +18,6 @@ use std::process::{Child as ChildProcess, Command};
 use std::{fs::canonicalize, thread, time::Duration};
 use uuid::Uuid;
 
-/// Helper that gives us real error details instead of a useless "failed to add group" panic.
-/// This is the key change that makes 400 / GraphQL errors actually debuggable.
-fn post_graphql<T: graphql_client::GraphQLQuery + 'static>(
-    client: &Client,
-    token: &String,
-    variables: T::Variables,
-) -> Result<T::ResponseData, String> {
-    match post::<T>(client, token, variables) {
-        Ok(data) => Ok(data),
-        Err(e) => {
-            // Raw fallback to capture the actual server response body
-            let graphql_url = format!("{}/api/graphql", env::http_url());
-
-            // We can't easily reconstruct the exact query here, so we just
-            // do a minimal request to show we can reach the server and log the attempt.
-            // The real value comes from the server logs (which now include the GraphQL error).
-            let raw_response = client
-                .post(&graphql_url)
-                .header("Authorization", format!("Bearer {}", token))
-                .header("Content-Type", "application/json")
-                .body(r#"{"query":"{ __typename }"}"#) // minimal valid query
-                .send();
-
-            let raw_info = match raw_response {
-                Ok(resp) => format!(
-                    "Raw probe to {} returned status: {} | body preview: {}",
-                    graphql_url,
-                    resp.status(),
-                    resp.text()
-                        .unwrap_or_default()
-                        .chars()
-                        .take(200)
-                        .collect::<String>()
-                ),
-                Err(err) => format!("Raw probe failed: {}", err),
-            };
-
-            Err(format!(
-                "GraphQL request failed: {}\n\
-                 {}\n\
-                 (Check server logs for the exact GraphQL errors array)",
-                e, raw_info
-            ))
-        }
-    }
-}
-
 #[derive(Clone)]
 pub struct User {
     pub username: String,
@@ -98,7 +51,7 @@ pub struct LLDAPFixture {
     _dir: tempfile::TempDir,
 }
 
-const MAX_HEALTHCHECK_ATTEMPS: u8 = 15; // slightly more generous
+const MAX_HEALTHCHECK_ATTEMPS: u8 = 15;
 
 impl LLDAPFixture {
     pub fn new() -> Self {
@@ -181,14 +134,13 @@ impl LLDAPFixture {
     }
 
     fn add_user(&mut self, user: &User) {
-        let username = &user.username;
-        let response = post_graphql::<CreateUser>(
+        post::<CreateUser>(
             &self.client,
             &self.token,
             create_user::Variables {
                 user: create_user::CreateUserInput {
-                    id: username.clone(),
-                    email: Some(format!("{username}@lldap.test")),
+                    id: user.username.clone(),
+                    email: Some(format!("{}@lldap.test", user.username)),
                     avatar: None,
                     display_name: user.display_name.clone(),
                     first_name: None,
@@ -197,15 +149,12 @@ impl LLDAPFixture {
                 },
             },
         )
-        .unwrap_or_else(|e| panic!("failed to add user '{}': {}", username, e));
-
-        // We don't actually need the response data here, just success
-        let _ = response;
-        self.users.insert(username.clone());
+        .unwrap_or_else(|e| panic!("failed to add user '{}': {e:#}", user.username));
+        self.users.insert(user.username.clone());
     }
 
     fn add_group(&mut self, group: &str) {
-        let result = post::<CreateGroup>(
+        let id = post::<CreateGroup>(
             &self.client,
             &self.token,
             create_group::Variables {
@@ -214,42 +163,11 @@ impl LLDAPFixture {
                     attributes: None,
                 },
             },
-        );
-
-        match result {
-            Ok(response) => {
-                let id = response.create_group.id;
-                self.groups.insert(group.to_owned(), id);
-            }
-            Err(e) => {
-                // Raw request with the CORRECT new query shape to capture exact server error
-                let graphql_url = format!("{}/api/graphql", env::http_url());
-                let raw_resp = self.client
-                .post(&graphql_url)
-                .header("Authorization", format!("Bearer {}", self.token))
-                .header("Content-Type", "application/json")
-                .body(serde_json::json!({
-                    "query": r#"mutation CreateGroup($group: CreateGroupInput!) { createGroup(group: $group) { id } }"#,
-                                        "variables": {
-                                            "group": {
-                                                "displayName": group,
-                                                "attributes": null
-                                            }
-                                        }
-                }).to_string())
-                .send();
-
-                let body = match raw_resp {
-                    Ok(r) => r.text().unwrap_or_default(),
-                    Err(err) => format!("Raw request failed: {}", err),
-                };
-
-                panic!(
-                    "failed to add group '{}': {}\n\n=== RAW SERVER RESPONSE ===\n{}\n===========================",
-                    group, e, body
-                );
-            }
-        }
+        )
+        .unwrap_or_else(|e| panic!("failed to add group '{group}': {e:#}"))
+        .create_group
+        .id;
+        self.groups.insert(group.to_owned(), id);
     }
 
     fn add_user_to_group(&mut self, user: &str, group: &String) {
@@ -257,7 +175,7 @@ impl LLDAPFixture {
             .groups
             .get(group)
             .expect("group id missing when adding user");
-        let _ = post_graphql::<AddUserToGroup>(
+        post::<AddUserToGroup>(
             &self.client,
             &self.token,
             add_user_to_group::Variables {
@@ -265,31 +183,43 @@ impl LLDAPFixture {
                 group: group_id,
             },
         )
-        .unwrap_or_else(|e| panic!("failed to add user '{}' to group '{}': {}", user, group, e));
+        .unwrap_or_else(|e| panic!("failed to add user '{user}' to group '{group}': {e:#}"));
+    }
+
+    // Cleanup must not panic inside Drop.
+    fn delete_user(&mut self, user: &String) {
+        if let Err(e) = post::<DeleteUserQuery>(
+            &self.client,
+            &self.token,
+            delete_user_query::Variables { user: user.clone() },
+        ) {
+            eprintln!("could not delete user {user}: {e:#}");
+        }
+        self.users.remove(user);
+    }
+
+    fn delete_group(&mut self, group: &String) {
+        let Some(group_id) = self.groups.remove(group) else {
+            return;
+        };
+        if let Err(e) = post::<DeleteGroupQuery>(
+            &self.client,
+            &self.token,
+            delete_group_query::Variables { group_id },
+        ) {
+            eprintln!("could not delete group {group}: {e:#}");
+        }
     }
 }
 
 impl Drop for LLDAPFixture {
     fn drop(&mut self) {
-        // Clean up in reverse order: users first, then groups
-        let users = self.users.clone();
-        for user in users {
-            if let Err(e) = self.try_delete_user(&user) {
-                eprintln!("Warning during Drop: could not delete user {}: {}", user, e);
-            }
+        for user in self.users.clone() {
+            self.delete_user(&user);
         }
-
-        let groups: Vec<String> = self.groups.keys().cloned().collect();
-        for group in groups {
-            if let Err(e) = self.try_delete_group(&group) {
-                eprintln!(
-                    "Warning during Drop: could not delete group {}: {}",
-                    group, e
-                );
-            }
+        for group in self.groups.keys().cloned().collect::<Vec<_>>() {
+            self.delete_group(&group);
         }
-
-        // Graceful shutdown of the server process
         let result = signal::kill(
             Pid::from_raw(self.child.id().try_into().unwrap()),
             Signal::SIGTERM,
@@ -320,40 +250,8 @@ impl Drop for LLDAPFixture {
             thread::sleep(Duration::from_millis(1000));
         }
 
-        println!("LLDAP did not exit gracefully after 12s — forcing kill.");
+        println!("LLDAP did not exit gracefully after 12s, forcing kill.");
         let _ = self.child.kill();
-    }
-}
-
-// Helper methods used only by Drop so we never panic during cleanup
-impl LLDAPFixture {
-    fn try_delete_user(&mut self, user: &String) -> Result<(), String> {
-        post_graphql::<DeleteUserQuery>(
-            &self.client,
-            &self.token,
-            delete_user_query::Variables { user: user.clone() },
-        )
-        .map(|_| {
-            self.users.remove(user);
-        })
-        .map_err(|e| e.to_string())
-    }
-
-    fn try_delete_group(&mut self, group: &String) -> Result<(), String> {
-        if let Some(group_id) = self.groups.get(group) {
-            let gid = *group_id;
-            post_graphql::<DeleteGroupQuery>(
-                &self.client,
-                &self.token,
-                delete_group_query::Variables { group_id: gid },
-            )
-            .map(|_| {
-                self.groups.remove(group);
-            })
-            .map_err(|e| e.to_string())
-        } else {
-            Ok(())
-        }
     }
 }
 
@@ -388,9 +286,7 @@ fn create_lldap_command(subcommand: &str, db_url: &str) -> Command {
     cmd
 }
 
-/// Like `create_lldap_command`, but against a real server key file and without the
-/// seed/admin-password environment: the migration tests bring their own database whose
-/// admin password and key must carry over untouched.
+/// The migration tests bring their own database and key: no seed, no admin password.
 pub fn create_lldap_command_with_key_file(
     subcommand: &str,
     db_url: &str,

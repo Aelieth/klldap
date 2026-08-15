@@ -109,16 +109,13 @@ pub fn setup_default_schema(mock: &mut MockTestBackendHandler) {
         .returning(|| Ok(PublicSchema::get()));
 }
 
-/// Robust default mock for all LDAP tests.
-/// This provides sensible defaults so individual tests only need to override what they assert on.
+/// Defaults for the LDAP tests, so each overrides only what it asserts on.
 pub fn setup_default_ldap_mock(mock: &mut MockTestBackendHandler) {
     setup_default_schema(mock);
 
-    // New OU system
     mock.expect_get_allowed_ous()
         .returning(|| Ok(vec!["people".to_string(), "groups".to_string()]));
 
-    // Default user details
     mock.expect_get_user_details().returning(|uid| {
         Ok(User {
             user_id: uid.clone(),
@@ -136,7 +133,6 @@ pub fn setup_default_ldap_mock(mock: &mut MockTestBackendHandler) {
         })
     });
 
-    // Default empty groups (most tests expect this)
     mock.expect_get_user_groups()
         .returning(|_| Ok(HashSet::new()));
 }

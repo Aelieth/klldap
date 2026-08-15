@@ -48,6 +48,12 @@
   updates accept the same 3000–60000 range as creates (the update path stopped at 20000) and a
   group may re-submit its own `gidNumber`. Base-scope LDAP lookups of a single user or group
   no longer scan the whole directory to answer.
+- Fixed: members of `lldap_password_manager` could not change another user's password
+  through LDAP Modify `userPassword` (the extended PasswordModify operation worked); LDAP
+  Modify now applies the same password rules as the extended operation. LDAP ADD of a group
+  persists its schema-known attributes (`gidNumber`, custom group attributes) like user ADD.
+  GraphQL error messages now carry the underlying cause in the message itself (the
+  `extensions.details` field is gone).
 
 ## [0.7.2] 2026-06-16
 

@@ -3047,6 +3047,7 @@ dependencies = [
  "lldap_domain_handlers",
  "minijinja",
  "pkg-config",
+ "pretty_assertions",
  "serde",
  "toml",
  "tracing",
@@ -3169,6 +3170,7 @@ dependencies = [
  "lldap_domain",
  "lldap_schema",
  "orion",
+ "pretty_assertions",
  "sea-orm",
  "serde",
  "serde_json",
@@ -3221,6 +3223,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "lldap_domain_handlers",
+ "pretty_assertions",
  "reqwest",
  "serde",
  "serde_json",
@@ -3291,6 +3294,7 @@ dependencies = [
  "generic-array",
  "lldap_auth",
  "opaque-ke 0.7.0",
+ "pretty_assertions",
  "rand 0.8.6",
  "rand_chacha 0.3.1",
  "rust-argon2",
@@ -3302,6 +3306,7 @@ name = "lldap_schema"
 version = "0.2.2"
 dependencies = [
  "derive_more",
+ "pretty_assertions",
  "sea-orm",
  "serde",
  "strum",

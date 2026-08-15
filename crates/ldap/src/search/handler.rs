@@ -1,5 +1,3 @@
-//! Main LDAP search handler.
-
 use crate::core::{
     error::{LdapError, LdapResult},
     utils::LdapInfo,
@@ -90,7 +88,7 @@ fn retain_exact_dn(ops: &mut Vec<LdapOp>, base: &str) {
 }
 
 pub(crate) fn include_operational(attrs: &[String]) -> bool {
-    // "+" or any requested attribute that is operational (== always_operational), from the table.
+    // "+" or any explicitly requested operational attribute.
     attrs
         .iter()
         .any(|a| a == "+" || crate::schema::operational::is_operational(a))
@@ -351,6 +349,7 @@ mod tests {
     use crate::search::make_search_request;
     use lldap_domain::types::{Attribute, GroupId, User, UserAndGroups, UserId, Uuid};
     use lldap_test_utils::{MockTestBackendHandler, setup_default_ldap_mock};
+    use pretty_assertions::assert_eq;
 
     fn user_in(uid: &str, ou: &str) -> UserAndGroups {
         UserAndGroups {
@@ -402,7 +401,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn base_search_on_a_user_returns_the_entry_and_success() {
+    async fn test_base_search_on_a_user_returns_the_entry_and_success() {
         let mut mock = MockTestBackendHandler::new();
         setup_default_ldap_mock(&mut mock);
         mock.expect_list_users()
@@ -421,7 +420,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn base_search_on_a_user_the_filter_rejects_is_success_only() {
+    async fn test_base_search_on_a_user_the_filter_rejects_is_success_only() {
         let mut mock = MockTestBackendHandler::new();
         setup_default_ldap_mock(&mut mock);
         mock.expect_list_users()
@@ -440,7 +439,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn base_search_on_a_missing_user_is_no_such_object() {
+    async fn test_base_search_on_a_missing_user_is_no_such_object() {
         let mut mock = MockTestBackendHandler::new();
         setup_default_ldap_mock(&mut mock);
         mock.expect_list_users().returning(|_, _| Ok(vec![]));
@@ -456,7 +455,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn base_search_on_a_group_returns_the_entry_and_success() {
+    async fn test_base_search_on_a_group_returns_the_entry_and_success() {
         let mut mock = MockTestBackendHandler::new();
         setup_default_ldap_mock(&mut mock);
         mock.expect_list_groups()
@@ -477,7 +476,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn base_search_on_a_missing_group_is_no_such_object() {
+    async fn test_base_search_on_a_missing_group_is_no_such_object() {
         let mut mock = MockTestBackendHandler::new();
         setup_default_ldap_mock(&mut mock);
         mock.expect_list_groups().returning(|_| Ok(vec![]));
@@ -493,7 +492,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_level_search_keeps_only_direct_children() {
+    async fn test_one_level_search_keeps_only_direct_children() {
         let mut mock = MockTestBackendHandler::new();
         setup_default_ldap_mock(&mut mock);
         mock.expect_list_users().returning(|_, _| {
@@ -526,11 +525,11 @@ mod tests {
     }
 
     #[test]
-    fn include_operational_is_plus_or_any_always_operational() {
+    fn test_include_operational_is_plus_or_any_always_operational() {
         assert!(!include_operational(&[]));
         assert!(!include_operational(&["*".into()]));
         assert!(!include_operational(&["uid".into()]));
-        // loginDisabled/sudoHost are explicit-only virtuals — not operational for gating.
+        // loginDisabled/sudoHost are explicit-only virtuals, not operational.
         assert!(!include_operational(&["loginDisabled".into()]));
         assert!(!include_operational(&["sudoHost".into()]));
         assert!(include_operational(&["+".into()]));
@@ -552,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn root_base_entry_always_emits_three_operational_attrs() {
+    fn test_root_base_entry_always_emits_three_operational_attrs() {
         let base_dn = vec![("dc".into(), "example".into()), ("dc".into(), "com".into())];
         let entry = root_base_entry(&base_dn, "dc=example,dc=com");
         assert_eq!(entry.dn, "dc=example,dc=com");

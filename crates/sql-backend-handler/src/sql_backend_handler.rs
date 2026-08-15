@@ -60,8 +60,7 @@ impl SqlBackendHandler {
         &self.sql_pool
     }
 
-    /// Resolves a user attribute name or alias via the static PublicSchema.
-    /// `_schema` is unused; hardcoded aliases live in PublicSchema, not the DB copy.
+    /// Hardcoded aliases live in the static PublicSchema, not in the DB copy.
     pub(crate) fn canonical_user_attribute_name(
         _schema: &PublicSchema,
         name: &str,

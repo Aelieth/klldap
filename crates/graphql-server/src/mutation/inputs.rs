@@ -12,7 +12,7 @@ pub struct AttributeValue {
     /// Integers (signed 64 bits) are represented as strings.
     /// Dates are represented as strings in RFC3339 format, e.g. "2019-10-12T07:20:50.52Z".
     /// Avatars are represented as base64 encoded strings. Maximum size 512x512
-    /// (PNG, BMP, or JPEG — automatically converted to optimized JPEG on storage).
+    /// (PNG, BMP, or JPEG; converted to JPEG on storage).
     pub value: Vec<String>,
 }
 

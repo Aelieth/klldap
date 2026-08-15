@@ -17,3 +17,6 @@ strum = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 sea-orm = { workspace = true, default-features = false, features = ["sqlx-all", "runtime-tokio-rustls"] }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

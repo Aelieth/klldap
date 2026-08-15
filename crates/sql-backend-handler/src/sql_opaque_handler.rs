@@ -52,7 +52,6 @@ impl SqlBackendHandler {
 
     #[instrument(skip(self), level = "debug", err)]
     async fn get_password_file_for_user(&self, user_id: UserId) -> Result<Option<Vec<u8>>> {
-        // Fetch the previously registered password file from the DB.
         Ok(model::User::find_by_id(user_id)
             .select_only()
             .column(UserColumn::PasswordHash)
@@ -67,11 +66,8 @@ impl SqlBackendHandler {
         use lldap_domain_model::model::{groups, memberships};
         use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
-        // Find the lldap_disabled group (built-in, created at startup, protected from deletion).
-        // Membership here both blocks login (below) *and* causes the LDAP layer to synthesize
-        // loginDisabled=TRUE (see crates/ldap/src/attributes.rs). This provides the standards
-        // info for SSSD (nds login policy, ldap_user_nds_login_disabled, access filters using
-        // (!(loginDisabled=TRUE))). Removal from the group removes the attr.
+        // Membership in lldap_disabled blocks login and makes the LDAP layer synthesize
+        // loginDisabled=TRUE for SSSD access filters; leaving the group clears both.
         let group = groups::Entity::find()
             .filter(groups::Column::DisplayName.eq("lldap_disabled"))
             .one(&self.sql_pool)
@@ -82,7 +78,6 @@ impl SqlBackendHandler {
             return Ok(false);
         };
 
-        // Check if user is member
         let membership = memberships::Entity::find()
             .filter(memberships::Column::UserId.eq(user_id.as_str()))
             .filter(memberships::Column::GroupId.eq(group.group_id))
@@ -126,8 +121,6 @@ impl SqlBackendHandler {
 impl LoginHandler for SqlBackendHandler {
     #[instrument(skip_all, level = "debug", err)]
     async fn bind(&self, request: BindRequest) -> Result<()> {
-        // Login interception for lldap_disabled (improved with explicit standards tie-in).
-        // Corresponds to loginDisabled attr synthesis for SSSD.
         if self.is_user_disabled(&request.name).await? {
             warn!(
                 r#"Login attempt denied for disabled user "{}""#,
@@ -193,8 +186,6 @@ impl OpaqueHandler for SqlOpaqueHandler {
     ) -> Result<login::ServerLoginStartResponse> {
         let user_id = request.username;
 
-        // Login interception for lldap_disabled (improved with explicit standards tie-in).
-        // Corresponds to loginDisabled attr synthesis for SSSD.
         if self.is_user_disabled(&user_id).await? {
             warn!(
                 r#"OPAQUE login attempt denied for disabled user "{}""#,
@@ -217,7 +208,6 @@ impl OpaqueHandler for SqlOpaqueHandler {
             .transpose()?;
 
         let mut rng = rand::rngs::OsRng;
-        // Get the CredentialResponse for the user, or a dummy one if no user/no password.
         let start_response = opaque::server::login::start_login(
             &mut rng,
             &self.opaque_setup,
@@ -249,9 +239,7 @@ impl OpaqueHandler for SqlOpaqueHandler {
             &base64::engine::general_purpose::STANDARD.decode(&request.server_data)?,
         )?)?;
 
-        // Extra safety check (in case login_start check is ever bypassed)
-        // Login interception for lldap_disabled (improved with explicit standards tie-in).
-        // Corresponds to loginDisabled attr synthesis for SSSD.
+        // Checked again in case login_start was bypassed.
         if self.is_user_disabled(&username).await? {
             warn!(
                 r#"OPAQUE login_finish denied for disabled user "{}""#,
@@ -262,8 +250,6 @@ impl OpaqueHandler for SqlOpaqueHandler {
             ));
         }
 
-        // Finish the login: this makes sure the client data is correct, and gives a session key we
-        // don't need.
         match opaque::server::login::finish_login(server_login, request.credential_finalization) {
             Ok(session) => {
                 info!(r#"OPAQUE login successful for "{}""#, &username);
@@ -283,7 +269,6 @@ impl OpaqueHandler for SqlOpaqueHandler {
         &self,
         request: registration::ClientRegistrationStartRequest,
     ) -> Result<registration::ServerRegistrationStartResponse> {
-        // Generate the server-side key and derive the data to send back.
         let start_response = opaque::server::registration::start_registration(
             &self.opaque_setup,
             request.registration_start_request,
@@ -313,7 +298,6 @@ impl OpaqueHandler for SqlOpaqueHandler {
 
         let password_file =
             opaque::server::registration::get_password_file(request.registration_upload);
-        // Set the user password to the new password.
         let now = chrono::Utc::now().naive_utc();
         let user_update = model::users::ActiveModel {
             user_id: ActiveValue::Set(username.clone()),
@@ -337,6 +321,7 @@ mod tests {
         get_initialized_db, insert_group, insert_membership, insert_user, insert_user_no_password,
     };
     use lldap_opaque_handler::register_password;
+    use pretty_assertions::assert_eq;
 
     async fn attempt_login(
         opaque_handler: &SqlOpaqueHandler,
@@ -431,15 +416,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_disabled_user_cannot_login() {
-        // Basic test covering lldap_disabled login interception (the three check sites)
-        // + the group-driven loginDisabled=TRUE synthesis contract (see attributes.rs).
         let sql_pool = get_initialized_db().await;
         let handler = SqlOpaqueHandler::new(generate_random_private_key(), sql_pool.clone());
         insert_user(&handler, "bob", "bob00").await;
         let disabled_gid = insert_group(&handler, "lldap_disabled").await;
         insert_membership(&handler, disabled_gid, "bob").await;
 
-        // Bind (and OPAQUE paths) must reject.
         let err = handler
             .bind(BindRequest {
                 name: UserId::new("bob"),

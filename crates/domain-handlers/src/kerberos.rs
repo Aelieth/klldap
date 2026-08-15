@@ -101,9 +101,10 @@ pub fn set_kerberos_backend(backend: Arc<dyn KerberosSync>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     #[test]
-    fn domain_from_base_dn_joins_dc_components() {
+    fn test_domain_from_base_dn_joins_dc_components() {
         assert_eq!(domain_from_base_dn("dc=gate,dc=test"), "gate.test");
         assert_eq!(domain_from_base_dn("dc=Example,dc=COM"), "example.com");
         assert_eq!(
@@ -113,7 +114,7 @@ mod tests {
     }
 
     #[test]
-    fn realm_prefers_non_empty_override_and_uppercases() {
+    fn test_realm_prefers_non_empty_override_and_uppercases() {
         assert_eq!(realm_from(None, "dc=gate,dc=test"), "GATE.TEST");
         assert_eq!(realm_from(Some(""), "dc=gate,dc=test"), "GATE.TEST");
         assert_eq!(
@@ -123,7 +124,7 @@ mod tests {
     }
 
     #[test]
-    fn principal_name_is_user_at_realm() {
+    fn test_principal_name_is_user_at_realm() {
         assert_eq!(
             format!("bob@{}", realm_from(Some("gate.test"), "dc=unused,dc=com")),
             "bob@GATE.TEST"

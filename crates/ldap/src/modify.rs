@@ -1,7 +1,7 @@
 use crate::{
     core::{
         error::{LdapError, LdapResult},
-        utils::LdapInfo,
+        utils::{LdapInfo, typed_attribute},
     },
     dn::get_user_id_from_distinguished_name,
     handler::make_modify_response,
@@ -11,14 +11,11 @@ use ldap3_proto::proto::{LdapModify, LdapModifyRequest, LdapModifyType, LdapOp, 
 use lldap_access_control::{UserReadableBackendHandler, UserWriteableBackendHandler};
 use lldap_auth::access_control::ValidationResults;
 use lldap_domain::{
-    deserialize,
     requests::UpdateUserRequest,
     types::{Attribute, AttributeName, AttributeType, AttributeValue, Cardinality, Email, UserId},
 };
-use lldap_domain_handlers::kerberos::kerberos_backend;
 use lldap_opaque_handler::OpaqueHandler;
 use lldap_schema::PublicSchema;
-use tracing::warn;
 
 // The profile attribute an LDAP Modify targets, after folding wire-name aliases (sn, cn, surname,
 // jpegphoto, ...) to the schema canonical name. Bridges canonical → DB attribute name / field.
@@ -46,59 +43,6 @@ fn modify_target(atype_lower: &str) -> ModifyTarget {
         "sshpublickey" => ModifyTarget::SshPublicKey,
         "ou" => ModifyTarget::Ou,
         _ => ModifyTarget::Unsupported,
-    }
-}
-
-fn typed_insert_attribute(
-    name: &str,
-    vals: &[String],
-    typ: AttributeType,
-    is_list: bool,
-) -> LdapResult<Attribute> {
-    Ok(Attribute {
-        name: name.into(),
-        value: deserialize::deserialize_attribute_value(vals, typ, is_list).map_err(|e| {
-            LdapError {
-                code: LdapResultCode::ConstraintViolation,
-                message: format!("Invalid {name} value: {e}"),
-            }
-        })?,
-    })
-}
-
-async fn handle_modify_change(
-    readable_handler: &impl UserReadableBackendHandler,
-    writeable_handler: &impl UserWriteableBackendHandler,
-    opaque_handler: &impl OpaqueHandler,
-    user_id: UserId,
-    credentials: &ValidationResults,
-    user_is_admin: bool,
-    change: &LdapModify,
-) -> LdapResult<()> {
-    if change
-        .modification
-        .atype
-        .eq_ignore_ascii_case("userpassword")
-    {
-        handle_password_modify(
-            readable_handler,
-            opaque_handler,
-            user_id,
-            credentials,
-            user_is_admin,
-            change,
-        )
-        .await
-    } else {
-        handle_profile_modify(
-            readable_handler,
-            writeable_handler,
-            user_id,
-            credentials,
-            user_is_admin,
-            change,
-        )
-        .await
     }
 }
 
@@ -142,28 +86,7 @@ async fn handle_password_modify(
         })?;
 
     if let Ok(plain_pass) = std::str::from_utf8(value) {
-        let user = match readable_handler.get_user_details(&user_id).await {
-            Ok(u) => u,
-            Err(e) => {
-                warn!("Failed to fetch user for Kerberos sync check: {}", e);
-                return Ok(());
-            }
-        };
-        let sync_enabled = lldap_domain::types::kerberos_sync_enabled(&user.attributes);
-        if let Err(e) =
-            kerberos_backend().sync_if_enabled(sync_enabled, user_id.as_str(), plain_pass)
-        {
-            warn!("Kerberos sync failed after LDAP password change: {}", e);
-        }
-        // A first password for an already-disabled user would otherwise mint a live principal.
-        if sync_enabled
-            && let Ok(groups) = readable_handler.get_user_groups(&user_id).await
-            && groups
-                .iter()
-                .any(|g| g.display_name == "lldap_disabled".into())
-        {
-            kerberos_backend().reassert_disabled(user_id.as_str());
-        }
+        password::sync_kerberos_after_password_change(readable_handler, &user_id, plain_pass).await;
     }
     Ok(())
 }
@@ -251,7 +174,7 @@ fn scalar_update(
     target: &ModifyTarget,
     values: &[String],
 ) -> LdapResult<bool> {
-    let insert = |name, typ| typed_insert_attribute(name, values, typ, false);
+    let insert = |name, typ| typed_attribute(name, values, typ, false);
     match target {
         ModifyTarget::FirstName => request
             .insert_attributes
@@ -357,7 +280,7 @@ async fn delete_values(
 }
 
 fn ssh_keys_attribute(keys: &[String]) -> LdapResult<Attribute> {
-    typed_insert_attribute("sshpublickey", keys, AttributeType::String, true)
+    typed_attribute("sshpublickey", keys, AttributeType::String, true)
 }
 
 async fn current_ssh_keys(
@@ -414,17 +337,6 @@ where
                             uid.as_str()
                         ),
                     })?;
-
-                let writeable_handler = get_writeable_handler(credentials, uid.clone())
-                    .ok_or_else(|| LdapError {
-                        code: LdapResultCode::InsufficentAccessRights,
-                        message: format!(
-                            "User `{}` cannot modify user `{}` (no write permission)",
-                            credentials.user.as_str(),
-                            uid.as_str()
-                        ),
-                    })?;
-
                 let user_is_admin = readable_handler
                     .get_user_groups(&uid)
                     .await
@@ -434,11 +346,35 @@ where
                     })?
                     .iter()
                     .any(|g| g.display_name == "lldap_admin".into());
-
-                handle_modify_change(
+                // Password changes are governed by can_change_password, not by write access.
+                if change
+                    .modification
+                    .atype
+                    .eq_ignore_ascii_case("userpassword")
+                {
+                    handle_password_modify(
+                        readable_handler,
+                        opaque_handler,
+                        uid.clone(),
+                        credentials,
+                        user_is_admin,
+                        change,
+                    )
+                    .await?;
+                    continue;
+                }
+                let writeable_handler = get_writeable_handler(credentials, uid.clone())
+                    .ok_or_else(|| LdapError {
+                        code: LdapResultCode::InsufficentAccessRights,
+                        message: format!(
+                            "User `{}` cannot modify user `{}` (no write permission)",
+                            credentials.user.as_str(),
+                            uid.as_str()
+                        ),
+                    })?;
+                handle_profile_modify(
                     readable_handler,
                     writeable_handler,
-                    opaque_handler,
                     uid.clone(),
                     credentials,
                     user_is_admin,
@@ -466,47 +402,15 @@ mod tests {
         setup_bound_admin_handler, setup_bound_handler_with_group,
         setup_bound_password_manager_handler,
     };
+    use crate::password::tests::expect_password_change;
     use ldap3_proto::proto::LdapResult as LdapResultOp;
-    use lldap_domain::types::User;
-    use lldap_domain::types::{GroupDetails, GroupId, UserId};
+    use lldap_domain::types::{GroupDetails, GroupId, User, UserId};
     use lldap_domain_model::error::DomainError;
     use lldap_test_utils::recording_kerberos::{KerberosOp, RecordingGuard};
     use lldap_test_utils::{MockTestBackendHandler, setup_default_ldap_mock, setup_default_schema};
     use pretty_assertions::assert_eq;
     use serial_test::serial;
     use std::collections::HashSet;
-
-    fn setup_password_change_expectations(mock: &mut MockTestBackendHandler, user: &str) {
-        use lldap_auth::{opaque, registration};
-        let mut rng = rand::rngs::OsRng;
-        let registration_start_request =
-            opaque::client::registration::start_registration("password".as_bytes(), &mut rng)
-                .unwrap();
-
-        let request = registration::ClientRegistrationStartRequest {
-            username: user.into(),
-            registration_start_request: registration_start_request.message,
-        };
-
-        let start_response = opaque::server::registration::start_registration(
-            &opaque::server::ServerSetup::new(&mut rng),
-            request.registration_start_request,
-            &request.username,
-        )
-        .unwrap();
-
-        mock.expect_registration_start()
-            .times(1)
-            .return_once(move |_| {
-                Ok(registration::ServerRegistrationStartResponse {
-                    server_data: "".to_string(),
-                    registration_response: start_response.message,
-                })
-            });
-        mock.expect_registration_finish()
-            .times(1)
-            .return_once(|_| Ok(()));
-    }
 
     fn make_password_modify_request(target_user: &str) -> LdapModifyRequest {
         LdapModifyRequest {
@@ -539,15 +443,11 @@ mod tests {
         })]
     }
 
-    // ========================================================================
-    // PASSWORD TESTS
-    // ========================================================================
-
     #[tokio::test]
     async fn test_modify_password_of_regular_as_admin() {
         let mut mock = MockTestBackendHandler::new();
         setup_default_ldap_mock(&mut mock);
-        setup_password_change_expectations(&mut mock, "bob");
+        expect_password_change(&mut mock, "bob");
         let ldap_handler = setup_bound_admin_handler(mock).await;
         assert_eq!(
             ldap_handler
@@ -561,7 +461,7 @@ mod tests {
     async fn test_modify_password_of_regular_as_regular() {
         let mut mock = MockTestBackendHandler::new();
         setup_default_ldap_mock(&mut mock);
-        setup_password_change_expectations(&mut mock, "test");
+        expect_password_change(&mut mock, "test");
         let ldap_handler = setup_bound_handler_with_group(mock, "regular").await;
         assert_eq!(
             ldap_handler
@@ -575,7 +475,7 @@ mod tests {
     async fn test_modify_password_of_regular_as_password_manager() {
         let mut mock = MockTestBackendHandler::new();
         setup_default_ldap_mock(&mut mock);
-        setup_password_change_expectations(&mut mock, "bob");
+        expect_password_change(&mut mock, "bob");
         let ldap_handler = setup_bound_password_manager_handler(mock).await;
         assert_eq!(
             ldap_handler
@@ -641,7 +541,7 @@ mod tests {
                 .await,
             make_modify_failure_response(
                 LdapResultCode::InsufficentAccessRights,
-                "User `test` cannot modify user `bob` (no write permission)"
+                "User `test` cannot modify user `bob`"
             )
         );
     }
@@ -650,7 +550,7 @@ mod tests {
     async fn test_modify_password_of_admin_as_admin() {
         let mut mock = MockTestBackendHandler::new();
         setup_default_ldap_mock(&mut mock);
-        setup_password_change_expectations(&mut mock, "test");
+        expect_password_change(&mut mock, "test");
         let ldap_handler = setup_bound_admin_handler(mock).await;
         assert_eq!(
             ldap_handler
@@ -685,10 +585,6 @@ mod tests {
         );
     }
 
-    // ========================================================================
-    // NEW PROFILE ATTRIBUTE MODIFY TESTS (givenName, sn, cn, mail, avatar, sshPublicKey)
-    // ========================================================================
-
     fn make_profile_modify_request(
         target_user: &str,
         attr: &str,
@@ -711,7 +607,6 @@ mod tests {
         let mut mock = MockTestBackendHandler::new();
         setup_default_ldap_mock(&mut mock);
 
-        // Expect update_user call with first_name
         mock.expect_update_user()
             .with(mockall::predicate::function(
                 |req: &lldap_domain::requests::UpdateUserRequest| {
@@ -778,6 +673,21 @@ mod tests {
         assert_eq!(
             ldap_handler.do_modify_request(&request).await,
             make_modify_success_response()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_modify_mail_as_password_manager_is_refused() {
+        let mut mock = MockTestBackendHandler::new();
+        setup_default_ldap_mock(&mut mock);
+        let ldap_handler = setup_bound_password_manager_handler(mock).await;
+        let request = make_profile_modify_request("bob", "mail", "bob.smith@example.com");
+        assert_eq!(
+            ldap_handler.do_modify_request(&request).await,
+            make_modify_failure_response(
+                LdapResultCode::InsufficentAccessRights,
+                "User `test` cannot modify user `bob` (no write permission)"
+            )
         );
     }
 
@@ -899,8 +809,7 @@ mod tests {
         }
     }
 
-    // Pins that the 5 non-schema wire-names (schema aliases since Stage 1) still route to the
-    // right sink on Replace — guards the ModifyTarget collapse.
+    // The five non-schema wire names route to the right sink on Replace.
     #[tokio::test]
     async fn test_modify_replace_non_schema_wire_names() {
         async fn check(
@@ -1219,7 +1128,7 @@ mod tests {
             .with(eq(UserId::new("bob")))
             .returning(|uid| Ok(synced_user(uid)));
         setup_default_ldap_mock(&mut mock);
-        setup_password_change_expectations(&mut mock, "bob");
+        expect_password_change(&mut mock, "bob");
         let ldap_handler = setup_bound_admin_handler(mock).await;
         assert_eq!(
             ldap_handler
@@ -1242,7 +1151,7 @@ mod tests {
         let guard = RecordingGuard::install();
         let mut mock = MockTestBackendHandler::new();
         setup_default_ldap_mock(&mut mock);
-        setup_password_change_expectations(&mut mock, "bob");
+        expect_password_change(&mut mock, "bob");
         let ldap_handler = setup_bound_admin_handler(mock).await;
         assert_eq!(
             ldap_handler
@@ -1254,7 +1163,7 @@ mod tests {
     }
 
     // Setting a password for a kerberossync=1 user already in lldap_disabled must still
-    // succeed — re-asserting -allow_tix is best-effort and no-ops without a KDC.
+    // succeed: re-asserting -allow_tix is best-effort.
     #[tokio::test]
     #[serial]
     async fn test_modify_password_born_disabled_reasserts_and_succeeds() {
@@ -1282,7 +1191,7 @@ mod tests {
                 Ok(set)
             });
         setup_default_ldap_mock(&mut mock);
-        setup_password_change_expectations(&mut mock, "bob");
+        expect_password_change(&mut mock, "bob");
 
         let ldap_handler = setup_bound_admin_handler(mock).await;
         assert_eq!(

@@ -162,6 +162,7 @@ pub fn decode_attribute(
 mod tests {
     use super::*;
     use chrono::NaiveDate;
+    use pretty_assertions::assert_eq;
 
     fn dt(s: &str) -> chrono::NaiveDateTime {
         s.parse().unwrap()
@@ -173,7 +174,7 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_all_type_cardinality_combos() {
+    fn test_roundtrip_all_type_cardinality_combos() {
         let jpeg = Avatar::new(lldap_domain::images::make_test_jpeg_bytes()).0;
         roundtrip(
             AttributeValue::String(Cardinality::Singleton("Bob".to_string())),
@@ -224,7 +225,7 @@ mod tests {
     }
 
     #[test]
-    fn datetime_decode_tolerates_legacy_forms() {
+    fn test_datetime_decode_tolerates_legacy_forms() {
         let expected = dt("2024-05-01T12:00:00");
         let epoch = Serialized(b"1714564800".to_vec());
         assert_eq!(
@@ -266,7 +267,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_bytes_decode_to_empty_lists() {
+    fn test_empty_bytes_decode_to_empty_lists() {
         let empty = Serialized(vec![]);
         assert_eq!(
             decode_attribute_value(&empty, AttributeType::String, true),
@@ -287,7 +288,7 @@ mod tests {
     }
 
     #[test]
-    fn integer_list_tolerates_legacy_single_ascii() {
+    fn test_integer_list_tolerates_legacy_single_ascii() {
         let legacy = Serialized(b"42".to_vec());
         assert_eq!(
             decode_attribute_value(&legacy, AttributeType::Integer, true),

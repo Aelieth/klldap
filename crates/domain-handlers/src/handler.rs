@@ -87,7 +87,7 @@ pub enum UserRequestFilter {
     LessOrEqual(UserColumn, String),
     AttributeGreaterOrEqual(AttributeName, String),
     AttributeLessOrEqual(AttributeName, String),
-    // This enables Keycloak (and other LDAP clients) admin searches to work properly.
+    // Lets clients that filter by DN under admin searches (Keycloak among them) work.
     AttributeSubString(AttributeName, SubStringFilter),
 }
 
@@ -109,8 +109,7 @@ pub enum GroupRequestFilter {
     LessOrEqual(String, String),
     AttributeGreaterOrEqual(AttributeName, String),
     AttributeLessOrEqual(AttributeName, String),
-    // This enables Keycloak admin console searches (and other LDAP clients) to work without
-    // "Unsupported user attribute for substring filter" errors.
+    // Same substring support for groups.
     AttributeSubString(AttributeName, SubStringFilter),
 }
 
@@ -204,7 +203,6 @@ pub trait BackendHandler:
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct PosixSettings {
-    // === Users ===
     pub user_uidnumber_assign: bool,
     pub user_uidnumber_start: i64,
     pub user_uidnumber_max: i64,
@@ -218,7 +216,6 @@ pub struct PosixSettings {
     pub user_homedirectory_assign: bool,
     pub user_homedirectory_prefix: String,
 
-    // === Groups ===
     pub group_gidnumber_assign: bool,
     pub group_gidnumber_start: i64,
     pub group_gidnumber_max: i64,
@@ -239,6 +236,7 @@ pub trait PosixBackendHandler: Send + Sync {
 mod tests {
     use super::*;
     use base64::Engine;
+    use pretty_assertions::assert_eq;
     use pretty_assertions::assert_ne;
 
     #[test]

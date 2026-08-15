@@ -19,6 +19,7 @@ rust-argon2 = "2"
 sha2 = "0.9"
 
 [dev-dependencies]
+pretty_assertions = { workspace = true }
 rand_chacha = "0.3"
 
 [dev-dependencies.lldap_auth]

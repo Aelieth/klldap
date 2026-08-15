@@ -1,14 +1,10 @@
-//! Attribute handling — Single canonical source of truth
-//!
-//! All user/group attribute resolution, EntryDn construction, memberOf,
-//! operational attributes, and search result entry building lives here.
-
-use crate::core::utils::is_ignored_attribute;
-use crate::dn::{DEFAULT_PRIMARY_GROUP_OU, DEFAULT_PRIMARY_USER_OU, build_group_dn, build_user_dn};
-use crate::schema::{ExpandedAttributes, GroupFieldType, UserFieldType};
+use crate::{
+    core::utils::is_ignored_attribute,
+    dn::{DEFAULT_PRIMARY_GROUP_OU, DEFAULT_PRIMARY_USER_OU, build_group_dn, build_user_dn},
+    schema::{ExpandedAttributes, GroupFieldType, UserFieldType},
+};
 use chrono::{NaiveDateTime, TimeZone};
-use ldap3_proto::LdapPartialAttribute;
-use ldap3_proto::LdapSearchResultEntry;
+use ldap3_proto::{LdapPartialAttribute, LdapSearchResultEntry};
 use lldap_domain::types::{
     Attribute, AttributeName, AttributeValue, Cardinality, Group, GroupDetails, GroupMember,
     LdapObjectClass, User, UserId,
@@ -44,11 +40,6 @@ fn member_values(
     members.into_iter().map(String::into_bytes).collect()
 }
 
-// ============================================================================
-// LOW-LEVEL HELPERS MOVED HERE (single source of truth for attribute handling)
-// ============================================================================
-
-/// Convert a NaiveDateTime to LDAP GeneralizedTime format (e.g. 20260101120000.000000Z)
 pub fn to_generalized_time(dt: &NaiveDateTime) -> Vec<u8> {
     chrono::Utc
         .from_utc_datetime(dt)
@@ -57,7 +48,6 @@ pub fn to_generalized_time(dt: &NaiveDateTime) -> Vec<u8> {
         .into_bytes()
 }
 
-/// Extracts a custom attribute value from a list of attributes.
 pub fn get_custom_attribute(
     attributes: &[Attribute],
     attribute_name: &AttributeName,
@@ -67,10 +57,8 @@ pub fn get_custom_attribute(
         .find(|a| &a.name == attribute_name)
         .map(|attribute| match &attribute.value {
             AttributeValue::String(Cardinality::Singleton(s)) => {
-                // Always return the full stored OU value (e.g. "people" or "people\testou").
-                // Returning only the leaf via get_leaf_ou broke Keycloak sync when child OUs
-                // were created under a parent OU. Users must continue advertising their
-                // actual stored ou value.
+                // The full stored OU (e.g. "people\\testou"): emitting only the leaf broke
+                // Keycloak sync for users under child OUs.
                 vec![s.clone().into_bytes()]
             }
             AttributeValue::String(Cardinality::Unbounded(l)) => {
@@ -92,8 +80,6 @@ pub fn get_custom_attribute(
         })
 }
 
-/// Common OU extractor from entity attributes (used by users and groups).
-/// Falls back to the provided default (e.g. "people" or "groups").
 pub fn get_ou_from_attributes(attributes: &[Attribute], default: &str) -> String {
     attributes
         .iter()
@@ -108,8 +94,6 @@ pub fn get_ou_from_attributes(attributes: &[Attribute], default: &str) -> String
         .unwrap_or_else(|| default.to_string())
 }
 
-/// Injects the standard operational attributes we always add to every LDAP search result.
-/// Only adds if not already present (prevents leaking operational attrs into "*").
 pub(crate) fn inject_operational_attributes(
     attrs: &mut Vec<LdapPartialAttribute>,
     structural_class: &str,
@@ -136,8 +120,7 @@ pub(crate) fn inject_operational_attributes(
             vals: vec![format!("cn=Subschema,{}", base_dn_str).into_bytes()],
         });
     }
-    // RFC 4512 creatorsName and modifiersName — injected with default admin DN
-    // (lldap doesn't track per-entry creators/modifiers, so we use a sensible default)
+    // lldap tracks no per-entry creators/modifiers, so the admin DN stands in.
     if !existing.contains("creatorsname") {
         attrs.push(LdapPartialAttribute {
             atype: "creatorsName".to_string(),
@@ -152,14 +135,8 @@ pub(crate) fn inject_operational_attributes(
     }
 }
 
-/// Returns the default object classes for a user as raw bytes (for LDAP internal use).
 pub fn get_default_user_object_classes_bytes(schema: &PublicSchema) -> Vec<Vec<u8>> {
-    let mut classes: Vec<Vec<u8>> = vec![
-        b"top".to_vec(),
-        b"person".to_vec(),
-        // mailAccount removed - non-standard lldap-specific objectClass
-        // Use extra_user_object_classes in schema config if legacy compatibility needed
-    ];
+    let mut classes: Vec<Vec<u8>> = vec![b"top".to_vec(), b"person".to_vec()];
     classes.extend(
         schema
             .get_schema()
@@ -170,7 +147,6 @@ pub fn get_default_user_object_classes_bytes(schema: &PublicSchema) -> Vec<Vec<u
     classes
 }
 
-/// Returns the default object classes for a group as raw bytes (for LDAP internal use).
 pub fn get_default_group_object_classes_bytes(schema: &PublicSchema) -> Vec<Vec<u8>> {
     let mut classes: Vec<Vec<u8>> = vec![b"groupOfUniqueNames".to_vec(), b"groupOfNames".to_vec()];
     classes.extend(
@@ -208,10 +184,6 @@ pub fn get_group_ou(group: &Group) -> String {
     get_ou_from_attributes(&group.attributes, DEFAULT_PRIMARY_GROUP_OU)
 }
 
-// ============================================================================
-// USER ATTRIBUTE RESOLUTION (canonical implementation)
-// ============================================================================
-
 pub fn get_user_attribute(
     user: &User,
     attribute: &AttributeName,
@@ -242,10 +214,7 @@ pub fn get_user_attribute(
                     .iter()
                     .find(|a| a.name.as_str().eq_ignore_ascii_case("ou"))
                     .and_then(|a| {
-                        if let lldap_domain::types::AttributeValue::String(
-                            lldap_domain::types::Cardinality::Singleton(s),
-                        ) = &a.value
-                        {
+                        if let AttributeValue::String(Cardinality::Singleton(s)) = &a.value {
                             Some(s.clone())
                         } else {
                             None
@@ -292,7 +261,7 @@ pub fn get_user_attribute(
             "1.1" => return None,
             "+" => return None,
             "*" => panic!("Matched {attribute}, * should have been expanded"),
-            // Virtual attributes driven purely by built-in group membership
+            // Virtual attributes driven by built-in group membership.
             s if s.eq_ignore_ascii_case("logindisabled") => {
                 if groups.is_some_and(|gs| {
                     gs.iter()
@@ -329,8 +298,7 @@ pub fn get_user_attribute(
             }
         },
     };
-    // Omit an attribute with no values (e.g. member/uniqueMember/memberUid on a memberless group, or
-    // memberOf for a user in no groups) — an attribute with zero values is malformed LDAP.
+    // An attribute with zero values is malformed LDAP (memberless group, user in no groups).
     if attribute_values.is_empty()
         || (attribute_values.len() == 1 && attribute_values[0].is_empty())
     {
@@ -340,15 +308,11 @@ pub fn get_user_attribute(
     }
 }
 
-// ============================================================================
-// GROUP ATTRIBUTE RESOLUTION (canonical implementation)
-// ============================================================================
-
 pub fn get_group_attribute(
     group: &Group,
     base_dn_str: &str,
     attribute: &AttributeName,
-    user_filter: &Option<lldap_domain::types::UserId>,
+    user_filter: &Option<UserId>,
     ignored_group_attributes: &[AttributeName],
     schema: &PublicSchema,
 ) -> Option<Vec<Vec<u8>>> {
@@ -384,9 +348,7 @@ pub fn get_group_attribute(
             member_values(group, user_filter, |member| member.user_id.to_string())
         }
         GroupFieldType::MemberOf => {
-            // memberOf is a user operational/virtual attribute (groups a user belongs to).
-            // For group entries we never emit it; use "member" / "uniqueMember" instead.
-            // (This prevents the filter alias from leaking into result attributes.)
+            // memberOf is a user attribute; groups emit member/uniqueMember instead.
             return None;
         }
         GroupFieldType::Uuid => vec![group.uuid.to_string().into_bytes()],
@@ -411,8 +373,6 @@ pub fn get_group_attribute(
             }
         },
     };
-    // Omit an attribute with no values (e.g. member/uniqueMember/memberUid on a memberless group, or
-    // memberOf for a user in no groups) — an attribute with zero values is malformed LDAP.
     if attribute_values.is_empty()
         || (attribute_values.len() == 1 && attribute_values[0].is_empty())
     {
@@ -421,10 +381,6 @@ pub fn get_group_attribute(
         Some(attribute_values)
     }
 }
-
-// ============================================================================
-// SEARCH RESULT ENTRY BUILDERS (canonical implementation)
-// ============================================================================
 
 pub fn make_ldap_search_user_result_entry(
     user: User,
@@ -468,7 +424,7 @@ pub fn make_ldap_search_group_result_entry(
     schema: &PublicSchema,
 ) -> LdapSearchResultEntry {
     let dn = build_group_dn(&group.display_name, &get_group_ou(&group), base_dn_str);
-    // posixGroup / groupOf(Unique)Names membership — group entries only.
+    // posixGroup / groupOf(Unique)Names membership, group entries only.
     build_entry(
         dn,
         expanded_attributes,
@@ -547,10 +503,11 @@ fn build_entry(
 mod tests {
     use super::*;
     use lldap_domain::types::UserId;
+    use pretty_assertions::assert_eq;
     use std::collections::{BTreeMap, HashSet};
 
     #[test]
-    fn default_object_classes_include_the_hub_extras() {
+    fn test_default_object_classes_include_the_hub_extras() {
         let users: Vec<String> = get_default_user_object_classes()
             .into_iter()
             .map(|c| c.to_string())
@@ -574,7 +531,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_schema_names_include_canonical_names_and_aliases() {
+    fn test_cached_schema_names_include_canonical_names_and_aliases() {
         assert!(USER_SCHEMA_ATTRIBUTE_NAMES.contains("mail"));
         assert!(USER_SCHEMA_ATTRIBUTE_NAMES.contains("email"));
         assert!(!USER_SCHEMA_ATTRIBUTE_NAMES.contains("mycustomattr"));
@@ -584,7 +541,7 @@ mod tests {
     }
 
     #[test]
-    fn result_entry_emits_custom_attribute_and_hides_schema_named_one() {
+    fn test_result_entry_emits_custom_attribute_and_hides_schema_named_one() {
         let user = User {
             user_id: UserId::new("bob"),
             email: "bob@example.com".into(),
@@ -686,7 +643,7 @@ mod tests {
     }
 
     #[test]
-    fn user_result_star_excludes_operational_and_plus_injects() {
+    fn test_user_result_star_excludes_operational_and_plus_injects() {
         let star = expand_and_user(&["*"]);
         assert!(star.contains("uid"));
         assert!(star.contains("mail"));
@@ -717,9 +674,9 @@ mod tests {
     }
 
     #[test]
-    fn user_result_explicit_login_disabled_omits_injected_ops() {
-        // Explicit loginDisabled/sudoHost must NOT trigger the 5 injected operational attrs
-        // (include_operational stays off — the Stage-2 correction; guards the Stage-4c flip).
+    fn test_user_result_explicit_login_disabled_omits_injected_ops() {
+        // Explicit loginDisabled/sudoHost must not switch the injected operational
+        // attributes on.
         for virt in ["loginDisabled", "sudoHost"] {
             let e = expand_and_user(&[virt]);
             for op in [
@@ -735,7 +692,7 @@ mod tests {
     }
 
     #[test]
-    fn group_result_star_excludes_operational_and_plus_injects() {
+    fn test_group_result_star_excludes_operational_and_plus_injects() {
         let star = expand_and_group(&["*"]);
         assert!(star.contains("cn"));
         assert!(!star.contains("createtimestamp"));
@@ -782,7 +739,7 @@ mod tests {
     }
 
     #[test]
-    fn group_entry_emits_the_primary_id_as_groupid() {
+    fn test_group_entry_emits_the_primary_id_as_groupid() {
         let entry = group_entry(&["groupid"]);
         assert_eq!(atype_vals(&entry, "groupid"), Some(&vec![b"1".to_vec()]));
     }
@@ -796,9 +753,8 @@ mod tests {
     }
 
     #[test]
-    fn display_name_hybrid_emission() {
-        // * emits both cn and displayName (same value); explicit displayName → displayName only;
-        // explicit cn → cn only; for users and groups.
+    fn test_display_name_hybrid_emission() {
+        // `*` emits both cn and displayName; explicit requests get only what they asked.
         let star = user_entry(&["*"]);
         assert_eq!(atype_vals(&star, "cn"), Some(&vec![b"Bob".to_vec()]));
         assert_eq!(
@@ -829,7 +785,7 @@ mod tests {
     }
 
     #[test]
-    fn membership_attributes_agree_and_honor_the_user_filter() {
+    fn test_membership_attributes_agree_and_honor_the_user_filter() {
         let mut group = sample_group();
         group.users = vec![
             lldap_domain::types::GroupMember {
@@ -869,8 +825,8 @@ mod tests {
     }
 
     #[test]
-    fn member_uid_emits_login_names() {
-        // RFC 2307 posixGroup: memberUid = bare login names (sorted/deduped), on explicit and `*`.
+    fn test_member_uid_emits_login_names() {
+        // RFC 2307 posixGroup: memberUid is bare login names, sorted and deduped.
         let mut group = sample_group();
         group.users = vec![
             lldap_domain::types::GroupMember {
@@ -905,12 +861,11 @@ mod tests {
         );
         assert_eq!(atype_vals(&entry(&["*"]), "memberUid"), Some(&expected));
 
-        // member still emits DNs, not bare uids.
         let member_entry = entry(&["member"]);
         let dns = atype_vals(&member_entry, "member").unwrap();
         assert!(dns.iter().all(|v| v.starts_with(b"uid=")));
 
-        // On `*`, member and uniqueMember (DNs) ride along too (groupOf(Unique)Names MUST).
+        // On `*`, member and uniqueMember ride along (groupOf(Unique)Names MUST).
         let star = entry(&["*"]);
         for atype in ["member", "uniqueMember"] {
             let vals = atype_vals(&star, atype).unwrap_or_else(|| panic!("* missing {atype}"));
@@ -922,7 +877,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_group_omits_membership_on_star() {
+    fn test_empty_group_omits_membership_on_star() {
         // A memberless group must not emit empty member/uniqueMember/memberUid on `*`.
         let star = group_entry(&["*"]);
         assert!(atype_vals(&star, "member").is_none());
@@ -931,9 +886,9 @@ mod tests {
     }
 
     #[test]
-    fn star_does_not_cross_object_class_wires() {
-        // Membership is group-only; gecos is user-only. Shared expand must not
-        // leak them onto the other class (that logged as unknown on every `*`).
+    fn test_star_does_not_cross_object_class_wires() {
+        // Membership is group-only and gecos user-only; shared expand must not leak
+        // them onto the other class.
         let ustar = user_entry(&["*"]);
         assert!(atype_vals(&ustar, "member").is_none());
         assert!(atype_vals(&ustar, "uniqueMember").is_none());
@@ -945,8 +900,8 @@ mod tests {
     }
 
     #[test]
-    fn gecos_emits_display_name() {
-        // gecos = display_name (POSIX GECOS), on explicit + `*`; a null display_name omits it.
+    fn test_gecos_emits_display_name() {
+        // gecos mirrors display_name; a null display_name omits it.
         let expected = vec![b"Bob".to_vec()];
         assert_eq!(
             atype_vals(&user_entry(&["gecos"]), "gecos"),

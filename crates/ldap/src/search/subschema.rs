@@ -26,7 +26,6 @@ pub fn make_ldap_subschema_entry(schema_manager: &SchemaManager, base_dn_str: &s
     let mut dynamic_attr_types: Vec<Vec<u8>> = Vec::new();
     let mut seen_attr_oids: HashSet<String> = HashSet::new();
 
-    // Core and std entries
     let core_entries: Vec<(&str, Vec<u8>)> = vec![
         ("2.5.4.0", b"( 2.5.4.0 NAME 'objectClass' DESC 'RFC4512' EQUALITY objectIdentifierMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.38 )".to_vec()),
         ("2.5.4.3", b"( 2.5.4.3 NAME ( 'cn' 'commonName' 'displayname' 'display_name' ) DESC 'RFC4519' EQUALITY caseIgnoreMatch SUBSTR caseIgnoreSubstringsMatch SYNTAX 1.3.6.1.4.1.1466.115.121.1.15{256} SINGLE-VALUE )".to_vec()),
@@ -59,13 +58,10 @@ pub fn make_ldap_subschema_entry(schema_manager: &SchemaManager, base_dn_str: &s
         }
     }
 
-    // unique OID counter for custom / runtime attributes (prevents collision)
     let mut custom_oid_counter: u32 = 100;
 
-    // Attributes that have *predefined static entries* in core/std/op_entries.
-    // Skipped here to avoid duplicate attributeType definitions (RFC 4512 §2.2.1 compliance).
-    // Exact match to PublicSchema::get() user/group attributes.
-    // (kerberossync, groupid, and any future custom attrs go dynamic)
+    // Attributes with predefined core/std/op entries are skipped here, or the subschema
+    // would carry duplicate attributeType definitions (RFC 4512 §2.2.1).
     let static_covered_attrs: HashSet<&str> = [
         "avatar",
         "creationdate",
@@ -107,7 +103,6 @@ pub fn make_ldap_subschema_entry(schema_manager: &SchemaManager, base_dn_str: &s
             ""
         };
 
-        // RFC-compliant EQUALITY per attribute type (future-proofs any custom DateTime/Integer attrs)
         let equality = match attr.attribute_type {
             lldap_schema::AttributeType::Integer => "integerMatch",
             lldap_schema::AttributeType::DateTime => "generalizedTimeMatch",
@@ -136,7 +131,6 @@ pub fn make_ldap_subschema_entry(schema_manager: &SchemaManager, base_dn_str: &s
             "sshpublickey" => "10.1".to_string(),
             "kerberossync" => "1.3.6.1.4.1.5322.1.1.1".to_string(),
             "groupid" => "10.2".to_string(),
-            // unique incremental OID for every custom/runtime attribute
             _ => {
                 let oid = format!("10.{}", custom_oid_counter);
                 custom_oid_counter += 1;
@@ -148,12 +142,11 @@ pub fn make_ldap_subschema_entry(schema_manager: &SchemaManager, base_dn_str: &s
             "( {} NAME ( {} ) DESC '{}' EQUALITY {} SYNTAX {}{}{} )",
             oid, name_list, desc, equality, syntax, single_str, op_str
         );
-        // Always push — OIDs are now guaranteed unique
         dynamic_attr_types.push(entry.into_bytes());
         seen_attr_oids.insert(oid);
     }
 
-    // Operational attributeType definitions are generated from the single operational source.
+    // Operational attributeTypes come from the operational table.
     for op in crate::schema::operational::all() {
         if let Some(entry) = op.to_attribute_type_definition() {
             let oid = op.published.as_ref().unwrap().oid;
@@ -163,7 +156,6 @@ pub fn make_ldap_subschema_entry(schema_manager: &SchemaManager, base_dn_str: &s
         }
     }
 
-    // Build inetOrgPerson MAY list (unchanged)
     let mut inet_may: Vec<String> = vec![];
     let mut seen: HashSet<String> = HashSet::new();
 
@@ -174,8 +166,7 @@ pub fn make_ldap_subschema_entry(schema_manager: &SchemaManager, base_dn_str: &s
         }
     }
 
-    // Names excluded from the inetOrgPerson MAY list: the operational attrs + their published
-    // aliases, from the single operational source.
+    // The inetOrgPerson MAY list excludes the operational attributes and their aliases.
     let operational_names: HashSet<String> = crate::schema::operational::all()
         .iter()
         .filter(|o| o.always_operational)
@@ -192,7 +183,7 @@ pub fn make_ldap_subschema_entry(schema_manager: &SchemaManager, base_dn_str: &s
         }
     }
 
-    // inetOrgPerson MAY deliberately re-includes these operational names for client compatibility.
+    // inetOrgPerson MAY re-includes these operational names for client compatibility.
     for extra in [
         "createTimestamp",
         "modifyTimestamp",
@@ -307,7 +298,8 @@ pub fn make_ldap_subschema_entry(schema_manager: &SchemaManager, base_dn_str: &s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::SchemaManager; // or wherever the real one lives
+    use crate::schema::SchemaManager;
+    use pretty_assertions::assert_eq; // or wherever the real one lives
 
     #[test]
     fn test_make_ldap_subschema_entry_basic_structure() {
@@ -317,7 +309,6 @@ mod tests {
             assert_eq!(entry.dn, "cn=Subschema,dc=example,dc=com");
             assert!(entry.attributes.iter().any(|a| a.atype == "attributeTypes"));
             assert!(entry.attributes.iter().any(|a| a.atype == "objectClasses"));
-            // Spot-check unique OID logic didn't collide
             let attr_types = entry
                 .attributes
                 .iter()
@@ -325,7 +316,6 @@ mod tests {
                 .unwrap();
             assert!(!attr_types.vals.is_empty());
 
-            // RFC compliance check for the two virtual synthesized attributes.
             let attr_types_blob: String = attr_types
                 .vals
                 .iter()
@@ -359,9 +349,8 @@ mod tests {
     }
 
     #[test]
-    fn op_entries_match_the_operational_source() {
-        // Byte fidelity of the blobs is owned by operational.rs's own test; here we assert the
-        // subschema emits exactly what the generator produces (no second handwritten copy).
+    fn test_op_entries_match_the_operational_source() {
+        // The blobs' bytes are pinned by operational.rs; this asserts the subschema emits them.
         let schema = SchemaManager::default();
         let LdapOp::SearchResultEntry(entry) =
             make_ldap_subschema_entry(&schema, "dc=example,dc=com")

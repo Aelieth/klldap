@@ -61,15 +61,13 @@ pub(super) async fn test_keycloak_connection<Handler: FullHandler + OpaqueHandle
             &span,
             "Unauthorized Keycloak connection test",
         ))?;
-
     let client =
         KeycloakClient::from_test_input(input.url, input.realm, input.admin_user, input.admin_pass);
-
     match client.test_connection().await {
         Ok(message) => Ok(TestKeycloakConnectionResponse { ok: true, message }),
         Err(e) => Ok(TestKeycloakConnectionResponse {
             ok: false,
-            message: format!("❌ {}", e),
+            message: format!("❌ {e}"),
         }),
     }
 }
@@ -85,13 +83,11 @@ pub(super) async fn save_keycloak_config<Handler: FullHandler + OpaqueHandler>(
             &span,
             "Unauthorized Keycloak config change",
         ))?;
-
     let config = KeycloakConfig {
         url: input.url,
         realm: input.realm,
         admin_user: input.admin_user,
     };
-
     match config.save() {
         Ok(path) => Ok(SaveKeycloakConfigResponse {
             ok: true,
@@ -102,7 +98,7 @@ pub(super) async fn save_keycloak_config<Handler: FullHandler + OpaqueHandler>(
         }),
         Err(e) => Ok(SaveKeycloakConfigResponse {
             ok: false,
-            message: format!("❌ Failed to save config: {}", e),
+            message: format!("❌ Failed to save config: {e}"),
         }),
     }
 }
@@ -118,23 +114,16 @@ pub(super) async fn push_realm_to_keycloak<Handler: FullHandler + OpaqueHandler>
             &span,
             "Unauthorized Keycloak realm push",
         ))?;
-
     let client =
         KeycloakClient::from_test_input(input.url, input.realm, input.admin_user, input.admin_pass);
-
-    let enable_hsts = input.enable_hsts;
-    let enable_brute_force = input.enable_brute_force;
-
     let message = client
         .setup_realm(
             input.lldap_url,
             input.sync_username,
             input.sync_password,
-            enable_hsts,
-            enable_brute_force,
+            input.enable_hsts,
+            input.enable_brute_force,
         )
-        .await
-        .map_err(|e| juniper::FieldError::new(e.to_string(), juniper::Value::null()))?;
-
+        .await?;
     Ok(PushRealmResponse { ok: true, message })
 }

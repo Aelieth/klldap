@@ -4,7 +4,13 @@
 
 D="$(phase_dir)"
 
-docker logs "$CONTAINER" >"$D/docker.log" 2>&1
+# The entrypoint polls the healthcheck once a second, as the runner does from outside; the
+# markers can trail the runner's first success by a poll interval.
+for _ in $(seq 1 30); do
+    docker logs "$CONTAINER" >"$D/docker.log" 2>&1
+    grep -q "Starting Kerberos manager" "$D/docker.log" && break
+    sleep 1
+done
 if grep -q "LLDAP is ready!" "$D/docker.log"; then
     p_ok "entrypoint reported LLDAP ready"
 else

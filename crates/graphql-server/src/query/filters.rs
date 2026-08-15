@@ -1,8 +1,9 @@
 use anyhow::Context as AnyhowContext;
 use juniper::{FieldResult, GraphQLInputObject};
-use lldap_domain::deserialize::deserialize_attribute_value;
-use lldap_domain::types::GroupId;
-use lldap_domain::types::UserId;
+use lldap_domain::{
+    deserialize::deserialize_attribute_value,
+    types::{AttributeName, GroupId, UserId},
+};
 use lldap_domain_handlers::handler::UserRequestFilter as DomainRequestFilter;
 use lldap_domain_model::model::UserColumn;
 use lldap_ldap::{UserFieldType, map_user_field};
@@ -35,7 +36,7 @@ impl RequestFilter {
                     .resolve_user_canonical_name(&eq.field)
                     .unwrap_or(&eq.field);
 
-                let attr_name = lldap_domain::types::AttributeName::from(canonical_field);
+                let attr_name = AttributeName::from(canonical_field);
 
                 match map_user_field(&attr_name, schema) {
                     UserFieldType::NoMatch => {
@@ -115,11 +116,10 @@ mod tests {
         }
     }
 
-    // Regression for #2/#5: KLLDAP canonical names resolve to their primary column in GraphQL
-    // equality filters, matching their aliases (previously they fell to AttributeEquality on a
-    // nonexistent custom attribute).
+    // Canonical names and their aliases must both land on the primary column, never on an
+    // AttributeEquality against a custom attribute of that name.
     #[test]
-    fn canonical_and_aliases_resolve_to_primary() {
+    fn test_canonical_and_aliases_resolve_to_primary() {
         let schema = PublicSchema::get();
         for field in ["userid", "uid", "user_id", "id"] {
             let f = eq_filter(field, "bob")

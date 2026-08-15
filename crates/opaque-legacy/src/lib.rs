@@ -164,9 +164,10 @@ impl LegacyServerSetup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pretty_assertions::assert_eq;
 
     #[test]
-    fn parse_and_reassemble_roundtrip() {
+    fn test_parse_and_reassemble_roundtrip() {
         let legacy = generate_random();
         assert_eq!(legacy.bytes.len(), SERIALIZED_LEN);
         assert_eq!(legacy.fake_public_key().len(), 32);
@@ -182,7 +183,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_accepts_right_password_and_rejects_wrong() {
+    fn test_verify_accepts_right_password_and_rejects_wrong() {
         let legacy = generate_random();
         let password_file = legacy.register_password("bob", "bob00").unwrap();
         assert!(legacy.verify_password(&password_file, "bob", "bob00"));
@@ -192,7 +193,7 @@ mod tests {
     }
 
     #[test]
-    fn reassembled_bytes_parse_under_current_opaque() {
+    fn test_reassembled_bytes_parse_under_current_opaque() {
         let legacy = generate_random();
         assert!(
             lldap_auth::opaque::server::ServerSetup::deserialize(&legacy.reassemble_for_current())
@@ -208,11 +209,9 @@ mod tests {
         );
     }
 
-    // key_seed decision gate (audit 03 Stage 3 / decision 6): do the 0.6.x and current
-    // seed derivations agree when driven by the same ChaCha20 stream? This pins the
-    // empirical verdict; the migration guide follows it.
+    // The migration guide rests on the 0.6.x and current seed derivations disagreeing.
     #[test]
-    fn key_seed_derivation_verdict_divergent() {
+    fn test_key_seed_derivation_verdict_divergent() {
         use rand::SeedableRng;
         let seed = [7u8; 32];
         let legacy = ServerSetup::new(&mut rand_chacha::ChaCha20Rng::from_seed(seed));
@@ -224,7 +223,7 @@ mod tests {
         let current_private = &current.serialize()[64..96];
         assert_ne!(
             legacy_private, current_private,
-            "the 0.6.x and current key_seed derivations now agree — key_seed continuity \
+            "the 0.6.x and current key_seed derivations now agree; key_seed continuity \
              is possible, revisit the migration guide"
         );
     }

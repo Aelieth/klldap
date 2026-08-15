@@ -39,17 +39,17 @@ impl KeycloakConfig {
             return Ok(Self::suggested());
         }
         let contents = std::fs::read_to_string(&path)
-            .with_context(|| format!("Failed to read {}", path.display()))?;
-        toml::from_str(&contents).with_context(|| format!("Failed to parse {}", path.display()))
+            .with_context(|| format!("while reading {}", path.display()))?;
+        toml::from_str(&contents).with_context(|| format!("while parsing {}", path.display()))
     }
 
     pub fn save(&self) -> Result<PathBuf> {
         let path = Self::path();
         let header = "# KLLDAP Keycloak federation settings, written from the Federation tab.\n\
                       # The admin password is not stored here: set LLDAP_KEYCLOAK_ADMIN_PASS.\n\n";
-        let body = toml::to_string_pretty(self).context("Failed to serialize keycloak config")?;
+        let body = toml::to_string_pretty(self).context("while serializing the Keycloak config")?;
         std::fs::write(&path, format!("{header}{body}"))
-            .with_context(|| format!("Failed to write {}", path.display()))?;
+            .with_context(|| format!("while writing {}", path.display()))?;
         Ok(path)
     }
 }

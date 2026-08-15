@@ -178,14 +178,9 @@ impl ConfigurationBuilder {
     }
 }
 
-/// Sentinel value used only when constructing the default Configuration for
-/// figment's Serialized::defaults and expected_keys extraction.
-/// When get_server_setup sees this exact seed it short-circuits and returns
-/// a throwaway in-memory ServerSetup without *any* filesystem operations on
-/// the default "server_key" path. This eliminates the root cause of the
-/// "Permission denied on server_key" bug (healthchecks and other commands
-/// running as root creating a root-owned 0400 file in /app that the real
-/// lldap user later cannot read).
+// Seed of the figment defaults shape and of every auxiliary command: with it, no key
+// material is read or written, so a root-run healthcheck can never plant a server_key the
+// server user cannot read.
 const FIGMENT_DUMMY_KEY_SEED: &str = "__LLDAP_FIGMENT_DEFAULTS_DUMMY_SEED__";
 
 fn stable_hash(val: &[u8]) -> [u8; 32] {
@@ -392,10 +387,6 @@ fn get_server_setup<L: Into<PrivateKeyLocationOrFigment>>(
     use std::fs::read;
     let path = std::path::Path::new(file_path);
 
-    // Special case for figment defaults / healthcheck init: never touch disk
-    // for the default relative "server_key". This is the key fix for the
-    // Docker permission-denied bug when root healthchecks race with the
-    // lldap user process.
     if key_seed == FIGMENT_DUMMY_KEY_SEED {
         use rand::SeedableRng;
         let mut rng = rand_chacha::ChaCha20Rng::from_seed([0u8; 32]);
@@ -429,12 +420,11 @@ fn get_server_setup<L: Into<PrivateKeyLocationOrFigment>>(
         })
     } else if path.exists() {
         let bytes = read(file_path).context(format!("Could not read key file `{file_path}`"))?;
-        // An LLDAP 0.6.x server_key stores a fake private key where the current format
-        // stores a fake public key. The formats are structurally indistinguishable (same
-        // length, no header; 0.6.x accepts any scalar bytes and the current parser
-        // accepts ~11% of 0.6.x fake keys as points) but agree on the oprf_seed and real
-        // private key — everything real-user verification uses. So carry both
-        // interpretations and let bind resolve behaviorally, like the password files.
+        // A 0.6.x server_key stores a fake private key where the current format stores a
+        // fake public key; the formats cannot be told apart (same length, no header, and
+        // the current parser accepts ~11% of 0.6.x fake keys) but agree on the oprf_seed
+        // and real private key. Carry both and let bind resolve behaviorally, like the
+        // password files.
         let legacy_server_setup = lldap_opaque_legacy::parse_server_setup(&bytes);
         let server_setup = match ServerSetup::deserialize(&bytes) {
             Ok(server_setup) => server_setup,
@@ -707,11 +697,8 @@ fn generate_jwt_sample_error() -> String {
     )
 }
 
-/// `init`, but with real private-key material: clears the figment dummy seed so the key
-/// file (or a configured seed) is actually loaded — creating the key file on first run.
-/// Only the serving path may use this; auxiliary commands (healthcheck, schema export,
-/// test email, create-schema) must never read or create key material, or a root-run
-/// healthcheck could plant an unreadable `server_key` before the server does.
+/// `init` for the serving path: loads the real key file or seed (creating the key file
+/// on first run). Auxiliary commands stay on `init` and never touch key material.
 pub fn init_with_private_key<C>(overrides: C) -> Result<Configuration>
 where
     C: TopLevelCommandOpts + ConfigOverrider,
@@ -754,10 +741,7 @@ where
     if config.verbose {
         println!("Configuration: {:#?}", config);
     }
-    // The dummy seed exists so that building the figment defaults shape (and every
-    // auxiliary command) never touches key material on disk. The serving path must
-    // clear the sentinel when nothing overrode it, or a key-file deployment would
-    // silently run on the deterministic dummy key instead of its key file.
+    // Without this a key-file deployment would run on the deterministic dummy key.
     if load_private_key
         && config.key_seed.as_ref().map(SecUtf8::unsecure) == Some(FIGMENT_DUMMY_KEY_SEED)
     {
@@ -815,7 +799,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn loopback_url_detection() {
+    fn test_loopback_url_detection() {
         for base in ["http://localhost", "http://127.0.0.1:17170", "http://[::1]"] {
             assert!(
                 is_loopback_url(&Url::parse(base).unwrap()),
@@ -832,7 +816,6 @@ mod tests {
 
     #[test]
     fn check_generated_server_key() {
-        // Exercise the full key-seed code path
         let result = get_server_setup("/doesnt/exist", "key seed", PrivateKeyLocation::Tests);
         assert!(
             result.is_ok(),
@@ -848,11 +831,9 @@ mod tests {
             "generated server key must not be empty"
         );
 
-        // Prove round-tripping still works after any opaque-ke / bincode updates
         let _deserialized: ServerSetup =
             bincode::deserialize(&serialized).expect("ServerSetup must round-trip through bincode");
 
-        // The real guarantee of key_seed: same seed → identical key (determinism)
         let result2 =
             get_server_setup("/doesnt/exist", "key seed", PrivateKeyLocation::Tests).unwrap();
         let serialized2 = bincode::serialize(&result2.server_setup).unwrap();
@@ -863,13 +844,7 @@ mod tests {
     }
 
     #[test]
-    fn figment_defaults_dummy_seed_does_not_materialize_server_key() {
-        // The core of the Docker permission bug fix: constructing the shape/defaults
-        // Configuration used by figment (and therefore by every healthcheck and run init)
-        // must never read or write the default "server_key" file on disk. Previously the
-        // unconditional ConfigurationBuilder::default().private_build() in Serialized::defaults
-        // would create a root-owned 0400 "server_key" in cwd when run as root (the entrypoint
-        // healthcheck polls).
+    fn test_figment_defaults_dummy_seed_does_not_materialize_server_key() {
         Jail::expect_with(|jail| {
             jail.clear_env();
             let key_path = jail.directory().join("server_key");
@@ -964,15 +939,13 @@ mod tests {
             jail.create_file("lldap_config.toml", r#"key_file = "test""#)?;
             jail.clear_env();
             jail.set_env("LLDAP_JWT_SECRET", "secret");
-            // Force the server key file value via the post-extract override (RunOpts field)
-            // rather than env (which can confuse figment's Env/FileAdapter with "file path"
-            // values) or the toml (key_file is ignored in the providers).
+            // Set through the RunOpts override: figment's FileAdapter would treat an env
+            // value as a file path.
             let mut opts = default_run_opts();
             opts.server_key_file = Some("test".to_string());
             write_random_key(jail, "test");
             let config = init_with_private_key(opts).unwrap();
-            // The key must come from the file — a leaked figment dummy seed would
-            // deterministically generate a publicly-known key here instead.
+            // A leaked dummy seed would generate a publicly-known key here instead.
             let file_bytes = std::fs::read(jail.directory().join("test")).unwrap();
             assert_eq!(&config.get_server_setup().serialize()[..], &file_bytes[..]);
             Ok(())
@@ -992,16 +965,10 @@ mod tests {
 
     #[test]
     fn check_server_setup_key_extraction_file_with_previous_different_file() {
-        // This test exercises the "contents of the private key file have changed"
-        // branch inside compare_private_key_hashes for the same named path.
-        // We do it directly (constructing two different PrivateKeyInfo with the
-        // same KeyFile location) to avoid any Jail + figment + BufWriter timing
-        // subtleties with on-disk visibility across full init() calls.
         let loc = PrivateKeyLocation::KeyFile(
             ConfigLocation::ConfigFile("lldap_config.toml".into()),
             "test".into(),
         );
-        // Two different random keys → different hashes, same location path.
         let k1 = generate_random_private_key();
         let k2 = generate_random_private_key();
         let hash = |k: &ServerSetup| {
@@ -1069,7 +1036,7 @@ mod tests {
     }
 
     #[test]
-    fn server_key_file_current_format_keeps_setup_and_arms_legacy() {
+    fn test_server_key_file_current_format_keeps_setup_and_arms_legacy() {
         Jail::expect_with(|jail| {
             let setup = generate_random_private_key();
             let path = jail.directory().join("server_key");
@@ -1085,9 +1052,9 @@ mod tests {
     }
 
     #[test]
-    fn server_key_file_ambiguous_legacy_bytes_arm_legacy() {
+    fn test_server_key_file_ambiguous_legacy_bytes_arm_legacy() {
         // ~11% of 0.6.x fake private keys accidentally parse as current-format public
-        // keys; such files must still arm legacy verification (P5 Issue 1).
+        // keys; such files must still arm legacy verification.
         let legacy = std::iter::repeat_with(lldap_opaque_legacy::generate_random)
             .find(|l| ServerSetup::deserialize(l.as_bytes()).is_ok())
             .unwrap();
@@ -1103,10 +1070,9 @@ mod tests {
     }
 
     #[test]
-    fn private_key_hash_of_legacy_key_matches_stock_lldap() {
-        // Stock lldap stores sha256(sk) (bytes 64..96 of the key file) in
-        // metadata.private_key_hash; the value computed at boot from a migrated key must
-        // match or compare_private_key_hashes refuses to start.
+    fn test_private_key_hash_of_legacy_key_matches_stock_lldap() {
+        // Stock lldap stores sha256(sk) (bytes 64..96 of the key file) as the private key
+        // hash; a migrated key must reproduce it or the server refuses to start.
         let legacy = lldap_opaque_legacy::generate_random();
         Jail::expect_with(|jail| {
             let path = jail.directory().join("server_key");
@@ -1122,7 +1088,7 @@ mod tests {
     }
 
     #[test]
-    fn server_key_file_legacy_format_reassembles_and_arms_legacy() {
+    fn test_server_key_file_legacy_format_reassembles_and_arms_legacy() {
         let legacy = std::iter::repeat_with(lldap_opaque_legacy::generate_random)
             .find(|l| ServerSetup::deserialize(l.as_bytes()).is_err())
             .unwrap();

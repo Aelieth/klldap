@@ -1,7 +1,7 @@
 use crate::sql_backend_handler::SqlBackendHandler;
 use async_trait::async_trait;
 use lldap_domain::types::{
-    Attribute, AttributeName, AttributeValue, Cardinality, Serialized, UserId,
+    Attribute, AttributeName, AttributeValue, Cardinality, GroupId, Serialized, UserId,
 };
 use lldap_domain_handlers::handler::{
     PosixBackendHandler, PosixSettings, SystemConfigBackendHandler,
@@ -263,7 +263,7 @@ impl SqlBackendHandler {
         }
         let mut candidate = start;
         while candidate <= max {
-            if !Self::is_gidnumber_taken(transaction, candidate).await? {
+            if !Self::is_gidnumber_taken(transaction, candidate, None).await? {
                 return Ok(candidate);
             }
             candidate += 1;
@@ -291,13 +291,36 @@ impl SqlBackendHandler {
     pub(crate) async fn is_gidnumber_taken(
         transaction: &DatabaseTransaction,
         gid: i64,
+        except_group: Option<GroupId>,
     ) -> Result<bool> {
-        let count = model::GroupAttributes::find()
+        let mut taken = model::GroupAttributes::find()
             .filter(model::GroupAttributesColumn::AttributeName.eq("gidnumber"))
-            .filter(model::GroupAttributesColumn::Value.eq(gid.to_string().into_bytes()))
-            .count(transaction)
-            .await?;
-        Ok(count > 0)
+            .filter(model::GroupAttributesColumn::Value.eq(gid.to_string().into_bytes()));
+        if let Some(group_id) = except_group {
+            taken = taken.filter(model::GroupAttributesColumn::GroupId.ne(group_id));
+        }
+        Ok(taken.count(transaction).await? > 0)
+    }
+
+    /// Rejects group gidNumbers outside 3000..=60000 or held by another group.
+    pub(crate) async fn validate_group_posix_numbers(
+        transaction: &DatabaseTransaction,
+        numbers: &[(String, i64)],
+        except_group: Option<GroupId>,
+    ) -> Result<()> {
+        for (name, value) in numbers.iter().filter(|(name, _)| name == "gidnumber") {
+            if !(3000..=60000).contains(value) {
+                return Err(DomainError::InternalError(format!(
+                    "{name} must be between 3000 and 60000"
+                )));
+            }
+            if Self::is_gidnumber_taken(transaction, *value, except_group).await? {
+                return Err(DomainError::InternalError(format!(
+                    "Number {value} is already assigned to another user/group"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Rejects POSIX ids outside 3000..=60000 and uidNumbers held by another user;
@@ -422,8 +445,11 @@ async fn posix_clear_user_attribute(tx: &DatabaseTransaction, attribute: &str) -
 mod tests {
     use super::*;
     use crate::sql_backend_handler::tests::TestFixture;
-    use lldap_domain::requests::{CreateUserRequest, UpdateUserRequest};
-    use lldap_domain_handlers::handler::UserBackendHandler;
+    use lldap_domain::requests::{
+        CreateGroupRequest, CreateUserRequest, UpdateGroupRequest, UpdateUserRequest,
+    };
+    use lldap_domain::types::GroupId;
+    use lldap_domain_handlers::handler::{GroupBackendHandler, UserBackendHandler};
     use pretty_assertions::assert_eq;
 
     fn integer(name: &str, value: i64) -> Attribute {
@@ -489,6 +515,73 @@ mod tests {
         let err = fixture
             .handler
             .update_user(set_attribute("patrick", integer("uidnumber", 70000)))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("between 3000 and 60000"), "{err}");
+    }
+
+    fn set_group_attribute(group_id: GroupId, attribute: Attribute) -> UpdateGroupRequest {
+        UpdateGroupRequest {
+            group_id,
+            display_name: None,
+            delete_attributes: Vec::new(),
+            insert_attributes: vec![attribute],
+        }
+    }
+
+    async fn group_gid(fixture: &TestFixture, group_id: GroupId) -> Option<AttributeValue> {
+        fixture
+            .handler
+            .get_group_details(group_id)
+            .await
+            .unwrap()
+            .attributes
+            .into_iter()
+            .find(|a| a.name.as_str() == "gidnumber")
+            .map(|a| a.value)
+    }
+
+    #[tokio::test]
+    async fn group_gidnumber_is_unique_and_ranged_but_may_be_resubmitted() {
+        let fixture = TestFixture::new().await;
+        for _ in 0..2 {
+            fixture
+                .handler
+                .update_group(set_group_attribute(
+                    fixture.groups[0],
+                    integer("gidnumber", 45000),
+                ))
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            group_gid(&fixture, fixture.groups[0]).await,
+            Some(AttributeValue::Integer(Cardinality::Singleton(45000)))
+        );
+        let err = fixture
+            .handler
+            .update_group(set_group_attribute(
+                fixture.groups[1],
+                integer("gidnumber", 45000),
+            ))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already assigned"), "{err}");
+        let err = fixture
+            .handler
+            .create_group(CreateGroupRequest {
+                display_name: "posix".into(),
+                attributes: vec![integer("gidnumber", 45000)],
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("already assigned"), "{err}");
+        let err = fixture
+            .handler
+            .create_group(CreateGroupRequest {
+                display_name: "posix".into(),
+                attributes: vec![integer("gidnumber", 70000)],
+            })
             .await
             .unwrap_err();
         assert!(err.to_string().contains("between 3000 and 60000"), "{err}");

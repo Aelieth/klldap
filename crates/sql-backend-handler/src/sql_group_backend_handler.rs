@@ -358,38 +358,20 @@ impl GroupBackendHandler for SqlBackendHandler {
                 Box::pin(async move {
                     let schema = Self::get_schema_with_transaction(transaction).await?;
 
-                    // === POSIX RANGE + DUPLICATE CHECKS (for group uidnumber/gidnumber) ===
                     let settings = Self::get_posix_settings_with_transaction(transaction).await?;
-
-                    for attr in &request.attributes {
-                        let name = attr.name.as_str();
-                        let value = match &attr.value {
-                            AttributeValue::Integer(Cardinality::Singleton(v)) => *v,
-                            _ => continue,
-                        };
-
-                        if name == "uidnumber" || name == "gidnumber" {
-                            if value != 0 && !(3000..=60000).contains(&value) {
-                                return Err(DomainError::InternalError(format!(
-                                    "{} must be between 3000 and 60000",
-                                    name
-                                )));
+                    let posix_numbers: Vec<(String, i64)> = request
+                        .attributes
+                        .iter()
+                        .filter_map(|attr| match &attr.value {
+                            AttributeValue::Integer(Cardinality::Singleton(value))
+                                if *value != 0 =>
+                            {
+                                Some((attr.name.as_str().to_owned(), *value))
                             }
-
-                            let taken = if name == "uidnumber" {
-                                Self::is_uidnumber_taken(transaction, value, None).await?
-                            } else {
-                                Self::is_gidnumber_taken(transaction, value).await?
-                            };
-
-                            if taken {
-                                return Err(DomainError::InternalError(format!(
-                                    "Number {} is already assigned to another user/group",
-                                    value
-                                )));
-                            }
-                        }
-                    }
+                            _ => None,
+                        })
+                        .collect();
+                    Self::validate_group_posix_numbers(transaction, &posix_numbers, None).await?;
 
                     let mut final_attributes = request.attributes;
 
@@ -506,8 +488,18 @@ impl SqlBackendHandler {
 
         let schema = Self::get_schema_with_transaction(transaction).await?;
 
-        // === POSIX RANGE + DUPLICATE CHECKS (on any inserted uidnumber/gidnumber for groups) ===
-        let _settings = Self::get_posix_settings_with_transaction(transaction).await?;
+        let posix_numbers: Vec<(String, i64)> = request
+            .insert_attributes
+            .iter()
+            .filter_map(|attr| match &attr.value {
+                AttributeValue::Integer(Cardinality::Singleton(value)) if *value != 0 => {
+                    Some((attr.name.as_str().to_owned(), *value))
+                }
+                _ => None,
+            })
+            .collect();
+        Self::validate_group_posix_numbers(transaction, &posix_numbers, Some(request.group_id))
+            .await?;
 
         let mut update_group_attributes = Vec::new();
         let mut remove_group_attributes = Vec::new();
@@ -518,47 +510,10 @@ impl SqlBackendHandler {
                 .get_by_name_or_alias(attribute.name.as_str())
                 .map(|s| s.name.clone().into())
                 .unwrap_or_else(|| attribute.name.clone());
-            let name = attribute.name.as_str();
-            let value = match &attribute.value {
-                AttributeValue::Integer(Cardinality::Singleton(v)) => *v,
-                _ => {
-                    let db_value = attribute_value_to_db_bytes(&attribute.value);
-                    update_group_attributes.push(model::group_attributes::ActiveModel {
-                        group_id: Set(request.group_id),
-                        attribute_name: Set(canonical_name.clone()),
-                        value: Set(Serialized(db_value)),
-                    });
-                    continue;
-                }
-            };
-
-            if name == "uidnumber" || name == "gidnumber" {
-                if value != 0 && !(3000..=20000).contains(&value) {
-                    return Err(DomainError::InternalError(format!(
-                        "{} must be between 3000 and 20000 (or 0 for no limit)",
-                        name
-                    )));
-                }
-
-                let taken = if name == "uidnumber" {
-                    Self::is_uidnumber_taken(transaction, value, None).await?
-                } else {
-                    Self::is_gidnumber_taken(transaction, value).await?
-                };
-
-                if taken {
-                    return Err(DomainError::InternalError(format!(
-                        "Number {} is already assigned to another user/group",
-                        value
-                    )));
-                }
-            }
-
-            let db_value = attribute_value_to_db_bytes(&attribute.value);
             update_group_attributes.push(model::group_attributes::ActiveModel {
                 group_id: Set(request.group_id),
                 attribute_name: Set(canonical_name),
-                value: Set(Serialized(db_value)),
+                value: Set(Serialized(attribute_value_to_db_bytes(&attribute.value))),
             });
         }
 

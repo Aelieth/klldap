@@ -44,7 +44,10 @@
   id, as in upstream LLDAP. The Keycloak realm push now builds the LDAP provider's
   `usersDn`/`groupsDn`/`bindDn` from LLDAP's base DN instead of the Keycloak realm name.
 - Fixed: re-submitting a user's own `uidNumber` on update was rejected as "already assigned".
-  `setPosixSettings` now checks authorization before validating ranges.
+  `setPosixSettings` now checks authorization before validating ranges. Group `gidNumber`
+  updates accept the same 3000–60000 range as creates (the update path stopped at 20000) and a
+  group may re-submit its own `gidNumber`. Base-scope LDAP lookups of a single user or group
+  no longer scan the whole directory to answer.
 
 ## [0.7.2] 2026-06-16
 

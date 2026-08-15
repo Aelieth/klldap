@@ -58,6 +58,37 @@ pub(crate) async fn get_groups_list<Backend: GroupListerBackendHandler>(
         })
 }
 
+fn no_such_object() -> LdapError {
+    LdapError {
+        code: LdapResultCode::NoSuchObject,
+        message: String::new(),
+    }
+}
+
+// Keeps entries under `base`; with `child_rdn_count` (one-level searches) only entries with
+// exactly that many RDNs, i.e. direct children.
+fn retain_under_base(ops: &mut Vec<LdapOp>, base: &str, child_rdn_count: Option<usize>) {
+    let base_lower = base.to_ascii_lowercase();
+    ops.retain(|op| match op {
+        LdapOp::SearchResultEntry(entry) => match parse_distinguished_name(&entry.dn) {
+            Ok(parts) => {
+                entry.dn.to_ascii_lowercase().ends_with(&base_lower)
+                    && child_rdn_count.is_none_or(|count| parts.len() == count)
+            }
+            Err(_) => false,
+        },
+        _ => true,
+    });
+}
+
+fn retain_exact_dn(ops: &mut Vec<LdapOp>, base: &str) {
+    let base_lower = base.to_ascii_lowercase();
+    ops.retain(|op| match op {
+        LdapOp::SearchResultEntry(entry) => entry.dn.to_ascii_lowercase() == base_lower,
+        _ => true,
+    });
+}
+
 pub(crate) fn include_operational(attrs: &[String]) -> bool {
     // "+" or any requested attribute that is operational (== always_operational), from the table.
     attrs
@@ -245,46 +276,10 @@ where
                 )
                 .collect();
 
-                // ADS-compatible filtering (unchanged, stable)
-                {
-                    let base_lower = request.base.to_ascii_lowercase();
-                    let expected_rdn_count = dn_parts.len() + 1;
-                    let is_one_level = request.scope == LdapSearchScope::OneLevel;
-
-                    user_ops.retain(|op| {
-                        if let LdapOp::SearchResultEntry(e) = op {
-                            if let Ok(parts) = parse_distinguished_name(&e.dn) {
-                                let under = e.dn.to_ascii_lowercase().ends_with(&base_lower);
-                                if is_one_level {
-                                    under && parts.len() == expected_rdn_count
-                                } else {
-                                    under
-                                }
-                            } else {
-                                false
-                            }
-                        } else {
-                            true
-                        }
-                    });
-
-                    group_ops.retain(|op| {
-                        if let LdapOp::SearchResultEntry(e) = op {
-                            if let Ok(parts) = parse_distinguished_name(&e.dn) {
-                                let under = e.dn.to_ascii_lowercase().ends_with(&base_lower);
-                                if is_one_level {
-                                    under && parts.len() == expected_rdn_count
-                                } else {
-                                    under
-                                }
-                            } else {
-                                false
-                            }
-                        } else {
-                            true
-                        }
-                    });
-                }
+                let child_rdn_count =
+                    (request.scope == LdapSearchScope::OneLevel).then_some(dn_parts.len() + 1);
+                retain_under_base(&mut user_ops, &request.base, child_rdn_count);
+                retain_under_base(&mut group_ops, &request.base, child_rdn_count);
 
                 results.extend(user_ops);
                 results.extend(group_ops);
@@ -292,108 +287,54 @@ where
             results.push(make_search_success());
             Ok(results)
         }
+        // Leaf lookups probe by RDN first so a missing entry is NoSuchObject while an entry
+        // the client filter rejects is a plain success with no entries.
         crate::search::scope::SearchScope::LeafUser => {
-            let user_id = match crate::dn::get_user_id_from_distinguished_name(
+            let Ok(user_id) = crate::dn::get_user_id_from_distinguished_name(
                 &request.base,
                 base_dn,
                 &ldap_info.base_dn_str,
-            ) {
-                Ok(id) => id,
-                Err(_) => return Ok(vec![make_search_success()]),
+            ) else {
+                return Ok(vec![make_search_success()]);
             };
-            let specific_filter =
-                ldap3_proto::LdapFilter::Equality("uid".to_string(), user_id.to_string());
-            let exists_users = get_user_list(
-                ldap_info,
-                &specific_filter,
-                true,
-                &request.base,
-                backend,
-                schema,
-            )
-            .await?;
-            if exists_users.is_empty() {
-                return Err(LdapError {
-                    code: LdapResultCode::NoSuchObject,
-                    message: "".to_string(),
-                });
+            let probe = LdapFilter::Equality("uid".to_string(), user_id.to_string());
+            if get_user_list(ldap_info, &probe, false, &request.base, backend, schema)
+                .await?
+                .is_empty()
+            {
+                return Err(no_such_object());
             }
-            // Now apply the REAL client filter (Problem 3)
-            let users = get_user_list(
-                ldap_info,
-                &request.filter,
-                true,
-                &request.base,
-                backend,
-                schema,
-            )
-            .await?;
+            let filter = LdapFilter::And(vec![probe, request.filter.clone()]);
+            let users =
+                get_user_list(ldap_info, &filter, true, &request.base, backend, schema).await?;
             let mut results: Vec<LdapOp> =
                 convert_users_to_ldap_op(users, &request.attrs, ldap_info, schema).collect();
-            // Post-filter to exact base DN (consistent with Container pattern, reusable)
-            let base_lower = request.base.to_ascii_lowercase();
-            results.retain(|op| {
-                if let LdapOp::SearchResultEntry(e) = op {
-                    e.dn.to_ascii_lowercase() == base_lower
-                } else {
-                    true
-                }
-            });
-            if results.is_empty() {
-                // Entry exists but filter did not match → success, 0 entries (correct LDAP behavior)
-                return Ok(vec![make_search_success()]);
-            }
+            retain_exact_dn(&mut results, &request.base);
             results.push(make_search_success());
             Ok(results)
         }
         crate::search::scope::SearchScope::LeafGroup => {
-            let group_name = match crate::dn::get_group_id_from_distinguished_name(
+            let Ok(group_name) = crate::dn::get_group_id_from_distinguished_name(
                 &request.base,
                 base_dn,
                 &ldap_info.base_dn_str,
-            ) {
-                Ok(name) => name,
-                Err(_) => return Ok(vec![make_search_success()]),
+            ) else {
+                return Ok(vec![make_search_success()]);
             };
-
-            // Existence check using the canonical attribute name for the group RDN.
-            // We use SchemaManager so we stay consistent with the dynamic alias mapping
-            // (displayname <-> cn) that was standardized in this release.
-            let schema_manager = crate::schema::get_schema_manager();
-            let group_rdn_attr = schema_manager.get_canonical_name("cn");
-            let specific_filter =
-                ldap3_proto::LdapFilter::Equality(group_rdn_attr, group_name.to_string());
-
-            let exists_groups =
-                get_groups_list(ldap_info, &specific_filter, &request.base, backend, schema)
-                    .await?;
-            if exists_groups.is_empty() {
-                return Err(LdapError {
-                    code: LdapResultCode::NoSuchObject,
-                    message: "".to_string(),
-                });
+            let probe = LdapFilter::Equality("cn".to_string(), group_name.to_string());
+            if get_groups_list(ldap_info, &probe, &request.base, backend, schema)
+                .await?
+                .is_empty()
+            {
+                return Err(no_such_object());
             }
-
-            // Apply the REAL client filter after confirming the entry exists.
-            // This two-step pattern (existence check + real filter) is required to
-            // correctly return NoSuchObject vs Success+0 entries per LDAP semantics.
+            let filter = LdapFilter::And(vec![probe, request.filter.clone()]);
             let groups =
-                get_groups_list(ldap_info, &request.filter, &request.base, backend, schema).await?;
+                get_groups_list(ldap_info, &filter, &request.base, backend, schema).await?;
             let mut results: Vec<LdapOp> =
                 convert_groups_to_ldap_op(groups, &request.attrs, ldap_info, &None, schema)
                     .collect();
-
-            let base_lower = request.base.to_ascii_lowercase();
-            results.retain(|op| {
-                if let LdapOp::SearchResultEntry(e) = op {
-                    e.dn.to_ascii_lowercase() == base_lower
-                } else {
-                    true
-                }
-            });
-            if results.is_empty() {
-                return Ok(vec![make_search_success()]);
-            }
+            retain_exact_dn(&mut results, &request.base);
             results.push(make_search_success());
             Ok(results)
         }
@@ -406,6 +347,183 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handler::tests::setup_bound_admin_handler;
+    use crate::search::make_search_request;
+    use lldap_domain::types::{Attribute, GroupId, User, UserAndGroups, UserId, Uuid};
+    use lldap_test_utils::{MockTestBackendHandler, setup_default_ldap_mock};
+
+    fn user_in(uid: &str, ou: &str) -> UserAndGroups {
+        UserAndGroups {
+            user: User {
+                user_id: UserId::new(uid),
+                attributes: vec![Attribute {
+                    name: "ou".into(),
+                    value: ou.to_string().into(),
+                }],
+                ..Default::default()
+            },
+            groups: Some(vec![]),
+        }
+    }
+
+    fn group_in(name: &str, ou: &str) -> Group {
+        let epoch = chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc();
+        Group {
+            id: GroupId(7),
+            display_name: name.into(),
+            creation_date: epoch,
+            uuid: Uuid::from_name_and_date(name, &epoch),
+            users: vec![],
+            attributes: vec![Attribute {
+                name: "ou".into(),
+                value: ou.to_string().into(),
+            }],
+            modified_date: epoch,
+        }
+    }
+
+    fn base_request(base: &str, filter: LdapFilter) -> LdapSearchRequest {
+        let mut request = make_search_request(base, filter, vec!["objectClass"]);
+        request.scope = LdapSearchScope::Base;
+        request
+    }
+
+    fn entry_dns(ops: &[LdapOp]) -> Vec<String> {
+        ops.iter()
+            .filter_map(|op| match op {
+                LdapOp::SearchResultEntry(e) => Some(e.dn.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn person_filter() -> LdapFilter {
+        LdapFilter::Equality("objectClass".to_string(), "person".to_string())
+    }
+
+    #[tokio::test]
+    async fn base_search_on_a_user_returns_the_entry_and_success() {
+        let mut mock = MockTestBackendHandler::new();
+        setup_default_ldap_mock(&mut mock);
+        mock.expect_list_users()
+            .returning(|_, _| Ok(vec![user_in("bob", "people")]));
+        let handler = setup_bound_admin_handler(mock).await;
+        let ops = handler
+            .do_search_or_dse(&base_request(
+                "uid=bob,ou=people,dc=example,dc=com",
+                person_filter(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(entry_dns(&ops), vec!["uid=bob,ou=people,dc=example,dc=com"]);
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops.last(), Some(&make_search_success()));
+    }
+
+    #[tokio::test]
+    async fn base_search_on_a_user_the_filter_rejects_is_success_only() {
+        let mut mock = MockTestBackendHandler::new();
+        setup_default_ldap_mock(&mut mock);
+        mock.expect_list_users()
+            .times(1)
+            .return_once(|_, _| Ok(vec![user_in("bob", "people")]));
+        mock.expect_list_users().return_once(|_, _| Ok(vec![]));
+        let handler = setup_bound_admin_handler(mock).await;
+        let ops = handler
+            .do_search_or_dse(&base_request(
+                "uid=bob,ou=people,dc=example,dc=com",
+                LdapFilter::Equality("uid".to_string(), "alice".to_string()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ops, vec![make_search_success()]);
+    }
+
+    #[tokio::test]
+    async fn base_search_on_a_missing_user_is_no_such_object() {
+        let mut mock = MockTestBackendHandler::new();
+        setup_default_ldap_mock(&mut mock);
+        mock.expect_list_users().returning(|_, _| Ok(vec![]));
+        let handler = setup_bound_admin_handler(mock).await;
+        let err = handler
+            .do_search_or_dse(&base_request(
+                "uid=nobody,ou=people,dc=example,dc=com",
+                person_filter(),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, LdapResultCode::NoSuchObject);
+    }
+
+    #[tokio::test]
+    async fn base_search_on_a_group_returns_the_entry_and_success() {
+        let mut mock = MockTestBackendHandler::new();
+        setup_default_ldap_mock(&mut mock);
+        mock.expect_list_groups()
+            .returning(|_| Ok(vec![group_in("admins", "groups")]));
+        let handler = setup_bound_admin_handler(mock).await;
+        let ops = handler
+            .do_search_or_dse(&base_request(
+                "cn=admins,ou=groups,dc=example,dc=com",
+                LdapFilter::Present("objectClass".to_string()),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            entry_dns(&ops),
+            vec!["cn=admins,ou=groups,dc=example,dc=com"]
+        );
+        assert_eq!(ops.last(), Some(&make_search_success()));
+    }
+
+    #[tokio::test]
+    async fn base_search_on_a_missing_group_is_no_such_object() {
+        let mut mock = MockTestBackendHandler::new();
+        setup_default_ldap_mock(&mut mock);
+        mock.expect_list_groups().returning(|_| Ok(vec![]));
+        let handler = setup_bound_admin_handler(mock).await;
+        let err = handler
+            .do_search_or_dse(&base_request(
+                "cn=nobody,ou=groups,dc=example,dc=com",
+                LdapFilter::Present("objectClass".to_string()),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, LdapResultCode::NoSuchObject);
+    }
+
+    #[tokio::test]
+    async fn one_level_search_keeps_only_direct_children() {
+        let mut mock = MockTestBackendHandler::new();
+        setup_default_ldap_mock(&mut mock);
+        mock.expect_list_users().returning(|_, _| {
+            Ok(vec![
+                user_in("bob", "people"),
+                user_in("alice", "people\\lab"),
+            ])
+        });
+        mock.expect_list_groups().returning(|_| Ok(vec![]));
+        let handler = setup_bound_admin_handler(mock).await;
+        let mut request = make_search_request(
+            "ou=people,dc=example,dc=com",
+            person_filter(),
+            vec!["objectClass"],
+        );
+        request.scope = LdapSearchScope::OneLevel;
+        let ops = handler.do_search_or_dse(&request).await.unwrap();
+        let dns = entry_dns(&ops);
+        assert!(
+            dns.contains(&"uid=bob,ou=people,dc=example,dc=com".to_string()),
+            "{dns:?}"
+        );
+        assert!(
+            !dns.iter().any(|dn| dn.starts_with("uid=alice,")),
+            "one-level must hide the nested user: {dns:?}"
+        );
+        request.scope = LdapSearchScope::Subtree;
+        let dns = entry_dns(&handler.do_search_or_dse(&request).await.unwrap());
+        assert!(dns.iter().any(|dn| dn.starts_with("uid=alice,")), "{dns:?}");
+    }
 
     #[test]
     fn include_operational_is_plus_or_any_always_operational() {

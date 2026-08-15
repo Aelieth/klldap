@@ -10,27 +10,39 @@ use chrono::{NaiveDateTime, TimeZone};
 use ldap3_proto::LdapPartialAttribute;
 use ldap3_proto::LdapSearchResultEntry;
 use lldap_domain::types::{
-    Attribute, AttributeName, AttributeValue, Cardinality, Group, GroupDetails, User,
+    Attribute, AttributeName, AttributeValue, Cardinality, Group, GroupDetails, GroupMember,
+    LdapObjectClass, User, UserId,
 };
-use lldap_schema::PublicSchema;
+use lldap_schema::{AttributeList, PublicSchema};
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
-static USER_SCHEMA_ATTRIBUTE_NAMES: LazyLock<HashSet<String>> = LazyLock::new(|| {
-    PublicSchema::shared()
-        .user_attributes()
-        .all_names_and_aliases()
-        .map(str::to_owned)
-        .collect()
-});
+static USER_SCHEMA_ATTRIBUTE_NAMES: LazyLock<HashSet<String>> =
+    LazyLock::new(|| schema_names(PublicSchema::shared().user_attributes()));
 
-static GROUP_SCHEMA_ATTRIBUTE_NAMES: LazyLock<HashSet<String>> = LazyLock::new(|| {
-    PublicSchema::shared()
-        .group_attributes()
+static GROUP_SCHEMA_ATTRIBUTE_NAMES: LazyLock<HashSet<String>> =
+    LazyLock::new(|| schema_names(PublicSchema::shared().group_attributes()));
+
+fn schema_names(attributes: &AttributeList) -> HashSet<String> {
+    attributes
         .all_names_and_aliases()
         .map(str::to_owned)
         .collect()
-});
+}
+
+fn member_values(
+    group: &Group,
+    user_filter: &Option<UserId>,
+    render: impl Fn(&GroupMember) -> String,
+) -> Vec<Vec<u8>> {
+    let members: std::collections::BTreeSet<String> = group
+        .users
+        .iter()
+        .filter(|member| user_filter.as_ref().is_none_or(|f| member.user_id == *f))
+        .map(render)
+        .collect();
+    members.into_iter().map(String::into_bytes).collect()
+}
 
 // ============================================================================
 // LOW-LEVEL HELPERS MOVED HERE (single source of truth for attribute handling)
@@ -171,24 +183,20 @@ pub fn get_default_group_object_classes_bytes(schema: &PublicSchema) -> Vec<Vec<
     classes
 }
 
-/// 0-argument versions for GraphQL + public API (returns LdapObjectClass).
-pub fn get_default_user_object_classes() -> Vec<lldap_domain::types::LdapObjectClass> {
-    let schema = PublicSchema::shared();
-    get_default_user_object_classes_bytes(schema)
-        .into_iter()
-        .map(|b| {
-            lldap_domain::types::LdapObjectClass::from(String::from_utf8_lossy(&b).to_string())
-        })
-        .collect()
+pub fn get_default_user_object_classes() -> Vec<LdapObjectClass> {
+    object_classes(get_default_user_object_classes_bytes(PublicSchema::shared()))
 }
 
-pub fn get_default_group_object_classes() -> Vec<lldap_domain::types::LdapObjectClass> {
-    let schema = PublicSchema::shared();
-    get_default_group_object_classes_bytes(schema)
+pub fn get_default_group_object_classes() -> Vec<LdapObjectClass> {
+    object_classes(get_default_group_object_classes_bytes(
+        PublicSchema::shared(),
+    ))
+}
+
+fn object_classes(classes: Vec<Vec<u8>>) -> Vec<LdapObjectClass> {
+    classes
         .into_iter()
-        .map(|b| {
-            lldap_domain::types::LdapObjectClass::from(String::from_utf8_lossy(&b).to_string())
-        })
+        .map(|class| LdapObjectClass::from(String::from_utf8_lossy(&class).to_string()))
         .collect()
 }
 
@@ -366,50 +374,14 @@ pub fn get_group_attribute(
         GroupFieldType::ModifiedDate => {
             vec![to_generalized_time(&group.modified_date)]
         }
-        GroupFieldType::Member => {
-            let members: std::collections::BTreeSet<_> = group
-                .users
-                .iter()
-                .filter(|u| {
-                    user_filter
-                        .as_ref()
-                        .map(|f| u.user_id == *f)
-                        .unwrap_or(true)
-                })
-                .map(|u| build_user_dn(&u.user_id, &u.ou, base_dn_str))
-                .collect();
-            members.into_iter().map(|s| s.into_bytes()).collect()
-        }
-        GroupFieldType::UniqueMember => {
-            // uniqueMember is the standard attribute for groupOfUniqueNames (RFC 4519)
-            // Use the exact same logic as Member
-            let members: std::collections::BTreeSet<_> = group
-                .users
-                .iter()
-                .filter(|u| {
-                    user_filter
-                        .as_ref()
-                        .map(|f| u.user_id == *f)
-                        .unwrap_or(true)
-                })
-                .map(|u| build_user_dn(&u.user_id, &u.ou, base_dn_str))
-                .collect();
-            members.into_iter().map(|s| s.into_bytes()).collect()
+        // groupOf(Unique)Names carry member DNs; RFC 2307 posixGroup carries bare login names.
+        GroupFieldType::Member | GroupFieldType::UniqueMember => {
+            member_values(group, user_filter, |member| {
+                build_user_dn(&member.user_id, &member.ou, base_dn_str)
+            })
         }
         GroupFieldType::MemberUid => {
-            // RFC 2307 posixGroup membership: bare login names (SSSD's default rfc2307 group member).
-            let members: std::collections::BTreeSet<_> = group
-                .users
-                .iter()
-                .filter(|u| {
-                    user_filter
-                        .as_ref()
-                        .map(|f| u.user_id == *f)
-                        .unwrap_or(true)
-                })
-                .map(|u| u.user_id.to_string())
-                .collect();
-            members.into_iter().map(|s| s.into_bytes()).collect()
+            member_values(group, user_filter, |member| member.user_id.to_string())
         }
         GroupFieldType::MemberOf => {
             // memberOf is a user operational/virtual attribute (groups a user belongs to).
@@ -457,119 +429,118 @@ pub fn get_group_attribute(
 pub fn make_ldap_search_user_result_entry(
     user: User,
     base_dn_str: &str,
-    mut expanded_attributes: ExpandedAttributes,
+    expanded_attributes: ExpandedAttributes,
     groups: Option<&[GroupDetails]>,
     ignored_user_attributes: &[AttributeName],
     schema: &PublicSchema,
 ) -> LdapSearchResultEntry {
-    if expanded_attributes.include_custom_attributes {
-        let custom_to_add: Vec<_> = user
-            .attributes
-            .iter()
-            .filter(|a| !USER_SCHEMA_ATTRIBUTE_NAMES.contains(a.name.as_str()))
-            .map(|a| (a.name.clone(), a.name.to_string()))
-            .collect();
-        expanded_attributes.attribute_keys.extend(custom_to_add);
-        // posixAccount MAY: gecos is the POSIX full name (same value as displayName / cn).
-        expanded_attributes
-            .attribute_keys
-            .insert(AttributeName::from("gecos"), "gecos".to_string());
-    }
-
-    LdapSearchResultEntry {
-        dn: build_user_dn(&user.user_id, &get_user_ou(&user), base_dn_str),
-        attributes: {
-            let mut attrs: Vec<ldap3_proto::LdapPartialAttribute> = expanded_attributes
-                .attribute_keys
-                .into_iter()
-                .filter(|(attribute, _)| {
-                    let is_op =
-                        crate::schema::get_schema_manager().is_operational(attribute.as_str());
-                    !is_op || expanded_attributes.include_operational_attributes
-                })
-                .filter_map(|(attribute, name)| {
-                    let values = get_user_attribute(
-                        &user,
-                        &attribute,
-                        base_dn_str,
-                        groups,
-                        ignored_user_attributes,
-                        schema,
-                    )?;
-                    Some(ldap3_proto::LdapPartialAttribute {
-                        atype: name,
-                        vals: values,
-                    })
-                })
-                .collect();
-            if expanded_attributes.include_operational_attributes {
-                inject_operational_attributes(&mut attrs, "inetOrgPerson", base_dn_str);
-            }
-            let mut seen = std::collections::HashSet::new();
-            attrs.retain(|attr| seen.insert(attr.atype.clone()));
-            attrs
+    let dn = build_user_dn(&user.user_id, &get_user_ou(&user), base_dn_str);
+    // posixAccount MAY: gecos is the POSIX full name (same value as displayName / cn).
+    build_entry(
+        dn,
+        expanded_attributes,
+        EntryShape {
+            custom_attributes: &user.attributes,
+            schema_names: &USER_SCHEMA_ATTRIBUTE_NAMES,
+            extra_wires: &["gecos"],
+            structural_class: "inetOrgPerson",
+            base_dn_str,
         },
-    }
+        |attribute| {
+            get_user_attribute(
+                &user,
+                attribute,
+                base_dn_str,
+                groups,
+                ignored_user_attributes,
+                schema,
+            )
+        },
+    )
 }
 
 pub fn make_ldap_search_group_result_entry(
     group: Group,
     base_dn_str: &str,
-    mut expanded_attributes: ExpandedAttributes,
-    user_filter: &Option<lldap_domain::types::UserId>,
+    expanded_attributes: ExpandedAttributes,
+    user_filter: &Option<UserId>,
     ignored_group_attributes: &[AttributeName],
     schema: &PublicSchema,
 ) -> LdapSearchResultEntry {
+    let dn = build_group_dn(&group.display_name, &get_group_ou(&group), base_dn_str);
+    // posixGroup / groupOf(Unique)Names membership — group entries only.
+    build_entry(
+        dn,
+        expanded_attributes,
+        EntryShape {
+            custom_attributes: &group.attributes,
+            schema_names: &GROUP_SCHEMA_ATTRIBUTE_NAMES,
+            extra_wires: &["member", "uniqueMember", "memberUid"],
+            structural_class: "groupOfUniqueNames",
+            base_dn_str,
+        },
+        |attribute| {
+            get_group_attribute(
+                &group,
+                base_dn_str,
+                attribute,
+                user_filter,
+                ignored_group_attributes,
+                schema,
+            )
+        },
+    )
+}
+
+struct EntryShape<'a> {
+    custom_attributes: &'a [Attribute],
+    schema_names: &'a HashSet<String>,
+    extra_wires: &'a [&'a str],
+    structural_class: &'a str,
+    base_dn_str: &'a str,
+}
+
+fn build_entry(
+    dn: String,
+    mut expanded_attributes: ExpandedAttributes,
+    shape: EntryShape<'_>,
+    value_of: impl Fn(&AttributeName) -> Option<Vec<Vec<u8>>>,
+) -> LdapSearchResultEntry {
     if expanded_attributes.include_custom_attributes {
-        let custom_to_add: Vec<_> = group
-            .attributes
-            .iter()
-            .filter(|a| !GROUP_SCHEMA_ATTRIBUTE_NAMES.contains(a.name.as_str()))
-            .map(|a| (a.name.clone(), a.name.to_string()))
-            .collect();
-        expanded_attributes.attribute_keys.extend(custom_to_add);
-        // posixGroup / groupOf(Unique)Names membership — group entries only.
-        for wire in ["member", "uniqueMember", "memberUid"] {
+        expanded_attributes.attribute_keys.extend(
+            shape
+                .custom_attributes
+                .iter()
+                .filter(|a| !shape.schema_names.contains(a.name.as_str()))
+                .map(|a| (a.name.clone(), a.name.to_string())),
+        );
+        for wire in shape.extra_wires {
             expanded_attributes
                 .attribute_keys
-                .insert(AttributeName::from(wire), wire.to_string());
+                .insert(AttributeName::from(*wire), wire.to_string());
         }
     }
-
-    LdapSearchResultEntry {
-        dn: build_group_dn(&group.display_name, &get_group_ou(&group), base_dn_str),
-        attributes: {
-            let mut attrs: Vec<ldap3_proto::LdapPartialAttribute> = expanded_attributes
-                .attribute_keys
-                .into_iter()
-                .filter(|(attribute, _)| {
-                    let is_op =
-                        crate::schema::get_schema_manager().is_operational(attribute.as_str());
-                    !is_op || expanded_attributes.include_operational_attributes
-                })
-                .filter_map(|(attribute, name)| {
-                    let values = get_group_attribute(
-                        &group,
-                        base_dn_str,
-                        &attribute,
-                        user_filter,
-                        ignored_group_attributes,
-                        schema,
-                    )?;
-                    Some(ldap3_proto::LdapPartialAttribute {
-                        atype: name,
-                        vals: values,
-                    })
-                })
-                .collect();
-            if expanded_attributes.include_operational_attributes {
-                inject_operational_attributes(&mut attrs, "groupOfUniqueNames", base_dn_str);
-            }
-            let mut seen = std::collections::HashSet::new();
-            attrs.retain(|attr| seen.insert(attr.atype.clone()));
-            attrs
-        },
+    let include_operational = expanded_attributes.include_operational_attributes;
+    let mut attributes: Vec<LdapPartialAttribute> = expanded_attributes
+        .attribute_keys
+        .into_iter()
+        .filter(|(attribute, _)| {
+            include_operational
+                || !crate::schema::get_schema_manager().is_operational(attribute.as_str())
+        })
+        .filter_map(|(attribute, name)| {
+            Some(LdapPartialAttribute {
+                atype: name,
+                vals: value_of(&attribute)?,
+            })
+        })
+        .collect();
+    if include_operational {
+        inject_operational_attributes(&mut attributes, shape.structural_class, shape.base_dn_str);
     }
+    let mut seen = HashSet::new();
+    attributes.retain(|attr| seen.insert(attr.atype.clone()));
+    LdapSearchResultEntry { dn, attributes }
 }
 
 #[cfg(test)]
@@ -855,6 +826,46 @@ mod tests {
             atype_vals(&gstar, "displayName"),
             Some(&vec![b"admins".to_vec()])
         );
+    }
+
+    #[test]
+    fn membership_attributes_agree_and_honor_the_user_filter() {
+        let mut group = sample_group();
+        group.users = vec![
+            lldap_domain::types::GroupMember {
+                user_id: UserId::new("bob"),
+                ou: "people".into(),
+            },
+            lldap_domain::types::GroupMember {
+                user_id: UserId::new("alice"),
+                ou: "people\\lab".into(),
+            },
+        ];
+        let schema = PublicSchema::shared();
+        let values = |attribute: &str, user_filter: Option<&str>| {
+            get_group_attribute(
+                &group,
+                "dc=example,dc=com",
+                &AttributeName::from(attribute),
+                &user_filter.map(UserId::new),
+                &[],
+                schema,
+            )
+            .unwrap()
+        };
+        let dns = vec![
+            b"uid=alice,ou=lab,ou=people,dc=example,dc=com".to_vec(),
+            b"uid=bob,ou=people,dc=example,dc=com".to_vec(),
+        ];
+        assert_eq!(values("member", None), dns);
+        assert_eq!(values("uniqueMember", None), dns);
+        assert_eq!(
+            values("memberUid", None),
+            vec![b"alice".to_vec(), b"bob".to_vec()]
+        );
+        assert_eq!(values("member", Some("bob")), vec![dns[1].clone()]);
+        assert_eq!(values("uniqueMember", Some("bob")), vec![dns[1].clone()]);
+        assert_eq!(values("memberUid", Some("bob")), vec![b"bob".to_vec()]);
     }
 
     #[test]

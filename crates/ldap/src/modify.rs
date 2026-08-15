@@ -13,7 +13,7 @@ use lldap_auth::access_control::ValidationResults;
 use lldap_domain::{
     deserialize,
     requests::UpdateUserRequest,
-    types::{Attribute, AttributeName, AttributeType, Email, UserId},
+    types::{Attribute, AttributeName, AttributeType, AttributeValue, Cardinality, Email, UserId},
 };
 use lldap_domain_handlers::kerberos::kerberos_backend;
 use lldap_opaque_handler::OpaqueHandler;
@@ -75,366 +75,312 @@ async fn handle_modify_change(
     user_is_admin: bool,
     change: &LdapModify,
 ) -> LdapResult<()> {
-    let atype_lower = change.modification.atype.to_ascii_lowercase();
-
-    if atype_lower == "userpassword" {
-        if change.operation != LdapModifyType::Replace {
-            return Err(LdapError {
-                code: LdapResultCode::UnwillingToPerform,
-                message: format!(
-                    r#"Unsupported operation: `{:?}` for `{}`"#,
-                    change.operation, change.modification.atype
-                ),
-            });
-        }
-
-        if !credentials.can_change_password(&user_id, user_is_admin) {
-            return Err(LdapError {
-                code: LdapResultCode::InsufficentAccessRights,
-                message: format!(
-                    r#"User `{}` cannot modify the password of user `{}`"#,
-                    credentials.user, user_id
-                ),
-            });
-        }
-
-        if let [value] = &change.modification.vals.as_slice() {
-            password::change_password(opaque_handler, user_id.clone(), value)
-                .await
-                .map_err(|e| LdapError {
-                    code: LdapResultCode::Other,
-                    message: format!("Error while changing the password: {e:#?}"),
-                })?;
-
-            if let Ok(plain_pass) = std::str::from_utf8(value) {
-                let user = match readable_handler.get_user_details(&user_id).await {
-                    Ok(u) => u,
-                    Err(e) => {
-                        warn!("Failed to fetch user for Kerberos sync check: {}", e);
-                        return Ok(());
-                    }
-                };
-
-                let sync_enabled = lldap_domain::types::kerberos_sync_enabled(&user.attributes);
-
-                if let Err(e) =
-                    kerberos_backend().sync_if_enabled(sync_enabled, user_id.as_str(), plain_pass)
-                {
-                    warn!("Kerberos sync failed after LDAP password change: {}", e);
-                }
-
-                // A first password for an already-disabled user would otherwise mint a live principal.
-                if sync_enabled
-                    && let Ok(groups) = readable_handler.get_user_groups(&user_id).await
-                    && groups
-                        .iter()
-                        .any(|g| g.display_name == "lldap_disabled".into())
-                {
-                    kerberos_backend().reassert_disabled(user_id.as_str());
-                }
-            }
-            Ok(())
-        } else {
-            Err(LdapError {
-                code: LdapResultCode::InvalidAttributeSyntax,
-                message: format!(
-                    r#"Wrong number of values for password attribute: {}"#,
-                    change.modification.vals.len()
-                ),
-            })
-        }
+    if change
+        .modification
+        .atype
+        .eq_ignore_ascii_case("userpassword")
+    {
+        handle_password_modify(
+            readable_handler,
+            opaque_handler,
+            user_id,
+            credentials,
+            user_is_admin,
+            change,
+        )
+        .await
     } else {
-        // === Profile attributes: now support Add / Replace / Delete ===
-        if !credentials.can_change_password(&user_id, user_is_admin) {
-            return Err(LdapError {
-                code: LdapResultCode::InsufficentAccessRights,
-                message: format!(
-                    r#"User `{}` cannot modify attributes of user `{}`"#,
-                    credentials.user, user_id
-                ),
-            });
-        }
-
-        // Protect mail (Email) and cn/displayname (DisplayName) from deletion.
-        if change.operation == LdapModifyType::Delete
-            && matches!(
-                modify_target(&atype_lower),
-                ModifyTarget::Email | ModifyTarget::DisplayName
-            )
-        {
-            return Err(LdapError {
-                code: LdapResultCode::InsufficentAccessRights,
-                message: format!(
-                    r#"Deletion of `{}` is not allowed via LDAP Modify (use GraphQL or protected path)"#,
-                    change.modification.atype
-                ),
-            });
-        }
-
-        let mut email: Option<Email> = None;
-        let mut display_name: Option<String> = None;
-        let mut insert_attributes: Vec<Attribute> = Vec::new();
-        let mut delete_attributes: Vec<AttributeName> = Vec::new();
-
-        match change.operation {
-            LdapModifyType::Replace => {
-                let vals: Vec<String> = change
-                    .modification
-                    .vals
-                    .iter()
-                    .filter_map(|v| std::str::from_utf8(v).ok().map(|s| s.to_string()))
-                    .collect();
-
-                if vals.is_empty() {
-                    return Err(LdapError {
-                        code: LdapResultCode::InvalidAttributeSyntax,
-                        message: format!("No values provided for {}", change.modification.atype),
-                    });
-                }
-
-                match modify_target(&atype_lower) {
-                    ModifyTarget::FirstName => insert_attributes.push(typed_insert_attribute(
-                        "first_name",
-                        &vals,
-                        AttributeType::String,
-                        false,
-                    )?),
-                    ModifyTarget::LastName => insert_attributes.push(typed_insert_attribute(
-                        "last_name",
-                        &vals,
-                        AttributeType::String,
-                        false,
-                    )?),
-                    ModifyTarget::DisplayName => display_name = Some(vals[0].clone()),
-                    ModifyTarget::Email => email = Some(Email::from(vals[0].clone())),
-                    ModifyTarget::Avatar => insert_attributes.push(typed_insert_attribute(
-                        "avatar",
-                        &vals,
-                        AttributeType::Avatar,
-                        false,
-                    )?),
-                    ModifyTarget::SshPublicKey => insert_attributes.push(typed_insert_attribute(
-                        "sshpublickey",
-                        &vals,
-                        AttributeType::String,
-                        true,
-                    )?),
-                    ModifyTarget::Ou => {
-                        return Err(LdapError {
-                            code: LdapResultCode::UnwillingToPerform,
-                            message:
-                                "Direct modification of 'ou' via LDAP Modify is not supported."
-                                    .to_string(),
-                        });
-                    }
-                    ModifyTarget::Unsupported => {
-                        return Err(LdapError {
-                            code: LdapResultCode::UnwillingToPerform,
-                            message: format!(
-                                "Unsupported attribute for LDAP Modify: {} (supported: givenName, sn, cn, mail, avatar, sshPublicKey, userPassword)",
-                                change.modification.atype
-                            ),
-                        });
-                    }
-                }
-            }
-
-            LdapModifyType::Add => {
-                let new_vals: Vec<String> = change
-                    .modification
-                    .vals
-                    .iter()
-                    .filter_map(|v| std::str::from_utf8(v).ok().map(|s| s.to_string()))
-                    .collect();
-
-                if new_vals.is_empty() {
-                    return Err(LdapError {
-                        code: LdapResultCode::InvalidAttributeSyntax,
-                        message: format!("No values provided for {}", change.modification.atype),
-                    });
-                }
-
-                if matches!(modify_target(&atype_lower), ModifyTarget::SshPublicKey) {
-                    let user = readable_handler
-                        .get_user_details(&user_id)
-                        .await
-                        .map_err(|e| LdapError {
-                            code: LdapResultCode::OperationsError,
-                            message: format!("Failed to read current user: {e}"),
-                        })?;
-
-                    let mut existing: Vec<String> = user
-                        .attributes
-                        .iter()
-                        .find(|a| a.name.as_str() == "sshpublickey")
-                        .and_then(|a| match &a.value {
-                            lldap_domain::types::AttributeValue::String(
-                                lldap_domain::types::Cardinality::Unbounded(list),
-                            ) => Some(list.clone()),
-                            lldap_domain::types::AttributeValue::String(
-                                lldap_domain::types::Cardinality::Singleton(s),
-                            ) => Some(vec![s.clone()]),
-                            _ => None,
-                        })
-                        .unwrap_or_default();
-
-                    for v in new_vals {
-                        if !existing.contains(&v) {
-                            existing.push(v);
-                        }
-                    }
-
-                    insert_attributes.push(Attribute {
-                        name: "sshpublickey".into(),
-                        value: deserialize::deserialize_attribute_value(
-                            &existing,
-                            AttributeType::String,
-                            true,
-                        )
-                        .map_err(|e| LdapError {
-                            code: LdapResultCode::ConstraintViolation,
-                            message: format!("Invalid sshPublicKey value: {e}"),
-                        })?,
-                    });
-                } else {
-                    match modify_target(&atype_lower) {
-                        ModifyTarget::FirstName => insert_attributes.push(typed_insert_attribute(
-                            "first_name",
-                            &new_vals,
-                            AttributeType::String,
-                            false,
-                        )?),
-                        ModifyTarget::LastName => insert_attributes.push(typed_insert_attribute(
-                            "last_name",
-                            &new_vals,
-                            AttributeType::String,
-                            false,
-                        )?),
-                        ModifyTarget::DisplayName => display_name = Some(new_vals[0].clone()),
-                        ModifyTarget::Email => email = Some(Email::from(new_vals[0].clone())),
-                        ModifyTarget::Avatar => insert_attributes.push(typed_insert_attribute(
-                            "avatar",
-                            &new_vals,
-                            AttributeType::Avatar,
-                            false,
-                        )?),
-                        _ => {
-                            return Err(LdapError {
-                                code: LdapResultCode::UnwillingToPerform,
-                                message: format!(
-                                    "Add not supported for {}",
-                                    change.modification.atype
-                                ),
-                            });
-                        }
-                    }
-                }
-            }
-
-            LdapModifyType::Delete => {
-                let delete_vals: Vec<String> = change
-                    .modification
-                    .vals
-                    .iter()
-                    .filter_map(|v| std::str::from_utf8(v).ok().map(|s| s.to_string()))
-                    .collect();
-
-                if matches!(modify_target(&atype_lower), ModifyTarget::SshPublicKey) {
-                    if delete_vals.is_empty() {
-                        // No specific values → delete whole attribute
-                        delete_attributes.push(AttributeName::from("sshpublickey"));
-                    } else {
-                        // Specific keys provided → remove only those exact keys
-                        let user =
-                            readable_handler
-                                .get_user_details(&user_id)
-                                .await
-                                .map_err(|e| LdapError {
-                                    code: LdapResultCode::OperationsError,
-                                    message: format!("Failed to read current user: {e}"),
-                                })?;
-
-                        let existing: Vec<String> = user
-                            .attributes
-                            .iter()
-                            .find(|a| a.name.as_str() == "sshpublickey")
-                            .and_then(|a| match &a.value {
-                                lldap_domain::types::AttributeValue::String(
-                                    lldap_domain::types::Cardinality::Unbounded(list),
-                                ) => Some(list.clone()),
-                                lldap_domain::types::AttributeValue::String(
-                                    lldap_domain::types::Cardinality::Singleton(s),
-                                ) => Some(vec![s.clone()]),
-                                _ => None,
-                            })
-                            .unwrap_or_default();
-
-                        let remaining: Vec<String> = existing
-                            .into_iter()
-                            .filter(|k| !delete_vals.contains(k))
-                            .collect();
-
-                        if remaining.is_empty() {
-                            delete_attributes.push(AttributeName::from("sshpublickey"));
-                        } else {
-                            insert_attributes.push(Attribute {
-                                name: "sshpublickey".into(),
-                                value: deserialize::deserialize_attribute_value(
-                                    &remaining,
-                                    AttributeType::String,
-                                    true,
-                                )
-                                .map_err(|e| LdapError {
-                                    code: LdapResultCode::ConstraintViolation,
-                                    message: format!("Invalid sshPublicKey value: {e}"),
-                                })?,
-                            });
-                        }
-                    }
-                } else {
-                    // Non-sshPublicKey delete (whole attribute)
-                    match modify_target(&atype_lower) {
-                        ModifyTarget::FirstName => {
-                            delete_attributes.push(AttributeName::from("first_name"))
-                        }
-                        ModifyTarget::LastName => {
-                            delete_attributes.push(AttributeName::from("last_name"))
-                        }
-                        ModifyTarget::Avatar => {
-                            delete_attributes.push(AttributeName::from("avatar"))
-                        }
-                        _ => {
-                            return Err(LdapError {
-                                code: LdapResultCode::UnwillingToPerform,
-                                message: format!(
-                                    "Deletion not supported for {}",
-                                    change.modification.atype
-                                ),
-                            });
-                        }
-                    }
-                }
-            }
-        }
-
-        let update_req = UpdateUserRequest {
-            user_id: user_id.clone(),
-            email,
-            display_name,
-            delete_attributes,
-            insert_attributes,
-        };
-
-        writeable_handler
-            .update_user(update_req)
-            .await
-            .map_err(|e| LdapError {
-                code: LdapResultCode::OperationsError,
-                message: format!("Error while updating user via LDAP Modify: {e:#?}"),
-            })?;
-
-        Ok(())
+        handle_profile_modify(
+            readable_handler,
+            writeable_handler,
+            user_id,
+            credentials,
+            user_is_admin,
+            change,
+        )
+        .await
     }
+}
+
+async fn handle_password_modify(
+    readable_handler: &impl UserReadableBackendHandler,
+    opaque_handler: &impl OpaqueHandler,
+    user_id: UserId,
+    credentials: &ValidationResults,
+    user_is_admin: bool,
+    change: &LdapModify,
+) -> LdapResult<()> {
+    if change.operation != LdapModifyType::Replace {
+        return Err(unwilling(format!(
+            r#"Unsupported operation: `{:?}` for `{}`"#,
+            change.operation, change.modification.atype
+        )));
+    }
+    if !credentials.can_change_password(&user_id, user_is_admin) {
+        return Err(LdapError {
+            code: LdapResultCode::InsufficentAccessRights,
+            message: format!(
+                r#"User `{}` cannot modify the password of user `{}`"#,
+                credentials.user, user_id
+            ),
+        });
+    }
+    let [value] = change.modification.vals.as_slice() else {
+        return Err(LdapError {
+            code: LdapResultCode::InvalidAttributeSyntax,
+            message: format!(
+                r#"Wrong number of values for password attribute: {}"#,
+                change.modification.vals.len()
+            ),
+        });
+    };
+    password::change_password(opaque_handler, user_id.clone(), value)
+        .await
+        .map_err(|e| LdapError {
+            code: LdapResultCode::Other,
+            message: format!("Error while changing the password: {e:#?}"),
+        })?;
+
+    if let Ok(plain_pass) = std::str::from_utf8(value) {
+        let user = match readable_handler.get_user_details(&user_id).await {
+            Ok(u) => u,
+            Err(e) => {
+                warn!("Failed to fetch user for Kerberos sync check: {}", e);
+                return Ok(());
+            }
+        };
+        let sync_enabled = lldap_domain::types::kerberos_sync_enabled(&user.attributes);
+        if let Err(e) =
+            kerberos_backend().sync_if_enabled(sync_enabled, user_id.as_str(), plain_pass)
+        {
+            warn!("Kerberos sync failed after LDAP password change: {}", e);
+        }
+        // A first password for an already-disabled user would otherwise mint a live principal.
+        if sync_enabled
+            && let Ok(groups) = readable_handler.get_user_groups(&user_id).await
+            && groups
+                .iter()
+                .any(|g| g.display_name == "lldap_disabled".into())
+        {
+            kerberos_backend().reassert_disabled(user_id.as_str());
+        }
+    }
+    Ok(())
+}
+
+async fn handle_profile_modify(
+    readable_handler: &impl UserReadableBackendHandler,
+    writeable_handler: &impl UserWriteableBackendHandler,
+    user_id: UserId,
+    credentials: &ValidationResults,
+    user_is_admin: bool,
+    change: &LdapModify,
+) -> LdapResult<()> {
+    if !credentials.can_change_password(&user_id, user_is_admin) {
+        return Err(LdapError {
+            code: LdapResultCode::InsufficentAccessRights,
+            message: format!(
+                r#"User `{}` cannot modify attributes of user `{}`"#,
+                credentials.user, user_id
+            ),
+        });
+    }
+    let atype = change.modification.atype.as_str();
+    let target = modify_target(&atype.to_ascii_lowercase());
+    if change.operation == LdapModifyType::Delete
+        && matches!(target, ModifyTarget::Email | ModifyTarget::DisplayName)
+    {
+        return Err(LdapError {
+            code: LdapResultCode::InsufficentAccessRights,
+            message: format!(
+                r#"Deletion of `{atype}` is not allowed via LDAP Modify (use GraphQL or protected path)"#
+            ),
+        });
+    }
+
+    let mut request = UpdateUserRequest {
+        user_id: user_id.clone(),
+        email: None,
+        display_name: None,
+        delete_attributes: Vec::new(),
+        insert_attributes: Vec::new(),
+    };
+    let values = utf8_values(&change.modification.vals);
+    match change.operation {
+        LdapModifyType::Replace => replace_values(&mut request, &target, &values, atype)?,
+        LdapModifyType::Add => {
+            add_values(readable_handler, &mut request, &target, &values, atype).await?
+        }
+        LdapModifyType::Delete => {
+            delete_values(readable_handler, &mut request, &target, &values, atype).await?
+        }
+    }
+
+    writeable_handler
+        .update_user(request)
+        .await
+        .map_err(|e| LdapError {
+            code: LdapResultCode::OperationsError,
+            message: format!("Error while updating user via LDAP Modify: {e:#?}"),
+        })
+}
+
+fn unwilling(message: String) -> LdapError {
+    LdapError {
+        code: LdapResultCode::UnwillingToPerform,
+        message,
+    }
+}
+
+fn no_values(atype: &str) -> LdapError {
+    LdapError {
+        code: LdapResultCode::InvalidAttributeSyntax,
+        message: format!("No values provided for {atype}"),
+    }
+}
+
+fn utf8_values(vals: &[Vec<u8>]) -> Vec<String> {
+    vals.iter()
+        .filter_map(|v| std::str::from_utf8(v).ok().map(str::to_owned))
+        .collect()
+}
+
+// The targets Replace and Add share; returns false when the caller must decide.
+fn scalar_update(
+    request: &mut UpdateUserRequest,
+    target: &ModifyTarget,
+    values: &[String],
+) -> LdapResult<bool> {
+    let insert = |name, typ| typed_insert_attribute(name, values, typ, false);
+    match target {
+        ModifyTarget::FirstName => request
+            .insert_attributes
+            .push(insert("first_name", AttributeType::String)?),
+        ModifyTarget::LastName => request
+            .insert_attributes
+            .push(insert("last_name", AttributeType::String)?),
+        ModifyTarget::DisplayName => request.display_name = Some(values[0].clone()),
+        ModifyTarget::Email => request.email = Some(Email::from(values[0].clone())),
+        ModifyTarget::Avatar => request
+            .insert_attributes
+            .push(insert("avatar", AttributeType::Avatar)?),
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+fn replace_values(
+    request: &mut UpdateUserRequest,
+    target: &ModifyTarget,
+    values: &[String],
+    atype: &str,
+) -> LdapResult<()> {
+    if values.is_empty() {
+        return Err(no_values(atype));
+    }
+    if scalar_update(request, target, values)? {
+        return Ok(());
+    }
+    match target {
+        ModifyTarget::SshPublicKey => {
+            request.insert_attributes.push(ssh_keys_attribute(values)?);
+            Ok(())
+        }
+        ModifyTarget::Ou => Err(unwilling(
+            "Direct modification of 'ou' via LDAP Modify is not supported.".to_string(),
+        )),
+        _ => Err(unwilling(format!(
+            "Unsupported attribute for LDAP Modify: {atype} (supported: givenName, sn, cn, mail, avatar, sshPublicKey, userPassword)"
+        ))),
+    }
+}
+
+async fn add_values(
+    readable_handler: &impl UserReadableBackendHandler,
+    request: &mut UpdateUserRequest,
+    target: &ModifyTarget,
+    values: &[String],
+    atype: &str,
+) -> LdapResult<()> {
+    if values.is_empty() {
+        return Err(no_values(atype));
+    }
+    if matches!(target, ModifyTarget::SshPublicKey) {
+        let mut keys = current_ssh_keys(readable_handler, &request.user_id).await?;
+        for value in values {
+            if !keys.contains(value) {
+                keys.push(value.clone());
+            }
+        }
+        request.insert_attributes.push(ssh_keys_attribute(&keys)?);
+        return Ok(());
+    }
+    if scalar_update(request, target, values)? {
+        return Ok(());
+    }
+    Err(unwilling(format!("Add not supported for {atype}")))
+}
+
+async fn delete_values(
+    readable_handler: &impl UserReadableBackendHandler,
+    request: &mut UpdateUserRequest,
+    target: &ModifyTarget,
+    values: &[String],
+    atype: &str,
+) -> LdapResult<()> {
+    let attribute = match target {
+        ModifyTarget::SshPublicKey => {
+            if !values.is_empty() {
+                let remaining: Vec<String> = current_ssh_keys(readable_handler, &request.user_id)
+                    .await?
+                    .into_iter()
+                    .filter(|key| !values.contains(key))
+                    .collect();
+                if !remaining.is_empty() {
+                    request
+                        .insert_attributes
+                        .push(ssh_keys_attribute(&remaining)?);
+                    return Ok(());
+                }
+            }
+            "sshpublickey"
+        }
+        ModifyTarget::FirstName => "first_name",
+        ModifyTarget::LastName => "last_name",
+        ModifyTarget::Avatar => "avatar",
+        _ => return Err(unwilling(format!("Deletion not supported for {atype}"))),
+    };
+    request
+        .delete_attributes
+        .push(AttributeName::from(attribute));
+    Ok(())
+}
+
+fn ssh_keys_attribute(keys: &[String]) -> LdapResult<Attribute> {
+    typed_insert_attribute("sshpublickey", keys, AttributeType::String, true)
+}
+
+async fn current_ssh_keys(
+    readable_handler: &impl UserReadableBackendHandler,
+    user_id: &UserId,
+) -> LdapResult<Vec<String>> {
+    let user = readable_handler
+        .get_user_details(user_id)
+        .await
+        .map_err(|e| LdapError {
+            code: LdapResultCode::OperationsError,
+            message: format!("Failed to read current user: {e}"),
+        })?;
+    Ok(user
+        .attributes
+        .iter()
+        .find(|a| a.name.as_str() == "sshpublickey")
+        .and_then(|a| match &a.value {
+            AttributeValue::String(Cardinality::Unbounded(list)) => Some(list.clone()),
+            AttributeValue::String(Cardinality::Singleton(key)) => Some(vec![key.clone()]),
+            _ => None,
+        })
+        .unwrap_or_default())
 }
 
 pub(crate) async fn handle_modify_request<'cred, UserBackendHandler, WriteBackendHandler>(
@@ -521,9 +467,11 @@ mod tests {
         setup_bound_password_manager_handler,
     };
     use ldap3_proto::proto::LdapResult as LdapResultOp;
+    use lldap_domain::types::User;
     use lldap_domain::types::{GroupDetails, GroupId, UserId};
+    use lldap_domain_model::error::DomainError;
     use lldap_test_utils::recording_kerberos::{KerberosOp, RecordingGuard};
-    use lldap_test_utils::{MockTestBackendHandler, setup_default_ldap_mock};
+    use lldap_test_utils::{MockTestBackendHandler, setup_default_ldap_mock, setup_default_schema};
     use pretty_assertions::assert_eq;
     use serial_test::serial;
     use std::collections::HashSet;
@@ -1058,6 +1006,186 @@ mod tests {
         assert_eq!(
             ldap_handler.do_modify_request(&request).await,
             make_modify_success_response()
+        );
+    }
+
+    fn modify_request(
+        user: &str,
+        operation: LdapModifyType,
+        atype: &str,
+        vals: &[&str],
+    ) -> LdapModifyRequest {
+        LdapModifyRequest {
+            dn: format!("uid={user},ou=people,dc=example,dc=com"),
+            changes: vec![LdapModify {
+                operation,
+                modification: ldap3_proto::LdapPartialAttribute {
+                    atype: atype.to_string(),
+                    vals: vals.iter().map(|v| v.as_bytes().to_vec()).collect(),
+                },
+            }],
+        }
+    }
+
+    fn user_with_ssh_keys(
+        keys: &[&str],
+    ) -> impl Fn(&UserId) -> Result<User, DomainError> + 'static {
+        let keys: Vec<String> = keys.iter().map(|k| (*k).to_owned()).collect();
+        move |uid| {
+            Ok(User {
+                user_id: uid.clone(),
+                attributes: vec![Attribute {
+                    name: "sshpublickey".into(),
+                    value: AttributeValue::String(Cardinality::Unbounded(keys.clone())),
+                }],
+                ..Default::default()
+            })
+        }
+    }
+
+    fn mock_with_ssh_keys(keys: &[&str]) -> MockTestBackendHandler {
+        let mut mock = MockTestBackendHandler::new();
+        setup_default_schema(&mut mock);
+        mock.expect_get_allowed_ous()
+            .returning(|| Ok(vec!["people".to_string(), "groups".to_string()]));
+        mock.expect_get_user_details()
+            .returning(user_with_ssh_keys(keys));
+        mock.expect_get_user_groups()
+            .returning(|_| Ok(HashSet::new()));
+        mock
+    }
+
+    fn ssh_keys_of(req: &UpdateUserRequest) -> Option<Vec<String>> {
+        req.insert_attributes
+            .iter()
+            .find(|a| a.name.as_str() == "sshpublickey")
+            .map(|a| match &a.value {
+                AttributeValue::String(Cardinality::Unbounded(list)) => list.clone(),
+                AttributeValue::String(Cardinality::Singleton(key)) => vec![key.clone()],
+                other => panic!("unexpected sshpublickey value {other:?}"),
+            })
+    }
+
+    #[tokio::test]
+    async fn test_modify_ou_is_refused() {
+        let mut mock = MockTestBackendHandler::new();
+        setup_default_ldap_mock(&mut mock);
+        let ldap_handler = setup_bound_admin_handler(mock).await;
+        assert_eq!(
+            ldap_handler
+                .do_modify_request(&make_profile_modify_request("bob", "ou", "labs"))
+                .await,
+            make_modify_failure_response(
+                LdapResultCode::UnwillingToPerform,
+                "Direct modification of 'ou' via LDAP Modify is not supported."
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_modify_add_ssh_key_merges_with_existing_keys() {
+        let mut mock = mock_with_ssh_keys(&["ssh-ed25519 AAA old"]);
+        mock.expect_update_user()
+            .withf(|req| {
+                ssh_keys_of(req)
+                    == Some(vec![
+                        "ssh-ed25519 AAA old".to_string(),
+                        "ssh-ed25519 BBB new".to_string(),
+                    ])
+            })
+            .times(1)
+            .return_once(|_| Ok(()));
+        let ldap_handler = setup_bound_admin_handler(mock).await;
+        let request = modify_request(
+            "bob",
+            LdapModifyType::Add,
+            "sshPublicKey",
+            &["ssh-ed25519 BBB new", "ssh-ed25519 AAA old"],
+        );
+        assert_eq!(
+            ldap_handler.do_modify_request(&request).await,
+            make_modify_success_response()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_modify_delete_ssh_key_values_keeps_the_rest() {
+        let mut mock = mock_with_ssh_keys(&["ssh-ed25519 AAA", "ssh-ed25519 BBB"]);
+        mock.expect_update_user()
+            .withf(|req| ssh_keys_of(req) == Some(vec!["ssh-ed25519 BBB".to_string()]))
+            .times(1)
+            .return_once(|_| Ok(()));
+        let ldap_handler = setup_bound_admin_handler(mock).await;
+        let request = modify_request(
+            "bob",
+            LdapModifyType::Delete,
+            "sshPublicKey",
+            &["ssh-ed25519 AAA"],
+        );
+        assert_eq!(
+            ldap_handler.do_modify_request(&request).await,
+            make_modify_success_response()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_modify_delete_all_ssh_keys_removes_the_attribute() {
+        for vals in [&[][..], &["ssh-ed25519 AAA"][..]] {
+            let mut mock = mock_with_ssh_keys(&["ssh-ed25519 AAA"]);
+            mock.expect_update_user()
+                .withf(|req| {
+                    req.insert_attributes.is_empty()
+                        && req.delete_attributes == vec![AttributeName::from("sshpublickey")]
+                })
+                .times(1)
+                .return_once(|_| Ok(()));
+            let ldap_handler = setup_bound_admin_handler(mock).await;
+            let request = modify_request("bob", LdapModifyType::Delete, "sshPublicKey", vals);
+            assert_eq!(
+                ldap_handler.do_modify_request(&request).await,
+                make_modify_success_response(),
+                "{vals:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_modify_without_values_is_invalid_syntax() {
+        for operation in [LdapModifyType::Replace, LdapModifyType::Add] {
+            let mut mock = MockTestBackendHandler::new();
+            setup_default_ldap_mock(&mut mock);
+            let ldap_handler = setup_bound_admin_handler(mock).await;
+            let request = modify_request("bob", operation, "givenName", &[]);
+            assert_eq!(
+                ldap_handler.do_modify_request(&request).await,
+                make_modify_failure_response(
+                    LdapResultCode::InvalidAttributeSyntax,
+                    "No values provided for givenName"
+                )
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_modify_add_of_unsupported_attribute_is_refused() {
+        let mut mock = MockTestBackendHandler::new();
+        setup_default_ldap_mock(&mut mock);
+        let ldap_handler = setup_bound_admin_handler(mock).await;
+        let request = make_add_modify_request("bob", "title", "Boss");
+        assert_eq!(
+            ldap_handler.do_modify_request(&request).await,
+            make_modify_failure_response(
+                LdapResultCode::UnwillingToPerform,
+                "Add not supported for title"
+            )
+        );
+        let request = modify_request("bob", LdapModifyType::Delete, "title", &[]);
+        assert_eq!(
+            ldap_handler.do_modify_request(&request).await,
+            make_modify_failure_response(
+                LdapResultCode::UnwillingToPerform,
+                "Deletion not supported for title"
+            )
         );
     }
 

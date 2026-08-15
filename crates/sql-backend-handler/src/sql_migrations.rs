@@ -1,4 +1,5 @@
 use crate::sql_tables::{DbConnection, LAST_SCHEMA_VERSION, SchemaVersion};
+use base64::{Engine as _, engine::general_purpose};
 use itertools::Itertools;
 use lldap_domain::types::{AttributeType, Avatar, GroupId, Serialized, UserId, Uuid};
 use lldap_schema::PublicSchema;
@@ -1286,6 +1287,540 @@ fn alias_rename_update(
     update
 }
 
+async fn ensure_system_config(
+    transaction: &DatabaseTransaction,
+    backend: sea_orm::DbBackend,
+) -> Result<(), DbErr> {
+    transaction
+        .execute(
+            backend.build(
+                Table::create()
+                    .table(Alias::new("system_config"))
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(Alias::new("key"))
+                            .string()
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(ColumnDef::new(Alias::new("value")).text().not_null()),
+            ),
+        )
+        .await?;
+
+    // Config data: seed the default only where no row exists — never overwrite user edits.
+    transaction
+        .execute(
+            backend.build(
+                Query::insert()
+                    .into_table(Alias::new("system_config"))
+                    .columns([Alias::new("key"), Alias::new("value")])
+                    .values_panic([
+                        "allowedous".into(),
+                        serde_json::to_string(&serde_json::json!(["people", "groups"]))
+                            .unwrap()
+                            .into(),
+                    ])
+                    .on_conflict(
+                        OnConflict::column(Alias::new("key"))
+                            .do_nothing_on([Alias::new("key")])
+                            .to_owned(),
+                    ),
+            ),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn ghost_and_alias_cleanup(
+    transaction: &DatabaseTransaction,
+    backend: sea_orm::DbBackend,
+    schema: &lldap_schema::Schema,
+) -> Result<(), DbErr> {
+    for attr in &schema.user_attributes.attributes {
+        let canonical = attr.name.as_str();
+        for alias in &attr.aliases {
+            transaction
+                .execute(backend.build(&alias_duplicate_delete(
+                    &user_attribute_tables(),
+                    canonical,
+                    alias,
+                )))
+                .await?;
+            transaction
+                .execute(backend.build(&alias_rename_update(
+                    &user_attribute_tables(),
+                    canonical,
+                    alias,
+                )))
+                .await?;
+        }
+    }
+
+    for attr in &schema.group_attributes.attributes {
+        let canonical = attr.name.as_str();
+        for alias in &attr.aliases {
+            transaction
+                .execute(backend.build(&alias_duplicate_delete(
+                    &group_attribute_tables(),
+                    canonical,
+                    alias,
+                )))
+                .await?;
+            transaction
+                .execute(backend.build(&alias_rename_update(
+                    &group_attribute_tables(),
+                    canonical,
+                    alias,
+                )))
+                .await?;
+        }
+    }
+
+    // v5 hardcoded schema rows under alias spellings (first_name, last_name). Custom
+    // attributes may legally reuse an alias name (email, cn); only drop hardcoded ghosts
+    // or CASCADE would wipe those rows and their EAV values.
+    let user_alias_names: Vec<String> = schema
+        .user_attributes
+        .attributes
+        .iter()
+        .filter(|a| a.is_hardcoded)
+        .flat_map(|a| a.aliases.iter().cloned())
+        .collect();
+    if !user_alias_names.is_empty() {
+        transaction
+            .execute(
+                backend.build(
+                    Query::delete()
+                        .from_table(UserAttributeSchema::Table)
+                        .and_where(
+                            Expr::col(UserAttributeSchema::UserAttributeSchemaName)
+                                .is_in(user_alias_names),
+                        )
+                        .and_where(
+                            Expr::col(UserAttributeSchema::UserAttributeSchemaIsHardcoded).eq(true),
+                        ),
+                ),
+            )
+            .await?;
+    }
+    let group_alias_names: Vec<String> = schema
+        .group_attributes
+        .attributes
+        .iter()
+        .filter(|a| a.is_hardcoded)
+        .flat_map(|a| a.aliases.iter().cloned())
+        .collect();
+    if !group_alias_names.is_empty() {
+        transaction
+            .execute(
+                backend.build(
+                    Query::delete()
+                        .from_table(GroupAttributeSchema::Table)
+                        .and_where(
+                            Expr::col(GroupAttributeSchema::GroupAttributeSchemaName)
+                                .is_in(group_alias_names),
+                        )
+                        .and_where(
+                            Expr::col(GroupAttributeSchema::GroupAttributeSchemaIsHardcoded)
+                                .eq(true),
+                        ),
+                ),
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+// Probes inside a savepoint so a missing column cannot poison the outer transaction on
+// Postgres; the add runs only where an interrupted or MySQL-skipped v12 left a gap.
+async fn ensure_column(
+    transaction: &DatabaseTransaction,
+    backend: sea_orm::DbBackend,
+    table: DynIden,
+    column: DynIden,
+    definition: ColumnDef,
+) -> Result<(), DbErr> {
+    let savepoint = transaction.begin().await?;
+    let probe = savepoint
+        .execute(backend.build(Query::select().column(column).from(table.clone()).limit(1)))
+        .await;
+    savepoint.rollback().await?;
+    if probe.is_err() {
+        transaction
+            .execute(backend.build(Table::alter().table(table).add_column(definition)))
+            .await?;
+    }
+    Ok(())
+}
+
+async fn attribute_type_map(
+    transaction: &DatabaseTransaction,
+    backend: sea_orm::DbBackend,
+    table: DynIden,
+    name_col: DynIden,
+    type_col: DynIden,
+    is_list_col: DynIden,
+) -> Result<std::collections::HashMap<String, (AttributeType, bool)>, DbErr> {
+    let rows = transaction
+        .query_all(
+            backend.build(
+                Query::select()
+                    .expr_as(Expr::col(name_col), Alias::new("name"))
+                    .expr_as(Expr::col(type_col), Alias::new("attr_type"))
+                    .expr_as(Expr::col(is_list_col), Alias::new("is_list"))
+                    .from(table),
+            ),
+        )
+        .await?;
+    let mut map = std::collections::HashMap::new();
+    for row in rows {
+        let name: String = row.try_get("", "name")?;
+        let attr_type: String = row.try_get("", "attr_type")?;
+        let is_list: bool = row.try_get("", "is_list")?;
+        if let Ok(typ) = <AttributeType as sea_orm::ActiveEnum>::try_from_value(&attr_type) {
+            map.insert(name, (typ, is_list));
+        }
+    }
+    Ok(map)
+}
+
+fn bincode_prefixed(bytes: &[u8]) -> Option<&[u8]> {
+    let len = u64::from_le_bytes(bytes.get(..8)?.try_into().ok()?) as usize;
+    (len == bytes.len() - 8).then(|| &bytes[8..])
+}
+
+fn is_ascii_integer(bytes: &[u8]) -> bool {
+    let digits = bytes.strip_prefix(b"-").unwrap_or(bytes);
+    !digits.is_empty() && digits.iter().all(u8::is_ascii_digit)
+}
+
+fn parse_iso_datetime(s: &str) -> Option<chrono::NaiveDateTime> {
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|dt| dt.naive_utc())
+        .ok()
+        .or_else(|| s.parse().ok())
+}
+
+// Some(new_bytes) when the value is a recognized LLDAP bincode form; None leaves the row
+// untouched (native raw values, and anything unrecognized — which is only warned about).
+fn reencode_value(
+    bytes: &[u8],
+    typ: AttributeType,
+    is_list: bool,
+    entity: &str,
+    name: &str,
+) -> Option<Vec<u8>> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let suspicious = || {
+        warn!("v13: unrecognized legacy encoding left untouched for {entity} attribute '{name}'")
+    };
+    match (typ, is_list) {
+        (AttributeType::String, false) => match bincode_prefixed(bytes) {
+            Some(payload) if std::str::from_utf8(payload).is_ok() => Some(payload.to_vec()),
+            Some(_) => {
+                suspicious();
+                None
+            }
+            None => None,
+        },
+        (AttributeType::String, true) => {
+            if serde_json::from_slice::<Vec<String>>(bytes).is_ok() {
+                None
+            } else if let Ok(list) = bincode::deserialize::<Vec<String>>(bytes) {
+                Some(serde_json::to_vec(&list).unwrap_or_else(|_| b"[]".to_vec()))
+            } else {
+                suspicious();
+                None
+            }
+        }
+        (AttributeType::Integer, false) => {
+            (bytes.len() == 8 && !is_ascii_integer(bytes)).then(|| {
+                i64::from_le_bytes(bytes.try_into().unwrap())
+                    .to_string()
+                    .into_bytes()
+            })
+        }
+        (AttributeType::Integer, true) => {
+            if serde_json::from_slice::<Vec<i64>>(bytes).is_ok() {
+                None
+            } else if let Ok(list) = bincode::deserialize::<Vec<i64>>(bytes) {
+                Some(serde_json::to_vec(&list).unwrap_or_else(|_| b"[]".to_vec()))
+            } else {
+                suspicious();
+                None
+            }
+        }
+        (AttributeType::DateTime, false) => {
+            if is_ascii_integer(bytes) {
+                None
+            } else if let Some(dt) = bincode::deserialize::<String>(bytes)
+                .ok()
+                .as_deref()
+                .and_then(parse_iso_datetime)
+            {
+                Some(dt.and_utc().timestamp().to_string().into_bytes())
+            } else {
+                suspicious();
+                None
+            }
+        }
+        (AttributeType::DateTime, true) => {
+            if serde_json::from_slice::<Vec<i64>>(bytes).is_ok() {
+                None
+            } else if let Ok(list) = bincode::deserialize::<Vec<String>>(bytes) {
+                let mut epochs = Vec::with_capacity(list.len());
+                for s in &list {
+                    let Some(dt) = parse_iso_datetime(s) else {
+                        suspicious();
+                        return None;
+                    };
+                    epochs.push(dt.and_utc().timestamp());
+                }
+                Some(serde_json::to_vec(&epochs).unwrap_or_else(|_| b"[]".to_vec()))
+            } else {
+                suspicious();
+                None
+            }
+        }
+        (AttributeType::Avatar, false) => {
+            if bytes.starts_with(&[0xFF, 0xD8]) {
+                None
+            } else {
+                match bincode_prefixed(bytes) {
+                    Some(payload) if payload.starts_with(&[0xFF, 0xD8]) => Some(payload.to_vec()),
+                    _ => {
+                        suspicious();
+                        None
+                    }
+                }
+            }
+        }
+        (AttributeType::Avatar, true) => {
+            if serde_json::from_slice::<Vec<String>>(bytes).is_ok() {
+                None
+            } else if let Ok(list) = bincode::deserialize::<Vec<Vec<u8>>>(bytes) {
+                let encoded: Vec<String> = list
+                    .iter()
+                    .map(|b| general_purpose::STANDARD.encode(b))
+                    .collect();
+                Some(serde_json::to_vec(&encoded).unwrap_or_else(|_| b"[]".to_vec()))
+            } else {
+                suspicious();
+                None
+            }
+        }
+    }
+}
+
+async fn reencode_attribute_rows(
+    transaction: &DatabaseTransaction,
+    backend: sea_orm::DbBackend,
+    t: &AttributeTables,
+    entity: &str,
+    types: &std::collections::HashMap<String, (AttributeType, bool)>,
+) -> Result<usize, DbErr> {
+    const CHUNK: u64 = 500;
+    let mut rewritten = 0usize;
+    let mut offset = 0u64;
+    loop {
+        let rows = transaction
+            .query_all(
+                backend.build(
+                    Query::select()
+                        .expr_as(
+                            Expr::col((t.attr_table.clone(), t.attr_id_col.clone())),
+                            Alias::new("id"),
+                        )
+                        .expr_as(
+                            Expr::col((t.attr_table.clone(), t.attr_name_col.clone())),
+                            Alias::new("name"),
+                        )
+                        .expr_as(
+                            Expr::col((t.attr_table.clone(), t.attr_value_col.clone())),
+                            Alias::new("value"),
+                        )
+                        .from(t.attr_table.clone())
+                        .order_by((t.attr_table.clone(), t.attr_id_col.clone()), Order::Asc)
+                        .order_by((t.attr_table.clone(), t.attr_name_col.clone()), Order::Asc)
+                        .limit(CHUNK)
+                        .offset(offset),
+                ),
+            )
+            .await?;
+        let fetched = rows.len() as u64;
+        for row in rows {
+            let id: Value = match row.try_get::<String>("", "id") {
+                Ok(s) => s.into(),
+                Err(_) => row.try_get::<i32>("", "id")?.into(),
+            };
+            let name: String = row.try_get("", "name")?;
+            let bytes: Vec<u8> = row.try_get("", "value")?;
+            let Some((typ, is_list)) = types.get(&name).copied() else {
+                continue;
+            };
+            if let Some(new_bytes) = reencode_value(&bytes, typ, is_list, entity, &name) {
+                transaction
+                    .execute(
+                        backend.build(
+                            Query::update()
+                                .table(t.attr_table.clone())
+                                .value(t.attr_value_col.clone(), new_bytes)
+                                .cond_where(Expr::col(t.attr_id_col.clone()).eq(id.clone()))
+                                .cond_where(Expr::col(t.attr_name_col.clone()).eq(name.clone())),
+                        ),
+                    )
+                    .await?;
+                rewritten += 1;
+            }
+        }
+        if fetched < CHUNK {
+            break;
+        }
+        offset += CHUNK;
+    }
+    Ok(rewritten)
+}
+
+// LLDAP-only repair + re-encode: bincode values and JpegPhoto schema rows arriving from an
+// upstream database become KLLDAP's raw formats; native rows are detector no-ops, so the
+// migration is idempotent and safe on fresh chains.
+async fn migrate_to_v13(transaction: DatabaseTransaction) -> Result<DatabaseTransaction, DbErr> {
+    let backend = transaction.get_database_backend();
+
+    info!("KLLDAP v13 migration starting");
+
+    ensure_column(
+        &transaction,
+        backend,
+        UserAttributeSchema::Table.into_iden(),
+        UserAttributeSchema::Aliases.into_iden(),
+        ColumnDef::new(UserAttributeSchema::Aliases)
+            .string_len(1024)
+            .default("[]")
+            .to_owned(),
+    )
+    .await?;
+    ensure_column(
+        &transaction,
+        backend,
+        UserAttributeSchema::Table.into_iden(),
+        UserAttributeSchema::UserAttributeSchemaIsReadonly.into_iden(),
+        ColumnDef::new(UserAttributeSchema::UserAttributeSchemaIsReadonly)
+            .boolean()
+            .not_null()
+            .default(false)
+            .to_owned(),
+    )
+    .await?;
+    ensure_column(
+        &transaction,
+        backend,
+        GroupAttributeSchema::Table.into_iden(),
+        GroupAttributeSchema::Aliases.into_iden(),
+        ColumnDef::new(GroupAttributeSchema::Aliases)
+            .string_len(1024)
+            .default("[]")
+            .to_owned(),
+    )
+    .await?;
+    ensure_column(
+        &transaction,
+        backend,
+        GroupAttributeSchema::Table.into_iden(),
+        GroupAttributeSchema::GroupAttributeSchemaIsReadonly.into_iden(),
+        ColumnDef::new(GroupAttributeSchema::GroupAttributeSchemaIsReadonly)
+            .boolean()
+            .not_null()
+            .default(false)
+            .to_owned(),
+    )
+    .await?;
+    ensure_column(
+        &transaction,
+        backend,
+        Users::Table.into_iden(),
+        Alias::new("krb_principal_name").into_iden(),
+        ColumnDef::new(Alias::new("krb_principal_name"))
+            .string_len(255)
+            .null()
+            .to_owned(),
+    )
+    .await?;
+    ensure_system_config(&transaction, backend).await?;
+
+    // v12 only repaired the row named 'avatar'; custom upstream JpegPhoto attrs hard-fail
+    // the shared enum until their type is normalized too.
+    for (table, type_col) in [
+        (
+            UserAttributeSchema::Table.into_iden(),
+            UserAttributeSchema::UserAttributeSchemaType.into_iden(),
+        ),
+        (
+            GroupAttributeSchema::Table.into_iden(),
+            GroupAttributeSchema::GroupAttributeSchemaType.into_iden(),
+        ),
+    ] {
+        transaction
+            .execute(
+                backend.build(
+                    Query::update()
+                        .table(table)
+                        .value(type_col.clone(), AttributeType::Avatar)
+                        .cond_where(Expr::col(type_col).eq("JpegPhoto")),
+                ),
+            )
+            .await?;
+    }
+
+    let public_schema = PublicSchema::get();
+    ghost_and_alias_cleanup(&transaction, backend, public_schema.get_schema()).await?;
+
+    let user_types = attribute_type_map(
+        &transaction,
+        backend,
+        UserAttributeSchema::Table.into_iden(),
+        UserAttributeSchema::UserAttributeSchemaName.into_iden(),
+        UserAttributeSchema::UserAttributeSchemaType.into_iden(),
+        UserAttributeSchema::UserAttributeSchemaIsList.into_iden(),
+    )
+    .await?;
+    let group_types = attribute_type_map(
+        &transaction,
+        backend,
+        GroupAttributeSchema::Table.into_iden(),
+        GroupAttributeSchema::GroupAttributeSchemaName.into_iden(),
+        GroupAttributeSchema::GroupAttributeSchemaType.into_iden(),
+        GroupAttributeSchema::GroupAttributeSchemaIsList.into_iden(),
+    )
+    .await?;
+    let user_rewrites = reencode_attribute_rows(
+        &transaction,
+        backend,
+        &user_attribute_tables(),
+        "user",
+        &user_types,
+    )
+    .await?;
+    let group_rewrites = reencode_attribute_rows(
+        &transaction,
+        backend,
+        &group_attribute_tables(),
+        "group",
+        &group_types,
+    )
+    .await?;
+
+    info!(
+        "v13 migration completed – re-encoded {} user + {} group attribute values",
+        user_rewrites, group_rewrites
+    );
+
+    Ok(transaction)
+}
+
 async fn migrate_to_v12(transaction: DatabaseTransaction) -> Result<DatabaseTransaction, DbErr> {
     let backend = transaction.get_database_backend();
 
@@ -1344,44 +1879,7 @@ async fn migrate_to_v12(transaction: DatabaseTransaction) -> Result<DatabaseTran
         )
         .await?;
 
-    transaction
-        .execute(
-            backend.build(
-                Table::create()
-                    .table(Alias::new("system_config"))
-                    .if_not_exists()
-                    .col(
-                        ColumnDef::new(Alias::new("key"))
-                            .string()
-                            .not_null()
-                            .primary_key(),
-                    )
-                    .col(ColumnDef::new(Alias::new("value")).text().not_null()),
-            ),
-        )
-        .await?;
-
-    // Config data: seed the default only where no row exists — never overwrite user edits.
-    transaction
-        .execute(
-            backend.build(
-                Query::insert()
-                    .into_table(Alias::new("system_config"))
-                    .columns([Alias::new("key"), Alias::new("value")])
-                    .values_panic([
-                        "allowedous".into(),
-                        serde_json::to_string(&serde_json::json!(["people", "groups"]))
-                            .unwrap()
-                            .into(),
-                    ])
-                    .on_conflict(
-                        OnConflict::column(Alias::new("key"))
-                            .do_nothing_on([Alias::new("key")])
-                            .to_owned(),
-                    ),
-            ),
-        )
-        .await?;
+    ensure_system_config(&transaction, backend).await?;
 
     transaction
         .execute(
@@ -1598,98 +2096,7 @@ async fn migrate_to_v12(transaction: DatabaseTransaction) -> Result<DatabaseTran
         )?))
         .await?;
 
-    for attr in &schema.user_attributes.attributes {
-        let canonical = attr.name.as_str();
-        for alias in &attr.aliases {
-            transaction
-                .execute(backend.build(&alias_duplicate_delete(
-                    &user_attribute_tables(),
-                    canonical,
-                    alias,
-                )))
-                .await?;
-            transaction
-                .execute(backend.build(&alias_rename_update(
-                    &user_attribute_tables(),
-                    canonical,
-                    alias,
-                )))
-                .await?;
-        }
-    }
-
-    for attr in &schema.group_attributes.attributes {
-        let canonical = attr.name.as_str();
-        for alias in &attr.aliases {
-            transaction
-                .execute(backend.build(&alias_duplicate_delete(
-                    &group_attribute_tables(),
-                    canonical,
-                    alias,
-                )))
-                .await?;
-            transaction
-                .execute(backend.build(&alias_rename_update(
-                    &group_attribute_tables(),
-                    canonical,
-                    alias,
-                )))
-                .await?;
-        }
-    }
-
-    // v5 hardcoded schema rows under alias spellings (first_name, last_name). Custom
-    // attributes may legally reuse an alias name (email, cn); only drop hardcoded ghosts
-    // or CASCADE would wipe those rows and their EAV values.
-    let user_alias_names: Vec<String> = schema
-        .user_attributes
-        .attributes
-        .iter()
-        .filter(|a| a.is_hardcoded)
-        .flat_map(|a| a.aliases.iter().cloned())
-        .collect();
-    if !user_alias_names.is_empty() {
-        transaction
-            .execute(
-                backend.build(
-                    Query::delete()
-                        .from_table(UserAttributeSchema::Table)
-                        .and_where(
-                            Expr::col(UserAttributeSchema::UserAttributeSchemaName)
-                                .is_in(user_alias_names),
-                        )
-                        .and_where(
-                            Expr::col(UserAttributeSchema::UserAttributeSchemaIsHardcoded).eq(true),
-                        ),
-                ),
-            )
-            .await?;
-    }
-    let group_alias_names: Vec<String> = schema
-        .group_attributes
-        .attributes
-        .iter()
-        .filter(|a| a.is_hardcoded)
-        .flat_map(|a| a.aliases.iter().cloned())
-        .collect();
-    if !group_alias_names.is_empty() {
-        transaction
-            .execute(
-                backend.build(
-                    Query::delete()
-                        .from_table(GroupAttributeSchema::Table)
-                        .and_where(
-                            Expr::col(GroupAttributeSchema::GroupAttributeSchemaName)
-                                .is_in(group_alias_names),
-                        )
-                        .and_where(
-                            Expr::col(GroupAttributeSchema::GroupAttributeSchemaIsHardcoded)
-                                .eq(true),
-                        ),
-                ),
-            )
-            .await?;
-    }
+    ghost_and_alias_cleanup(&transaction, backend, schema).await?;
 
     info!("v12 migration completed");
 
@@ -1728,6 +2135,7 @@ pub(crate) async fn migrate_from_version(
         to_sync!(migrate_to_v10),
         to_sync!(migrate_to_v11),
         to_sync!(migrate_to_v12), // KLLDAP extension
+        to_sync!(migrate_to_v13), // KLLDAP extension
     ];
     assert_eq!(migrations.len(), (LAST_SCHEMA_VERSION.0 - 1) as usize);
     for migration in 2..=last_version.0 {
@@ -2734,7 +3142,7 @@ mod tests {
             .await
             .unwrap();
 
-        let assert_v12_state = |pool: DbConnection| async move {
+        let assert_v12_state = |pool: DbConnection, expected_version: SchemaVersion| async move {
             let ver = JustSchemaVersion::find_by_statement(raw_statement(
                 r#"SELECT version FROM metadata"#,
             ))
@@ -2742,7 +3150,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-            assert_eq!(ver.version, SchemaVersion(12));
+            assert_eq!(ver.version, expected_version);
 
             // New columns are queryable.
             count(
@@ -2866,12 +3274,316 @@ mod tests {
             pool
         };
 
-        let pool = assert_v12_state(pool).await;
+        let pool = assert_v12_state(pool, SchemaVersion(12)).await;
 
-        // Idempotency runs through the version gate: a second init is a no-op at 12
-        // (the v12 body itself must not re-run — plain add_column would fail).
+        // Idempotency runs through the version gate: re-init carries the DB to LAST
+        // without re-running the v12 body (plain add_column would fail); the v12 state
+        // must survive v13's detector untouched.
         init_table(&pool).await.unwrap();
-        assert_v12_state(pool).await;
+        assert_v12_state(pool, LAST_SCHEMA_VERSION).await;
+    }
+
+    async fn insert_group_attr(pool: &DbConnection, group_id: i32, name: &str, value: &[u8]) {
+        pool.execute(
+            pool.get_database_backend().build(
+                Query::insert()
+                    .into_table(GroupAttributes::Table)
+                    .columns([
+                        GroupAttributes::GroupAttributeGroupId,
+                        GroupAttributes::GroupAttributeName,
+                        GroupAttributes::GroupAttributeValue,
+                    ])
+                    .values_panic([
+                        group_id.into(),
+                        name.into(),
+                        Serialized(value.to_vec()).into(),
+                    ]),
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_v13_reencodes_lldap_bincode_values() {
+        use lldap_domain::types::{AttributeValue, Cardinality};
+        use lldap_domain_model::model::codec;
+
+        let pool = get_in_memory_db().await;
+        upgrade_to_v1(&pool).await.unwrap();
+        migrate_from_version(&pool, SchemaVersion(1), SchemaVersion(11))
+            .await
+            .unwrap();
+
+        pool.execute(raw_statement(
+            r#"INSERT INTO users (user_id, email, lowercase_email, creation_date, uuid, modified_date, password_modified_date)
+               VALUES ("bob", "bob@ex.com", "bob@ex.com", "1970-01-01 00:00:00", "a02eaf13-48a7-30f6-a3d4-040ff7c52b04", "1970-01-01 00:00:00", "1970-01-01 00:00:00")"#,
+        ))
+        .await
+        .unwrap();
+        pool.execute(raw_statement(
+            r#"INSERT INTO groups (group_id, display_name, lowercase_display_name, creation_date, uuid, modified_date)
+               VALUES (7, "devs", "devs", "1970-01-01 00:00:00", "33333333-3333-3333-3333-333333333333", "1970-01-01 00:00:00")"#,
+        ))
+        .await
+        .unwrap();
+        // Custom schema rows in v11 shape; these are user-owned attributes and
+        // stay after v13 (the migration never creates scratch schema).
+        // Upstream stores JpegPhoto as its own type.
+        for (name, typ, is_list) in [
+            ("mylist", "String", 1),
+            ("myints", "Integer", 1),
+            ("myint", "Integer", 0),
+            ("mydate", "DateTime", 0),
+            ("mydates", "DateTime", 1),
+            ("baddates", "DateTime", 1),
+            ("myphoto", "JpegPhoto", 0),
+            ("myphotos", "JpegPhoto", 1),
+            ("rawstr", "String", 0),
+        ] {
+            pool.execute(raw_statement(&format!(
+                r#"INSERT INTO user_attribute_schema
+                   (user_attribute_schema_name, user_attribute_schema_type,
+                    user_attribute_schema_is_list, user_attribute_schema_is_user_visible,
+                    user_attribute_schema_is_user_editable, user_attribute_schema_is_hardcoded)
+                   VALUES ("{name}", "{typ}", {is_list}, true, true, false)"#,
+            )))
+            .await
+            .unwrap();
+        }
+        pool.execute(raw_statement(
+            r#"INSERT INTO group_attribute_schema
+               (group_attribute_schema_name, group_attribute_schema_type,
+                group_attribute_schema_is_list, group_attribute_schema_is_group_visible,
+                group_attribute_schema_is_group_editable, group_attribute_schema_is_hardcoded)
+               VALUES ("gnote", "String", false, true, true, false)"#,
+        ))
+        .await
+        .unwrap();
+
+        let jpeg = lldap_domain::images::make_test_jpeg_bytes();
+        insert_user_attr(
+            &pool,
+            "bob",
+            "first_name",
+            &bincode::serialize("Bincode Bob").unwrap(),
+        )
+        .await;
+        insert_user_attr(
+            &pool,
+            "bob",
+            "mylist",
+            &bincode::serialize(&vec!["a".to_string(), "b".to_string()]).unwrap(),
+        )
+        .await;
+        insert_user_attr(
+            &pool,
+            "bob",
+            "myints",
+            &bincode::serialize(&vec![1i64, 2]).unwrap(),
+        )
+        .await;
+        insert_user_attr(
+            &pool,
+            "bob",
+            "myint",
+            &bincode::serialize(&4242i64).unwrap(),
+        )
+        .await;
+        insert_user_attr(
+            &pool,
+            "bob",
+            "mydate",
+            &bincode::serialize("2024-05-01T12:00:00").unwrap(),
+        )
+        .await;
+        insert_user_attr(
+            &pool,
+            "bob",
+            "mydates",
+            &bincode::serialize(&vec![
+                "2024-05-01T12:00:00".to_string(),
+                "2024-05-02T12:00:00".to_string(),
+            ])
+            .unwrap(),
+        )
+        .await;
+        let baddates = bincode::serialize(&vec![
+            "2024-05-01T12:00:00".to_string(),
+            "not-a-date".to_string(),
+        ])
+        .unwrap();
+        insert_user_attr(&pool, "bob", "baddates", &baddates).await;
+        insert_user_attr(&pool, "bob", "myphoto", &bincode::serialize(&jpeg).unwrap()).await;
+        insert_user_attr(
+            &pool,
+            "bob",
+            "myphotos",
+            &bincode::serialize(&vec![jpeg.clone()]).unwrap(),
+        )
+        .await;
+        insert_user_attr(&pool, "bob", "rawstr", b"native").await;
+        insert_group_attr(
+            &pool,
+            7,
+            "gnote",
+            &bincode::serialize("Group note").unwrap(),
+        )
+        .await;
+
+        migrate_from_version(&pool, SchemaVersion(11), SchemaVersion(13))
+            .await
+            .unwrap();
+
+        let assert_v13_state = |pool: DbConnection, jpeg: Vec<u8>, baddates: Vec<u8>| async move {
+            let ver = JustSchemaVersion::find_by_statement(raw_statement(
+                r#"SELECT version FROM metadata"#,
+            ))
+            .one(&pool)
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(ver.version, SchemaVersion(13));
+
+            assert_eq!(
+                bytes(
+                    &pool,
+                    r#"SELECT user_attribute_value as v FROM user_attributes
+                       WHERE user_attribute_user_id = "bob" AND user_attribute_name = "firstname""#
+                )
+                .await,
+                b"Bincode Bob"
+            );
+            assert_eq!(
+                count(
+                    &pool,
+                    r#"SELECT COUNT(*) as c FROM user_attributes
+                       WHERE user_attribute_name = "first_name""#
+                )
+                .await,
+                0
+            );
+            assert_eq!(
+                bytes(
+                    &pool,
+                    r#"SELECT user_attribute_value as v FROM user_attributes
+                       WHERE user_attribute_user_id = "bob" AND user_attribute_name = "mylist""#
+                )
+                .await,
+                br#"["a","b"]"#
+            );
+            assert_eq!(
+                bytes(
+                    &pool,
+                    r#"SELECT user_attribute_value as v FROM user_attributes
+                       WHERE user_attribute_user_id = "bob" AND user_attribute_name = "myints""#
+                )
+                .await,
+                b"[1,2]"
+            );
+            assert_eq!(
+                bytes(
+                    &pool,
+                    r#"SELECT user_attribute_value as v FROM user_attributes
+                       WHERE user_attribute_user_id = "bob" AND user_attribute_name = "myint""#
+                )
+                .await,
+                b"4242"
+            );
+            let mydate = bytes(
+                &pool,
+                r#"SELECT user_attribute_value as v FROM user_attributes
+                   WHERE user_attribute_user_id = "bob" AND user_attribute_name = "mydate""#,
+            )
+            .await;
+            assert_eq!(mydate, b"1714564800");
+            assert_eq!(
+                codec::decode_attribute_value(&Serialized(mydate), AttributeType::DateTime, false),
+                AttributeValue::DateTime(Cardinality::Singleton(
+                    "2024-05-01T12:00:00".parse().unwrap()
+                ))
+            );
+            assert_eq!(
+                bytes(
+                    &pool,
+                    r#"SELECT user_attribute_value as v FROM user_attributes
+                       WHERE user_attribute_user_id = "bob" AND user_attribute_name = "mydates""#
+                )
+                .await,
+                b"[1714564800,1714651200]"
+            );
+            assert_eq!(
+                bytes(
+                    &pool,
+                    r#"SELECT user_attribute_value as v FROM user_attributes
+                       WHERE user_attribute_user_id = "bob" AND user_attribute_name = "baddates""#
+                )
+                .await,
+                baddates
+            );
+            assert_eq!(
+                bytes(
+                    &pool,
+                    r#"SELECT user_attribute_value as v FROM user_attributes
+                       WHERE user_attribute_user_id = "bob" AND user_attribute_name = "myphoto""#
+                )
+                .await,
+                jpeg
+            );
+            let myphotos = bytes(
+                &pool,
+                r#"SELECT user_attribute_value as v FROM user_attributes
+                   WHERE user_attribute_user_id = "bob" AND user_attribute_name = "myphotos""#,
+            )
+            .await;
+            assert_eq!(
+                myphotos,
+                serde_json::to_vec(&[general_purpose::STANDARD.encode(&jpeg)]).unwrap()
+            );
+            assert_eq!(
+                text(
+                    &pool,
+                    r#"SELECT user_attribute_schema_type as t FROM user_attribute_schema
+                       WHERE user_attribute_schema_name = "myphoto""#
+                )
+                .await,
+                "Avatar"
+            );
+            assert_eq!(
+                text(
+                    &pool,
+                    r#"SELECT user_attribute_schema_type as t FROM user_attribute_schema
+                       WHERE user_attribute_schema_name = "myphotos""#
+                )
+                .await,
+                "Avatar"
+            );
+            assert_eq!(
+                bytes(
+                    &pool,
+                    r#"SELECT user_attribute_value as v FROM user_attributes
+                       WHERE user_attribute_user_id = "bob" AND user_attribute_name = "rawstr""#
+                )
+                .await,
+                b"native"
+            );
+            assert_eq!(
+                bytes(
+                    &pool,
+                    r#"SELECT group_attribute_value as v FROM group_attributes
+                       WHERE group_attribute_group_id = 7 AND group_attribute_name = "gnote""#
+                )
+                .await,
+                b"Group note"
+            );
+            pool
+        };
+
+        let pool = assert_v13_state(pool, jpeg.clone(), baddates.clone()).await;
+
+        // Idempotent: a second init at LAST leaves every re-encoded byte untouched.
+        init_table(&pool).await.unwrap();
+        assert_v13_state(pool, jpeg, baddates).await;
     }
 
     #[test]

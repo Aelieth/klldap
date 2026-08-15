@@ -92,6 +92,35 @@ impl SqlBackendHandler {
 
         Ok(membership.is_some())
     }
+
+    // A verified plaintext lets us transparently re-enroll a migrated 0.6.x password in
+    // the current OPAQUE format. Writes only password_hash: the password didn't change,
+    // so the modified dates must not move (unlike registration_finish).
+    async fn reregister_password(&self, username: &UserId, password: &str) -> Result<()> {
+        use opaque::{client, server};
+        let mut rng = rand::rngs::OsRng;
+        let registration_start =
+            client::registration::start_registration(password.as_bytes(), &mut rng)?;
+        let server_start = server::registration::start_registration(
+            &self.opaque_setup,
+            registration_start.message,
+            username,
+        )?;
+        let registration_finish = client::registration::finish_registration(
+            registration_start.state,
+            password.as_bytes(),
+            server_start.message,
+            &mut rng,
+        )?;
+        let password_file = server::registration::get_password_file(registration_finish.message);
+        let user_update = model::users::ActiveModel {
+            user_id: ActiveValue::Set(username.clone()),
+            password_hash: ActiveValue::Set(Some(password_file.serialize().to_vec())),
+            ..Default::default()
+        };
+        user_update.update(&self.sql_pool).await?;
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -123,6 +152,24 @@ impl LoginHandler for SqlBackendHandler {
             )
             .is_ok()
             {
+                return Ok(());
+            }
+            if let Some(legacy) = &self.legacy_opaque_setup
+                && legacy.verify_password(&password_hash, request.name.as_str(), &request.password)
+            {
+                info!(
+                    r#"Verified "{}" against the legacy password format; re-enrolling"#,
+                    &request.name
+                );
+                if let Err(e) = self
+                    .reregister_password(&request.name, &request.password)
+                    .await
+                {
+                    warn!(
+                        r#"Failed to re-enroll "{}" in the current password format (will retry next login): {}"#,
+                        &request.name, e
+                    );
+                }
                 return Ok(());
             }
         } else {
@@ -441,5 +488,113 @@ mod tests {
             msg.contains("disabled") || msg.contains("Account disabled"),
             "unexpected error: {msg}"
         );
+    }
+
+    fn reassembled_setup(
+        legacy: &lldap_opaque_legacy::LegacyServerSetup,
+    ) -> opaque::server::ServerSetup {
+        opaque::server::ServerSetup::deserialize(&legacy.reassemble_for_current()).unwrap()
+    }
+
+    async fn set_raw_password_hash(
+        sql_pool: &crate::sql_tables::DbConnection,
+        user: &str,
+        hash: Vec<u8>,
+    ) {
+        let user_update = model::users::ActiveModel {
+            user_id: ActiveValue::Set(UserId::new(user)),
+            password_hash: ActiveValue::Set(Some(hash)),
+            ..Default::default()
+        };
+        user_update.update(sql_pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_bind_upgrades_legacy_password() {
+        let sql_pool = get_initialized_db().await;
+        let legacy = lldap_opaque_legacy::generate_random();
+        let handler = SqlBackendHandler::new_with_legacy(
+            reassembled_setup(&legacy),
+            Some(legacy.clone()),
+            sql_pool.clone(),
+        );
+        insert_user_no_password(&handler, "bob").await;
+        let legacy_file = legacy.register_password("bob", "bob00").unwrap();
+        set_raw_password_hash(&sql_pool, "bob", legacy_file.clone()).await;
+
+        handler
+            .bind(BindRequest {
+                name: UserId::new("bob"),
+                password: "wrong_password".to_string(),
+            })
+            .await
+            .unwrap_err();
+        handler
+            .bind(BindRequest {
+                name: UserId::new("bob"),
+                password: "bob00".to_string(),
+            })
+            .await
+            .unwrap();
+        let new_hash = handler
+            .get_password_file_for_user(UserId::new("bob"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(new_hash, legacy_file);
+
+        // The re-enrolled hash verifies without any legacy support.
+        let handler = SqlBackendHandler::new(reassembled_setup(&legacy), sql_pool.clone());
+        handler
+            .bind(BindRequest {
+                name: UserId::new("bob"),
+                password: "bob00".to_string(),
+            })
+            .await
+            .unwrap();
+        handler
+            .bind(BindRequest {
+                name: UserId::new("bob"),
+                password: "wrong_password".to_string(),
+            })
+            .await
+            .unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn test_bind_with_legacy_enabled_leaves_current_hashes_alone() {
+        let sql_pool = get_initialized_db().await;
+        let legacy = lldap_opaque_legacy::generate_random();
+        let handler = SqlBackendHandler::new_with_legacy(
+            reassembled_setup(&legacy),
+            Some(legacy),
+            sql_pool.clone(),
+        );
+        insert_user(&handler, "john", "john00").await;
+        let before = handler
+            .get_password_file_for_user(UserId::new("john"))
+            .await
+            .unwrap()
+            .unwrap();
+        handler
+            .bind(BindRequest {
+                name: UserId::new("john"),
+                password: "john00".to_string(),
+            })
+            .await
+            .unwrap();
+        let after = handler
+            .get_password_file_for_user(UserId::new("john"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(before, after);
+        handler
+            .bind(BindRequest {
+                name: UserId::new("john"),
+                password: "bad_password".to_string(),
+            })
+            .await
+            .unwrap_err();
     }
 }

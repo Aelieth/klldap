@@ -1,6 +1,6 @@
 #! /bin/bash
 
-tables=("users" "groups" "memberships" "jwt_refresh_storage" "jwt_storage" "password_reset_tokens" "group_attribute_schema" "group_attributes")
+tables=("users" "groups" "memberships" "jwt_refresh_storage" "jwt_storage" "password_reset_tokens" "group_attribute_schema" "group_attributes" "user_object_classes" "group_object_classes" "system_config")
 echo ".header on"
 
 for table in "${tables[@]}"; do

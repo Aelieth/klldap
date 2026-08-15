@@ -1,11 +1,11 @@
 ###
-### lldap - podman quadlet file
+### klldap - podman quadlet file (adapted from upstream LLDAP's; untested with rootless podman)
 ### https://docs.podman.io/en/latest/markdown/podman-systemd.unit.5.html
 ###
 
 [Unit]
-Description=LLDAP container
-Documentation=https://github.com/lldap/lldap
+Description=KLLDAP container
+Documentation=https://github.com/Aelieth/klldap
 Requires=lldap-db.service
 
 [Service]
@@ -14,15 +14,25 @@ Restart=on-failure
 [Container]
 AutoUpdate=registry
 ContainerName=lldap
-Image=docker.io/lldap/lldap:stable-debian
+Image=docker.io/aelieth/klldap:latest
+
+# /data holds the config, keytabs and (for sqlite) the database; the KDC database has
+# its own volume. Both must persist.
+Volume=lldap-data.volume:/data:Z
+Volume=lldap-kdc.volume:/var/kerberos/krb5kdc:Z
+
+# Kerberos clients need the KDC (88) and kadmin (749); publish them on the host.
+PublishPort=88:88/tcp
+PublishPort=88:88/udp
+PublishPort=749:749/tcp
 
 # using multiple networks for traefik and db, not essential
 Network=lldap-frontend.network
 Network=lldap-backend.network
 
 # environment variables
-Environment=UID=1000
-Environment=GID=1000
+Environment=LLDAP_UID=1000
+Environment=LLDAP_GID=1000
 Environment=LLDAP_LDAP_BASE_DN=dc=example,dc=com
 Environment=LLDAP_DATABASE_URL=postgres://lldapuser:lldappass@lldap-db/lldap
 Environment=LLDAP_LDAP_USER_EMAIL=admin@example.com
@@ -33,11 +43,11 @@ Environment=LLDAP_JWT_SECRET_FILE=/run/secrets/lldap-jwt-secret
 Environment=LLDAP_LDAP_USER_PASS_FILE=/run/secrets/lldap-ldap-user-pass
 
 
-# health check
-HealthCmd=/app/lldap healthcheck
+# health check (the KDC bootstraps after the server is up, hence the start period)
+HealthCmd=/app/lldap healthcheck --config-file /data/lldap_config.toml --kerberos
 HealthInterval=30s
 HealthRetries=3
-HealthStartPeriod=15s
+HealthStartPeriod=90s
 HealthTimeout=30s
 
 # if using traefik, automatically configure to proxy the web service

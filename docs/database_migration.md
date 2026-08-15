@@ -1,9 +1,9 @@
 # Migration
 
-> Migrating **from stock LLDAP** (not between database backends) is
-> [v0.7-from-lldap.md](migration_guides/v0.7-from-lldap.md).
+Migrating **from stock LLDAP** (not between database backends) is
+[v0.7-from-lldap.md](migration_guides/v0.7-from-lldap.md).
 
-Existing servers can migrate from one database backend to another. This page includes guidance for migrating from SQLite - similar concepts apply when migrating from databases of other types.
+Existing servers can migrate from one database backend to another. This page includes guidance for migrating from SQLite - similar concepts apply when migrating from databases of other types. SQLite and PostgreSQL are tested in CI; MySQL/MariaDB is best-effort.
 
 NOTE: [pgloader](https://github.com/dimitri/pgloader) is a tool that can easily migrate to PostgreSQL from other databases. Consider it if your target database is PostgreSQL
 
@@ -35,11 +35,16 @@ We want to dump (almost) all existing values to some file - the exception being 
 the `sqlite_sequence` table, when it exists). Be sure to stop/pause LLDAP during this step, as some
 databases (SQLite in this example) will give an error if LLDAP is in the middle of a write. The dump should consist just INSERT
 statements. There are various ways to do this, but a simple enough way is filtering a
-whole database dump. This repo contains [a script](/scripts/sqlite_dump_commands.sh) to generate SQLite commands for creating an appropriate dump:
+whole database dump. This repo contains [a script](../scripts/sqlite_dump_commands.sh) to generate SQLite commands for creating an appropriate dump:
 
 ```sh
 ./sqlite_dump_commands.sh | sqlite3 /path/to/lldap/config/users.db > /path/to/dump.sql
 ```
+
+The script covers KLLDAP's tables too: `user_object_classes`, `group_object_classes` and
+`system_config` (your OUs and POSIX settings). `create_schema` seeds `system_config` with the
+defaults, so delete those rows on the target before inserting the dump
+(`DELETE FROM system_config;`), or the insert stops on the duplicate `allowedous` key.
 
 ## Sanitize data
 
@@ -111,4 +116,6 @@ Modify your `database_url` in `lldap_config.toml` (or `LLDAP_DATABASE_URL` in th
 to point to your new database (the same value used when generating schema). Restart
 LLDAP and check the logs to ensure there were no errors.
 
-#### More details/examples can be seen in the CI process [here](https://raw.githubusercontent.com/lldap/lldap/main/.github/workflows/docker-build-static.yml), look for the job `lldap-database-migration-test`
+The PostgreSQL path is exercised in CI: the migration lane in
+[`.github/workflows/rust.yml`](../.github/workflows/rust.yml) and the `postgres` matrix entry
+of [`gate.yml`](../.github/workflows/gate.yml).

@@ -2,67 +2,107 @@
 
 ## [0.7.4] unreleased
 
-- **Security**: key-file deployments without a `key_seed` silently ran on a built-in
-  deterministic key since 0.7.2 (the "startup figment logic" change) — the configured
-  key file was ignored. The server now loads the real key file; affected deployments
-  will stop at startup with "The private key has changed" and must restart once with
+Everything since 0.7.2: the LLDAP migration path, a full audit of the LDAP layer, a
+container test gate, and a code sweep back to LLDAP's shape.
+
+### Security
+
+- Key-file deployments without a `key_seed` silently ran on a built-in deterministic
+  key since 0.7.2 (the "startup figment logic" change) — the configured key file was
+  ignored. The server now loads the real key file; affected deployments stop at startup
+  with "The private key has changed" and must restart once with
   `--force-update-private-key=true` (and `--force-ldap-user-pass-reset=true`), after
   which every user must reset their password. Deployments using `key_seed` are not
   affected.
-- Migration from stock LLDAP 0.6.x (schema ≤11) is now supported end-to-end: schema v13
-  re-encodes upstream attribute values, upstream `server_key` files are accepted, and
-  passwords upgrade transparently on the first LDAP bind or `/auth/simple/login`. See
-  `docs/migration_guides/v0.7-from-lldap.md`.
-- GraphQL API restored to full upstream compatibility (lldap-cli works unmodified).
-- GitHub Actions CI resurrected; release version single-sourced from Cargo.toml.
-- New container gate suite (`make gate`): 13 phases exercising the real image from
-  entrypoint boot through OU/user lifecycle, Kerberos principal sync/kinit, LDAP
-  read/write matrices, keytab export, restart persistence and KDC-death detection;
-  SQLite and Postgres lanes, wired into CI (`gate.yml`).
-- The Docker HEALTHCHECK now includes Kerberos (`lldap healthcheck --kerberos`): a dead
-  KDC or missing admin keytab turns the container unhealthy instead of silently
-  degrading sync. Boot scripts prefer `LLDAP_UID`/`LLDAP_GID` (legacy `UID`/`GID` still
-  honored); the KDC bootstrap is idempotent and re-runnable via
-  `kerberos_manager --bootstrap-only`.
+- Members of `lldap_password_manager` could not change another user's password through
+  LDAP Modify `userPassword` (the extended PasswordModify operation worked); LDAP Modify
+  now applies the same password rules as the extended operation.
+
+### Migration from LLDAP
+
+- Stock LLDAP 0.6.x databases (schema ≤ 11) migrate end-to-end: schema v13 re-encodes
+  upstream attribute values, upstream `server_key` files are accepted, and passwords
+  upgrade transparently on the first LDAP bind or `/auth/simple/login`. See
+  [docs/migration_guides/v0.7-from-lldap.md](docs/migration_guides/v0.7-from-lldap.md).
+- The v12 migration is repaired and idempotent on PostgreSQL (fresh and upgraded).
+- Attribute values use one canonical encoding on read and write; DateTime attributes no
+  longer corrupt.
+
+### LDAP
+
+- Users, groups and OUs answer filters and scopes per RFC 4511: subtree at a leaf DN
+  returns that entry, base-scope lookups no longer scan the directory, OU entries only
+  match filters their attributes satisfy, `cn` equality is case-insensitive,
+  `displayName` is returned alongside `cn`, `groupid` is exposed and filterable, and
+  canonical attribute names (`userid`, `displayname`, timestamps) resolve like their
+  aliases.
+- SSSD rfc2307 enumeration works out of the box: `memberUid`, `member`/`uniqueMember`,
+  `gecos`; `shadow*`/`host`/`userPassword` requests are silent no-ops; unknown filter
+  attributes log at debug.
 - LDAP ADD no longer silently drops attributes: values the schema knows (custom
-  attributes, sshPublicKey, admin-overridable POSIX numbers) persist; read-only and
-  unknown names are skipped with a warning.
-- Fixed: `--healthcheck-http-host`/`--healthcheck-ldap-host` CLI flags had no effect
-  (their environment variables worked).
-- Kerberos file locations and the KDC port can be overridden with `LLDAP_KERB_*`
-  environment variables (`LLDAP_KERB_ADMIN_KEYTAB`, `LLDAP_KERB_KRB5_CONF`,
-  `LLDAP_KERB_KDC_DIR`, `LLDAP_KERB_KDC_PORT`, ...); unset means the container layout
-  is unchanged. The Kerberos FFI is now exercised against a throwaway KDC in CI
-  (`make test-kdc`).
-- Keycloak federation settings have a single owner: `/data/keycloak_config.toml`
-  (path override `LLDAP_KEYCLOAK_CONFIG`), written from the Federation tab; the admin
-  password stays in `LLDAP_KEYCLOAK_ADMIN_PASS`. The file is no longer pre-created at boot
-  (derived defaults are shown until the first save) and the unused `[keycloak_options]`
-  server config block is gone. Boot logs no longer warn about `LLDAP_UID`/`LLDAP_GID`
-  or `LLDAP_KERB_*` as unknown variables.
-- LDAP group entries expose `groupid` again and `(groupid=N)` filters match on the group
-  id, as in upstream LLDAP. The Keycloak realm push now builds the LDAP provider's
-  `usersDn`/`groupsDn`/`bindDn` from LLDAP's base DN instead of the Keycloak realm name.
-- Fixed: re-submitting a user's own `uidNumber` on update was rejected as "already assigned".
-  `setPosixSettings` now checks authorization before validating ranges. Group `gidNumber`
-  updates accept the same 3000–60000 range as creates (the update path stopped at 20000) and a
-  group may re-submit its own `gidNumber`. Base-scope LDAP lookups of a single user or group
-  no longer scan the whole directory to answer.
-- Fixed: members of `lldap_password_manager` could not change another user's password
-  through LDAP Modify `userPassword` (the extended PasswordModify operation worked); LDAP
-  Modify now applies the same password rules as the extended operation. LDAP ADD of a group
-  persists its schema-known attributes (`gidNumber`, custom group attributes) like user ADD.
-  GraphQL error messages now carry the underlying cause in the message itself (the
+  attributes, sshPublicKey, admin-overridable POSIX numbers) persist for users and
+  groups; read-only and unknown names are skipped with a warning.
+
+### Kerberos
+
+- KDC principals are disabled while a user is in `lldap_disabled` and re-asserted after
+  a password sync; the admin keytab is recreated when `/data` is wiped but the KDC
+  volume survives.
+- The Docker HEALTHCHECK includes Kerberos (`lldap healthcheck --kerberos`): a dead KDC
+  or missing admin keytab turns the container unhealthy. The KDC bootstrap is idempotent
+  and re-runnable via `kerberos_manager --bootstrap-only`.
+- File locations and the KDC port can be overridden with `LLDAP_KERB_*` variables;
+  unset means the container layout is unchanged.
+
+### GraphQL and Keycloak
+
+- Full upstream GraphQL compatibility restored (lldap-cli works unmodified).
+- Keycloak federation settings have a single owner, `/data/keycloak_config.toml`
+  (`LLDAP_KEYCLOAK_CONFIG`), written from the Federation tab; the admin password stays
+  in `LLDAP_KEYCLOAK_ADMIN_PASS`. The realm push builds the LDAP provider DNs from
+  LLDAP's base DN. `setPosixSettings` checks authorization before validating ranges.
+- GraphQL error messages carry the underlying cause in the message (the
   `extensions.details` field is gone).
+
+### Configuration and container
+
+- Boot scripts prefer `LLDAP_UID`/`LLDAP_GID` (legacy `UID`/`GID` still honored) and no
+  longer warn about `LLDAP_KERB_*`/`LLDAP_KEYCLOAK_*` as unknown variables.
+- SQLite URLs of the form `sqlite:///data/users.db` are normalized so a missing database
+  is created; a loopback `http_url` with password reset enabled logs a warning.
+- Fixed: `--healthcheck-http-host`/`--healthcheck-ldap-host` CLI flags had no effect.
+
+### Fixes
+
+- Re-submitting a user's own `uidNumber` was rejected as "already assigned"; group
+  `gidNumber` updates accept the same 3000–60000 range as creates and a group may
+  re-submit its own `gidNumber`.
+- Avatar processing, OU error display, Kerberos loading state and the `.gz` wasm asset
+  in the web UI.
+
+### Tests and CI
+
+- GitHub Actions resurrected (Rust workflow with SQLite and PostgreSQL lanes, shellcheck,
+  a live-KDC lane); release version single-sourced from `Cargo.toml`.
+- Container gate suite (`make gate`): 13 phases exercising the real image from entrypoint
+  boot through OU/user lifecycle, Kerberos principal sync/kinit, LDAP read/write matrices,
+  keytab export, restart persistence and KDC-death detection; SQLite and PostgreSQL
+  lanes, wired into CI (`gate.yml`). `make test-kdc` runs the Kerberos FFI against a
+  throwaway KDC.
+- Comment density and code shape brought back to LLDAP's; the crate layout is documented
+  in [docs/architecture.md](docs/architecture.md).
 
 ## [0.7.2] 2026-06-16
 
-- Bugfixes: user GID no longer clashes and errors against group GID's. Group uid and memberof lookup added to ldap search. startup figment logic for .lldap_initialized. Prevent deletion and name change of built-in load bearing functionality lldap groups.
-- kadm5.acl no longer automatically overwritten on container restart allowing for custom access permissions
-- kadm5.acl now checks for sanity and attempts basic self heal if not sane, if unable restores to default
-- attribute group: lldap_sudohost added with RFC compliance for search and lookup for SSSD
-- attribute group: lldap_disabled improved RFC compliance
-- unknown ldap search attributes no longer return warn spam, returning only on debug
+- User GIDs no longer clash with group GIDs.
+- Group `uid` and `memberOf` lookups added to LDAP search.
+- Startup no longer fails when `.lldap_initialized` is present.
+- Built-in `lldap_*` groups can no longer be deleted or renamed.
+- `kadm5.acl` is no longer overwritten on restart; it is sanity-checked and repaired,
+  falling back to the default when unrepairable.
+- `lldap_sudohost` group added (SSSD `sudoHost`); `lldap_disabled` RFC compliance
+  improved.
+- Unknown LDAP search attributes log at debug instead of warn.
 
 ## [0.7.1] 2026-05-15
 
@@ -79,6 +119,11 @@ Major fork release, integration of MIT Kerberos into a docker container, OU's, r
  - Migraton to v12 to support new schema and system_settings
  - Updated rust toolchain to 1.95.0
  - Dependency updates, including opaque version 4, graphql .16 and many others
+
+---
+
+Everything below is upstream [LLDAP](https://github.com/lldap/lldap)'s changelog; KLLDAP
+forked after 0.6.3.
 
 ## [0.6.3] 2026-05-01
 

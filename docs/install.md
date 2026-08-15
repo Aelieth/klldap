@@ -1,32 +1,34 @@
 # Installing KLLDAP
 
-KLLDAP is currently **Docker-only**.  
-This is a personal hobby project / half-brother fork of LLDAP developed for my own home-lab use. The Docker container is the exact environment I build and test against.
-
-**Podman** (rootless) is **not supported** at this time. MIT Kerberos requires root privileges inside the container for kadmin.local, keytab creation, and database initialization. You are welcome to experiment, but it is not tested or guaranteed to work.
+KLLDAP is Docker-only: the MIT Kerberos KDC (`krb5kdc`, `kadmind`) runs inside the
+image beside the server, bootstrapped by the entrypoint. There are no packages, and
+bare-metal installs are not supported.
 
 - [With Docker](#with-docker)
+- [First start](#first-start)
 - [With Podman](#with-podman)
-- [Other methods](#other-methods)
+- [Migrating from LLDAP](#migrating-from-lldap)
 
 ### With Docker
 
-The image is available at `aelieth/klldap`.
+The image is available at `aelieth/klldap`. Persist two folders:
 
-You should persist two folders:
-- `/data` — contains LLDAP config, users, groups, and keycloak_config.toml
-- `/var/kerberos/krb5kdc` — contains the Kerberos database (critical — do not lose this)
+- `/data`: configuration, the SQLite database, the admin keytab, keytabs exported
+  for Keycloak, and `keycloak_config.toml`.
+- `/var/kerberos/krb5kdc`: the KDC database. Losing it means every Kerberos
+  principal has to be recreated.
 
-On first run the container automatically bootstraps the full MIT Kerberos KDC (creates database, admin principal, keytab, renders configs, starts krb5kdc and kadmind).
+Configuration is `/data/lldap_config.toml`, copied from
+[`lldap_config.docker_template.toml`](../lldap_config.docker_template.toml) on first
+start, and any `LLDAP_*` environment variable overrides it (see the table in the
+[README](../README.md#configuration)). Set `LLDAP_JWT_SECRET`, `LLDAP_LDAP_USER_PASS`,
+`LLDAP_KEY_SEED` (or a `key_file` under `/data`) and `LLDAP_LDAP_BASE_DN`; the base
+DN also becomes the Kerberos realm (`dc=example,dc=com` → `EXAMPLE.COM`).
 
 ```yaml
-version: "3"
-
 volumes:
   lldap_data:
-    driver: local
   kerberos_db:
-    driver: local
 
 services:
   klldap:
@@ -34,39 +36,30 @@ services:
     container_name: klldap
     restart: unless-stopped
     ports:
-      # LDAP (not recommended to expose publicly)
-      - "3890:3890"
-      # For LDAPS (LDAP Over SSL), enable port if LLDAP_LDAPS_OPTIONS__ENABLED set true, look env below
-      #- "6360:6360"
-      # Web UI
-      - "17170:17170"
-      # Kerberos KDC
-      - "88:88/tcp"
+      - "3890:3890"       # LDAP (do not expose publicly)
+      #- "6360:6360"      # LDAPS, with LLDAP_LDAPS_OPTIONS__ENABLED=true
+      - "17170:17170"     # Web UI and API
+      - "88:88/tcp"       # Kerberos KDC
       - "88:88/udp"
-      # Kerberos admin
-      - "749:749/tcp"
+      - "749:749/tcp"     # Kerberos admin (kadmin)
     volumes:
       - lldap_data:/data
       - kerberos_db:/var/kerberos/krb5kdc
-      # Alternatively, you can mount local folders:
-      # - "./lldap_data:/data"
-      # - "./kerberos_db:/var/kerberos/krb5kdc"
     environment:
-      - UID=####
-      - GID=####
-      - TZ=####/####
+      - LLDAP_UID=1000
+      - LLDAP_GID=1000
+      - TZ=Etc/UTC
       - LLDAP_JWT_SECRET=REPLACE_WITH_RANDOM_SECRET
+      - LLDAP_KEY_SEED=REPLACE_WITH_RANDOM_SEED
       - LLDAP_LDAP_USER_PASS=CHANGE_ME
       - LLDAP_LDAP_BASE_DN=dc=example,dc=com
-      # KLLDAP-specific (optional)
-      - LLDAP_KEYCLOAK_ADMIN_PASS=admin
-      - LLDAP_KERB_REALM_NAME=EXAMPLE.COM
-      # Original LLDAP options still fully supported:
-      # - LLDAP_DATABASE_URL=mysql://mysql-user:password@mysql-server/my-database
-      # - LLDAP_DATABASE_URL=postgres://postgres-user:password@postgres-server/my-database
+      # Optional:
+      # - LLDAP_KERB_REALM_NAME=EXAMPLE.COM
+      # - LLDAP_KEYCLOAK_ADMIN_PASS=admin
+      # - LLDAP_DATABASE_URL=postgres://user:password@postgres/lldap
       # - LLDAP_LDAPS_OPTIONS__ENABLED=true
-      # - LLDAP_LDAPS_OPTIONS__CERT_FILE=/path/to/certfile.crt
-      # - LLDAP_LDAPS_OPTIONS__KEY_FILE=/path/to/keyfile.key
+      # - LLDAP_LDAPS_OPTIONS__CERT_FILE=/data/cert/cert.pem
+      # - LLDAP_LDAPS_OPTIONS__KEY_FILE=/data/cert/key.pem
       # - LLDAP_SMTP_OPTIONS__ENABLE_PASSWORD_RESET=true
       # - LLDAP_SMTP_OPTIONS__SERVER=smtp.example.com
       # - LLDAP_SMTP_OPTIONS__PORT=465
@@ -74,28 +67,41 @@ services:
       # - LLDAP_SMTP_OPTIONS__USER=no-reply@example.com
       # - LLDAP_SMTP_OPTIONS__PASSWORD=PasswordGoesHere
       # - LLDAP_SMTP_OPTIONS__FROM=no-reply <no-reply@example.com>
-      # - LLDAP_SMTP_OPTIONS__REPLY_TO=Do not reply <no-reply@example.com>
-      # Required for working password-reset links (the emailed URL is built from it):
-      # - LLDAP_HTTP_URL=https://your-real-ui-url
+      # - LLDAP_HTTP_URL=https://ldap.example.com   # password-reset links are built from it
 ```
 
-After first start:
+Secrets can come from files instead of the environment by appending `_FILE`
+(`LLDAP_JWT_SECRET_FILE=/run/secrets/jwt`).
 
-Visit http://your-server:17170
-Default admin login: admin / whatever you set for LLDAP_LDAP_USER_PASS
-Use the Federation tab to configure and push to Keycloak.
+### First start
 
-The container will automatically bootstrap the Kerberos KDC on first run (creates database, admin keytab, renders config files).
-## With Podman
-Podman is currently not supported.
-The integrated MIT Kerberos KDC requires root privileges inside the container. Podman’s default rootless mode does not work reliably with KLLDAP.
-You are free to experiment, but no support or guarantees are provided.
+The entrypoint starts the server, waits for it to be healthy, then bootstraps the KDC:
+it creates the Kerberos database with a random, stash-only master password, the
+`admin/admin@REALM` principal and `/data/kadm5.keytab`, renders `krb5.conf`,
+`kdc.conf` and `kadm5.acl` from the templates in `/app`, and starts
+`krb5kdc` and `kadmind`. Later starts skip what already exists. The container's
+healthcheck (`lldap healthcheck --kerberos`) fails until the KDC is up.
 
+Then:
 
-## Other methods
-Kubernetes – Not officially supported yet (you can try the upstream LLDAP Kubernetes examples, but Kerberos will need extra work).
-From source / bare metal – Possible but not recommended. This is a personal hobby project developed exclusively for Docker.
-Package repositories – None exist. KLLDAP is not packaged anywhere.
+- open `http://your-server:17170` and log in as `admin` with `LLDAP_LDAP_USER_PASS`,
+- create users, groups and OUs; turn on `kerberosSync` for users that need a principal
+  (it is created when their password is set),
+- point Keycloak at KLLDAP from the Federation tab, if you use it.
 
-# Note: KLLDAP is a personal hobby project for my own home-lab use. The Docker container is the only target I actively develop and test against. Use at your own risk.
-For configuration details see the Environment Variables section in the main README.
+`docker logs klldap` shows the bootstrap; `docker exec klldap kadmin.local -q listprincs`
+lists the principals. See [kerberos.md](kerberos.md) for the details and
+[faq.md](faq.md) if you cannot log in.
+
+### With Podman
+
+Untested. The container needs to run as root inside its own namespace (it chowns
+`/data`, runs `kdb5_util` and spawns the daemons), which rootless Podman provides;
+the [quadlets](../example_configs/podman-quadlets/) are adapted to KLLDAP as a
+starting point. Please report what you find.
+
+### Migrating from LLDAP
+
+Stock LLDAP 0.6.x databases (schema 11 or older) can move to KLLDAP with data and
+passwords intact: [migration_guides/v0.7-from-lldap.md](migration_guides/v0.7-from-lldap.md).
+Moving between database backends is in [database_migration.md](database_migration.md).

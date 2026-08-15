@@ -1,9 +1,19 @@
 # Example configurations
 
+KLLDAP keeps LLDAP's LDAP layout, so upstream's client configurations apply unchanged;
+these are upstream's, plus the KLLDAP-specific guides:
+
+- [SSSD + Kerberos + Keycloak](../docs/SSSD_LDAP_Kerberos_Setup_Guide.md) — POSIX login
+  with Kerberos authentication and browser SSO
+- [PAM / nslcd](pam/README.md) — Linux accounts over LDAP without SSSD
+- [Podman quadlets](podman-quadlets/readme.md) — untested with KLLDAP, adapted as a start
+- [Bootstrap](bootstrap/bootstrap.md) — declarative users, groups and attributes from JSON
+
 Some specific clients have been tested to work and come with sample
 configuration files:
 
 - [Airsonic Advanced](airsonic-advanced.md)
+- [Apache HTTP Server](apache.md)
 - [Apache Guacamole](apacheguacamole.md)
 - [Apereo CAS Server](apereo_cas_server.md)
 - [Authelia](authelia.md)
@@ -11,16 +21,20 @@ configuration files:
 - [Bookstack](bookstack.env.example)
 - [Calibre-Web](calibre_web.md)
 - [Carpal](carpal.md)
+- [Continuwuity](continuwuity.md)
 - [Dell iDRAC](dell_idrac.md)
 - [Dex](dex_config.yml)
 - [Dokuwiki](dokuwiki.md)
 - [Dolibarr](dolibarr.md)
 - [Duo Auth Proxy](duo_auth_proxy.md)
 - [Ejabberd](ejabberd.md)
+- [Elasticsearch](elasticsearch.md)
 - [Emby](emby.md)
 - [Ergo IRCd](ergo.md)
+- [Gerrit](gerrit.md)
 - [Gitea](gitea.md)
 - [GitLab](gitlab.md)
+- [Gogs](gogs.md)
 - [Grafana](grafana_ldap_config.toml)
 - [Grocy](grocy.md)
 - [Harbor](harbor.md)
@@ -47,6 +61,8 @@ configuration files:
 - [Nexus](nexus.md)
 - [OCIS (OwnCloud Infinite Scale)](ocis.md)
 - [OneDev](onedev.md)
+- [OpenCloud](opencloud.md)
+- [Open WebUI](open-webui.md)
 - [Organizr](Organizr.md)
 - [Peertube](peertube.md)
 - [Penpot](penpot.md)
@@ -60,6 +76,7 @@ configuration files:
 - [Radicale](radicale.md)
 - [Rancher](rancher.md)
 - [Seafile](seafile.md)
+- [Semaphore](semaphore.md)
 - [Shaarli](shaarli.md)
 - [Snipe-IT](snipe-it.md)
 - [SonarQube](sonarqube.md)

@@ -1,5 +1,11 @@
 # Getting Started with UNIX PAM using SSSD
 
+> This is upstream LLDAP's guide, kept for the nslcd path and its custom-attribute
+> walkthrough. With KLLDAP, users and groups already carry the POSIX attributes and
+> object classes, and the KDC does authentication: the
+> [SSSD + Kerberos guide](../../docs/SSSD_LDAP_Kerberos_Setup_Guide.md) is the canonical
+> setup.
+
 This guide was tested with LDAPS on debian 12 with SSSD 2.8.2 and certificates signed by a registered CA.
 
 ## Configuring LLDAP
@@ -103,7 +109,7 @@ The following domain configuration is set up for the LLDAP `RFC2307bis` schema a
 beginning of the guide. It allows all configured LDAP users to log in by default while filtering out users and groups
 which don't have their posix IDs set.
 
-Because caching is enabled make sure to check the [Debugging](#Debugging) section on how to
+Because caching is enabled make sure to check the [Debugging](#debugging) section on how to
 flush the cache if you are having problems.
 
 Create a separate configuration file for your domain.

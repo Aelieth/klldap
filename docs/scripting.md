@@ -1,37 +1,61 @@
 # Scripting
 
-Programmatically accessing LLDAP can be done either through the LDAP protocol,
+Programmatically accessing KLLDAP can be done either through the LDAP protocol,
 or via the GraphQL API.
 
 ## LDAP
 
-Most _read-only_ queries about users and groups are supported. Anything not
+Read queries about users and groups are supported: base, one-level and subtree
+searches with the usual filters (`&`, `|`, `!`, equality, substring, presence,
+`>=`/`<=` on timestamps and numbers, `memberOf`, `memberUid`), operational
+attributes (`+`), the subschema and the root DSE, compare and whoami. Anything not
 supported would be considered a missing feature or a bug.
 
-Most _modification_ queries are not supported, except for creating users and
-changing the password (through the extended password operation). Those could be
-added in the future, on a case-by-case basis.
+Writes are supported for the common administrative operations:
 
-Most _meta_-queries about the LDAP server itself are not supported and are out
-of scope. That includes anything that touches the schema, for instance. LLDAP
-still supports basic RootDSE queries.
+- `ldapadd` a user under `ou=people` (`inetOrgPerson`; `mail`, `cn`, `givenName`,
+  `sn`, `userPassword`, POSIX numbers, `sshPublicKey`, `kerberosSync`, custom
+  attributes) or a group under `ou=groups` (`groupOfUniqueNames`/`posixGroup`,
+  `gidNumber`, custom attributes). Read-only and unknown attributes are skipped with
+  a warning; the user's OU comes from the DN.
+- `ldapmodify` on a user: replace/add/delete `mail`, `cn`, `givenName`, `sn`,
+  `jpegPhoto`, `sshPublicKey`, and replace `userPassword` (self, admin, or a
+  password manager for non-admins). `ou` is changed through GraphQL, not LDAP.
+- `ldappasswd`, the password-modify extended operation (RFC 3062), same rules.
+- `ldapdelete` of a user or group (admin).
 
-Anonymous bind is not supported.
+Group membership, OUs and POSIX settings are managed through GraphQL. Meta-queries
+about the server beyond the root DSE and subschema are out of scope. Anonymous bind
+is not supported.
 
 ## `lldap-cli`
 
-There is a community-built CLI frontend,
-[Zepmann/lldap-cli](https://github.com/Zepmann/lldap-cli), that supports all
-(as of this writing) the operations possible. Getting information from the
-server, creating users, adding them to groups, creating new custom attributes
-and populating them, all of that is supported. It is currently the easiest way
-to script the interaction with LLDAP.
+The community CLI [Zepmann/lldap-cli](https://github.com/Zepmann/lldap-cli) works
+against KLLDAP unmodified (its exact request shapes are replayed in the test suite).
+The one visible difference is that the `JPEG_PHOTO` attribute type is displayed as
+`AVATAR`; both names are accepted as input.
 
 ## GraphQL
 
-The best way to interact with LLDAP programmatically is via the GraphQL
+The best way to interact with KLLDAP programmatically is via the GraphQL
 interface. You can use any language that has a GraphQL library (most of them
 do), and use the [GraphQL Schema](../schema.graphql) to guide your queries.
+
+Beyond LLDAP's users, groups, attributes and object classes, the schema exposes:
+
+- OUs: `listOus`, `createOu`, `deleteOu`, `changeUserOu`, `changeGroupOu`.
+- POSIX: `posixSettings`, `setPosixSettings`, and the bulk re-assignment mutations
+  (`reassignUserUidNumbers`, `reassignUserGidNumbers`, `reassignUserHomedirectories`,
+  `reassignUserLoginshells`, `reassignGidNumbers`).
+- Kerberos: `kerberosInfo` (the RSA public key the web UI encrypts passwords with),
+  `syncKerberosPassword`, `exportKeytabForKeycloak`.
+- Keycloak: `keycloakSuggestedConfig`, `keycloakConfig`, `testKeycloakConnection`,
+  `saveKeycloakConfig`, `pushRealmToKeycloak`.
+
+`setUserPassword(userId, password)` sets a password over the API (self or admin): the
+server runs the OPAQUE registration itself, so nothing but the OPAQUE record is stored,
+and the KDC principal is updated when the user has `kerberosSync` on. Use it over
+HTTPS only, like the rest of the API.
 
 ### Getting a token
 
@@ -42,7 +66,7 @@ members of these groups, for instance).
 
 #### Manually
 
-Log in to the web front-end of LLDAP. Then open the developer tools (F12), find
+Log in to the web front-end of KLLDAP. Then open the developer tools (F12), find
 the "Storage > Cookies", and you'll find the "token" cookie with your JWT.
 
 ![Cookies menu with a JWT](cookie.png)
@@ -84,6 +108,8 @@ Then you can enter your query, for instance:
 {
   user(userId:"admin") {
     displayName
+    ou
+    sshPublicKeys
   }
   groups {
     id

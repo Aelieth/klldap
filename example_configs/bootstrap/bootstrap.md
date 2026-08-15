@@ -1,4 +1,4 @@
-# Bootstrapping lldap using [bootstrap.sh](/scripts/bootstrap.sh) script
+# Bootstrapping lldap using [bootstrap.sh](../../scripts/bootstrap.sh) script
 
 bootstrap.sh allows managing your lldap in a git-ops, declarative way using JSON config files.
 
@@ -202,7 +202,7 @@ version: "3"
 
 services:
   lldap:
-    image: lldap/lldap:v0.5.0
+    image: aelieth/klldap:latest
     volumes:
       - ./bootstrap:/bootstrap
     ports:
@@ -246,7 +246,7 @@ spec:
       restartPolicy: OnFailure
       containers:
         - name: lldap-bootstrap
-          image: lldap/lldap:latest
+          image: aelieth/klldap:latest
 
           command:
             - /app/bootstrap.sh

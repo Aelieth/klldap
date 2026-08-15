@@ -1,15 +1,12 @@
+## Copied to /data/kerberos_config.toml on first start (see docs/kerberos.md).
+## realm_name and base_dn are always taken from the environment
+## (LLDAP_KERB_REALM_NAME or the realm derived from LLDAP_LDAP_BASE_DN); the values below
+## are rendered into krb5.conf.
 [kerberos]
-# Realm will be auto-derived from LLDAP_LDAP_BASE_DN (e.g., dc=homelab,dc=local → HOMELAB.LOCAL)
-# Override with LLDAP_KERB_REALM_NAME env if needed.
 realm_name = ""
-
-# Base DN shared with LLDAP — auto-set from LLDAP_LDAP_BASE_DN env.
 base_dn = ""
 
 ticket_lifetime = "24h"
 renew_lifetime = "7d"
 forwardable = true
 rdns = false
-
-## realm_name and base_dn are derived from LLDAP_KERB_REALM_NAME / LLDAP_LDAP_BASE_DN;
-## the remaining values come from this file.

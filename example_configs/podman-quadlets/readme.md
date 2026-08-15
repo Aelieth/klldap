@@ -1,11 +1,19 @@
 ## Installing the quadlet lldap user service
 
+These quadlets are upstream LLDAP's, adapted to the KLLDAP image (two volumes, the
+Kerberos ports and the `--kerberos` healthcheck). KLLDAP under rootless Podman is
+**untested**: the container runs its KDC bootstrap as root inside its user namespace,
+which Podman provides, but nobody has confirmed the result yet — please report what you
+find.
+
 The following assumes you have a working Podman installation and that you want to install lldap as a user service.
 
 It will create a systemd service for each of the quadlet files. As the files are supplied, the resulting services are:
 - lldap.service
 - lldap-db.service
 - lldap-db-volume.service
+- lldap-data-volume.service
+- lldap-kdc-volume.service
 - lldap-frontend-network.service
 - lldap-backend-network.service
 
@@ -17,7 +25,7 @@ Starting `lldap.service` will start all the other services, but stopping it will
 
 ### Instructions
 
-- Copy `lldap-db.container`, `lldap.container`, `lldap-db.volume`, `lldap-frontend.network`, and `lldap-backend.network` to `~/.config/containers/systemd/`
+- Copy `lldap-db.container`, `lldap.container`, `lldap-db.volume`, `lldap-data.volume`, `lldap-kdc.volume`, `lldap-frontend.network`, and `lldap-backend.network` to `~/.config/containers/systemd/`
 - Adjust the line `Environment=LLDAP_LDAP_BASE_DN=dc=example,dc=com` in `lldap.container` to match your domain name.
     - The default value assumes your domain is "example.com"
 - Create the necessary secrets: `lldap-jwt-secret`, `lldap-key-seed`, and `lldap-ldap-user-pass`.

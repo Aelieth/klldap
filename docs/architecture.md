@@ -1,57 +1,70 @@
 # Architecture
 
 The server is entirely written in Rust, using [actix](https://actix.rs) for the
-backend and [yew](https://yew.rs) for the frontend.
+backend and [yew](https://yew.rs) for the frontend. An MIT Kerberos KDC runs beside
+it in the same container.
 
 Backend:
 * Listens on a port for LDAP protocol.
-  * Only a small, read-only subset of the LDAP protocol is supported.
-  * In addition to that, an extension to allow resetting the password is also
-    supported.
+  * Reads: bind, search (base/one/subtree, filters, `memberOf`, operational
+    attributes, subschema, root DSE), compare, whoami.
+  * Writes: add users and groups, modify a user's attributes and password (Replace,
+    Add, Delete), delete users and groups, and the password-modify extended operation.
 * Listens on another port for HTTP traffic.
   * The authentication API, based on JWTs, is under "/auth".
   * The user management API is a GraphQL API under "/api/graphql". The schema
     is defined in `schema.graphql`.
   * The static frontend files are served by this port too.
-* Integrated MIT Kerberos KDC runs inside the container via FFI bindings.
-  * Automatic principal sync on user create/password change/delete.
-  * Keycloak federation support via dedicated GraphQL mutations.
+* Keeps the KDC in step: principals are created, updated, disabled and deleted as
+  users are created, get a password, join or leave `lldap_disabled`, or are deleted.
+  The KDC's own database lives in `/var/kerberos/krb5kdc`; the admin keytab in
+  `/data/kadm5.keytab`.
 
 Note that HTTPS is currently not supported. This can be worked around by using
 a reverse proxy in front of the server (for the HTTP API) that wraps/unwraps
-the HTTPS messages. LDAPS is supported. Kerberos ports (88/tcp+udp, 749/tcp)
-are also exposed.
+the HTTPS messages. LDAPS is supported.
 
 Frontend:
-* User management UI with new Federation tab.
+* User management UI, plus OU management, POSIX settings and the Keycloak
+  Federation tab.
 * Written in Rust compiled to WASM as an SPA with the Yew library.
 * Based on components, with a React-like framework.
-* Includes reusable OuSelector and OuTable for hierarchical OU management.
 
 Data storage:
-* The data (users, groups, memberships, active JWTs, ...) is stored in SQL.
-* The main SQL DBs are supported: SQLite by default, MySQL, MariaDB, PostgreSQL
-  (see [DB Migration](/database_migration.md) for how to migrate off of
-  SQLite).
-* Single source of truth for schema, OUs, and system settings lives in
-  `crates/schema/src/public_schema.rs` (PublicSchema::get()).
+* The data (users, groups, memberships, OUs, POSIX settings, active JWTs, ...) is
+  stored in SQL.
+* SQLite by default; PostgreSQL is tested in CI; MySQL/MariaDB is best-effort (see
+  [DB Migration](database_migration.md) for how to migrate off of SQLite).
+* The attribute schema (names, aliases, types, flags) is compiled in:
+  `crates/schema/src/public_schema.rs`. Custom attributes live in the database.
 
 ### Code organization
 
-* `auth/`: Contains the shared structures needed for authentication, the
-  interface between front and back-end. In particular, it contains the OPAQUE
-  structures and the JWT format.
-* `app/`: The frontend.
-  * `src/components`: The elements containing the business and display logic of
-    the various pages and their components (including new Federation and OU
-    components).
-  * `src/infra`: Various tools and utilities.
-* `server/`: The backend.
-  * `src/domain/`: Domain-specific logic: users, groups, checking passwords...
-  * `src/infra/`: API, both GraphQL and LDAP.
-* `crates/schema/`: Single source of truth for all attributes (PublicSchema).
-* `crates/kerberos/`: Full MIT Kerberos KDC, principal sync, and Keycloak
-  federation logic (FFI bindings + kerberos_manager bin).
+* `server/`: the binary — configuration, the LDAP and HTTP servers, the healthcheck.
+* `app/`: the frontend.
+  * `src/components`: the pages and their components.
+  * `src/infra`: tools and utilities.
+* `crates/auth`: the shared structures needed for authentication, the interface
+  between front and back-end (OPAQUE structures, JWT format).
+* `crates/domain`, `crates/domain-model`, `crates/domain-handlers`: domain types,
+  SeaORM models, and the backend-handler traits, including the `KerberosSync` seam
+  that ldap/sql/graphql call and the server binds to the real KDC.
+* `crates/sql-backend-handler`: the SQL implementation of the handlers, the
+  migrations (v12/v13 are KLLDAP's) and the POSIX validators.
+* `crates/access-control`: the permission-checked handles the APIs go through.
+* `crates/ldap`: the LDAP protocol layer (search, create, modify, delete, compare,
+  password), its DN model and the operational-attribute table.
+* `crates/graphql-server`: the GraphQL API, mutations split by concern (users and
+  groups, OUs, POSIX, Kerberos, Keycloak).
+* `crates/schema`: the attribute schema hub.
+* `crates/kerberos`: the libkadm5/libkrb5 FFI (the only unsafe code), the KDC
+  bootstrap and supervision (`kerberos_manager` binary), and the live `KerberosSync`.
+* `crates/keycloak`: the Keycloak admin client used by the Federation tab.
+* `crates/opaque-handler`, `crates/opaque-legacy`: the OPAQUE registration ceremony
+  and the LLDAP 0.6.x verifier used during migration.
+* `crates/validation`, `crates/frontend-options`, `crates/test-utils`.
+* `migration-tool/`, `set-password/`: the upstream command-line tools.
+* `gate/`: the container gate suite (see [testing.md](testing.md)).
 
 ## Authentication
 
@@ -74,13 +87,10 @@ shouldn't change (it would invalidate all passwords). Note that even if it was
 compromised, the attacker wouldn't be able to decrypt the passwords without
 running an expensive brute-force search independently for each password.
 
-Kerberos principals are handled with the same zero-knowledge philosophy. The
-MIT Kerberos KDC maintains its own independent database (`/var/kerberos/krb5kdc`).
-On user creation or password change, the plaintext password is decrypted once
-(RSA 2048 OAEP+SHA-256) and synced to the KDC via the kadm5 keytab. After this
-single sync operation, KLLDAP immediately discards all knowledge of the
-plaintext password — exactly like OPAQUE, retaining zero knowledge of the
-actual credential.
+The KDC needs the plaintext once, to set the principal's key: the web UI encrypts
+the password with RSA-OAEP for the `syncKerberosPassword` mutation, the LDAP and
+GraphQL password paths already hold it, and after the `kadmin` call it is dropped.
+KLLDAP keeps no copy; the KDC stores its own keys in its own database.
 
 ### JWTs and refresh tokens
 

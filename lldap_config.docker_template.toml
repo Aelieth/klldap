@@ -91,6 +91,12 @@
 ## Alternatively, you can set it to "always" to reset every time the server starts.
 # force_ldap_user_pass_reset = false
 
+## Accept a private key (key_file / key_seed) that differs from the one the database
+## was created with. Every stored password becomes unusable; combine with
+## force_ldap_user_pass_reset and have users reset their passwords. Env variable:
+## LLDAP_FORCE_UPDATE_PRIVATE_KEY
+# force_update_private_key = false
+
 ## Database URL.
 ## This encodes the type of database (SQlite, MySQL, or PostgreSQL)
 ## , the path, the user, password, and sometimes the mode (when
@@ -110,9 +116,11 @@ database_url = "sqlite:////data/users.db?mode=rwc"
 ## Note that even with a database dump and the private key, an attacker
 ## would still have to perform an (expensive) brute force attack to find
 ## each password.
-## Randomly generated on first run if it doesn't exist.
+## Randomly generated on first run if it doesn't exist. The default is
+## "server_key" relative to the working directory (/app in the image, which is
+## not persisted): in Docker, use a path under /data.
 ## Env variable: LLDAP_KEY_FILE
-#key_file = "/data/private_key"
+#key_file = "/data/server_key"
 
 ## Seed to generate the server private key, see key_file above.
 ## This can be any random string, the recommendation is that it's at least 12
@@ -175,3 +183,13 @@ key_seed = "RanD0m STR1ng"
 ## If "ldap_host" is set to a specific IP address, this must be set to match if the built-in
 ## healthcheck command is used.
 #ldap_host = "localhost"
+## Also require the Kerberos KDC to accept connections and the admin keytab to exist.
+## The image's HEALTHCHECK passes --kerberos on the command line, which has the same effect.
+#kerberos = false
+
+## Kerberos and Keycloak are configured outside this file:
+##  - the realm comes from ldap_base_dn (LLDAP_KERB_REALM_NAME overrides it) and the
+##    ticket settings from /data/kerberos_config.toml (see docs/kerberos.md);
+##  - Keycloak federation settings are written by the Federation tab to
+##    /data/keycloak_config.toml (LLDAP_KEYCLOAK_CONFIG); the admin password is
+##    LLDAP_KEYCLOAK_ADMIN_PASS.

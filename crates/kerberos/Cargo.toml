@@ -24,6 +24,9 @@ sha2 = "0.10"
 toml = "0.8"
 tracing = { workspace = true }
 
+[dependencies.lldap_domain_handlers]
+path = "../domain-handlers"
+
 [build-dependencies]
 bindgen = { version = "0.69.4", features = ["runtime"] }
 pkg-config = "0.3.30"

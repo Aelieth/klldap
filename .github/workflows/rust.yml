@@ -36,7 +36,7 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v6.0.1
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev clang pkg-config
+        run: sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y libkrb5-dev clang pkg-config krb5-kdc krb5-admin-server krb5-user
       - name: Install Rust
         run: rustup show
       - uses: Swatinem/rust-cache@v2
@@ -44,6 +44,8 @@ jobs:
         run: cargo build --verbose --workspace
       - name: Run tests
         run: cargo test --verbose --workspace
+      - name: Live-KDC FFI lane
+        run: gate/kdc-sandbox.sh cargo test -p lldap-kerberos --verbose -- --ignored --nocapture
       - name: Generate GraphQL schema
         run: cargo run -- export_graphql_schema -o generated_schema.graphql
       - name: Check schema
@@ -102,4 +104,4 @@ jobs:
           shellcheck --severity=error
           entrypoint.sh start-lldap.sh generate_secrets.sh export_schema.sh
           prepare-release.sh app/build.sh scripts/*.sh
-          gate/run-gate.sh gate/lib/*.sh gate/phases.d/*.sh
+          gate/run-gate.sh gate/kdc-sandbox.sh gate/lib/*.sh gate/phases.d/*.sh

@@ -41,12 +41,10 @@ path = "../opaque-handler"
 [dependencies.lldap_schema]
 path = "../schema"
 
-[dependencies.lldap-kerberos]
-path = "../kerberos"
-
 [dev-dependencies]
 mockall = { workspace = true }
 pretty_assertions = { workspace = true }
+serial_test = { workspace = true }
 
 [dev-dependencies.lldap_domain]
 path = "../domain"

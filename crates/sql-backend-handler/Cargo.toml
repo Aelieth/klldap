@@ -48,9 +48,6 @@ path = "../opaque-legacy"
 [dependencies.lldap_schema]
 path = "../schema"
 
-[dependencies.lldap-kerberos]
-path = "../kerberos"
-
 [dependencies.sea-orm]
 workspace = true
 features = [
@@ -68,6 +65,7 @@ workspace = true
 log = { workspace = true }
 mockall = { workspace = true }
 pretty_assertions = { workspace = true }
+serial_test = { workspace = true }
 
 [dev-dependencies.lldap_domain]
 path = "../domain"

@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 use std::env::var;
+use std::sync::Mutex;
 
 pub const DB_KEY: &str = "LLDAP_DATABASE_URL";
 pub const PRIVATE_KEY_SEED: &str = "LLDAP_KEY_SEED";
@@ -11,15 +12,30 @@ pub fn database_url() -> String {
     url.unwrap_or("sqlite://e2e_test.db?mode=rwc".to_string())
 }
 
+// Ports of the fixture-spawned server; env/defaults still serve an external server.
+static PORTS: Mutex<Option<(u16, u16)>> = Mutex::new(None);
+
+pub fn set_ports(ldap_port: u16, http_port: u16) {
+    *PORTS.lock().unwrap() = Some((ldap_port, http_port));
+}
+
+fn fixture_ports() -> Option<(u16, u16)> {
+    *PORTS.lock().unwrap()
+}
+
 pub fn ldap_url() -> String {
-    let port = var("LLDAP_LDAP_PORT").ok();
-    let port = port.unwrap_or("3890".to_string());
+    let port = fixture_ports()
+        .map(|(ldap, _)| ldap.to_string())
+        .or_else(|| var("LLDAP_LDAP_PORT").ok())
+        .unwrap_or("3890".to_string());
     format!("ldap://localhost:{port}")
 }
 
 pub fn http_url() -> String {
-    let port = var("LLDAP_HTTP_PORT").ok();
-    let port = port.unwrap_or("17170".to_string());
+    let port = fixture_ports()
+        .map(|(_, http)| http.to_string())
+        .or_else(|| var("LLDAP_HTTP_PORT").ok())
+        .unwrap_or("17170".to_string());
     format!("http://localhost:{port}")
 }
 

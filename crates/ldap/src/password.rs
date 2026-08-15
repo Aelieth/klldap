@@ -13,7 +13,7 @@ use lldap_access_control::{AccessControlledBackendHandler, UserReadableBackendHa
 use lldap_auth::access_control::ValidationResults;
 use lldap_domain::types::UserId;
 use lldap_domain_handlers::handler::{BackendHandler, BindRequest, LoginHandler};
-use lldap_kerberos::sync_kerberos_principal;
+use lldap_domain_handlers::kerberos::kerberos_backend;
 use lldap_opaque_handler::OpaqueHandler;
 use tracing::{info, warn};
 
@@ -156,7 +156,8 @@ pub(crate) async fn do_password_modification<Handler: BackendHandler + OpaqueHan
                         );
 
                         if sync_enabled {
-                            if let Err(e) = sync_kerberos_principal(uid.as_str(), password.as_str())
+                            if let Err(e) =
+                                kerberos_backend().sync_principal(uid.as_str(), password.as_str())
                             {
                                 warn!(
                                     "Kerberos principal sync failed after LDAP password change: {}",
@@ -186,7 +187,7 @@ pub(crate) async fn do_password_modification<Handler: BackendHandler + OpaqueHan
                                     .iter()
                                     .any(|g| g.display_name == "lldap_disabled".into())
                             {
-                                lldap_kerberos::reassert_kerberos_disabled(uid.as_str());
+                                kerberos_backend().reassert_disabled(uid.as_str());
                             }
                         }
 

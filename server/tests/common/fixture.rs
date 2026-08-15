@@ -29,13 +29,13 @@ fn post_graphql<T: graphql_client::GraphQLQuery + 'static>(
         Ok(data) => Ok(data),
         Err(e) => {
             // Raw fallback to capture the actual server response body
-            let graphql_url = "http://localhost:17170/api/graphql";
+            let graphql_url = format!("{}/api/graphql", env::http_url());
 
             // We can't easily reconstruct the exact query here, so we just
             // do a minimal request to show we can reach the server and log the attempt.
             // The real value comes from the server logs (which now include the GraphQL error).
             let raw_response = client
-                .post(graphql_url)
+                .post(&graphql_url)
                 .header("Authorization", format!("Bearer {}", token))
                 .header("Content-Type", "application/json")
                 .body(r#"{"query":"{ __typename }"}"#) // minimal valid query
@@ -95,17 +95,22 @@ pub struct LLDAPFixture {
     child: ChildProcess,
     users: HashSet<String>,
     groups: HashMap<String, i64>,
+    _dir: tempfile::TempDir,
 }
 
 const MAX_HEALTHCHECK_ATTEMPS: u8 = 15; // slightly more generous
 
 impl LLDAPFixture {
     pub fn new() -> Self {
-        // Generate a unique database for this test run to avoid state leakage
-        let unique_id = Uuid::new_v4().simple();
-        let db_path = format!("sqlite://e2e_test_{}.db?mode=rwc", unique_id);
+        let dir = tempfile::TempDir::new().expect("temp dir");
+        let db_path = format!("sqlite://{}/users.db?mode=rwc", dir.path().display());
+        let ldap_port = free_port();
+        let http_port = free_port();
+        env::set_ports(ldap_port, http_port);
 
         let child = create_lldap_command("run", &db_path)
+            .env("LLDAP_LDAP_PORT", ldap_port.to_string())
+            .env("LLDAP_HTTP_PORT", http_port.to_string())
             .arg("--verbose")
             .spawn()
             .expect("Unable to start server");
@@ -113,6 +118,8 @@ impl LLDAPFixture {
         let mut started = false;
         for attempt in 0..MAX_HEALTHCHECK_ATTEMPS {
             let status = create_lldap_command("healthcheck", &db_path)
+                .env("LLDAP_LDAP_PORT", ldap_port.to_string())
+                .env("LLDAP_HTTP_PORT", http_port.to_string())
                 .status()
                 .expect("healthcheck command failed to execute");
 
@@ -145,6 +152,7 @@ impl LLDAPFixture {
             child,
             users: HashSet::new(),
             groups: HashMap::new(),
+            _dir: dir,
         }
     }
 
@@ -356,6 +364,14 @@ pub fn new_id(prefix: Option<&str>) -> String {
         Some(prefix) => format!("{prefix}{id}"),
         None => id,
     }
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("bind an ephemeral port")
+        .local_addr()
+        .expect("local addr")
+        .port()
 }
 
 fn create_lldap_command(subcommand: &str, db_url: &str) -> Command {

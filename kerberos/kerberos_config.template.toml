@@ -11,5 +11,5 @@ renew_lifetime = "7d"
 forwardable = true
 rdns = false
 
-## All values can be overridden with LLDAP_KERB_ prefixed env vars.
-## Realm and base_dn are auto-derived for consistency if not overridden.
+## realm_name and base_dn are derived from LLDAP_KERB_REALM_NAME / LLDAP_LDAP_BASE_DN;
+## the remaining values come from this file.

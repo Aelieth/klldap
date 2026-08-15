@@ -23,7 +23,7 @@ reviews:
     docstrings:
       enabled: false
     unit_tests:
-      enabled: false
+      enabled: true
 
   pre_merge_checks:
     docstrings:

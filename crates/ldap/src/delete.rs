@@ -7,8 +7,8 @@ use ldap3_proto::proto::{LdapOp, LdapResult as LdapResultOp, LdapResultCode};
 use lldap_access_control::AdminBackendHandler;
 use lldap_domain::types::{GroupName, UserId};
 use lldap_domain_handlers::handler::GroupRequestFilter;
+use lldap_domain_handlers::kerberos::kerberos_backend;
 use lldap_domain_model::error::DomainError;
-use lldap_kerberos::delete_kerberos_principal;
 use tracing::instrument;
 
 pub(crate) fn make_del_response(code: LdapResultCode, message: String) -> LdapOp {
@@ -63,7 +63,7 @@ async fn delete_user(
             message: format!("Error while deleting user: {e:?}"),
         })?;
     // Clean up Kerberos principal (idempotent/safe if none exists)
-    if let Err(e) = delete_kerberos_principal(user_id.as_str()) {
+    if let Err(e) = kerberos_backend().delete_principal(user_id.as_str()) {
         tracing::warn!(
             "Failed to delete Kerberos principal for deleted user {}: {}",
             user_id,
@@ -118,11 +118,15 @@ mod tests {
     use lldap_domain::types::{Group, GroupId, User, Uuid};
     use lldap_domain_model::error::DomainError;
     use lldap_test_utils::MockTestBackendHandler;
+    use lldap_test_utils::recording_kerberos::{KerberosOp, RecordingGuard};
     use mockall::predicate::eq;
     use pretty_assertions::assert_eq;
+    use serial_test::serial;
 
     #[tokio::test]
+    #[serial]
     async fn test_delete_user() {
+        let guard = RecordingGuard::install();
         let mut mock = MockTestBackendHandler::new();
         mock.expect_get_user_details()
             .with(eq(UserId::new("bob")))
@@ -144,6 +148,12 @@ mod tests {
                 LdapResultCode::Success,
                 String::new()
             )])
+        );
+        assert_eq!(
+            guard.recorder().take_ops(),
+            vec![KerberosOp::DeletePrincipal {
+                username: "bob".into(),
+            }]
         );
     }
 

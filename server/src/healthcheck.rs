@@ -12,6 +12,7 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
+use std::path::Path;
 use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector as RustlsTlsConnector;
@@ -198,13 +199,14 @@ pub async fn check_api(host: &str, port: u16) -> Result<()> {
 /// every sync operation depends on must exist. Turns a dead KDC into an unhealthy
 /// container instead of a silently-degraded one.
 #[instrument(level = "info", err)]
-pub async fn check_kerberos(host: &str, port: u16, admin_keytab: &str) -> Result<()> {
+pub async fn check_kerberos(host: &str, port: u16, admin_keytab: &Path) -> Result<()> {
     TcpStream::connect((host, port))
         .await
         .with_context(|| format!("KDC not reachable on {host}:{port}"))?;
-    anyhow::ensure!(
-        std::path::Path::new(admin_keytab).exists(),
-        "admin keytab {admin_keytab} is missing"
+    ensure!(
+        admin_keytab.exists(),
+        "admin keytab {} is missing",
+        admin_keytab.display()
     );
     info!("Success");
     Ok(())

@@ -91,6 +91,9 @@ path = "../crates/graphql-server"
 [dependencies.lldap_ldap]
 path = "../crates/ldap"
 
+[dependencies.lldap-kerberos]
+path = "../crates/kerberos"
+
 [dependencies.lldap_opaque_handler]
 path = "../crates/opaque-handler"
 
@@ -111,6 +114,7 @@ ldap3 = { workspace = true }
 mockall = { workspace = true }
 nix = { version = "0.31", features = ["process", "signal"] }
 pretty_assertions = { workspace = true }
+tempfile = "3"
 uuid = { workspace = true }
 
 [dev-dependencies.lldap_auth]
@@ -135,8 +139,7 @@ default-features = false
 features = ["json", "blocking", "rustls-tls"]
 
 [dev-dependencies.serial_test]
-version = "2.0.0"
-default-features = false
+workspace = true
 features = ["file_locks"]
 
 [dev-dependencies.figment]

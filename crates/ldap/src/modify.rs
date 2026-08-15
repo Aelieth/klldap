@@ -14,6 +14,7 @@ use lldap_domain::{
     requests::UpdateUserRequest,
     types::{Attribute, AttributeName, AttributeType, Email, UserId},
 };
+use lldap_domain_handlers::kerberos::kerberos_backend;
 use lldap_opaque_handler::OpaqueHandler;
 use tracing::warn;
 
@@ -115,11 +116,9 @@ async fn handle_modify_change(
                 let sync_enabled =
                     lldap_domain::types::kerberos_sync_enabled(&user.attributes, "kerberossync");
 
-                if let Err(e) = lldap_kerberos::sync_kerberos_if_enabled(
-                    sync_enabled,
-                    user_id.as_str(),
-                    plain_pass,
-                ) {
+                if let Err(e) =
+                    kerberos_backend().sync_if_enabled(sync_enabled, user_id.as_str(), plain_pass)
+                {
                     warn!("Kerberos sync failed after LDAP password change: {}", e);
                 }
 
@@ -130,7 +129,7 @@ async fn handle_modify_change(
                         .iter()
                         .any(|g| g.display_name == "lldap_disabled".into())
                 {
-                    lldap_kerberos::reassert_kerberos_disabled(user_id.as_str());
+                    kerberos_backend().reassert_disabled(user_id.as_str());
                 }
             }
             Ok(())
@@ -522,8 +521,10 @@ mod tests {
     };
     use ldap3_proto::proto::LdapResult as LdapResultOp;
     use lldap_domain::types::{GroupDetails, GroupId, UserId};
+    use lldap_test_utils::recording_kerberos::{KerberosOp, RecordingGuard};
     use lldap_test_utils::{MockTestBackendHandler, setup_default_ldap_mock};
     use pretty_assertions::assert_eq;
+    use serial_test::serial;
     use std::collections::HashSet;
 
     fn setup_password_change_expectations(mock: &mut MockTestBackendHandler, user: &str) {
@@ -1059,38 +1060,81 @@ mod tests {
         );
     }
 
-    // Setting a password for a kerberossync=1 user already in lldap_disabled must still
-    // succeed — re-asserting -allow_tix is best-effort and no-ops without a KDC.
+    fn synced_user(uid: &lldap_domain::types::UserId) -> lldap_domain::types::User {
+        lldap_domain::types::User {
+            user_id: uid.clone(),
+            email: format!("{}@example.com", uid.as_str()).into(),
+            display_name: None,
+            creation_date: chrono::Utc::now().naive_utc(),
+            modified_date: chrono::Utc::now().naive_utc(),
+            password_modified_date: chrono::Utc::now().naive_utc(),
+            uuid: lldap_domain::types::Uuid::from_name_and_date(
+                uid.as_str(),
+                &chrono::Utc::now().naive_utc(),
+            ),
+            attributes: vec![Attribute {
+                name: "kerberossync".into(),
+                value: 1i64.into(),
+            }],
+            krb_principal_name: None,
+        }
+    }
+
     #[tokio::test]
-    async fn test_modify_password_born_disabled_reasserts_and_succeeds() {
+    #[serial]
+    async fn test_modify_password_syncs_when_enabled() {
         use mockall::predicate::eq;
+        let guard = RecordingGuard::install();
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_get_user_details()
+            .with(eq(UserId::new("bob")))
+            .returning(|uid| Ok(synced_user(uid)));
+        setup_default_ldap_mock(&mut mock);
+        setup_password_change_expectations(&mut mock, "bob");
+        let ldap_handler = setup_bound_admin_handler(mock).await;
+        assert_eq!(
+            ldap_handler
+                .do_modify_request(&make_password_modify_request("bob"))
+                .await,
+            make_modify_success_response()
+        );
+        assert_eq!(
+            guard.recorder().take_ops(),
+            vec![KerberosOp::SyncPrincipal {
+                username: "bob".into(),
+                password: "newpassword".into(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_modify_password_skips_when_sync_disabled() {
+        let guard = RecordingGuard::install();
         let mut mock = MockTestBackendHandler::new();
         setup_default_ldap_mock(&mut mock);
         setup_password_change_expectations(&mut mock, "bob");
+        let ldap_handler = setup_bound_admin_handler(mock).await;
+        assert_eq!(
+            ldap_handler
+                .do_modify_request(&make_password_modify_request("bob"))
+                .await,
+            make_modify_success_response()
+        );
+        assert!(guard.recorder().take_ops().is_empty());
+    }
 
-        // bob is kerberossync-managed …
+    // Setting a password for a kerberossync=1 user already in lldap_disabled must still
+    // succeed — re-asserting -allow_tix is best-effort and no-ops without a KDC.
+    #[tokio::test]
+    #[serial]
+    async fn test_modify_password_born_disabled_reasserts_and_succeeds() {
+        use mockall::predicate::eq;
+        let guard = RecordingGuard::install();
+        let mut mock = MockTestBackendHandler::new();
         mock.expect_get_user_details()
             .with(eq(UserId::new("bob")))
-            .returning(|uid| {
-                Ok(lldap_domain::types::User {
-                    user_id: uid.clone(),
-                    email: format!("{}@example.com", uid.as_str()).into(),
-                    display_name: None,
-                    creation_date: chrono::Utc::now().naive_utc(),
-                    modified_date: chrono::Utc::now().naive_utc(),
-                    password_modified_date: chrono::Utc::now().naive_utc(),
-                    uuid: lldap_domain::types::Uuid::from_name_and_date(
-                        uid.as_str(),
-                        &chrono::Utc::now().naive_utc(),
-                    ),
-                    attributes: vec![Attribute {
-                        name: "kerberossync".into(),
-                        value: 1i64.into(),
-                    }],
-                    krb_principal_name: None,
-                })
-            });
-        // … and already disabled.
+            .returning(|uid| Ok(synced_user(uid)));
         mock.expect_get_user_groups()
             .with(eq(UserId::new("bob")))
             .returning(|_| {
@@ -1108,6 +1152,8 @@ mod tests {
                 });
                 Ok(set)
             });
+        setup_default_ldap_mock(&mut mock);
+        setup_password_change_expectations(&mut mock, "bob");
 
         let ldap_handler = setup_bound_admin_handler(mock).await;
         assert_eq!(
@@ -1115,6 +1161,19 @@ mod tests {
                 .do_modify_request(&make_password_modify_request("bob"))
                 .await,
             make_modify_success_response()
+        );
+        assert_eq!(
+            guard.recorder().take_ops(),
+            vec![
+                KerberosOp::SyncPrincipal {
+                    username: "bob".into(),
+                    password: "newpassword".into(),
+                },
+                KerberosOp::SetEnabled {
+                    username: "bob".into(),
+                    enabled: false,
+                },
+            ]
         );
     }
 }

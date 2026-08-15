@@ -1,5 +1,6 @@
 //! KDC bootstrap and supervision used by the `kerberos_manager` binary.
 
+use crate::paths::KerberosPaths;
 use crate::{derive_realm_from_base_dn, domain_from_base_dn};
 use anyhow::{Context, Result};
 use minijinja::{Environment, context};
@@ -24,13 +25,11 @@ pub struct KerberosConfig {
     pub rdns: bool,
 }
 
-const ADMIN_KEYTAB_PATH: &str = "/data/kadm5.keytab";
-
 /// Run kadmin.local — only show output on error
-fn run_kadmin_local(query: &str) -> Result<Output> {
+fn run_kadmin_local(query: &str, paths: &KerberosPaths) -> Result<Output> {
     let output = Command::new("sudo")
         .arg("/usr/sbin/kadmin.local")
-        .env("KRB5_CONFIG", "/etc/krb5.conf")
+        .env("KRB5_CONFIG", &paths.krb5_conf)
         .arg("-q")
         .arg(query)
         .output()
@@ -69,71 +68,74 @@ fn plan_admin_keytab(keytab_exists: bool, db_created: bool) -> KeytabAction {
     }
 }
 
-pub fn ensure_admin_keytab(admin_princ: &str, db_created: bool) -> Result<()> {
-    let create_principal =
-        match plan_admin_keytab(Path::new(ADMIN_KEYTAB_PATH).exists(), db_created) {
-            KeytabAction::UpToDate => return Ok(()),
-            KeytabAction::Regenerate { create_principal } => create_principal,
-        };
+pub fn ensure_admin_keytab(
+    admin_princ: &str,
+    db_created: bool,
+    paths: &KerberosPaths,
+) -> Result<()> {
+    let create_principal = match plan_admin_keytab(paths.admin_keytab.exists(), db_created) {
+        KeytabAction::UpToDate => return Ok(()),
+        KeytabAction::Regenerate { create_principal } => create_principal,
+    };
 
     if create_principal {
         println!("Creating admin principal with random key: {}", admin_princ);
-        let add_output = run_kadmin_local(&format!("addprinc -randkey {}", admin_princ))?;
+        let add_output = run_kadmin_local(&format!("addprinc -randkey {}", admin_princ), paths)?;
         if !add_output.status.success() {
             anyhow::bail!("addprinc failed for {}", admin_princ);
         }
-        let _ = fs::remove_file(ADMIN_KEYTAB_PATH);
+        let _ = fs::remove_file(&paths.admin_keytab);
     } else {
         println!(
             "Admin keytab {} missing — regenerating from existing KDC database.",
-            ADMIN_KEYTAB_PATH
+            paths.admin_keytab.display()
         );
     }
 
     // ktadd rotates the kvno; safe here since this keytab is the only consumer of the
     // admin principal's key.
-    let ktadd_output =
-        run_kadmin_local(&format!("ktadd -k {} {}", ADMIN_KEYTAB_PATH, admin_princ))?;
+    let ktadd_output = run_kadmin_local(
+        &format!("ktadd -k {} {}", paths.admin_keytab.display(), admin_princ),
+        paths,
+    )?;
     if !ktadd_output.status.success() {
         anyhow::bail!("ktadd failed — Kerberos admin operations will fail");
     }
 
-    ensure_admin_keytab_ownership()?;
+    ensure_admin_keytab_ownership(paths)?;
 
-    if !Path::new(ADMIN_KEYTAB_PATH).exists() {
+    if !paths.admin_keytab.exists() {
         anyhow::bail!("admin keytab still missing after ktadd");
     }
-    println!("Admin keytab ready at {}.", ADMIN_KEYTAB_PATH);
+    println!("Admin keytab ready at {}.", paths.admin_keytab.display());
     Ok(())
 }
 
-fn ensure_admin_keytab_ownership() -> Result<()> {
+fn ensure_admin_keytab_ownership(paths: &KerberosPaths) -> Result<()> {
     let status = Command::new("sudo")
         .arg("chown")
         .arg("lldap:lldap")
-        .arg(ADMIN_KEYTAB_PATH)
+        .arg(&paths.admin_keytab)
         .status()
         .context("Failed to chown keytab")?;
     if !status.success() {
         anyhow::bail!("chown keytab failed");
     }
-    fs::set_permissions(ADMIN_KEYTAB_PATH, fs::Permissions::from_mode(0o640))
+    fs::set_permissions(&paths.admin_keytab, fs::Permissions::from_mode(0o640))
         .context("Failed to chmod keytab")?;
     Ok(())
 }
 
-/// Load `/data/kerberos_config.toml` (copy the template on first run) and resolve realm/DN.
-pub fn load_config() -> Result<(KerberosConfig, String)> {
-    let config_path = "/data/kerberos_config.toml";
-    let template_path = "/app/kerberos_config.template.toml";
-
-    if !Path::new(config_path).exists() {
+/// Load the Kerberos config (copy the template on first run) and resolve realm/DN.
+pub fn load_config(paths: &KerberosPaths) -> Result<(KerberosConfig, String)> {
+    if !paths.kerberos_config.exists() {
         println!("Kerberos config not found. Copying template...");
-        fs::copy(template_path, config_path).context("Failed to copy config template")?;
+        fs::copy(&paths.kerberos_config_template, &paths.kerberos_config)
+            .context("Failed to copy config template")?;
     }
 
-    let toml_str =
-        fs::read_to_string(config_path).context("Failed to read kerberos_config.toml")?;
+    let toml_str = fs::read_to_string(&paths.kerberos_config)
+        .context("Failed to read kerberos_config.toml")?;
     let full_config: toml::Table = toml::from_str(&toml_str).context("Failed to parse TOML")?;
 
     let kerberos_value = full_config
@@ -158,33 +160,20 @@ pub fn admin_principal(config: &KerberosConfig) -> String {
 }
 
 /// Render krb5.conf, kdc.conf, and kadm5.acl; copy the Keycloak config on first run.
-pub fn render_configs(config: &KerberosConfig, domain: &str) -> Result<()> {
-    fs::create_dir_all("/var/kerberos/krb5kdc").context("Failed to create krb5kdc dir")?;
-    render_template("/app/krb5.template.conf", "/etc/krb5.conf", config, domain)?;
-    render_template(
-        "/app/kdc.template.conf",
-        "/var/kerberos/krb5kdc/kdc.conf",
-        config,
-        domain,
-    )?;
-    ensure_kadm5_acl(
-        "/var/kerberos/krb5kdc/kadm5.acl",
-        "/app/kadm5.template.acl",
-        config,
-        domain,
-    )?;
+pub fn render_configs(config: &KerberosConfig, domain: &str, paths: &KerberosPaths) -> Result<()> {
+    fs::create_dir_all(&paths.kdc_dir).context("Failed to create krb5kdc dir")?;
+    render_template(&paths.krb5_template, &paths.krb5_conf, config, domain)?;
+    render_template(&paths.kdc_template, &paths.kdc_conf, config, domain)?;
+    ensure_kadm5_acl(&paths.kadm5_acl, &paths.kadm5_acl_template, config, domain)?;
 
-    let keycloak_config_path = "/data/keycloak_config.toml";
-    let keycloak_template_path = "/app/keycloak_config.template.toml";
-
-    if !Path::new(keycloak_config_path).exists() {
+    if !paths.keycloak_config.exists() {
         println!("Keycloak config not found. Copying template...");
-        fs::copy(keycloak_template_path, keycloak_config_path)
+        fs::copy(&paths.keycloak_template, &paths.keycloak_config)
             .context("Failed to copy keycloak_config.template.toml")?;
         Command::new("sudo")
             .arg("chown")
             .arg("lldap:lldap")
-            .arg(keycloak_config_path)
+            .arg(&paths.keycloak_config)
             .status()
             .context("Failed to chown keycloak_config.toml")?;
         println!("Created default keycloak_config.toml in /data");
@@ -196,9 +185,8 @@ pub fn render_configs(config: &KerberosConfig, domain: &str) -> Result<()> {
 
 /// Create the KDC database if it does not exist (password-less: random master password,
 /// stash only). Returns whether the database was created on this run.
-pub fn bootstrap_kdb() -> Result<bool> {
-    let db_path = Path::new("/var/kerberos/krb5kdc/principal");
-    let db_created = !db_path.exists();
+pub fn bootstrap_kdb(paths: &KerberosPaths) -> Result<bool> {
+    let db_created = !paths.kdc_principal().exists();
 
     if db_created {
         println!("First run detected — no KDC database. Bootstrapping password-less...");
@@ -220,7 +208,7 @@ pub fn bootstrap_kdb() -> Result<bool> {
         println!("Creating KDC database with piped password...");
         let mut child = Command::new("sudo")
             .arg("kdb5_util")
-            .env("KRB5_CONFIG", "/etc/krb5.conf")
+            .env("KRB5_CONFIG", &paths.krb5_conf)
             .arg("create")
             .arg("-s")
             .stdin(Stdio::piped())
@@ -252,7 +240,7 @@ pub fn bootstrap_kdb() -> Result<bool> {
             .arg("chown")
             .arg("-R")
             .arg("lldap:lldap")
-            .arg("/var/kerberos/krb5kdc")
+            .arg(&paths.kdc_dir)
             .status()
             .context("Failed to chown DB dir")?;
         println!("Ownership set on DB files.");
@@ -275,30 +263,33 @@ pub fn spawn_daemons() -> Result<(Child, Child)> {
     Ok((kdc_child, kadmind_child))
 }
 
-/// Fail if the KDC does not accept connections on port 88 within 60s.
-pub fn wait_kdc_ready() -> Result<()> {
-    println!("Waiting for KDC on port 88...");
+/// Fail if the KDC does not accept connections on its configured port within 60s.
+pub fn wait_kdc_ready(paths: &KerberosPaths) -> Result<()> {
+    println!("Waiting for KDC on port {}...", paths.kdc_port);
     for _ in 0..60 {
-        if TcpStream::connect(("localhost", 88)).is_ok() {
-            println!("KDC ready on port 88.");
+        if TcpStream::connect(("localhost", paths.kdc_port)).is_ok() {
+            println!("KDC ready on port {}.", paths.kdc_port);
             return Ok(());
         }
         thread::sleep(Duration::from_secs(1));
     }
-    anyhow::bail!("KDC did not accept connections on port 88 within 60s")
+    anyhow::bail!(
+        "KDC did not accept connections on port {} within 60s",
+        paths.kdc_port
+    )
 }
 
-pub fn populate_ccache(admin_princ: &str) -> Result<()> {
-    if Path::new(ADMIN_KEYTAB_PATH).exists() {
+pub fn populate_ccache(admin_princ: &str, paths: &KerberosPaths) -> Result<()> {
+    if paths.admin_keytab.exists() {
         println!(
             "Populating ccache with keytab (daemons ready): {}",
             admin_princ
         );
         let kinit_output = Command::new("/usr/bin/kinit")
-            .env("KRB5_CONFIG", "/etc/krb5.conf")
+            .env("KRB5_CONFIG", &paths.krb5_conf)
             .arg("-k")
             .arg("-t")
-            .arg(ADMIN_KEYTAB_PATH)
+            .arg(&paths.admin_keytab)
             .arg(admin_princ)
             .output()
             .context("Failed kinit")?;
@@ -323,18 +314,18 @@ pub fn run_daemons_to_completion(mut kdc: Child, mut kadmind: Child) -> Result<(
 }
 
 fn render_template(
-    template_path: &str,
-    output_path: &str,
+    template_path: &Path,
+    output_path: &Path,
     config: &KerberosConfig,
     domain: &str,
 ) -> Result<()> {
     let template_str = fs::read_to_string(template_path)
-        .context(format!("Failed to read template: {}", template_path))?;
+        .with_context(|| format!("Failed to read template: {}", template_path.display()))?;
 
     let mut env = Environment::new();
     env.add_template("template", &template_str)?;
 
-    let tmpl = env.get_template("template").unwrap();
+    let tmpl = env.get_template("template")?;
     let rendered = tmpl.render(context! {
         TICKET_LIFETIME => config.ticket_lifetime,
         RENEW_LIFETIME => config.renew_lifetime,
@@ -344,23 +335,24 @@ fn render_template(
         DOMAIN => domain,
     })?;
 
-    fs::write(output_path, rendered).context(format!("Failed to write {}", output_path))?;
-    println!("Generated {} successfully.", output_path);
+    fs::write(output_path, rendered)
+        .with_context(|| format!("Failed to write {}", output_path.display()))?;
+    println!("Generated {} successfully.", output_path.display());
 
     Ok(())
 }
 
 /// Ensure kadm5.acl is readable, grants `admin/admin@REALM *`, and is parseable.
 fn ensure_kadm5_acl(
-    acl_path: &str,
-    template_path: &str,
+    acl_path: &Path,
+    template_path: &Path,
     config: &KerberosConfig,
     domain: &str,
 ) -> Result<()> {
     let admin_princ = format!("admin/admin@{}", config.realm_name.to_uppercase());
     let required_line = format!("{}    *", admin_princ);
 
-    if !Path::new(acl_path).exists() {
+    if !acl_path.exists() {
         render_template(template_path, acl_path, config, domain)?;
         let _ = apply_permissions(acl_path);
         return Ok(());
@@ -400,7 +392,7 @@ fn ensure_kadm5_acl(
     Ok(())
 }
 
-fn apply_permissions(path: &str) -> Result<()> {
+fn apply_permissions(path: &Path) -> Result<()> {
     let perms = fs::Permissions::from_mode(0o644);
     fs::set_permissions(path, perms).context("Failed to set 0644 permissions on kadm5.acl")?;
 
@@ -416,7 +408,7 @@ fn apply_permissions(path: &str) -> Result<()> {
     Ok(())
 }
 
-fn apply_permissions_if_needed(path: &str) -> Result<()> {
+fn apply_permissions_if_needed(path: &Path) -> Result<()> {
     let meta = match fs::metadata(path) {
         Ok(m) => m,
         Err(_) => return apply_permissions(path),
@@ -702,13 +694,8 @@ mod tests {
 
             assert!(!acl.exists());
 
-            ensure_kadm5_acl(
-                acl.to_str().unwrap(),
-                template.to_str().unwrap(),
-                &config,
-                "example",
-            )
-            .expect("ensure should succeed on create path");
+            ensure_kadm5_acl(acl, template, &config, "example")
+                .expect("ensure should succeed on create path");
 
             let content = fs::read_to_string(acl).expect("acl should exist after ensure");
             assert!(
@@ -729,13 +716,8 @@ mod tests {
                 "# custom comment\nservice/HTTP@TEST.EXAMPLE    x\nrestricted@TEST.EXAMPLE    l\n";
             fs::write(acl, initial).unwrap();
 
-            ensure_kadm5_acl(
-                acl.to_str().unwrap(),
-                template.to_str().unwrap(),
-                &config,
-                "example",
-            )
-            .expect("repair ensure should succeed");
+            ensure_kadm5_acl(acl, template, &config, "example")
+                .expect("repair ensure should succeed");
 
             let repaired = fs::read_to_string(acl).unwrap();
             assert!(
@@ -750,13 +732,8 @@ mod tests {
             fs::write(acl, good).unwrap();
 
             let before = fs::read_to_string(acl).unwrap();
-            ensure_kadm5_acl(
-                acl.to_str().unwrap(),
-                template.to_str().unwrap(),
-                &config,
-                "example",
-            )
-            .expect("noop ensure should succeed");
+            ensure_kadm5_acl(acl, template, &config, "example")
+                .expect("noop ensure should succeed");
             let after = fs::read_to_string(acl).unwrap();
 
             assert_eq!(
@@ -769,13 +746,8 @@ mod tests {
             let garbage = "total\nnonsense\nwith no useful principal lines at all\n!!!\n";
             fs::write(acl, garbage).unwrap();
 
-            ensure_kadm5_acl(
-                acl.to_str().unwrap(),
-                template.to_str().unwrap(),
-                &config,
-                "example",
-            )
-            .expect("remake on garbled should succeed");
+            ensure_kadm5_acl(acl, template, &config, "example")
+                .expect("remake on garbled should succeed");
 
             let remade = fs::read_to_string(acl).unwrap();
             assert_eq!(remade.trim(), required_line);

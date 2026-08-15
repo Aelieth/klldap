@@ -16,11 +16,11 @@ use lldap_domain_handlers::handler::{
     SubStringFilter, SystemConfigBackendHandler, UserBackendHandler, UserListerBackendHandler,
     UserRequestFilter,
 };
+use lldap_domain_handlers::kerberos::{kerberos_backend, principal_name};
 use lldap_domain_model::{
     error::{DomainError, Result},
     model::{self, GroupColumn, UserColumn, codec, system_config},
 };
-use lldap_kerberos::delete_kerberos_principal;
 use lldap_schema::PublicSchema;
 use sea_orm::{
     ActiveModelTrait, ActiveValue, ColumnTrait, DatabaseTransaction, EntityTrait, ModelTrait,
@@ -318,10 +318,12 @@ impl SqlBackendHandler {
         ))
     }
 
+    /// Returns whether the caller must delete the user's KDC principal once the
+    /// transaction has committed.
     async fn update_user_with_transaction(
         transaction: &DatabaseTransaction,
         request: UpdateUserRequest,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let schema = Self::get_schema_with_transaction(transaction).await?;
         let (update_user_attributes, remove_user_attributes, kerb_sync_enabled) =
             Self::compute_user_attribute_changes(
@@ -401,31 +403,18 @@ impl SqlBackendHandler {
                 .await?;
         }
 
-        match kerb_sync_enabled {
-            Some(false) => {
-                // Clear the field in our DB
-                let update = model::users::ActiveModel {
-                    user_id: ActiveValue::Set(request.user_id.clone()),
-                    krb_principal_name: ActiveValue::Set(None),
-                    modified_date: ActiveValue::Set(now),
-                    ..Default::default()
-                };
-                update.update(transaction).await?;
-
-                // === Actually delete the principal from the Kerberos KDC ===
-                if let Err(e) = delete_kerberos_principal(request.user_id.as_str()) {
-                    tracing::warn!(
-                        "Failed to delete Kerberos principal for user {} when disabling sync: {}",
-                        request.user_id,
-                        e
-                    );
-                }
-            }
-            Some(true) => {}
-            None => {}
+        let delete_principal = matches!(kerb_sync_enabled, Some(false));
+        if delete_principal {
+            let update = model::users::ActiveModel {
+                user_id: ActiveValue::Set(request.user_id.clone()),
+                krb_principal_name: ActiveValue::Set(None),
+                modified_date: ActiveValue::Set(now),
+                ..Default::default()
+            };
+            update.update(transaction).await?;
         }
 
-        Ok(())
+        Ok(delete_principal)
     }
 }
 
@@ -471,7 +460,7 @@ impl SystemConfigBackendHandler for SqlBackendHandler {
         let now = Utc::now().naive_utc();
 
         if enabled {
-            let principal = lldap_kerberos::get_kerberos_principal_name(user_id.as_str());
+            let principal = principal_name(user_id.as_str());
             tracing::info!(
                 "Kerberos sync succeeded → injecting protected krbPrincipalName = {} for user {}",
                 principal,
@@ -851,8 +840,7 @@ impl SqlBackendHandler {
         if !synced {
             return; // no KLLDAP-managed principal to touch
         }
-        if let Err(e) = lldap_kerberos::set_kerberos_principal_enabled(user_id.as_str(), !disabled)
-        {
+        if let Err(e) = kerberos_backend().set_principal_enabled(user_id.as_str(), !disabled) {
             tracing::warn!(
                 "Failed to {} Kerberos principal for {} (non-fatal): {}",
                 if disabled { "disable" } else { "enable" },
@@ -1089,13 +1077,23 @@ impl UserBackendHandler for SqlBackendHandler {
 
     #[instrument(skip(self), level = "debug", err, fields(user_id = ?request.user_id.as_str()))]
     async fn update_user(&self, request: UpdateUserRequest) -> Result<()> {
-        self.sql_pool
-            .transaction::<_, (), DomainError>(|transaction| {
+        let user_id = request.user_id.clone();
+        let delete_principal = self
+            .sql_pool
+            .transaction::<_, bool, DomainError>(|transaction| {
                 Box::pin(
                     async move { Self::update_user_with_transaction(transaction, request).await },
                 )
             })
             .await?;
+        // KDC side effects run after commit so a rollback cannot orphan a deleted principal.
+        if delete_principal && let Err(e) = kerberos_backend().delete_principal(user_id.as_str()) {
+            tracing::warn!(
+                "Failed to delete Kerberos principal for user {} when disabling sync: {}",
+                user_id,
+                e
+            );
+        }
         Ok(())
     }
 
@@ -1104,7 +1102,7 @@ impl UserBackendHandler for SqlBackendHandler {
         // Kerberos principal must be removed when the user ceases to exist.
         // We do this *before* the hard delete so the row still exists if anything
         // downstream needs it, and because delete_kerberos_principal is idempotent.
-        if let Err(e) = delete_kerberos_principal(user_id.as_str()) {
+        if let Err(e) = kerberos_backend().delete_principal(user_id.as_str()) {
             tracing::warn!(
                 "Failed to delete Kerberos principal for user {} during deletion (non-fatal): {}",
                 user_id,
@@ -1284,7 +1282,9 @@ mod tests {
     use lldap_domain::types::Attribute;
     use lldap_domain_handlers::handler::SubStringFilter;
     use lldap_domain_model::model::UserColumn;
+    use lldap_test_utils::recording_kerberos::{KerberosOp, RecordingGuard};
     use pretty_assertions::{assert_eq, assert_ne};
+    use serial_test::serial;
 
     #[tokio::test]
     async fn test_list_users_no_filter() {
@@ -1641,6 +1641,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_delete_user() {
         let fixture = TestFixture::new().await;
         fixture
@@ -2045,7 +2046,9 @@ mod tests {
     // Toggling lldap_disabled fires a best-effort Kerberos enable/disable. With no KDC
     // the reflect no-ops, so add/remove still succeed and never become a hard error.
     #[tokio::test]
+    #[serial]
     async fn test_toggle_lldap_disabled_runs_kerberos_hook_cleanly() {
+        let guard = RecordingGuard::install();
         let fixture = TestFixture::new().await;
 
         fixture
@@ -2085,6 +2088,13 @@ mod tests {
             .await,
             vec!["ksync"]
         );
+        assert_eq!(
+            guard.recorder().take_ops(),
+            vec![KerberosOp::SetEnabled {
+                username: "ksync".into(),
+                enabled: false,
+            }]
+        );
 
         // Re-enable transition.
         fixture
@@ -2099,6 +2109,13 @@ mod tests {
             )
             .await
             .is_empty()
+        );
+        assert_eq!(
+            guard.recorder().take_ops(),
+            vec![KerberosOp::SetEnabled {
+                username: "ksync".into(),
+                enabled: true,
+            }]
         );
     }
 
@@ -2145,6 +2162,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_delete_user_not_found() {
         let fixture = TestFixture::new().await;
 
@@ -2195,5 +2213,50 @@ mod tests {
             })
             .await
             .unwrap_err();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_disable_sync_deletes_principal_after_commit() {
+        let guard = RecordingGuard::install();
+        let fixture = TestFixture::new().await;
+        fixture
+            .handler
+            .update_user(UpdateUserRequest {
+                user_id: UserId::new("bob"),
+                email: None,
+                display_name: None,
+                delete_attributes: Vec::new(),
+                insert_attributes: vec![Attribute {
+                    name: "kerberossync".into(),
+                    value: 0i64.into(),
+                }],
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            guard.recorder().take_ops(),
+            vec![KerberosOp::DeletePrincipal {
+                username: "bob".into(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_delete_user_emits_delete_principal() {
+        let guard = RecordingGuard::install();
+        let fixture = TestFixture::new().await;
+        fixture
+            .handler
+            .delete_user(&UserId::new("bob"))
+            .await
+            .unwrap();
+        assert_eq!(
+            guard.recorder().take_ops(),
+            vec![KerberosOp::DeletePrincipal {
+                username: "bob".into(),
+            }]
+        );
     }
 }

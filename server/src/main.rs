@@ -32,11 +32,13 @@ use lldap_sql_backend_handler::{
     sql_tables::{self, get_private_key_info, set_private_key_info},
 };
 use sea_orm::{Database, DatabaseConnection};
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use tracing::{Instrument, Level, debug, error, info, instrument, span, warn};
 
 use lldap_domain::requests::{CreateGroupRequest, CreateUserRequest};
 use lldap_domain::types::{Attribute, BUILTIN_GROUPS};
+use lldap_domain_handlers::kerberos::set_kerberos_backend;
+use lldap_kerberos::{live::LiveKerberos, paths::KerberosPaths};
 
 use lldap_domain_handlers::handler::{
     GroupBackendHandler, GroupListerBackendHandler, GroupRequestFilter, UserBackendHandler,
@@ -136,6 +138,7 @@ async fn set_up_server(config: Configuration) -> Result<(ServerBuilder, Database
     info!("Starting LLDAP version {}", env!("CARGO_PKG_VERSION"));
 
     let sql_pool = setup_sql_tables(&config.database_url).await?;
+    set_kerberos_backend(Arc::new(LiveKerberos));
     let private_key_info = config.get_private_key_info();
     let force_update_private_key = config.force_update_private_key;
     match (
@@ -280,13 +283,14 @@ async fn run_healthcheck(opts: RunOpts) -> Result<()> {
     );
 
     let kerberos = if config.healthcheck_options.kerberos {
+        let paths = KerberosPaths::from_env();
         Some(
             timeout(
                 delay,
                 healthcheck::check_kerberos(
                     &config.healthcheck_options.ldap_host,
-                    88,
-                    "/data/kadm5.keytab",
+                    paths.kdc_port,
+                    &paths.admin_keytab,
                 ),
             )
             .await,

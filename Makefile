@@ -105,7 +105,7 @@ test-run:
 # - gate-fast     → run the gate against the existing klldap-test image
 # - gate-postgres → gate with a gate-managed postgres:16 backend
 # - gate-phase    → run selected phases, e.g. make gate-phase PHASE=kerberos
-.PHONY: safety gate gate-fast gate-postgres gate-phase
+.PHONY: safety gate gate-fast gate-postgres gate-phase test-kdc
 
 safety:
 	cargo fmt --all
@@ -126,6 +126,9 @@ gate-postgres:
 
 gate-phase:
 	GATE_PHASES="$(PHASE)" gate/run-gate.sh
+
+test-kdc:
+	gate/kdc-sandbox.sh cargo test -p lldap-kerberos -- --ignored --nocapture
 
 # Quick cleanup of generated tarballs
 clean:

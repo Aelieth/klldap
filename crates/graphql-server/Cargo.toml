@@ -59,6 +59,7 @@ workspace = true
 [dev-dependencies]
 mockall = { workspace = true }
 pretty_assertions = { workspace = true }
+serial_test = { workspace = true }
 
 [dev-dependencies.lldap_test_utils]
 path = "../test-utils"

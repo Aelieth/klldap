@@ -29,3 +29,8 @@ cargo clippy --tests --all -- -D warnings
 
 `make test` builds a local Docker image (`klldap-test`) from this tree;
 `make test-run` boots it with test secrets and local volumes.
+
+`make gate` runs the container gate suite against that image (needs docker,
+`ldap-utils`/`openldap-clients`, python3). `make test-kdc` runs the Kerberos FFI
+tests against a throwaway KDC (Fedora: `sudo dnf install krb5-server krb5-workstation`;
+Debian/Ubuntu: `sudo apt-get install krb5-kdc krb5-admin-server krb5-user`).

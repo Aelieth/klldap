@@ -18,6 +18,7 @@ use lldap_domain::{
     requests::{CreateGroupRequest, CreateUserRequest},
     types::{Attribute, AttributeType, Email, GroupName, UserId},
 };
+use lldap_domain_handlers::kerberos::kerberos_backend;
 use std::collections::HashMap;
 use tracing::{instrument, warn};
 
@@ -268,7 +269,7 @@ async fn create_user(
             .get("userpassword")
             .or_else(|| attributes.get("userPassword"))
         && let Ok(plain) = std::str::from_utf8(pw_bytes)
-        && let Err(e) = lldap_kerberos::sync_kerberos_principal(user_id.as_str(), plain)
+        && let Err(e) = kerberos_backend().sync_principal(user_id.as_str(), plain)
     {
         warn!(
             "Kerberos principal sync failed after LDAP user create: {}",
@@ -324,8 +325,10 @@ mod tests {
     use crate::handler::tests::setup_bound_admin_handler;
     use lldap_domain::{deserialize, types::*};
     use lldap_test_utils::MockTestBackendHandler;
+    use lldap_test_utils::recording_kerberos::{KerberosOp, RecordingGuard};
     use mockall::predicate::eq;
     use pretty_assertions::assert_eq;
+    use serial_test::serial;
 
     #[tokio::test]
     async fn test_create_user() {
@@ -529,5 +532,95 @@ mod tests {
                 String::new()
             )])
         );
+    }
+
+    fn add_user_request(extra: Vec<LdapPartialAttribute>) -> LdapAddRequest {
+        let mut attributes = vec![LdapPartialAttribute {
+            atype: "cn".to_owned(),
+            vals: vec![b"Bob".to_vec()],
+        }];
+        attributes.extend(extra);
+        LdapAddRequest {
+            dn: "uid=bob,ou=people,dc=example,dc=com".to_owned(),
+            attributes,
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_create_user_with_password_syncs() {
+        let guard = RecordingGuard::install();
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_create_user().times(1).return_once(|_| Ok(()));
+        let ldap_handler = setup_bound_admin_handler(mock).await;
+        assert_eq!(
+            ldap_handler
+                .create_user_or_group(add_user_request(vec![
+                    LdapPartialAttribute {
+                        atype: "kerberossync".to_owned(),
+                        vals: vec![b"1".to_vec()],
+                    },
+                    LdapPartialAttribute {
+                        atype: "userPassword".to_owned(),
+                        vals: vec![b"s3cret".to_vec()],
+                    },
+                ]))
+                .await,
+            Ok(vec![make_add_response(
+                LdapResultCode::Success,
+                String::new()
+            )])
+        );
+        assert_eq!(
+            guard.recorder().take_ops(),
+            vec![KerberosOp::SyncPrincipal {
+                username: "bob".into(),
+                password: "s3cret".into(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_create_user_without_sync_skips_principal() {
+        let guard = RecordingGuard::install();
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_create_user().times(1).return_once(|_| Ok(()));
+        let ldap_handler = setup_bound_admin_handler(mock).await;
+        assert_eq!(
+            ldap_handler
+                .create_user_or_group(add_user_request(vec![LdapPartialAttribute {
+                    atype: "userPassword".to_owned(),
+                    vals: vec![b"s3cret".to_vec()],
+                }]))
+                .await,
+            Ok(vec![make_add_response(
+                LdapResultCode::Success,
+                String::new()
+            )])
+        );
+        assert!(guard.recorder().take_ops().is_empty());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_create_user_sync_without_password_skips_principal() {
+        let guard = RecordingGuard::install();
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_create_user().times(1).return_once(|_| Ok(()));
+        let ldap_handler = setup_bound_admin_handler(mock).await;
+        assert_eq!(
+            ldap_handler
+                .create_user_or_group(add_user_request(vec![LdapPartialAttribute {
+                    atype: "kerberossync".to_owned(),
+                    vals: vec![b"1".to_vec()],
+                }]))
+                .await,
+            Ok(vec![make_add_response(
+                LdapResultCode::Success,
+                String::new()
+            )])
+        );
+        assert!(guard.recorder().take_ops().is_empty());
     }
 }

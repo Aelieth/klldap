@@ -29,6 +29,11 @@
   unknown names are skipped with a warning.
 - Fixed: `--healthcheck-http-host`/`--healthcheck-ldap-host` CLI flags had no effect
   (their environment variables worked).
+- Kerberos file locations and the KDC port can be overridden with `LLDAP_KERB_*`
+  environment variables (`LLDAP_KERB_ADMIN_KEYTAB`, `LLDAP_KERB_KRB5_CONF`,
+  `LLDAP_KERB_KDC_DIR`, `LLDAP_KERB_KDC_PORT`, ...); unset means the container layout
+  is unchanged. The Kerberos FFI is now exercised against a throwaway KDC in CI
+  (`make test-kdc`).
 
 ## [0.7.2] 2026-06-16
 

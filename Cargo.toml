@@ -124,6 +124,10 @@ version = "0.11"
 [workspace.dependencies.serde_json]
 version = "1"
 
+[workspace.dependencies.serial_test]
+version = "2.0.0"
+default-features = false
+
 [workspace.dependencies.strum]
 version = "0.26.3"
 features = ["derive", "std"]

@@ -28,11 +28,6 @@ else
   echo "[start-lldap] Not root; skipping ownership repair (rely on volume setup)."
 fi
 
-# Touch marker on first sight (kerberos_manager may still use absence of some files for its bootstrap)
-if [ ! -f /data/.lldap_initialized ]; then
-  touch /data/.lldap_initialized
-fi
-
 # Official LLDAP writable check
 if [[ ( ! -w "/data" ) ]] || [[ ( ! -d "/data" ) ]]; then
   echo "[start-lldap] The /data folder doesn't exist or cannot be written to. Make sure to mount a volume."

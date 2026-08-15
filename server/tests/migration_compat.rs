@@ -1,4 +1,7 @@
-use crate::common::{env, fixture::create_lldap_command_with_key_file};
+use crate::common::{
+    env,
+    fixture::{create_lldap_command_with_key_file, free_port, http_url},
+};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use nix::{
@@ -8,7 +11,6 @@ use nix::{
 use reqwest::blocking::{Client, ClientBuilder};
 use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
 use serde_json::{Value, json};
-use serial_test::file_serial;
 use std::process::Child as ChildProcess;
 use std::{thread, time::Duration};
 mod common;
@@ -106,6 +108,17 @@ impl Drop for FixtureFiles {
 
 struct ServerGuard {
     child: ChildProcess,
+    ldap_port: u16,
+    http_port: u16,
+}
+
+impl ServerGuard {
+    fn http_url(&self) -> String {
+        http_url(self.http_port)
+    }
+    fn ldap_url(&self) -> String {
+        format!("ldap://localhost:{}", self.ldap_port)
+    }
 }
 
 impl Drop for ServerGuard {
@@ -125,12 +138,22 @@ impl Drop for ServerGuard {
 }
 
 fn spawn_and_wait_healthy(db_url: &str, key_file: &str) -> ServerGuard {
+    let ldap_port = free_port();
+    let http_port = free_port();
     let child = create_lldap_command_with_key_file("run", db_url, key_file)
+        .env("LLDAP_LDAP_PORT", ldap_port.to_string())
+        .env("LLDAP_HTTP_PORT", http_port.to_string())
         .spawn()
         .expect("unable to start server");
-    let guard = ServerGuard { child };
+    let guard = ServerGuard {
+        child,
+        ldap_port,
+        http_port,
+    };
     for _ in 0..30 {
         let healthy = create_lldap_command_with_key_file("healthcheck", db_url, key_file)
+            .env("LLDAP_LDAP_PORT", ldap_port.to_string())
+            .env("LLDAP_HTTP_PORT", http_port.to_string())
             .status()
             .expect("healthcheck failed to execute")
             .success();
@@ -150,17 +173,22 @@ fn make_client() -> Client {
         .expect("failed to make http client")
 }
 
-fn simple_login(client: &Client, username: &str, password: &str) -> reqwest::blocking::Response {
+fn simple_login(
+    client: &Client,
+    base_url: &str,
+    username: &str,
+    password: &str,
+) -> reqwest::blocking::Response {
     client
-        .post(format!("{}/auth/simple/login", env::http_url()))
+        .post(format!("{base_url}/auth/simple/login"))
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(json!({"username": username, "password": password}).to_string())
         .send()
         .expect("login send failed")
 }
 
-fn login_token(client: &Client, username: &str, password: &str) -> String {
-    let body: Value = simple_login(client, username, password)
+fn login_token(client: &Client, base_url: &str, username: &str, password: &str) -> String {
+    let body: Value = simple_login(client, base_url, username, password)
         .error_for_status()
         .unwrap_or_else(|e| panic!("login as {username} failed: {e}"))
         .json()
@@ -168,9 +196,9 @@ fn login_token(client: &Client, username: &str, password: &str) -> String {
     body["token"].as_str().expect("no token").to_string()
 }
 
-fn gql(client: &Client, token: &str, query: &str, variables: Value) -> Value {
+fn gql(client: &Client, base_url: &str, token: &str, query: &str, variables: Value) -> Value {
     let body: Value = client
-        .post(format!("{}/api/graphql", env::http_url()))
+        .post(format!("{base_url}/api/graphql"))
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .bearer_auth(token)
         .body(json!({"query": query, "variables": variables}).to_string())
@@ -197,7 +225,6 @@ fn attribute_values<'a>(attributes: &'a Value, name: &str) -> Option<&'a Value> 
 }
 
 #[test]
-#[file_serial]
 fn test_stock_lldap_database_migrates_with_data_and_passwords() {
     let run_id = uuid::Uuid::new_v4().simple().to_string();
     let db_path = std::env::temp_dir().join(format!("klldap_migration_{run_id}.db"));
@@ -224,36 +251,38 @@ fn test_stock_lldap_database_migrates_with_data_and_passwords() {
     .expect("bob must have a stock password hash");
 
     {
-        let _server = spawn_and_wait_healthy(&db_url, &key_file);
+        let server = spawn_and_wait_healthy(&db_url, &key_file);
+        let base_url = server.http_url();
         let client = make_client();
 
         // First bind runs the legacy OPAQUE ceremony and transparently re-enrolls;
         // the second must succeed against the re-enrolled current-format hash.
-        login_token(&client, "bob", BOB_PASS);
-        login_token(&client, "bob", BOB_PASS);
+        login_token(&client, &base_url, "bob", BOB_PASS);
+        login_token(&client, &base_url, "bob", BOB_PASS);
         assert!(
-            !simple_login(&client, "bob", "not-the-password")
+            !simple_login(&client, &base_url, "bob", "not-the-password")
                 .status()
                 .is_success(),
             "wrong password must not bind"
         );
         assert!(
-            !simple_login(&client, "charlie", "anything")
+            !simple_login(&client, &base_url, "charlie", "anything")
                 .status()
                 .is_success(),
             "charlie never had a password"
         );
 
-        let mut ldap = ldap3::LdapConn::new(&env::ldap_url()).expect("ldap connect");
+        let mut ldap = ldap3::LdapConn::new(&server.ldap_url()).expect("ldap connect");
         ldap.simple_bind(&format!("uid=bob,ou=people,{}", env::base_dn()), BOB_PASS)
             .expect("ldap bind send")
             .success()
             .expect("ldap bind as bob must succeed");
         let _ = ldap.unbind();
 
-        let admin_token = login_token(&client, "admin", ADMIN_PASS);
+        let admin_token = login_token(&client, &base_url, "admin", ADMIN_PASS);
         let user = gql(
             &client,
+            &base_url,
             &admin_token,
             r#"query($id: String!) { user(userId: $id) {
                 displayName
@@ -313,6 +342,7 @@ fn test_stock_lldap_database_migrates_with_data_and_passwords() {
             .expect("bob must be in the fixture group");
         let crew_details = gql(
             &client,
+            &base_url,
             &admin_token,
             r#"query($id: Int!) { group(groupId: $id) { attributes { name value } } }"#,
             json!({"id": crew["id"]}),
@@ -325,6 +355,7 @@ fn test_stock_lldap_database_migrates_with_data_and_passwords() {
 
         let schema = gql(
             &client,
+            &base_url,
             &admin_token,
             r#"{ schema { userSchema { attributes { name attributeType } } } }"#,
             json!({}),

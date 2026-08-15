@@ -1,3 +1,4 @@
+use lldap_domain_model::error::DomainError;
 use std::env;
 use std::sync::{Arc, LazyLock, RwLock};
 use tracing::warn;
@@ -41,6 +42,10 @@ pub fn principal_name(username: &str) -> String {
 }
 
 pub trait KerberosSync: Send + Sync {
+    /// Whether the KDC has been reachable at least once since the process started.
+    fn ready(&self) -> bool {
+        true
+    }
     fn sync_principal(&self, username: &str, password: &str) -> Result<(), String>;
     fn sync_if_enabled(
         &self,
@@ -96,6 +101,18 @@ pub fn kerberos_backend() -> Arc<dyn KerberosSync> {
 
 pub fn set_kerberos_backend(backend: Arc<dyn KerberosSync>) {
     *BACKEND.write().expect("kerberos backend") = backend;
+}
+
+/// Directory writes are refused until the KDC has come up, so nothing changes that the
+/// KDC could not follow.
+pub fn require_kdc_ready() -> Result<(), DomainError> {
+    if kerberos_backend().ready() {
+        Ok(())
+    } else {
+        Err(DomainError::KdcUnavailable(
+            "the Kerberos KDC is still starting; retry shortly".to_owned(),
+        ))
+    }
 }
 
 #[cfg(test)]

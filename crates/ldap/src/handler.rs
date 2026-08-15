@@ -299,14 +299,7 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
         };
         modify::handle_modify_request(
             self.get_opaque_handler(),
-            |credentials, user_id| {
-                self.backend_handler
-                    .get_readable_handler(credentials, user_id)
-            },
-            |credentials, user_id| {
-                self.backend_handler
-                    .get_writeable_handler(credentials, user_id)
-            },
+            &self.backend_handler,
             self.ldap_info,
             credentials,
             request,

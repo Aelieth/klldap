@@ -15,6 +15,7 @@ use lldap_domain_handlers::handler::{
     GroupBackendHandler, GroupListerBackendHandler, GroupRequestFilter, ReadSchemaBackendHandler,
     SubStringFilter, SystemConfigBackendHandler,
 };
+use lldap_domain_handlers::kerberos::require_kdc_ready;
 use lldap_domain_model::{
     error::{DomainError, Result},
     model::{self, GroupColumn, MembershipColumn, codec},
@@ -302,6 +303,7 @@ impl GroupBackendHandler for SqlBackendHandler {
 
     #[instrument(skip(self), level = "debug", err, fields(group_id = ?request.group_id))]
     async fn update_group(&self, request: UpdateGroupRequest) -> Result<()> {
+        require_kdc_ready()?;
         if request.display_name.is_some() {
             let current = self.get_group_details(request.group_id).await?;
             if is_builtin_group(current.display_name.as_str()) {
@@ -324,6 +326,7 @@ impl GroupBackendHandler for SqlBackendHandler {
 
     #[instrument(skip(self), level = "debug", ret, err)]
     async fn create_group(&self, request: CreateGroupRequest) -> Result<GroupId> {
+        require_kdc_ready()?;
         let now = chrono::Utc::now().naive_utc();
         let uuid = Uuid::from_name_and_date(request.display_name.as_str(), &now);
         let lower_display_name = request.display_name.as_str().to_lowercase();
@@ -435,6 +438,7 @@ impl GroupBackendHandler for SqlBackendHandler {
 
     #[instrument(skip(self), level = "debug", err)]
     async fn delete_group(&self, group_id: GroupId) -> Result<()> {
+        require_kdc_ready()?;
         let group_details = self.get_group_details(group_id).await?;
 
         if is_builtin_group(group_details.display_name.as_str()) {

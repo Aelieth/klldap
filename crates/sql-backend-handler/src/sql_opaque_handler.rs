@@ -4,6 +4,7 @@ use base64::Engine;
 use lldap_auth::opaque;
 use lldap_domain::types::UserId;
 use lldap_domain_handlers::handler::{BindRequest, LoginHandler};
+use lldap_domain_handlers::kerberos::require_kdc_ready;
 use lldap_domain_model::{
     error::{DomainError, Result},
     model::{self, UserColumn},
@@ -290,6 +291,7 @@ impl OpaqueHandler for SqlOpaqueHandler {
         &self,
         request: registration::ClientRegistrationFinishRequest,
     ) -> Result<()> {
+        require_kdc_ready()?;
         let secret_key = self.get_orion_secret_key()?;
         let registration::ServerData { username } = bincode::deserialize(&orion::aead::open(
             &secret_key,

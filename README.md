@@ -114,7 +114,7 @@ read from a file instead by appending `_FILE` to the variable name
 | `LLDAP_FORCE_UPDATE_PRIVATE_KEY` | `false` | Accept a changed private key (invalidates every password) |
 | `LLDAP_LDAPS_OPTIONS__ENABLED` / `__PORT` / `__CERT_FILE` / `__KEY_FILE` | `false` / `6360` | LDAPS |
 | `LLDAP_SMTP_OPTIONS__ENABLE_PASSWORD_RESET`, `__SERVER`, `__PORT`, `__SMTP_ENCRYPTION`, `__USER`, `__PASSWORD`, `__FROM`, `__REPLY_TO` | off | Password-reset mail |
-| `LLDAP_HEALTHCHECK_OPTIONS__HTTP_HOST` / `__LDAP_HOST` / `__KERBEROS` | `localhost` / `false` | What `lldap healthcheck` probes; the image runs it with `--kerberos` |
+| `LLDAP_HEALTHCHECK_OPTIONS__HTTP_HOST` / `__LDAP_HOST` / `__KERBEROS` | `localhost` / `false` (`true` in the image) | What `lldap healthcheck` probes; `__KERBEROS` also makes directory writes wait for the KDC after boot |
 | `LLDAP_KERB_REALM_NAME` | derived | Kerberos realm override |
 | `LLDAP_KERB_ADMIN_KEYTAB`, `_CONFIG`, `_KRB5_CONF`, `_KDC_CONF`, `_KADM5_ACL`, `_KDC_DIR`, `_KEYCLOAK_KEYTAB`, `_KDC_PORT` (+ `_*_TEMPLATE`) | container layout | Kerberos file locations and KDC port, see [docs/kerberos.md](docs/kerberos.md) |
 | `LLDAP_KEYCLOAK_ADMIN_PASS` | `admin` | Keycloak admin password used by the Federation tab |

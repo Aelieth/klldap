@@ -8,14 +8,18 @@ use crate::{
     password,
 };
 use ldap3_proto::proto::{LdapModify, LdapModifyRequest, LdapModifyType, LdapOp, LdapResultCode};
-use lldap_access_control::{UserReadableBackendHandler, UserWriteableBackendHandler};
+use lldap_access_control::{
+    AccessControlledBackendHandler, UserReadableBackendHandler, UserWriteableBackendHandler,
+};
 use lldap_auth::access_control::ValidationResults;
 use lldap_domain::{
     requests::UpdateUserRequest,
     types::{Attribute, AttributeName, AttributeType, AttributeValue, Cardinality, Email, UserId},
 };
+use lldap_domain_handlers::handler::BackendHandler;
 use lldap_opaque_handler::OpaqueHandler;
 use lldap_schema::PublicSchema;
+use tracing::warn;
 
 // The profile attribute an LDAP Modify targets, after folding wire-name aliases (sn, cn, surname,
 // jpegphoto, ...) to the schema canonical name. Bridges canonical → DB attribute name / field.
@@ -46,7 +50,8 @@ fn modify_target(atype_lower: &str) -> ModifyTarget {
     }
 }
 
-async fn handle_password_modify(
+async fn handle_password_modify<Handler: BackendHandler + OpaqueHandler>(
+    backend_handler: &AccessControlledBackendHandler<Handler>,
     readable_handler: &impl UserReadableBackendHandler,
     opaque_handler: &impl OpaqueHandler,
     user_id: UserId,
@@ -86,7 +91,15 @@ async fn handle_password_modify(
         })?;
 
     if let Ok(plain_pass) = std::str::from_utf8(value) {
-        password::sync_kerberos_after_password_change(readable_handler, &user_id, plain_pass).await;
+        let sync_enabled =
+            password::sync_kerberos_after_password_change(readable_handler, &user_id, plain_pass)
+                .await;
+        if let Err(e) = backend_handler
+            .ensure_kerberos_principal_consistency(&user_id, sync_enabled)
+            .await
+        {
+            warn!("Failed to record Kerberos principal name for {user_id}: {e}");
+        }
     }
     Ok(())
 }
@@ -306,21 +319,13 @@ async fn current_ssh_keys(
         .unwrap_or_default())
 }
 
-pub(crate) async fn handle_modify_request<'cred, UserBackendHandler, WriteBackendHandler>(
+pub(crate) async fn handle_modify_request<Handler: BackendHandler + OpaqueHandler>(
     opaque_handler: &impl OpaqueHandler,
-    get_readable_handler: impl Fn(&'cred ValidationResults, UserId) -> Option<&'cred UserBackendHandler>,
-    get_writeable_handler: impl Fn(
-        &'cred ValidationResults,
-        UserId,
-    ) -> Option<&'cred WriteBackendHandler>,
+    backend_handler: &AccessControlledBackendHandler<Handler>,
     ldap_info: &LdapInfo,
-    credentials: &'cred ValidationResults,
+    credentials: &ValidationResults,
     request: &LdapModifyRequest,
-) -> LdapResult<Vec<LdapOp>>
-where
-    UserBackendHandler: UserReadableBackendHandler + 'cred,
-    WriteBackendHandler: UserWriteableBackendHandler + 'cred,
-{
+) -> LdapResult<Vec<LdapOp>> {
     match get_user_id_from_distinguished_name(
         &request.dn,
         &ldap_info.base_dn,
@@ -328,8 +333,9 @@ where
     ) {
         Ok(uid) => {
             for change in &request.changes {
-                let readable_handler =
-                    get_readable_handler(credentials, uid.clone()).ok_or_else(|| LdapError {
+                let readable_handler = backend_handler
+                    .get_readable_handler(credentials, uid.clone())
+                    .ok_or_else(|| LdapError {
                         code: LdapResultCode::InsufficentAccessRights,
                         message: format!(
                             "User `{}` cannot modify user `{}`",
@@ -353,6 +359,7 @@ where
                     .eq_ignore_ascii_case("userpassword")
                 {
                     handle_password_modify(
+                        backend_handler,
                         readable_handler,
                         opaque_handler,
                         uid.clone(),
@@ -363,7 +370,8 @@ where
                     .await?;
                     continue;
                 }
-                let writeable_handler = get_writeable_handler(credentials, uid.clone())
+                let writeable_handler = backend_handler
+                    .get_writeable_handler(credentials, uid.clone())
                     .ok_or_else(|| LdapError {
                         code: LdapResultCode::InsufficentAccessRights,
                         message: format!(

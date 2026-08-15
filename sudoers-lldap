@@ -1,2 +1,0 @@
-# Allow lldap user to run kadmin.local as root without password
-lldap ALL=(root) NOPASSWD: /usr/sbin/kadmin.local

@@ -65,6 +65,7 @@ pub(crate) fn error_to_http_response(error: TcpError) -> HttpResponse {
             DomainError::Base64DecodeError(_)
             | DomainError::BinarySerializationError(_)
             | DomainError::EntityNotFound(_) => HttpResponse::BadRequest(),
+            DomainError::KdcUnavailable(_) => HttpResponse::ServiceUnavailable(),
         },
         TcpError::BadRequest(_) => HttpResponse::BadRequest(),
         TcpError::NotFoundError(_) => HttpResponse::NotFound(),

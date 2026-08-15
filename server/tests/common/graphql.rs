@@ -1,5 +1,4 @@
 #![allow(dead_code)]
-use crate::common::env;
 use anyhow::{Context, Result, anyhow};
 use graphql_client::GraphQLQuery;
 use reqwest::blocking::Client;
@@ -85,6 +84,7 @@ pub struct DeleteUserQuery;
 
 pub fn post<QueryType>(
     client: &Client,
+    base_url: &str,
     token: &String,
     variables: QueryType::Variables,
 ) -> Result<QueryType::ResponseData>
@@ -104,7 +104,7 @@ where
             )
         })
     };
-    let url = env::http_url() + "/api/graphql";
+    let url = format!("{base_url}/api/graphql");
     let auth_header = format!("Bearer {token}");
     client
         .post(url)

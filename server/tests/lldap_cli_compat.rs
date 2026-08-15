@@ -1,7 +1,6 @@
 use crate::common::{env, fixture::LLDAPFixture};
 use reqwest::blocking::{Client, ClientBuilder};
 use serde_json::{Value, json};
-use serial_test::file_serial;
 mod common;
 
 // Replays lldap-cli's exact REST and GraphQL shapes (Zepmann/lldap-cli) against a live
@@ -17,8 +16,7 @@ fn make_client() -> Client {
         .expect("failed to make http client")
 }
 
-fn simple_login(client: &Client) -> (String, String) {
-    let base_url = env::http_url();
+fn simple_login(client: &Client, base_url: &str) -> (String, String) {
     let body: Value = client
         .post(format!("{base_url}/auth/simple/login"))
         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -38,8 +36,7 @@ fn simple_login(client: &Client) -> (String, String) {
     )
 }
 
-fn gql(client: &Client, token: &str, query: &str, variables: Value) -> Value {
-    let base_url = env::http_url();
+fn gql(client: &Client, base_url: &str, token: &str, query: &str, variables: Value) -> Value {
     let body: Value = client
         .post(format!("{base_url}/api/graphql"))
         .header(reqwest::header::CONTENT_TYPE, "application/json")
@@ -59,13 +56,12 @@ fn gql(client: &Client, token: &str, query: &str, variables: Value) -> Value {
 }
 
 #[test]
-#[file_serial]
 fn test_lldap_cli_operation_sequence() {
-    let mut _fixture = LLDAPFixture::new();
+    let fixture = LLDAPFixture::new();
     let client = make_client();
-    let base_url = env::http_url();
+    let base_url = fixture.http_url();
 
-    let (token, refresh_token) = simple_login(&client);
+    let (token, refresh_token) = simple_login(&client, &base_url);
     let refreshed: Value = client
         .get(format!("{base_url}/auth/refresh"))
         .header(
@@ -85,6 +81,7 @@ fn test_lldap_cli_operation_sequence() {
 
     let created = gql(
         &client,
+        &base_url,
         &token,
         r#"mutation CreateUser($user: CreateUserInput!) {
             createUser(user: $user) {id email displayName firstName lastName avatar}
@@ -95,6 +92,7 @@ fn test_lldap_cli_operation_sequence() {
 
     let users = gql(
         &client,
+        &base_url,
         &token,
         r#"{users{id creationDate uuid email displayName firstName lastName}}"#,
         json!({}),
@@ -109,6 +107,7 @@ fn test_lldap_cli_operation_sequence() {
 
     let attrs = gql(
         &client,
+        &base_url,
         &token,
         r#"query GetUserAttributes($id: String!) {
             user(userId: $id) { attributes { name value } }
@@ -125,6 +124,7 @@ fn test_lldap_cli_operation_sequence() {
 
     gql(
         &client,
+        &base_url,
         &token,
         r#"mutation UpdateUser($user: UpdateUserInput!) {updateUser(user: $user) {ok}}"#,
         json!({"user": {"id": user_id, "insertAttributes": [{"name": "firstname", "value": ["Cli"]}]}}),
@@ -132,6 +132,7 @@ fn test_lldap_cli_operation_sequence() {
 
     let group = gql(
         &client,
+        &base_url,
         &token,
         r#"mutation CreateGroup($group: String!) {createGroup(name: $group) {id}}"#,
         json!({"group": group_name}),
@@ -140,6 +141,7 @@ fn test_lldap_cli_operation_sequence() {
 
     let groups = gql(
         &client,
+        &base_url,
         &token,
         r#"{groups{id creationDate uuid displayName}}"#,
         json!({}),
@@ -153,6 +155,7 @@ fn test_lldap_cli_operation_sequence() {
     );
     gql(
         &client,
+        &base_url,
         &token,
         r#"mutation UpdateGroup($group: UpdateGroupInput!) {updateGroup(group: $group) {ok}}"#,
         json!({"group": {"id": group_id, "insertAttributes": []}}),
@@ -161,6 +164,7 @@ fn test_lldap_cli_operation_sequence() {
     for (name, attr_type) in [("clistrattr", "STRING"), ("clijpegattr", "JPEG_PHOTO")] {
         gql(
             &client,
+            &base_url,
             &token,
             r#"mutation AddUserAttribute($name: String!, $attributeType: AttributeType!) {
                 addUserAttribute(name: $name, attributeType: $attributeType,
@@ -171,6 +175,7 @@ fn test_lldap_cli_operation_sequence() {
     }
     let schema = gql(
         &client,
+        &base_url,
         &token,
         r#"{schema{userSchema{attributes{name attributeType isList isVisible isEditable}}}}"#,
         json!({}),
@@ -186,12 +191,14 @@ fn test_lldap_cli_operation_sequence() {
 
     gql(
         &client,
+        &base_url,
         &token,
         r#"mutation AddUserObjectClass($name: String!) {addUserObjectClass(name: $name) {ok}}"#,
         json!({"name": "cliCompatClass"}),
     );
     let classes = gql(
         &client,
+        &base_url,
         &token,
         r#"{schema{userSchema{extraLdapObjectClasses}}}"#,
         json!({}),
@@ -205,6 +212,7 @@ fn test_lldap_cli_operation_sequence() {
     );
     gql(
         &client,
+        &base_url,
         &token,
         r#"mutation DeleteUserObjectClass($name: String!) {deleteUserObjectClass(name: $name) {ok}}"#,
         json!({"name": "cliCompatClass"}),
@@ -213,6 +221,7 @@ fn test_lldap_cli_operation_sequence() {
     for name in ["clistrattr", "clijpegattr"] {
         gql(
             &client,
+            &base_url,
             &token,
             r#"mutation DeleteUserAttribute($name: String!) {deleteUserAttribute(name: $name) {ok}}"#,
             json!({"name": name}),
@@ -220,12 +229,14 @@ fn test_lldap_cli_operation_sequence() {
     }
     gql(
         &client,
+        &base_url,
         &token,
         r#"mutation DeleteGroup($id: Int!) {deleteGroup(groupId: $id) {ok}}"#,
         json!({"id": group_id}),
     );
     gql(
         &client,
+        &base_url,
         &token,
         r#"mutation DeleteUser($userId: String!) {deleteUser(userId: $userId) {ok}}"#,
         json!({"userId": user_id}),

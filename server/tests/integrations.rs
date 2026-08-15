@@ -5,11 +5,9 @@ use crate::common::{
     fixture::{LLDAPFixture, User, new_id},
 };
 use ldap3::{LdapConn, Scope, SearchEntry};
-use serial_test::file_serial;
 mod common;
 
 #[test]
-#[file_serial]
 fn gitea() {
     let mut fixture = LLDAPFixture::new();
     let gitea_user_group = new_id(Some("gitea_user-"));
@@ -24,8 +22,7 @@ fn gitea() {
     ];
     fixture.load_state(&initial_state);
 
-    let mut ldap =
-        LdapConn::new(env::ldap_url().as_str()).expect("failed to create ldap connection");
+    let mut ldap = LdapConn::new(&fixture.ldap_url()).expect("failed to create ldap connection");
     let base_dn = env::base_dn();
     let bind_dn = format!("uid={},ou=people,{}", env::admin_dn(), base_dn);
     ldap.simple_bind(bind_dn.as_str(), env::admin_password().as_str())

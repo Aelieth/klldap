@@ -52,13 +52,17 @@ Group configs are used to define groups that will be created by the script
 Fields description:
 
 * `name`: name of the group (**MANDATORY**)
+* `ou`: the group's organizational unit (KLLDAP; the OU must exist, `groups` by default)
+* any other key is applied as a group attribute (`gidnumber`, custom attributes)
 
 ```json
 {
   "name": "group-1"
 }
 {
-  "name": "group-2"
+  "name": "group-2",
+  "ou": "lab",
+  "gidnumber": 4200
 }
 ```
 
@@ -80,6 +84,10 @@ Fields description:
 * `gravatar_avatar` (`false` by default): the script will try to get an avatar from [gravatar](https://gravatar.com/) by previously specified `email` (has the highest priority)
 * `weserv_avatar` (`false` by default): avatar file from `avatar_url` or `gravatar_avatar` would be converted to jpeg using [wsrv.nl](https://wsrv.nl) (useful when your avatar is png)
 * `groups`: an array of groups the user would be a member of (all the groups must be specified in group config files)
+* `ou`: the user's organizational unit (KLLDAP; the OU must exist, `people` by default)
+* any other key is applied as a user attribute: `kerberossync` (`"1"` to give the user a
+  Kerberos principal on the next password set), `uidnumber`, `gidnumber`, `homedirectory`,
+  `loginshell`, `sshpublickey` (a list), and custom attributes
 
 ```json
 {
@@ -96,7 +104,10 @@ Fields description:
   "groups": [
     "group-1",
     "group-2"
-  ]
+  ],
+  "ou": "lab",
+  "kerberossync": "1",
+  "sshpublickey": ["ssh-ed25519 AAAA... user@host"]
 }
 
 ```

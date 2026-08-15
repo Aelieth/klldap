@@ -84,3 +84,39 @@ impl Drop for RecordingGuard {
         set_kerberos_backend(Arc::new(NoopKerberos));
     }
 }
+
+// The KDC has not come up yet: directory writes must be refused.
+pub struct NotReadyKerberos;
+
+impl KerberosSync for NotReadyKerberos {
+    fn ready(&self) -> bool {
+        false
+    }
+    fn sync_principal(&self, _: &str, _: &str) -> Result<(), String> {
+        Err("KDC not ready".to_owned())
+    }
+    fn delete_principal(&self, _: &str) -> Result<(), String> {
+        Err("KDC not ready".to_owned())
+    }
+    fn set_principal_enabled(&self, _: &str, _: bool) -> Result<(), String> {
+        Err("KDC not ready".to_owned())
+    }
+    fn export_keytab_for_keycloak(&self, _: &str) -> Result<String, String> {
+        Err("KDC not ready".to_owned())
+    }
+}
+
+pub struct NotReadyGuard;
+
+impl NotReadyGuard {
+    pub fn install() -> Self {
+        set_kerberos_backend(Arc::new(NotReadyKerberos));
+        Self
+    }
+}
+
+impl Drop for NotReadyGuard {
+    fn drop(&mut self) {
+        set_kerberos_backend(Arc::new(NoopKerberos));
+    }
+}

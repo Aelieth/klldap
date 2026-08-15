@@ -5,11 +5,9 @@ use crate::common::{
     fixture::{LLDAPFixture, User, new_id},
 };
 use ldap3::{LdapConn, Scope, SearchEntry, SearchResult};
-use serial_test::file_serial;
 mod common;
 
 #[test]
-#[file_serial]
 fn basic_users_search() {
     let mut fixture = LLDAPFixture::new();
     let prefix = "ldap-basic_users_search-";
@@ -26,8 +24,7 @@ fn basic_users_search() {
     ];
     fixture.load_state(&initial_state);
 
-    let mut ldap =
-        LdapConn::new(env::ldap_url().as_str()).expect("failed to create ldap connection");
+    let mut ldap = LdapConn::new(&fixture.ldap_url()).expect("failed to create ldap connection");
 
     let base_dn = env::base_dn();
     let bind_dn = format!("uid={},ou=people,{}", env::admin_dn(), base_dn);
@@ -67,12 +64,10 @@ fn basic_users_search() {
 }
 
 #[test]
-#[file_serial]
 fn admin_search() {
-    let mut _fixture = LLDAPFixture::new();
+    let fixture = LLDAPFixture::new();
 
-    let mut ldap =
-        LdapConn::new(env::ldap_url().as_str()).expect("failed to create ldap connection");
+    let mut ldap = LdapConn::new(&fixture.ldap_url()).expect("failed to create ldap connection");
 
     let base_dn = env::base_dn();
     let bind_dn = format!("uid={},ou=people,{}", env::admin_dn(), base_dn);
@@ -111,7 +106,6 @@ fn admin_search() {
 }
 
 #[test]
-#[file_serial]
 fn test_nested_ou_test() {
     let mut fixture = LLDAPFixture::new();
     let prefix = "nested-ou-test-";
@@ -121,8 +115,7 @@ fn test_nested_ou_test() {
     let initial_state = vec![User::new(&user_name, vec![&group_name])];
     fixture.load_state(&initial_state);
 
-    let mut ldap =
-        LdapConn::new(env::ldap_url().as_str()).expect("failed to create ldap connection");
+    let mut ldap = LdapConn::new(&fixture.ldap_url()).expect("failed to create ldap connection");
 
     let base_dn = env::base_dn();
     let bind_dn = format!("uid={},ou=people,{}", env::admin_dn(), base_dn);
@@ -150,7 +143,6 @@ fn test_nested_ou_test() {
 }
 
 #[test]
-#[file_serial]
 fn test_subtree_search_at_leaf_returns_entry() {
     // RFC 4511 §4.5.1.2: wholeSubtree includes the base entry, so a subtree search
     // based at a user's own DN must return that user, not zero entries.
@@ -159,8 +151,7 @@ fn test_subtree_search_at_leaf_returns_entry() {
     let user_name = new_id(Some(prefix));
     fixture.load_state(&vec![User::new(&user_name, vec![])]);
 
-    let mut ldap =
-        LdapConn::new(env::ldap_url().as_str()).expect("failed to create ldap connection");
+    let mut ldap = LdapConn::new(&fixture.ldap_url()).expect("failed to create ldap connection");
     let base_dn = env::base_dn();
     let bind_dn = format!("uid={},ou=people,{}", env::admin_dn(), base_dn);
     ldap.simple_bind(&bind_dn, env::admin_password().as_str())
@@ -187,14 +178,12 @@ fn test_subtree_search_at_leaf_returns_entry() {
 }
 
 #[test]
-#[file_serial]
 fn test_ou_entries_respect_filter() {
     // A filter an OU cannot satisfy (a cn substring) must not return phantom OU entries,
     // while an objectClass filter that does match still returns them.
-    let mut _fixture = LLDAPFixture::new();
+    let fixture = LLDAPFixture::new();
 
-    let mut ldap =
-        LdapConn::new(env::ldap_url().as_str()).expect("failed to create ldap connection");
+    let mut ldap = LdapConn::new(&fixture.ldap_url()).expect("failed to create ldap connection");
     let base_dn = env::base_dn();
     let bind_dn = format!("uid={},ou=people,{}", env::admin_dn(), base_dn);
     ldap.simple_bind(&bind_dn, env::admin_password().as_str())
@@ -232,7 +221,6 @@ fn test_ou_entries_respect_filter() {
 }
 
 #[test]
-#[file_serial]
 fn test_cn_substring_matches_display_name() {
     // uid is random and does not contain the substring, so a match is via display_name.
     let mut fixture = LLDAPFixture::new();
@@ -242,8 +230,7 @@ fn test_cn_substring_matches_display_name() {
         User::new(&user_name, vec![]).with_display_name("Shaia Aelieth Meow"),
     ]);
 
-    let mut ldap =
-        LdapConn::new(env::ldap_url().as_str()).expect("failed to create ldap connection");
+    let mut ldap = LdapConn::new(&fixture.ldap_url()).expect("failed to create ldap connection");
     let base_dn = env::base_dn();
     let bind_dn = format!("uid={},ou=people,{}", env::admin_dn(), base_dn);
     ldap.simple_bind(&bind_dn, env::admin_password().as_str())
@@ -267,7 +254,6 @@ fn test_cn_substring_matches_display_name() {
 }
 
 #[test]
-#[file_serial]
 fn test_display_name_emitted_for_cn_and_display_name() {
     // A wildcard search returns both cn and displayName (same value); an explicit displayName
     // request returns displayName over the wire.
@@ -279,8 +265,7 @@ fn test_display_name_emitted_for_cn_and_display_name() {
         User::new(&user_name, vec![]).with_display_name(display),
     ]);
 
-    let mut ldap =
-        LdapConn::new(env::ldap_url().as_str()).expect("failed to create ldap connection");
+    let mut ldap = LdapConn::new(&fixture.ldap_url()).expect("failed to create ldap connection");
     let base_dn = env::base_dn();
     let bind_dn = format!("uid={},ou=people,{}", env::admin_dn(), base_dn);
     ldap.simple_bind(&bind_dn, env::admin_password().as_str())
@@ -336,7 +321,6 @@ fn attrs_for_user(results: SearchResult, uid: &str) -> HashMap<String, String> {
 }
 
 #[test]
-#[file_serial]
 fn test_member_uid_lists_group_members() {
     // memberUid (RFC 2307 posixGroup): a wildcard group search exposes member login names, and
     // (memberUid=<user>) resolves the user's groups: the SSSD default rfc2307 membership path.
@@ -346,8 +330,7 @@ fn test_member_uid_lists_group_members() {
     let group_name = new_id(Some(prefix));
     fixture.load_state(&vec![User::new(&user_name, vec![&group_name])]);
 
-    let mut ldap =
-        LdapConn::new(env::ldap_url().as_str()).expect("failed to create ldap connection");
+    let mut ldap = LdapConn::new(&fixture.ldap_url()).expect("failed to create ldap connection");
     let base_dn = env::base_dn();
     let bind_dn = format!("uid={},ou=people,{}", env::admin_dn(), base_dn);
     ldap.simple_bind(&bind_dn, env::admin_password().as_str())

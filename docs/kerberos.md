@@ -24,10 +24,12 @@ The entrypoint starts the server, waits until it is healthy, then runs
 3. creates the KDC database (`kdb5_util create -s`) with a random master password that
    is only stashed, never shown or stored elsewhere,
 4. creates `admin/admin@REALM` with a random key and writes it to `/data/kadm5.keytab`
-   (mode 640, owned by the server user); every KDC operation KLLDAP performs uses this
-   keytab through libkadm5,
-5. starts `krb5kdc` and `kadmind`, waits for port 88, and populates a credential cache
-   from the keytab.
+   (mode 640, owned by the server user, i.e. `LLDAP_UID:LLDAP_GID`, like the KDC database
+   itself); every KDC operation KLLDAP performs uses this keytab through libkadm5,
+5. starts `krb5kdc` and `kadmind` in the foreground, waits for port 88, populates a
+   credential cache from the keytab, and then supervises them: if either exits, the other
+   is stopped and the manager exits, so the healthcheck reports the KDC down instead of a
+   half-working one.
 
 Every step is idempotent: existing databases, principals and files are kept, and a
 missing keytab is recreated from the surviving database (`/data` and
@@ -38,7 +40,17 @@ overwritten on restart; it is checked for the `admin/admin@REALM *` grant and re
 
 The container's healthcheck runs `lldap healthcheck --kerberos`: the KDC port must
 accept connections and the admin keytab must exist, otherwise the container reports
-unhealthy.
+unhealthy. The image also sets `LLDAP_HEALTHCHECK_OPTIONS__KERBEROS=true`, which tells
+the server that a KDC is part of the deployment: **directory writes (users, groups,
+passwords, attributes, settings) are refused with "Kerberos KDC unavailable" until the KDC
+has answered once after boot**, so nothing changes that the KDC could not follow. Logins
+and reads are never gated, and a KDC that dies later does not block writes — that is the
+healthcheck's job. Outside the image (no KDC), leave the option unset and writes never
+wait.
+
+The KDC's master password is random and exists only as the stash file `.k5.<REALM>` in
+`/var/kerberos/krb5kdc`, next to the database it unlocks; `kadmin.local` and `kdb5_util`
+(dump, load) work from the stash. Back that volume up as a whole.
 
 ## Principals
 
@@ -92,8 +104,9 @@ Unset variables keep the container layout; they exist for tests and unusual layo
 
 ## Losing a volume
 
-- `/var/kerberos/krb5kdc` lost: the next start creates a fresh KDC database and admin
-  keytab. Existing users have no principal until their password is next set (or an
-  admin sets one for them); the Keycloak keytab has to be exported again.
+- `/var/kerberos/krb5kdc` lost (database and stash go together): the next start creates
+  a fresh KDC database and admin keytab. Existing users have no principal until their
+  password is next set (or an admin sets one for them); the Keycloak keytab has to be
+  exported again.
 - `/data` lost: the admin keytab is regenerated against the surviving KDC database. The
   LLDAP database and `server_key` are gone with it, though — restore them from backup.

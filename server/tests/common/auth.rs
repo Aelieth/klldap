@@ -1,10 +1,9 @@
 use crate::common::env;
 use reqwest::blocking::Client;
 
-pub fn get_token(client: &Client) -> String {
+pub fn get_token(client: &Client, base_url: &str) -> String {
     let username = env::admin_dn();
     let password = env::admin_password();
-    let base_url = env::http_url();
     let response = client
         .post(format!("{base_url}/auth/simple/login"))
         .header(reqwest::header::CONTENT_TYPE, "application/json")

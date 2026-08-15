@@ -86,7 +86,7 @@ RUN groupadd -g 1000 lldap && \
 
 # Runtime deps (Kerberos + LLDAP needs)
 RUN microdnf install -y --assumeyes \
-    tzdata bash openssl cyrus-sasl-gssapi krb5-server krb5-libs krb5-workstation openldap-clients procps-ng ca-certificates sudo strace \
+    tzdata bash openssl cyrus-sasl-gssapi krb5-server krb5-libs krb5-workstation openldap-clients procps-ng ca-certificates \
     && microdnf clean all
 
 # Pre-create persistent directories with correct ownership
@@ -116,10 +116,6 @@ COPY --chown=lldap:lldap start-lldap.sh /start-lldap.sh
 RUN chmod +x /entrypoint.sh
 RUN chmod +x /start-lldap.sh
 
-# Setup sudo for kadmin.local
-COPY sudoers-lldap /etc/sudoers.d/lldap
-RUN chmod 0440 /etc/sudoers.d/lldap
-
 # Volumes for persistence
 VOLUME /data /var/kerberos/krb5kdc
 
@@ -130,10 +126,12 @@ EXPOSE 3890 17170 88/tcp 88/udp 749/tcp
 # docker --user, or kubernetes securityContext) — prefer LLDAP_UID/LLDAP_GID; the legacy
 # UID/GID names are still honored (read via printenv, immune to bash builds that reset
 # $UID to a readonly builtin). Default matches the lldap user created below (1000:1000).
-# The named "lldap" user/group is intentionally kept so that kerberos_manager's
-# sudo/chown steps (which reference the name) continue to act as a sanity check that the
-# user exists in the image.
+# The named "lldap" user/group stays: it is the ownership fallback when LLDAP_UID/LLDAP_GID
+# are unset.
 ENV UID=1000 GID=1000 LLDAP_UID=1000 LLDAP_GID=1000
+# The KDC is part of this image: the healthcheck covers it and directory writes wait for it
+# to come up after boot.
+ENV LLDAP_HEALTHCHECK_OPTIONS__KERBEROS=true
 
 # Entry & health — pass --config-file explicitly (like upstream LLDAP) so the prepared
 # /data/lldap_config.toml (with key_seed, database_url pointing at the volume, etc.) is

@@ -5,6 +5,7 @@ use lldap_domain::{
     types::{AttributeName, LdapObjectClass},
 };
 use lldap_domain_handlers::handler::{ReadSchemaBackendHandler, SchemaBackendHandler};
+use lldap_domain_handlers::kerberos::require_kdc_ready;
 use lldap_domain_model::{
     error::{DomainError, Result},
     model,
@@ -29,6 +30,7 @@ impl ReadSchemaBackendHandler for SqlBackendHandler {
 #[async_trait]
 impl SchemaBackendHandler for SqlBackendHandler {
     async fn add_user_attribute(&self, request: CreateAttributeRequest) -> Result<()> {
+        require_kdc_ready()?;
         let new_attribute = model::user_attribute_schema::ActiveModel {
             attribute_name: Set(request.name),
             attribute_type: Set(request.attribute_type),
@@ -44,6 +46,7 @@ impl SchemaBackendHandler for SqlBackendHandler {
     }
 
     async fn add_group_attribute(&self, request: CreateAttributeRequest) -> Result<()> {
+        require_kdc_ready()?;
         let new_attribute = model::group_attribute_schema::ActiveModel {
             attribute_name: Set(request.name),
             attribute_type: Set(request.attribute_type),
@@ -59,6 +62,7 @@ impl SchemaBackendHandler for SqlBackendHandler {
     }
 
     async fn delete_user_attribute(&self, name: &AttributeName) -> Result<()> {
+        require_kdc_ready()?;
         model::UserAttributeSchema::delete_by_id(name.clone())
             .exec(&self.sql_pool)
             .await?;
@@ -66,6 +70,7 @@ impl SchemaBackendHandler for SqlBackendHandler {
     }
 
     async fn delete_group_attribute(&self, name: &AttributeName) -> Result<()> {
+        require_kdc_ready()?;
         model::GroupAttributeSchema::delete_by_id(name.clone())
             .exec(&self.sql_pool)
             .await?;
@@ -73,6 +78,7 @@ impl SchemaBackendHandler for SqlBackendHandler {
     }
 
     async fn add_user_object_class(&self, name: &LdapObjectClass) -> Result<()> {
+        require_kdc_ready()?;
         let mut name_key = name.to_string();
         name_key.make_ascii_lowercase();
         model::user_object_classes::ActiveModel {
@@ -85,6 +91,7 @@ impl SchemaBackendHandler for SqlBackendHandler {
     }
 
     async fn add_group_object_class(&self, name: &LdapObjectClass) -> Result<()> {
+        require_kdc_ready()?;
         let mut name_key = name.to_string();
         name_key.make_ascii_lowercase();
         model::group_object_classes::ActiveModel {
@@ -97,6 +104,7 @@ impl SchemaBackendHandler for SqlBackendHandler {
     }
 
     async fn delete_user_object_class(&self, name: &LdapObjectClass) -> Result<()> {
+        require_kdc_ready()?;
         model::UserObjectClasses::delete_by_id(name.as_str().to_ascii_lowercase())
             .exec(&self.sql_pool)
             .await?;
@@ -104,6 +112,7 @@ impl SchemaBackendHandler for SqlBackendHandler {
     }
 
     async fn delete_group_object_class(&self, name: &LdapObjectClass) -> Result<()> {
+        require_kdc_ready()?;
         model::GroupObjectClasses::delete_by_id(name.as_str().to_ascii_lowercase())
             .exec(&self.sql_pool)
             .await?;

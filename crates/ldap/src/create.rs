@@ -225,9 +225,18 @@ async fn create_user(
     if kerberossync_enabled
         && let Some(password) = attributes.get("userpassword")
         && let Ok(plain) = std::str::from_utf8(password)
-        && let Err(e) = kerberos_backend().sync_principal(user_id.as_str(), plain)
     {
-        warn!("Kerberos principal sync failed after LDAP user create: {e}");
+        match kerberos_backend().sync_principal(user_id.as_str(), plain) {
+            Ok(()) => {
+                if let Err(e) = backend_handler
+                    .ensure_kerberos_principal_consistency(&user_id, true)
+                    .await
+                {
+                    warn!("Failed to record Kerberos principal name for {user_id}: {e}");
+                }
+            }
+            Err(e) => warn!("Kerberos principal sync failed after LDAP user create: {e}"),
+        }
     }
 
     Ok(vec![make_add_response(
@@ -561,6 +570,10 @@ mod tests {
         let guard = RecordingGuard::install();
         let mut mock = MockTestBackendHandler::new();
         mock.expect_create_user().times(1).return_once(|_| Ok(()));
+        mock.expect_ensure_kerberos_principal_consistency()
+            .with(eq(UserId::new("bob")), eq(true))
+            .times(1)
+            .return_once(|_, _| Ok(()));
         let ldap_handler = setup_bound_admin_handler(mock).await;
         assert_eq!(
             ldap_handler

@@ -5,12 +5,10 @@ use crate::common::{
     graphql::{GetUserDetails, ListUsers, get_user_details, list_users, post},
 };
 use reqwest::blocking::ClientBuilder;
-use serial_test::file_serial;
 use std::collections::HashSet;
 mod common;
 
 #[test]
-#[file_serial]
 fn list_users() {
     let mut fixture = LLDAPFixture::new();
     let prefix = "graphql-list_users-";
@@ -32,9 +30,14 @@ fn list_users() {
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .expect("failed to make http client");
-    let token = get_token(&client);
-    let result =
-        post::<ListUsers>(&client, &token, list_users::Variables {}).expect("failed to list users");
+    let token = get_token(&client, &fixture.http_url());
+    let result = post::<ListUsers>(
+        &client,
+        &fixture.http_url(),
+        &token,
+        list_users::Variables {},
+    )
+    .expect("failed to list users");
     let users: HashSet<String> = result.users.iter().map(|user| user.id.clone()).collect();
     assert!(users.contains(&user1_name));
     assert!(users.contains(&user2_name));
@@ -42,9 +45,8 @@ fn list_users() {
 }
 
 #[test]
-#[file_serial]
 fn get_admin() {
-    let mut _fixture = LLDAPFixture::new();
+    let fixture = LLDAPFixture::new();
     let client = ClientBuilder::new()
         .connect_timeout(std::time::Duration::from_secs(2))
         .timeout(std::time::Duration::from_secs(5))
@@ -53,9 +55,10 @@ fn get_admin() {
         .expect("failed to make http client");
     let admin_name = env::admin_dn();
     let admin_group_name = "lldap_admin";
-    let token = get_token(&client);
+    let token = get_token(&client, &fixture.http_url());
     let result = post::<GetUserDetails>(
         &client,
+        &fixture.http_url(),
         &token,
         get_user_details::Variables { id: admin_name },
     )

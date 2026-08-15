@@ -439,11 +439,52 @@ update_user_attributes() {
 }
 
 extract_custom_group_attributes() {
-  extract_custom_attributes "$1" '"name"'
+  extract_custom_attributes "$1" '"name","ou"'
 }
 
 extract_custom_user_attributes() {
-  extract_custom_attributes "$1" '"id","email","password","password_file","displayName","firstName","lastName","groups","avatar_file","avatar_url","gravatar_avatar","weserv_avatar"'
+  extract_custom_attributes "$1" '"id","email","password","password_file","displayName","firstName","lastName","groups","avatar_file","avatar_url","gravatar_avatar","weserv_avatar","ou"'
+}
+
+# "ou" is read-only as an attribute; it moves through the OU mutations.
+change_user_ou() {
+  local user_id="$1" ou="$2"
+  local query
+  query=$(jq -n -c --arg id "$user_id" --arg ou "$ou" '
+    {
+      "query": "mutation ChangeUserOu($ids: [String!]!, $ou: String!) {changeUserOu(userIds: $ids, newOu: $ou) {ok}}",
+      "operationName": "ChangeUserOu",
+      "variables": {"ids": [$id], "ou": $ou}
+    }')
+  __apply_ou_mutation "$query" "user \"$user_id\"" "$ou"
+}
+
+change_group_ou() {
+  local group_id="$1" ou="$2"
+  local query
+  query=$(jq -n -c --argjson id "$group_id" --arg ou "$ou" '
+    {
+      "query": "mutation ChangeGroupOu($ids: [Int!]!, $ou: String!) {changeGroupOu(groupIds: $ids, newOu: $ou) {ok}}",
+      "operationName": "ChangeGroupOu",
+      "variables": {"ids": [$id], "ou": $ou}
+    }')
+  __apply_ou_mutation "$query" "group ID \"$group_id\"" "$ou"
+}
+
+__apply_ou_mutation() {
+  local query="$1" subject="$2" ou="$3"
+  local response='' error=''
+  response="$(curl --silent --request POST \
+    --url "$LLDAP_URL/api/graphql" \
+    --header "Authorization: Bearer $TOKEN" \
+    --header 'Content-Type: application/json' \
+    --data "$query")"
+  error="$(printf '%s' "$response" | jq --raw-output '.errors | if . != null then .[].message else empty end')"
+  if [[ -n "$error" ]]; then
+    printf 'Error moving %s to OU "%s": %s\n' "$subject" "$ou" "$error"
+  else
+    printf 'Moved %s to OU "%s"\n' "$subject" "$ou"
+  fi
 }
 
 extract_custom_attributes() {
@@ -663,6 +704,11 @@ main() {
     group_name="$(printf '%s' "$group_config" | jq --raw-output '.name')"
     create_group "$group_name"
     redundant_groups="$(printf '%s' "$redundant_groups" | jq --compact-output --arg name "$group_name" '. - [$name]')"
+    local group_ou=''
+    group_ou="$(printf '%s' "$group_config" | jq --raw-output '.ou // empty')"
+    if [[ -n "$group_ou" ]]; then
+      change_group_ou "$(get_group_id "$group_name")" "$group_ou"
+    fi
     # Process custom attributes
     printf -- '--- Processing custom attributes for group %s ---\n' "$group_name"
     local attributes_json
@@ -710,6 +756,11 @@ main() {
 
     create_update_user "$id" "$email" "$displayName" "$firstName" "$lastName" "$avatar_file" "$avatar_url" "$gravatar_avatar" "$weserv_avatar"
     redundant_users="$(printf '%s' "$redundant_users" | jq --compact-output --arg id "$id" '. - [$id]')"
+    local user_ou=''
+    user_ou="$(printf '%s' "$user_config" | jq --raw-output '.ou // empty')"
+    if [[ -n "$user_ou" ]]; then
+      change_user_ou "$id" "$user_ou"
+    fi
 
     if [[ "$password_file" != 'null' ]] && [[ "$password_file" != '""' ]]; then
       "$LLDAP_SET_PASSWORD_PATH" --base-url "$LLDAP_URL" --token "$TOKEN" --username "$id" --password "$(cat $password_file)"

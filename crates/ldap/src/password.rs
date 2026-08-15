@@ -152,10 +152,11 @@ pub(crate) async fn do_password_modification<Handler: BackendHandler + OpaqueHan
                         let readable = backend_handler
                             .get_readable_handler(credentials, uid.clone())
                             .expect("Unexpected permission error");
-                        if sync_kerberos_after_password_change(readable, &uid, password).await
-                            && let Err(e) = backend_handler
-                                .ensure_kerberos_principal_consistency(&uid, true)
-                                .await
+                        let sync_enabled =
+                            sync_kerberos_after_password_change(readable, &uid, password).await;
+                        if let Err(e) = backend_handler
+                            .ensure_kerberos_principal_consistency(&uid, sync_enabled)
+                            .await
                         {
                             warn!("Failed to record Kerberos principal name for {uid}: {e}");
                         }
@@ -332,6 +333,10 @@ pub mod tests {
         mock.expect_registration_finish()
             .times(1)
             .return_once(|_| Ok(()));
+        // Every password change records (or clears) the principal name.
+        mock.expect_ensure_kerberos_principal_consistency()
+            .times(1)
+            .returning(|_, _| Ok(()));
     }
 
     #[tokio::test]

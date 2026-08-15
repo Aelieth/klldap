@@ -6,6 +6,7 @@ use lldap_domain::types::{
 use lldap_domain_handlers::handler::{
     PosixBackendHandler, PosixSettings, SystemConfigBackendHandler,
 };
+use lldap_domain_handlers::kerberos::require_kdc_ready;
 use lldap_domain_model::{
     error::{DomainError, Result},
     model::{self, system_config},
@@ -34,6 +35,7 @@ impl PosixBackendHandler for SqlBackendHandler {
     }
 
     async fn set_posix_settings(&self, settings: PosixSettings) -> Result<()> {
+        require_kdc_ready()?;
         let json = serde_json::to_string(&settings).map_err(|e| {
             DomainError::InternalError(format!("Failed to serialize posix_settings: {}", e))
         })?;
@@ -42,6 +44,7 @@ impl PosixBackendHandler for SqlBackendHandler {
 
     #[instrument(skip(self), level = "info", err)]
     async fn reassign_gid_numbers(&self) -> Result<()> {
+        require_kdc_ready()?;
         let settings = self.get_posix_settings().await?;
         self.sql_pool
             .transaction::<_, (), DomainError>(|transaction| {
@@ -94,6 +97,7 @@ impl PosixBackendHandler for SqlBackendHandler {
 
     #[instrument(skip(self), level = "info", err)]
     async fn reassign_user_uid_numbers(&self) -> Result<()> {
+        require_kdc_ready()?;
         let settings = self.get_posix_settings().await?;
         self.sql_pool
             .transaction::<_, (), DomainError>(|tx| {
@@ -125,6 +129,7 @@ impl PosixBackendHandler for SqlBackendHandler {
 
     #[instrument(skip(self), level = "info", err)]
     async fn reassign_user_gid_numbers(&self) -> Result<()> {
+        require_kdc_ready()?;
         let settings = self.get_posix_settings().await?;
         self.sql_pool
             .transaction::<_, (), DomainError>(|tx| {
@@ -153,6 +158,7 @@ impl PosixBackendHandler for SqlBackendHandler {
 
     #[instrument(skip(self), level = "info", err)]
     async fn reassign_user_homedirectories(&self) -> Result<()> {
+        require_kdc_ready()?;
         let settings = self.get_posix_settings().await?;
         self.sql_pool
             .transaction::<_, (), DomainError>(|tx| {
@@ -182,6 +188,7 @@ impl PosixBackendHandler for SqlBackendHandler {
 
     #[instrument(skip(self), level = "info", err)]
     async fn reassign_user_loginshells(&self) -> Result<()> {
+        require_kdc_ready()?;
         let settings = self.get_posix_settings().await?;
         self.sql_pool
             .transaction::<_, (), DomainError>(|tx| {

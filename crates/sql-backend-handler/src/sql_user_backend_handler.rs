@@ -15,7 +15,7 @@ use lldap_domain_handlers::handler::{
     GroupBackendHandler, ReadSchemaBackendHandler, SubStringFilter, SystemConfigBackendHandler,
     UserBackendHandler, UserListerBackendHandler, UserRequestFilter,
 };
-use lldap_domain_handlers::kerberos::{kerberos_backend, principal_name};
+use lldap_domain_handlers::kerberos::{kerberos_backend, principal_name, require_kdc_ready};
 use lldap_domain_model::{
     error::{DomainError, Result},
     model::{self, GroupColumn, UserColumn, codec, system_config},
@@ -405,6 +405,7 @@ impl SystemConfigBackendHandler for SqlBackendHandler {
     }
 
     async fn set_system_config(&self, key: &str, value: String) -> Result<()> {
+        require_kdc_ready()?;
         let config = system_config::ActiveModel {
             key: Set(key.to_string()),
             value: Set(value),
@@ -508,6 +509,7 @@ impl UserBackendHandler for SqlBackendHandler {
 
     #[instrument(skip(self), level = "debug", err, fields(user_id = ?request.user_id.as_str()))]
     async fn create_user(&self, mut request: CreateUserRequest) -> Result<()> {
+        require_kdc_ready()?;
         let now = chrono::Utc::now().naive_utc();
         let uuid = Uuid::from_name_and_date(request.user_id.as_str(), &now);
         let lower_email = request.email.as_str().to_lowercase();
@@ -607,6 +609,7 @@ impl UserBackendHandler for SqlBackendHandler {
 
     #[instrument(skip(self), level = "debug", err, fields(user_id = ?request.user_id.as_str()))]
     async fn update_user(&self, request: UpdateUserRequest) -> Result<()> {
+        require_kdc_ready()?;
         let user_id = request.user_id.clone();
         let delete_principal = self
             .sql_pool
@@ -629,6 +632,7 @@ impl UserBackendHandler for SqlBackendHandler {
 
     #[instrument(skip_all, level = "debug", err, fields(user_id = ?user_id.as_str()))]
     async fn delete_user(&self, user_id: &UserId) -> Result<()> {
+        require_kdc_ready()?;
         // Removed before the row delete, and idempotent, so a missing principal is fine.
         if let Err(e) = kerberos_backend().delete_principal(user_id.as_str()) {
             tracing::warn!(
@@ -651,6 +655,7 @@ impl UserBackendHandler for SqlBackendHandler {
 
     #[instrument(skip_all, level = "debug", err, fields(user_id = ?user_id.as_str(), group_id))]
     async fn add_user_to_group(&self, user_id: &UserId, group_id: GroupId) -> Result<()> {
+        require_kdc_ready()?;
         let user_groups = self.get_user_groups(user_id).await?;
         let target_group_details = self.get_group_details(group_id).await?;
 
@@ -705,6 +710,7 @@ impl UserBackendHandler for SqlBackendHandler {
 
     #[instrument(skip_all, level = "debug", err, fields(user_id = ?user_id.as_str(), group_id))]
     async fn remove_user_from_group(&self, user_id: &UserId, group_id: GroupId) -> Result<()> {
+        require_kdc_ready()?;
         // Resolved before the user_id shadow; a lookup failure skips the best-effort reflect.
         let disabled_target = self
             .get_group_details(group_id)

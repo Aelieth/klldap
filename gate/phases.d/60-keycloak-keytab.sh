@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # Phase: Keycloak keytab export — the GraphQL mutation must produce a real keytab with
-# the HTTP service principal and modern enctypes. Standing net for the sudo-surface
-# fragility around export_keytab_for_keycloak.
+# the HTTP service principal and modern enctypes (kadmin.local run by the server user
+# against the KDB it owns).
 
 D="$(phase_dir)"
 KC_HOST="keycloak.gate.test"

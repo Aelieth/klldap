@@ -211,3 +211,37 @@ pub async fn check_kerberos(host: &str, port: u16, admin_keytab: &Path) -> Resul
     info!("Success");
     Ok(())
 }
+
+/// Logs every failed or timed-out check and says whether any did.
+pub fn any_failed<I>(results: I) -> bool
+where
+    I: IntoIterator<Item = std::result::Result<Result<()>, tokio::time::error::Elapsed>>,
+{
+    results
+        .into_iter()
+        .map(|res| res.map_err(anyhow::Error::from).and_then(|r| r))
+        .filter_map(|res| res.err())
+        .inspect(|e| tracing::error!("Error running the health check: {e:#}"))
+        .count()
+        > 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn test_a_timed_out_check_is_a_failure() {
+        let elapsed = timeout(
+            Duration::from_millis(1),
+            std::future::pending::<Result<()>>(),
+        )
+        .await;
+        assert!(elapsed.is_err());
+        assert!(any_failed([elapsed]));
+        assert!(any_failed([Ok(Err(anyhow!("down")))]));
+        assert!(!any_failed([Ok(Ok(())), Ok(Ok(()))]));
+    }
+}

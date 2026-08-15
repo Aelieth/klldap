@@ -48,6 +48,8 @@ pub struct LLDAPFixture {
     child: ChildProcess,
     users: HashSet<String>,
     groups: HashMap<String, i64>,
+    ldap_port: u16,
+    http_port: u16,
     _dir: tempfile::TempDir,
 }
 
@@ -59,8 +61,6 @@ impl LLDAPFixture {
         let db_path = format!("sqlite://{}/users.db?mode=rwc", dir.path().display());
         let ldap_port = free_port();
         let http_port = free_port();
-        env::set_ports(ldap_port, http_port);
-
         let child = create_lldap_command("run", &db_path)
             .env("LLDAP_LDAP_PORT", ldap_port.to_string())
             .env("LLDAP_HTTP_PORT", http_port.to_string())
@@ -97,16 +97,25 @@ impl LLDAPFixture {
             .build()
             .expect("failed to make http client");
 
-        let token = get_token(&client);
-
+        let token = get_token(&client, &http_url(http_port));
         Self {
             client,
             token,
             child,
             users: HashSet::new(),
             groups: HashMap::new(),
+            ldap_port,
+            http_port,
             _dir: dir,
         }
+    }
+
+    pub fn ldap_url(&self) -> String {
+        format!("ldap://localhost:{}", self.ldap_port)
+    }
+
+    pub fn http_url(&self) -> String {
+        http_url(self.http_port)
     }
 
     pub fn load_state(&mut self, state: &Vec<User>) {
@@ -136,6 +145,7 @@ impl LLDAPFixture {
     fn add_user(&mut self, user: &User) {
         post::<CreateUser>(
             &self.client,
+            &self.http_url(),
             &self.token,
             create_user::Variables {
                 user: create_user::CreateUserInput {
@@ -156,6 +166,7 @@ impl LLDAPFixture {
     fn add_group(&mut self, group: &str) {
         let id = post::<CreateGroup>(
             &self.client,
+            &self.http_url(),
             &self.token,
             create_group::Variables {
                 group: create_group::CreateGroupInput {
@@ -177,6 +188,7 @@ impl LLDAPFixture {
             .expect("group id missing when adding user");
         post::<AddUserToGroup>(
             &self.client,
+            &self.http_url(),
             &self.token,
             add_user_to_group::Variables {
                 user: user.to_owned(),
@@ -190,6 +202,7 @@ impl LLDAPFixture {
     fn delete_user(&mut self, user: &String) {
         if let Err(e) = post::<DeleteUserQuery>(
             &self.client,
+            &self.http_url(),
             &self.token,
             delete_user_query::Variables { user: user.clone() },
         ) {
@@ -204,6 +217,7 @@ impl LLDAPFixture {
         };
         if let Err(e) = post::<DeleteGroupQuery>(
             &self.client,
+            &self.http_url(),
             &self.token,
             delete_group_query::Variables { group_id },
         ) {
@@ -264,7 +278,11 @@ pub fn new_id(prefix: Option<&str>) -> String {
     }
 }
 
-fn free_port() -> u16 {
+pub fn http_url(port: u16) -> String {
+    format!("http://localhost:{port}")
+}
+
+pub fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .expect("bind an ephemeral port")
         .local_addr()

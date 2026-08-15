@@ -143,7 +143,6 @@ async fn set_up_server(config: Configuration) -> Result<(ServerBuilder, Database
     info!("Starting LLDAP version {}", env!("CARGO_PKG_VERSION"));
 
     let sql_pool = setup_sql_tables(&config.database_url).await?;
-    set_kerberos_backend(Arc::new(LiveKerberos));
     let private_key_info = config.get_private_key_info();
     let force_update_private_key = config.force_update_private_key;
     match (
@@ -224,6 +223,11 @@ async fn set_up_server(config: Configuration) -> Result<(ServerBuilder, Database
             "Restart the server without --force-update-private-key or --force-ldap-user-pass-reset to continue."
         );
     }
+    // The KDC boots after the server, so the guard on directory writes must not see the
+    // built-in group and admin creation above.
+    set_kerberos_backend(Arc::new(LiveKerberos::new(
+        config.healthcheck_options.kerberos,
+    )));
     let server_builder = ldap_server::build_ldap_server(
         &config,
         backend_handler.clone(),
@@ -274,7 +278,20 @@ async fn run_healthcheck(opts: RunOpts) -> Result<()> {
 
     use tokio::time::timeout;
     let delay = Duration::from_millis(3000);
-    let (ldap, ldaps, api) = tokio::join!(
+    let paths = KerberosPaths::from_env();
+    let kerberos = async {
+        if config.healthcheck_options.kerberos {
+            healthcheck::check_kerberos(
+                &config.healthcheck_options.ldap_host,
+                paths.kdc_port,
+                &paths.admin_keytab,
+            )
+            .await
+        } else {
+            Ok(())
+        }
+    };
+    let (ldap, ldaps, api, kerberos) = tokio::join!(
         timeout(
             delay,
             healthcheck::check_ldap(&config.healthcheck_options.ldap_host, config.ldap_port)
@@ -287,36 +304,9 @@ async fn run_healthcheck(opts: RunOpts) -> Result<()> {
             delay,
             healthcheck::check_api(&config.healthcheck_options.http_host, config.http_port)
         ),
+        timeout(delay, kerberos),
     );
-
-    let kerberos = if config.healthcheck_options.kerberos {
-        let paths = KerberosPaths::from_env();
-        Some(
-            timeout(
-                delay,
-                healthcheck::check_kerberos(
-                    &config.healthcheck_options.ldap_host,
-                    paths.kdc_port,
-                    &paths.admin_keytab,
-                ),
-            )
-            .await,
-        )
-    } else {
-        None
-    };
-
-    let failure = [Some(ldap), Some(ldaps), Some(api), kerberos]
-        .into_iter()
-        .flatten()
-        .flat_map(|res| {
-            if let Err(e) = &res {
-                error!("Error running the health check: {:#}", e);
-            }
-            res
-        })
-        .any(|r| r.is_err());
-    if failure {
+    if healthcheck::any_failed([ldap, ldaps, api, kerberos]) {
         bail!("Healthcheck failed")
     } else {
         Ok(())

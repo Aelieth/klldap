@@ -129,8 +129,12 @@ pub fn export_keytab_for_keycloak(hostname_input: &str) -> Result<String> {
         keytab_path.display(),
         principal
     );
+    // -p: the server may run as a uid without a passwd entry, from which kadmin.local
+    // cannot derive a client name.
     let output = Command::new("/usr/sbin/kadmin.local")
         .env("KRB5_CONFIG", &paths.krb5_conf)
+        .arg("-p")
+        .arg(format!("admin/admin@{realm}"))
         .arg("-q")
         .arg(&query)
         .output()

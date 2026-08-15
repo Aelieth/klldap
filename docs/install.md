@@ -80,7 +80,9 @@ it creates the Kerberos database with a random, stash-only master password, the
 `admin/admin@REALM` principal and `/data/kadm5.keytab`, renders `krb5.conf`,
 `kdc.conf` and `kadm5.acl` from the templates in `/app`, and starts
 `krb5kdc` and `kadmind`. Later starts skip what already exists. The container's
-healthcheck (`lldap healthcheck --kerberos`) fails until the KDC is up.
+healthcheck (`lldap healthcheck --kerberos`) fails until the KDC is up, and directory
+writes are refused ("Kerberos KDC unavailable") until it has answered once — logins and
+reads work throughout.
 
 Then:
 

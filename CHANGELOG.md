@@ -45,12 +45,23 @@ container test gate, and a code sweep back to LLDAP's shape.
 
 ### Kerberos
 
+- Directory writes (users, groups, passwords, attributes, settings) are refused with
+  "Kerberos KDC unavailable" until the KDC has come up after boot, so nothing changes that
+  the KDC could not follow; logins and reads are never gated. The image enables this with
+  `LLDAP_HEALTHCHECK_OPTIONS__KERBEROS=true`; without it (no KDC) writes never wait.
+- Custom `LLDAP_UID`/`LLDAP_GID` deployments work with Kerberos: the admin keytab and the
+  KDC database are owned by the configured user (they were `lldap:lldap`, so a first boot
+  could not read the keytab and keytab export never worked), and `kadmin.local` is called
+  with an explicit principal (a uid without a passwd entry has none). The runtime image no longer
+  ships `sudo` or `strace`. `krbPrincipalName` is now recorded on the LDAP password paths
+  too (Modify `userPassword`, `ldappasswd`, ADD with `userPassword`).
 - KDC principals are disabled while a user is in `lldap_disabled` and re-asserted after
   a password sync; the admin keytab is recreated when `/data` is wiped but the KDC
   volume survives.
 - The Docker HEALTHCHECK includes Kerberos (`lldap healthcheck --kerberos`): a dead KDC
   or missing admin keytab turns the container unhealthy. The KDC bootstrap is idempotent
-  and re-runnable via `kerberos_manager --bootstrap-only`.
+  and re-runnable via `kerberos_manager --bootstrap-only`; `krb5kdc` and `kadmind` run in
+  the foreground under the manager, which stops both when either exits.
 - File locations and the KDC port can be overridden with `LLDAP_KERB_*` variables;
   unset means the container layout is unchanged.
 
@@ -70,7 +81,9 @@ container test gate, and a code sweep back to LLDAP's shape.
   longer warn about `LLDAP_KERB_*`/`LLDAP_KEYCLOAK_*` as unknown variables.
 - SQLite URLs of the form `sqlite:///data/users.db` are normalized so a missing database
   is created; a loopback `http_url` with password reset enabled logs a warning.
-- Fixed: `--healthcheck-http-host`/`--healthcheck-ldap-host` CLI flags had no effect.
+- Fixed: `--healthcheck-http-host`/`--healthcheck-ldap-host` CLI flags had no effect; a
+  timed-out healthcheck probe counted as success. `bootstrap.sh` applies `ou` from user
+  and group configs (`changeUserOu`/`changeGroupOu`).
 
 ### Fixes
 
@@ -84,11 +97,11 @@ container test gate, and a code sweep back to LLDAP's shape.
 
 - GitHub Actions resurrected (Rust workflow with SQLite and PostgreSQL lanes, shellcheck,
   a live-KDC lane); release version single-sourced from `Cargo.toml`.
-- Container gate suite (`make gate`): 13 phases exercising the real image from entrypoint
-  boot through OU/user lifecycle, Kerberos principal sync/kinit, LDAP read/write matrices,
-  keytab export, restart persistence and KDC-death detection; SQLite and PostgreSQL
-  lanes, wired into CI (`gate.yml`). `make test-kdc` runs the Kerberos FFI against a
-  throwaway KDC.
+- Container gate suite (`make gate`): 14 phases exercising the real image from entrypoint
+  boot through a custom-UID boot, OU/user lifecycle, Kerberos principal sync/kinit, LDAP
+  read/write matrices, keytab export, restart persistence and KDC-death detection; SQLite
+  and PostgreSQL lanes, wired into CI (`gate.yml`). `make test-kdc` runs the Kerberos FFI
+  against a throwaway KDC. `server/tests` run in parallel on ephemeral ports.
 - Comment density and code shape brought back to LLDAP's; the crate layout is documented
   in [docs/architecture.md](docs/architecture.md).
 

@@ -138,10 +138,6 @@ workspace = true
 default-features = false
 features = ["json", "blocking", "rustls-tls"]
 
-[dev-dependencies.serial_test]
-workspace = true
-features = ["file_locks"]
-
 [dev-dependencies.figment]
 features = ["test"]
 version = "0"

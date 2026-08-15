@@ -23,9 +23,35 @@ pub struct KerberosConfig {
     pub rdns: bool,
 }
 
+// The manager runs as root; the server runs as LLDAP_UID and must read the keytab and the
+// KDB (kadmin.local for keytab export), so everything the manager creates is owned by it.
+fn service_owner() -> String {
+    let id = |key: &str| env::var(key).ok().filter(|v| !v.is_empty());
+    format!(
+        "{}:{}",
+        id("LLDAP_UID").unwrap_or_else(|| "lldap".to_owned()),
+        id("LLDAP_GID").unwrap_or_else(|| "lldap".to_owned())
+    )
+}
+
+fn chown(recursive: bool, path: &Path) -> Result<()> {
+    let mut command = Command::new("chown");
+    if recursive {
+        command.arg("-R");
+    }
+    let status = command
+        .arg(service_owner())
+        .arg(path)
+        .status()
+        .with_context(|| format!("while chowning {}", path.display()))?;
+    if !status.success() {
+        anyhow::bail!("chown {} failed", path.display());
+    }
+    Ok(())
+}
+
 fn run_kadmin_local(query: &str, paths: &KerberosPaths) -> Result<Output> {
-    let output = Command::new("sudo")
-        .arg("/usr/sbin/kadmin.local")
+    let output = Command::new("/usr/sbin/kadmin.local")
         .env("KRB5_CONFIG", &paths.krb5_conf)
         .arg("-q")
         .arg(query)
@@ -106,15 +132,7 @@ pub fn ensure_admin_keytab(
 }
 
 fn ensure_admin_keytab_ownership(paths: &KerberosPaths) -> Result<()> {
-    let status = Command::new("sudo")
-        .arg("chown")
-        .arg("lldap:lldap")
-        .arg(&paths.admin_keytab)
-        .status()
-        .context("while chowning the keytab")?;
-    if !status.success() {
-        anyhow::bail!("chown keytab failed");
-    }
+    chown(false, &paths.admin_keytab)?;
     fs::set_permissions(&paths.admin_keytab, fs::Permissions::from_mode(0o640))
         .context("while chmodding the keytab")?;
     Ok(())
@@ -178,8 +196,7 @@ pub fn bootstrap_kdb(paths: &KerberosPaths) -> Result<bool> {
             master_pass.len()
         );
         println!("Creating KDC database with piped password...");
-        let mut child = Command::new("sudo")
-            .arg("kdb5_util")
+        let mut child = Command::new("/usr/sbin/kdb5_util")
             .env("KRB5_CONFIG", &paths.krb5_conf)
             .arg("create")
             .arg("-s")
@@ -206,27 +223,29 @@ pub fn bootstrap_kdb(paths: &KerberosPaths) -> Result<bool> {
             );
         }
         println!("KDC database created successfully.");
-        Command::new("sudo")
-            .arg("chown")
-            .arg("-R")
-            .arg("lldap:lldap")
-            .arg(&paths.kdc_dir)
-            .status()
-            .context("while chowning the DB dir")?;
-        println!("Ownership set on DB files.");
+        chown(true, &paths.kdc_dir)?;
+        println!(
+            "Ownership set on DB files. The master key lives only in the stash file under {}; \
+             back that volume up with the database.",
+            paths.kdc_dir.display()
+        );
     } else {
         println!("Existing KDC database detected, skipping database creation.");
     }
     Ok(db_created)
 }
 
+// Foreground daemons: without -n/-nofork they daemonize, the parents exit at once, and
+// the manager would have nothing to wait on.
 pub fn spawn_daemons() -> Result<(Child, Child)> {
     println!("Starting krb5kdc...");
     let kdc_child = Command::new("/usr/sbin/krb5kdc")
+        .arg("-n")
         .spawn()
         .context("while starting krb5kdc")?;
     println!("Starting kadmind...");
     let kadmind_child = Command::new("/usr/sbin/kadmind")
+        .arg("-nofork")
         .spawn()
         .context("while starting kadmind")?;
     Ok((kdc_child, kadmind_child))
@@ -269,13 +288,20 @@ pub fn populate_ccache(admin_princ: &str, paths: &KerberosPaths) -> Result<()> {
     Ok(())
 }
 
+// Returns when either daemon exits; the healthcheck already reports the KDC as down, this
+// makes it visible in the container log.
 pub fn run_daemons_to_completion(mut kdc: Child, mut kadmind: Child) -> Result<()> {
-    let kdc_status = kdc.wait().context("krb5kdc exited unexpectedly")?;
-    let kadmind_status = kadmind.wait().context("kadmind exited unexpectedly")?;
-    if !kdc_status.success() || !kadmind_status.success() {
-        return Err(anyhow::anyhow!("Kerberos service failed"));
+    loop {
+        if let Some(status) = kdc.try_wait().context("while waiting on krb5kdc")? {
+            let _ = kadmind.kill();
+            anyhow::bail!("krb5kdc exited: {status}");
+        }
+        if let Some(status) = kadmind.try_wait().context("while waiting on kadmind")? {
+            let _ = kdc.kill();
+            anyhow::bail!("kadmind exited: {status}");
+        }
+        thread::sleep(Duration::from_secs(1));
     }
-    Ok(())
 }
 
 fn render_template(
@@ -354,13 +380,7 @@ fn apply_permissions(path: &Path) -> Result<()> {
     fs::set_permissions(path, perms).context("while setting kadm5.acl permissions")?;
 
     #[cfg(not(test))]
-    {
-        let _ = Command::new("sudo")
-            .arg("chown")
-            .arg("lldap:lldap")
-            .arg(path)
-            .status();
-    }
+    let _ = chown(false, path);
 
     Ok(())
 }

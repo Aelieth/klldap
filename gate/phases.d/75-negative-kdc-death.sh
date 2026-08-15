@@ -39,9 +39,10 @@ else
     p_ok "healthcheck --kerberos fails once the KDC is dead"
 fi
 
-# Plain LLDAP health must be unaffected — the KDC leg is additive.
-if gexec /app/lldap healthcheck --config-file /data/lldap_config.toml \
-    >"$D/health-plain.log" 2>&1; then
+# LDAP/HTTP health must be unaffected — the KDC leg is additive (the image turns it on by
+# default, so it is switched off explicitly here).
+if gexec env LLDAP_HEALTHCHECK_OPTIONS__KERBEROS=false /app/lldap healthcheck \
+    --config-file /data/lldap_config.toml >"$D/health-plain.log" 2>&1; then
     p_ok "plain healthcheck still passes (LDAP/HTTP unaffected)"
 else
     p_bad "plain healthcheck failed after KDC death"

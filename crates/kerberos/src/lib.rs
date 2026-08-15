@@ -12,6 +12,7 @@ use tracing::{info, warn};
 
 pub mod keycloak_client;
 pub mod keycloak_config;
+pub mod manager;
 
 pub use keycloak_client::KeycloakClient;
 pub use keycloak_config::{

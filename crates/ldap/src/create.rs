@@ -186,6 +186,61 @@ async fn create_user(
             })?,
         });
     }
+    // Schema-known writable leftovers persist; readonly/unknown are skipped.
+    let consumed = [
+        "uid",
+        "user_id",
+        "mail",
+        "displayname",
+        "firstname",
+        "lastname",
+        "avatar",
+        "ou",
+        "kerberossync",
+        "userpassword",
+    ];
+    let extra_names: Vec<&String> = attributes
+        .keys()
+        .filter(|name| {
+            let canonical = lldap_domain::public_schema::PublicSchema::shared()
+                .resolve_user_canonical_name(name)
+                .unwrap_or(name.as_str());
+            !consumed.contains(&canonical)
+        })
+        .collect();
+    if !extra_names.is_empty() {
+        let schema = backend_handler.get_schema().await.map_err(|e| LdapError {
+            code: LdapResultCode::OperationsError,
+            message: format!("Could not read the schema: {e:#?}"),
+        })?;
+        for name in extra_names {
+            let Some(attribute_schema) = schema.user_attributes().get_by_name_or_alias(name) else {
+                warn!("LDAP add: ignoring attribute {name} (not in the user schema)");
+                continue;
+            };
+            if attribute_schema.is_readonly {
+                warn!("LDAP add: ignoring read-only attribute {name}");
+                continue;
+            }
+            let Ok(value) = std::str::from_utf8(&attributes[name]) else {
+                warn!("LDAP add: ignoring attribute {name} (value is not valid UTF-8)");
+                continue;
+            };
+            new_user_attributes.push(Attribute {
+                name: attribute_schema.name.as_str().into(),
+                value: deserialize::deserialize_attribute_value(
+                    &[value.to_owned()],
+                    attribute_schema.attribute_type,
+                    attribute_schema.is_list,
+                )
+                .map_err(|e| LdapError {
+                    code: LdapResultCode::ConstraintViolation,
+                    message: format!("Invalid {name} value: {e}"),
+                })?,
+            });
+        }
+    }
+
     let kerberossync_enabled =
         lldap_domain::types::kerberos_sync_enabled(&new_user_attributes, "kerberossync");
 
@@ -298,6 +353,90 @@ mod tests {
                 atype: "cn".to_owned(),
                 vals: vec![b"Bob".to_vec()],
             }],
+        };
+
+        assert_eq!(
+            ldap_handler.create_user_or_group(request).await,
+            Ok(vec![make_add_response(
+                LdapResultCode::Success,
+                String::new()
+            )])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_user_persists_schema_known_extra_attributes() {
+        let mut mock = MockTestBackendHandler::new();
+
+        mock.expect_get_schema().times(1).returning(|| {
+            let mut schema = lldap_domain::public_schema::PublicSchema::get();
+            schema
+                .0
+                .user_attributes
+                .attributes
+                .push(lldap_schema::AttributeSchema {
+                    name: "gatecustom".to_owned(),
+                    aliases: vec![],
+                    attribute_type: AttributeType::String,
+                    is_list: false,
+                    is_visible: true,
+                    is_editable: true,
+                    is_hardcoded: false,
+                    is_readonly: false,
+                });
+            Ok(schema)
+        });
+        mock.expect_create_user()
+            .with(mockall::predicate::function(|req: &CreateUserRequest| {
+                let value_of = |n: &str| {
+                    req.attributes
+                        .iter()
+                        .find(|a| a.name.as_str() == n)
+                        .map(|a| a.value.clone())
+                };
+                value_of("gatecustom")
+                    == Some(AttributeValue::String(Cardinality::Singleton(
+                        "brought by ldapadd".to_owned(),
+                    )))
+                    && value_of("sshpublickey").is_some()
+                    && value_of("uidnumber")
+                        == Some(AttributeValue::Integer(Cardinality::Singleton(4242)))
+                    && value_of("creationdate").is_none()
+                    && value_of("junkattr").is_none()
+            }))
+            .times(1)
+            .return_once(|_| Ok(()));
+
+        let ldap_handler = setup_bound_admin_handler(mock).await;
+
+        let request = LdapAddRequest {
+            dn: "uid=bob,ou=people,dc=example,dc=com".to_owned(),
+            attributes: vec![
+                LdapPartialAttribute {
+                    atype: "cn".to_owned(),
+                    vals: vec![b"Bob".to_vec()],
+                },
+                LdapPartialAttribute {
+                    atype: "gatecustom".to_owned(),
+                    vals: vec![b"brought by ldapadd".to_vec()],
+                },
+                LdapPartialAttribute {
+                    atype: "sshPublicKey".to_owned(),
+                    vals: vec![b"ssh-rsa AAAATestKey gate@test".to_vec()],
+                },
+                LdapPartialAttribute {
+                    atype: "uidNumber".to_owned(),
+                    vals: vec![b"4242".to_vec()],
+                },
+                LdapPartialAttribute {
+                    atype: "createTimestamp".to_owned(),
+                    vals: vec![b"20200101000000Z".to_vec()],
+                },
+                LdapPartialAttribute {
+                    atype: "junkattr".to_owned(),
+                    vals: vec![b"dropped with a warning".to_vec()],
+                },
+            ],
         };
 
         assert_eq!(

@@ -3990,4 +3990,186 @@ mod tests {
     //  The v1 driver fully exercises every single migration step with rich data "along the way".
     //  The v5 driver specifically covers the critical EAV conversion + v12 normalization/alias cleanup on a post-v5 DB.
     //  Adding more start points is possible by making populate/version branches even finer-grained for columns.)
+
+    // These two #[ignore] tests DROP SCHEMA public; the lock stops parallel clobber.
+    static PG_LANE_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    async fn connect_scratch_postgres() -> Option<DbConnection> {
+        let url = std::env::var("KLLDAP_TEST_DATABASE_URL").ok()?;
+        let mut opts = sea_orm::ConnectOptions::new(url);
+        opts.max_connections(2).sqlx_logging(false);
+        let pool = Database::connect(opts)
+            .await
+            .expect("connect test postgres");
+        for reset in ["DROP SCHEMA public CASCADE", "CREATE SCHEMA public"] {
+            pool.execute(sea_orm::Statement::from_string(
+                DbBackend::Postgres,
+                reset.to_owned(),
+            ))
+            .await
+            .expect("reset scratch schema");
+        }
+        Some(pool)
+    }
+
+    async fn pg_user_attribute(pool: &DbConnection, user: &str, name: &str) -> Vec<u8> {
+        pool.query_one(sea_orm::Statement::from_string(
+            DbBackend::Postgres,
+            format!(
+                "SELECT user_attribute_value FROM user_attributes \
+                 WHERE user_attribute_user_id = '{user}' AND user_attribute_name = '{name}'"
+            ),
+        ))
+        .await
+        .expect("query")
+        .unwrap_or_else(|| panic!("attribute {name} missing for {user}"))
+        .try_get_by_index::<Vec<u8>>(0)
+        .expect("value column")
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+    async fn postgres_fresh_install_migrates() {
+        let _lane = PG_LANE_LOCK.lock().await;
+        let Some(pool) = connect_scratch_postgres().await else {
+            eprintln!("KLLDAP_TEST_DATABASE_URL not set; skipping");
+            return;
+        };
+        init_table(&pool).await.expect("fresh init on postgres");
+        assert_eq!(get_schema_version(&pool).await, Some(LAST_SCHEMA_VERSION));
+        init_table(&pool).await.expect("re-init must be idempotent");
+        assert_eq!(get_schema_version(&pool).await, Some(LAST_SCHEMA_VERSION));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+    async fn postgres_stepwise_migration() {
+        let _lane = PG_LANE_LOCK.lock().await;
+        let Some(pool) = connect_scratch_postgres().await else {
+            eprintln!("KLLDAP_TEST_DATABASE_URL not set; skipping");
+            return;
+        };
+        upgrade_to_v1(&pool).await.unwrap();
+        migrate_from_version(&pool, SchemaVersion(1), SchemaVersion(11))
+            .await
+            .expect("chain to v11 on postgres");
+
+        let now = chrono::Utc::now().naive_utc();
+        let builder = pool.get_database_backend();
+        let mut insert_user = Query::insert();
+        insert_user
+            .into_table(Users::Table)
+            .columns([
+                Users::UserId,
+                Users::Email,
+                Users::LowercaseEmail,
+                Users::CreationDate,
+                Users::Uuid,
+                Users::ModifiedDate,
+                Users::PasswordModifiedDate,
+            ])
+            .values_panic([
+                "pguser".into(),
+                "pg@ex.com".into(),
+                "pg@ex.com".into(),
+                now.into(),
+                "11111111-1111-1111-1111-111111111111".into(),
+                now.into(),
+                now.into(),
+            ]);
+        pool.execute(builder.build(&insert_user)).await.unwrap();
+
+        for (name, typ) in [("pgcustom", "String"), ("kerberossync", "String")] {
+            let mut insert_schema = Query::insert();
+            insert_schema
+                .into_table(UserAttributeSchema::Table)
+                .columns([
+                    UserAttributeSchema::UserAttributeSchemaName,
+                    UserAttributeSchema::UserAttributeSchemaType,
+                    UserAttributeSchema::UserAttributeSchemaIsList,
+                    UserAttributeSchema::UserAttributeSchemaIsUserVisible,
+                    UserAttributeSchema::UserAttributeSchemaIsUserEditable,
+                    UserAttributeSchema::UserAttributeSchemaIsHardcoded,
+                ])
+                .values_panic([
+                    name.into(),
+                    typ.into(),
+                    false.into(),
+                    true.into(),
+                    true.into(),
+                    false.into(),
+                ]);
+            pool.execute(builder.build(&insert_schema)).await.unwrap();
+        }
+
+        let jpeg: &[u8] = b"\xff\xd8\xff\xe0raw-jpeg-bytes";
+        let bincoded = bincode::serialize("PG Bob").unwrap();
+        for (name, value) in [
+            ("avatar", jpeg.to_vec()),
+            ("kerberossync", b"1".to_vec()),
+            ("pgcustom", bincoded),
+        ] {
+            let mut insert_value = Query::insert();
+            insert_value
+                .into_table(UserAttributes::Table)
+                .columns([
+                    UserAttributes::UserAttributeUserId,
+                    UserAttributes::UserAttributeName,
+                    UserAttributes::UserAttributeValue,
+                ])
+                .values_panic(["pguser".into(), name.into(), value.into()]);
+            pool.execute(builder.build(&insert_value)).await.unwrap();
+        }
+
+        migrate_from_version(&pool, SchemaVersion(11), LAST_SCHEMA_VERSION)
+            .await
+            .expect("v12+v13 on postgres");
+        assert_eq!(get_schema_version(&pool).await, Some(LAST_SCHEMA_VERSION));
+
+        assert_eq!(
+            pg_user_attribute(&pool, "pguser", "pgcustom").await,
+            b"PG Bob",
+            "v13 must re-encode bincode on postgres"
+        );
+        assert_eq!(
+            pg_user_attribute(&pool, "pguser", "kerberossync").await,
+            b"1",
+            "v12 normalize must preserve truthy kerberossync"
+        );
+        assert_eq!(
+            pg_user_attribute(&pool, "pguser", "ou").await,
+            b"people",
+            "v12 OU default must byte-bind into bytea"
+        );
+        assert_eq!(
+            pg_user_attribute(&pool, "pguser", "avatar").await,
+            jpeg,
+            "raw JPEG must pass through untouched"
+        );
+        let aliases_row = pool
+            .query_one(sea_orm::Statement::from_string(
+                DbBackend::Postgres,
+                "SELECT aliases FROM user_attribute_schema \
+                 WHERE user_attribute_schema_name = 'avatar'"
+                    .to_owned(),
+            ))
+            .await
+            .expect("query")
+            .expect("avatar schema row");
+        let aliases: Option<String> = aliases_row.try_get_by_index(0).expect("aliases column");
+        assert!(
+            aliases
+                .unwrap_or_default()
+                .to_lowercase()
+                .contains("jpegphoto"),
+            "v12 upsert must reach the hardcoded avatar aliases on postgres"
+        );
+
+        init_table(&pool).await.expect("re-init must be idempotent");
+        assert_eq!(
+            pg_user_attribute(&pool, "pguser", "pgcustom").await,
+            b"PG Bob"
+        );
+    }
 }

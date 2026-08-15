@@ -4,8 +4,11 @@ set -euo pipefail
 CONFIG_FILE=/data/lldap_config.toml
 
 # === UID/GID support (rootless-friendly, matches upstream LLDAP docker behavior) ===
-LLDAP_UID="${UID:-1000}"
-LLDAP_GID="${GID:-1000}"
+# LLDAP_UID/LLDAP_GID take precedence; legacy UID/GID are read with printenv because
+# some bash builds reset $UID to the process uid and mark it readonly — printenv reads
+# the environment directly, so the override works under either bash behavior.
+LLDAP_UID="${LLDAP_UID:-$(printenv UID || echo 1000)}"
+LLDAP_GID="${LLDAP_GID:-$(printenv GID || echo 1000)}"
 
 # Create required persistent directories (kerberos_manager now owns its own dirs)
 mkdir -p /data /data/keytab /data/cert

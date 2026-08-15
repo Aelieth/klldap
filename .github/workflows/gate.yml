@@ -1,0 +1,57 @@
+name: Gate
+
+on:
+  push:
+    # 0.7.4 is the current development line; drop it when this tree lands on main.
+    branches: [ main, 0.7.4 ]
+  pull_request:
+    types: [opened, reopened, synchronize]
+    paths:
+      - '**.rs'
+      - '**.sh'
+      - '**/Cargo.toml'
+      - 'Cargo.lock'
+      - 'Dockerfile'
+      - 'gate/**'
+      - 'kerberos/**'
+      - '.github/workflows/gate.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: gate-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: container gate (${{ matrix.db }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        db: [sqlite, postgres]
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v6.0.1
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Build the test image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          load: true
+          tags: klldap-test
+          build-args: VERSION=ci-gate
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Install gate client tools
+        run: sudo apt-get update && sudo apt-get install -y ldap-utils jq
+      - name: Run the gate
+        run: GATE_DB=${{ matrix.db }} gate/run-gate.sh
+      - name: Upload gate results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-results-${{ matrix.db }}
+          path: gate/results/
+          if-no-files-found: ignore

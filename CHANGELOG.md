@@ -15,6 +15,20 @@
   `docs/migration_guides/v0.7-from-lldap.md`.
 - GraphQL API restored to full upstream compatibility (lldap-cli works unmodified).
 - GitHub Actions CI resurrected; release version single-sourced from Cargo.toml.
+- New container gate suite (`make gate`): 13 phases exercising the real image from
+  entrypoint boot through OU/user lifecycle, Kerberos principal sync/kinit, LDAP
+  read/write matrices, keytab export, restart persistence and KDC-death detection;
+  SQLite and Postgres lanes, wired into CI (`gate.yml`).
+- The Docker HEALTHCHECK now includes Kerberos (`lldap healthcheck --kerberos`): a dead
+  KDC or missing admin keytab turns the container unhealthy instead of silently
+  degrading sync. Boot scripts prefer `LLDAP_UID`/`LLDAP_GID` (legacy `UID`/`GID` still
+  honored); the KDC bootstrap is idempotent and re-runnable via
+  `kerberos_manager --bootstrap-only`.
+- LDAP ADD no longer silently drops attributes: values the schema knows (custom
+  attributes, sshPublicKey, admin-overridable POSIX numbers) persist; read-only and
+  unknown names are skipped with a warning.
+- Fixed: `--healthcheck-http-host`/`--healthcheck-ldap-host` CLI flags had no effect
+  (their environment variables worked).
 
 ## [0.7.2] 2026-06-16
 

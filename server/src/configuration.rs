@@ -109,6 +109,8 @@ pub struct HealthcheckOptions {
     pub http_host: String,
     #[builder(default = r#"String::from("localhost")"#)]
     pub ldap_host: String,
+    #[builder(default = "false")]
+    pub kerberos: bool,
 }
 
 impl std::default::Default for HealthcheckOptions {
@@ -546,6 +548,7 @@ impl ConfigOverrider for RunOpts {
 
         self.smtp_opts.override_config(config);
         self.ldaps_opts.override_config(config);
+        self.healthcheck_opts.override_config(config);
     }
 }
 
@@ -630,6 +633,10 @@ impl ConfigOverrider for HealthcheckOpts {
         self.healthcheck_ldap_host
             .as_ref()
             .inspect(|host| config.healthcheck_options.ldap_host.clone_from(host));
+
+        if self.healthcheck_kerberos {
+            config.healthcheck_options.kerberos = true;
+        }
     }
 }
 

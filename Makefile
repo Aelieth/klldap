@@ -99,6 +99,34 @@ test-run:
 	@echo "UI:   http://127.0.0.1:17170  (admin / $(LLDAP_LDAP_USER_PASS))"
 	@echo "logs: docker logs -f klldap-test"
 
+# ---- Verification ----
+# - safety        → the pre-commit dance: fmt, build, test, clippy, schema drift
+# - gate          → build the test image and run the full container gate
+# - gate-fast     → run the gate against the existing klldap-test image
+# - gate-postgres → gate with a gate-managed postgres:16 backend
+# - gate-phase    → run selected phases, e.g. make gate-phase PHASE=kerberos
+.PHONY: safety gate gate-fast gate-postgres gate-phase
+
+safety:
+	cargo fmt --all
+	cargo build --workspace
+	cargo test --workspace
+	cargo clippy --tests --all -- -D warnings
+	./export_schema.sh
+	git diff --exit-code schema.graphql
+
+gate: test
+	gate/run-gate.sh
+
+gate-fast:
+	gate/run-gate.sh
+
+gate-postgres:
+	GATE_DB=postgres gate/run-gate.sh
+
+gate-phase:
+	GATE_PHASES="$(PHASE)" gate/run-gate.sh
+
 # Quick cleanup of generated tarballs
 clean:
 	rm -f lldap-*-glibc-*.tar.gz

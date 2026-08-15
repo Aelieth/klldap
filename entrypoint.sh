@@ -4,9 +4,11 @@ set -e
 CONFIG_FILE=/data/lldap_config.toml
 
 # === UID/GID for rootless-friendly operation (matches upstream LLDAP docker entrypoint style) ===
-# Defaults keep current image behavior (hardcoded 1000 user created in Dockerfile).
-LLDAP_UID="${UID:-1000}"
-LLDAP_GID="${GID:-1000}"
+# LLDAP_UID/LLDAP_GID take precedence; legacy UID/GID are read with printenv because
+# some bash builds reset $UID to the process uid and mark it readonly — printenv reads
+# the environment directly, so the override works under either bash behavior.
+LLDAP_UID="${LLDAP_UID:-$(printenv UID || echo 1000)}"
+LLDAP_GID="${LLDAP_GID:-$(printenv GID || echo 1000)}"
 
 # === Required env checks ===
 if [ -z "$LLDAP_JWT_SECRET" ]; then
@@ -27,19 +29,21 @@ echo "Starting LLDAP..."
 LLDAP_PID=$!
 
 echo "Waiting for LLDAP to become ready..."
-for i in $(seq 1 60); do
+ready=""
+for _ in $(seq 1 60); do
     # Run healthcheck as the target user (prevents root from creating root-owned
     # 0400 "server_key" files in /app that the real lldap process cannot read).
     # Also pass --config-file so we reliably load the /data copy (with key_seed etc.),
     # matching upstream LLDAP docker CMD + HEALTHCHECK behavior.
     if gosu "${LLDAP_UID}:${LLDAP_GID}" /app/lldap healthcheck --config-file "$CONFIG_FILE" >/dev/null 2>&1; then
         echo "LLDAP is ready!"
+        ready=1
         break
     fi
     sleep 1
 done
 
-if [ "$i" -eq 60 ]; then
+if [ -z "$ready" ]; then
     echo "ERROR: LLDAP failed to start within 60 seconds."
     exit 1
 fi

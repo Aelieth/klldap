@@ -279,8 +279,25 @@ async fn run_healthcheck(opts: RunOpts) -> Result<()> {
         ),
     );
 
-    let failure = [ldap, ldaps, api]
+    let kerberos = if config.healthcheck_options.kerberos {
+        Some(
+            timeout(
+                delay,
+                healthcheck::check_kerberos(
+                    &config.healthcheck_options.ldap_host,
+                    88,
+                    "/data/kadm5.keytab",
+                ),
+            )
+            .await,
+        )
+    } else {
+        None
+    };
+
+    let failure = [Some(ldap), Some(ldaps), Some(api), kerberos]
         .into_iter()
+        .flatten()
         .flat_map(|res| {
             if let Err(e) = &res {
                 error!("Error running the health check: {:#}", e);

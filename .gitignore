@@ -42,3 +42,4 @@ working/
 
 # Local container bind-mount data
 klldap-data/
+gate/results/

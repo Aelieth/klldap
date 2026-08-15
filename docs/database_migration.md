@@ -1,5 +1,8 @@
 # Migration
 
+> Migrating **from stock LLDAP** (not between database backends) is
+> [v0.7-from-lldap.md](migration_guides/v0.7-from-lldap.md).
+
 Existing servers can migrate from one database backend to another. This page includes guidance for migrating from SQLite - similar concepts apply when migrating from databases of other types.
 
 NOTE: [pgloader](https://github.com/dimitri/pgloader) is a tool that can easily migrate to PostgreSQL from other databases. Consider it if your target database is PostgreSQL

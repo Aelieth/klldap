@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.7.4] unreleased
+
+- **Security**: key-file deployments without a `key_seed` silently ran on a built-in
+  deterministic key since 0.7.2 (the "startup figment logic" change) — the configured
+  key file was ignored. The server now loads the real key file; affected deployments
+  will stop at startup with "The private key has changed" and must restart once with
+  `--force-update-private-key=true` (and `--force-ldap-user-pass-reset=true`), after
+  which every user must reset their password. Deployments using `key_seed` are not
+  affected.
+- Migration from stock LLDAP 0.6.x (schema ≤11) is now supported end-to-end: schema v13
+  re-encodes upstream attribute values, upstream `server_key` files are accepted, and
+  passwords upgrade transparently on the first LDAP bind or `/auth/simple/login`. See
+  `docs/migration_guides/v0.7-from-lldap.md`.
+- GraphQL API restored to full upstream compatibility (lldap-cli works unmodified).
+- GitHub Actions CI resurrected; release version single-sourced from Cargo.toml.
+
 ## [0.7.2] 2026-06-16
 
 - Bugfixes: user GID no longer clashes and errors against group GID's. Group uid and memberof lookup added to ldap search. startup figment logic for .lldap_initialized. Prevent deletion and name change of built-in load bearing functionality lldap groups.

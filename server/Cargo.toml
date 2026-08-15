@@ -105,6 +105,7 @@ path = "../crates/validation"
 
 [dev-dependencies]
 assert_cmd = "2"
+base64 = { workspace = true }
 graphql_client = { workspace = true, features = ["graphql_query_derive", "reqwest"] }
 ldap3 = { workspace = true }
 mockall = { workspace = true }

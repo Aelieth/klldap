@@ -371,3 +371,23 @@ fn create_lldap_command(subcommand: &str, db_url: &str) -> Command {
     cmd.arg("--server-key-file=''");
     cmd
 }
+
+/// Like `create_lldap_command`, but against a real server key file and without the
+/// seed/admin-password environment: the migration tests bring their own database whose
+/// admin password and key must carry over untouched.
+pub fn create_lldap_command_with_key_file(
+    subcommand: &str,
+    db_url: &str,
+    key_file: &str,
+) -> Command {
+    let mut cmd = Command::new(cargo_bin!());
+    let path = canonicalize("..").expect("canonical path to repo root");
+    cmd.current_dir(path);
+    cmd.env(env::DB_KEY, db_url);
+    cmd.env_remove(env::PRIVATE_KEY_SEED);
+    cmd.env(env::JWT_SECRET, "Random JWT secret for test");
+    cmd.arg(subcommand);
+    cmd.arg("--config-file=/dev/null");
+    cmd.arg(format!("--server-key-file={key_file}"));
+    cmd
+}

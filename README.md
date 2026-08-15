@@ -25,6 +25,10 @@ Refer to [LLDAP](https://github.com/lldap/lldap) for a more community supported 
 
 ## Installation
 
+Stock LLDAP 0.6.x databases (schema 11 or older) can move to KLLDAP with data
+and passwords intact — see
+[docs/migration_guides/v0.7-from-lldap.md](docs/migration_guides/v0.7-from-lldap.md).
+
 KLLDAP only supports Docker images at this time. Why? MIT Kerberos is a must in order to get
 Kerberos functionality with the system. Kerberos is setup to be tight-knit and secure by
 being contained within the same environment as LLDAP, acting in unison with one another.
@@ -37,8 +41,7 @@ being contained within the same environment as LLDAP, acting in unison with one 
   - Group attributes
   - System attributes (new section for allowedous and future settings)
 - Every attribute carries full metadata: name, aliases, type, list support, visibility, editability, hardcoded flag, and readonly status
-- Database migration v12 clears old tables and re-seeds everything directly from `PublicSchema::get()`
-- Runtime code always pulls from the database but stays 100% consistent with the PublicSchema definition
+- v12/v13 are additive: v12 upserts hardcoded schema from `PublicSchema`; v13 re-encodes LLDAP values. Custom attributes persist in the database; the catalog itself is compile-time `PublicSchema`
 
 ## Kerberos Integration – MIT KDC
 - Hands off integration: Bootstrap handled by custom startup binary `crates/kerberos/src/bin/kerberos_manager.rs` on first container start

@@ -232,7 +232,7 @@ async fn set_up_server(config: Configuration) -> Result<(ServerBuilder, Database
 async fn run_server_command(opts: RunOpts) -> Result<()> {
     debug!("CLI: {:#?}", &opts);
 
-    let config = configuration::init(opts)?;
+    let config = configuration::init_with_private_key(opts)?;
     logging::init(&config)?;
 
     let (server, sql_pool) = set_up_server(config).await?;

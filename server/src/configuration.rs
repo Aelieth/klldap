@@ -725,7 +725,26 @@ fn generate_jwt_sample_error() -> String {
     )
 }
 
+/// `init`, but with real private-key material: clears the figment dummy seed so the key
+/// file (or a configured seed) is actually loaded — creating the key file on first run.
+/// Only the serving path may use this; auxiliary commands (healthcheck, schema export,
+/// test email, create-schema) must never read or create key material, or a root-run
+/// healthcheck could plant an unreadable `server_key` before the server does.
+pub fn init_with_private_key<C>(overrides: C) -> Result<Configuration>
+where
+    C: TopLevelCommandOpts + ConfigOverrider,
+{
+    init_impl(overrides, true)
+}
+
 pub fn init<C>(overrides: C) -> Result<Configuration>
+where
+    C: TopLevelCommandOpts + ConfigOverrider,
+{
+    init_impl(overrides, false)
+}
+
+fn init_impl<C>(overrides: C, load_private_key: bool) -> Result<Configuration>
 where
     C: TopLevelCommandOpts + ConfigOverrider,
 {
@@ -752,6 +771,15 @@ where
     overrides.override_config(&mut config);
     if config.verbose {
         println!("Configuration: {:#?}", config);
+    }
+    // The dummy seed exists so that building the figment defaults shape (and every
+    // auxiliary command) never touches key material on disk. The serving path must
+    // clear the sentinel when nothing overrode it, or a key-file deployment would
+    // silently run on the deterministic dummy key instead of its key file.
+    if load_private_key
+        && config.key_seed.as_ref().map(SecUtf8::unsecure) == Some(FIGMENT_DUMMY_KEY_SEED)
+    {
+        config.key_seed = None;
     }
     check_for_unexpected_env_variables(env_variable_provider());
     config.server_setup = Some(get_server_setup(
@@ -930,7 +958,7 @@ mod tests {
             jail.clear_env();
             jail.set_env("LLDAP_KEY_SEED", "a123");
             jail.set_env("LLDAP_JWT_SECRET", "secret");
-            init(default_run_opts()).unwrap();
+            init_with_private_key(default_run_opts()).unwrap();
             Ok(())
         });
     }
@@ -943,7 +971,7 @@ mod tests {
             jail.set_env("LLDAP_KEY_SEED", "a123");
             jail.set_env("LLDAP_JWT_SECRET", "secret");
             write_random_key(jail, "test");
-            init(default_run_opts()).unwrap_err();
+            init_with_private_key(default_run_opts()).unwrap_err();
             Ok(())
         });
     }
@@ -960,7 +988,11 @@ mod tests {
             let mut opts = default_run_opts();
             opts.server_key_file = Some("test".to_string());
             write_random_key(jail, "test");
-            init(opts).unwrap();
+            let config = init_with_private_key(opts).unwrap();
+            // The key must come from the file — a leaked figment dummy seed would
+            // deterministically generate a publicly-known key here instead.
+            let file_bytes = std::fs::read(jail.directory().join("test")).unwrap();
+            assert_eq!(&config.get_server_setup().serialize()[..], &file_bytes[..]);
             Ok(())
         });
     }
@@ -971,7 +1003,7 @@ mod tests {
             jail.create_file("lldap_config.toml", r#"key_file = "test""#)?;
             jail.clear_env();
             jail.set_env("LLDAP_JWT_SECRET", "secret");
-            init(default_run_opts()).unwrap();
+            init_with_private_key(default_run_opts()).unwrap();
             Ok(())
         });
     }
@@ -1017,9 +1049,11 @@ mod tests {
             jail.set_env("LLDAP_JWT_SECRET", "secret");
             jail.create_file("lldap_config.toml", "")?;
             write_random_key(jail, "server_key");
-            init(default_run_opts()).unwrap();
+            init_with_private_key(default_run_opts()).unwrap();
             jail.create_file("lldap_config.toml", r#"key_seed = "test""#)?;
-            let error_message = init(default_run_opts()).unwrap_err().to_string();
+            let error_message = init_with_private_key(default_run_opts())
+                .unwrap_err()
+                .to_string();
             assert!(
                 error_message.contains("A key_seed was given, but a key file already exists at",),
                 "{error_message}"
@@ -1035,11 +1069,11 @@ mod tests {
             jail.set_env("LLDAP_JWT_SECRET", "secret");
             jail.create_file("lldap_config.toml", "")?;
             write_random_key(jail, "server_key");
-            let config = init(default_run_opts()).unwrap();
+            let config = init_with_private_key(default_run_opts()).unwrap();
             let info = config.get_private_key_info();
             std::fs::remove_file(jail.directory().join("server_key")).unwrap();
             jail.create_file("lldap_config.toml", r#"key_seed = "test""#)?;
-            let new_config = init(default_run_opts()).unwrap();
+            let new_config = init_with_private_key(default_run_opts()).unwrap();
             let error_message =
                 compare_private_key_hashes(Some(&info), &new_config.get_private_key_info())
                     .unwrap_err()
@@ -1082,6 +1116,25 @@ mod tests {
                 get_server_setup(path.to_str().unwrap(), "", PrivateKeyLocation::Tests).unwrap();
             assert_eq!(config.legacy_server_setup.as_ref(), Some(&legacy));
             assert_eq!(&config.server_setup.serialize()[..], legacy.as_bytes());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn private_key_hash_of_legacy_key_matches_stock_lldap() {
+        // Stock lldap stores sha256(sk) (bytes 64..96 of the key file) in
+        // metadata.private_key_hash; the value computed at boot from a migrated key must
+        // match or compare_private_key_hashes refuses to start.
+        let legacy = lldap_opaque_legacy::generate_random();
+        Jail::expect_with(|jail| {
+            let path = jail.directory().join("server_key");
+            std::fs::write(&path, legacy.as_bytes()).unwrap();
+            let config =
+                get_server_setup(path.to_str().unwrap(), "", PrivateKeyLocation::Tests).unwrap();
+            assert_eq!(
+                stable_hash(config.server_setup.keypair().private().serialize().as_ref()),
+                stable_hash(&legacy.as_bytes()[64..96]),
+            );
             Ok(())
         });
     }

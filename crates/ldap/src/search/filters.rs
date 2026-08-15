@@ -10,12 +10,22 @@ use crate::dn::{
 };
 use ldap3_proto::LdapFilter;
 use lldap_domain::deserialize::deserialize_attribute_value;
-use lldap_domain::public_schema::PublicSchema;
 use lldap_domain::types::{AttributeName, AttributeType, UserId};
 use lldap_domain_handlers::handler::{GroupRequestFilter, UserRequestFilter};
+use lldap_schema::PublicSchema;
 use tracing::{debug, warn};
 
-use crate::core::utils::LdapInfo;
+use crate::attributes::{
+    get_default_group_object_classes_bytes, get_default_user_object_classes_bytes,
+};
+use crate::core::utils::{LdapInfo, is_unrecognized_attribute};
+use crate::schema::{GroupFieldType, UserFieldType};
+
+fn is_object_class(value: &str, classes: &[Vec<u8>]) -> bool {
+    classes
+        .iter()
+        .any(|class| class.eq_ignore_ascii_case(value.as_bytes()))
+}
 
 // USER FILTER CONVERSION
 
@@ -52,27 +62,13 @@ pub fn convert_user_filter(
 ) -> LdapResult<UserRequestFilter> {
     let rec = |f| convert_user_filter(ldap_info, f, schema);
     match filter {
-        LdapFilter::Equality(field, value) if field.eq_ignore_ascii_case("objectclass") => {
-            let v = value.to_ascii_lowercase();
-            let standard_user_classes = [
-                "top",
-                "person",
-                "inetorgperson",
-                "posixaccount",
-                "ldappublickey",
-            ];
-            let extra_classes: Vec<String> = schema
-                .get_schema()
-                .extra_user_object_classes
-                .iter()
-                .map(|c| c.to_ascii_lowercase())
-                .collect();
-            if standard_user_classes.contains(&v.as_str()) || extra_classes.contains(&v) {
-                Ok(UserRequestFilter::True)
+        LdapFilter::Equality(field, value) if field.eq_ignore_ascii_case("objectclass") => Ok(
+            if is_object_class(value, &get_default_user_object_classes_bytes(schema)) {
+                UserRequestFilter::True
             } else {
-                Ok(UserRequestFilter::False)
-            }
-        }
+                UserRequestFilter::False
+            },
+        ),
 
         LdapFilter::And(filters) => {
             let res = filters
@@ -142,26 +138,23 @@ pub fn convert_user_filter(
             }
 
             match crate::schema::get_schema_manager().map_user_field(&field, schema) {
-                crate::core::utils::UserFieldType::PrimaryField(
-                    lldap_domain_model::model::UserColumn::UserId,
-                ) => Ok(UserRequestFilter::UserId(UserId::new(&value_lc))),
-                crate::core::utils::UserFieldType::PrimaryField(
-                    lldap_domain_model::model::UserColumn::Email,
-                ) => Ok(UserRequestFilter::Equality(
-                    lldap_domain_model::model::UserColumn::LowercaseEmail,
-                    value_lc,
-                )),
-                crate::core::utils::UserFieldType::PrimaryField(field) => {
+                UserFieldType::PrimaryField(lldap_domain_model::model::UserColumn::UserId) => {
+                    Ok(UserRequestFilter::UserId(UserId::new(&value_lc)))
+                }
+                UserFieldType::PrimaryField(lldap_domain_model::model::UserColumn::Email) => {
+                    Ok(UserRequestFilter::Equality(
+                        lldap_domain_model::model::UserColumn::LowercaseEmail,
+                        value_lc,
+                    ))
+                }
+                UserFieldType::PrimaryField(field) => {
                     Ok(UserRequestFilter::Equality(field, value_lc))
                 }
-                crate::core::utils::UserFieldType::Attribute(field, typ, is_list) => Ok(
+                UserFieldType::Attribute(field, typ, is_list) => Ok(
                     get_user_attribute_equality_filter(&field, typ, is_list, value),
                 ),
-                crate::core::utils::UserFieldType::NoMatch => {
-                    if crate::core::utils::is_unrecognized_attribute(
-                        &field,
-                        &ldap_info.ignored_user_attributes,
-                    ) {
+                UserFieldType::NoMatch => {
+                    if is_unrecognized_attribute(&field, &ldap_info.ignored_user_attributes) {
                         debug!(
                             r#"Ignoring unknown user attribute "{}" in filter. Add to "ignored_user_attributes" to silence."#,
                             field
@@ -169,23 +162,18 @@ pub fn convert_user_filter(
                     }
                     Ok(UserRequestFilter::False)
                 }
-                crate::core::utils::UserFieldType::ObjectClass => {
-                    Ok(UserRequestFilter::And(vec![]))
-                }
-                crate::core::utils::UserFieldType::MemberOf => {
-                    Ok(get_group_id_from_distinguished_name_or_plain_name(
-                        &value_lc,
-                        &ldap_info.base_dn,
-                        &ldap_info.base_dn_str,
-                    )
-                    .map(UserRequestFilter::MemberOf)
-                    .unwrap_or_else(|e| {
-                        warn!("Invalid memberOf filter: {}", e);
-                        UserRequestFilter::False
-                    }))
-                }
-                crate::core::utils::UserFieldType::EntryDn
-                | crate::core::utils::UserFieldType::Dn => {
+                UserFieldType::ObjectClass => Ok(UserRequestFilter::And(vec![])),
+                UserFieldType::MemberOf => Ok(get_group_id_from_distinguished_name_or_plain_name(
+                    &value_lc,
+                    &ldap_info.base_dn,
+                    &ldap_info.base_dn_str,
+                )
+                .map(UserRequestFilter::MemberOf)
+                .unwrap_or_else(|e| {
+                    warn!("Invalid memberOf filter: {}", e);
+                    UserRequestFilter::False
+                })),
+                UserFieldType::EntryDn | UserFieldType::Dn => {
                     Ok(get_user_id_from_distinguished_name_or_plain_name(
                         value_lc.as_str(),
                         &ldap_info.base_dn,
@@ -197,7 +185,7 @@ pub fn convert_user_filter(
                         UserRequestFilter::False
                     }))
                 }
-                crate::core::utils::UserFieldType::EntryUuid => {
+                UserFieldType::EntryUuid => {
                     // entryUUID maps to the internal user uuid column
                     match lldap_domain::types::Uuid::try_from(value.as_str()) {
                         Ok(_) => Ok(UserRequestFilter::Equality(
@@ -215,7 +203,7 @@ pub fn convert_user_filter(
         LdapFilter::GreaterOrEqual(field, value) => {
             let field = AttributeName::from(field.as_str());
             match crate::schema::get_schema_manager().map_user_field(&field, schema) {
-                crate::core::utils::UserFieldType::PrimaryField(f)
+                UserFieldType::PrimaryField(f)
                     if matches!(
                         f,
                         lldap_domain_model::model::UserColumn::CreationDate
@@ -225,12 +213,9 @@ pub fn convert_user_filter(
                 {
                     Ok(UserRequestFilter::GreaterOrEqual(f, value.to_string()))
                 }
-                crate::core::utils::UserFieldType::Attribute(name, AttributeType::DateTime, _) => {
-                    Ok(UserRequestFilter::AttributeGreaterOrEqual(
-                        name,
-                        value.to_string(),
-                    ))
-                }
+                UserFieldType::Attribute(name, AttributeType::DateTime, _) => Ok(
+                    UserRequestFilter::AttributeGreaterOrEqual(name, value.to_string()),
+                ),
                 _ => Err(LdapError {
                     code: ldap3_proto::LdapResultCode::UnwillingToPerform,
                     message: format!("GreaterOrEqual not supported on this attribute: {}", field),
@@ -240,7 +225,7 @@ pub fn convert_user_filter(
         LdapFilter::LessOrEqual(field, value) => {
             let field = AttributeName::from(field.as_str());
             match crate::schema::get_schema_manager().map_user_field(&field, schema) {
-                crate::core::utils::UserFieldType::PrimaryField(f)
+                UserFieldType::PrimaryField(f)
                     if matches!(
                         f,
                         lldap_domain_model::model::UserColumn::CreationDate
@@ -250,12 +235,9 @@ pub fn convert_user_filter(
                 {
                     Ok(UserRequestFilter::LessOrEqual(f, value.to_string()))
                 }
-                crate::core::utils::UserFieldType::Attribute(name, AttributeType::DateTime, _) => {
-                    Ok(UserRequestFilter::AttributeLessOrEqual(
-                        name,
-                        value.to_string(),
-                    ))
-                }
+                UserFieldType::Attribute(name, AttributeType::DateTime, _) => Ok(
+                    UserRequestFilter::AttributeLessOrEqual(name, value.to_string()),
+                ),
                 _ => Err(LdapError {
                     code: ldap3_proto::LdapResultCode::UnwillingToPerform,
                     message: format!("LessOrEqual not supported on this attribute: {}", field),
@@ -277,10 +259,10 @@ pub fn convert_user_filter(
 
             Ok(
                 match crate::schema::get_schema_manager().map_user_field(&field, schema) {
-                    crate::core::utils::UserFieldType::Attribute(name, _, _) => {
+                    UserFieldType::Attribute(name, _, _) => {
                         UserRequestFilter::CustomAttributePresent(name)
                     }
-                    crate::core::utils::UserFieldType::NoMatch => UserRequestFilter::False,
+                    UserFieldType::NoMatch => UserRequestFilter::False,
                     _ => UserRequestFilter::True,
                 },
             )
@@ -288,48 +270,44 @@ pub fn convert_user_filter(
         LdapFilter::Substring(field, substring_filter) => {
             let field = AttributeName::from(field.as_str());
             match crate::schema::get_schema_manager().map_user_field(&field, schema) {
-                crate::core::utils::UserFieldType::PrimaryField(
-                    lldap_domain_model::model::UserColumn::UserId,
-                ) => Ok(UserRequestFilter::UserIdSubString(
-                    substring_filter.clone().into(),
-                )),
-                crate::core::utils::UserFieldType::Attribute(
-                    name,
-                    lldap_schema::AttributeType::String,
-                    _,
-                ) => Ok(UserRequestFilter::AttributeSubString(
-                    name,
-                    substring_filter.clone().into(),
-                )),
+                UserFieldType::PrimaryField(lldap_domain_model::model::UserColumn::UserId) => Ok(
+                    UserRequestFilter::UserIdSubString(substring_filter.clone().into()),
+                ),
+                UserFieldType::Attribute(name, lldap_schema::AttributeType::String, _) => Ok(
+                    UserRequestFilter::AttributeSubString(name, substring_filter.clone().into()),
+                ),
                 // Non-string custom attributes still get rejected (makes sense)
-                crate::core::utils::UserFieldType::Attribute(_, _, _) => Err(LdapError {
+                UserFieldType::Attribute(_, _, _) => Err(LdapError {
                     code: ldap3_proto::LdapResultCode::UnwillingToPerform,
                     message: format!("Unsupported user attribute for substring filter: {field:?}"),
                 }),
-                crate::core::utils::UserFieldType::ObjectClass
-                | crate::core::utils::UserFieldType::MemberOf
-                | crate::core::utils::UserFieldType::Dn
-                | crate::core::utils::UserFieldType::EntryDn
-                | crate::core::utils::UserFieldType::EntryUuid
-                | crate::core::utils::UserFieldType::PrimaryField(
+                UserFieldType::ObjectClass
+                | UserFieldType::MemberOf
+                | UserFieldType::Dn
+                | UserFieldType::EntryDn
+                | UserFieldType::EntryUuid
+                | UserFieldType::PrimaryField(
                     lldap_domain_model::model::UserColumn::CreationDate,
                 )
-                | crate::core::utils::UserFieldType::PrimaryField(
-                    lldap_domain_model::model::UserColumn::Uuid,
-                ) => Err(LdapError {
-                    code: ldap3_proto::LdapResultCode::UnwillingToPerform,
-                    message: format!("Unsupported user attribute for substring filter: {field:?}"),
-                }),
-                crate::core::utils::UserFieldType::NoMatch => Ok(UserRequestFilter::False),
-                crate::core::utils::UserFieldType::PrimaryField(
-                    lldap_domain_model::model::UserColumn::Email,
-                ) => Ok(UserRequestFilter::SubString(
-                    lldap_domain_model::model::UserColumn::LowercaseEmail,
+                | UserFieldType::PrimaryField(lldap_domain_model::model::UserColumn::Uuid) => {
+                    Err(LdapError {
+                        code: ldap3_proto::LdapResultCode::UnwillingToPerform,
+                        message: format!(
+                            "Unsupported user attribute for substring filter: {field:?}"
+                        ),
+                    })
+                }
+                UserFieldType::NoMatch => Ok(UserRequestFilter::False),
+                UserFieldType::PrimaryField(lldap_domain_model::model::UserColumn::Email) => {
+                    Ok(UserRequestFilter::SubString(
+                        lldap_domain_model::model::UserColumn::LowercaseEmail,
+                        substring_filter.clone().into(),
+                    ))
+                }
+                UserFieldType::PrimaryField(field) => Ok(UserRequestFilter::SubString(
+                    field,
                     substring_filter.clone().into(),
                 )),
-                crate::core::utils::UserFieldType::PrimaryField(field) => Ok(
-                    UserRequestFilter::SubString(field, substring_filter.clone().into()),
-                ),
             }
         }
         _ => Err(LdapError {
@@ -374,48 +352,36 @@ pub fn convert_group_filter(
 ) -> LdapResult<GroupRequestFilter> {
     let rec = |f| convert_group_filter(ldap_info, f, schema);
     match filter {
-        LdapFilter::Equality(field, value) if field.eq_ignore_ascii_case("objectclass") => {
-            let v = value.to_ascii_lowercase();
-            let standard_group_classes = ["groupofuniquenames", "groupofnames", "posixgroup"];
-            let extra_classes: Vec<String> = schema
-                .get_schema()
-                .extra_group_object_classes
-                .iter()
-                .map(|c| c.to_ascii_lowercase())
-                .collect();
-            if standard_group_classes.contains(&v.as_str()) || extra_classes.contains(&v) {
-                Ok(GroupRequestFilter::True)
+        LdapFilter::Equality(field, value) if field.eq_ignore_ascii_case("objectclass") => Ok(
+            if is_object_class(value, &get_default_group_object_classes_bytes(schema)) {
+                GroupRequestFilter::True
             } else {
-                Ok(GroupRequestFilter::False)
-            }
-        }
+                GroupRequestFilter::False
+            },
+        ),
 
         LdapFilter::Equality(field, value) => {
             let field = AttributeName::from(field.as_str());
             let value_lc = value.to_ascii_lowercase();
             match crate::schema::get_schema_manager().map_group_field(&field, schema) {
-                crate::core::utils::GroupFieldType::GroupId => Ok(value_lc
+                GroupFieldType::GroupId => Ok(value_lc
                     .parse::<i32>()
                     .map(|id| GroupRequestFilter::GroupId(lldap_domain::types::GroupId(id)))
                     .unwrap_or_else(|_| {
                         warn!("Given group id is not a valid integer: {}", value_lc);
                         GroupRequestFilter::False
                     })),
-                crate::core::utils::GroupFieldType::DisplayName => {
-                    Ok(GroupRequestFilter::DisplayName(value_lc.into()))
-                }
-                crate::core::utils::GroupFieldType::Uuid => {
-                    lldap_domain::types::Uuid::try_from(value_lc.as_str())
-                        .map(GroupRequestFilter::Uuid)
-                        .map_err(|e| LdapError {
-                            code: ldap3_proto::LdapResultCode::Other,
-                            message: format!("Invalid UUID: {e:#}"),
-                        })
-                }
-                crate::core::utils::GroupFieldType::Member
-                | crate::core::utils::GroupFieldType::UniqueMember
-                | crate::core::utils::GroupFieldType::MemberUid
-                | crate::core::utils::GroupFieldType::MemberOf => {
+                GroupFieldType::DisplayName => Ok(GroupRequestFilter::DisplayName(value_lc.into())),
+                GroupFieldType::Uuid => lldap_domain::types::Uuid::try_from(value_lc.as_str())
+                    .map(GroupRequestFilter::Uuid)
+                    .map_err(|e| LdapError {
+                        code: ldap3_proto::LdapResultCode::Other,
+                        message: format!("Invalid UUID: {e:#}"),
+                    }),
+                GroupFieldType::Member
+                | GroupFieldType::UniqueMember
+                | GroupFieldType::MemberUid
+                | GroupFieldType::MemberOf => {
                     // "member" and "uniqueMember" are the standards; "memberof"/"ismemberof"
                     // are accepted as aliases pointing to the same membership filter semantics
                     // for groups (enables client compatibility + faster lookups).
@@ -433,11 +399,8 @@ pub fn convert_group_filter(
                         GroupRequestFilter::False
                     }))
                 }
-                crate::core::utils::GroupFieldType::ObjectClass => {
-                    Ok(GroupRequestFilter::And(vec![]))
-                }
-                crate::core::utils::GroupFieldType::Dn
-                | crate::core::utils::GroupFieldType::EntryDn => {
+                GroupFieldType::ObjectClass => Ok(GroupRequestFilter::And(vec![])),
+                GroupFieldType::Dn | GroupFieldType::EntryDn => {
                     Ok(get_group_id_from_distinguished_name_or_plain_name(
                         value_lc.as_str(),
                         &ldap_info.base_dn,
@@ -449,19 +412,14 @@ pub fn convert_group_filter(
                         GroupRequestFilter::False
                     }))
                 }
-                crate::core::utils::GroupFieldType::EntryUuid => {
-                    lldap_domain::types::Uuid::try_from(value.as_str())
-                        .map(GroupRequestFilter::Uuid)
-                        .map_err(|e| LdapError {
-                            code: ldap3_proto::LdapResultCode::Other,
-                            message: format!("Invalid UUID in filter: {e:#}"),
-                        })
-                }
-                crate::core::utils::GroupFieldType::NoMatch => {
-                    if crate::core::utils::is_unrecognized_attribute(
-                        &field,
-                        &ldap_info.ignored_group_attributes,
-                    ) {
+                GroupFieldType::EntryUuid => lldap_domain::types::Uuid::try_from(value.as_str())
+                    .map(GroupRequestFilter::Uuid)
+                    .map_err(|e| LdapError {
+                        code: ldap3_proto::LdapResultCode::Other,
+                        message: format!("Invalid UUID in filter: {e:#}"),
+                    }),
+                GroupFieldType::NoMatch => {
+                    if is_unrecognized_attribute(&field, &ldap_info.ignored_group_attributes) {
                         debug!(
                             r#"Ignoring unknown group attribute "{}" in filter. Add to "ignored_group_attributes" to silence."#,
                             field
@@ -469,14 +427,14 @@ pub fn convert_group_filter(
                     }
                     Ok(GroupRequestFilter::False)
                 }
-                crate::core::utils::GroupFieldType::Attribute(field, typ, is_list) => Ok(
+                GroupFieldType::Attribute(field, typ, is_list) => Ok(
                     get_group_attribute_equality_filter(&field, typ, is_list, value),
                 ),
-                crate::core::utils::GroupFieldType::CreationDate => Err(LdapError {
+                GroupFieldType::CreationDate => Err(LdapError {
                     code: ldap3_proto::LdapResultCode::UnwillingToPerform,
                     message: "Creation date filter for groups not supported".to_owned(),
                 }),
-                crate::core::utils::GroupFieldType::ModifiedDate => Err(LdapError {
+                GroupFieldType::ModifiedDate => Err(LdapError {
                     code: ldap3_proto::LdapResultCode::UnwillingToPerform,
                     message: "Modified date filter for groups not supported".to_owned(),
                 }),
@@ -485,8 +443,7 @@ pub fn convert_group_filter(
         LdapFilter::GreaterOrEqual(field, value) => {
             let field = AttributeName::from(field.as_str());
             match crate::schema::get_schema_manager().map_group_field(&field, schema) {
-                crate::core::utils::GroupFieldType::CreationDate
-                | crate::core::utils::GroupFieldType::ModifiedDate => {
+                GroupFieldType::CreationDate | GroupFieldType::ModifiedDate => {
                     // Use the authoritative PublicSchema (passed in) + resolve_group_canonical_name
                     // so aliases ("createTimestamp", "modifyTimestamp", "creation_date", etc.)
                     // are properly translated to the internal canonical names ("creationdate"/"modifieddate").
@@ -499,12 +456,9 @@ pub fn convert_group_filter(
                         value.to_string(),
                     ))
                 }
-                crate::core::utils::GroupFieldType::Attribute(name, AttributeType::DateTime, _) => {
-                    Ok(GroupRequestFilter::AttributeGreaterOrEqual(
-                        name,
-                        value.to_string(),
-                    ))
-                }
+                GroupFieldType::Attribute(name, AttributeType::DateTime, _) => Ok(
+                    GroupRequestFilter::AttributeGreaterOrEqual(name, value.to_string()),
+                ),
                 _ => Err(LdapError {
                     code: ldap3_proto::LdapResultCode::UnwillingToPerform,
                     message: format!(
@@ -517,8 +471,7 @@ pub fn convert_group_filter(
         LdapFilter::LessOrEqual(field, value) => {
             let field = AttributeName::from(field.as_str());
             match crate::schema::get_schema_manager().map_group_field(&field, schema) {
-                crate::core::utils::GroupFieldType::CreationDate
-                | crate::core::utils::GroupFieldType::ModifiedDate => {
+                GroupFieldType::CreationDate | GroupFieldType::ModifiedDate => {
                     // Use the authoritative PublicSchema (passed in) + resolve_group_canonical_name
                     // (see GreaterOrEqual comment for full rationale)
                     let canonical = schema
@@ -530,12 +483,9 @@ pub fn convert_group_filter(
                         value.to_string(),
                     ))
                 }
-                crate::core::utils::GroupFieldType::Attribute(name, AttributeType::DateTime, _) => {
-                    Ok(GroupRequestFilter::AttributeLessOrEqual(
-                        name,
-                        value.to_string(),
-                    ))
-                }
+                GroupFieldType::Attribute(name, AttributeType::DateTime, _) => Ok(
+                    GroupRequestFilter::AttributeLessOrEqual(name, value.to_string()),
+                ),
                 _ => Err(LdapError {
                     code: ldap3_proto::LdapResultCode::UnwillingToPerform,
                     message: format!(
@@ -590,10 +540,10 @@ pub fn convert_group_filter(
             let field = AttributeName::from(field.as_str());
             Ok(
                 match crate::schema::get_schema_manager().map_group_field(&field, schema) {
-                    crate::core::utils::GroupFieldType::Attribute(name, _, _) => {
+                    GroupFieldType::Attribute(name, _, _) => {
                         GroupRequestFilter::CustomAttributePresent(name)
                     }
-                    crate::core::utils::GroupFieldType::NoMatch => GroupRequestFilter::False,
+                    GroupFieldType::NoMatch => GroupRequestFilter::False,
                     _ => GroupRequestFilter::True,
                 },
             )
@@ -601,16 +551,13 @@ pub fn convert_group_filter(
         LdapFilter::Substring(field, substring_filter) => {
             let field = AttributeName::from(field.as_str());
             match crate::schema::get_schema_manager().map_group_field(&field, schema) {
-                crate::core::utils::GroupFieldType::DisplayName => Ok(
-                    GroupRequestFilter::DisplayNameSubString(substring_filter.clone().into()),
+                GroupFieldType::DisplayName => Ok(GroupRequestFilter::DisplayNameSubString(
+                    substring_filter.clone().into(),
+                )),
+                GroupFieldType::Attribute(name, AttributeType::String, _) => Ok(
+                    GroupRequestFilter::AttributeSubString(name, substring_filter.clone().into()),
                 ),
-                crate::core::utils::GroupFieldType::Attribute(name, AttributeType::String, _) => {
-                    Ok(GroupRequestFilter::AttributeSubString(
-                        name,
-                        substring_filter.clone().into(),
-                    ))
-                }
-                crate::core::utils::GroupFieldType::NoMatch => Ok(GroupRequestFilter::False),
+                GroupFieldType::NoMatch => Ok(GroupRequestFilter::False),
                 _ => Err(LdapError {
                     code: ldap3_proto::LdapResultCode::UnwillingToPerform,
                     message: format!(
@@ -630,7 +577,7 @@ pub fn convert_group_filter(
 mod tests {
     use super::*;
     use ldap3_proto::proto::LdapSubstringFilter;
-    use lldap_domain::public_schema::PublicSchema;
+    use lldap_schema::PublicSchema;
 
     #[test]
     fn test_convert_user_filter_substring_on_custom_string_attribute() {
@@ -724,10 +671,7 @@ mod tests {
             GroupRequestFilter::False => {}
             other => panic!("expected False for uid-on-group, got {other:?}"),
         }
-        assert!(!crate::core::utils::is_unrecognized_attribute(
-            &AttributeName::from("uid"),
-            &[]
-        ));
+        assert!(!is_unrecognized_attribute(&AttributeName::from("uid"), &[]));
     }
 
     fn info() -> LdapInfo {
@@ -857,5 +801,16 @@ mod tests {
             group_eq("no_such_attr", "x"),
             GroupRequestFilter::False
         ));
+    }
+
+    #[test]
+    fn group_filter_groupid_targets_the_primary_id() {
+        for name in ["groupid", "group_id", "groupId"] {
+            assert_eq!(
+                group_eq(name, "7"),
+                GroupRequestFilter::GroupId(lldap_domain::types::GroupId(7)),
+                "{name}"
+            );
+        }
     }
 }

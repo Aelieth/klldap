@@ -1,8 +1,9 @@
 use crate::{
     core::{
         error::{LdapError, LdapResult},
-        utils::{LdapInfo, get_user_id_from_distinguished_name},
+        utils::LdapInfo,
     },
+    dn::get_user_id_from_distinguished_name,
     handler::make_modify_response,
     password,
 };
@@ -16,6 +17,7 @@ use lldap_domain::{
 };
 use lldap_domain_handlers::kerberos::kerberos_backend;
 use lldap_opaque_handler::OpaqueHandler;
+use lldap_schema::PublicSchema;
 use tracing::warn;
 
 // The profile attribute an LDAP Modify targets, after folding wire-name aliases (sn, cn, surname,
@@ -32,7 +34,7 @@ enum ModifyTarget {
 }
 
 fn modify_target(atype_lower: &str) -> ModifyTarget {
-    let canonical = lldap_domain::public_schema::PublicSchema::shared()
+    let canonical = PublicSchema::shared()
         .resolve_user_canonical_name(atype_lower)
         .unwrap_or(atype_lower);
     match canonical {
@@ -113,8 +115,7 @@ async fn handle_modify_change(
                     }
                 };
 
-                let sync_enabled =
-                    lldap_domain::types::kerberos_sync_enabled(&user.attributes, "kerberossync");
+                let sync_enabled = lldap_domain::types::kerberos_sync_enabled(&user.attributes);
 
                 if let Err(e) =
                     kerberos_backend().sync_if_enabled(sync_enabled, user_id.as_str(), plain_pass)

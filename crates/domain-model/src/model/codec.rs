@@ -1,11 +1,9 @@
 use crate::error::DomainError;
 use base64::{Engine as _, engine::general_purpose};
-use lldap_domain::{
-    schema::AttributeList,
-    types::{
-        Attribute, AttributeName, AttributeType, AttributeValue, Avatar, Cardinality, Serialized,
-    },
+use lldap_domain::types::{
+    Attribute, AttributeName, AttributeType, AttributeValue, Avatar, Cardinality, Serialized,
 };
+use lldap_schema::AttributeList;
 
 // Canonical DB byte encoding: String → UTF-8, Integer → ASCII decimal, Avatar → raw JPEG,
 // DateTime → ASCII epoch seconds; lists → JSON. DateTime decode also accepts RFC3339,

@@ -13,8 +13,6 @@ pub struct KerberosPaths {
     pub kadm5_acl: PathBuf,
     pub kadm5_acl_template: PathBuf,
     pub kdc_dir: PathBuf,
-    pub keycloak_config: PathBuf,
-    pub keycloak_template: PathBuf,
     pub keycloak_keytab: PathBuf,
     pub kdc_port: u16,
 }
@@ -32,8 +30,6 @@ impl Default for KerberosPaths {
             kadm5_acl: PathBuf::from("/var/kerberos/krb5kdc/kadm5.acl"),
             kadm5_acl_template: PathBuf::from("/app/kadm5.template.acl"),
             kdc_dir: PathBuf::from("/var/kerberos/krb5kdc"),
-            keycloak_config: PathBuf::from("/data/keycloak_config.toml"),
-            keycloak_template: PathBuf::from("/app/keycloak_config.template.toml"),
             keycloak_keytab: PathBuf::from("/data/keytab/keycloak-http.keytab"),
             kdc_port: 88,
         }
@@ -67,8 +63,6 @@ impl KerberosPaths {
             kadm5_acl: path("LLDAP_KERB_KADM5_ACL", defaults.kadm5_acl),
             kadm5_acl_template: path("LLDAP_KERB_KADM5_ACL_TEMPLATE", defaults.kadm5_acl_template),
             kdc_dir: path("LLDAP_KERB_KDC_DIR", defaults.kdc_dir),
-            keycloak_config: path("LLDAP_KERB_KEYCLOAK_CONFIG", defaults.keycloak_config),
-            keycloak_template: path("LLDAP_KERB_KEYCLOAK_TEMPLATE", defaults.keycloak_template),
             keycloak_keytab: path("LLDAP_KERB_KEYCLOAK_KEYTAB", defaults.keycloak_keytab),
             kdc_port: get("LLDAP_KERB_KDC_PORT")
                 .and_then(|value| value.parse().ok())

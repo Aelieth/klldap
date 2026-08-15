@@ -5,16 +5,58 @@ use crate::core::{
     utils::LdapInfo,
 };
 use crate::dn::parse_distinguished_name;
+use crate::search::filters::{convert_group_filter, convert_user_filter};
 use crate::search::scope::ou_matches_filter;
 use crate::search::{
     build_ou_entries, convert_groups_to_ldap_op, convert_users_to_ldap_op, get_search_scope,
     make_ou_entry, make_search_success,
 };
-use ldap3_proto::LdapResultCode;
 use ldap3_proto::proto::{LdapOp, LdapSearchRequest, LdapSearchScope};
-use ldap3_proto::{LdapPartialAttribute, LdapSearchResultEntry};
+use ldap3_proto::{LdapFilter, LdapPartialAttribute, LdapResultCode, LdapSearchResultEntry};
 use lldap_access_control::UserAndGroupListerBackendHandler;
-use lldap_domain::public_schema::PublicSchema;
+use lldap_domain::types::{Group, UserAndGroups};
+use lldap_domain_handlers::handler::{GroupListerBackendHandler, UserListerBackendHandler};
+use lldap_schema::PublicSchema;
+use tracing::{debug, instrument};
+
+#[instrument(skip_all, level = "debug", fields(ldap_filter, request_groups))]
+pub(crate) async fn get_user_list<Backend: UserListerBackendHandler>(
+    ldap_info: &LdapInfo,
+    ldap_filter: &LdapFilter,
+    request_groups: bool,
+    base: &str,
+    backend: &Backend,
+    schema: &PublicSchema,
+) -> LdapResult<Vec<UserAndGroups>> {
+    let filters = convert_user_filter(ldap_info, ldap_filter, schema)?;
+    debug!(?filters);
+    backend
+        .list_users(Some(filters), request_groups)
+        .await
+        .map_err(|e| LdapError {
+            code: LdapResultCode::Other,
+            message: format!(r#"Error while searching user "{base}": {e:#}"#),
+        })
+}
+
+#[instrument(skip_all, level = "debug", fields(ldap_filter))]
+pub(crate) async fn get_groups_list<Backend: GroupListerBackendHandler>(
+    ldap_info: &LdapInfo,
+    ldap_filter: &LdapFilter,
+    base: &str,
+    backend: &Backend,
+    schema: &PublicSchema,
+) -> LdapResult<Vec<Group>> {
+    let filters = convert_group_filter(ldap_info, ldap_filter, schema)?;
+    debug!(?filters);
+    backend
+        .list_groups(Some(filters))
+        .await
+        .map_err(|e| LdapError {
+            code: LdapResultCode::Other,
+            message: format!(r#"Error while listing groups "{base}": {e:#}"#),
+        })
+}
 
 pub(crate) fn include_operational(attrs: &[String]) -> bool {
     // "+" or any requested attribute that is operational (== always_operational), from the table.
@@ -112,7 +154,7 @@ where
             let mut results = build_ou_entries(&ous_to_add, &ldap_info.base_dn_str, include_op);
 
             if request.scope == LdapSearchScope::Subtree {
-                let user_results = crate::core::user::get_user_list(
+                let user_results = get_user_list(
                     ldap_info,
                     &request.filter,
                     true,
@@ -128,14 +170,9 @@ where
                     schema,
                 ));
 
-                let group_results = crate::core::group::get_groups_list(
-                    ldap_info,
-                    &request.filter,
-                    &request.base,
-                    backend,
-                    schema,
-                )
-                .await?;
+                let group_results =
+                    get_groups_list(ldap_info, &request.filter, &request.base, backend, schema)
+                        .await?;
                 results.extend(convert_groups_to_ldap_op(
                     group_results,
                     &request.attrs,
@@ -183,7 +220,7 @@ where
                     ));
                 }
 
-                let user_results = crate::core::user::get_user_list(
+                let user_results = get_user_list(
                     ldap_info,
                     &request.filter,
                     true,
@@ -196,14 +233,9 @@ where
                     convert_users_to_ldap_op(user_results, &request.attrs, ldap_info, schema)
                         .collect();
 
-                let group_results = crate::core::group::get_groups_list(
-                    ldap_info,
-                    &request.filter,
-                    &request.base,
-                    backend,
-                    schema,
-                )
-                .await?;
+                let group_results =
+                    get_groups_list(ldap_info, &request.filter, &request.base, backend, schema)
+                        .await?;
                 let mut group_ops: Vec<LdapOp> = convert_groups_to_ldap_op(
                     group_results,
                     &request.attrs,
@@ -271,7 +303,7 @@ where
             };
             let specific_filter =
                 ldap3_proto::LdapFilter::Equality("uid".to_string(), user_id.to_string());
-            let exists_users = crate::core::user::get_user_list(
+            let exists_users = get_user_list(
                 ldap_info,
                 &specific_filter,
                 true,
@@ -287,7 +319,7 @@ where
                 });
             }
             // Now apply the REAL client filter (Problem 3)
-            let users = crate::core::user::get_user_list(
+            let users = get_user_list(
                 ldap_info,
                 &request.filter,
                 true,
@@ -332,14 +364,9 @@ where
             let specific_filter =
                 ldap3_proto::LdapFilter::Equality(group_rdn_attr, group_name.to_string());
 
-            let exists_groups = crate::core::group::get_groups_list(
-                ldap_info,
-                &specific_filter,
-                &request.base,
-                backend,
-                schema,
-            )
-            .await?;
+            let exists_groups =
+                get_groups_list(ldap_info, &specific_filter, &request.base, backend, schema)
+                    .await?;
             if exists_groups.is_empty() {
                 return Err(LdapError {
                     code: LdapResultCode::NoSuchObject,
@@ -350,14 +377,8 @@ where
             // Apply the REAL client filter after confirming the entry exists.
             // This two-step pattern (existence check + real filter) is required to
             // correctly return NoSuchObject vs Success+0 entries per LDAP semantics.
-            let groups = crate::core::group::get_groups_list(
-                ldap_info,
-                &request.filter,
-                &request.base,
-                backend,
-                schema,
-            )
-            .await?;
+            let groups =
+                get_groups_list(ldap_info, &request.filter, &request.base, backend, schema).await?;
             let mut results: Vec<LdapOp> =
                 convert_groups_to_ldap_op(groups, &request.attrs, ldap_info, &None, schema)
                     .collect();

@@ -166,8 +166,7 @@ pub fn is_valid_avatar_dimensions(width: u32, height: u32) -> bool {
     width <= TARGET_AVATAR_SIZE && height <= TARGET_AVATAR_SIZE
 }
 
-/// Single source of truth for test avatar data.
-/// Use this everywhere instead of duplicating JPEG bytes.
+#[cfg(feature = "test")]
 pub fn make_test_jpeg_bytes() -> Vec<u8> {
     vec![
         0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x00, 0x00,
@@ -197,8 +196,7 @@ pub fn make_test_jpeg_bytes() -> Vec<u8> {
     ]
 }
 
-/// Ready-to-use avatar attribute value for tests.
-/// Uses `crate::` because we're inside lldap_domain.
+#[cfg(feature = "test")]
 pub fn make_test_avatar_value() -> crate::types::AttributeValue {
     use crate::types::{AttributeValue, Avatar, Cardinality};
     AttributeValue::Avatar(Cardinality::Singleton(Avatar(make_test_jpeg_bytes())))

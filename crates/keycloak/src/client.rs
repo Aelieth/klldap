@@ -3,7 +3,22 @@ use reqwest::Client as HttpClient;
 use serde_json::json;
 use tracing::info;
 
-use crate::keycloak_config::KeycloakConfig;
+use crate::config::{KeycloakConfig, admin_password};
+use lldap_domain_handlers::kerberos::base_dn_from_env;
+
+struct LldapProviderDns {
+    bind_dn: String,
+    users_dn: String,
+    groups_dn: String,
+}
+
+fn lldap_provider_dns(base_dn: &str, sync_username: &str) -> LldapProviderDns {
+    LldapProviderDns {
+        bind_dn: format!("uid={sync_username},ou=people,{base_dn}"),
+        users_dn: format!("ou=people,{base_dn}"),
+        groups_dn: format!("ou=groups,{base_dn}"),
+    }
+}
 
 #[derive(Clone)]
 pub struct KeycloakClient {
@@ -28,7 +43,7 @@ impl KeycloakClient {
         admin_pass: String,
     ) -> Self {
         let pass = if admin_pass.trim().is_empty() {
-            crate::keycloak_config::get_keycloak_admin_password()
+            admin_password()
         } else {
             admin_pass
         };
@@ -192,7 +207,7 @@ impl KeycloakClient {
         sync_password: &str,
     ) -> Result<String> {
         info!("   → Adding LDAP+Kerberos provider...");
-        let base_dn = format!("dc={}", self.config.realm.replace('.', ",dc="));
+        let dns = lldap_provider_dns(&base_dn_from_env(), sync_username);
         let component_json = json!({
             "name": "lldap-with-kerberos",
             "providerId": "ldap",
@@ -200,10 +215,10 @@ impl KeycloakClient {
             "config": {
                 "vendor": ["other"],
                 "connectionUrl": [lldap_url],
-                "bindDn": [format!("uid={},ou=people,{}", sync_username, base_dn)],
+                "bindDn": [dns.bind_dn],
                 "bindCredential": [sync_password],
-                "usersDn": [format!("ou=people,{}", base_dn)],
-                "groupsDn": [format!("ou=groups,{}", base_dn)],
+                "usersDn": [dns.users_dn],
+                "groupsDn": [dns.groups_dn],
                 "userObjectClasses": ["top, person, inetOrgPerson, posixAccount, ldapPublicKey"],
                 "rdnLDAPAttribute": ["uid"],
                 "uuidLDAPAttribute": ["entryUUID"],
@@ -617,5 +632,22 @@ impl KeycloakClient {
         } else {
             Err(anyhow::anyhow!("Test failed: HTTP {}", resp.status()))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lldap_provider_dns;
+
+    #[test]
+    fn provider_dns_uses_the_lldap_base_dn() {
+        let dns = lldap_provider_dns("dc=gate,dc=test", "syncuser");
+        assert_eq!(dns.bind_dn, "uid=syncuser,ou=people,dc=gate,dc=test");
+        assert_eq!(dns.users_dn, "ou=people,dc=gate,dc=test");
+        assert_eq!(dns.groups_dn, "ou=groups,dc=gate,dc=test");
+        assert!(
+            !dns.users_dn.contains("dc=master"),
+            "must not derive DNs from a Keycloak realm name"
+        );
     }
 }

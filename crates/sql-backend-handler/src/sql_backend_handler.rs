@@ -24,7 +24,7 @@ pub(crate) fn get_repeated_filter<F>(
 pub(crate) fn is_backend_writable_readonly_attribute(name: &str) -> bool {
     matches!(
         name,
-        "ou" | "kerberossync" | "allowedous" | "krb_principal_name"
+        "ou" | lldap_schema::KERBEROS_SYNC | "allowedous" | "krb_principal_name"
     )
 }
 

@@ -1,12 +1,12 @@
 use anyhow::Context as AnyhowContext;
 use juniper::{FieldResult, GraphQLInputObject};
 use lldap_domain::deserialize::deserialize_attribute_value;
-use lldap_domain::public_schema::PublicSchema;
 use lldap_domain::types::GroupId;
 use lldap_domain::types::UserId;
 use lldap_domain_handlers::handler::UserRequestFilter as DomainRequestFilter;
 use lldap_domain_model::model::UserColumn;
-use lldap_ldap::{UserFieldType, get_schema_manager};
+use lldap_ldap::{UserFieldType, map_user_field};
+use lldap_schema::PublicSchema;
 
 #[derive(PartialEq, Eq, Debug, GraphQLInputObject)]
 /// A filter for requests, specifying a boolean expression based on field constraints. Only one of
@@ -37,7 +37,7 @@ impl RequestFilter {
 
                 let attr_name = lldap_domain::types::AttributeName::from(canonical_field);
 
-                match get_schema_manager().map_user_field(&attr_name, schema) {
+                match map_user_field(&attr_name, schema) {
                     UserFieldType::NoMatch => {
                         Err(format!("Unknown request filter: {}", eq.field).into())
                     }

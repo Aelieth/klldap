@@ -48,6 +48,10 @@ lldap_config.toml
 server_key
 screenshot.png
 recipe.json
-lldap_config.toml
 cert.pem
 key.pem
+
+# Local working state, never part of the image
+klldap-data/
+working/
+gate/

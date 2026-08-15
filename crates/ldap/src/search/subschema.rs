@@ -3,29 +3,25 @@ use chrono::Utc;
 use ldap3_proto::{LdapPartialAttribute, LdapSearchResultEntry, proto::LdapOp};
 use std::collections::HashSet;
 
+fn attr_type_to_ldap_syntax(attr: &lldap_schema::AttributeSchema) -> (String, bool, bool) {
+    let (syntax, is_single) = match attr.attribute_type {
+        lldap_schema::AttributeType::String => ("1.3.6.1.4.1.1466.115.121.1.15", !attr.is_list),
+        lldap_schema::AttributeType::Integer => ("1.3.6.1.4.1.1466.115.121.1.27", !attr.is_list),
+        lldap_schema::AttributeType::DateTime => ("1.3.6.1.4.1.1466.115.121.1.24", !attr.is_list),
+        lldap_schema::AttributeType::Avatar => ("1.3.6.1.4.1.1466.115.121.1.28", !attr.is_list),
+    };
+    let name_lower = attr.name.to_ascii_lowercase();
+    let is_operational = attr.is_readonly
+        || matches!(
+            name_lower.as_str(),
+            "creationdate" | "modifieddate" | "passwordmodifieddate" | "uuid" | "entryuuid"
+        );
+    (syntax.to_string(), is_single, is_operational)
+}
+
 pub fn make_ldap_subschema_entry(schema_manager: &SchemaManager, base_dn_str: &str) -> LdapOp {
     let current_time_utc = Utc::now().format("%Y%m%d%H%M%SZ").to_string().into_bytes();
     let full_subschema_dn = format!("cn=Subschema,{}", base_dn_str);
-
-    fn attr_type_to_ldap_syntax(attr: &lldap_schema::AttributeSchema) -> (String, bool, bool) {
-        let (syntax, is_single) = match attr.attribute_type {
-            lldap_schema::AttributeType::String => ("1.3.6.1.4.1.1466.115.121.1.15", !attr.is_list),
-            lldap_schema::AttributeType::Integer => {
-                ("1.3.6.1.4.1.1466.115.121.1.27", !attr.is_list)
-            }
-            lldap_schema::AttributeType::DateTime => {
-                ("1.3.6.1.4.1.1466.115.121.1.24", !attr.is_list)
-            }
-            lldap_schema::AttributeType::Avatar => ("1.3.6.1.4.1.1466.115.121.1.28", !attr.is_list),
-        };
-        let name_lower = attr.name.to_ascii_lowercase();
-        let is_operational = attr.is_readonly
-            || matches!(
-                name_lower.as_str(),
-                "creationdate" | "modifieddate" | "passwordmodifieddate" | "uuid" | "entryuuid"
-            );
-        (syntax.to_string(), is_single, is_operational)
-    }
 
     let mut dynamic_attr_types: Vec<Vec<u8>> = Vec::new();
     let mut seen_attr_oids: HashSet<String> = HashSet::new();

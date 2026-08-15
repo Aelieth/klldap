@@ -4,7 +4,7 @@ use tracing::warn;
 
 const DEFAULT_BASE_DN: &str = "dc=example,dc=com";
 
-fn base_dn_from_env() -> String {
+pub fn base_dn_from_env() -> String {
     env::var("LLDAP_LDAP_BASE_DN").unwrap_or_else(|_| DEFAULT_BASE_DN.to_owned())
 }
 

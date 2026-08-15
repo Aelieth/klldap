@@ -19,6 +19,7 @@ use lldap_domain::{
     types::{Attribute, AttributeType, Email, GroupName, UserId},
 };
 use lldap_domain_handlers::kerberos::kerberos_backend;
+use lldap_schema::{KERBEROS_SYNC, PublicSchema};
 use std::collections::HashMap;
 use tracing::{instrument, warn};
 
@@ -77,8 +78,8 @@ async fn create_user(
         .collect::<LdapResult<_>>()?;
 
     // Default kerberossync = 0 if not provided (matches PublicSchema)
-    if !attributes.contains_key("kerberossync") {
-        attributes.insert("kerberossync".to_string(), b"0".to_vec());
+    if !attributes.contains_key(KERBEROS_SYNC) {
+        attributes.insert(KERBEROS_SYNC.to_string(), b"0".to_vec());
     }
 
     // Set/override ou from DN (full internal form, e.g. "service" or "office\\floor1")
@@ -160,9 +161,9 @@ async fn create_user(
         })?,
     });
 
-    if let Some(ksync_str) = get_attribute("kerberossync").transpose()? {
+    if let Some(ksync_str) = get_attribute(KERBEROS_SYNC).transpose()? {
         new_user_attributes.push(Attribute {
-            name: "kerberossync".into(),
+            name: KERBEROS_SYNC.into(),
             value: deserialize::deserialize_attribute_value(
                 std::slice::from_ref(&ksync_str),
                 AttributeType::Integer,
@@ -175,7 +176,7 @@ async fn create_user(
         });
     } else {
         new_user_attributes.push(Attribute {
-            name: "kerberossync".into(),
+            name: KERBEROS_SYNC.into(),
             value: deserialize::deserialize_attribute_value(
                 &["0".to_string()],
                 AttributeType::Integer,
@@ -197,13 +198,13 @@ async fn create_user(
         "lastname",
         "avatar",
         "ou",
-        "kerberossync",
+        KERBEROS_SYNC,
         "userpassword",
     ];
     let extra_names: Vec<&String> = attributes
         .keys()
         .filter(|name| {
-            let canonical = lldap_domain::public_schema::PublicSchema::shared()
+            let canonical = PublicSchema::shared()
                 .resolve_user_canonical_name(name)
                 .unwrap_or(name.as_str());
             !consumed.contains(&canonical)
@@ -242,8 +243,7 @@ async fn create_user(
         }
     }
 
-    let kerberossync_enabled =
-        lldap_domain::types::kerberos_sync_enabled(&new_user_attributes, "kerberossync");
+    let kerberossync_enabled = lldap_domain::types::kerberos_sync_enabled(&new_user_attributes);
 
     backend_handler
         .create_user(CreateUserRequest {
@@ -372,7 +372,7 @@ mod tests {
         let mut mock = MockTestBackendHandler::new();
 
         mock.expect_get_schema().times(1).returning(|| {
-            let mut schema = lldap_domain::public_schema::PublicSchema::get();
+            let mut schema = PublicSchema::get();
             schema
                 .0
                 .user_attributes

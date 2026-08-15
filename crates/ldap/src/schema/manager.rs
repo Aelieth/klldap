@@ -1,10 +1,9 @@
 //! SchemaManager - For all attribute handling.
 
-use super::definitions::{ExpandedAttributes, LogicalAttr};
+use super::definitions::{ExpandedAttributes, GroupFieldType, LogicalAttr, UserFieldType};
 use super::operational;
-use crate::core::utils::{GroupFieldType, UserFieldType};
-use lldap_domain::public_schema::PublicSchema;
 use lldap_domain::types::AttributeName;
+use lldap_schema::PublicSchema;
 use std::collections::{BTreeMap, HashSet};
 
 #[derive(Clone)]
@@ -175,6 +174,10 @@ impl SchemaManager {
     }
 
     pub fn map_group_field(&self, field: &AttributeName, schema: &PublicSchema) -> GroupFieldType {
+        // The primary key, not an EAV attribute: filter and emit it as the group id.
+        if schema.resolve_group_canonical_name(field.as_str()) == Some("groupid") {
+            return GroupFieldType::GroupId;
+        }
         if let Some((logical, _)) = self.resolve_attribute(field.as_str()) {
             return match logical {
                 LogicalAttr::ObjectClass => GroupFieldType::ObjectClass,

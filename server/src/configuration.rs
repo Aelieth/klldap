@@ -77,25 +77,6 @@ pub struct LdapsOptions {
     pub key_file: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, derive_builder::Builder)]
-#[builder(pattern = "owned")]
-pub struct KeycloakOptions {
-    #[builder(default = r#"String::from("http://keycloak:8080")"#)]
-    pub url: String,
-    #[builder(default = r#"String::from("master")"#)]
-    pub realm: String,
-    #[builder(default = r#"String::from("admin")"#)]
-    pub admin_user: String,
-    #[builder(default = r#"SecUtf8::from("")"#)]
-    pub admin_pass: SecUtf8,
-}
-
-impl std::default::Default for KeycloakOptions {
-    fn default() -> Self {
-        KeycloakOptionsBuilder::default().build().unwrap()
-    }
-}
-
 impl std::default::Default for LdapsOptions {
     fn default() -> Self {
         LdapsOptionsBuilder::default().build().unwrap()
@@ -166,8 +147,6 @@ pub struct Configuration {
     pub smtp_options: MailOptions,
     #[builder(default)]
     pub ldaps_options: LdapsOptions,
-    #[builder(default)]
-    pub keycloak_options: KeycloakOptions,
     #[builder(default = r#"HttpUrl(Url::parse("http://localhost").unwrap())"#)]
     pub http_url: HttpUrl,
     #[debug(skip)]
@@ -640,15 +619,6 @@ impl ConfigOverrider for HealthcheckOpts {
     }
 }
 
-impl ConfigOverrider for KeycloakOptions {
-    fn override_config(&self, config: &mut Configuration) {
-        config.keycloak_options.url = self.url.clone();
-        config.keycloak_options.realm = self.realm.clone();
-        config.keycloak_options.admin_user = self.admin_user.clone();
-        config.keycloak_options.admin_pass = self.admin_pass.clone();
-    }
-}
-
 fn extract_keys(dict: &figment::value::Dict) -> HashSet<String> {
     use figment::value::{Dict, Value};
     fn process_value(value: &Dict, keys: &mut HashSet<String>, path: &mut Vec<String>) {
@@ -680,7 +650,10 @@ fn expected_keys(dict: &figment::value::Dict) -> HashSet<String> {
     // CLI-only values.
     keys.insert("LLDAP_CONFIG_FILE".to_string());
     keys.insert("LLDAP_TEST_EMAIL_TO".to_string());
-    keys.insert("LLDAP_KEYCLOAK_ADMIN_PASS".to_string());
+    keys.insert("LLDAP_KERBEROS_HEALTHCHECK".to_string());
+    // Container knobs read by the entrypoint.
+    keys.insert("LLDAP_UID".to_string());
+    keys.insert("LLDAP_GID".to_string());
     // Alternate spellings from clap.
     keys.insert("LLDAP_SERVER_KEY_FILE".to_string());
     keys.insert("LLDAP_SERVER_KEY_SEED".to_string());
@@ -702,9 +675,11 @@ fn check_for_unexpected_env_variables<P: Provider>(env_variable_provider: P) {
         .data()
         .unwrap()[&Profile::default()],
     );
+    // LLDAP_KERB_* and LLDAP_KEYCLOAK_* belong to the kerberos and keycloak crates.
     extract_keys(&env_variable_provider.data().unwrap()[&Profile::default()])
         .iter()
         .filter(|k| !expected_keys.contains(k.as_str()))
+        .filter(|k| !k.starts_with("LLDAP_KERB_") && !k.starts_with("LLDAP_KEYCLOAK_"))
         .for_each(|k| {
             eprintln!("WARNING: Unknown environment variable: {k}");
         });

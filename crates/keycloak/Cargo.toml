@@ -1,10 +1,9 @@
 [package]
-name = "lldap-kerberos"
-version = "0.2.1"
-description = "MIT Kerberos KDC integration for KLLDAP"
-authors.workspace = true
-documentation.workspace = true
+name = "lldap_keycloak"
+version = "0.1.0"
+description = "Keycloak federation client and settings for KLLDAP"
 edition.workspace = true
+authors.workspace = true
 homepage.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -12,18 +11,11 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
-minijinja = "2.0"
+reqwest = { workspace = true, features = ["json"] }
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 toml = "0.8"
 tracing = { workspace = true }
 
 [dependencies.lldap_domain_handlers]
 path = "../domain-handlers"
-
-[build-dependencies]
-bindgen = { version = "0.69.4", features = ["runtime"] }
-pkg-config = "0.3.30"
-
-[[bin]]
-name = "kerberos_manager"
-path = "src/bin/kerberos_manager.rs"

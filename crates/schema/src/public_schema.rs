@@ -26,6 +26,9 @@ use crate::schema::{AttributeList, AttributeSchema, AttributeType, PosixSettings
 use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
+/// Per-user switch for KDC principal sync; the schema attribute name behind `kerberosSync`.
+pub const KERBEROS_SYNC: &str = "kerberossync";
+
 #[derive(PartialEq, Eq, Debug, Serialize, Deserialize, Clone)]
 pub struct PublicSchema(pub Schema);
 
@@ -79,8 +82,7 @@ impl PublicSchema {
                 .aliases(&["login_shell", "loginShell"]),
 
             // --- Kerberos ---
-            A::generated("kerberossync", Integer)
-                .aliases(&["kerberos_sync", "kerberosSync"]),
+            A::generated(KERBEROS_SYNC, Integer).aliases(&["kerberos_sync", "kerberosSync"]),
             A::hidden("krbprincipalname", String)
                 .aliases(&["krb_principal_name", "krbPrincipalName"]),
 

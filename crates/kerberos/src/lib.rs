@@ -1,26 +1,16 @@
-#![recursion_limit = "256"]
+// Unsafe stays quarantined in ffi.rs (the only place allowed to hold it).
+#![deny(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
+#![warn(clippy::undocumented_unsafe_blocks)]
 use anyhow::{Context, Result};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
-use rand::rngs::OsRng;
-use rsa::pkcs1::EncodeRsaPublicKey;
-use rsa::{Oaep, RsaPrivateKey, RsaPublicKey};
-use sha2::Sha256;
 use std::fs;
 use std::process::Command;
 use tracing::{info, warn};
 
-pub mod keycloak_client;
-pub mod keycloak_config;
 pub mod live;
 pub mod manager;
 pub mod paths;
 
-pub use keycloak_client::KeycloakClient;
-pub use keycloak_config::{
-    KeycloakConfig, KeycloakSuggestedConfig, get_keycloak_admin_password,
-    get_keycloak_suggested_config, load_keycloak_config, save_keycloak_config,
-};
 pub use lldap_domain_handlers::kerberos::{
     derive_domain_from_base_dn, derive_realm_from_base_dn, domain_from_base_dn, principal_name,
 };
@@ -28,29 +18,6 @@ use paths::KerberosPaths;
 
 mod ffi;
 pub(crate) use ffi::Kadm5Handle;
-
-static KEYPAIR: std::sync::LazyLock<(RsaPrivateKey, RsaPublicKey)> =
-    std::sync::LazyLock::new(|| {
-        generate_keypair().expect("Failed to generate RSA keypair for Kerberos password sync")
-    });
-
-fn generate_keypair() -> Result<(RsaPrivateKey, RsaPublicKey)> {
-    let mut rng = OsRng;
-    let bits = 2048;
-    let priv_key = RsaPrivateKey::new(&mut rng, bits).context("Failed to generate private key")?;
-    let pub_key = RsaPublicKey::from(&priv_key);
-    Ok((priv_key, pub_key))
-}
-
-pub fn decrypt_password(encrypted: &str) -> Result<String> {
-    let priv_key = &KEYPAIR.0;
-    let dec_data = STANDARD.decode(encrypted).context("Base64 decode failed")?;
-    let padding = Oaep::new::<Sha256>();
-    let plain_data = priv_key
-        .decrypt(padding, &dec_data)
-        .context("Decryption failed")?;
-    String::from_utf8(plain_data).context("UTF-8 decode failed")
-}
 
 fn admin_handle(realm: &str) -> Result<Kadm5Handle> {
     let keytab = KerberosPaths::from_env().admin_keytab;
@@ -143,14 +110,6 @@ pub fn sync_kerberos_principal(username: &str, plain_password: &str) -> Result<(
         full_principal
     );
     Ok(())
-}
-
-pub fn get_public_key_der_base64() -> String {
-    let der = KEYPAIR
-        .1
-        .to_pkcs1_der()
-        .expect("Failed to encode Kerberos RSA public key as PKCS1 DER");
-    STANDARD.encode(der.as_bytes())
 }
 
 pub fn export_keytab_for_keycloak(hostname_input: &str) -> Result<String> {

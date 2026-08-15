@@ -2,9 +2,11 @@ use crate::{
     compare,
     core::{
         error::{LdapError, LdapResult},
-        utils::{LdapInfo, internal_ou_to_ldap_rdn_chain},
+        utils::LdapInfo,
     },
-    create, delete, modify,
+    create, delete,
+    dn::internal_ou_to_ldap_rdn_chain,
+    modify,
     password::{self, do_password_modification},
     search::{
         is_root_dse_request, is_subschema_entry_request, make_ldap_subschema_entry,
@@ -248,7 +250,7 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
                 let backend = self.backend_handler.unsafe_get_handler();
 
                 let user_filter = LdapFilter::Equality("uid".to_string(), user_id.to_string());
-                let users = crate::core::user::get_user_list(
+                let users = crate::search::get_user_list(
                     self.ldap_info,
                     &user_filter,
                     false,
@@ -262,7 +264,7 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
                 let user_ou = if let Some(uag) = users.first() {
                     crate::attributes::get_user_ou(&uag.user)
                 } else {
-                    crate::core::utils::DEFAULT_PRIMARY_USER_OU.to_string()
+                    crate::dn::DEFAULT_PRIMARY_USER_OU.to_string()
                 };
 
                 let rdn_chain = internal_ou_to_ldap_rdn_chain(&user_ou);

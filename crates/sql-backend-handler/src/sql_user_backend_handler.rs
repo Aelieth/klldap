@@ -21,7 +21,7 @@ use lldap_domain_model::{
     error::{DomainError, Result},
     model::{self, GroupColumn, UserColumn, codec, system_config},
 };
-use lldap_schema::PublicSchema;
+use lldap_schema::{KERBEROS_SYNC, PublicSchema};
 use sea_orm::{
     ActiveModelTrait, ActiveValue, ColumnTrait, DatabaseTransaction, EntityTrait, ModelTrait,
     PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait, Set, TransactionTrait,
@@ -267,7 +267,7 @@ impl SqlBackendHandler {
                 .map(|s| s.name.clone().into())
                 .unwrap_or_else(|| attribute.name.clone());
 
-            if attribute.name.as_str() == "kerberossync" {
+            if attribute.name.as_str() == KERBEROS_SYNC {
                 kerb_sync_enabled = match &attribute.value {
                     // Frontend (user_details_form + kerberos_switch) sends String "0"/"1"
                     AttributeValue::String(Cardinality::Singleton(s)) => match s.trim() {
@@ -827,7 +827,7 @@ impl SqlBackendHandler {
     /// true sets `-allow_tix`; false restores `+allow_tix`.
     async fn reflect_kerberos_disabled(&self, user_id: &UserId, disabled: bool) {
         let synced = match self.get_user_details(user_id).await {
-            Ok(u) => lldap_domain::types::kerberos_sync_enabled(&u.attributes, "kerberossync"),
+            Ok(u) => lldap_domain::types::kerberos_sync_enabled(&u.attributes),
             Err(e) => {
                 tracing::warn!(
                     "Kerberos disable-sync: could not load user {} ({}); skipping",

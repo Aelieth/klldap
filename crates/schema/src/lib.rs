@@ -5,5 +5,5 @@ pub mod schema;
 #[cfg(test)]
 mod tests;
 
-pub use public_schema::PublicSchema;
+pub use public_schema::{KERBEROS_SYNC, PublicSchema};
 pub use schema::{AttributeList, AttributeSchema, AttributeType, PosixSettings, Schema};

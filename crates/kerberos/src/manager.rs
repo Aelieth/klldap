@@ -159,28 +159,12 @@ pub fn admin_principal(config: &KerberosConfig) -> String {
     format!("admin/admin@{}", config.realm_name.to_uppercase())
 }
 
-/// Render krb5.conf, kdc.conf, and kadm5.acl; copy the Keycloak config on first run.
+/// Render krb5.conf, kdc.conf, and kadm5.acl.
 pub fn render_configs(config: &KerberosConfig, domain: &str, paths: &KerberosPaths) -> Result<()> {
     fs::create_dir_all(&paths.kdc_dir).context("Failed to create krb5kdc dir")?;
     render_template(&paths.krb5_template, &paths.krb5_conf, config, domain)?;
     render_template(&paths.kdc_template, &paths.kdc_conf, config, domain)?;
-    ensure_kadm5_acl(&paths.kadm5_acl, &paths.kadm5_acl_template, config, domain)?;
-
-    if !paths.keycloak_config.exists() {
-        println!("Keycloak config not found. Copying template...");
-        fs::copy(&paths.keycloak_template, &paths.keycloak_config)
-            .context("Failed to copy keycloak_config.template.toml")?;
-        Command::new("sudo")
-            .arg("chown")
-            .arg("lldap:lldap")
-            .arg(&paths.keycloak_config)
-            .status()
-            .context("Failed to chown keycloak_config.toml")?;
-        println!("Created default keycloak_config.toml in /data");
-    } else {
-        println!("Existing keycloak_config.toml found — skipping template copy.");
-    }
-    Ok(())
+    ensure_kadm5_acl(&paths.kadm5_acl, &paths.kadm5_acl_template, config, domain)
 }
 
 /// Create the KDC database if it does not exist (password-less: random master password,

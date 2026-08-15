@@ -21,7 +21,7 @@ use lldap_access_control::{
 };
 use lldap_domain::types::{GroupId, UserId};
 use lldap_domain_handlers::handler::{BackendHandler, ReadSchemaBackendHandler};
-use lldap_kerberos::get_keycloak_suggested_config;
+use lldap_keycloak::{KeycloakConfig, SUGGESTED_HOSTNAME};
 use lldap_opaque_handler::OpaqueHandler;
 use lldap_schema::PublicSchema;
 use std::sync::Arc;
@@ -208,9 +208,8 @@ impl<Handler: FullHandler + OpaqueHandler> Query<Handler> {
     }
 
     fn kerberos_info(&self, _context: &Context<Handler>) -> FieldResult<KerberosInfo> {
-        let public_key_der_base64 = lldap_kerberos::get_public_key_der_base64();
         Ok(KerberosInfo {
-            public_key_der_base64: Some(public_key_der_base64),
+            public_key_der_base64: Some(crate::kerberos_transport::public_key_der_base64()),
         })
     }
 
@@ -225,12 +224,12 @@ impl<Handler: FullHandler + OpaqueHandler> Query<Handler> {
                 "Unauthorized to read Keycloak config",
             ))?;
 
-        let cfg = get_keycloak_suggested_config();
+        let cfg = KeycloakConfig::suggested();
         Ok(KeycloakSuggestedConfig {
             url: cfg.url,
             realm: cfg.realm,
-            admin_username: cfg.admin_username,
-            keycloak_hostname: cfg.keycloak_hostname,
+            admin_username: cfg.admin_user,
+            keycloak_hostname: SUGGESTED_HOSTNAME.to_owned(),
         })
     }
 
@@ -243,13 +242,12 @@ impl<Handler: FullHandler + OpaqueHandler> Query<Handler> {
                 "Unauthorized to read Keycloak config",
             ))?;
 
-        let cfg = lldap_kerberos::load_keycloak_config().unwrap_or_else(|_| {
-            lldap_kerberos::KeycloakConfig {
-                url: "http://keycloak:8080".to_string(),
-                realm: "master".to_string(),
-                admin_user: "admin".to_string(),
-            }
-        });
+        let cfg = KeycloakConfig::load().map_err(|e| {
+            FieldError::new(
+                format!("Could not read the Keycloak config: {e:#}"),
+                juniper::Value::null(),
+            )
+        })?;
 
         Ok(KeycloakConfigResponse {
             url: cfg.url,
@@ -336,14 +334,13 @@ mod tests {
         execute, graphql_value,
     };
     use lldap_auth::access_control::{Permission, ValidationResults};
-    use lldap_domain::schema::AttributeSchema as DomainAttributeSchema;
     use lldap_domain::types::{Attribute as DomainAttribute, GroupDetails, User as DomainUser};
-    use lldap_domain::{
-        schema::{AttributeList, Schema},
-        types::{AttributeName, AttributeType},
-    };
+    use lldap_domain::types::{AttributeName, AttributeType};
     use lldap_domain_model::model::UserColumn;
-    use lldap_schema::schema::PosixSettings as DomainPosixSettings;
+    use lldap_schema::{
+        AttributeList, AttributeSchema as DomainAttributeSchema,
+        PosixSettings as DomainPosixSettings, Schema,
+    };
     use lldap_test_utils::{MockTestBackendHandler, setup_default_schema};
     use mockall::predicate::eq;
     use pretty_assertions::assert_eq;

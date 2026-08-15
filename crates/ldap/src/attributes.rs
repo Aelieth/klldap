@@ -3,15 +3,16 @@
 //! All user/group attribute resolution, EntryDn construction, memberOf,
 //! operational attributes, and search result entry building lives here.
 
-use crate::core::utils::{DEFAULT_PRIMARY_GROUP_OU, DEFAULT_PRIMARY_USER_OU};
-use crate::dn::{build_group_dn, build_user_dn};
+use crate::core::utils::is_ignored_attribute;
+use crate::dn::{DEFAULT_PRIMARY_GROUP_OU, DEFAULT_PRIMARY_USER_OU, build_group_dn, build_user_dn};
+use crate::schema::{ExpandedAttributes, GroupFieldType, UserFieldType};
 use chrono::{NaiveDateTime, TimeZone};
 use ldap3_proto::LdapPartialAttribute;
 use ldap3_proto::LdapSearchResultEntry;
-use lldap_domain::{
-    public_schema::PublicSchema,
-    types::{Attribute, AttributeName, AttributeValue, Cardinality, Group, GroupDetails, User},
+use lldap_domain::types::{
+    Attribute, AttributeName, AttributeValue, Cardinality, Group, GroupDetails, User,
 };
+use lldap_schema::PublicSchema;
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
@@ -215,18 +216,16 @@ pub fn get_user_attribute(
     let attribute_values = match crate::schema::get_schema_manager()
         .map_user_field(&attribute, schema)
     {
-        crate::core::utils::UserFieldType::ObjectClass => {
-            get_default_user_object_classes_bytes(schema)
-        }
-        crate::core::utils::UserFieldType::Dn => return None,
-        crate::core::utils::UserFieldType::EntryDn => {
+        UserFieldType::ObjectClass => get_default_user_object_classes_bytes(schema),
+        UserFieldType::Dn => return None,
+        UserFieldType::EntryDn => {
             let internal_ou = get_user_ou(user);
             vec![build_user_dn(&user.user_id, &internal_ou, base_dn_str).into_bytes()]
         }
-        crate::core::utils::UserFieldType::EntryUuid => {
+        UserFieldType::EntryUuid => {
             vec![user.uuid.to_string().into_bytes()]
         }
-        crate::core::utils::UserFieldType::MemberOf => groups
+        UserFieldType::MemberOf => groups
             .into_iter()
             .flatten()
             .map(|group| {
@@ -248,56 +247,40 @@ pub fn get_user_attribute(
                 build_group_dn(&group.display_name, &group_ou, base_dn_str).into_bytes()
             })
             .collect(),
-        crate::core::utils::UserFieldType::PrimaryField(
-            lldap_domain_model::model::UserColumn::UserId,
-        ) => {
+        UserFieldType::PrimaryField(lldap_domain_model::model::UserColumn::UserId) => {
             vec![user.user_id.to_string().into_bytes()]
         }
-        crate::core::utils::UserFieldType::PrimaryField(
-            lldap_domain_model::model::UserColumn::Email,
-        ) => {
+        UserFieldType::PrimaryField(lldap_domain_model::model::UserColumn::Email) => {
             vec![user.email.to_string().into_bytes()]
         }
-        crate::core::utils::UserFieldType::PrimaryField(
+        UserFieldType::PrimaryField(
             lldap_domain_model::model::UserColumn::LowercaseEmail
             | lldap_domain_model::model::UserColumn::PasswordHash
             | lldap_domain_model::model::UserColumn::TotpSecret
             | lldap_domain_model::model::UserColumn::MfaType,
         ) => panic!("Should not get here"),
-        crate::core::utils::UserFieldType::PrimaryField(
-            lldap_domain_model::model::UserColumn::Uuid,
-        ) => {
+        UserFieldType::PrimaryField(lldap_domain_model::model::UserColumn::Uuid) => {
             vec![user.uuid.to_string().into_bytes()]
         }
-        crate::core::utils::UserFieldType::PrimaryField(
-            lldap_domain_model::model::UserColumn::DisplayName,
-        ) => {
+        UserFieldType::PrimaryField(lldap_domain_model::model::UserColumn::DisplayName) => {
             vec![user.display_name.clone()?.into_bytes()]
         }
-        crate::core::utils::UserFieldType::PrimaryField(
-            lldap_domain_model::model::UserColumn::CreationDate,
-        ) => {
+        UserFieldType::PrimaryField(lldap_domain_model::model::UserColumn::CreationDate) => {
             vec![to_generalized_time(&user.creation_date)]
         }
-        crate::core::utils::UserFieldType::PrimaryField(
-            lldap_domain_model::model::UserColumn::ModifiedDate,
-        ) => {
+        UserFieldType::PrimaryField(lldap_domain_model::model::UserColumn::ModifiedDate) => {
             vec![to_generalized_time(&user.modified_date)]
         }
-        crate::core::utils::UserFieldType::PrimaryField(
+        UserFieldType::PrimaryField(
             lldap_domain_model::model::UserColumn::PasswordModifiedDate,
         ) => {
             vec![to_generalized_time(&user.password_modified_date)]
         }
-        crate::core::utils::UserFieldType::PrimaryField(
-            lldap_domain_model::model::UserColumn::KrbPrincipalName,
-        ) => {
+        UserFieldType::PrimaryField(lldap_domain_model::model::UserColumn::KrbPrincipalName) => {
             vec![user.krb_principal_name.clone()?.into_bytes()]
         }
-        crate::core::utils::UserFieldType::Attribute(attr, _, _) => {
-            get_custom_attribute(&user.attributes, &attr)?
-        }
-        crate::core::utils::UserFieldType::NoMatch => match attribute.as_str() {
+        UserFieldType::Attribute(attr, _, _) => get_custom_attribute(&user.attributes, &attr)?,
+        UserFieldType::NoMatch => match attribute.as_str() {
             "1.1" => return None,
             "+" => return None,
             "*" => panic!("Matched {attribute}, * should have been expanded"),
@@ -323,7 +306,7 @@ pub fn get_user_attribute(
                 }
             }
             _ => {
-                if crate::core::utils::is_ignored_attribute(&attribute, ignored_user_attributes) {
+                if is_ignored_attribute(&attribute, ignored_user_attributes) {
                     return None;
                 }
                 let is_unknown = crate::schema::get_schema_manager()
@@ -364,28 +347,26 @@ pub fn get_group_attribute(
     let attribute_values = match crate::schema::get_schema_manager()
         .map_group_field(attribute, schema)
     {
-        crate::core::utils::GroupFieldType::ObjectClass => {
-            get_default_group_object_classes_bytes(schema)
-        }
-        crate::core::utils::GroupFieldType::Dn => return None,
-        crate::core::utils::GroupFieldType::EntryDn => {
+        GroupFieldType::ObjectClass => get_default_group_object_classes_bytes(schema),
+        GroupFieldType::Dn => return None,
+        GroupFieldType::EntryDn => {
             let internal_ou = get_group_ou(group);
             vec![build_group_dn(&group.display_name, &internal_ou, base_dn_str).into_bytes()]
         }
-        crate::core::utils::GroupFieldType::EntryUuid => {
+        GroupFieldType::EntryUuid => {
             vec![group.uuid.to_string().into_bytes()]
         }
-        crate::core::utils::GroupFieldType::GroupId => vec![group.id.0.to_string().into_bytes()],
-        crate::core::utils::GroupFieldType::DisplayName => {
+        GroupFieldType::GroupId => vec![group.id.0.to_string().into_bytes()],
+        GroupFieldType::DisplayName => {
             vec![group.display_name.to_string().into_bytes()]
         }
-        crate::core::utils::GroupFieldType::CreationDate => {
+        GroupFieldType::CreationDate => {
             vec![to_generalized_time(&group.creation_date)]
         }
-        crate::core::utils::GroupFieldType::ModifiedDate => {
+        GroupFieldType::ModifiedDate => {
             vec![to_generalized_time(&group.modified_date)]
         }
-        crate::core::utils::GroupFieldType::Member => {
+        GroupFieldType::Member => {
             let members: std::collections::BTreeSet<_> = group
                 .users
                 .iter()
@@ -399,7 +380,7 @@ pub fn get_group_attribute(
                 .collect();
             members.into_iter().map(|s| s.into_bytes()).collect()
         }
-        crate::core::utils::GroupFieldType::UniqueMember => {
+        GroupFieldType::UniqueMember => {
             // uniqueMember is the standard attribute for groupOfUniqueNames (RFC 4519)
             // Use the exact same logic as Member
             let members: std::collections::BTreeSet<_> = group
@@ -415,7 +396,7 @@ pub fn get_group_attribute(
                 .collect();
             members.into_iter().map(|s| s.into_bytes()).collect()
         }
-        crate::core::utils::GroupFieldType::MemberUid => {
+        GroupFieldType::MemberUid => {
             // RFC 2307 posixGroup membership: bare login names (SSSD's default rfc2307 group member).
             let members: std::collections::BTreeSet<_> = group
                 .users
@@ -430,22 +411,20 @@ pub fn get_group_attribute(
                 .collect();
             members.into_iter().map(|s| s.into_bytes()).collect()
         }
-        crate::core::utils::GroupFieldType::MemberOf => {
+        GroupFieldType::MemberOf => {
             // memberOf is a user operational/virtual attribute (groups a user belongs to).
             // For group entries we never emit it; use "member" / "uniqueMember" instead.
             // (This prevents the filter alias from leaking into result attributes.)
             return None;
         }
-        crate::core::utils::GroupFieldType::Uuid => vec![group.uuid.to_string().into_bytes()],
-        crate::core::utils::GroupFieldType::Attribute(attr, _, _) => {
-            get_custom_attribute(&group.attributes, &attr)?
-        }
-        crate::core::utils::GroupFieldType::NoMatch => match attribute.as_str() {
+        GroupFieldType::Uuid => vec![group.uuid.to_string().into_bytes()],
+        GroupFieldType::Attribute(attr, _, _) => get_custom_attribute(&group.attributes, &attr)?,
+        GroupFieldType::NoMatch => match attribute.as_str() {
             "1.1" => return None,
             "+" => return None,
             "*" => panic!("Matched {attribute}, * should have been expanded"),
             _ => {
-                if crate::core::utils::is_ignored_attribute(attribute, ignored_group_attributes) {
+                if is_ignored_attribute(attribute, ignored_group_attributes) {
                     return None;
                 }
                 let is_unknown = crate::schema::get_schema_manager()
@@ -478,7 +457,7 @@ pub fn get_group_attribute(
 pub fn make_ldap_search_user_result_entry(
     user: User,
     base_dn_str: &str,
-    mut expanded_attributes: crate::core::utils::ExpandedAttributes,
+    mut expanded_attributes: ExpandedAttributes,
     groups: Option<&[GroupDetails]>,
     ignored_user_attributes: &[AttributeName],
     schema: &PublicSchema,
@@ -536,7 +515,7 @@ pub fn make_ldap_search_user_result_entry(
 pub fn make_ldap_search_group_result_entry(
     group: Group,
     base_dn_str: &str,
-    mut expanded_attributes: crate::core::utils::ExpandedAttributes,
+    mut expanded_attributes: ExpandedAttributes,
     user_filter: &Option<lldap_domain::types::UserId>,
     ignored_group_attributes: &[AttributeName],
     schema: &PublicSchema,
@@ -596,9 +575,32 @@ pub fn make_ldap_search_group_result_entry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::utils::ExpandedAttributes;
     use lldap_domain::types::UserId;
     use std::collections::{BTreeMap, HashSet};
+
+    #[test]
+    fn default_object_classes_include_the_hub_extras() {
+        let users: Vec<String> = get_default_user_object_classes()
+            .into_iter()
+            .map(|c| c.to_string())
+            .collect();
+        for class in [
+            "top",
+            "person",
+            "inetOrgPerson",
+            "posixAccount",
+            "ldapPublicKey",
+        ] {
+            assert!(users.contains(&class.to_string()), "{class}");
+        }
+        let groups: Vec<String> = get_default_group_object_classes()
+            .into_iter()
+            .map(|c| c.to_string())
+            .collect();
+        for class in ["groupOfUniqueNames", "groupOfNames", "posixGroup"] {
+            assert!(groups.contains(&class.to_string()), "{class}");
+        }
+    }
 
     #[test]
     fn cached_schema_names_include_canonical_names_and_aliases() {
@@ -806,6 +808,12 @@ mod tests {
             &[],
             schema,
         )
+    }
+
+    #[test]
+    fn group_entry_emits_the_primary_id_as_groupid() {
+        let entry = group_entry(&["groupid"]);
+        assert_eq!(atype_vals(&entry, "groupid"), Some(&vec![b"1".to_vec()]));
     }
 
     fn atype_vals<'a>(entry: &'a LdapSearchResultEntry, atype: &str) -> Option<&'a Vec<Vec<u8>>> {

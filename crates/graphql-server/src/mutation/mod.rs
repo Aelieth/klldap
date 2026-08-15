@@ -25,7 +25,7 @@ use lldap_domain::{
 };
 use lldap_domain_handlers::handler::{BackendHandler, ReadSchemaBackendHandler, UserRequestFilter};
 use lldap_domain_handlers::kerberos::kerberos_backend;
-use lldap_kerberos::decrypt_password;
+use lldap_keycloak::{KeycloakClient, KeycloakConfig};
 use lldap_opaque_handler::OpaqueHandler;
 use lldap_schema::schema::AttributeList;
 use lldap_validation::attributes::{ALLOWED_CHARACTERS_DESCRIPTION, validate_attribute_name};
@@ -246,8 +246,7 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             .get_user_details(&target_user_id)
             .await
             .context("Failed to fetch user for Kerberos sync check")?;
-        let sync_enabled =
-            lldap_domain::types::kerberos_sync_enabled(&user.attributes, "kerberossync");
+        let sync_enabled = lldap_domain::types::kerberos_sync_enabled(&user.attributes);
 
         // Real Kerberos sync
         if let Err(e) = kerberos_backend().sync_if_enabled(sync_enabled, &user_id, &password) {
@@ -1135,12 +1134,13 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             .get_writeable_handler(target_user_id.clone())
             .ok_or_else(field_error_callback(&span, "Unauthorized Kerberos sync"))?;
 
-        let plain_password = decrypt_password(&encrypted_password).map_err(|e| {
-            FieldError::new(
-                "Kerberos password decryption failed",
-                graphql_value!({ "details": (e.to_string()) }),
-            )
-        })?;
+        let plain_password = crate::kerberos_transport::decrypt_password(&encrypted_password)
+            .map_err(|e| {
+                FieldError::new(
+                    "Kerberos password decryption failed",
+                    graphql_value!({ "details": (e.to_string()) }),
+                )
+            })?;
 
         let user = handler
             .get_user_details(&target_user_id)
@@ -1152,8 +1152,7 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
                 )
             })?;
 
-        let sync_enabled =
-            lldap_domain::types::kerberos_sync_enabled(&user.attributes, "kerberossync");
+        let sync_enabled = lldap_domain::types::kerberos_sync_enabled(&user.attributes);
 
         if sync_enabled {
             kerberos_backend()
@@ -1235,7 +1234,7 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
                 "Unauthorized Keycloak connection test",
             ))?;
 
-        let client = lldap_kerberos::KeycloakClient::from_test_input(
+        let client = KeycloakClient::from_test_input(
             input.url,
             input.realm,
             input.admin_user,
@@ -1263,16 +1262,19 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
                 "Unauthorized Keycloak config change",
             ))?;
 
-        let config = lldap_kerberos::KeycloakConfig {
+        let config = KeycloakConfig {
             url: input.url,
             realm: input.realm,
             admin_user: input.admin_user,
         };
 
-        match lldap_kerberos::save_keycloak_config(&config) {
-            Ok(_) => Ok(SaveKeycloakConfigResponse {
+        match config.save() {
+            Ok(path) => Ok(SaveKeycloakConfigResponse {
                 ok: true,
-                message: "✅ Keycloak settings saved to /data/keycloak_config.toml (password remains in-memory/env only)".to_string(),
+                message: format!(
+                    "✅ Keycloak settings saved to {} (password remains in-memory/env only)",
+                    path.display()
+                ),
             }),
             Err(e) => Ok(SaveKeycloakConfigResponse {
                 ok: false,
@@ -1293,7 +1295,7 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
                 "Unauthorized Keycloak realm push",
             ))?;
 
-        let client = lldap_kerberos::KeycloakClient::from_test_input(
+        let client = KeycloakClient::from_test_input(
             input.url,
             input.realm,
             input.admin_user,

@@ -34,6 +34,15 @@
   `LLDAP_KERB_KDC_DIR`, `LLDAP_KERB_KDC_PORT`, ...); unset means the container layout
   is unchanged. The Kerberos FFI is now exercised against a throwaway KDC in CI
   (`make test-kdc`).
+- Keycloak federation settings have a single owner: `/data/keycloak_config.toml`
+  (path override `LLDAP_KEYCLOAK_CONFIG`), written from the Federation tab; the admin
+  password stays in `LLDAP_KEYCLOAK_ADMIN_PASS`. The file is no longer pre-created at boot
+  (derived defaults are shown until the first save) and the unused `[keycloak_options]`
+  server config block is gone. Boot logs no longer warn about `LLDAP_UID`/`LLDAP_GID`
+  or `LLDAP_KERB_*` as unknown variables.
+- LDAP group entries expose `groupid` again and `(groupid=N)` filters match on the group
+  id, as in upstream LLDAP. The Keycloak realm push now builds the LDAP provider's
+  `usersDn`/`groupsDn`/`bindDn` from LLDAP's base DN instead of the Keycloak realm name.
 
 ## [0.7.2] 2026-06-16
 

@@ -2,14 +2,19 @@ pub mod definitions;
 pub mod manager;
 pub mod operational;
 
-pub use definitions::{ExpandedAttributes, GroupFieldType, LogicalAttr, UserFieldType};
+pub use definitions::{ExpandedAttributes, GroupFieldType, UserFieldType};
+use lldap_domain::types::AttributeName;
+use lldap_schema::PublicSchema;
 pub use manager::SchemaManager;
 use std::sync::LazyLock;
 
 static SCHEMA_MANAGER: LazyLock<SchemaManager> =
-    LazyLock::new(|| SchemaManager::new(lldap_domain::public_schema::PublicSchema::shared()));
+    LazyLock::new(|| SchemaManager::new(PublicSchema::shared()));
 
-/// Returns the shared SchemaManager built from the static PublicSchema.
 pub fn get_schema_manager() -> &'static SchemaManager {
     &SCHEMA_MANAGER
+}
+
+pub fn map_user_field(field: &AttributeName, schema: &PublicSchema) -> UserFieldType {
+    get_schema_manager().map_user_field(field, schema)
 }

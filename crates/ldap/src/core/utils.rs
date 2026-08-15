@@ -2,15 +2,6 @@ use crate::core::error::LdapResult;
 use itertools::join;
 use lldap_domain::types::AttributeName;
 
-// Re-export the constants and DN helpers that are still widely used
-pub use crate::dn::{
-    DEFAULT_PRIMARY_GROUP_OU, DEFAULT_PRIMARY_USER_OU, get_user_id_from_distinguished_name,
-    internal_ou_to_ldap_rdn_chain,
-};
-
-// Re-export FieldType enums from schema (single source of truth)
-pub use crate::schema::definitions::{ExpandedAttributes, GroupFieldType, UserFieldType};
-
 /// LdapInfo — shared configuration for the LDAP layer (base DN + ignored attributes).
 pub struct LdapInfo {
     pub base_dn: Vec<(String, String)>,
@@ -144,12 +135,5 @@ mod utils_tests {
         assert!(LdapInfo::new("dc=example,,dc=com", vec![], vec![]).is_err());
         // Too many =
         assert!(LdapInfo::new("dc=example=foo,dc=com", vec![], vec![]).is_err());
-    }
-
-    #[test]
-    fn ldap_info_reexports_are_available() {
-        // Just ensure the pub use doesn't break compilation / visibility
-        let _ = crate::core::utils::DEFAULT_PRIMARY_USER_OU;
-        let _ = crate::core::utils::DEFAULT_PRIMARY_GROUP_OU;
     }
 }

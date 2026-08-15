@@ -589,23 +589,13 @@ impl From<&GroupId> for Value {
     }
 }
 
-/// Shared kerberossync detection: Integer(1) or the string forms "1"/"true" enable sync.
-/// `name_or_alias` is resolved through PublicSchema so `kerberos_sync` / `kerberosSync` match.
-pub fn kerberos_sync_enabled(attrs: &[Attribute], name_or_alias: &str) -> bool {
-    let schema_attr = crate::public_schema::PublicSchema::shared()
-        .user_attributes()
-        .get_by_name_or_alias(name_or_alias);
+/// Integer(1) or the string forms "1"/"true" enable sync; aliases resolve through the schema.
+pub fn kerberos_sync_enabled(attrs: &[Attribute]) -> bool {
+    let schema = lldap_schema::PublicSchema::shared();
     attrs
         .iter()
-        .find(|a| match schema_attr {
-            Some(schema_attr) => {
-                a.name.as_str() == schema_attr.name
-                    || schema_attr
-                        .aliases
-                        .iter()
-                        .any(|alias| alias.eq_ignore_ascii_case(a.name.as_str()))
-            }
-            None => a.name.as_str() == name_or_alias,
+        .find(|a| {
+            schema.resolve_user_canonical_name(a.name.as_str()) == Some(lldap_schema::KERBEROS_SYNC)
         })
         .map(|a| match &a.value {
             AttributeValue::Integer(Cardinality::Singleton(i)) => *i == 1,

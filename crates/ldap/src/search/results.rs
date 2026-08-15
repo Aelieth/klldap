@@ -3,8 +3,8 @@
 use crate::attributes::{make_ldap_search_group_result_entry, make_ldap_search_user_result_entry};
 use crate::core::utils::LdapInfo;
 use ldap3_proto::proto::LdapOp;
-use lldap_domain::public_schema::PublicSchema;
 use lldap_domain::types::{Group, UserAndGroups, UserId};
+use lldap_schema::PublicSchema;
 
 pub fn convert_users_to_ldap_op<'a>(
     users: Vec<UserAndGroups>,

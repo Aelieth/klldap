@@ -15,7 +15,9 @@ base64 = { workspace = true }
 chrono = { workspace = true }
 juniper = { workspace = true }
 rand = { workspace = true }
+rsa = "0.9.6"
 serde_json = { workspace = true }
+sha2 = "0.10"
 tracing = { workspace = true }
 urlencoding = { workspace = true }
 
@@ -50,8 +52,8 @@ path = "../sql-backend-handler"
 [dependencies.lldap_validation]
 path = "../validation"
 
-[dependencies.lldap-kerberos]
-path = "../kerberos"
+[dependencies.lldap_keycloak]
+path = "../keycloak"
 
 [dependencies.serde]
 workspace = true

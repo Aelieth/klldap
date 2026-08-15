@@ -1,8 +1,9 @@
 use crate::{
     core::{
         error::{LdapError, LdapResult},
-        utils::{LdapInfo, get_user_id_from_distinguished_name},
+        utils::LdapInfo,
     },
+    dn::get_user_id_from_distinguished_name,
     handler::make_extended_response,
 };
 use anyhow::Result;
@@ -150,10 +151,8 @@ pub(crate) async fn do_password_modification<Handler: BackendHandler + OpaqueHan
                                     message: format!("Failed to fetch user for Kerberos sync: {e}"),
                                 })?;
 
-                        let sync_enabled = lldap_domain::types::kerberos_sync_enabled(
-                            &user_details.attributes,
-                            "kerberossync",
-                        );
+                        let sync_enabled =
+                            lldap_domain::types::kerberos_sync_enabled(&user_details.attributes);
 
                         if sync_enabled {
                             if let Err(e) =

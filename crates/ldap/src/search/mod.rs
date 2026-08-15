@@ -8,6 +8,7 @@ pub mod scope;
 pub mod subschema;
 
 pub use handler::do_search;
+pub(crate) use handler::get_user_list;
 pub use results::{convert_groups_to_ldap_op, convert_users_to_ldap_op};
 pub use root_dse::{is_root_dse_request, is_subschema_entry_request, root_dse_response};
 pub use scope::{build_ou_entries, get_search_scope, make_ou_entry};

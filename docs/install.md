@@ -104,6 +104,6 @@ starting point. Please report what you find.
 
 ### Migrating from LLDAP
 
-Stock LLDAP 0.6.x databases (schema 11 or older) can move to KLLDAP with data and
-passwords intact: [migration_guides/v0.7-from-lldap.md](migration_guides/v0.7-from-lldap.md).
+Stock LLDAP 0.6.x databases (schema 11 or older) can move to KLLDAP with their
+data; users set a new password: [migration_guides/v0.7-from-lldap.md](migration_guides/v0.7-from-lldap.md).
 Moving between database backends is in [database_migration.md](database_migration.md).

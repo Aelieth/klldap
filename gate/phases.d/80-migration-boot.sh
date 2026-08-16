@@ -1,8 +1,8 @@
 # shellcheck shell=bash
-# Phase: migration boot — boot the image against an existing /data + KDC volume set
-# (the 03 contract). SKIPs unless the fixture env is provided; `test-klldap/` next to
-# the repo is the local reference set. The fixture dirs are copied first: booting
-# migrates the database in place.
+# Phase: migration boot — adopt an existing /data + KDC volume set the way the migration
+# guide says (force flags once, then a normal boot). SKIPs unless the fixture env is
+# provided; `test-klldap/` next to the repo is the local reference set. The fixture dirs
+# are copied first: booting migrates the database in place.
 #
 # Required env: GATE_FIXTURE_DATA, GATE_FIXTURE_KDC, GATE_FIXTURE_BASE_DN
 # Optional:     GATE_FIXTURE_ADMIN_PASS (enables the login assertion)
@@ -18,6 +18,28 @@ else
     mkdir -p "$WORK"
     cp -a "$GATE_FIXTURE_DATA" "$WORK/data"
     cp -a "$GATE_FIXTURE_KDC" "$WORK/krb5kdc"
+
+    # An LLDAP database is adopted under a fresh key: one run with the force flags (the
+    # server exits after applying them; the entrypoint follows), then a normal boot.
+    force_env=(
+        -e LLDAP_FORCE_UPDATE_PRIVATE_KEY=true
+        -e LLDAP_FORCE_LDAP_USER_PASS_RESET=true
+    )
+    if [ -n "${GATE_FIXTURE_ADMIN_PASS:-}" ]; then
+        force_env+=(-e LLDAP_LDAP_USER_PASS="$GATE_FIXTURE_ADMIN_PASS")
+    fi
+    if timeout 120 docker run --rm --name "$MIG_CONTAINER-prep" \
+        -v "$WORK/data:/data" -v "$WORK/krb5kdc:/var/kerberos/krb5kdc" \
+        -e LLDAP_JWT_SECRET="$JWT_SECRET" \
+        -e LLDAP_LDAP_BASE_DN="$GATE_FIXTURE_BASE_DN" \
+        "${force_env[@]}" \
+        "$GATE_IMAGE" >"$D/force-reset.log" 2>&1; then
+        p_bad "force-reset boot did not exit (it must stop after applying the flags)"
+    elif grep -q "Restart the server without" "$D/force-reset.log"; then
+        p_ok "force-reset boot applied the flags and exited"
+    else
+        p_bad "force-reset boot failed for another reason (see force-reset.log)"
+    fi
 
     docker run -d --name "$MIG_CONTAINER" \
         --network "$NET" \

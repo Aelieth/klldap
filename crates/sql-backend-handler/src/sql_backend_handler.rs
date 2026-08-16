@@ -35,23 +35,13 @@ pub(crate) fn attribute_value_to_db_bytes(value: &AttributeValue) -> Vec<u8> {
 #[derive(Clone)]
 pub struct SqlBackendHandler {
     pub(crate) opaque_setup: ServerSetup,
-    pub(crate) legacy_opaque_setup: Option<lldap_opaque_legacy::LegacyServerSetup>,
     pub(crate) sql_pool: DbConnection,
 }
 
 impl SqlBackendHandler {
     pub fn new(opaque_setup: ServerSetup, sql_pool: DbConnection) -> Self {
-        Self::new_with_legacy(opaque_setup, None, sql_pool)
-    }
-
-    pub fn new_with_legacy(
-        opaque_setup: ServerSetup,
-        legacy_opaque_setup: Option<lldap_opaque_legacy::LegacyServerSetup>,
-        sql_pool: DbConnection,
-    ) -> Self {
         SqlBackendHandler {
             opaque_setup,
-            legacy_opaque_setup,
             sql_pool,
         }
     }

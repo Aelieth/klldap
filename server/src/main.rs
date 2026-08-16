@@ -165,11 +165,8 @@ async fn set_up_server(config: Configuration) -> Result<(ServerBuilder, Database
             return Err(anyhow!("The private key encoding the passwords has changed since last successful startup. Changing the private key will invalidate all existing passwords. If you want to proceed, restart the server with the CLI arg --force-update-private-key=true or the env variable LLDAP_FORCE_UPDATE_PRIVATE_KEY=true. You probably also want --force-ldap-user-pass-reset / LLDAP_FORCE_LDAP_USER_PASS_RESET=true to reset the admin password to the value in the configuration.").context(e));
         }
     }
-    let backend_handler = SqlBackendHandler::new_with_legacy(
-        config.get_server_setup().clone(),
-        config.get_legacy_server_setup().cloned(),
-        sql_pool.clone(),
-    );
+    let backend_handler =
+        SqlBackendHandler::new(config.get_server_setup().clone(), sql_pool.clone());
     for group in BUILTIN_GROUPS {
         ensure_group_exists(&backend_handler, group).await?;
     }

@@ -195,14 +195,6 @@ impl Configuration {
         &self.server_setup.as_ref().unwrap().server_setup
     }
 
-    pub fn get_legacy_server_setup(&self) -> Option<&lldap_opaque_legacy::LegacyServerSetup> {
-        self.server_setup
-            .as_ref()
-            .unwrap()
-            .legacy_server_setup
-            .as_ref()
-    }
-
     pub fn get_server_keys(&self) -> &KeyPair {
         self.get_server_setup().keypair()
     }
@@ -301,7 +293,6 @@ fn write_to_readonly_file(path: &std::path::Path, buffer: &[u8]) -> Result<()> {
 #[derive(Debug, Clone)]
 pub struct ServerSetupConfig {
     server_setup: ServerSetup,
-    legacy_server_setup: Option<lldap_opaque_legacy::LegacyServerSetup>,
     private_key_location: PrivateKeyLocation,
 }
 
@@ -393,7 +384,6 @@ fn get_server_setup<L: Into<PrivateKeyLocationOrFigment>>(
         let server_setup = ServerSetup::new(&mut rng);
         return Ok(ServerSetupConfig {
             server_setup,
-            legacy_server_setup: None,
             private_key_location: PrivateKeyLocation::Default,
         });
     }
@@ -415,37 +405,14 @@ fn get_server_setup<L: Into<PrivateKeyLocationOrFigment>>(
         let mut rng = rand_chacha::ChaCha20Rng::from_seed(stable_hash(key_seed.as_bytes()));
         Ok(ServerSetupConfig {
             server_setup: ServerSetup::new(&mut rng),
-            legacy_server_setup: None,
             private_key_location: private_key_location.for_key_seed(),
         })
     } else if path.exists() {
         let bytes = read(file_path).context(format!("Could not read key file `{file_path}`"))?;
-        // A 0.6.x server_key stores a fake private key where the current format stores a
-        // fake public key; the formats cannot be told apart (same length, no header, and
-        // the current parser accepts ~11% of 0.6.x fake keys) but agree on the oprf_seed
-        // and real private key. Carry both and let bind resolve behaviorally, like the
-        // password files.
-        let legacy_server_setup = lldap_opaque_legacy::parse_server_setup(&bytes);
-        let server_setup = match ServerSetup::deserialize(&bytes) {
-            Ok(server_setup) => server_setup,
-            Err(e) => match &legacy_server_setup {
-                Some(legacy) => {
-                    println!(
-                        "`{file_path}` is a legacy LLDAP server key; accepting it and enabling legacy password verification"
-                    );
-                    ServerSetup::deserialize(&legacy.reassemble_for_current())
-                        .context(format!("while converting the legacy `{file_path}` file"))?
-                }
-                None => {
-                    return Err(e).context(format!(
-                        "while parsing the contents of the `{file_path}` file"
-                    ));
-                }
-            },
-        };
+        let server_setup = ServerSetup::deserialize(&bytes)
+            .with_context(|| format!("while parsing the contents of the `{file_path}` file"))?;
         Ok(ServerSetupConfig {
             server_setup,
-            legacy_server_setup,
             private_key_location: private_key_location.for_key_file(file_path),
         })
     } else {
@@ -455,7 +422,6 @@ fn get_server_setup<L: Into<PrivateKeyLocationOrFigment>>(
         ))?;
         Ok(ServerSetupConfig {
             server_setup,
-            legacy_server_setup: None,
             private_key_location: private_key_location.for_key_file(file_path),
         })
     }
@@ -1036,7 +1002,7 @@ mod tests {
     }
 
     #[test]
-    fn test_server_key_file_current_format_keeps_setup_and_arms_legacy() {
+    fn test_server_key_file_current_format_loads() {
         Jail::expect_with(|jail| {
             let setup = generate_random_private_key();
             let path = jail.directory().join("server_key");
@@ -1044,64 +1010,19 @@ mod tests {
             let config =
                 get_server_setup(path.to_str().unwrap(), "", PrivateKeyLocation::Tests).unwrap();
             assert_eq!(config.server_setup.serialize(), setup.serialize());
-            // The 0.6.x parser accepts any scalar bytes, so the fallback arms on modern
-            // files too; bind only consults it after the current check fails.
-            assert!(config.legacy_server_setup.is_some());
             Ok(())
         });
     }
 
     #[test]
-    fn test_server_key_file_ambiguous_legacy_bytes_arm_legacy() {
-        // ~11% of 0.6.x fake private keys accidentally parse as current-format public
-        // keys; such files must still arm legacy verification.
-        let legacy = std::iter::repeat_with(lldap_opaque_legacy::generate_random)
-            .find(|l| ServerSetup::deserialize(l.as_bytes()).is_ok())
-            .unwrap();
+    fn test_unparseable_server_key_is_an_error() {
         Jail::expect_with(|jail| {
             let path = jail.directory().join("server_key");
-            std::fs::write(&path, legacy.as_bytes()).unwrap();
-            let config =
-                get_server_setup(path.to_str().unwrap(), "", PrivateKeyLocation::Tests).unwrap();
-            assert_eq!(config.legacy_server_setup.as_ref(), Some(&legacy));
-            assert_eq!(&config.server_setup.serialize()[..], legacy.as_bytes());
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn test_private_key_hash_of_legacy_key_matches_stock_lldap() {
-        // Stock lldap stores sha256(sk) (bytes 64..96 of the key file) as the private key
-        // hash; a migrated key must reproduce it or the server refuses to start.
-        let legacy = lldap_opaque_legacy::generate_random();
-        Jail::expect_with(|jail| {
-            let path = jail.directory().join("server_key");
-            std::fs::write(&path, legacy.as_bytes()).unwrap();
-            let config =
-                get_server_setup(path.to_str().unwrap(), "", PrivateKeyLocation::Tests).unwrap();
-            assert_eq!(
-                stable_hash(config.server_setup.keypair().private().serialize().as_ref()),
-                stable_hash(&legacy.as_bytes()[64..96]),
-            );
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn test_server_key_file_legacy_format_reassembles_and_arms_legacy() {
-        let legacy = std::iter::repeat_with(lldap_opaque_legacy::generate_random)
-            .find(|l| ServerSetup::deserialize(l.as_bytes()).is_err())
-            .unwrap();
-        Jail::expect_with(|jail| {
-            let path = jail.directory().join("server_key");
-            std::fs::write(&path, legacy.as_bytes()).unwrap();
-            let config =
-                get_server_setup(path.to_str().unwrap(), "", PrivateKeyLocation::Tests).unwrap();
-            assert_eq!(config.legacy_server_setup.as_ref(), Some(&legacy));
-            assert_eq!(
-                &config.server_setup.serialize()[..],
-                &legacy.reassemble_for_current()[..]
-            );
+            std::fs::write(&path, [0u8; 128]).unwrap();
+            let err = get_server_setup(path.to_str().unwrap(), "", PrivateKeyLocation::Tests)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("while parsing the contents of the"), "{err}");
             Ok(())
         });
     }

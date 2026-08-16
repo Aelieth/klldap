@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 #
 # Regenerates the committed stock-lldap migration fixtures in
-# server/tests/fixtures/ (lldap_v11.sql, server_key.b64, fixture.md).
+# server/tests/fixtures/ (lldap_v11.sql, fixture.md).
 #
 # This is a manual tool, not part of CI: it boots a *stock* upstream lldap
 # server (tag v0.6.3, schema v11) on a temporary database, creates the fixture
 # content through its real GraphQL API and OPAQUE password registration, then
 # dumps the result. The committed fixtures are consumed by
-# server/tests/migration_compat.rs to prove that a genuine lldap database and
-# server_key migrate into KLLDAP with data and passwords intact.
+# server/tests/migration_compat.rs to prove that a genuine lldap database migrates
+# into KLLDAP with its data intact (passwords are set again under a fresh key).
 #
 # Usage:
 #   git clone https://github.com/lldap/lldap /tmp/lldap-stock
@@ -16,7 +16,7 @@
 #   LLDAP_SRC=/tmp/lldap-stock scripts/generate_lldap_fixture.sh
 #
 # The stock checkout's rust-toolchain.toml (1.89.0) is honored by rustup.
-# Requires: bash, python3 (stdlib only), base64. No sqlite3 CLI needed.
+# Requires: bash, python3 (stdlib only). No sqlite3 CLI needed.
 
 set -euo pipefail
 
@@ -173,9 +173,6 @@ with open(os.environ["OUT_SQL"], "w") as f:
         f.write(line + "\n")
 PY
 
-base64 -w0 "$WORK/server_key" >"$FIXTURES_DIR/server_key.b64"
-echo >>"$FIXTURES_DIR/server_key.b64"
-
 SRC_COMMIT="$(git -C "$LLDAP_SRC" rev-parse HEAD)"
 GENERATED="$(date -u +%Y-%m-%d)"
 cat >"$FIXTURES_DIR/fixture.md" <<EOF
@@ -186,8 +183,9 @@ Genuine artifacts from stock upstream lldap **v0.6.3** (schema **v11**), produce
 the server booted on a fresh SQLite database, all content was created through its
 GraphQL API, and both passwords were registered through the real OPAQUE flows
 (admin at first boot, bob via \`lldap_set_password\`). \`lldap_v11.sql\` is the
-python-\`iterdump\` of the resulting database; \`server_key.b64\` is the server's
-key file, base64-encoded. Consumed by \`server/tests/migration_compat.rs\`.
+python-\`iterdump\` of the resulting database. Consumed by
+\`server/tests/migration_compat.rs\`, which adopts it under a fresh key: the stock
+passwords are only asserted to be gone.
 
 ## Constants (asserted by the test — keep in sync with the script)
 
@@ -204,7 +202,7 @@ key file, base64-encoded. Consumed by \`server/tests/migration_compat.rs\`.
 | charlie | no password ever registered (bind must fail cleanly) |
 
 UUIDs and creation/modification dates are whatever generation produced — the test
-asserts the constants above, not those. Regeneration rewrites all three files; diff
+asserts the constants above, not those. Regeneration rewrites both files; diff
 before committing.
 EOF
 

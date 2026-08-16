@@ -31,6 +31,14 @@ LLDAP_PID=$!
 echo "Waiting for LLDAP to become ready..."
 ready=""
 for _ in $(seq 1 60); do
+    # A server that already exited (bad config, or the one-shot force flags) is reported at
+    # once, with its own status, instead of after the full wait.
+    if ! kill -0 "$LLDAP_PID" 2>/dev/null; then
+        status=0
+        wait "$LLDAP_PID" || status=$?
+        echo "ERROR: LLDAP exited with status $status before becoming ready."
+        exit "$status"
+    fi
     # Run healthcheck as the target user (prevents root from creating root-owned
     # 0400 "server_key" files in /app that the real lldap process cannot read).
     # Also pass --config-file so we reliably load the /data copy (with key_seed etc.),

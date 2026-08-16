@@ -97,9 +97,6 @@ path = "../crates/kerberos"
 [dependencies.lldap_opaque_handler]
 path = "../crates/opaque-handler"
 
-[dependencies.lldap_opaque_legacy]
-path = "../crates/opaque-legacy"
-
 [dependencies.lldap_sql_backend_handler]
 path = "../crates/sql-backend-handler"
 

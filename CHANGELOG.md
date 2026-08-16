@@ -20,9 +20,11 @@ container test gate, and a code sweep back to LLDAP's shape.
 
 ### Migration from LLDAP
 
-- Stock LLDAP 0.6.x databases (schema ≤ 11) migrate end-to-end: schema v13 re-encodes
-  upstream attribute values, upstream `server_key` files are accepted, and passwords
-  upgrade transparently on the first LDAP bind or `/auth/simple/login`. See
+- Stock LLDAP 0.6.x databases (schema ≤ 11) can be adopted: schema v13 re-encodes
+  upstream attribute values and JpegPhoto types. Passwords do not carry over (the OPAQUE
+  library changed): start once with `--force-update-private-key` and
+  `--force-ldap-user-pass-reset` under a fresh key, then users set a new password — which
+  is also when a Kerberos principal is created. See
   [docs/migration_guides/v0.7-from-lldap.md](docs/migration_guides/v0.7-from-lldap.md).
 - The v12 migration is repaired and idempotent on PostgreSQL (fresh and upgraded).
 - Attribute values use one canonical encoding on read and write; DateTime attributes no

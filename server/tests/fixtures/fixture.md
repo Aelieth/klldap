@@ -5,8 +5,9 @@ Genuine artifacts from stock upstream lldap **v0.6.3** (schema **v11**), produce
 the server booted on a fresh SQLite database, all content was created through its
 GraphQL API, and both passwords were registered through the real OPAQUE flows
 (admin at first boot, bob via `lldap_set_password`). `lldap_v11.sql` is the
-python-`iterdump` of the resulting database; `server_key.b64` is the server's
-key file, base64-encoded. Consumed by `server/tests/migration_compat.rs`.
+python-`iterdump` of the resulting database. Consumed by
+`server/tests/migration_compat.rs`, which adopts it under a fresh key: the stock
+passwords are only asserted to be gone.
 
 ## Constants (asserted by the test — keep in sync with the script)
 
@@ -23,5 +24,5 @@ key file, base64-encoded. Consumed by `server/tests/migration_compat.rs`.
 | charlie | no password ever registered (bind must fail cleanly) |
 
 UUIDs and creation/modification dates are whatever generation produced — the test
-asserts the constants above, not those. Regeneration rewrites all three files; diff
+asserts the constants above, not those. Regeneration rewrites both files; diff
 before committing.

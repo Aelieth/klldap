@@ -41,9 +41,6 @@ path = "../domain-model"
 [dependencies.lldap_opaque_handler]
 path = "../opaque-handler"
 
-[dependencies.lldap_opaque_legacy]
-path = "../opaque-legacy"
-
 [dependencies.lldap_schema]
 path = "../schema"
 

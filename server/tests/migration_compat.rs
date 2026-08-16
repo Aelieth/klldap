@@ -15,14 +15,17 @@ use std::process::Child as ChildProcess;
 use std::{thread, time::Duration};
 mod common;
 
-// A stock lldap 0.6.3 (schema v11) database and server_key, produced by
-// scripts/generate_lldap_fixture.sh, boot into KLLDAP, migrate through v12+v13, and keep data
-// and passwords intact. The constants mirror fixtures/fixture.md.
+// A stock lldap 0.6.3 (schema v11) database, produced by scripts/generate_lldap_fixture.sh,
+// is adopted the way the guide says: a fresh key plus one run with
+// --force-update-private-key/--force-ldap-user-pass-reset, then a normal boot. Data survives
+// v12+v13; stock passwords do not, and get set again. The constants mirror
+// fixtures/fixture.md.
 
 const LLDAP_V11_SQL: &str = include_str!("fixtures/lldap_v11.sql");
-const SERVER_KEY_B64: &str = include_str!("fixtures/server_key.b64");
 const ADMIN_PASS: &str = "FixtureAdminPass2026!";
+const NEW_ADMIN_PASS: &str = "NewAdminPass2026!";
 const BOB_PASS: &str = "FixtureBobPass2026!";
+const NEW_BOB_PASS: &str = "NewBobPass2026!";
 const DATE_EPOCH: i64 = 1714564800; // 2024-05-01T12:00:00Z
 const GROUP_NAME: &str = "Fixture Crew";
 const GROUP_NOTE: &str = "stock group attribute survives";
@@ -165,6 +168,23 @@ fn spawn_and_wait_healthy(db_url: &str, key_file: &str) -> ServerGuard {
     panic!("migrated server did not become healthy");
 }
 
+// The one-shot the guide prescribes: the server adopts the database under a fresh key,
+// resets the admin password, and exits asking to be restarted without the flags.
+fn run_force_reset(db_url: &str, key_file: &str, admin_pass: &str) {
+    let output = create_lldap_command_with_key_file("run", db_url, key_file)
+        .env(env::LDAP_USER_PASSWORD, admin_pass)
+        .arg("--force-update-private-key=true")
+        .arg("--force-ldap-user-pass-reset=true")
+        .output()
+        .expect("unable to run the force-reset boot");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success() && stderr.contains("Restart the server without"),
+        "force-reset boot: status {:?}\n{stderr}",
+        output.status
+    );
+}
+
 fn make_client() -> Client {
     ClientBuilder::new()
         .connect_timeout(std::time::Duration::from_secs(2))
@@ -225,18 +245,11 @@ fn attribute_values<'a>(attributes: &'a Value, name: &str) -> Option<&'a Value> 
 }
 
 #[test]
-fn test_stock_lldap_database_migrates_with_data_and_passwords() {
+fn test_stock_lldap_database_migrates_data() {
     let run_id = uuid::Uuid::new_v4().simple().to_string();
     let db_path = std::env::temp_dir().join(format!("klldap_migration_{run_id}.db"));
     let key_path = std::env::temp_dir().join(format!("klldap_migration_{run_id}_server_key"));
     let db_url = format!("sqlite://{}?mode=rwc", db_path.display());
-    std::fs::write(
-        &key_path,
-        BASE64
-            .decode(SERVER_KEY_B64.trim())
-            .expect("server_key.b64 invalid"),
-    )
-    .expect("write server key");
     let _files = FixtureFiles {
         db_path: db_path.clone(),
         key_path: key_path.clone(),
@@ -244,21 +257,35 @@ fn test_stock_lldap_database_migrates_with_data_and_passwords() {
     let key_file = key_path.to_str().expect("key path utf-8").to_owned();
 
     load_fixture_dump(&db_url);
-    let legacy_bob_hash = query_optional_bytes(
+    let stock_bob_hash = query_optional_bytes(
         &db_url,
         "SELECT password_hash FROM users WHERE user_id = 'bob'",
     )
-    .expect("bob must have a stock password hash");
+    .expect("bob has a stock password hash");
+    // A fresh key is created by that first run; the stock one is not reused.
+    run_force_reset(&db_url, &key_file, NEW_ADMIN_PASS);
+    assert!(
+        key_path.exists(),
+        "the force-reset boot must create the key file"
+    );
 
     {
         let server = spawn_and_wait_healthy(&db_url, &key_file);
         let base_url = server.http_url();
         let client = make_client();
 
-        // First bind runs the legacy OPAQUE ceremony and transparently re-enrolls;
-        // the second must succeed against the re-enrolled current-format hash.
-        login_token(&client, &base_url, "bob", BOB_PASS);
-        login_token(&client, &base_url, "bob", BOB_PASS);
+        assert!(
+            !simple_login(&client, &base_url, "admin", ADMIN_PASS)
+                .status()
+                .is_success(),
+            "the stock admin password is gone with the key"
+        );
+        assert!(
+            !simple_login(&client, &base_url, "bob", BOB_PASS)
+                .status()
+                .is_success(),
+            "stock LLDAP passwords do not carry over"
+        );
         assert!(
             !simple_login(&client, &base_url, "bob", "not-the-password")
                 .status()
@@ -273,13 +300,14 @@ fn test_stock_lldap_database_migrates_with_data_and_passwords() {
         );
 
         let mut ldap = ldap3::LdapConn::new(&server.ldap_url()).expect("ldap connect");
-        ldap.simple_bind(&format!("uid=bob,ou=people,{}", env::base_dn()), BOB_PASS)
+        let bind = ldap
+            .simple_bind(&format!("uid=bob,ou=people,{}", env::base_dn()), BOB_PASS)
             .expect("ldap bind send")
-            .success()
-            .expect("ldap bind as bob must succeed");
+            .success();
+        assert!(bind.is_err(), "ldap bind with the stock password must fail");
         let _ = ldap.unbind();
 
-        let admin_token = login_token(&client, &base_url, "admin", ADMIN_PASS);
+        let admin_token = login_token(&client, &base_url, "admin", NEW_ADMIN_PASS);
         let user = gql(
             &client,
             &base_url,
@@ -377,6 +405,30 @@ fn test_stock_lldap_database_migrates_with_data_and_passwords() {
             Some(json!("AVATAR")),
             "custom JpegPhoto attributes must migrate to Avatar"
         );
+
+        // A new password is the way back in, over the API and then over LDAP.
+        gql(
+            &client,
+            &base_url,
+            &admin_token,
+            r#"mutation($id: String!, $pw: String!) { setUserPassword(userId: $id, password: $pw) { ok } }"#,
+            json!({"id": "bob", "pw": NEW_BOB_PASS}),
+        );
+        assert!(
+            simple_login(&client, &base_url, "bob", NEW_BOB_PASS)
+                .status()
+                .is_success(),
+            "bob logs in with the new password"
+        );
+        let mut ldap = ldap3::LdapConn::new(&server.ldap_url()).expect("ldap connect");
+        ldap.simple_bind(
+            &format!("uid=bob,ou=people,{}", env::base_dn()),
+            NEW_BOB_PASS,
+        )
+        .expect("ldap bind send")
+        .success()
+        .expect("ldap bind with the new password");
+        let _ = ldap.unbind();
     }
 
     // Server is down; byte-level assertions on the migrated database.
@@ -415,14 +467,14 @@ fn test_stock_lldap_database_migrates_with_data_and_passwords() {
         .expect("group note missing"),
         GROUP_NOTE.as_bytes()
     );
-    let upgraded_bob_hash = query_optional_bytes(
-        &db_url,
-        "SELECT password_hash FROM users WHERE user_id = 'bob'",
-    )
-    .expect("bob hash after migration");
     assert_ne!(
-        upgraded_bob_hash, legacy_bob_hash,
-        "first bind must re-enroll the password in the current format"
+        query_optional_bytes(
+            &db_url,
+            "SELECT password_hash FROM users WHERE user_id = 'bob'",
+        )
+        .expect("bob has a password again"),
+        stock_bob_hash,
+        "bob's record was registered afresh under the new key"
     );
     assert_eq!(
         query_optional_bytes(

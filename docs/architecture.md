@@ -60,8 +60,7 @@ Data storage:
 * `crates/kerberos`: the libkadm5/libkrb5 FFI (the only unsafe code), the KDC
   bootstrap and supervision (`kerberos_manager` binary), and the live `KerberosSync`.
 * `crates/keycloak`: the Keycloak admin client used by the Federation tab.
-* `crates/opaque-handler`, `crates/opaque-legacy`: the OPAQUE registration ceremony
-  and the LLDAP 0.6.x verifier used during migration.
+* `crates/opaque-handler`: the OPAQUE registration ceremony.
 * `crates/validation`, `crates/frontend-options`, `crates/test-utils`.
 * `migration-tool/`, `set-password/`: the upstream command-line tools.
 * `gate/`: the container gate suite (see [testing.md](testing.md)).

@@ -70,6 +70,35 @@ pub fn validate_kerberos_username(username: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Directory create rejects only names that would become another principal
+/// (`/`, `@`) or a reserved KDC identity. Quotes and non-ASCII stay allowed
+/// so existing IDs and the SQL-injection fixture still insert; sync uses
+/// `validate_kerberos_username`.
+pub fn validate_directory_username(username: &str) -> Result<(), String> {
+    if username.is_empty() || username.len() > 128 {
+        return Err("Username is empty or longer than 128 characters".to_owned());
+    }
+    if username.contains('/')
+        || username.contains('@')
+        || username
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(
+            "Username must not contain '/', '@', whitespace or control characters".to_owned(),
+        );
+    }
+    if RESERVED_PRINCIPALS
+        .iter()
+        .any(|reserved| username.eq_ignore_ascii_case(reserved))
+    {
+        return Err(format!(
+            "Kerberos username '{username}' is reserved by the KDC"
+        ));
+    }
+    Ok(())
+}
+
 /// Hostnames interpolated into `HTTP/{host}@{realm}` and then into
 /// `kadmin.local -q` must be a DNS name or IPv4 address: no spaces, slashes
 /// or newlines that would split the query.
@@ -220,6 +249,19 @@ mod tests {
         ] {
             assert_eq!(validate_kerberos_username(name), Ok(()), "{name}");
         }
+    }
+
+    #[test]
+    fn test_validate_directory_username_allows_quotes_rejects_reserved() {
+        assert_eq!(
+            validate_directory_username(r#"bob"e"i'o;aü"#),
+            Ok(()),
+            "SQL-injection fixture ids must still insert"
+        );
+        assert!(validate_directory_username("krbtgt").is_err());
+        assert!(validate_directory_username("bob/admin").is_err());
+        assert!(validate_directory_username("bob@realm").is_err());
+        assert!(validate_directory_username("bob principal").is_err());
     }
 
     #[test]

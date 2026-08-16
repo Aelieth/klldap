@@ -16,7 +16,7 @@ use lldap_domain_handlers::handler::{
     UserBackendHandler, UserListerBackendHandler, UserRequestFilter,
 };
 use lldap_domain_handlers::kerberos::{
-    kerberos_backend, principal_name, require_kdc_ready, validate_kerberos_username,
+    kerberos_backend, principal_name, require_kdc_ready, validate_directory_username,
 };
 use lldap_domain_model::{
     error::{DomainError, Result},
@@ -512,7 +512,8 @@ impl UserBackendHandler for SqlBackendHandler {
     #[instrument(skip(self), level = "debug", err, fields(user_id = ?request.user_id.as_str()))]
     async fn create_user(&self, mut request: CreateUserRequest) -> Result<()> {
         require_kdc_ready()?;
-        validate_kerberos_username(request.user_id.as_str()).map_err(DomainError::InternalError)?;
+        validate_directory_username(request.user_id.as_str())
+            .map_err(DomainError::InternalError)?;
         let now = chrono::Utc::now().naive_utc();
         let uuid = Uuid::from_name_and_date(request.user_id.as_str(), &now);
         let lower_email = request.email.as_str().to_lowercase();

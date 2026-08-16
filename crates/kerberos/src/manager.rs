@@ -23,8 +23,7 @@ pub struct KerberosConfig {
     pub rdns: bool,
 }
 
-// The manager runs as root; the server runs as LLDAP_UID and must read the keytab and the
-// KDB (kadmin.local for keytab export), so everything the manager creates is owned by it.
+// Root bootstrap; the server (LLDAP_UID) must own the keytab and KDB.
 fn service_owner() -> String {
     let id = |key: &str| env::var(key).ok().filter(|v| !v.is_empty());
     format!(
@@ -113,8 +112,7 @@ pub fn ensure_admin_keytab(
         );
     }
 
-    // ktadd rotates the kvno; safe here since this keytab is the only consumer of the
-    // admin principal's key.
+    // ktadd rotates the kvno; this keytab is the only consumer of the admin key.
     let ktadd_output = run_kadmin_local(
         &format!("ktadd -k {} {}", paths.admin_keytab.display(), admin_princ),
         paths,
@@ -176,8 +174,7 @@ pub fn render_configs(config: &KerberosConfig, domain: &str, paths: &KerberosPat
     ensure_kadm5_acl(&paths.kadm5_acl, &paths.kadm5_acl_template, config, domain)
 }
 
-/// Creates the KDC database with a random, stash-only master password. Returns whether it
-/// was created on this run.
+/// Creates the KDC database with a random, stash-only master password. Returns whether this run created it.
 pub fn bootstrap_kdb(paths: &KerberosPaths) -> Result<bool> {
     let db_created = !paths.kdc_principal().exists();
     if db_created {
@@ -235,8 +232,7 @@ pub fn bootstrap_kdb(paths: &KerberosPaths) -> Result<bool> {
     Ok(db_created)
 }
 
-// Foreground daemons: without -n/-nofork they daemonize, the parents exit at once, and
-// the manager would have nothing to wait on.
+// -n/-nofork: without them the parents exit and the manager has nothing to wait on.
 pub fn spawn_daemons() -> Result<(Child, Child)> {
     println!("Starting krb5kdc...");
     let kdc_child = Command::new("/usr/sbin/krb5kdc")
@@ -288,8 +284,7 @@ pub fn populate_ccache(admin_princ: &str, paths: &KerberosPaths) -> Result<()> {
     Ok(())
 }
 
-// Returns when either daemon exits; the healthcheck already reports the KDC as down, this
-// makes it visible in the container log.
+// Kill the sibling when either daemon exits so a half-dead KDC is visible in the log.
 pub fn run_daemons_to_completion(mut kdc: Child, mut kadmind: Child) -> Result<()> {
     loop {
         if let Some(status) = kdc.try_wait().context("while waiting on krb5kdc")? {

@@ -37,44 +37,129 @@ impl PublicSchema {
         use AttributeType::{Avatar, DateTime, Integer, String};
 
         let user_attributes = vec![
-            A::editable("avatar", Avatar).aliases(&["jpegphoto", "jpegPhoto", "jpeg_photo"]),
-            A::readonly("creationdate", DateTime).aliases(&["creation_date", "createTimestamp"]),
-            A::editable("displayname", String).aliases(&["display_name", "cn", "commonname"]),
-            A::editable("firstname", String).aliases(&["first_name", "givenName", "given_name"]),
-            A::editable("lastname", String).aliases(&["last_name", "sn", "surname"]),
-            A::editable("mail", String).aliases(&["email"]),
-            A::readonly("modifieddate", DateTime).aliases(&["modified_date", "modifyTimestamp"]),
-            A::readonly("passwordmodifieddate", DateTime)
-                .aliases(&["password_modified_date", "pwdChangedTime"]),
-            A::readonly("userid", String).aliases(&["user_id", "uid", "id"]),
-            A::readonly("uuid", String).aliases(&["entryUUID", "entryuuid"]),
-            A::generated("uidnumber", Integer).aliases(&["uid_number", "uidNumber"]),
-            A::generated("gidnumber", Integer).aliases(&["gid_number", "gidNumber"]),
-            A::generated("homedirectory", String).aliases(&["home_directory", "homeDirectory"]),
-            A::generated("loginshell", String).aliases(&["login_shell", "loginShell"]),
-            A::generated(KERBEROS_SYNC, Integer).aliases(&["kerberos_sync", "kerberosSync"]),
-            A::hidden("krbprincipalname", String)
-                .aliases(&["krb_principal_name", "krbPrincipalName"]),
-            A::editable("sshpublickey", String)
-                .aliases(&["sshPublicKey", "ssHPublicKey", "ssh_public_key"])
-                .list(),
-            A::readonly("ou", String).aliases(&["organizationalunit", "organizationalUnit"]),
+            // Core
+            AttributeSchema {
+                aliases: vec!["jpegphoto".into(), "jpegPhoto".into(), "jpeg_photo".into()],
+                ..A::editable("avatar", Avatar)
+            },
+            AttributeSchema {
+                aliases: vec!["creation_date".into(), "createTimestamp".into()],
+                ..A::readonly("creationdate", DateTime)
+            },
+            AttributeSchema {
+                aliases: vec!["display_name".into(), "cn".into(), "commonname".into()],
+                ..A::editable("displayname", String)
+            },
+            AttributeSchema {
+                aliases: vec!["first_name".into(), "givenName".into(), "given_name".into()],
+                ..A::editable("firstname", String)
+            },
+            AttributeSchema {
+                aliases: vec!["last_name".into(), "sn".into(), "surname".into()],
+                ..A::editable("lastname", String)
+            },
+            AttributeSchema {
+                aliases: vec!["email".into()],
+                ..A::editable("mail", String)
+            },
+            AttributeSchema {
+                aliases: vec!["modified_date".into(), "modifyTimestamp".into()],
+                ..A::readonly("modifieddate", DateTime)
+            },
+            AttributeSchema {
+                aliases: vec!["password_modified_date".into(), "pwdChangedTime".into()],
+                ..A::readonly("passwordmodifieddate", DateTime)
+            },
+            AttributeSchema {
+                aliases: vec!["user_id".into(), "uid".into(), "id".into()],
+                ..A::readonly("userid", String)
+            },
+            AttributeSchema {
+                aliases: vec!["entryUUID".into(), "entryuuid".into()],
+                ..A::readonly("uuid", String)
+            },
+            // POSIX
+            AttributeSchema {
+                aliases: vec!["uid_number".into(), "uidNumber".into()],
+                ..A::generated("uidnumber", Integer)
+            },
+            AttributeSchema {
+                aliases: vec!["gid_number".into(), "gidNumber".into()],
+                ..A::generated("gidnumber", Integer)
+            },
+            AttributeSchema {
+                aliases: vec!["home_directory".into(), "homeDirectory".into()],
+                ..A::generated("homedirectory", String)
+            },
+            AttributeSchema {
+                aliases: vec!["login_shell".into(), "loginShell".into()],
+                ..A::generated("loginshell", String)
+            },
+            // Kerberos
+            AttributeSchema {
+                aliases: vec!["kerberos_sync".into(), "kerberosSync".into()],
+                ..A::generated(KERBEROS_SYNC, Integer)
+            },
+            AttributeSchema {
+                aliases: vec!["krb_principal_name".into(), "krbPrincipalName".into()],
+                ..A::hidden("krbprincipalname", String)
+            },
+            // SSH
+            AttributeSchema {
+                aliases: vec![
+                    "sshPublicKey".into(),
+                    "ssHPublicKey".into(),
+                    "ssh_public_key".into(),
+                ],
+                ..A::editable("sshpublickey", String).list()
+            },
+            // OU
+            AttributeSchema {
+                aliases: vec!["organizationalunit".into(), "organizationalUnit".into()],
+                ..A::readonly("ou", String)
+            },
         ];
 
         let group_attributes = vec![
-            A::readonly("groupid", Integer).aliases(&["group_id"]),
-            A::readonly("creationdate", DateTime).aliases(&["creation_date", "createTimestamp"]),
-            A::readonly("modifieddate", DateTime).aliases(&["modified_date", "modifyTimestamp"]),
-            A::readonly("uuid", String).aliases(&["entryUUID", "entryuuid"]),
-            A::editable("displayname", String).aliases(&["display_name", "cn", "commonname"]),
-            A::readonly("ou", String).aliases(&["organizationalunit", "organizationalUnit"]),
-            A::generated("gidnumber", Integer).aliases(&["gid_number", "gidNumber"]),
+            // Core
+            AttributeSchema {
+                aliases: vec!["group_id".into()],
+                ..A::readonly("groupid", Integer)
+            },
+            AttributeSchema {
+                aliases: vec!["creation_date".into(), "createTimestamp".into()],
+                ..A::readonly("creationdate", DateTime)
+            },
+            AttributeSchema {
+                aliases: vec!["modified_date".into(), "modifyTimestamp".into()],
+                ..A::readonly("modifieddate", DateTime)
+            },
+            AttributeSchema {
+                aliases: vec!["entryUUID".into(), "entryuuid".into()],
+                ..A::readonly("uuid", String)
+            },
+            AttributeSchema {
+                aliases: vec!["display_name".into(), "cn".into(), "commonname".into()],
+                ..A::editable("displayname", String)
+            },
+            // OU
+            AttributeSchema {
+                aliases: vec!["organizationalunit".into(), "organizationalUnit".into()],
+                ..A::readonly("ou", String)
+            },
+            // POSIX
+            AttributeSchema {
+                aliases: vec!["gid_number".into(), "gidNumber".into()],
+                ..A::generated("gidnumber", Integer)
+            },
         ];
 
         let system_attributes = vec![
-            A::hidden("allowedous", String)
-                .aliases(&["allowedOUs", "AllowedOUs"])
-                .list(),
+            // Access control
+            AttributeSchema {
+                aliases: vec!["allowedOUs".into(), "AllowedOUs".into()],
+                ..A::hidden("allowedous", String).list()
+            },
         ];
 
         PublicSchema(Schema {

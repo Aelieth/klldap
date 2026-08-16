@@ -1682,142 +1682,6 @@ async fn reencode_attribute_rows(
     Ok(rewritten)
 }
 
-// Re-encodes bincode values and JpegPhoto schema rows arriving from an upstream database
-// into KLLDAP's raw formats; native rows are no-ops, so it is idempotent on fresh chains.
-async fn migrate_to_v13(transaction: DatabaseTransaction) -> Result<DatabaseTransaction, DbErr> {
-    let backend = transaction.get_database_backend();
-
-    info!("KLLDAP v13 migration starting");
-
-    ensure_column(
-        &transaction,
-        backend,
-        UserAttributeSchema::Table.into_iden(),
-        UserAttributeSchema::Aliases.into_iden(),
-        ColumnDef::new(UserAttributeSchema::Aliases)
-            .string_len(1024)
-            .default("[]")
-            .to_owned(),
-    )
-    .await?;
-    ensure_column(
-        &transaction,
-        backend,
-        UserAttributeSchema::Table.into_iden(),
-        UserAttributeSchema::UserAttributeSchemaIsReadonly.into_iden(),
-        ColumnDef::new(UserAttributeSchema::UserAttributeSchemaIsReadonly)
-            .boolean()
-            .not_null()
-            .default(false)
-            .to_owned(),
-    )
-    .await?;
-    ensure_column(
-        &transaction,
-        backend,
-        GroupAttributeSchema::Table.into_iden(),
-        GroupAttributeSchema::Aliases.into_iden(),
-        ColumnDef::new(GroupAttributeSchema::Aliases)
-            .string_len(1024)
-            .default("[]")
-            .to_owned(),
-    )
-    .await?;
-    ensure_column(
-        &transaction,
-        backend,
-        GroupAttributeSchema::Table.into_iden(),
-        GroupAttributeSchema::GroupAttributeSchemaIsReadonly.into_iden(),
-        ColumnDef::new(GroupAttributeSchema::GroupAttributeSchemaIsReadonly)
-            .boolean()
-            .not_null()
-            .default(false)
-            .to_owned(),
-    )
-    .await?;
-    ensure_column(
-        &transaction,
-        backend,
-        Users::Table.into_iden(),
-        Alias::new("krb_principal_name").into_iden(),
-        ColumnDef::new(Alias::new("krb_principal_name"))
-            .string_len(255)
-            .null()
-            .to_owned(),
-    )
-    .await?;
-    ensure_system_config(&transaction, backend).await?;
-
-    // v12 only repaired the row named 'avatar'; custom upstream JpegPhoto attrs hard-fail
-    // the shared enum until their type is normalized too.
-    for (table, type_col) in [
-        (
-            UserAttributeSchema::Table.into_iden(),
-            UserAttributeSchema::UserAttributeSchemaType.into_iden(),
-        ),
-        (
-            GroupAttributeSchema::Table.into_iden(),
-            GroupAttributeSchema::GroupAttributeSchemaType.into_iden(),
-        ),
-    ] {
-        transaction
-            .execute(
-                backend.build(
-                    Query::update()
-                        .table(table)
-                        .value(type_col.clone(), AttributeType::Avatar)
-                        .cond_where(Expr::col(type_col).eq("JpegPhoto")),
-                ),
-            )
-            .await?;
-    }
-
-    let public_schema = PublicSchema::get();
-    ghost_and_alias_cleanup(&transaction, backend, public_schema.get_schema()).await?;
-
-    let user_types = attribute_type_map(
-        &transaction,
-        backend,
-        UserAttributeSchema::Table.into_iden(),
-        UserAttributeSchema::UserAttributeSchemaName.into_iden(),
-        UserAttributeSchema::UserAttributeSchemaType.into_iden(),
-        UserAttributeSchema::UserAttributeSchemaIsList.into_iden(),
-    )
-    .await?;
-    let group_types = attribute_type_map(
-        &transaction,
-        backend,
-        GroupAttributeSchema::Table.into_iden(),
-        GroupAttributeSchema::GroupAttributeSchemaName.into_iden(),
-        GroupAttributeSchema::GroupAttributeSchemaType.into_iden(),
-        GroupAttributeSchema::GroupAttributeSchemaIsList.into_iden(),
-    )
-    .await?;
-    let user_rewrites = reencode_attribute_rows(
-        &transaction,
-        backend,
-        &user_attribute_tables(),
-        "user",
-        &user_types,
-    )
-    .await?;
-    let group_rewrites = reencode_attribute_rows(
-        &transaction,
-        backend,
-        &group_attribute_tables(),
-        "group",
-        &group_types,
-    )
-    .await?;
-
-    info!(
-        "v13 migration completed – re-encoded {} user + {} group attribute values",
-        user_rewrites, group_rewrites
-    );
-
-    Ok(transaction)
-}
-
 async fn migrate_to_v12(transaction: DatabaseTransaction) -> Result<DatabaseTransaction, DbErr> {
     let backend = transaction.get_database_backend();
 
@@ -2096,6 +1960,141 @@ async fn migrate_to_v12(transaction: DatabaseTransaction) -> Result<DatabaseTran
     ghost_and_alias_cleanup(&transaction, backend, schema).await?;
 
     info!("v12 migration completed");
+
+    Ok(transaction)
+}
+// Re-encodes bincode values and JpegPhoto schema rows arriving from an upstream database
+// into KLLDAP's raw formats; native rows are no-ops, so it is idempotent on fresh chains.
+async fn migrate_to_v13(transaction: DatabaseTransaction) -> Result<DatabaseTransaction, DbErr> {
+    let backend = transaction.get_database_backend();
+
+    info!("KLLDAP v13 migration starting");
+
+    ensure_column(
+        &transaction,
+        backend,
+        UserAttributeSchema::Table.into_iden(),
+        UserAttributeSchema::Aliases.into_iden(),
+        ColumnDef::new(UserAttributeSchema::Aliases)
+            .string_len(1024)
+            .default("[]")
+            .to_owned(),
+    )
+    .await?;
+    ensure_column(
+        &transaction,
+        backend,
+        UserAttributeSchema::Table.into_iden(),
+        UserAttributeSchema::UserAttributeSchemaIsReadonly.into_iden(),
+        ColumnDef::new(UserAttributeSchema::UserAttributeSchemaIsReadonly)
+            .boolean()
+            .not_null()
+            .default(false)
+            .to_owned(),
+    )
+    .await?;
+    ensure_column(
+        &transaction,
+        backend,
+        GroupAttributeSchema::Table.into_iden(),
+        GroupAttributeSchema::Aliases.into_iden(),
+        ColumnDef::new(GroupAttributeSchema::Aliases)
+            .string_len(1024)
+            .default("[]")
+            .to_owned(),
+    )
+    .await?;
+    ensure_column(
+        &transaction,
+        backend,
+        GroupAttributeSchema::Table.into_iden(),
+        GroupAttributeSchema::GroupAttributeSchemaIsReadonly.into_iden(),
+        ColumnDef::new(GroupAttributeSchema::GroupAttributeSchemaIsReadonly)
+            .boolean()
+            .not_null()
+            .default(false)
+            .to_owned(),
+    )
+    .await?;
+    ensure_column(
+        &transaction,
+        backend,
+        Users::Table.into_iden(),
+        Alias::new("krb_principal_name").into_iden(),
+        ColumnDef::new(Alias::new("krb_principal_name"))
+            .string_len(255)
+            .null()
+            .to_owned(),
+    )
+    .await?;
+    ensure_system_config(&transaction, backend).await?;
+
+    // v12 only repaired the row named 'avatar'; custom upstream JpegPhoto attrs hard-fail
+    // the shared enum until their type is normalized too.
+    for (table, type_col) in [
+        (
+            UserAttributeSchema::Table.into_iden(),
+            UserAttributeSchema::UserAttributeSchemaType.into_iden(),
+        ),
+        (
+            GroupAttributeSchema::Table.into_iden(),
+            GroupAttributeSchema::GroupAttributeSchemaType.into_iden(),
+        ),
+    ] {
+        transaction
+            .execute(
+                backend.build(
+                    Query::update()
+                        .table(table)
+                        .value(type_col.clone(), AttributeType::Avatar)
+                        .cond_where(Expr::col(type_col).eq("JpegPhoto")),
+                ),
+            )
+            .await?;
+    }
+
+    let public_schema = PublicSchema::get();
+    ghost_and_alias_cleanup(&transaction, backend, public_schema.get_schema()).await?;
+
+    let user_types = attribute_type_map(
+        &transaction,
+        backend,
+        UserAttributeSchema::Table.into_iden(),
+        UserAttributeSchema::UserAttributeSchemaName.into_iden(),
+        UserAttributeSchema::UserAttributeSchemaType.into_iden(),
+        UserAttributeSchema::UserAttributeSchemaIsList.into_iden(),
+    )
+    .await?;
+    let group_types = attribute_type_map(
+        &transaction,
+        backend,
+        GroupAttributeSchema::Table.into_iden(),
+        GroupAttributeSchema::GroupAttributeSchemaName.into_iden(),
+        GroupAttributeSchema::GroupAttributeSchemaType.into_iden(),
+        GroupAttributeSchema::GroupAttributeSchemaIsList.into_iden(),
+    )
+    .await?;
+    let user_rewrites = reencode_attribute_rows(
+        &transaction,
+        backend,
+        &user_attribute_tables(),
+        "user",
+        &user_types,
+    )
+    .await?;
+    let group_rewrites = reencode_attribute_rows(
+        &transaction,
+        backend,
+        &group_attribute_tables(),
+        "group",
+        &group_types,
+    )
+    .await?;
+
+    info!(
+        "v13 migration completed – re-encoded {} user + {} group attribute values",
+        user_rewrites, group_rewrites
+    );
 
     Ok(transaction)
 }

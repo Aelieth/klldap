@@ -41,8 +41,7 @@ pub fn delete_kerberos_principal(username: &str) -> Result<()> {
         full_principal
     );
 
-    // An unavailable admin handle means Kerberos is disabled or not yet bootstrapped;
-    // deleting a principal that cannot exist is treated as idempotent success.
+    // No admin handle: Kerberos is off or not bootstrapped; delete is a no-op.
     let handle = match admin_handle(&realm) {
         Ok(handle) => handle,
         Err(e) => {
@@ -57,8 +56,7 @@ pub fn delete_kerberos_principal(username: &str) -> Result<()> {
     handle.delete_principal(&full_principal)
 }
 
-/// `enabled == false` sets DISALLOW_ALL_TIX (`modprinc -allow_tix`), `true` clears it.
-/// Like `delete_kerberos_principal`, an unavailable admin handle is an idempotent no-op.
+/// `enabled == false` sets DISALLOW_ALL_TIX; a missing admin handle is a no-op.
 pub fn set_kerberos_principal_enabled(username: &str, enabled: bool) -> Result<()> {
     let realm = derive_realm_from_base_dn();
     let handle = match admin_handle(&realm) {
@@ -83,7 +81,6 @@ pub fn sync_kerberos_principal(username: &str, plain_password: &str) -> Result<(
     info!("Kerberos sync started for principal: {}", full_principal);
     let handle = admin_handle(&realm)?;
 
-    // Usually the principal already exists.
     if handle
         .chpass_principal(username, plain_password, &realm)
         .is_ok()
@@ -122,15 +119,13 @@ pub fn export_keytab_for_keycloak(hostname_input: &str) -> Result<String> {
     }
     let _ = fs::remove_file(keytab_path);
 
-    // Fresh random key via FFI, then ktadd with the enctypes Keycloak/Java can decrypt.
     handle.set_random_key_for_service(&principal)?;
     let query = format!(
         "ktadd -k {} -e aes256-cts-hmac-sha1-96:normal,aes128-cts-hmac-sha1-96:normal {}",
         keytab_path.display(),
         principal
     );
-    // -p: the server may run as a uid without a passwd entry, from which kadmin.local
-    // cannot derive a client name.
+    // -p: this uid may have no passwd entry for kadmin.local to derive a name from.
     let output = Command::new("/usr/sbin/kadmin.local")
         .env("KRB5_CONFIG", &paths.krb5_conf)
         .arg("-p")

@@ -62,9 +62,8 @@ fn main() {
 
     let mut content = fs::read_to_string(&bindings_file).expect("Failed to read bindings");
     content = content.replace("extern \"C\" {", "unsafe extern \"C\" {");
-    // Depending on clang and architecture, bindgen emits va_list as [u64; 4], [u64; 3usize] or
-    // __va_list_tag, which trips improper_ctypes or duplicate definitions. No vararg function
-    // is called through this FFI, so every emitted definition gives way to one opaque type.
+    // bindgen's va_list layout varies by clang/arch and trips improper_ctypes; no vararg
+    // is called, so every emitted definition is replaced with one opaque type.
     if content.contains("va_list") {
         content = content.replace("pub type va_list = ", "// neutralized: pub type va_list = ");
         content = content.replace(

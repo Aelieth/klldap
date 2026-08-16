@@ -32,8 +32,7 @@ impl LiveKerberos {
 }
 
 impl KerberosSync for LiveKerberos {
-    // A latch: the KDC boots after the server, and writes wait for it once. A KDC that dies
-    // later is the healthcheck's business.
+    // Latch: wait once after boot; a later KDC death is the healthcheck's job.
     fn ready(&self) -> bool {
         if !self.wait_for_kdc || self.seen_kdc.load(Ordering::Relaxed) {
             return true;

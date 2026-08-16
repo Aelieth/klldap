@@ -20,6 +20,28 @@ fn lldap_provider_dns(base_dn: &str, sync_username: &str) -> LldapProviderDns {
     }
 }
 
+/// The server fetches this URL; only http(s) are accepted so a crafted
+/// `file://` or `gopher://` target cannot be used as an SSRF trampoline.
+pub fn validate_keycloak_url(raw: &str) -> Result<()> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        anyhow::bail!("Keycloak URL is required");
+    }
+    if raw.chars().any(char::is_whitespace) {
+        anyhow::bail!("Keycloak URL must not contain whitespace");
+    }
+    let parsed = reqwest::Url::parse(raw).context("Invalid Keycloak URL")?;
+    match parsed.scheme() {
+        "http" | "https" => {
+            if parsed.host_str().is_none() {
+                anyhow::bail!("Keycloak URL must include a host");
+            }
+            Ok(())
+        }
+        other => anyhow::bail!("Keycloak URL must be http or https, not {other}"),
+    }
+}
+
 #[derive(Clone)]
 pub struct KeycloakClient {
     config: KeycloakConfig,
@@ -41,13 +63,14 @@ impl KeycloakClient {
         realm: String,
         admin_user: String,
         admin_pass: String,
-    ) -> Self {
+    ) -> Result<Self> {
+        validate_keycloak_url(&url)?;
         let pass = if admin_pass.trim().is_empty() {
-            admin_password()
+            admin_password()?
         } else {
             admin_pass
         };
-        Self {
+        Ok(Self {
             config: KeycloakConfig {
                 url,
                 realm,
@@ -55,7 +78,7 @@ impl KeycloakClient {
             },
             admin_pass: pass,
             http_client: HttpClient::new(),
-        }
+        })
     }
 
     pub async fn setup_realm(
@@ -611,7 +634,7 @@ impl KeycloakClient {
 
 #[cfg(test)]
 mod tests {
-    use super::lldap_provider_dns;
+    use super::{lldap_provider_dns, validate_keycloak_url};
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -624,5 +647,27 @@ mod tests {
             !dns.users_dn.contains("dc=master"),
             "must not derive DNs from a Keycloak realm name"
         );
+    }
+
+    #[test]
+    fn test_validate_keycloak_url_accepts_http_https() {
+        assert!(validate_keycloak_url("https://keycloak.example.com").is_ok());
+        assert!(validate_keycloak_url("http://127.0.0.1:8080/auth").is_ok());
+    }
+
+    #[test]
+    fn test_validate_keycloak_url_rejects_non_http_schemes() {
+        for url in [
+            "file:///etc/passwd",
+            "gopher://127.0.0.1:70/",
+            "ftp://keycloak.example.com",
+            "",
+            "https://key cloak.example.com",
+        ] {
+            assert!(
+                validate_keycloak_url(url).is_err(),
+                "expected {url:?} to be rejected"
+            );
+        }
     }
 }

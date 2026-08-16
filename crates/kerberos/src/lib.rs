@@ -3,6 +3,8 @@
 #![warn(clippy::undocumented_unsafe_blocks)]
 use anyhow::{Context, Result};
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::process::Command;
 use tracing::{info, warn};
 
@@ -12,6 +14,7 @@ pub mod paths;
 
 pub use lldap_domain_handlers::kerberos::{
     derive_domain_from_base_dn, derive_realm_from_base_dn, domain_from_base_dn, principal_name,
+    validate_kerberos_username, validate_keytab_hostname,
 };
 use paths::KerberosPaths;
 
@@ -34,6 +37,7 @@ fn admin_handle(realm: &str) -> Result<Kadm5Handle> {
 }
 
 pub fn delete_kerberos_principal(username: &str) -> Result<()> {
+    validate_kerberos_username(username).map_err(anyhow::Error::msg)?;
     let realm = derive_realm_from_base_dn();
     let full_principal = format!("{username}@{realm}");
     info!(
@@ -58,6 +62,7 @@ pub fn delete_kerberos_principal(username: &str) -> Result<()> {
 
 /// `enabled == false` sets DISALLOW_ALL_TIX; a missing admin handle is a no-op.
 pub fn set_kerberos_principal_enabled(username: &str, enabled: bool) -> Result<()> {
+    validate_kerberos_username(username).map_err(anyhow::Error::msg)?;
     let realm = derive_realm_from_base_dn();
     let handle = match admin_handle(&realm) {
         Ok(handle) => handle,
@@ -76,6 +81,7 @@ pub fn set_kerberos_principal_enabled(username: &str, enabled: bool) -> Result<(
 }
 
 pub fn sync_kerberos_principal(username: &str, plain_password: &str) -> Result<()> {
+    validate_kerberos_username(username).map_err(anyhow::Error::msg)?;
     let realm = derive_realm_from_base_dn();
     let full_principal = format!("{username}@{realm}");
     info!("Kerberos sync started for principal: {}", full_principal);
@@ -109,6 +115,7 @@ pub fn export_keytab_for_keycloak(hostname_input: &str) -> Result<String> {
         "" | "keycloak" => format!("keycloak.{}", derive_domain_from_base_dn()),
         hostname => hostname.to_owned(),
     };
+    validate_keytab_hostname(&hostname).map_err(anyhow::Error::msg)?;
     let principal = format!("HTTP/{hostname}@{realm}");
     info!("Generating Keycloak keytab for principal: {}", principal);
     let paths = KerberosPaths::from_env();
@@ -140,7 +147,51 @@ pub fn export_keytab_for_keycloak(hostname_input: &str) -> Result<String> {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    lock_down_keytab(keytab_path)?;
 
     info!("Keytab successfully exported to {}", keytab_path.display());
     Ok(keytab_path.display().to_string())
+}
+
+fn lock_down_keytab(path: &Path) -> Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("while chmodding {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sync_principal_rejects_krbtgt_before_touching_the_kdc() {
+        let err = sync_kerberos_principal("krbtgt", "secret")
+            .expect_err("krbtgt must never be synced")
+            .to_string();
+        assert!(
+            err.contains("reserved"),
+            "expected reserved-name error, got {err}"
+        );
+    }
+
+    #[test]
+    fn test_lock_down_keytab_is_owner_read_write_only() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("kll-keytab-mode-{}", std::process::id()));
+        std::fs::write(&path, b"keytab").unwrap();
+        lock_down_keytab(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(mode, 0o600, "exported keytab must not be world-readable");
+    }
+
+    #[test]
+    fn test_export_keytab_rejects_injected_hostname_before_kadmin() {
+        let err = export_keytab_for_keycloak("foo\ndelprinc admin/admin")
+            .expect_err("newline hostname must be rejected")
+            .to_string();
+        assert!(
+            err.contains("hostname") || err.contains("invalid"),
+            "expected hostname validation error, got {err}"
+        );
+    }
 }

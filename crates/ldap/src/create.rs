@@ -222,20 +222,25 @@ async fn create_user(
             message: format!("Could not create user: {e:#?}"),
         })?;
 
-    if kerberossync_enabled
-        && let Some(password) = attributes.get("userpassword")
-        && let Ok(plain) = std::str::from_utf8(password)
-    {
-        match kerberos_backend().sync_principal(user_id.as_str(), plain) {
-            Ok(()) => {
-                if let Err(e) = backend_handler
-                    .ensure_kerberos_principal_consistency(&user_id, true)
-                    .await
-                {
-                    warn!("Failed to record Kerberos principal name for {user_id}: {e}");
+    if let Some(password) = attributes.get("userpassword") {
+        crate::password::change_password(backend_handler, user_id.clone(), password)
+            .await
+            .map_err(|e| LdapError {
+                code: LdapResultCode::Other,
+                message: format!("Error while setting the password: {e:#?}"),
+            })?;
+        if kerberossync_enabled && let Ok(plain) = std::str::from_utf8(password) {
+            match kerberos_backend().sync_principal(user_id.as_str(), plain) {
+                Ok(()) => {
+                    if let Err(e) = backend_handler
+                        .ensure_kerberos_principal_consistency(&user_id, true)
+                        .await
+                    {
+                        warn!("Failed to record Kerberos principal name for {user_id}: {e}");
+                    }
                 }
+                Err(e) => warn!("Kerberos principal sync failed after LDAP user create: {e}"),
             }
-            Err(e) => warn!("Kerberos principal sync failed after LDAP user create: {e}"),
         }
     }
 
@@ -288,6 +293,7 @@ async fn create_group(
 mod tests {
     use super::*;
     use crate::handler::tests::setup_bound_admin_handler;
+    use crate::password::tests::expect_password_registration;
     use lldap_domain::{deserialize, types::*};
     use lldap_test_utils::MockTestBackendHandler;
     use lldap_test_utils::recording_kerberos::{KerberosOp, RecordingGuard};
@@ -570,6 +576,7 @@ mod tests {
         let guard = RecordingGuard::install();
         let mut mock = MockTestBackendHandler::new();
         mock.expect_create_user().times(1).return_once(|_| Ok(()));
+        expect_password_registration(&mut mock, "bob");
         mock.expect_ensure_kerberos_principal_consistency()
             .with(eq(UserId::new("bob")), eq(true))
             .times(1)
@@ -608,6 +615,7 @@ mod tests {
         let guard = RecordingGuard::install();
         let mut mock = MockTestBackendHandler::new();
         mock.expect_create_user().times(1).return_once(|_| Ok(()));
+        expect_password_registration(&mut mock, "bob");
         let ldap_handler = setup_bound_admin_handler(mock).await;
         assert_eq!(
             ldap_handler

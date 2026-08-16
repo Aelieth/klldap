@@ -132,6 +132,12 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
             ]);
         } else if is_subschema_entry_request(request) {
             debug!("Schema request");
+            if self.user_info.is_none() {
+                return Err(LdapError {
+                    code: LdapResultCode::InsufficentAccessRights,
+                    message: "No user currently bound".to_string(),
+                });
+            }
             return Ok(vec![
                 make_ldap_subschema_entry(
                     crate::schema::get_schema_manager(),
@@ -429,5 +435,25 @@ pub mod tests {
         mock: MockTestBackendHandler,
     ) -> LdapHandler<MockTestBackendHandler> {
         setup_bound_handler_with_group(mock, "lldap_strict_readonly").await
+    }
+
+    #[tokio::test]
+    async fn test_subschema_requires_bind() {
+        let mut handler =
+            LdapHandler::new_for_tests(MockTestBackendHandler::new(), "dc=example,dc=com");
+        let request = crate::search::make_search_request(
+            "cn=Subschema,dc=example,dc=com",
+            ldap3_proto::LdapFilter::Present("objectClass".to_string()),
+            vec!["*", "+"],
+        );
+        assert_eq!(
+            handler
+                .handle_ldap_message(LdapOp::SearchRequest(request))
+                .await,
+            Some(vec![crate::search::make_search_error(
+                LdapResultCode::InsufficentAccessRights,
+                "No user currently bound".to_string(),
+            )])
+        );
     }
 }

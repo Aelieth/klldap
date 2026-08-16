@@ -15,7 +15,9 @@ use lldap_domain_handlers::handler::{
     GroupBackendHandler, ReadSchemaBackendHandler, SubStringFilter, SystemConfigBackendHandler,
     UserBackendHandler, UserListerBackendHandler, UserRequestFilter,
 };
-use lldap_domain_handlers::kerberos::{kerberos_backend, principal_name, require_kdc_ready};
+use lldap_domain_handlers::kerberos::{
+    kerberos_backend, principal_name, require_kdc_ready, validate_kerberos_username,
+};
 use lldap_domain_model::{
     error::{DomainError, Result},
     model::{self, GroupColumn, UserColumn, codec, system_config},
@@ -510,6 +512,7 @@ impl UserBackendHandler for SqlBackendHandler {
     #[instrument(skip(self), level = "debug", err, fields(user_id = ?request.user_id.as_str()))]
     async fn create_user(&self, mut request: CreateUserRequest) -> Result<()> {
         require_kdc_ready()?;
+        validate_kerberos_username(request.user_id.as_str()).map_err(DomainError::InternalError)?;
         let now = chrono::Utc::now().naive_utc();
         let uuid = Uuid::from_name_and_date(request.user_id.as_str(), &now);
         let lower_email = request.email.as_str().to_lowercase();
@@ -633,6 +636,23 @@ impl UserBackendHandler for SqlBackendHandler {
     #[instrument(skip_all, level = "debug", err, fields(user_id = ?user_id.as_str()))]
     async fn delete_user(&self, user_id: &UserId) -> Result<()> {
         require_kdc_ready()?;
+        let groups = self.get_user_groups(user_id).await?;
+        if groups
+            .iter()
+            .any(|g| g.display_name == "lldap_admin".into())
+        {
+            let admins = self
+                .list_users(
+                    Some(UserRequestFilter::MemberOf("lldap_admin".into())),
+                    false,
+                )
+                .await?;
+            if admins.len() <= 1 {
+                return Err(DomainError::InternalError(
+                    "Cannot delete the last member of lldap_admin".to_string(),
+                ));
+            }
+        }
         // Removed before the row delete, and idempotent, so a missing principal is fine.
         if let Err(e) = kerberos_backend().delete_principal(user_id.as_str()) {
             tracing::warn!(
@@ -1701,6 +1721,57 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(still_member.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_cannot_delete_last_lldap_admin_user() {
+        let fixture = TestFixture::new().await;
+        let admin_gid = fixture
+            .handler
+            .create_group(CreateGroupRequest {
+                display_name: "lldap_admin".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        fixture
+            .handler
+            .add_user_to_group(&UserId::new("bob"), admin_gid)
+            .await
+            .unwrap();
+        let err = fixture
+            .handler
+            .delete_user(&UserId::new("bob"))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("last member of lldap_admin"),
+            "expected last-admin delete protection, got: {err}"
+        );
+        fixture
+            .handler
+            .get_user_details(&UserId::new("bob"))
+            .await
+            .expect("last admin must still exist");
+    }
+
+    #[tokio::test]
+    async fn test_create_user_rejects_reserved_kerberos_name() {
+        let fixture = TestFixture::new().await;
+        let err = fixture
+            .handler
+            .create_user(CreateUserRequest {
+                user_id: UserId::new("krbtgt"),
+                email: "krbtgt@example.com".into(),
+                display_name: None,
+                attributes: Vec::new(),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("reserved"),
+            "expected reserved principal rejection, got: {err}"
+        );
     }
 
     #[tokio::test]

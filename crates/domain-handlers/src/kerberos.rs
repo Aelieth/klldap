@@ -41,6 +41,66 @@ pub fn principal_name(username: &str) -> String {
     format!("{username}@{}", derive_realm_from_base_dn())
 }
 
+const RESERVED_PRINCIPALS: &[&str] = &["krbtgt", "kadmin", "kiprop", "wellknown"];
+
+/// Usernames that become `{user}@{realm}` must be a single principal component:
+/// no `/` `@` whitespace (those would parse as another principal or feed
+/// `kadmin.local -q`), and never the KDC's own reserved names.
+pub fn validate_kerberos_username(username: &str) -> Result<(), String> {
+    if username.is_empty() || username.len() > 128 {
+        return Err("Kerberos username is empty or longer than 128 characters".to_owned());
+    }
+    let mut chars = username.chars();
+    let Some(first) = chars.next() else {
+        return Err("Kerberos username is empty".to_owned());
+    };
+    if !first.is_ascii_alphanumeric()
+        || !chars.all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    {
+        return Err("Kerberos username must be ASCII alphanumeric plus '.', '_' or '-'".to_owned());
+    }
+    if RESERVED_PRINCIPALS
+        .iter()
+        .any(|reserved| username.eq_ignore_ascii_case(reserved))
+    {
+        return Err(format!(
+            "Kerberos username '{username}' is reserved by the KDC"
+        ));
+    }
+    Ok(())
+}
+
+/// Hostnames interpolated into `HTTP/{host}@{realm}` and then into
+/// `kadmin.local -q` must be a DNS name or IPv4 address: no spaces, slashes
+/// or newlines that would split the query.
+pub fn validate_keytab_hostname(hostname: &str) -> Result<(), String> {
+    if hostname.is_empty() || hostname.len() > 253 {
+        return Err("Keytab hostname is empty or longer than 253 characters".to_owned());
+    }
+    if hostname.starts_with('.') || hostname.ends_with('.') {
+        return Err("Keytab hostname must be a DNS name or IPv4 address".to_owned());
+    }
+    for label in hostname.split('.') {
+        if label.is_empty() || label.len() > 63 {
+            return Err("Keytab hostname has an empty or oversized label".to_owned());
+        }
+        let bytes = label.as_bytes();
+        if !bytes[0].is_ascii_alphanumeric() || !bytes[label.len() - 1].is_ascii_alphanumeric() {
+            return Err(
+                "Keytab hostname labels must start and end with an alphanumeric character"
+                    .to_owned(),
+            );
+        }
+        if !bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+        {
+            return Err("Keytab hostname contains invalid characters".to_owned());
+        }
+    }
+    Ok(())
+}
+
 pub trait KerberosSync: Send + Sync {
     /// Whether the KDC has been reachable at least once since the process started.
     fn ready(&self) -> bool {
@@ -146,5 +206,68 @@ mod tests {
             format!("bob@{}", realm_from(Some("gate.test"), "dc=unused,dc=com")),
             "bob@GATE.TEST"
         );
+    }
+
+    #[test]
+    fn test_validate_kerberos_username_accepts_directory_ids() {
+        for name in [
+            "bob",
+            "admin",
+            "bob.smith",
+            "bob_smith",
+            "bob-1",
+            &format!("user-{}", "a".repeat(60)),
+        ] {
+            assert_eq!(validate_kerberos_username(name), Ok(()), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_validate_kerberos_username_rejects_injection_and_reserved() {
+        for name in [
+            "",
+            "bob/admin",
+            "bob@realm",
+            "bob principal",
+            "bob\ndelprinc",
+            "krbtgt",
+            "KAdmin",
+            "kiprop",
+            "WELLKNOWN",
+            "-leading",
+            "has space",
+        ] {
+            assert!(
+                validate_kerberos_username(name).is_err(),
+                "expected {name:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_validate_keytab_hostname_accepts_dns_and_ipv4() {
+        for host in ["keycloak", "keycloak.example.com", "192.168.1.10"] {
+            assert_eq!(validate_keytab_hostname(host), Ok(()), "{host}");
+        }
+    }
+
+    #[test]
+    fn test_validate_keytab_hostname_rejects_kadmin_injection() {
+        for host in [
+            "",
+            "foo\ndelprinc admin/admin",
+            "foo; delprinc",
+            "foo bar",
+            "../etc",
+            "foo/bar",
+            "-leading",
+            ".example.com",
+            "example.com.",
+        ] {
+            assert!(
+                validate_keytab_hostname(host).is_err(),
+                "expected {host:?} to be rejected"
+            );
+        }
     }
 }

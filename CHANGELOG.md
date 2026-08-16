@@ -17,6 +17,28 @@ container test gate, and a code sweep back to LLDAP's shape.
 - Members of `lldap_password_manager` could not change another user's password through
   LDAP Modify `userPassword` (the extended PasswordModify operation worked); LDAP Modify
   now applies the same password rules as the extended operation.
+- Adding a user to `lldap_disabled` now also blocks their existing web session (JWT and
+  refresh) and refuses a password-reset email, matching the bind/login denial. A leftover
+  token previously stayed valid until expiry.
+- Kerberos usernames and Keycloak keytab hostnames are validated before they reach
+  `kadmin.local` or kadm5: reserved principals (`krbtgt`, `kadmin`, …) and injected
+  characters (`/`, newlines) are rejected so a directory user cannot overwrite the TGS
+  key or split a `ktadd` query.
+- Federation URLs must be `http://` or `https://`; `file://` and other schemes are
+  rejected before the server connects. `LLDAP_KEYCLOAK_ADMIN_PASS` has no default
+  (`admin` is no longer implied). Exported Keycloak keytabs are `0600`.
+- Refresh and password-reset tokens are generated with `OsRng` (they used
+  `SmallRng`, weaker than LLDAP). LDAP Password Modify no longer panics when a
+  regular user targets another identity (InsufficientAccessRights, as upstream).
+- Unauthenticated LDAP subschema searches are refused (same as LLDAP). `ldapadd`
+  with `userPassword` now stores the bind password, not only a Kerberos principal.
+- Built-in group protection (`lldap_admin`, …) is case-insensitive.
+- LDAP/GraphQL cannot delete the last `lldap_admin` member (GraphQL already
+  blocked self-delete; LDAP `ldapdelete` on `admin` emptied the admin group).
+- User IDs that would become reserved Kerberos principals (`krbtgt`, `kadmin`,
+  names with `/` or `@`) are rejected at create.
+- Disabled-account login returns the same client error as a failed bind
+  (server logs still say the account is disabled).
 
 ### Migration from LLDAP
 

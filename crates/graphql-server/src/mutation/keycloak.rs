@@ -37,7 +37,7 @@ pub(super) struct PushRealmResponse {
     message: String,
 }
 
-#[derive(juniper::GraphQLInputObject, Debug)]
+#[derive(juniper::GraphQLInputObject)]
 pub(super) struct PushRealmToKeycloakInput {
     url: String,
     realm: String,
@@ -61,8 +61,12 @@ pub(super) async fn test_keycloak_connection<Handler: FullHandler + OpaqueHandle
             &span,
             "Unauthorized Keycloak connection test",
         ))?;
-    let client =
-        KeycloakClient::from_test_input(input.url, input.realm, input.admin_user, input.admin_pass);
+    let client = KeycloakClient::from_test_input(
+        input.url,
+        input.realm,
+        input.admin_user,
+        input.admin_pass,
+    )?;
     match client.test_connection().await {
         Ok(message) => Ok(TestKeycloakConnectionResponse { ok: true, message }),
         Err(e) => Ok(TestKeycloakConnectionResponse {
@@ -83,6 +87,7 @@ pub(super) async fn save_keycloak_config<Handler: FullHandler + OpaqueHandler>(
             &span,
             "Unauthorized Keycloak config change",
         ))?;
+    lldap_keycloak::validate_keycloak_url(&input.url)?;
     let config = KeycloakConfig {
         url: input.url,
         realm: input.realm,
@@ -114,8 +119,12 @@ pub(super) async fn push_realm_to_keycloak<Handler: FullHandler + OpaqueHandler>
             &span,
             "Unauthorized Keycloak realm push",
         ))?;
-    let client =
-        KeycloakClient::from_test_input(input.url, input.realm, input.admin_user, input.admin_pass);
+    let client = KeycloakClient::from_test_input(
+        input.url,
+        input.realm,
+        input.admin_user,
+        input.admin_pass,
+    )?;
     let message = client
         .setup_realm(
             input.lldap_url,

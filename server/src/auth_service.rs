@@ -125,6 +125,11 @@ where
     if !path.ends_with('/') {
         path.push('/');
     };
+    if account_is_disabled(&data, &user).await {
+        return Err(TcpError::DomainError(DomainError::AuthenticationError(
+            "Account disabled".to_string(),
+        )));
+    }
     let groups = data.get_readonly_handler().get_user_groups(&user).await?;
     let token = create_jwt(data.get_tcp_handler(), jwt_key, &user, groups).await;
     Ok(HttpResponse::Ok()
@@ -469,13 +474,14 @@ where
 {
     use actix_web::FromRequest;
     let inner_payload = &mut payload.into_inner();
-    let validation_result = BearerAuth::from_request(&request, inner_payload)
-        .await
-        .ok()
-        .and_then(|bearer| check_if_token_is_valid(&data, bearer.token()).ok())
-        .ok_or_else(|| {
-            TcpError::UnauthorizedError("Not authorized to change the user's password".to_string())
-        })?;
+    let bearer = BearerAuth::from_request(&request, inner_payload).await.ok();
+    let validation_result = match bearer {
+        Some(bearer) => check_if_token_is_valid(&data, bearer.token()).await.ok(),
+        None => None,
+    }
+    .ok_or_else(|| {
+        TcpError::UnauthorizedError("Not authorized to change the user's password".to_string())
+    })?;
     let registration_start_request =
         web::Json::<registration::ClientRegistrationStartRequest>::from_request(
             &request,
@@ -598,8 +604,20 @@ where
     }
 }
 
+async fn account_is_disabled<Backend: BackendHandler>(
+    state: &AppState<Backend>,
+    user: &UserId,
+) -> bool {
+    match state.get_readonly_handler().get_user_groups(user).await {
+        Ok(groups) => groups
+            .iter()
+            .any(|g| g.display_name == "lldap_disabled".into()),
+        Err(_) => true,
+    }
+}
+
 #[instrument(skip_all, level = "debug", err, ret)]
-pub(crate) fn check_if_token_is_valid<Backend: BackendHandler + OpaqueHandler>(
+pub(crate) async fn check_if_token_is_valid<Backend: BackendHandler + OpaqueHandler>(
     state: &AppState<Backend>,
     token_str: &str,
 ) -> Result<ValidationResults, actix_web::Error> {
@@ -618,8 +636,12 @@ pub(crate) fn check_if_token_is_valid<Backend: BackendHandler + OpaqueHandler>(
     if state.jwt_blacklist.read().unwrap().contains(&jwt_hash) {
         return Err(ErrorUnauthorized("JWT was logged out"));
     }
+    let user = UserId::new(&token.claims().user);
+    if account_is_disabled(state, &user).await {
+        return Err(ErrorUnauthorized("Account disabled"));
+    }
     Ok(state.backend_handler.get_permissions_from_groups(
-        UserId::new(&token.claims().user),
+        user,
         token
             .claims()
             .groups

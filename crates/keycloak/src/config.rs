@@ -54,6 +54,28 @@ impl KeycloakConfig {
     }
 }
 
-pub fn admin_password() -> String {
-    env::var("LLDAP_KEYCLOAK_ADMIN_PASS").unwrap_or_else(|_| "admin".to_owned())
+pub fn admin_password() -> Result<String> {
+    admin_password_from(env::var("LLDAP_KEYCLOAK_ADMIN_PASS").ok().as_deref())
+}
+
+fn admin_password_from(value: Option<&str>) -> Result<String> {
+    value
+        .map(str::trim)
+        .filter(|pass| !pass.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("LLDAP_KEYCLOAK_ADMIN_PASS is not set"))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_admin_password_has_no_default() {
+        assert!(super::admin_password_from(None).is_err());
+        assert!(super::admin_password_from(Some("")).is_err());
+        assert!(super::admin_password_from(Some("   ")).is_err());
+        assert_eq!(
+            super::admin_password_from(Some("s3cret")).unwrap(),
+            "s3cret"
+        );
+    }
 }

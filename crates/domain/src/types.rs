@@ -603,5 +603,20 @@ pub const BUILTIN_GROUPS: &[&str] = &[
 ];
 
 pub fn is_builtin_group(name: &str) -> bool {
-    BUILTIN_GROUPS.contains(&name)
+    BUILTIN_GROUPS
+        .iter()
+        .any(|builtin| builtin.eq_ignore_ascii_case(name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_builtin_group;
+
+    #[test]
+    fn test_is_builtin_group_is_case_insensitive() {
+        assert!(is_builtin_group("lldap_admin"));
+        assert!(is_builtin_group("LLDAP_ADMIN"));
+        assert!(is_builtin_group("Lldap_Disabled"));
+        assert!(!is_builtin_group("family"));
+    }
 }

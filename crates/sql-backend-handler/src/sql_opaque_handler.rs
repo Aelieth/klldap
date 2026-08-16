@@ -63,7 +63,7 @@ impl SqlBackendHandler {
     }
 
     #[instrument(skip(self), level = "debug")]
-    async fn is_user_disabled(&self, user_id: &UserId) -> Result<bool> {
+    pub async fn is_user_disabled(&self, user_id: &UserId) -> Result<bool> {
         use lldap_domain_model::model::{groups, memberships};
         use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
@@ -98,9 +98,10 @@ impl LoginHandler for SqlBackendHandler {
                 r#"Login attempt denied for disabled user "{}""#,
                 &request.name
             );
-            return Err(DomainError::AuthenticationError(
-                "- Account disabled. Contact administrator.".to_string(),
-            ));
+            return Err(DomainError::AuthenticationError(format!(
+                r#"for user "{}""#,
+                request.name
+            )));
         }
 
         if let Some(password_hash) = self
@@ -145,9 +146,10 @@ impl OpaqueHandler for SqlOpaqueHandler {
                 r#"OPAQUE login attempt denied for disabled user "{}""#,
                 &user_id
             );
-            return Err(DomainError::AuthenticationError(
-                "- Account disabled. Contact administrator.".to_string(),
-            ));
+            return Err(DomainError::AuthenticationError(format!(
+                r#"for user "{}""#,
+                user_id
+            )));
         }
 
         info!(r#"OPAQUE login attempt for "{}""#, &user_id);
@@ -199,9 +201,10 @@ impl OpaqueHandler for SqlOpaqueHandler {
                 r#"OPAQUE login_finish denied for disabled user "{}""#,
                 &username
             );
-            return Err(DomainError::AuthenticationError(
-                "- Account disabled. Contact administrator.".to_string(),
-            ));
+            return Err(DomainError::AuthenticationError(format!(
+                r#"for user "{}""#,
+                username
+            )));
         }
 
         match opaque::server::login::finish_login(server_login, request.credential_finalization) {
@@ -385,8 +388,29 @@ mod tests {
             .unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("disabled") || msg.contains("Account disabled"),
-            "unexpected error: {msg}"
+            msg.contains(r#"for user "bob""#),
+            "disabled login must look like a failed bind, got: {msg}"
+        );
+        assert!(
+            !msg.to_lowercase().contains("disabled"),
+            "must not leak account-disabled to the client: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_is_user_disabled_follows_membership() {
+        let sql_pool = get_initialized_db().await;
+        let handler = SqlOpaqueHandler::new(generate_random_private_key(), sql_pool.clone());
+        insert_user(&handler, "bob", "bob00").await;
+        assert!(
+            !handler.is_user_disabled(&UserId::new("bob")).await.unwrap(),
+            "fresh user is not disabled"
+        );
+        let disabled_gid = insert_group(&handler, "lldap_disabled").await;
+        insert_membership(&handler, disabled_gid, "bob").await;
+        assert!(
+            handler.is_user_disabled(&UserId::new("bob")).await.unwrap(),
+            "membership in lldap_disabled must be detected"
         );
     }
 }

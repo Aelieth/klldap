@@ -129,7 +129,7 @@ async fn graphql_route<Handler: BackendHandler + lldap_opaque_handler::OpaqueHan
 ) -> Result<HttpResponse, Error> {
     let mut inner_payload = payload.into_inner();
     let bearer = BearerAuth::from_request(&req, &mut inner_payload).await?;
-    let validation_result = check_if_token_is_valid(&data, bearer.token())?;
+    let validation_result = check_if_token_is_valid(&data, bearer.token()).await?;
     let context = Context::<Handler> {
         handler: data.backend_handler.clone(),
         validation_result,

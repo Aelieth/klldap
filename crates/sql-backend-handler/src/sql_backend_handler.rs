@@ -1,6 +1,7 @@
 use crate::sql_tables::DbConnection;
+use itertools::Itertools;
 use lldap_auth::opaque::server::ServerSetup;
-use lldap_domain::types::{AttributeName, AttributeValue};
+use lldap_domain::types::{Attribute, AttributeName, AttributeValue};
 use lldap_schema::PublicSchema;
 use sea_orm::sea_query::{Cond, IntoCondition, SimpleExpr};
 
@@ -28,6 +29,25 @@ pub(crate) fn is_backend_writable_readonly_attribute(name: &str) -> bool {
     )
 }
 
+/// Names only, never values: what an update touched, for the log detail.
+pub(crate) fn describe_changes(
+    inserted: &[Attribute],
+    deleted: &[AttributeName],
+    fields: &[(&str, bool)],
+) -> String {
+    inserted
+        .iter()
+        .map(|a| a.name.as_str().to_owned())
+        .chain(deleted.iter().map(|a| format!("-{}", a.as_str())))
+        .chain(
+            fields
+                .iter()
+                .filter(|(_, changed)| *changed)
+                .map(|(name, _)| (*name).to_owned()),
+        )
+        .join(", ")
+}
+
 pub(crate) fn attribute_value_to_db_bytes(value: &AttributeValue) -> Vec<u8> {
     lldap_domain_model::model::codec::encode_attribute_value(value)
 }
@@ -36,14 +56,22 @@ pub(crate) fn attribute_value_to_db_bytes(value: &AttributeValue) -> Vec<u8> {
 pub struct SqlBackendHandler {
     pub(crate) opaque_setup: ServerSetup,
     pub(crate) sql_pool: DbConnection,
+    pub(crate) read_pool: DbConnection,
 }
 
 impl SqlBackendHandler {
     pub fn new(opaque_setup: ServerSetup, sql_pool: DbConnection) -> Self {
         SqlBackendHandler {
             opaque_setup,
+            read_pool: sql_pool.clone(),
             sql_pool,
         }
+    }
+
+    /// The log lookups read on this pool, so a slow summary cannot queue binds behind it.
+    pub fn with_read_pool(mut self, read_pool: DbConnection) -> Self {
+        self.read_pool = read_pool;
+        self
     }
 
     pub fn pool(&self) -> &DbConnection {

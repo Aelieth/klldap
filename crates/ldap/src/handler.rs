@@ -20,9 +20,12 @@ use ldap3_proto::proto::{
 };
 use lldap_access_control::AccessControlledBackendHandler;
 use lldap_auth::access_control::ValidationResults;
+use lldap_domain::types::UserId;
 use lldap_domain_handlers::handler::{BackendHandler, LoginHandler};
+use lldap_domain_handlers::logging::{self, LogKind, RequestMeta, with_request};
 use lldap_opaque_handler::OpaqueHandler;
 use lldap_schema::PublicSchema;
+use std::net::IpAddr;
 use tracing::{debug, instrument};
 
 use super::delete::make_del_response;
@@ -63,6 +66,7 @@ pub struct LdapHandler<Backend> {
     backend_handler: AccessControlledBackendHandler<Backend>,
     ldap_info: &'static LdapInfo,
     session_uuid: uuid::Uuid,
+    peer: Option<IpAddr>,
 }
 
 impl<Backend> LdapHandler<Backend> {
@@ -93,12 +97,14 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
         backend_handler: AccessControlledBackendHandler<Backend>,
         ldap_info: &'static LdapInfo,
         session_uuid: uuid::Uuid,
+        peer: Option<IpAddr>,
     ) -> Self {
         Self {
             user_info: None,
             backend_handler,
             ldap_info,
             session_uuid,
+            peer,
         }
     }
 
@@ -110,6 +116,7 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
                 LdapInfo::new(ldap_base_dn, Vec::new(), Vec::new()).unwrap(),
             )),
             uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap(),
+            Some(std::net::Ipv4Addr::LOCALHOST.into()),
         )
     }
 
@@ -172,44 +179,17 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
 
     #[instrument(skip_all, level = "debug", fields(dn = %request.dn))]
     pub async fn do_bind(&mut self, request: &LdapBindRequest) -> Vec<LdapOp> {
-        let (code, message) = {
-            match password::do_bind(self.ldap_info, request, self.get_login_handler()).await {
-                Ok(user_id) => {
-                    let inner = self.backend_handler.unsafe_get_handler();
-                    match inner.get_user_details(&user_id).await {
-                        Ok(user) => {
-                            let stored_ou = crate::attributes::get_user_ou(&user);
-                            let provided_ou = if let Ok(parts) = crate::dn::parse_distinguished_name(
-                                &request.dn.to_ascii_lowercase(),
-                            ) {
-                                crate::dn::get_internal_ou_from_dn_parts(&parts)
-                            } else {
-                                String::new()
-                            };
-
-                            if provided_ou.eq_ignore_ascii_case(&stored_ou) {
-                                self.user_info = self
-                                    .backend_handler
-                                    .get_permissions_for_user(user_id)
-                                    .await
-                                    .ok();
-                                debug!("Success! OU verified: {}", stored_ou);
-                                (LdapResultCode::Success, "".to_string())
-                            } else {
-                                debug!(
-                                    "Bind rejected - OU mismatch: provided='{}', stored='{}'",
-                                    provided_ou, stored_ou
-                                );
-                                (LdapResultCode::InvalidCredentials, "".to_string())
-                            }
-                        }
-                        Err(_) => (LdapResultCode::InvalidCredentials, "".to_string()),
-                    }
-                }
-                Err(err) => (err.code, err.message),
+        let (code, message) = match self.authenticate(request).await {
+            Ok(user_id) => {
+                self.user_info = self
+                    .backend_handler
+                    .get_permissions_for_user(user_id)
+                    .await
+                    .ok();
+                (LdapResultCode::Success, "".to_string())
             }
+            Err(err) => (err.code, err.message),
         };
-
         vec![LdapOp::BindResponse(LdapBindResponse {
             res: LdapResultOp {
                 code,
@@ -219,6 +199,49 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
             },
             saslcreds: None,
         })]
+    }
+
+    // A known user bound under the wrong OU is refused before any password work, so the
+    // login handler never records a success for a bind the server rejects.
+    async fn authenticate(&self, request: &LdapBindRequest) -> LdapResult<UserId> {
+        let (user_id, password) = password::parse_bind_request(self.ldap_info, request)
+            .inspect_err(|err| {
+                logging::record_as(
+                    None,
+                    LogKind::Bind,
+                    (!request.dn.is_empty()).then_some(request.dn.as_str()),
+                    false,
+                    Some(&err.message),
+                );
+            })?;
+        let inner = self.backend_handler.unsafe_get_handler();
+        if let Ok(user) = inner.get_user_details(&user_id).await {
+            let stored_ou = crate::attributes::get_user_ou(&user);
+            let provided_ou =
+                match crate::dn::parse_distinguished_name(&request.dn.to_ascii_lowercase()) {
+                    Ok(parts) => crate::dn::get_internal_ou_from_dn_parts(&parts),
+                    Err(_) => String::new(),
+                };
+            if !provided_ou.eq_ignore_ascii_case(&stored_ou) {
+                debug!(
+                    "Bind rejected - OU mismatch: provided='{}', stored='{}'",
+                    provided_ou, stored_ou
+                );
+                logging::record_as(
+                    Some(&user_id),
+                    LogKind::Bind,
+                    None,
+                    false,
+                    Some("ou mismatch"),
+                );
+                return Err(LdapError {
+                    code: LdapResultCode::InvalidCredentials,
+                    message: "".to_string(),
+                });
+            }
+        }
+        // Wrong passwords and unknown users are recorded by the login handler itself.
+        password::bind(self.get_login_handler(), user_id, password).await
     }
 
     #[instrument(skip_all, level = "debug")]
@@ -355,6 +378,16 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
     }
 
     pub async fn handle_ldap_message(&mut self, ldap_op: LdapOp) -> Option<Vec<LdapOp>> {
+        let meta = RequestMeta::ldap(self.user_info.as_ref().map(|u| u.user.clone()), self.peer);
+        with_request(meta, async {
+            let response = self.dispatch(ldap_op).await;
+            record_denial(response.as_deref());
+            response
+        })
+        .await
+    }
+
+    async fn dispatch(&mut self, ldap_op: LdapOp) -> Option<Vec<LdapOp>> {
         Some(match ldap_op {
             LdapOp::BindRequest(request) => self.do_bind(&request).await,
             LdapOp::SearchRequest(request) => self
@@ -394,12 +427,53 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
     }
 }
 
+// Every denial ends in a result op with InsufficentAccessRights, so one look at the
+// response covers all of them.
+fn record_denial(response: Option<&[LdapOp]>) {
+    let Some(result) = response.and_then(|ops| ops.last()).and_then(result_of) else {
+        return;
+    };
+    if result.code == LdapResultCode::InsufficentAccessRights {
+        logging::record_failure(LogKind::AccessDenied, None, &result.message);
+    }
+}
+
+fn result_of(op: &LdapOp) -> Option<&LdapResultOp> {
+    match op {
+        LdapOp::BindResponse(response) => Some(&response.res),
+        LdapOp::ExtendedResponse(response) => Some(&response.res),
+        LdapOp::SearchResultDone(result)
+        | LdapOp::ModifyResponse(result)
+        | LdapOp::AddResponse(result)
+        | LdapOp::DelResponse(result)
+        | LdapOp::CompareResult(result)
+        | LdapOp::ModifyDNResponse(result) => Some(result),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
     use lldap_auth::access_control::{Permission, ValidationResults};
     use lldap_domain::types::UserId;
-    use lldap_test_utils::MockTestBackendHandler;
+    use lldap_domain_handlers::logging::Protocol;
+    use lldap_domain_model::error::DomainError;
+    use lldap_test_utils::{
+        MockTestBackendHandler, recording_log::LogGuard, setup_default_ldap_mock,
+    };
+    use pretty_assertions::assert_eq;
+    use serial_test::serial;
+
+    // Non-serial tests record too; a private peer address keeps each test's events apart.
+    fn events_from(guard: &LogGuard, peer: &str) -> Vec<lldap_domain_handlers::logging::LogEvent> {
+        guard
+            .recorder()
+            .take_events()
+            .into_iter()
+            .filter(|e| e.peer.as_deref() == Some(peer))
+            .collect()
+    }
 
     pub async fn setup_bound_handler_with_group(
         mock: MockTestBackendHandler,
@@ -435,6 +509,155 @@ pub mod tests {
         mock: MockTestBackendHandler,
     ) -> LdapHandler<MockTestBackendHandler> {
         setup_bound_handler_with_group(mock, "lldap_strict_readonly").await
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_denied_write_records_access_denied_with_actor_and_peer() {
+        let mut mock = MockTestBackendHandler::new();
+        setup_default_ldap_mock(&mut mock);
+        let mut handler = setup_bound_handler_with_group(mock, "regular").await;
+        handler.peer = Some("198.51.100.1".parse().unwrap());
+        let guard = LogGuard::install();
+
+        let response = handler
+            .handle_ldap_message(LdapOp::DelRequest(
+                "uid=bob,ou=people,dc=example,dc=com".to_string(),
+            ))
+            .await;
+        assert_eq!(
+            response,
+            Some(vec![make_del_response(
+                LdapResultCode::InsufficentAccessRights,
+                "Unauthorized write".to_string(),
+            )])
+        );
+
+        let events = events_from(&guard, "198.51.100.1");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, LogKind::AccessDenied);
+        assert!(!events[0].success);
+        assert_eq!(events[0].actor.as_deref(), Some("test"));
+        assert_eq!(events[0].protocol, Protocol::Ldap);
+        assert_eq!(events[0].detail.as_deref(), Some("Unauthorized write"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_unbound_request_records_access_denied_without_an_actor() {
+        let mut handler =
+            LdapHandler::new_for_tests(MockTestBackendHandler::new(), "dc=example,dc=com");
+        handler.peer = Some("198.51.100.2".parse().unwrap());
+        let guard = LogGuard::install();
+
+        handler
+            .handle_ldap_message(LdapOp::ExtendedRequest(LdapExtendedRequest {
+                name: OID_WHOAMI.to_string(),
+                value: None,
+            }))
+            .await;
+
+        let events = events_from(&guard, "198.51.100.2");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, LogKind::AccessDenied);
+        assert_eq!(events[0].actor, None);
+        assert_eq!(events[0].detail.as_deref(), Some("No user currently bound"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_ldap_layer_records_only_non_credential_bind_failures() {
+        use ldap3_proto::proto::LdapBindCred;
+        let mut mock = MockTestBackendHandler::new();
+        setup_default_ldap_mock(&mut mock);
+        mock.expect_bind()
+            .returning(|_| Err(DomainError::AuthenticationError("nope".to_string())));
+        let mut handler = LdapHandler::new_for_tests(mock, "dc=example,dc=com");
+        handler.peer = Some("198.51.100.3".parse().unwrap());
+        let guard = LogGuard::install();
+
+        for (dn, cred) in [
+            (
+                "uid=bob,ou=people,dc=example,dc=com",
+                LdapBindCred::Simple("wrong".to_string()),
+            ),
+            ("", LdapBindCred::Simple("wrong".to_string())),
+            (
+                "uid=bob,ou=people,dc=example,dc=com",
+                LdapBindCred::SASL(ldap3_proto::proto::SaslCredentials {
+                    mechanism: "GSSAPI".to_string(),
+                    credentials: vec![],
+                }),
+            ),
+            (
+                "cn=bob,ou=people,dc=other,dc=com",
+                LdapBindCred::Simple("wrong".to_string()),
+            ),
+        ] {
+            handler
+                .handle_ldap_message(LdapOp::BindRequest(LdapBindRequest {
+                    dn: dn.to_string(),
+                    cred,
+                }))
+                .await;
+        }
+
+        let events = events_from(&guard, "198.51.100.3");
+        let summary: Vec<_> = events
+            .iter()
+            .map(|e| (e.kind, e.target.as_deref(), e.detail.as_deref()))
+            .collect();
+        // The wrong password is the login handler's row, not the LDAP layer's.
+        assert_eq!(
+            summary,
+            vec![
+                (LogKind::Bind, None, Some("Anonymous bind not allowed")),
+                (
+                    LogKind::Bind,
+                    Some("uid=bob,ou=people,dc=example,dc=com"),
+                    Some("SASL not supported")
+                ),
+                (
+                    LogKind::Bind,
+                    Some("cn=bob,ou=people,dc=other,dc=com"),
+                    Some("Not a subtree of the base tree")
+                ),
+            ]
+        );
+        assert!(events.iter().all(|e| !e.success && e.actor.is_none()));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_ou_mismatch_bind_records_a_failure_for_the_user() {
+        use ldap3_proto::proto::LdapBindCred;
+        let mut mock = MockTestBackendHandler::new();
+        setup_default_ldap_mock(&mut mock);
+        // Refused before the password is checked: no login-handler success row.
+        mock.expect_bind().times(0);
+        let mut handler = LdapHandler::new_for_tests(mock, "dc=example,dc=com");
+        handler.peer = Some("198.51.100.4".parse().unwrap());
+        let guard = LogGuard::install();
+
+        let response = handler
+            .handle_ldap_message(LdapOp::BindRequest(LdapBindRequest {
+                dn: "uid=bob,ou=lab,dc=example,dc=com".to_string(),
+                cred: LdapBindCred::Simple("pass".to_string()),
+            }))
+            .await;
+        assert_eq!(
+            response,
+            Some(crate::password::tests::make_bind_result(
+                LdapResultCode::InvalidCredentials,
+                ""
+            ))
+        );
+
+        let events = events_from(&guard, "198.51.100.4");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, LogKind::Bind);
+        assert_eq!(events[0].actor.as_deref(), Some("bob"));
+        assert_eq!(events[0].detail.as_deref(), Some("ou mismatch"));
     }
 
     #[tokio::test]

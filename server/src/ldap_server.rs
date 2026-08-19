@@ -9,6 +9,7 @@ use lldap_access_control::AccessControlledBackendHandler;
 use lldap_domain_handlers::handler::{BackendHandler, LoginHandler};
 use lldap_ldap::{LdapHandler, LdapInfo};
 use lldap_opaque_handler::OpaqueHandler;
+use std::net::IpAddr;
 use tokio_rustls::TlsAcceptor as RustlsTlsAcceptor;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing::{debug, error, info, instrument};
@@ -34,12 +35,11 @@ where
     }
     debug!(?msg);
 
-    // Real operations that matter to an admin (bind, modify, add, delete, extended)
-    // All SearchRequests (the 30-second idle keepalive pings) stay silent at debug level.
+    // Modify, add, delete and extended still matter to an admin at info; binds have their
+    // own log events, and searches (the 30-second keepalive pings) stay debug.
     let is_real_operation = matches!(
         msg.op,
-        LdapOp::BindRequest(_)
-            | LdapOp::ModifyRequest(_)
+        LdapOp::ModifyRequest(_)
             | LdapOp::AddRequest(_)
             | LdapOp::DelRequest(_)
             | LdapOp::ExtendedRequest(_)
@@ -55,10 +55,7 @@ where
             if is_real_operation {
                 info!("LDAP request session_id: {}", session.session_uuid());
             } else {
-                debug!(
-                    "LDAP request [idle ping] session_id: {}",
-                    session.session_uuid()
-                );
+                debug!("LDAP request session_id: {}", session.session_uuid());
             }
 
             let results: i64 = result.len().try_into().unwrap();
@@ -93,6 +90,7 @@ async fn handle_ldap_stream<Stream, Backend>(
     stream: Stream,
     backend_handler: Backend,
     ldap_info: &'static LdapInfo,
+    peer: Option<IpAddr>,
 ) -> Result<Stream>
 where
     Backend: BackendHandler + LoginHandler + OpaqueHandler + 'static,
@@ -108,6 +106,7 @@ where
         AccessControlledBackendHandler::new(backend_handler),
         ldap_info,
         session_uuid,
+        peer,
     );
 
     debug!("LDAP session start: {}", session_uuid);
@@ -174,7 +173,8 @@ where
             let context = context.clone();
             async move {
                 let (handler, ldap_info) = context;
-                handle_ldap_stream(stream, handler, ldap_info).await
+                let peer = stream.peer_addr().ok().map(|addr| addr.ip());
+                handle_ldap_stream(stream, handler, ldap_info, peer).await
             }
         })
         .map_err(|err: anyhow::Error| error!("[LDAP] Service Error: {:#}", err))
@@ -196,8 +196,9 @@ where
                 let tls_context = tls_context.clone();
                 async move {
                     let ((handler, ldap_info), tls_acceptor) = tls_context;
+                    let peer = stream.peer_addr().ok().map(|addr| addr.ip());
                     let tls_stream = tls_acceptor.accept(stream).await?;
-                    handle_ldap_stream(tls_stream, handler, ldap_info).await
+                    handle_ldap_stream(tls_stream, handler, ldap_info, peer).await
                 }
             })
             .map_err(|err: anyhow::Error| error!("[LDAPS] Service Error: {:#}", err))

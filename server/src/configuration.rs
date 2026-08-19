@@ -1,6 +1,6 @@
 use crate::{
     cli::{
-        GeneralConfigOpts, HealthcheckOpts, LdapsOpts, RunOpts, SmtpEncryption, SmtpOpts,
+        GeneralConfigOpts, HealthcheckOpts, LdapsOpts, LogOpts, RunOpts, SmtpEncryption, SmtpOpts,
         TestEmailOpts, TrueFalseAlways,
     },
     database_string::DatabaseUrl,
@@ -100,6 +100,25 @@ impl std::default::Default for HealthcheckOptions {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, derive_builder::Builder)]
+#[builder(pattern = "owned")]
+pub struct LogOptions {
+    #[builder(default = "true")]
+    pub persist: bool,
+    #[builder(default = "30")]
+    pub retention_days: u32,
+    #[builder(default = "50000")]
+    pub max_entries: u64,
+    #[builder(default = "300")]
+    pub bind_coalesce_seconds: u32,
+}
+
+impl std::default::Default for LogOptions {
+    fn default() -> Self {
+        LogOptionsBuilder::default().build().unwrap()
+    }
+}
+
 #[derive(Clone, Deserialize, Serialize, derive_more::Debug)]
 #[debug(r#""{_0}""#)]
 pub struct HttpUrl(pub Url);
@@ -155,6 +174,8 @@ pub struct Configuration {
     server_setup: Option<ServerSetupConfig>,
     #[builder(default)]
     pub healthcheck_options: HealthcheckOptions,
+    #[builder(default)]
+    pub log_options: LogOptions,
 }
 
 impl std::default::Default for Configuration {
@@ -484,6 +505,7 @@ impl ConfigOverrider for RunOpts {
         self.smtp_opts.override_config(config);
         self.ldaps_opts.override_config(config);
         self.healthcheck_opts.override_config(config);
+        self.log_opts.override_config(config);
     }
 }
 
@@ -572,6 +594,22 @@ impl ConfigOverrider for HealthcheckOpts {
         if self.healthcheck_kerberos {
             config.healthcheck_options.kerberos = true;
         }
+    }
+}
+
+impl ConfigOverrider for LogOpts {
+    fn override_config(&self, config: &mut Configuration) {
+        self.log_persist
+            .inspect(|&persist| config.log_options.persist = persist);
+
+        self.log_retention_days
+            .inspect(|&days| config.log_options.retention_days = days);
+
+        self.log_max_entries
+            .inspect(|&max_entries| config.log_options.max_entries = max_entries);
+
+        self.log_bind_coalesce_seconds
+            .inspect(|&seconds| config.log_options.bind_coalesce_seconds = seconds);
     }
 }
 
@@ -1023,6 +1061,34 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(err.contains("while parsing the contents of the"), "{err}");
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_log_options_defaults_file_env_and_cli_precedence() {
+        Jail::expect_with(|jail| {
+            jail.clear_env();
+            jail.set_env("LLDAP_JWT_SECRET", "secret");
+            let config = init(default_run_opts()).unwrap();
+            assert!(config.log_options.persist);
+            assert_eq!(config.log_options.retention_days, 30);
+            assert_eq!(config.log_options.max_entries, 50000);
+            assert_eq!(config.log_options.bind_coalesce_seconds, 300);
+
+            jail.create_file(
+                "lldap_config.toml",
+                "[log_options]\nmax_entries = 7\nretention_days = 5\nbind_coalesce_seconds = 9\n",
+            )?;
+            jail.set_env("LLDAP_LOG_OPTIONS__RETENTION_DAYS", "90");
+            let mut opts = default_run_opts();
+            opts.log_opts.log_persist = Some(false);
+            opts.log_opts.log_bind_coalesce_seconds = Some(0);
+            let config = init(opts).unwrap();
+            assert!(!config.log_options.persist);
+            assert_eq!(config.log_options.retention_days, 90);
+            assert_eq!(config.log_options.max_entries, 7);
+            assert_eq!(config.log_options.bind_coalesce_seconds, 0);
             Ok(())
         });
     }

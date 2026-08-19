@@ -51,6 +51,9 @@ Beyond LLDAP's users, groups, attributes and object classes, the schema exposes:
   `syncKerberosPassword`, `exportKeytabForKeycloak`.
 - Keycloak: `keycloakSuggestedConfig`, `keycloakConfig`, `testKeycloakConnection`,
   `saveKeycloakConfig`, `pushRealmToKeycloak`.
+- Event log (admin-only): `logs(filter, limit, beforeId, afterId)` for rows,
+  `logSummary(filter, groupBy, limit)` for counts, `logActivity(actor, kinds, since)` for
+  one account — see [logging](logging.md).
 
 `setUserPassword(userId, password)` sets a password over the API (self or admin): the
 server runs the OPAQUE registration itself, so nothing but the OPAQUE record is stored,
@@ -122,4 +125,21 @@ Then you can enter your query, for instance:
 }
 ```
 
-The schema is on the right, along with some basic docs.
+The schema is on the right, along with some basic docs. As an admin, the event log is one
+query away:
+
+```graphql
+{
+  logs(filter: {kinds: [BIND], success: false}, limit: 20) {
+    timestamp
+    actor
+    peer
+    detail
+  }
+  logSummary(filter: {kinds: [BIND, LOGIN], success: false}, groupBy: [ACTOR]) {
+    actor
+    count
+    last
+  }
+}
+```

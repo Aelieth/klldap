@@ -28,8 +28,9 @@ use actix_server::ServerBuilder;
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::TryFutureExt;
 use lldap_sql_backend_handler::{
-    SqlBackendHandler, register_password,
+    LogRetention, SqlBackendHandler, register_password,
     sql_tables::{self, get_private_key_info, set_private_key_info},
+    start_log_writer,
 };
 use sea_orm::{Database, DatabaseConnection};
 use std::{sync::Arc, time::Duration};
@@ -38,6 +39,7 @@ use tracing::{Instrument, Level, debug, error, info, instrument, span, warn};
 use lldap_domain::requests::{CreateGroupRequest, CreateUserRequest};
 use lldap_domain::types::{Attribute, BUILTIN_GROUPS};
 use lldap_domain_handlers::kerberos::set_kerberos_backend;
+use lldap_domain_handlers::logging::{LogKind, record};
 use lldap_kerberos::{live::LiveKerberos, paths::KerberosPaths};
 
 use lldap_domain_handlers::handler::{
@@ -115,6 +117,28 @@ async fn ensure_group_exists(handler: &SqlBackendHandler, group_name: &str) -> R
     Ok(())
 }
 
+// Log lookups read here so a slow summary cannot queue binds behind SQLite's one write
+// connection; other backends already run several connections.
+async fn setup_read_pool(
+    database_url: &DatabaseUrl,
+    sql_pool: &DatabaseConnection,
+) -> Result<DatabaseConnection> {
+    let connect_string = database_url.to_connect_string();
+    if database_url.db_type() != "sqlite" || connect_string.contains(":memory:") {
+        return Ok(sql_pool.clone());
+    }
+    let mut sql_opt = sea_orm::ConnectOptions::new(connect_string);
+    sql_opt
+        .max_connections(2)
+        .acquire_timeout(Duration::from_secs(10))
+        .sqlx_logging(true)
+        .sqlx_logging_level(log::LevelFilter::Debug)
+        .map_sqlx_sqlite_opts(|options| options.read_only(true));
+    Database::connect(sql_opt)
+        .await
+        .context("while opening the read-only pool for log lookups")
+}
+
 async fn setup_sql_tables(database_url: &DatabaseUrl) -> Result<DatabaseConnection> {
     let sql_pool = {
         let num_connections = if database_url.db_type() == "sqlite" {
@@ -138,11 +162,18 @@ async fn setup_sql_tables(database_url: &DatabaseUrl) -> Result<DatabaseConnecti
     Ok(sql_pool)
 }
 
-#[instrument(skip_all)]
-async fn set_up_server(config: Configuration) -> Result<(ServerBuilder, DatabaseConnection)> {
-    info!("Starting LLDAP version {}", env!("CARGO_PKG_VERSION"));
+fn log_retention(config: &Configuration) -> LogRetention {
+    LogRetention {
+        retention_days: config.log_options.retention_days,
+        max_entries: config.log_options.max_entries,
+    }
+}
 
-    let sql_pool = setup_sql_tables(&config.database_url).await?;
+#[instrument(skip_all)]
+async fn set_up_server(
+    config: Configuration,
+    sql_pool: DatabaseConnection,
+) -> Result<ServerBuilder> {
     let private_key_info = config.get_private_key_info();
     let force_update_private_key = config.force_update_private_key;
     match (
@@ -166,7 +197,8 @@ async fn set_up_server(config: Configuration) -> Result<(ServerBuilder, Database
         }
     }
     let backend_handler =
-        SqlBackendHandler::new(config.get_server_setup().clone(), sql_pool.clone());
+        SqlBackendHandler::new(config.get_server_setup().clone(), sql_pool.clone())
+            .with_read_pool(setup_read_pool(&config.database_url, &sql_pool).await?);
     for group in BUILTIN_GROUPS {
         ensure_group_exists(&backend_handler, group).await?;
     }
@@ -189,6 +221,11 @@ async fn set_up_server(config: Configuration) -> Result<(ServerBuilder, Database
             .await
             .map_err(|e| anyhow!("Error setting up admin login/account: {:#}", e))
             .context("while creating the admin user")?;
+        record(
+            LogKind::AdminBootstrap,
+            Some(config.ldap_user_dn.as_str()),
+            Some("admin user created"),
+        );
     } else if config.force_ldap_user_pass_reset.is_positive() {
         let span = if config.force_ldap_user_pass_reset.is_yes() {
             span!(
@@ -214,6 +251,11 @@ async fn set_up_server(config: Configuration) -> Result<(ServerBuilder, Database
             "while resetting admin password for {}",
             config.ldap_user_dn
         ))?;
+        record(
+            LogKind::AdminBootstrap,
+            Some(config.ldap_user_dn.as_str()),
+            Some("admin password reset from the configuration"),
+        );
     }
     if config.force_update_private_key || config.force_ldap_user_pass_reset.is_yes() {
         bail!(
@@ -235,9 +277,9 @@ async fn set_up_server(config: Configuration) -> Result<(ServerBuilder, Database
         .await
         .context("while binding the TCP server")?;
     // Run every hour.
-    let scheduler = Scheduler::new("0 0 * * * * *", sql_pool.clone());
+    let scheduler = Scheduler::new("0 0 * * * * *", sql_pool, log_retention(&config));
     scheduler.start();
-    Ok((server_builder, sql_pool))
+    Ok(server_builder)
 }
 
 async fn run_server_command(opts: RunOpts) -> Result<()> {
@@ -245,11 +287,32 @@ async fn run_server_command(opts: RunOpts) -> Result<()> {
 
     let config = configuration::init_with_private_key(opts)?;
     logging::init(&config)?;
+    info!("Starting LLDAP version {}", env!("CARGO_PKG_VERSION"));
 
-    let (server, sql_pool) = set_up_server(config).await?;
-    let server = server.workers(1);
+    let sql_pool = setup_sql_tables(&config.database_url).await?;
+    let log_writer = config.log_options.persist.then(|| {
+        start_log_writer(
+            sql_pool.clone(),
+            log_retention(&config),
+            config.log_options.bind_coalesce_seconds,
+        )
+    });
 
-    let result = server.run().await.context("while starting the server");
+    // One exit path, so the one-shot force flags and errors flush the log too.
+    let result = match set_up_server(config, sql_pool.clone()).await {
+        Ok(server) => {
+            record(LogKind::ServerStart, None, Some(env!("CARGO_PKG_VERSION")));
+            server
+                .workers(1)
+                .run()
+                .await
+                .context("while starting the server")
+        }
+        Err(e) => Err(e),
+    };
+    if let Some(writer) = log_writer {
+        writer.shutdown().await;
+    }
     if let Err(e) = sql_pool.close().await {
         error!("Error closing database connection pool: {}", e);
     }

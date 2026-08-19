@@ -11,6 +11,7 @@ use juniper::{
     },
 };
 use lldap_domain_handlers::handler::BackendHandler;
+use lldap_domain_handlers::logging::{Protocol, current_request, with_actor, with_request};
 use lldap_graphql_server::api::Context;
 use lldap_graphql_server::api::schema;
 
@@ -128,19 +129,29 @@ async fn graphql_route<Handler: BackendHandler + lldap_opaque_handler::OpaqueHan
     data: web::Data<AppState<Handler>>,
 ) -> Result<HttpResponse, Error> {
     let mut inner_payload = payload.into_inner();
-    let bearer = BearerAuth::from_request(&req, &mut inner_payload).await?;
-    let validation_result = check_if_token_is_valid(&data, bearer.token()).await?;
-    let context = Context::<Handler> {
-        handler: data.backend_handler.clone(),
-        validation_result,
-    };
-    let schema = &schema();
-    let context = &context;
-    match *req.method() {
-        actix_http::Method::POST => post_graphql_handler(schema, context, req, inner_payload).await,
-        actix_http::Method::GET => get_graphql_handler(schema, context, req).await,
-        _ => Err(actix_web::error::UrlGenerationError::ResourceNotFound.into()),
-    }
+    let meta = current_request().with_protocol(Protocol::Graphql);
+    with_request(meta, async {
+        let bearer = BearerAuth::from_request(&req, &mut inner_payload).await?;
+        let validation_result = check_if_token_is_valid(&data, bearer.token()).await?;
+        let actor = validation_result.user.clone();
+        let context = Context::<Handler> {
+            handler: data.backend_handler.clone(),
+            validation_result,
+        };
+        let schema = &schema();
+        let context = &context;
+        with_actor(Some(actor), async {
+            match *req.method() {
+                actix_http::Method::POST => {
+                    post_graphql_handler(schema, context, req, inner_payload).await
+                }
+                actix_http::Method::GET => get_graphql_handler(schema, context, req).await,
+                _ => Err(actix_web::error::UrlGenerationError::ResourceNotFound.into()),
+            }
+        })
+        .await
+    })
+    .await
 }
 
 pub fn configure_endpoint<Backend>(cfg: &mut web::ServiceConfig)

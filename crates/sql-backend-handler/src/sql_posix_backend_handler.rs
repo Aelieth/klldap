@@ -7,6 +7,7 @@ use lldap_domain_handlers::handler::{
     PosixBackendHandler, PosixSettings, SystemConfigBackendHandler,
 };
 use lldap_domain_handlers::kerberos::require_kdc_ready;
+use lldap_domain_handlers::logging::{self, LogKind};
 use lldap_domain_model::{
     error::{DomainError, Result},
     model::{self, system_config},
@@ -92,6 +93,11 @@ impl PosixBackendHandler for SqlBackendHandler {
                 })
             })
             .await?;
+        logging::record(
+            LogKind::PosixChange,
+            Some("group gidnumber"),
+            Some("reassign"),
+        );
         Ok(())
     }
 
@@ -124,6 +130,11 @@ impl PosixBackendHandler for SqlBackendHandler {
                 })
             })
             .await?;
+        logging::record(
+            LogKind::PosixChange,
+            Some("user uidnumber"),
+            Some("reassign"),
+        );
         Ok(())
     }
 
@@ -153,6 +164,11 @@ impl PosixBackendHandler for SqlBackendHandler {
                 })
             })
             .await?;
+        logging::record(
+            LogKind::PosixChange,
+            Some("user gidnumber"),
+            Some("reassign"),
+        );
         Ok(())
     }
 
@@ -183,6 +199,11 @@ impl PosixBackendHandler for SqlBackendHandler {
                 })
             })
             .await?;
+        logging::record(
+            LogKind::PosixChange,
+            Some("user homedirectory"),
+            Some("reassign"),
+        );
         Ok(())
     }
 
@@ -211,6 +232,11 @@ impl PosixBackendHandler for SqlBackendHandler {
                 })
             })
             .await?;
+        logging::record(
+            LogKind::PosixChange,
+            Some("user loginshell"),
+            Some("reassign"),
+        );
         Ok(())
     }
 }

@@ -1,6 +1,7 @@
 pub mod attribute;
 pub mod filters;
 pub mod group;
+pub mod logs;
 pub mod schema;
 pub mod user;
 
@@ -9,13 +10,17 @@ pub use attribute::{
 };
 pub use filters::{EqualityConstraint, RequestFilter};
 pub use group::Group;
+pub use logs::{
+    GraphQLLogDimension, GraphQLLogKind, GraphQLLogProtocol, LogActivity, LogBucket, LogEntry,
+    LogFilterInput,
+};
 pub use schema::{AttributeList, ObjectClassInfo, Schema};
 pub use user::User;
 
 use crate::api::{Context, FullHandler, field_error_callback};
 use crate::kerberos_transport::public_key_der_base64;
 use anyhow::anyhow;
-use juniper::{FieldResult, GraphQLObject, graphql_object};
+use juniper::{FieldResult, GraphQLObject, ID, graphql_object};
 use lldap_access_control::{ReadonlyBackendHandler, UserReadableBackendHandler};
 use lldap_domain::types::{GroupId, UserId};
 use lldap_domain_handlers::handler::{
@@ -128,10 +133,7 @@ impl<Handler: FullHandler + OpaqueHandler> Query<Handler> {
         });
         let filters = match (where_filters, filters) {
             (Some(_), Some(_)) => {
-                return Err(field_error_callback(
-                    &span,
-                    "users accepts only one of `where` and `filters`",
-                )());
+                return Err("users accepts only one of `where` and `filters`".into());
             }
             (w, f) => w.or(f),
         };
@@ -281,6 +283,39 @@ impl<Handler: FullHandler + OpaqueHandler> Query<Handler> {
             group_gidnumber_max: settings.group_gidnumber_max as i32,
         })
     }
+
+    /// Newest first; `beforeId` pages back, `afterId` pages forward oldest first.
+    async fn logs(
+        context: &Context<Handler>,
+        filter: Option<LogFilterInput>,
+        limit: Option<i32>,
+        before_id: Option<ID>,
+        after_id: Option<ID>,
+    ) -> FieldResult<Vec<LogEntry>> {
+        logs::list_logs(context, filter, limit, before_id, after_id).await
+    }
+
+    /// Counts per distinct combination of `groupBy`, most frequent first; no `groupBy` gives
+    /// the total.
+    async fn log_summary(
+        context: &Context<Handler>,
+        filter: Option<LogFilterInput>,
+        group_by: Option<Vec<GraphQLLogDimension>>,
+        limit: Option<i32>,
+    ) -> FieldResult<Vec<LogBucket>> {
+        logs::log_summary(context, filter, group_by, limit).await
+    }
+
+    /// One user's last success and failure among `kinds` (default: bind and login) and the
+    /// failures since that success.
+    async fn log_activity(
+        context: &Context<Handler>,
+        actor: String,
+        kinds: Option<Vec<GraphQLLogKind>>,
+        since: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> FieldResult<LogActivity> {
+        logs::log_activity(context, actor, kinds, since).await
+    }
 }
 
 impl<Handler: BackendHandler + OpaqueHandler> Query<Handler> {
@@ -307,6 +342,10 @@ mod tests {
     use lldap_auth::access_control::{Permission, ValidationResults};
     use lldap_domain::types::{Attribute as DomainAttribute, GroupDetails, User as DomainUser};
     use lldap_domain::types::{AttributeName, AttributeType};
+    use lldap_domain_handlers::logging::{
+        LOGIN_KINDS, LogActivity as DomainLogActivity, LogBucket as DomainLogBucket, LogCursor,
+        LogDimension, LogEvent, LogFilter, LogKind, LogRecord, Protocol,
+    };
     use lldap_domain_model::model::UserColumn;
     use lldap_schema::{
         AttributeList, AttributeSchema as DomainAttributeSchema,
@@ -668,5 +707,495 @@ mod tests {
         let schema = schema(Query::<MockTestBackendHandler>::new());
         let result = execute(QUERY, None, &schema, &Variables::new(), &context).await;
         assert!(result.is_ok(), "Query failed: {:?}", result);
+    }
+
+    fn log_record(id: i64, kind: LogKind, actor: &str) -> LogRecord {
+        LogRecord {
+            id,
+            event: LogEvent {
+                timestamp: chrono::Utc
+                    .timestamp_opt(1714564800 + id, 0)
+                    .unwrap()
+                    .naive_utc(),
+                kind,
+                success: kind != LogKind::AccessDenied,
+                protocol: Protocol::Ldap,
+                actor: Some(actor.to_owned()),
+                target: None,
+                peer: Some("10.0.0.5".to_owned()),
+                forwarded_for: None,
+                detail: (kind == LogKind::AccessDenied).then(|| "Unauthorized write".to_owned()),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn test_logs_requires_admin() {
+        const QUERIES: [&str; 3] = [
+            r#"{ logs(limit: 5) { id } }"#,
+            r#"{ logSummary(groupBy: [ACTOR]) { count } }"#,
+            r#"{ logActivity(actor: "bob") { failuresSinceLastSuccess } }"#,
+        ];
+        for permission in [
+            Permission::Regular,
+            Permission::PasswordManager,
+            Permission::Readonly,
+        ] {
+            for query in QUERIES {
+                let mut mock = MockTestBackendHandler::new();
+                mock.expect_list_log_events().times(0);
+                mock.expect_summarize_log_events().times(0);
+                mock.expect_log_activity().times(0);
+                let context = Context::<MockTestBackendHandler>::new_for_tests(
+                    mock,
+                    ValidationResults {
+                        user: UserId::new("bob"),
+                        permission,
+                    },
+                );
+                let schema = schema(Query::<MockTestBackendHandler>::new());
+                let (_, errors) = execute(query, None, &schema, &Variables::new(), &context)
+                    .await
+                    .unwrap();
+                assert!(
+                    errors.iter().any(|e| e
+                        .error()
+                        .message()
+                        .contains("Unauthorized to read the logs")),
+                    "{permission:?} {query}: {errors:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_logs_maps_filter_pagination_and_rows() {
+        const QUERY: &str = r#"{
+        logs(filter: {kinds: [BIND], success: false, actor: "Bob", protocol: LDAP,
+                      since: "2024-05-01T00:00:00Z"}, limit: 50, beforeId: "41") {
+            id
+            timestamp
+            kind
+            success
+            protocol
+            actor
+            target
+            peer
+            forwardedFor
+            detail
+        }
+    }"#;
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_list_log_events()
+            .withf(|filter, limit, cursor| {
+                *filter
+                    == LogFilter {
+                        actor: Some(UserId::new("bob")),
+                        kinds: vec![LogKind::Bind],
+                        success: Some(false),
+                        protocol: Some(Protocol::Ldap),
+                        since: Some(
+                            chrono::Utc
+                                .timestamp_opt(1714521600, 0)
+                                .unwrap()
+                                .naive_utc(),
+                        ),
+                        ..Default::default()
+                    }
+                    && *limit == 50
+                    && *cursor == LogCursor::Before(41)
+            })
+            .times(1)
+            .return_once(|_, _, _| {
+                Ok(vec![
+                    log_record(40, LogKind::AccessDenied, "bob"),
+                    log_record(12, LogKind::Bind, "bob"),
+                ])
+            });
+        let context = Context::<MockTestBackendHandler>::new_for_tests(
+            mock,
+            ValidationResults {
+                user: UserId::new("admin"),
+                permission: Permission::Admin,
+            },
+        );
+
+        let schema = schema(Query::<MockTestBackendHandler>::new());
+        assert_eq!(
+            execute(QUERY, None, &schema, &Variables::new(), &context).await,
+            Ok((
+                graphql_value!({
+                    "logs": [
+                        {
+                            "id": "40",
+                            "timestamp": "2024-05-01T12:00:40Z",
+                            "kind": "ACCESS_DENIED",
+                            "success": false,
+                            "protocol": "LDAP",
+                            "actor": "bob",
+                            "target": None,
+                            "peer": "10.0.0.5",
+                            "forwardedFor": None,
+                            "detail": "Unauthorized write",
+                        },
+                        {
+                            "id": "12",
+                            "timestamp": "2024-05-01T12:00:12Z",
+                            "kind": "BIND",
+                            "success": true,
+                            "protocol": "LDAP",
+                            "actor": "bob",
+                            "target": None,
+                            "peer": "10.0.0.5",
+                            "forwardedFor": None,
+                            "detail": None,
+                        },
+                    ]
+                }),
+                vec![]
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_logs_defaults_and_bad_cursor() {
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_list_log_events()
+            .withf(|filter, limit, cursor| {
+                *filter == LogFilter::default() && *limit == 100 && *cursor == LogCursor::Newest
+            })
+            .times(1)
+            .return_once(|_, _, _| Ok(vec![]));
+        let context = Context::<MockTestBackendHandler>::new_for_tests(
+            mock,
+            ValidationResults {
+                user: UserId::new("admin"),
+                permission: Permission::Admin,
+            },
+        );
+        let schema = schema(Query::<MockTestBackendHandler>::new());
+        assert_eq!(
+            execute(
+                r#"{ logs { id } }"#,
+                None,
+                &schema,
+                &Variables::new(),
+                &context
+            )
+            .await,
+            Ok((graphql_value!({ "logs": [] }), vec![]))
+        );
+
+        let (_, errors) = execute(
+            r#"{ logs(beforeId: "not-a-number") { id } }"#,
+            None,
+            &schema,
+            &Variables::new(),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.error().message().contains("Invalid log id")),
+            "{errors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_logs_after_cursor_and_cursor_conflict() {
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_list_log_events()
+            .withf(|filter, limit, cursor| {
+                *filter
+                    == LogFilter {
+                        member_of: Some("Devs".to_owned()),
+                        member_of_id: Some(GroupId(3)),
+                        ..Default::default()
+                    }
+                    && *limit == 1000
+                    && *cursor == LogCursor::After(41)
+            })
+            .times(1)
+            .return_once(|_, _, _| Ok(vec![log_record(42, LogKind::Bind, "bob")]));
+        let context = Context::<MockTestBackendHandler>::new_for_tests(
+            mock,
+            ValidationResults {
+                user: UserId::new("admin"),
+                permission: Permission::Admin,
+            },
+        );
+        let schema = schema(Query::<MockTestBackendHandler>::new());
+        assert_eq!(
+            execute(
+                r#"{ logs(filter: {memberOf: "Devs", memberOfId: 3}, limit: 5000, afterId: "41") { id } }"#,
+                None,
+                &schema,
+                &Variables::new(),
+                &context
+            )
+            .await,
+            Ok((graphql_value!({ "logs": [{ "id": "42" }] }), vec![]))
+        );
+
+        let (_, errors) = execute(
+            r#"{ logs(beforeId: "41", afterId: "12") { id } }"#,
+            None,
+            &schema,
+            &Variables::new(),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(
+            errors.iter().any(|e| e
+                .error()
+                .message()
+                .contains("logs takes either beforeId or afterId")),
+            "{errors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_log_summary_maps_filter_group_by_and_buckets() {
+        const QUERY: &str = r#"{
+        logSummary(filter: {kinds: [BIND, LOGIN], success: false, memberOfId: 7,
+                            since: "2024-05-01T00:00:00Z"},
+                   groupBy: [ACTOR, DAY], limit: 5) {
+            actor
+            target
+            kind
+            protocol
+            peer
+            success
+            day
+            hour
+            count
+            first
+            last
+        }
+    }"#;
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_summarize_log_events()
+            .withf(|filter, group_by, limit| {
+                *filter
+                    == LogFilter {
+                        kinds: vec![LogKind::Bind, LogKind::Login],
+                        success: Some(false),
+                        member_of_id: Some(GroupId(7)),
+                        since: Some(
+                            chrono::Utc
+                                .timestamp_opt(1714521600, 0)
+                                .unwrap()
+                                .naive_utc(),
+                        ),
+                        ..Default::default()
+                    }
+                    && *group_by == vec![LogDimension::Actor, LogDimension::Day]
+                    && *limit == 5
+            })
+            .times(1)
+            .return_once(|_, _, _| {
+                let at = |secs: i64| {
+                    chrono::Utc
+                        .timestamp_opt(1714564800 + secs, 0)
+                        .unwrap()
+                        .naive_utc()
+                };
+                Ok(vec![
+                    DomainLogBucket {
+                        actor: Some("bob".to_owned()),
+                        target: None,
+                        kind: None,
+                        protocol: None,
+                        peer: None,
+                        success: None,
+                        day: Some("2024-05-01".to_owned()),
+                        hour: None,
+                        count: 3,
+                        first: at(0),
+                        last: at(120),
+                    },
+                    DomainLogBucket {
+                        actor: None,
+                        target: None,
+                        kind: Some(LogKind::Bind),
+                        protocol: Some(Protocol::Ldap),
+                        peer: Some("10.0.0.5".to_owned()),
+                        success: Some(false),
+                        day: None,
+                        hour: Some(23),
+                        count: 1,
+                        first: at(5),
+                        last: at(5),
+                    },
+                ])
+            });
+        let context = Context::<MockTestBackendHandler>::new_for_tests(
+            mock,
+            ValidationResults {
+                user: UserId::new("admin"),
+                permission: Permission::Admin,
+            },
+        );
+        let schema = schema(Query::<MockTestBackendHandler>::new());
+        assert_eq!(
+            execute(QUERY, None, &schema, &Variables::new(), &context).await,
+            Ok((
+                graphql_value!({
+                    "logSummary": [
+                        {
+                            "actor": "bob",
+                            "target": None,
+                            "kind": None,
+                            "protocol": None,
+                            "peer": None,
+                            "success": None,
+                            "day": "2024-05-01",
+                            "hour": None,
+                            "count": 3,
+                            "first": "2024-05-01T12:00:00Z",
+                            "last": "2024-05-01T12:02:00Z",
+                        },
+                        {
+                            "actor": None,
+                            "target": None,
+                            "kind": "BIND",
+                            "protocol": "LDAP",
+                            "peer": "10.0.0.5",
+                            "success": false,
+                            "day": None,
+                            "hour": 23,
+                            "count": 1,
+                            "first": "2024-05-01T12:00:05Z",
+                            "last": "2024-05-01T12:00:05Z",
+                        },
+                    ]
+                }),
+                vec![]
+            ))
+        );
+
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_summarize_log_events()
+            .withf(|filter, group_by, limit| {
+                *filter == LogFilter::default() && group_by.is_empty() && *limit == 100
+            })
+            .times(1)
+            .return_once(|_, _, _| Ok(vec![]));
+        let context = Context::<MockTestBackendHandler>::new_for_tests(
+            mock,
+            ValidationResults {
+                user: UserId::new("admin"),
+                permission: Permission::Admin,
+            },
+        );
+        assert_eq!(
+            execute(
+                r#"{ logSummary { count } }"#,
+                None,
+                &schema,
+                &Variables::new(),
+                &context
+            )
+            .await,
+            Ok((graphql_value!({ "logSummary": [] }), vec![]))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_log_activity_maps_defaults_and_records() {
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_log_activity()
+            .withf(|actor, kinds, since| {
+                actor == &UserId::new("bob") && *kinds == LOGIN_KINDS && since.is_none()
+            })
+            .times(1)
+            .return_once(|actor, _, _| {
+                Ok(DomainLogActivity {
+                    actor: actor.clone(),
+                    last_success: None,
+                    last_failure: Some(log_record(40, LogKind::AccessDenied, "bob")),
+                    failures_since_last_success: 4,
+                })
+            });
+        mock.expect_log_activity()
+            .withf(|actor, kinds, since| {
+                actor == &UserId::new("carol")
+                    && *kinds == vec![LogKind::Login, LogKind::TokenRefresh]
+                    && *since
+                        == Some(
+                            chrono::Utc
+                                .timestamp_opt(1714521600, 0)
+                                .unwrap()
+                                .naive_utc(),
+                        )
+            })
+            .times(1)
+            .return_once(|actor, _, _| {
+                Ok(DomainLogActivity {
+                    actor: actor.clone(),
+                    last_success: Some(log_record(12, LogKind::Login, "carol")),
+                    last_failure: None,
+                    failures_since_last_success: 0,
+                })
+            });
+        let context = Context::<MockTestBackendHandler>::new_for_tests(
+            mock,
+            ValidationResults {
+                user: UserId::new("admin"),
+                permission: Permission::Admin,
+            },
+        );
+        let schema = schema(Query::<MockTestBackendHandler>::new());
+        assert_eq!(
+            execute(
+                r#"{
+                bob: logActivity(actor: "Bob") {
+                    actor
+                    lastSuccess { id }
+                    lastFailure { id kind detail }
+                    failuresSinceLastSuccess
+                }
+                carol: logActivity(actor: "carol", kinds: [LOGIN, TOKEN_REFRESH],
+                                   since: "2024-05-01T00:00:00Z") {
+                    actor
+                    lastSuccess { id timestamp }
+                    lastFailure { id }
+                    failuresSinceLastSuccess
+                }
+            }"#,
+                None,
+                &schema,
+                &Variables::new(),
+                &context
+            )
+            .await,
+            Ok((
+                graphql_value!({
+                    "bob": {
+                        "actor": "bob",
+                        "lastSuccess": None,
+                        "lastFailure": {
+                            "id": "40",
+                            "kind": "ACCESS_DENIED",
+                            "detail": "Unauthorized write",
+                        },
+                        "failuresSinceLastSuccess": 4,
+                    },
+                    "carol": {
+                        "actor": "carol",
+                        "lastSuccess": {
+                            "id": "12",
+                            "timestamp": "2024-05-01T12:00:12Z",
+                        },
+                        "lastFailure": None,
+                        "failuresSinceLastSuccess": 0,
+                    },
+                }),
+                vec![]
+            ))
+        );
     }
 }

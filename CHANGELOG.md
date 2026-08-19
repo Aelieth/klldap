@@ -1,5 +1,82 @@
 # Changelog
 
+## [0.7.5] unreleased
+
+### Logging
+
+- Security-relevant events are now recorded in the database (`logs` table, part of the
+  v13 schema; databases already at v13 get the table at their next start): LDAP binds and
+  web logins (success, wrong password, disabled account), token refresh, logout, password
+  reset requests and completions, password changes on every path, user, group, membership,
+  schema, system-config and POSIX changes, access denials on both protocols (unparseable
+  JWTs are printed, not stored), Kerberos principal operations and keytab exports,
+  Keycloak federation changes, and server start / admin bootstrap. Each row carries the
+  actor (claimed identity for authentication events), the target, the protocol (`ldap`,
+  `http`, `graphql`, `system`), the client address (plus `X-Forwarded-For` for HTTP), a
+  short detail and the time. Control characters are stripped from those strings.
+- Events never touch the database on the request path: they go through a bounded in-memory
+  queue and are written in batches; if the queue overflows, a `log_gap` row records how
+  many events were dropped.
+- `[log_options]` (`LLDAP_LOG_OPTIONS__PERSIST`, `__RETENTION_DAYS`, `__MAX_ENTRIES`,
+  `--log-*` flags): persistence on by default, 30 days and 50000 entries kept (`0` removes
+  a limit); the hourly cleaner trims by age and size, the writer by size after bursts, and
+  the trim also runs while `persist = false`. Retention deletes run in 1000-row chunks so
+  SQLite's one connection can still serve a bind. Every event is also printed
+  (`target: logs`; failures at warn, other events at info, successful binds/logins/refreshes
+  at debug), so the terminal log gains them even with persistence off.
+- Admins read the log over GraphQL: `logs(filter, limit, beforeId, afterId)` returns
+  `LogEntry` rows newest first (`id` is the paging cursor, `afterId` pages forward oldest
+  first so another service can tail the log; filters on actor, target, kinds, success,
+  protocol, peer, a time window and group membership; 100 rows by default, 1000 at most).
+  Documented in `docs/logging.md`.
+- Two lookups count in the database instead of returning rows, for the account policies
+  that come next: `logSummary(filter, groupBy: [ACTOR|TARGET|KIND|PROTOCOL|PEER|SUCCESS|
+  DAY|HOUR], limit)` gives one bucket (count, first, last) per distinct combination, most
+  frequent first; `logActivity(actor, kinds, since)` gives one account's last success, last
+  failure and the failures since that success. Both ride new indexes on `kind`, `target` and
+  `peer` (each with `timestamp`; existing databases get them at the next start). The same
+  methods sit on `LogBackendHandler` for in-process code. `docs/logging.md` maps each
+  planned policy (failed-login lockout, inactivity, password age, login hours, addresses,
+  policy by group) to its lookup and its limits. On SQLite those lookups share the one
+  pooled connection; pass `since`/`kinds` on `logSummary` and `memberOf` so a busy box
+  does not walk the whole table.
+- Repeated successful binds by the same actor, protocol and address are stored once per
+  `bind_coalesce_seconds` (`LLDAP_LOG_OPTIONS__BIND_COALESCE_SECONDS`,
+  `--log-bind-coalesce-seconds`, default 300, `0` stores every bind), so service accounts
+  that bind every few seconds no longer push the security rows out of `max_entries`; failed
+  binds and every other kind are always stored, the terminal lines are unchanged.
+- Unknown-name bind failures now carry the detail `unknown user` (an account with no
+  password set reads the same, deliberately; the client response does not change) and are
+  coalesced by the writer: the first 8 per client address, protocol and 300 s window are
+  stored one-to-one, the rest become one `bind_flood` row carrying the count and the
+  distinct-name count — a unique-name spray that used to write thousands of rows a second
+  (and evict real history from `max_entries`) now stores a handful. Wrong passwords against
+  real accounts are always stored one-to-one, so per-user failure counts stay exact.
+- On SQLite the log lookups (`logs`, `logSummary`, `logActivity`) read on a small read-only
+  pool of their own instead of queueing on the single write connection: an unfiltered
+  summary or a `memberOf` scan no longer stalls LDAP binds behind it (a stress run measured
+  5-28 s bind waits and pool timeouts; they are gone). The writer also drains a full queue
+  back-to-back instead of pausing 250 ms per batch, so bursts stop dropping events long
+  before the queue limit.
+- Terminal calm under floods: the per-attempt `Login attempt` and LDAP bind session lines
+  moved to debug (the `logs`-target line is the terminal record — one warn per failure),
+  auth-path span errors no longer print at error level per attempt, and failure lines are
+  rate-limited to 64 per 10 s with a `suppressed N failure lines` summary; the limiter is
+  terminal-only, the table keeps every stored row.
+- Bind floods are now bracketed so an admin can trace began → ended even while the spray is
+  suppressed: the writer emits a `bind_flood` `started` row the moment a source is flagged
+  (visible in GraphQL at once, not only after a window rolls or a restart) and a paired
+  `resolved` row — with the total binds, distinct-name count and duration — when the source
+  goes quiet (~20 s) or on shutdown. Each source is one incident; a later burst is a new one.
+  A writer tick also flushes the terminal `suppressed N failure lines` summary promptly when
+  a failure flood stops, instead of only on the next failure.
+- The same flood bracketing now covers access denials: an `access_denied` flood from one
+  client address (authenticated abuse or a junk-JWT spammer) is stored one-to-one for the
+  first few then coalesced into an `access_denied_flood` `started`/`resolved` pair, so it
+  cannot fill the table 1:1. Junk (`Invalid JWT`) and expired JWTs are now recorded as
+  `access_denied` rows (they used to be terminal-only), so a token spammer is visible in the
+  table and coalesces under load.
+
 ## [0.7.4] unreleased
 
 Everything since 0.7.2: the LLDAP migration path, a full audit of the LDAP layer, a

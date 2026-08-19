@@ -1,18 +1,12 @@
 use crate::common::{
     env,
-    fixture::{create_lldap_command_with_key_file, free_port, http_url},
+    fixture::{create_lldap_command_with_key_file, query_i64, runtime, spawn_and_wait_healthy},
 };
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use nix::{
-    sys::signal::{self, Signal},
-    unistd::Pid,
-};
 use reqwest::blocking::{Client, ClientBuilder};
 use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
 use serde_json::{Value, json};
-use std::process::Child as ChildProcess;
-use std::{thread, time::Duration};
 mod common;
 
 // A stock lldap 0.6.3 (schema v11) database, produced by scripts/generate_lldap_fixture.sh,
@@ -30,13 +24,6 @@ const DATE_EPOCH: i64 = 1714564800; // 2024-05-01T12:00:00Z
 const GROUP_NAME: &str = "Fixture Crew";
 const GROUP_NOTE: &str = "stock group attribute survives";
 const JPEG_B64: &str = "/9j/4AAQSkZJRgABAgAAAQABAAD/wAARCAAEAAQDAREAAhEBAxEB/9sAQwAIBgYHBgUIBwcHCQkICgwUDQwLCwwZEhMPFB0aHx4dGhwcICQuJyAiLCMcHCg3KSwwMTQ0NB8nOT04MjwuMzQy/9sAQwEJCQkMCwwYDQ0YMiEcITIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIy/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDa8KW8f9gQfLXLmGT4T279093NKkvrMj//2Q==";
-
-fn runtime() -> tokio::runtime::Runtime {
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime")
-}
 
 // The dump's transaction markers are skipped; each statement runs in autocommit.
 fn load_fixture_dump(db_url: &str) {
@@ -85,18 +72,6 @@ fn query_optional_bytes(db_url: &str, sql: &str) -> Option<Vec<u8>> {
     })
 }
 
-fn query_i64(db_url: &str, sql: &str) -> i64 {
-    runtime().block_on(async {
-        let db = Database::connect(db_url).await.expect("connect db");
-        let row = db
-            .query_one(Statement::from_string(DbBackend::Sqlite, sql.to_owned()))
-            .await
-            .expect("query")
-            .expect("no row");
-        row.try_get_by_index::<i64>(0).expect("column")
-    })
-}
-
 struct FixtureFiles {
     db_path: std::path::PathBuf,
     key_path: std::path::PathBuf,
@@ -107,65 +82,6 @@ impl Drop for FixtureFiles {
         let _ = std::fs::remove_file(&self.db_path);
         let _ = std::fs::remove_file(&self.key_path);
     }
-}
-
-struct ServerGuard {
-    child: ChildProcess,
-    ldap_port: u16,
-    http_port: u16,
-}
-
-impl ServerGuard {
-    fn http_url(&self) -> String {
-        http_url(self.http_port)
-    }
-    fn ldap_url(&self) -> String {
-        format!("ldap://localhost:{}", self.ldap_port)
-    }
-}
-
-impl Drop for ServerGuard {
-    fn drop(&mut self) {
-        let _ = signal::kill(
-            Pid::from_raw(self.child.id().try_into().unwrap()),
-            Signal::SIGTERM,
-        );
-        for _ in 0..12 {
-            if let Ok(Some(_)) = self.child.try_wait() {
-                return;
-            }
-            thread::sleep(Duration::from_millis(1000));
-        }
-        let _ = self.child.kill();
-    }
-}
-
-fn spawn_and_wait_healthy(db_url: &str, key_file: &str) -> ServerGuard {
-    let ldap_port = free_port();
-    let http_port = free_port();
-    let child = create_lldap_command_with_key_file("run", db_url, key_file)
-        .env("LLDAP_LDAP_PORT", ldap_port.to_string())
-        .env("LLDAP_HTTP_PORT", http_port.to_string())
-        .spawn()
-        .expect("unable to start server");
-    let guard = ServerGuard {
-        child,
-        ldap_port,
-        http_port,
-    };
-    for _ in 0..30 {
-        let healthy = create_lldap_command_with_key_file("healthcheck", db_url, key_file)
-            .env("LLDAP_LDAP_PORT", ldap_port.to_string())
-            .env("LLDAP_HTTP_PORT", http_port.to_string())
-            .status()
-            .expect("healthcheck failed to execute")
-            .success();
-        if healthy {
-            return guard;
-        }
-        thread::sleep(Duration::from_millis(1000));
-    }
-    panic!("migrated server did not become healthy");
 }
 
 // The one-shot the guide prescribes: the server adopts the database under a fresh key,
@@ -270,7 +186,9 @@ fn test_stock_lldap_database_migrates_data() {
     );
 
     {
-        let server = spawn_and_wait_healthy(&db_url, &key_file);
+        let server = spawn_and_wait_healthy(|sub| {
+            create_lldap_command_with_key_file(sub, &db_url, &key_file)
+        });
         let base_url = server.http_url();
         let client = make_client();
 

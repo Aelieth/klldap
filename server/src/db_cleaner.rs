@@ -4,6 +4,7 @@ use cron::Schedule;
 use lldap_domain_model::model::{
     self, JwtRefreshStorageColumn, JwtStorageColumn, PasswordResetTokensColumn,
 };
+use lldap_sql_backend_handler::{LogRetention, enforce_log_retention};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use std::{str::FromStr, time::Duration};
 use tracing::{error, info, instrument};
@@ -12,6 +13,7 @@ use tracing::{error, info, instrument};
 pub struct Scheduler {
     schedule: Schedule,
     sql_pool: DbConnection,
+    log_retention: LogRetention,
 }
 
 // Provide Actor implementation for our actor
@@ -32,13 +34,20 @@ impl Actor for Scheduler {
 }
 
 impl Scheduler {
-    pub fn new(cron_expression: &str, sql_pool: DbConnection) -> Self {
+    pub fn new(cron_expression: &str, sql_pool: DbConnection, log_retention: LogRetention) -> Self {
         let schedule = Schedule::from_str(cron_expression).unwrap();
-        Self { schedule, sql_pool }
+        Self {
+            schedule,
+            sql_pool,
+            log_retention,
+        }
     }
 
     fn schedule_task(&self, ctx: &mut Context<Self>) {
-        let future = actix::fut::wrap_future::<_, Self>(Self::cleanup_db(self.sql_pool.clone()));
+        let future = actix::fut::wrap_future::<_, Self>(Self::cleanup_db(
+            self.sql_pool.clone(),
+            self.log_retention,
+        ));
         ctx.spawn(future);
 
         ctx.run_later(self.duration_until_next(), move |this, ctx| {
@@ -47,7 +56,7 @@ impl Scheduler {
     }
 
     #[instrument(skip_all)]
-    async fn cleanup_db(sql_pool: DbConnection) {
+    async fn cleanup_db(sql_pool: DbConnection, log_retention: LogRetention) {
         if let Err(e) = model::JwtRefreshStorage::delete_many()
             .filter(JwtRefreshStorageColumn::ExpiryDate.lt(chrono::Utc::now().naive_utc()))
             .exec(&sql_pool)
@@ -69,6 +78,9 @@ impl Scheduler {
         {
             error!("DB error while cleaning up password reset tokens: {}", e);
         };
+        if let Err(e) = enforce_log_retention(&sql_pool, log_retention).await {
+            error!("DB error while trimming the logs table: {}", e);
+        }
     }
 
     fn duration_until_next(&self) -> Duration {

@@ -187,6 +187,21 @@ key_seed = "RanD0m STR1ng"
 ## The image's HEALTHCHECK passes --kerberos on the command line, which has the same effect.
 #kerberos = false
 
+## Options to configure the event log.
+## To set these options from environment variables, use the following format
+## (example with retention_days): LLDAP_LOG_OPTIONS__RETENTION_DAYS
+[log_options]
+## Persist events (logins, binds, directory changes, denials) to the database.
+## The terminal lines are printed either way; the two limits below still apply.
+#persist = true
+## Delete events older than this many days (a longer history: 90). 0 keeps them forever.
+#retention_days = 30
+## Keep at most this many events, oldest first (a longer history: 100000). 0 means unlimited.
+#max_entries = 50000
+## Store one successful bind per user, protocol and address within this many seconds, so
+## service accounts that bind constantly do not fill max_entries. 0 stores every bind.
+#bind_coalesce_seconds = 300
+
 ## Kerberos and Keycloak are configured outside this file:
 ##  - the realm comes from ldap_base_dn (LLDAP_KERB_REALM_NAME overrides it) and the
 ##    ticket settings from /data/kerberos_config.toml (see docs/kerberos.md);

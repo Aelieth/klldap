@@ -13,6 +13,7 @@ use nix::{
     unistd::Pid,
 };
 use reqwest::blocking::{Client, ClientBuilder};
+use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
 use std::collections::{HashMap, HashSet};
 use std::process::{Child as ChildProcess, Command};
 use std::{fs::canonicalize, thread, time::Duration};
@@ -53,7 +54,7 @@ pub struct LLDAPFixture {
     _dir: tempfile::TempDir,
 }
 
-const MAX_HEALTHCHECK_ATTEMPS: u8 = 15;
+const MAX_HEALTHCHECK_ATTEMPS: u8 = 30;
 
 impl LLDAPFixture {
     pub fn new() -> Self {
@@ -290,7 +291,7 @@ pub fn free_port() -> u16 {
         .port()
 }
 
-fn create_lldap_command(subcommand: &str, db_url: &str) -> Command {
+pub fn create_lldap_command(subcommand: &str, db_url: &str) -> Command {
     let mut cmd = Command::new(cargo_bin!());
     let path = canonicalize("..").expect("canonical path to repo root");
     cmd.current_dir(path);
@@ -320,4 +321,84 @@ pub fn create_lldap_command_with_key_file(
     cmd.arg("--config-file=/dev/null");
     cmd.arg(format!("--server-key-file={key_file}"));
     cmd
+}
+
+pub struct ServerGuard {
+    child: ChildProcess,
+    ldap_port: u16,
+    http_port: u16,
+}
+
+impl ServerGuard {
+    pub fn http_url(&self) -> String {
+        http_url(self.http_port)
+    }
+    pub fn ldap_url(&self) -> String {
+        format!("ldap://localhost:{}", self.ldap_port)
+    }
+}
+
+impl Drop for ServerGuard {
+    fn drop(&mut self) {
+        let _ = signal::kill(
+            Pid::from_raw(self.child.id().try_into().unwrap()),
+            Signal::SIGTERM,
+        );
+        for _ in 0..12 {
+            if let Ok(Some(_)) = self.child.try_wait() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(1000));
+        }
+        let _ = self.child.kill();
+    }
+}
+
+/// Boots `run` on ephemeral ports and waits for `healthcheck`; the guard stops it with
+/// SIGTERM, so a test can inspect the database after a clean shutdown and boot again.
+pub fn spawn_and_wait_healthy(make_command: impl Fn(&str) -> Command) -> ServerGuard {
+    let ldap_port = free_port();
+    let http_port = free_port();
+    let child = make_command("run")
+        .env("LLDAP_LDAP_PORT", ldap_port.to_string())
+        .env("LLDAP_HTTP_PORT", http_port.to_string())
+        .spawn()
+        .expect("unable to start server");
+    let guard = ServerGuard {
+        child,
+        ldap_port,
+        http_port,
+    };
+    for _ in 0..30 {
+        let healthy = make_command("healthcheck")
+            .env("LLDAP_LDAP_PORT", ldap_port.to_string())
+            .env("LLDAP_HTTP_PORT", http_port.to_string())
+            .status()
+            .expect("healthcheck failed to execute")
+            .success();
+        if healthy {
+            return guard;
+        }
+        thread::sleep(Duration::from_millis(1000));
+    }
+    panic!("server did not become healthy");
+}
+
+pub fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+}
+
+pub fn query_i64(db_url: &str, sql: &str) -> i64 {
+    runtime().block_on(async {
+        let db = Database::connect(db_url).await.expect("connect db");
+        let row = db
+            .query_one(Statement::from_string(DbBackend::Sqlite, sql.to_owned()))
+            .await
+            .expect("query")
+            .expect("no row");
+        row.try_get_by_index::<i64>(0).expect("column")
+    })
 }

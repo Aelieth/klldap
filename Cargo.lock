@@ -2940,10 +2940,12 @@ dependencies = [
  "anyhow",
  "bindgen",
  "lldap_domain_handlers",
+ "lldap_test_utils",
  "minijinja",
  "pkg-config",
  "pretty_assertions",
  "serde",
+ "serial_test",
  "toml",
  "tracing",
 ]
@@ -3051,6 +3053,9 @@ dependencies = [
  "lldap_schema",
  "pretty_assertions",
  "serde",
+ "serial_test",
+ "strum",
+ "tokio",
  "tracing",
 ]
 
@@ -3107,6 +3112,7 @@ dependencies = [
  "serde_json",
  "serial_test",
  "sha2",
+ "strum",
  "tokio",
  "tracing",
  "urlencoding",

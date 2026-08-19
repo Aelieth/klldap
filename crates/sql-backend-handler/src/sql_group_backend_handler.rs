@@ -1,6 +1,6 @@
 use crate::sql_backend_handler::{
-    SqlBackendHandler, attribute_value_to_db_bytes, bool_to_expr, get_repeated_filter,
-    is_backend_writable_readonly_attribute,
+    SqlBackendHandler, attribute_value_to_db_bytes, bool_to_expr, describe_changes,
+    get_repeated_filter, is_backend_writable_readonly_attribute,
 };
 use async_trait::async_trait;
 use lldap_domain::{
@@ -16,6 +16,7 @@ use lldap_domain_handlers::handler::{
     SubStringFilter, SystemConfigBackendHandler,
 };
 use lldap_domain_handlers::kerberos::require_kdc_ready;
+use lldap_domain_handlers::logging::{self, LogKind};
 use lldap_domain_model::{
     error::{DomainError, Result},
     model::{self, GroupColumn, MembershipColumn, codec},
@@ -304,24 +305,36 @@ impl GroupBackendHandler for SqlBackendHandler {
     #[instrument(skip(self), level = "debug", err, fields(group_id = ?request.group_id))]
     async fn update_group(&self, request: UpdateGroupRequest) -> Result<()> {
         require_kdc_ready()?;
-        if request.display_name.is_some() {
-            let current = self.get_group_details(request.group_id).await?;
-            if is_builtin_group(current.display_name.as_str()) {
-                return Err(DomainError::InternalError(format!(
-                    "Cannot rename built-in group '{}'",
-                    current.display_name
-                )));
-            }
+        let current_name = model::Group::find_by_id(request.group_id)
+            .select_only()
+            .column(GroupColumn::DisplayName)
+            .into_tuple::<(String,)>()
+            .one(&self.sql_pool)
+            .await?
+            .map(|(name,)| name)
+            .ok_or_else(|| {
+                DomainError::EntityNotFound(format!("No such group: '{:?}'", request.group_id))
+            })?;
+        if request.display_name.is_some() && is_builtin_group(&current_name) {
+            return Err(DomainError::InternalError(format!(
+                "Cannot rename built-in group '{current_name}'"
+            )));
         }
+        let changes = describe_changes(
+            &request.insert_attributes,
+            &request.delete_attributes,
+            &[("display_name", request.display_name.is_some())],
+        );
 
-        Ok(self
-            .sql_pool
+        self.sql_pool
             .transaction::<_, (), DomainError>(|transaction| {
                 Box::pin(
                     async move { Self::update_group_with_transaction(request, transaction).await },
                 )
             })
-            .await?)
+            .await?;
+        logging::record(LogKind::GroupUpdate, Some(&current_name), Some(&changes));
+        Ok(())
     }
 
     #[instrument(skip(self), level = "debug", ret, err)]
@@ -329,7 +342,8 @@ impl GroupBackendHandler for SqlBackendHandler {
         require_kdc_ready()?;
         let now = chrono::Utc::now().naive_utc();
         let uuid = Uuid::from_name_and_date(request.display_name.as_str(), &now);
-        let lower_display_name = request.display_name.as_str().to_lowercase();
+        let display_name = request.display_name.as_str().to_owned();
+        let lower_display_name = display_name.to_lowercase();
 
         let new_group = model::groups::ActiveModel {
             display_name: Set(request.display_name),
@@ -346,7 +360,7 @@ impl GroupBackendHandler for SqlBackendHandler {
             .next()
             .unwrap_or_else(|| "groups".to_string());
 
-        Ok(self
+        let group_id = self
             .sql_pool
             .transaction::<_, GroupId, DomainError>(|transaction| {
                 Box::pin(async move {
@@ -433,7 +447,9 @@ impl GroupBackendHandler for SqlBackendHandler {
                     Ok(group_id)
                 })
             })
-            .await?)
+            .await?;
+        logging::record(LogKind::GroupCreate, Some(&display_name), None);
+        Ok(group_id)
     }
 
     #[instrument(skip(self), level = "debug", err)]
@@ -456,6 +472,11 @@ impl GroupBackendHandler for SqlBackendHandler {
                 "No such group: '{group_id:?}'"
             )));
         }
+        logging::record(
+            LogKind::GroupDelete,
+            Some(group_details.display_name.as_str()),
+            None,
+        );
         Ok(())
     }
 }

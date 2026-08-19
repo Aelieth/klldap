@@ -18,11 +18,10 @@ use lldap_domain_handlers::kerberos::kerberos_backend;
 use lldap_opaque_handler::OpaqueHandler;
 use tracing::{info, warn};
 
-pub(crate) async fn do_bind(
+pub(crate) fn parse_bind_request<'a>(
     ldap_info: &LdapInfo,
-    request: &LdapBindRequest,
-    login_handler: &impl LoginHandler,
-) -> LdapResult<UserId> {
+    request: &'a LdapBindRequest,
+) -> LdapResult<(UserId, &'a str)> {
     if request.dn.is_empty() {
         return Err(LdapError {
             code: LdapResultCode::InappropriateAuthentication,
@@ -42,18 +41,24 @@ pub(crate) async fn do_bind(
             });
         }
     };
-    let password = if let LdapBindCred::Simple(password) = &request.cred {
-        password
-    } else {
+    let LdapBindCred::Simple(password) = &request.cred else {
         return Err(LdapError {
             code: LdapResultCode::UnwillingToPerform,
             message: "SASL not supported".to_string(),
         });
     };
+    Ok((user_id, password))
+}
+
+pub(crate) async fn bind(
+    login_handler: &impl LoginHandler,
+    user_id: UserId,
+    password: &str,
+) -> LdapResult<UserId> {
     match login_handler
         .bind(BindRequest {
             name: user_id.clone(),
-            password: password.clone(),
+            password: password.to_owned(),
         })
         .await
     {

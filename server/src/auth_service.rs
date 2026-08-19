@@ -24,6 +24,7 @@ use lldap_domain::types::{GroupDetails, GroupName, UserId};
 use lldap_domain_handlers::handler::{
     BackendHandler, BindRequest, LoginHandler, UserRequestFilter,
 };
+use lldap_domain_handlers::logging::{self, LogKind, with_actor};
 use lldap_domain_model::{error::DomainError, model::UserColumn};
 use lldap_opaque_handler::OpaqueHandler;
 use sha2::Sha512;
@@ -117,6 +118,13 @@ where
         .check_token(refresh_token_hash, &user)
         .await?;
     if !found {
+        logging::record_as(
+            Some(&user),
+            LogKind::TokenRefresh,
+            None,
+            false,
+            Some("invalid refresh token"),
+        );
         return Err(TcpError::DomainError(DomainError::AuthenticationError(
             "Invalid refresh token".to_string(),
         )));
@@ -126,12 +134,20 @@ where
         path.push('/');
     };
     if account_is_disabled(&data, &user).await {
+        logging::record_as(
+            Some(&user),
+            LogKind::TokenRefresh,
+            None,
+            false,
+            Some("account disabled"),
+        );
         return Err(TcpError::DomainError(DomainError::AuthenticationError(
             "Account disabled".to_string(),
         )));
     }
     let groups = data.get_readonly_handler().get_user_groups(&user).await?;
     let token = create_jwt(data.get_tcp_handler(), jwt_key, &user, groups).await;
+    logging::record_as(Some(&user), LogKind::TokenRefresh, None, true, None);
     Ok(HttpResponse::Ok()
         .cookie(
             Cookie::build("token", token.as_str())
@@ -181,9 +197,24 @@ where
             false,
         )
         .await?;
+    // The response stays silent about unknown or disabled accounts; the log does not.
     if user_results.is_empty() {
+        logging::record_as(
+            None,
+            LogKind::PasswordResetRequest,
+            Some(user_string),
+            false,
+            Some("unknown user"),
+        );
         return Ok(());
     } else if user_results.len() > 1 {
+        logging::record_as(
+            None,
+            LogKind::PasswordResetRequest,
+            Some(user_string),
+            false,
+            Some("ambiguous user id or email"),
+        );
         return Err(TcpError::InternalServerError(
             "Ambiguous user id or email".to_owned(),
         ));
@@ -194,7 +225,16 @@ where
         .start_password_reset(&user.user_id)
         .await?
     {
-        None => return Ok(()),
+        None => {
+            logging::record_as(
+                None,
+                LogKind::PasswordResetRequest,
+                Some(user.user_id.as_str()),
+                false,
+                Some("account disabled"),
+            );
+            return Ok(());
+        }
         Some(token) => token,
     };
     if let Err(e) = super::mail::send_password_reset_email(
@@ -211,10 +251,24 @@ where
     {
         warn!("Error sending email: {:#?}", e);
         info!("Reset token: {}", token);
+        logging::record_as(
+            None,
+            LogKind::PasswordResetRequest,
+            Some(user.user_id.as_str()),
+            false,
+            Some("could not send email"),
+        );
         return Err(TcpError::InternalServerError(format!(
             "Could not send email: {e}"
         )));
     }
+    logging::record_as(
+        None,
+        LogKind::PasswordResetRequest,
+        Some(user.user_id.as_str()),
+        true,
+        None,
+    );
     Ok(())
 }
 
@@ -249,12 +303,26 @@ where
         .await
         .map_err(|e| {
             debug!("Reset token error: {e:#}");
+            logging::record_as(
+                None,
+                LogKind::PasswordResetComplete,
+                None,
+                false,
+                Some("wrong or expired reset token"),
+            );
             TcpError::NotFoundError("Wrong or expired reset token".to_owned())
         })?;
     let _ = data
         .get_tcp_handler()
         .delete_password_reset_token(token)
         .await;
+    logging::record_as(
+        Some(&user_id),
+        LogKind::PasswordResetComplete,
+        None,
+        true,
+        None,
+    );
     let groups = HashSet::new();
     let token = create_jwt(data.get_tcp_handler(), &data.jwt_key, &user_id, groups).await;
     let mut path = data.server_url.path().to_string();
@@ -306,6 +374,7 @@ where
     for jwt_hash in new_blacklisted_jwt_hashes {
         jwt_blacklist.insert(jwt_hash);
     }
+    logging::record_as(Some(&user), LogKind::Logout, None, true, None);
     let mut path = data.server_url.path().to_string();
     if !path.ends_with('/') {
         path.push('/');
@@ -475,9 +544,17 @@ where
     use actix_web::FromRequest;
     let inner_payload = &mut payload.into_inner();
     let bearer = BearerAuth::from_request(&request, inner_payload).await.ok();
+    // A rejected token is recorded by check_if_token_is_valid; only a missing one is not.
     let validation_result = match bearer {
         Some(bearer) => check_if_token_is_valid(&data, bearer.token()).await.ok(),
-        None => None,
+        None => {
+            logging::record_failure(
+                LogKind::AccessDenied,
+                None,
+                "Not authorized to change the user's password",
+            );
+            None
+        }
     }
     .ok_or_else(|| {
         TcpError::UnauthorizedError("Not authorized to change the user's password".to_string())
@@ -498,6 +575,13 @@ where
         .iter()
         .any(|g| g.display_name == "lldap_admin".into());
     if !validation_result.can_change_password(user_id, user_is_admin) {
+        logging::record_as(
+            Some(&validation_result.user),
+            LogKind::AccessDenied,
+            Some(user_id.as_str()),
+            false,
+            Some("Not authorized to change the user's password"),
+        );
         return Err(TcpError::UnauthorizedError(
             "Not authorized to change the user's password".to_string(),
         ));
@@ -524,26 +608,37 @@ where
 
 #[instrument(skip_all, level = "debug")]
 async fn opaque_register_finish<Backend>(
+    http_request: HttpRequest,
     data: web::Data<AppState<Backend>>,
     request: web::Json<registration::ClientRegistrationFinishRequest>,
 ) -> TcpResult<HttpResponse>
 where
     Backend: TcpBackendHandler + BackendHandler + OpaqueHandler + 'static,
 {
-    data.get_opaque_handler()
-        .registration_finish(request.into_inner())
-        .await?;
+    use actix_web::FromRequest;
+    // The ceremony authenticates itself through server_data; the bearer only names the actor.
+    let actor = BearerAuth::from_request(&http_request, &mut actix_web::dev::Payload::None)
+        .await
+        .ok()
+        .and_then(|bearer| actor_from_token(&data.jwt_key, bearer.token()));
+    with_actor(
+        actor,
+        data.get_opaque_handler()
+            .registration_finish(request.into_inner()),
+    )
+    .await?;
     Ok(HttpResponse::Ok().finish())
 }
 
 async fn opaque_register_finish_handler<Backend>(
+    http_request: HttpRequest,
     data: web::Data<AppState<Backend>>,
     request: web::Json<registration::ClientRegistrationFinishRequest>,
 ) -> HttpResponse
 where
     Backend: TcpBackendHandler + BackendHandler + OpaqueHandler + 'static,
 {
-    opaque_register_finish(data, request)
+    opaque_register_finish(http_request, data, request)
         .await
         .unwrap_or_else(error_to_http_response)
 }
@@ -616,17 +711,37 @@ async fn account_is_disabled<Backend: BackendHandler>(
     }
 }
 
+// Signature and expiry only: names the user without the blacklist and disabled-account
+// checks, and without recording anything.
+fn actor_from_token(jwt_key: &Hmac<Sha512>, token_str: &str) -> Option<UserId> {
+    let token: Token<_> = VerifyWithKey::verify_with_key(token_str, jwt_key).ok()?;
+    (token.claims().exp > Utc::now()).then(|| UserId::new(&token.claims().user))
+}
+
 #[instrument(skip_all, level = "debug", err, ret)]
 pub(crate) async fn check_if_token_is_valid<Backend: BackendHandler + OpaqueHandler>(
     state: &AppState<Backend>,
     token_str: &str,
 ) -> Result<ValidationResults, actix_web::Error> {
-    let token: Token<_> = VerifyWithKey::verify_with_key(token_str, &state.jwt_key)
-        .map_err(|_| ErrorUnauthorized("Invalid JWT"))?;
+    let token: Token<_> =
+        VerifyWithKey::verify_with_key(token_str, &state.jwt_key).map_err(|_| {
+            // Recorded (not terminal-only) so a junk-JWT flood is visible and coalesces.
+            logging::record_failure(LogKind::AccessDenied, None, "Invalid JWT");
+            ErrorUnauthorized("Invalid JWT")
+        })?;
     if token.claims().exp.lt(&Utc::now()) {
+        logging::record_failure(LogKind::AccessDenied, None, "Expired JWT");
         return Err(ErrorUnauthorized("Expired JWT"));
     }
+    let user = UserId::new(&token.claims().user);
     if token.header().algorithm != jwt::AlgorithmType::Hs512 {
+        logging::record_as(
+            Some(&user),
+            LogKind::AccessDenied,
+            None,
+            false,
+            Some("Unsupported JWT algorithm"),
+        );
         return Err(ErrorUnauthorized(format!(
             "Unsupported JWT algorithm: '{:?}'. Supported ones are: ['HS512']",
             token.header().algorithm
@@ -634,10 +749,23 @@ pub(crate) async fn check_if_token_is_valid<Backend: BackendHandler + OpaqueHand
     }
     let jwt_hash = default_hash(token_str);
     if state.jwt_blacklist.read().unwrap().contains(&jwt_hash) {
+        logging::record_as(
+            Some(&user),
+            LogKind::AccessDenied,
+            None,
+            false,
+            Some("JWT was logged out"),
+        );
         return Err(ErrorUnauthorized("JWT was logged out"));
     }
-    let user = UserId::new(&token.claims().user);
     if account_is_disabled(state, &user).await {
+        logging::record_as(
+            Some(&user),
+            LogKind::AccessDenied,
+            None,
+            false,
+            Some("Account disabled"),
+        );
         return Err(ErrorUnauthorized("Account disabled"));
     }
     Ok(state.backend_handler.get_permissions_from_groups(

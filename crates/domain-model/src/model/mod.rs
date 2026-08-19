@@ -4,6 +4,7 @@ pub mod codec;
 pub mod groups;
 pub mod jwt_refresh_storage;
 pub mod jwt_storage;
+pub mod logs;
 pub mod memberships;
 pub mod password_reset_tokens;
 pub mod users;

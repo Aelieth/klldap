@@ -48,14 +48,19 @@ Data storage:
   between front and back-end (OPAQUE structures, JWT format).
 * `crates/domain`, `crates/domain-model`, `crates/domain-handlers`: domain types,
   SeaORM models, and the backend-handler traits, including the `KerberosSync` seam
-  that ldap/sql/graphql call and the server binds to the real KDC.
+  that ldap/sql/graphql call and the server binds to the real KDC, and the logging seam
+  (`logging.rs`: event model, per-request context, sink registry) that the handlers
+  record into and the server binds to the SQL writer.
 * `crates/sql-backend-handler`: the SQL implementation of the handlers, the
-  migrations (v12/v13 are KLLDAP's) and the POSIX validators.
+  migrations (v12/v13 are KLLDAP's; v13 carries the `logs` table through
+  `ensure_logs`), the log writer (batched, coalescing repeated binds), retention and the
+  log lookups (list, summary, activity), and the POSIX validators.
 * `crates/access-control`: the permission-checked handles the APIs go through.
 * `crates/ldap`: the LDAP protocol layer (search, create, modify, delete, compare,
   password), its DN model and the operational-attribute table.
 * `crates/graphql-server`: the GraphQL API, mutations split by concern (users and
-  groups, OUs, POSIX, Kerberos, Keycloak).
+  groups, OUs, POSIX, Kerberos, Keycloak) and the admin-only log queries (`logs`,
+  `logSummary`, `logActivity`).
 * `crates/schema`: the attribute schema hub.
 * `crates/kerberos`: the libkadm5/libkrb5 FFI (the only unsafe code), the KDC
   bootstrap and supervision (`kerberos_manager` binary), and the live `KerberosSync`.

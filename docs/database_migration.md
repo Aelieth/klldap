@@ -41,10 +41,12 @@ whole database dump. This repo contains [a script](../scripts/sqlite_dump_comman
 ./sqlite_dump_commands.sh | sqlite3 /path/to/lldap/config/users.db > /path/to/dump.sql
 ```
 
-The script covers KLLDAP's tables too: `user_object_classes`, `group_object_classes` and
-`system_config` (your OUs and POSIX settings). `create_schema` seeds `system_config` with the
-defaults, so delete those rows on the target before inserting the dump
-(`DELETE FROM system_config;`), or the insert stops on the duplicate `allowedous` key.
+The script covers KLLDAP's tables too: `user_object_classes`, `group_object_classes`,
+`system_config` (your OUs and POSIX settings) and `logs` (the event history; omit that
+table from the dump if you do not want to carry it over). `create_schema` seeds
+`system_config` with the defaults, so delete those rows on the target before inserting
+the dump (`DELETE FROM system_config;`), or the insert stops on the duplicate
+`allowedous` key.
 
 ## Sanitize data
 
@@ -60,8 +62,10 @@ format to PostgreSQL format, and wrap it all in a transaction:
 ```sh
 sed -i -r -e "s/X'([[:xdigit:]]+'[^'])/'\\\x\\1/g" \
 -e ":a; s/(INSERT INTO (user_attribute_schema|jwt_storage)\(.*\) VALUES\(.*),1([^']*\);)$/\1,true\3/; s/(INSERT INTO (user_attribute_schema|jwt_storage)\(.*\) VALUES\(.*),0([^']*\);)$/\1,false\3/; ta" \
+-e "s/(INSERT INTO logs\(.*\) VALUES\([^,]*,'[^']*','[^']*',)1,/\1true,/; s/(INSERT INTO logs\(.*\) VALUES\([^,]*,'[^']*','[^']*',)0,/\1false,/" \
 -e '1s/^/BEGIN;\n/' \
 -e '$aSELECT setval(pg_get_serial_sequence('\''groups'\'', '\''group_id'\''), COALESCE((SELECT MAX(group_id) FROM groups), 1));' \
+-e '$aSELECT setval(pg_get_serial_sequence('\''logs'\'', '\''id'\''), COALESCE((SELECT MAX(id) FROM logs), 1));' \
 -e '$aCOMMIT;' /path/to/dump.sql
 ```
 

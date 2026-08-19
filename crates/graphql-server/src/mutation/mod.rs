@@ -175,10 +175,7 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             },
             (None, Some(group)) => group,
             _ => {
-                return Err(field_error_callback(
-                    &span,
-                    "createGroup requires exactly one of `name` and `group`",
-                )());
+                return Err("createGroup requires exactly one of `name` and `group`".into());
             }
         };
         create_group_with_details(context, group, span).await
@@ -1466,6 +1463,44 @@ mod tests {
             .await
             .unwrap();
         assert_unauthorized(&errors, query);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_denied_mutation_records_access_denied_for_the_scoped_actor() {
+        use lldap_domain_handlers::logging::{LogKind, Protocol, RequestMeta, with_request};
+        use lldap_test_utils::recording_log::LogGuard;
+        let guard = LogGuard::install();
+        let context = regular_context(MockTestBackendHandler::new());
+        let query = r#"mutation { deleteUser(userId: "carol") { ok } }"#;
+
+        let meta = RequestMeta::http(Some("203.0.113.5".parse().unwrap()), None)
+            .with_actor(Some(UserId::new("log-probe")))
+            .with_protocol(Protocol::Graphql);
+        let (_, errors) = with_request(
+            meta,
+            execute(query, None, &root_schema(), &Variables::new(), &context),
+        )
+        .await
+        .unwrap();
+        assert_unauthorized(&errors, query);
+
+        // Other tests deny concurrently; only this test scopes the probe actor.
+        let events: Vec<_> = guard
+            .recorder()
+            .take_events()
+            .into_iter()
+            .filter(|e| e.actor.as_deref() == Some("log-probe"))
+            .collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, LogKind::AccessDenied);
+        assert!(!events[0].success);
+        assert_eq!(events[0].protocol, Protocol::Graphql);
+        assert_eq!(events[0].peer.as_deref(), Some("203.0.113.5"));
+        assert_eq!(
+            events[0].detail.as_deref(),
+            Some("Unauthorized user deletion")
+        );
     }
 
     #[tokio::test]

@@ -12,6 +12,8 @@ pub use super::jwt_refresh_storage::Column as JwtRefreshStorageColumn;
 pub use super::jwt_refresh_storage::Entity as JwtRefreshStorage;
 pub use super::jwt_storage::Column as JwtStorageColumn;
 pub use super::jwt_storage::Entity as JwtStorage;
+pub use super::logs::Column as LogsColumn;
+pub use super::logs::Entity as Logs;
 pub use super::memberships::Column as MembershipColumn;
 pub use super::memberships::Entity as Membership;
 pub use super::password_reset_tokens::Column as PasswordResetTokensColumn;

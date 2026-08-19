@@ -8,11 +8,19 @@ use actix_files::Files;
 use actix_http::{HttpServiceBuilder, header};
 use actix_server::ServerBuilder;
 use actix_service::map_config;
-use actix_web::{App, HttpResponse, Responder, dev::AppConfig, guard, web};
+use actix_web::{
+    App, Error, HttpResponse, Responder,
+    body::MessageBody,
+    dev::{AppConfig, ServiceRequest, ServiceResponse},
+    guard,
+    middleware::{Next, from_fn},
+    web,
+};
 use anyhow::{Context, Result};
 use hmac::Hmac;
 use lldap_access_control::{AccessControlledBackendHandler, ReadonlyBackendHandler};
 use lldap_domain_handlers::handler::{BackendHandler, LoginHandler};
+use lldap_domain_handlers::logging::{RequestMeta, with_request};
 use lldap_domain_model::error::DomainError;
 use lldap_opaque_handler::OpaqueHandler;
 use sha2::Sha512;
@@ -20,6 +28,23 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::RwLock;
 use tracing::{info, warn};
+
+async fn log_request_scope(
+    req: ServiceRequest,
+    next: Next<impl MessageBody>,
+) -> Result<ServiceResponse<impl MessageBody>, Error> {
+    let forwarded_for = req
+        .headers()
+        .get_all("x-forwarded-for")
+        .filter_map(|value| value.to_str().ok())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let meta = RequestMeta::http(
+        req.peer_addr().map(|addr| addr.ip()),
+        (!forwarded_for.is_empty()).then_some(forwarded_for),
+    );
+    with_request(meta, next.call(req)).await
+}
 
 async fn index<Backend>(data: web::Data<AppState<Backend>>) -> actix_web::Result<impl Responder> {
     let mut file = std::fs::read_to_string(data.assets_path.join("index.html"))?;
@@ -237,6 +262,7 @@ where
                 HttpServiceBuilder::default()
                     .finish(map_config(
                         App::new()
+                            .wrap(from_fn(log_request_scope))
                             .wrap(actix_web::middleware::Condition::new(
                                 verbose,
                                 tracing_actix_web::TracingLogger::<CustomRootSpanBuilder>::new(),

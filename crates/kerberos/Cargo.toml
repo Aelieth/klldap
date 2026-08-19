@@ -30,3 +30,7 @@ path = "src/bin/kerberos_manager.rs"
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
+serial_test = { workspace = true }
+
+[dev-dependencies.lldap_test_utils]
+path = "../test-utils"

@@ -11,6 +11,54 @@ enum AttributeType {
   JPEG_PHOTO @deprecated(reason: "Legacy alias for AVATAR")
 }
 
+enum LogDimension {
+  ACTOR
+  TARGET
+  KIND
+  PROTOCOL
+  PEER
+  SUCCESS
+  DAY
+  HOUR
+}
+
+enum LogKind {
+  BIND
+  LOGIN
+  LOGOUT
+  TOKEN_REFRESH
+  PASSWORD_RESET_REQUEST
+  PASSWORD_RESET_COMPLETE
+  PASSWORD_CHANGE
+  USER_CREATE
+  USER_UPDATE
+  USER_DELETE
+  GROUP_CREATE
+  GROUP_UPDATE
+  GROUP_DELETE
+  MEMBERSHIP_ADD
+  MEMBERSHIP_REMOVE
+  SCHEMA_CHANGE
+  SYSTEM_CONFIG_CHANGE
+  POSIX_CHANGE
+  KERBEROS_SYNC
+  KEYTAB_EXPORT
+  KEYCLOAK_CHANGE
+  ACCESS_DENIED
+  SERVER_START
+  ADMIN_BOOTSTRAP
+  LOG_GAP
+  BIND_FLOOD
+  ACCESS_DENIED_FLOOD
+}
+
+enum LogProtocol {
+  LDAP
+  HTTP
+  GRAPHQL
+  SYSTEM
+}
+
 input AttributeValueInput {
   """
     The name of the attribute. It must be present in the schema, and the type informs how
@@ -55,6 +103,23 @@ input CreateUserInput {
 input EqualityConstraint {
   field: String!
   value: String!
+}
+
+"""
+  Every field narrows the result; `since`/`until` are inclusive, `kinds` empty means any,
+  `memberOf`/`memberOfId` keep the events of the current members of a group.
+"""
+input LogFilter {
+  actor: String
+  target: String
+  kinds: [LogKind!]
+  success: Boolean
+  protocol: LogProtocol
+  peer: String
+  since: DateTime
+  until: DateTime
+  memberOf: String
+  memberOfId: Int
 }
 
 input PosixSettingsInput {
@@ -228,6 +293,48 @@ type KeycloakSuggestedConfig {
   keycloakHostname: String!
 }
 
+"""
+  `failuresSinceLastSuccess` counts the failures recorded after `lastSuccess` (all of
+  them when there is none), within `since` when given.
+"""
+type LogActivity {
+  actor: String!
+  lastSuccess: LogEntry
+  lastFailure: LogEntry
+  failuresSinceLastSuccess: Int!
+}
+
+"""
+  One row of `logSummary`: only the grouped dimensions are set (`day` is `YYYY-MM-DD`,
+  `hour` 0-23, both UTC).
+"""
+type LogBucket {
+  actor: String
+  target: String
+  kind: LogKind
+  protocol: LogProtocol
+  peer: String
+  success: Boolean
+  day: String
+  hour: Int
+  count: Int!
+  first: DateTime!
+  last: DateTime!
+}
+
+type LogEntry {
+  id: ID!
+  timestamp: DateTime!
+  kind: LogKind!
+  success: Boolean!
+  protocol: LogProtocol!
+  actor: String
+  target: String
+  peer: String
+  forwardedFor: String
+  detail: String
+}
+
 type Mutation {
   createUser(user: CreateUserInput!): User!
   setUserPassword(userId: String!, password: String!): Success!
@@ -306,6 +413,18 @@ type Query {
   keycloakConfig: KeycloakConfigResponse!
   listOus: [String!]!
   posixSettings: PosixSettings!
+  "Newest first; `beforeId` pages back, `afterId` pages forward oldest first."
+  logs(filter: LogFilter, limit: Int, beforeId: ID, afterId: ID): [LogEntry!]!
+  """
+    Counts per distinct combination of `groupBy`, most frequent first; no `groupBy` gives
+    the total.
+  """
+  logSummary(filter: LogFilter, groupBy: [LogDimension!], limit: Int): [LogBucket!]!
+  """
+    One user's last success and failure among `kinds` (default: bind and login) and the
+    failures since that success.
+  """
+  logActivity(actor: String!, kinds: [LogKind!], since: DateTime): LogActivity!
 }
 
 type SaveKeycloakConfigResponse {

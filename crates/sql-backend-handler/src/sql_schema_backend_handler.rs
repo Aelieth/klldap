@@ -6,6 +6,7 @@ use lldap_domain::{
 };
 use lldap_domain_handlers::handler::{ReadSchemaBackendHandler, SchemaBackendHandler};
 use lldap_domain_handlers::kerberos::require_kdc_ready;
+use lldap_domain_handlers::logging::{self, LogKind};
 use lldap_domain_model::{
     error::{DomainError, Result},
     model,
@@ -31,6 +32,7 @@ impl ReadSchemaBackendHandler for SqlBackendHandler {
 impl SchemaBackendHandler for SqlBackendHandler {
     async fn add_user_attribute(&self, request: CreateAttributeRequest) -> Result<()> {
         require_kdc_ready()?;
+        let name = request.name.clone();
         let new_attribute = model::user_attribute_schema::ActiveModel {
             attribute_name: Set(request.name),
             attribute_type: Set(request.attribute_type),
@@ -42,11 +44,17 @@ impl SchemaBackendHandler for SqlBackendHandler {
             aliases: Set("[]".to_string()),
         };
         new_attribute.insert(&self.sql_pool).await?;
+        logging::record(
+            LogKind::SchemaChange,
+            Some(name.as_str()),
+            Some("add user attribute"),
+        );
         Ok(())
     }
 
     async fn add_group_attribute(&self, request: CreateAttributeRequest) -> Result<()> {
         require_kdc_ready()?;
+        let name = request.name.clone();
         let new_attribute = model::group_attribute_schema::ActiveModel {
             attribute_name: Set(request.name),
             attribute_type: Set(request.attribute_type),
@@ -58,6 +66,11 @@ impl SchemaBackendHandler for SqlBackendHandler {
             aliases: Set("[]".to_string()),
         };
         new_attribute.insert(&self.sql_pool).await?;
+        logging::record(
+            LogKind::SchemaChange,
+            Some(name.as_str()),
+            Some("add group attribute"),
+        );
         Ok(())
     }
 
@@ -66,6 +79,11 @@ impl SchemaBackendHandler for SqlBackendHandler {
         model::UserAttributeSchema::delete_by_id(name.clone())
             .exec(&self.sql_pool)
             .await?;
+        logging::record(
+            LogKind::SchemaChange,
+            Some(name.as_str()),
+            Some("delete user attribute"),
+        );
         Ok(())
     }
 
@@ -74,6 +92,11 @@ impl SchemaBackendHandler for SqlBackendHandler {
         model::GroupAttributeSchema::delete_by_id(name.clone())
             .exec(&self.sql_pool)
             .await?;
+        logging::record(
+            LogKind::SchemaChange,
+            Some(name.as_str()),
+            Some("delete group attribute"),
+        );
         Ok(())
     }
 
@@ -87,6 +110,11 @@ impl SchemaBackendHandler for SqlBackendHandler {
         }
         .insert(&self.sql_pool)
         .await?;
+        logging::record(
+            LogKind::SchemaChange,
+            Some(name.as_str()),
+            Some("add user object class"),
+        );
         Ok(())
     }
 
@@ -100,6 +128,11 @@ impl SchemaBackendHandler for SqlBackendHandler {
         }
         .insert(&self.sql_pool)
         .await?;
+        logging::record(
+            LogKind::SchemaChange,
+            Some(name.as_str()),
+            Some("add group object class"),
+        );
         Ok(())
     }
 
@@ -108,6 +141,11 @@ impl SchemaBackendHandler for SqlBackendHandler {
         model::UserObjectClasses::delete_by_id(name.as_str().to_ascii_lowercase())
             .exec(&self.sql_pool)
             .await?;
+        logging::record(
+            LogKind::SchemaChange,
+            Some(name.as_str()),
+            Some("delete user object class"),
+        );
         Ok(())
     }
 
@@ -116,6 +154,11 @@ impl SchemaBackendHandler for SqlBackendHandler {
         model::GroupObjectClasses::delete_by_id(name.as_str().to_ascii_lowercase())
             .exec(&self.sql_pool)
             .await?;
+        logging::record(
+            LogKind::SchemaChange,
+            Some(name.as_str()),
+            Some("delete group object class"),
+        );
         Ok(())
     }
 }

@@ -1,6 +1,6 @@
 use crate::sql_backend_handler::{
-    SqlBackendHandler, attribute_value_to_db_bytes, bool_to_expr, get_repeated_filter,
-    is_backend_writable_readonly_attribute,
+    SqlBackendHandler, attribute_value_to_db_bytes, bool_to_expr, describe_changes,
+    get_repeated_filter, is_backend_writable_readonly_attribute,
 };
 use async_trait::async_trait;
 use itertools::Itertools;
@@ -18,6 +18,7 @@ use lldap_domain_handlers::handler::{
 use lldap_domain_handlers::kerberos::{
     kerberos_backend, principal_name, require_kdc_ready, validate_directory_username,
 };
+use lldap_domain_handlers::logging::{self, LogKind};
 use lldap_domain_model::{
     error::{DomainError, Result},
     model::{self, GroupColumn, UserColumn, codec, system_config},
@@ -410,7 +411,7 @@ impl SystemConfigBackendHandler for SqlBackendHandler {
         require_kdc_ready()?;
         let config = system_config::ActiveModel {
             key: Set(key.to_string()),
-            value: Set(value),
+            value: Set(value.clone()),
         };
 
         system_config::Entity::insert(config)
@@ -422,6 +423,11 @@ impl SystemConfigBackendHandler for SqlBackendHandler {
             .exec(&self.sql_pool)
             .await?;
 
+        let detail = match key {
+            "allowedous" | "posix_settings" => value.as_str(),
+            _ => "updated",
+        };
+        logging::record(LogKind::SystemConfigChange, Some(key), Some(detail));
         Ok(())
     }
 }
@@ -458,7 +464,7 @@ impl SqlBackendHandler {
 
 #[async_trait]
 impl UserBackendHandler for SqlBackendHandler {
-    #[instrument(skip_all, level = "debug", err, fields(user_id = ?user_id.as_str()))]
+    #[instrument(skip_all, level = "debug", err(level = "debug"), fields(user_id = ?user_id.as_str()))]
     async fn get_user_details(&self, user_id: &UserId) -> Result<User> {
         let mut user = User::from(
             model::User::find_by_id(user_id.to_owned())
@@ -514,6 +520,7 @@ impl UserBackendHandler for SqlBackendHandler {
         require_kdc_ready()?;
         validate_directory_username(request.user_id.as_str())
             .map_err(DomainError::InternalError)?;
+        let user_id = request.user_id.clone();
         let now = chrono::Utc::now().naive_utc();
         let uuid = Uuid::from_name_and_date(request.user_id.as_str(), &now);
         let lower_email = request.email.as_str().to_lowercase();
@@ -608,6 +615,7 @@ impl UserBackendHandler for SqlBackendHandler {
                 })
             })
             .await?;
+        logging::record(LogKind::UserCreate, Some(user_id.as_str()), None);
         Ok(())
     }
 
@@ -615,6 +623,14 @@ impl UserBackendHandler for SqlBackendHandler {
     async fn update_user(&self, request: UpdateUserRequest) -> Result<()> {
         require_kdc_ready()?;
         let user_id = request.user_id.clone();
+        let changes = describe_changes(
+            &request.insert_attributes,
+            &request.delete_attributes,
+            &[
+                ("email", request.email.is_some()),
+                ("display_name", request.display_name.is_some()),
+            ],
+        );
         let delete_principal = self
             .sql_pool
             .transaction::<_, bool, DomainError>(|transaction| {
@@ -623,6 +639,7 @@ impl UserBackendHandler for SqlBackendHandler {
                 )
             })
             .await?;
+        logging::record(LogKind::UserUpdate, Some(user_id.as_str()), Some(&changes));
         // KDC side effects run after commit so a rollback cannot orphan a deleted principal.
         if delete_principal && let Err(e) = kerberos_backend().delete_principal(user_id.as_str()) {
             tracing::warn!(
@@ -671,6 +688,7 @@ impl UserBackendHandler for SqlBackendHandler {
                 "No such user: '{user_id}'"
             )));
         }
+        logging::record(LogKind::UserDelete, Some(user_id.as_str()), None);
         Ok(())
     }
 
@@ -721,6 +739,11 @@ impl UserBackendHandler for SqlBackendHandler {
                 })
             })
             .await?;
+        logging::record(
+            LogKind::MembershipAdd,
+            Some(kerb_uid.as_str()),
+            Some(target_name),
+        );
 
         // On disable, revoke KDC ticket issuance for kerberossync-managed users (best-effort).
         if disabled_target {
@@ -733,11 +756,12 @@ impl UserBackendHandler for SqlBackendHandler {
     async fn remove_user_from_group(&self, user_id: &UserId, group_id: GroupId) -> Result<()> {
         require_kdc_ready()?;
         // Resolved before the user_id shadow; a lookup failure skips the best-effort reflect.
-        let disabled_target = self
+        let group_name = self
             .get_group_details(group_id)
             .await
-            .map(|g| g.display_name.as_str() == "lldap_disabled")
-            .unwrap_or(false);
+            .ok()
+            .map(|g| g.display_name.as_str().to_owned());
+        let disabled_target = group_name.as_deref() == Some("lldap_disabled");
         let kerb_uid = user_id.clone();
 
         let user_id = user_id.clone();
@@ -790,6 +814,11 @@ impl UserBackendHandler for SqlBackendHandler {
                 sea_orm::TransactionError::Connection(e) => DomainError::DatabaseError(e),
                 sea_orm::TransactionError::Transaction(e) => DomainError::DatabaseError(e),
             })?;
+        logging::record(
+            LogKind::MembershipRemove,
+            Some(kerb_uid.as_str()),
+            group_name.as_deref(),
+        );
 
         // On re-enable, restore KDC ticket issuance for kerberossync-managed users (best-effort).
         if disabled_target {

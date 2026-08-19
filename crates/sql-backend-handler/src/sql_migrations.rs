@@ -12,7 +12,7 @@ use sea_orm::{
     },
 };
 use serde::{Deserialize, Serialize};
-use tracing::{error, info, instrument, warn};
+use tracing::{debug, error, info, instrument, warn};
 
 #[derive(DeriveIden, PartialEq, Eq, Debug, Serialize, Deserialize, Clone, Copy)]
 pub enum Users {
@@ -107,6 +107,21 @@ pub(crate) enum GroupObjectClasses {
     Table,
     LowerObjectClass,
     ObjectClass,
+}
+
+#[derive(DeriveIden, Clone, Copy)]
+pub(crate) enum Logs {
+    Table,
+    Id,
+    Timestamp,
+    Kind,
+    Success,
+    Protocol,
+    Actor,
+    Target,
+    Peer,
+    ForwardedFor,
+    Detail,
 }
 
 // Metadata about the SQL DB.
@@ -1452,6 +1467,101 @@ async fn ensure_column(
     Ok(())
 }
 
+// Table via the same probe as ensure_column. Indexes are always try-created in a
+// savepoint: MySQL's builder drops IF NOT EXISTS on indexes, so a missing-table-only
+// path would leave a crashed half-create without them forever.
+async fn ensure_logs(
+    transaction: &DatabaseTransaction,
+    backend: sea_orm::DbBackend,
+) -> Result<(), DbErr> {
+    let savepoint = transaction.begin().await?;
+    let probe = savepoint
+        .execute(backend.build(Query::select().expr(1).from(Logs::Table).limit(1)))
+        .await;
+    savepoint.rollback().await?;
+    if probe.is_err() {
+        transaction
+            .execute(
+                backend.build(
+                    Table::create()
+                        .table(Logs::Table)
+                        .if_not_exists()
+                        .col(
+                            ColumnDef::new(Logs::Id)
+                                .big_integer()
+                                .auto_increment()
+                                .not_null()
+                                .primary_key(),
+                        )
+                        .col(ColumnDef::new(Logs::Timestamp).date_time().not_null())
+                        .col(ColumnDef::new(Logs::Kind).string_len(32).not_null())
+                        .col(ColumnDef::new(Logs::Success).boolean().not_null())
+                        .col(ColumnDef::new(Logs::Protocol).string_len(8).not_null())
+                        .col(ColumnDef::new(Logs::Actor).string_len(255).null())
+                        .col(ColumnDef::new(Logs::Target).string_len(255).null())
+                        .col(ColumnDef::new(Logs::Peer).string_len(64).null())
+                        .col(ColumnDef::new(Logs::ForwardedFor).string_len(255).null())
+                        .col(ColumnDef::new(Logs::Detail).text().null()),
+                ),
+            )
+            .await?;
+    }
+    ensure_index(
+        transaction,
+        backend,
+        Index::create()
+            .name("logs-timestamp")
+            .table(Logs::Table)
+            .col(Logs::Timestamp)
+            .to_owned(),
+    )
+    .await?;
+    // Each lookup column pairs with the timestamp: actor activity, kind boards, target
+    // history and per-address counts all become one range seek.
+    for (name, column) in [
+        ("logs-actor", Logs::Actor),
+        ("logs-kind", Logs::Kind),
+        ("logs-target", Logs::Target),
+        ("logs-peer", Logs::Peer),
+    ] {
+        ensure_index(
+            transaction,
+            backend,
+            Index::create()
+                .name(name)
+                .table(Logs::Table)
+                .col(column)
+                .col(Logs::Timestamp)
+                .to_owned(),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn ensure_index(
+    transaction: &DatabaseTransaction,
+    backend: sea_orm::DbBackend,
+    index: sea_orm::sea_query::IndexCreateStatement,
+) -> Result<(), DbErr> {
+    let savepoint = transaction.begin().await?;
+    match savepoint.execute(backend.build(&index)).await {
+        Ok(_) => savepoint.commit().await,
+        Err(e) => {
+            debug!("Index left as is: {e}");
+            savepoint.rollback().await
+        }
+    }
+}
+
+// v13 is the pre-release schema: databases already stamped 13 pick up its later additions
+// at the next boot instead of through a new version.
+pub(crate) async fn ensure_v13_additions(pool: &DbConnection) -> Result<(), DbErr> {
+    let transaction = pool.begin().await?;
+    ensure_logs(&transaction, transaction.get_database_backend()).await?;
+    transaction.commit().await
+}
+
 async fn attribute_type_map(
     transaction: &DatabaseTransaction,
     backend: sea_orm::DbBackend,
@@ -2028,6 +2138,7 @@ async fn migrate_to_v13(transaction: DatabaseTransaction) -> Result<DatabaseTran
     )
     .await?;
     ensure_system_config(&transaction, backend).await?;
+    ensure_logs(&transaction, backend).await?;
 
     // v12 only repaired the row named 'avatar'; custom upstream JpegPhoto attrs hard-fail
     // the shared enum until their type is normalized too.

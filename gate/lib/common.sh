@@ -103,6 +103,33 @@ for part in os.environ["PATH_EXPR"].split("."):
 print(value)'
 }
 
+# log_rows <sql condition>: rows of logs matching it, read from the lane's database
+# (a copy of the SQLite file, or psql in the gate postgres). Booleans as `success`/`NOT success`.
+log_rows() {
+    case "$GATE_DB" in
+    postgres)
+        gexec_in "$PG_CONTAINER" psql -U klldap -d klldap -tAc \
+            "SELECT COUNT(*) FROM logs WHERE $1" | tr -d '[:space:]'
+        ;;
+    sqlite)
+        local copy
+        copy="$(phase_dir)/logs-copy.db"
+        docker cp "$CONTAINER:/data/users.db" "$copy" >/dev/null 2>&1 || {
+            echo -1
+            return
+        }
+        LOGS_DB="$copy" LOGS_WHERE="$1" python3 - <<'PY'
+import os, sqlite3
+con = sqlite3.connect(os.environ["LOGS_DB"])
+print(con.execute("SELECT COUNT(*) FROM logs WHERE " + os.environ["LOGS_WHERE"]).fetchone()[0])
+PY
+        ;;
+    *)
+        echo -1
+        ;;
+    esac
+}
+
 # ---- LDAP (host openldap-clients against the published port) ----
 
 admin_dn() { printf 'uid=admin,ou=people,%s' "$BASE_DN"; }

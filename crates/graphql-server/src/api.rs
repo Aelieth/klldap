@@ -6,6 +6,7 @@ use lldap_access_control::{
 };
 use lldap_auth::{access_control::ValidationResults, types::UserId};
 use lldap_domain_handlers::handler::BackendHandler;
+use lldap_domain_handlers::logging::{self, LogKind};
 use lldap_opaque_handler::OpaqueHandler;
 use tracing::debug;
 
@@ -24,6 +25,7 @@ pub fn field_error_callback<'a>(
 ) -> impl 'a + FnOnce() -> FieldError {
     move || {
         span.in_scope(|| debug!("Unauthorized"));
+        logging::record_failure(LogKind::AccessDenied, None, error_message);
         FieldError::from(error_message)
     }
 }

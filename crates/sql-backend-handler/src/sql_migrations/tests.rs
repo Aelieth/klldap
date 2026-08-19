@@ -1577,6 +1577,79 @@ async fn assert_full_rich_data_integrity(pool: &DbConnection, at_version: Schema
             "sshpublickey (list attr) must be in schema after v12"
         );
     }
+
+    if at_version.0 >= 13 {
+        assert_eq!(
+            count(pool, r#"SELECT COUNT(*) as c FROM logs"#).await,
+            0,
+            "logs must exist and be empty after v13"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_v13_database_without_logs_gets_it_on_init() {
+    let pool = get_in_memory_db().await;
+    init_table(&pool).await.unwrap();
+    pool.execute(raw_statement(r#"DROP TABLE logs"#))
+        .await
+        .unwrap();
+
+    init_table(&pool).await.unwrap();
+
+    pool.execute(raw_statement(
+        r#"INSERT INTO logs (timestamp, kind, success, protocol)
+           VALUES ('2026-01-01 00:00:00', 'server_start', 1, 'system')"#,
+    ))
+    .await
+    .unwrap();
+    init_table(&pool).await.unwrap();
+    assert_eq!(
+        count(&pool, r#"SELECT COUNT(*) as c FROM logs"#).await,
+        1,
+        "re-init keeps the logs table and its rows"
+    );
+}
+
+const LOG_INDEXES: [&str; 5] = [
+    "logs-timestamp",
+    "logs-actor",
+    "logs-kind",
+    "logs-target",
+    "logs-peer",
+];
+
+#[tokio::test]
+async fn test_v13_database_without_log_indexes_gets_them_on_init() {
+    let pool = get_in_memory_db().await;
+    init_table(&pool).await.unwrap();
+    for name in LOG_INDEXES {
+        pool.execute(raw_statement(&format!(r#"DROP INDEX "{name}""#)))
+            .await
+            .unwrap();
+    }
+
+    init_table(&pool).await.unwrap();
+
+    #[derive(FromQueryResult)]
+    struct NameRow {
+        name: String,
+    }
+    let names: Vec<String> = NameRow::find_by_statement(raw_statement(
+        r#"SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'logs'"#,
+    ))
+    .all(&pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|r| r.name)
+    .collect();
+    for index in LOG_INDEXES {
+        assert!(
+            names.iter().any(|n| n == index),
+            "{index} restored: {names:?}"
+        );
+    }
 }
 
 async fn run_stepwise_migration_test(start_ver: SchemaVersion) {
@@ -1862,4 +1935,183 @@ async fn test_postgres_stepwise_migration() {
         pg_user_attribute(&pool, "pguser", "pgcustom").await,
         b"PG Bob"
     );
+}
+
+#[tokio::test]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_log_retention_trims_by_age_and_size() {
+    use crate::sql_log_handler::{LogRetention, enforce_log_retention};
+    use lldap_domain_model::model::{Logs, LogsColumn, logs};
+    use sea_orm::{ActiveValue::Set, EntityTrait, QueryOrder};
+
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres().await else {
+        eprintln!("KLLDAP_TEST_DATABASE_URL not set; skipping");
+        return;
+    };
+    init_table(&pool).await.expect("fresh init on postgres");
+    let row = |actor: &str, days_ago: i64| logs::ActiveModel {
+        timestamp: Set(chrono::Utc::now().naive_utc() - chrono::Duration::days(days_ago)),
+        kind: Set("bind".to_owned()),
+        success: Set(true),
+        protocol: Set("ldap".to_owned()),
+        actor: Set(Some(actor.to_owned())),
+        ..Default::default()
+    };
+    Logs::insert_many(
+        std::iter::once(row("old", 40)).chain((0..5).map(|i| row(&format!("new{i}"), 0))),
+    )
+    .exec(&pool)
+    .await
+    .expect("insert rows");
+
+    enforce_log_retention(
+        &pool,
+        LogRetention {
+            retention_days: 30,
+            max_entries: 3,
+        },
+    )
+    .await
+    .expect("retention on postgres");
+    let actors: Vec<_> = Logs::find()
+        .order_by_asc(LogsColumn::Id)
+        .all(&pool)
+        .await
+        .expect("query")
+        .into_iter()
+        .filter_map(|r| r.actor)
+        .collect();
+    assert_eq!(actors, vec!["new2", "new3", "new4"]);
+}
+
+#[tokio::test]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_log_lookups_summarize_and_activity() {
+    use crate::sql_backend_handler::tests::{
+        insert_group, insert_membership, insert_user_no_password,
+    };
+    use lldap_domain_handlers::handler::LogBackendHandler;
+    use lldap_domain_handlers::logging::{
+        LOGIN_KINDS, LogCursor, LogDimension, LogFilter, LogKind,
+    };
+    use lldap_domain_model::model::{Logs, logs};
+    use sea_orm::{ActiveValue::Set, EntityTrait};
+
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres().await else {
+        eprintln!("KLLDAP_TEST_DATABASE_URL not set; skipping");
+        return;
+    };
+    init_table(&pool).await.expect("fresh init on postgres");
+    let handler = SqlBackendHandler::new(generate_random_private_key(), pool.clone());
+    insert_user_no_password(&handler, "bob").await;
+    let devs = insert_group(&handler, "Devs").await;
+    insert_membership(&handler, devs, "bob").await;
+    let at = |day: u32, hour: u32| {
+        NaiveDate::from_ymd_opt(2024, 5, day)
+            .unwrap()
+            .and_hms_micro_opt(hour, 0, 40, 123_456)
+            .unwrap()
+    };
+    let row =
+        |actor: &str, kind: &str, success: bool, timestamp: NaiveDateTime| logs::ActiveModel {
+            timestamp: Set(timestamp),
+            kind: Set(kind.to_owned()),
+            success: Set(success),
+            protocol: Set("ldap".to_owned()),
+            actor: Set(Some(actor.to_owned())),
+            peer: Set(Some("10.0.0.5".to_owned())),
+            ..Default::default()
+        };
+    Logs::insert_many([
+        row("bob", "bind", false, at(1, 9)),
+        row("bob", "bind", true, at(1, 10)),
+        row("bob", "bind", false, at(1, 12)),
+        row("bob", "login", false, at(2, 12)),
+        row("carol", "bind", false, at(2, 13)),
+    ])
+    .exec(&pool)
+    .await
+    .expect("insert rows");
+
+    let by_day = handler
+        .summarize_log_events(LogFilter::default(), vec![LogDimension::Day], 100)
+        .await
+        .expect("summary by day");
+    assert_eq!(
+        by_day
+            .iter()
+            .map(|b| (b.day.as_deref(), b.count))
+            .collect::<Vec<_>>(),
+        vec![(Some("2024-05-01"), 3), (Some("2024-05-02"), 2)]
+    );
+    let by_hour = handler
+        .summarize_log_events(
+            LogFilter {
+                kinds: vec![LogKind::Bind, LogKind::Login],
+                success: Some(false),
+                ..Default::default()
+            },
+            vec![LogDimension::Kind, LogDimension::Hour],
+            100,
+        )
+        .await
+        .expect("summary by kind and hour");
+    assert_eq!(
+        by_hour
+            .iter()
+            .map(|b| (b.kind, b.hour, b.count))
+            .collect::<Vec<_>>(),
+        vec![
+            (Some(LogKind::Bind), Some(13), 1),
+            (Some(LogKind::Login), Some(12), 1),
+            (Some(LogKind::Bind), Some(12), 1),
+            (Some(LogKind::Bind), Some(9), 1),
+        ],
+        "equal counts: newest first"
+    );
+    assert_eq!(by_hour[0].first, at(2, 13));
+
+    let members = handler
+        .list_log_events(
+            LogFilter {
+                member_of: Some("devs".to_owned()),
+                ..Default::default()
+            },
+            10,
+            LogCursor::After(0),
+        )
+        .await
+        .expect("members of devs, oldest first");
+    assert_eq!(
+        members.iter().map(|r| r.id).collect::<Vec<_>>(),
+        vec![1, 2, 3, 4]
+    );
+
+    let activity = handler
+        .log_activity(&UserId::new("bob"), LOGIN_KINDS.to_vec(), None)
+        .await
+        .expect("activity");
+    assert_eq!(activity.last_success.map(|r| r.id), Some(2));
+    assert_eq!(activity.last_failure.map(|r| r.id), Some(4));
+    assert_eq!(activity.failures_since_last_success, 2);
+
+    #[derive(FromQueryResult)]
+    struct IndexRow {
+        indexname: String,
+    }
+    let indexes: Vec<String> = IndexRow::find_by_statement(sea_orm::Statement::from_string(
+        DbBackend::Postgres,
+        "SELECT indexname FROM pg_indexes WHERE tablename = 'logs'".to_owned(),
+    ))
+    .all(&pool)
+    .await
+    .expect("pg_indexes")
+    .into_iter()
+    .map(|r| r.indexname)
+    .collect();
+    for index in LOG_INDEXES {
+        assert!(indexes.iter().any(|n| n == index), "{index}: {indexes:?}");
+    }
 }

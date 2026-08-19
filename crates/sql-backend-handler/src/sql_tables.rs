@@ -1,4 +1,6 @@
-use crate::sql_migrations::{Metadata, get_schema_version, migrate_from_version, upgrade_to_v1};
+use crate::sql_migrations::{
+    Metadata, ensure_v13_additions, get_schema_version, migrate_from_version, upgrade_to_v1,
+};
 use sea_orm::{
     ConnectionTrait, DeriveValueType, Iden, QueryResult, TryGetable, Value, sea_query::Query,
 };
@@ -51,6 +53,7 @@ pub async fn init_table(pool: &DbConnection) -> anyhow::Result<()> {
         }
     };
     migrate_from_version(pool, version, LAST_SCHEMA_VERSION).await?;
+    ensure_v13_additions(pool).await?;
     Ok(())
 }
 

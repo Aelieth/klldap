@@ -26,9 +26,13 @@ cargo clippy --tests --all -- -D warnings
 `cargo test --workspace` runs the unit tests of every crate and `server/tests`, which
 starts the freshly built binary against a temporary SQLite database on ephemeral ports (one
 server per test, tests run in parallel): LDAP over the wire, GraphQL over HTTP, the lldap-cli
-request shapes, and the migration of a genuine LLDAP 0.6.3 database
-(`server/tests/fixtures`). The Kerberos backend is a recorder in these tests; nothing needs
-a KDC.
+request shapes, the migration of a genuine LLDAP 0.6.3 database
+(`server/tests/fixtures`), and the event log (`server/tests/logs.rs`: boot, act, stop,
+inspect the `logs` table, boot again; the summary, activity and tail-cursor queries; two
+successful binds within the coalescing window stored once). The Kerberos backend is a recorder in these tests;
+nothing needs a KDC. The log sink is process-global like the Kerberos backend: a test that
+installs `LogGuard` must be `#[serial]`, and non-serial tests keep recording meanwhile, so
+assert on your own markers (a private peer address or actor), not on the whole recording.
 
 ## The container gate
 
@@ -37,12 +41,13 @@ boots it with test secrets on the standard ports and two named volumes.
 
 `make gate` builds that image and runs `gate/run-gate.sh` against it: the real
 container, entrypoint and all, exercised as CLI invocations (`ldapsearch`, `ldapmodify`,
-`kinit`, GraphQL over HTTP) through 14 phases — fresh boot, environment validation,
+`kinit`, GraphQL over HTTP) through 15 phases — fresh boot, environment validation,
 a custom `LLDAP_UID`/`LLDAP_GID` boot, GraphQL auth, OU lifecycle, Kerberos lifecycle
 (principal, kinit, disable, re-enable),
-bootstrap idempotence, LDAP read and write matrices, Keycloak keytab export, restart
-persistence, KDC death detection, and, when their inputs are given, migration boot and a
-real lldap-cli run. It needs docker, the OpenLDAP client tools
+bootstrap idempotence, LDAP read and write matrices, Keycloak keytab export, the event
+log queries (rows with peers, per-actor summary and activity, the tail cursor, admin-only),
+restart persistence (directory data and the logs table), KDC death detection, and, when their
+inputs are given, migration boot and a real lldap-cli run. It needs docker, the OpenLDAP client tools
 (`openldap-clients` / `ldap-utils`) and python3; `kinit` runs inside the container.
 
 - `make gate-fast` runs the phases against the already built image.

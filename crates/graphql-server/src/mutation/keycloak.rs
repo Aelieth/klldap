@@ -1,5 +1,6 @@
 use crate::api::{Context, FullHandler, field_error_callback};
 use juniper::FieldResult;
+use lldap_domain_handlers::logging::{self, LogKind};
 use lldap_keycloak::{KeycloakClient, KeycloakConfig};
 use lldap_opaque_handler::OpaqueHandler;
 use tracing::debug_span;
@@ -61,13 +62,21 @@ pub(super) async fn test_keycloak_connection<Handler: FullHandler + OpaqueHandle
             &span,
             "Unauthorized Keycloak connection test",
         ))?;
+    let url = input.url.clone();
     let client = KeycloakClient::from_test_input(
         input.url,
         input.realm,
         input.admin_user,
         input.admin_pass,
     )?;
-    match client.test_connection().await {
+    let result = client.test_connection().await;
+    logging::record_outcome(
+        LogKind::KeycloakChange,
+        Some(&url),
+        result.is_ok(),
+        Some("test connection"),
+    );
+    match result {
         Ok(message) => Ok(TestKeycloakConnectionResponse { ok: true, message }),
         Err(e) => Ok(TestKeycloakConnectionResponse {
             ok: false,
@@ -93,7 +102,14 @@ pub(super) async fn save_keycloak_config<Handler: FullHandler + OpaqueHandler>(
         realm: input.realm,
         admin_user: input.admin_user,
     };
-    match config.save() {
+    let result = config.save();
+    logging::record_outcome(
+        LogKind::KeycloakChange,
+        Some(&config.url),
+        result.is_ok(),
+        Some("save config"),
+    );
+    match result {
         Ok(path) => Ok(SaveKeycloakConfigResponse {
             ok: true,
             message: format!(
@@ -119,13 +135,14 @@ pub(super) async fn push_realm_to_keycloak<Handler: FullHandler + OpaqueHandler>
             &span,
             "Unauthorized Keycloak realm push",
         ))?;
+    let realm = input.realm.clone();
     let client = KeycloakClient::from_test_input(
         input.url,
         input.realm,
         input.admin_user,
         input.admin_pass,
     )?;
-    let message = client
+    let result = client
         .setup_realm(
             input.lldap_url,
             input.sync_username,
@@ -133,6 +150,15 @@ pub(super) async fn push_realm_to_keycloak<Handler: FullHandler + OpaqueHandler>
             input.enable_hsts,
             input.enable_brute_force,
         )
-        .await?;
-    Ok(PushRealmResponse { ok: true, message })
+        .await;
+    logging::record_outcome(
+        LogKind::KeycloakChange,
+        Some(&realm),
+        result.is_ok(),
+        Some("push realm"),
+    );
+    Ok(PushRealmResponse {
+        ok: true,
+        message: result?,
+    })
 }

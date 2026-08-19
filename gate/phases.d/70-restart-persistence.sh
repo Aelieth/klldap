@@ -17,6 +17,7 @@ graphql 'mutation($id: String!, $pw: String!) { setUserPassword(userId: $id, pas
 
 keytab_before="$(file_digest /data/kadm5.keytab)"
 kvno_before="$(kadmin_q "getprinc admin/admin@$REALM" | grep -m1 "vno" | awk '{print $3}' | tr -d ',')"
+logs_before="$(log_rows "1 = 1")"
 restart_stamp="$(date +%s)"
 
 if t docker restart "$CONTAINER" >/dev/null 2>&1; then
@@ -71,4 +72,21 @@ if lsearch -b "$BASE_DN" -s sub "(uid=$KEEP_USER)" uid 2>"$D/ldap.err" | grep -q
     p_ok "LDAP data intact after restart"
 else
     p_bad "LDAP search for $KEEP_USER failed after restart"
+fi
+
+logs_after="$(log_rows "1 = 1")"
+if [ "$logs_before" -gt 0 ] && [ "$logs_after" -ge "$logs_before" ]; then
+    p_ok "logs rows survive the restart ($logs_before → $logs_after)"
+else
+    p_bad "logs rows lost across the restart ($logs_before → $logs_after)"
+fi
+if [ "$(log_rows "kind = 'user_create' AND target = '$KEEP_USER' AND actor = 'admin' AND protocol = 'graphql'")" = "1" ]; then
+    p_ok "createUser $KEEP_USER is in the logs table with actor and protocol"
+else
+    p_bad "createUser $KEEP_USER missing from the logs table"
+fi
+if [ "$(log_rows "kind = 'server_start'")" -ge 2 ]; then
+    p_ok "server_start recorded for both boots"
+else
+    p_bad "server_start rows missing after restart"
 fi

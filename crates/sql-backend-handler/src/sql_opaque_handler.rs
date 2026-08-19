@@ -1,10 +1,12 @@
 use crate::SqlBackendHandler;
+use crate::sql_log_handler::UNKNOWN_USER_DETAIL;
 use async_trait::async_trait;
 use base64::Engine;
 use lldap_auth::opaque;
 use lldap_domain::types::UserId;
 use lldap_domain_handlers::handler::{BindRequest, LoginHandler};
 use lldap_domain_handlers::kerberos::require_kdc_ready;
+use lldap_domain_handlers::logging::{self, LogKind};
 use lldap_domain_model::{
     error::{DomainError, Result},
     model::{self, UserColumn},
@@ -15,7 +17,7 @@ use tracing::{debug, info, instrument, warn};
 
 type SqlOpaqueHandler = SqlBackendHandler;
 
-#[instrument(skip_all, level = "debug", err, fields(username = %username.as_str()))]
+#[instrument(skip_all, level = "debug", err(level = "debug"), fields(username = %username.as_str()))]
 fn passwords_match(
     password_file_bytes: &[u8],
     clear_password: &str,
@@ -91,12 +93,19 @@ impl SqlBackendHandler {
 
 #[async_trait]
 impl LoginHandler for SqlBackendHandler {
-    #[instrument(skip_all, level = "debug", err)]
+    #[instrument(skip_all, level = "debug", err(level = "debug"))]
     async fn bind(&self, request: BindRequest) -> Result<()> {
         if self.is_user_disabled(&request.name).await? {
             warn!(
                 r#"Login attempt denied for disabled user "{}""#,
                 &request.name
+            );
+            logging::record_as(
+                Some(&request.name),
+                LogKind::Bind,
+                None,
+                false,
+                Some("account disabled"),
             );
             return Err(DomainError::AuthenticationError(format!(
                 r#"for user "{}""#,
@@ -104,11 +113,11 @@ impl LoginHandler for SqlBackendHandler {
             )));
         }
 
-        if let Some(password_hash) = self
+        let detail = if let Some(password_hash) = self
             .get_password_file_for_user(request.name.clone())
             .await?
         {
-            info!(r#"Login attempt for "{}""#, &request.name);
+            debug!(r#"Login attempt for "{}""#, &request.name);
             if passwords_match(
                 &password_hash,
                 &request.password,
@@ -117,14 +126,24 @@ impl LoginHandler for SqlBackendHandler {
             )
             .is_ok()
             {
+                logging::record_as(Some(&request.name), LogKind::Bind, None, true, None);
                 return Ok(());
             }
+            "invalid credentials"
         } else {
             debug!(
                 r#"User "{}" doesn't exist or has no password"#,
                 &request.name
             );
-        }
+            UNKNOWN_USER_DETAIL
+        };
+        logging::record_as(
+            Some(&request.name),
+            LogKind::Bind,
+            None,
+            false,
+            Some(detail),
+        );
         Err(DomainError::AuthenticationError(format!(
             r#"for user "{}""#,
             request.name
@@ -134,7 +153,7 @@ impl LoginHandler for SqlBackendHandler {
 
 #[async_trait]
 impl OpaqueHandler for SqlOpaqueHandler {
-    #[instrument(skip_all, level = "debug", err)]
+    #[instrument(skip_all, level = "debug", err(level = "debug"))]
     async fn login_start(
         &self,
         request: login::ClientLoginStartRequest,
@@ -145,6 +164,13 @@ impl OpaqueHandler for SqlOpaqueHandler {
             warn!(
                 r#"OPAQUE login attempt denied for disabled user "{}""#,
                 &user_id
+            );
+            logging::record_as(
+                Some(&user_id),
+                LogKind::Login,
+                None,
+                false,
+                Some("account disabled"),
             );
             return Err(DomainError::AuthenticationError(format!(
                 r#"for user "{}""#,
@@ -184,7 +210,7 @@ impl OpaqueHandler for SqlOpaqueHandler {
         })
     }
 
-    #[instrument(skip_all, level = "debug", err)]
+    #[instrument(skip_all, level = "debug", err(level = "debug"))]
     async fn login_finish(&self, request: login::ClientLoginFinishRequest) -> Result<UserId> {
         let secret_key = self.get_orion_secret_key()?;
         let login::ServerData {
@@ -201,6 +227,13 @@ impl OpaqueHandler for SqlOpaqueHandler {
                 r#"OPAQUE login_finish denied for disabled user "{}""#,
                 &username
             );
+            logging::record_as(
+                Some(&username),
+                LogKind::Login,
+                None,
+                false,
+                Some("account disabled"),
+            );
             return Err(DomainError::AuthenticationError(format!(
                 r#"for user "{}""#,
                 username
@@ -210,10 +243,18 @@ impl OpaqueHandler for SqlOpaqueHandler {
         match opaque::server::login::finish_login(server_login, request.credential_finalization) {
             Ok(session) => {
                 info!(r#"OPAQUE login successful for "{}""#, &username);
+                logging::record_as(Some(&username), LogKind::Login, None, true, None);
                 let _ = session.session_key;
             }
             Err(e) => {
                 warn!(r#"OPAQUE login attempt failed for "{}""#, &username);
+                logging::record_as(
+                    Some(&username),
+                    LogKind::Login,
+                    None,
+                    false,
+                    Some("invalid credentials"),
+                );
                 return Err(e.into());
             }
         };
@@ -266,6 +307,7 @@ impl OpaqueHandler for SqlOpaqueHandler {
         };
         user_update.update(&self.sql_pool).await?;
         info!(r#"Successfully (re)set password for "{}""#, &username);
+        logging::record(LogKind::PasswordChange, Some(username.as_str()), None);
         Ok(())
     }
 }

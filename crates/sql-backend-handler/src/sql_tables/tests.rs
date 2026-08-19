@@ -74,6 +74,14 @@ async fn test_init_table() {
             creation_date: Utc.timestamp_opt(0, 0).unwrap().naive_utc(),
         }
     );
+
+    sql_pool
+        .execute(raw_statement(
+            r#"INSERT INTO logs (timestamp, kind, success, protocol, actor, target, peer, detail)
+               VALUES ("1970-01-01 00:00:00", "user_create", 1, "graphql", "admin", "bôb", "127.0.0.1", NULL)"#,
+        ))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

@@ -1,3 +1,6 @@
+use crate::logging::{
+    LogActivity, LogBucket, LogCursor, LogDimension, LogFilter, LogKind, LogRecord,
+};
 use async_trait::async_trait;
 use ldap3_proto::proto::LdapSubstringFilter;
 use lldap_domain::{
@@ -187,6 +190,32 @@ pub trait SystemConfigBackendHandler: Send + Sync {
 }
 
 #[async_trait]
+pub trait LogBackendHandler: Send + Sync {
+    async fn list_log_events(
+        &self,
+        filter: LogFilter,
+        limit: u32,
+        cursor: LogCursor,
+    ) -> Result<Vec<LogRecord>>;
+    /// One bucket per distinct combination of `group_by`, most frequent first (then newest);
+    /// no dimension gives one bucket of totals.
+    async fn summarize_log_events(
+        &self,
+        filter: LogFilter,
+        group_by: Vec<LogDimension>,
+        limit: u32,
+    ) -> Result<Vec<LogBucket>>;
+    /// The actor's last success and failure among `kinds` (`since` bounds both), and the
+    /// failures recorded after that last success.
+    async fn log_activity(
+        &self,
+        actor: &UserId,
+        kinds: Vec<LogKind>,
+        since: Option<chrono::NaiveDateTime>,
+    ) -> Result<LogActivity>;
+}
+
+#[async_trait]
 pub trait BackendHandler:
     Send
     + Sync
@@ -198,6 +227,7 @@ pub trait BackendHandler:
     + SchemaBackendHandler
     + SystemConfigBackendHandler
     + PosixBackendHandler
+    + LogBackendHandler
 {
 }
 

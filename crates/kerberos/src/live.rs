@@ -3,6 +3,7 @@ use crate::{
     set_kerberos_principal_enabled, sync_kerberos_principal,
 };
 use lldap_domain_handlers::kerberos::KerberosSync;
+use lldap_domain_handlers::logging::{LogKind, record_outcome};
 use std::{
     net::{SocketAddr, TcpStream},
     sync::atomic::{AtomicBool, Ordering},
@@ -45,17 +46,37 @@ impl KerberosSync for LiveKerberos {
         up
     }
     fn sync_principal(&self, username: &str, password: &str) -> Result<(), String> {
-        sync_kerberos_principal(username, password).map_err(|e| format!("{e:#}"))
+        logged(LogKind::KerberosSync, username, "sync", || {
+            sync_kerberos_principal(username, password)
+        })
     }
     fn delete_principal(&self, username: &str) -> Result<(), String> {
-        delete_kerberos_principal(username).map_err(|e| format!("{e:#}"))
+        logged(LogKind::KerberosSync, username, "delete", || {
+            delete_kerberos_principal(username)
+        })
     }
     fn set_principal_enabled(&self, username: &str, enabled: bool) -> Result<(), String> {
-        set_kerberos_principal_enabled(username, enabled).map_err(|e| format!("{e:#}"))
+        let op = if enabled { "enable" } else { "disable" };
+        logged(LogKind::KerberosSync, username, op, || {
+            set_kerberos_principal_enabled(username, enabled)
+        })
     }
     fn export_keytab_for_keycloak(&self, hostname: &str) -> Result<String, String> {
-        export_keytab_for_keycloak(hostname).map_err(|e| format!("{e:#}"))
+        logged(LogKind::KeytabExport, hostname, "keycloak", || {
+            export_keytab_for_keycloak(hostname)
+        })
     }
+}
+
+fn logged<T>(
+    kind: LogKind,
+    target: &str,
+    op: &str,
+    f: impl FnOnce() -> anyhow::Result<T>,
+) -> Result<T, String> {
+    let result = f().map_err(|e| format!("{e:#}"));
+    record_outcome(kind, Some(target), result.is_ok(), Some(op));
+    result
 }
 
 #[cfg(test)]
@@ -78,5 +99,45 @@ mod tests {
         assert!(live.ready(), "the KDC port answers");
         drop(listener);
         assert!(live.ready(), "latched: a KDC seen once counts as up");
+    }
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+    use lldap_domain_handlers::logging::{LogKind, Protocol};
+    use lldap_test_utils::recording_log::LogGuard;
+    use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn test_principal_operations_record_kerberos_sync_events() {
+        let guard = LogGuard::install();
+        let live = LiveKerberos::on_port(1, false);
+
+        // No KDC: the delete is a no-op success, the sync a failure; both are recorded.
+        assert!(live.delete_principal("bob").is_ok());
+        assert!(live.sync_principal("bob", "pw").is_err());
+        assert!(live.export_keytab_for_keycloak("host.example.com").is_err());
+
+        let events = guard.recorder().take_events();
+        let summary: Vec<_> = events
+            .iter()
+            .map(|e| (e.kind, e.target.as_deref(), e.detail.as_deref(), e.success))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (LogKind::KerberosSync, Some("bob"), Some("delete"), true),
+                (LogKind::KerberosSync, Some("bob"), Some("sync"), false),
+                (
+                    LogKind::KeytabExport,
+                    Some("host.example.com"),
+                    Some("keycloak"),
+                    false
+                ),
+            ]
+        );
+        assert!(events.iter().all(|e| e.protocol == Protocol::System));
     }
 }

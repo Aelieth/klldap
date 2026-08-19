@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 pub mod recording_kerberos;
+pub mod recording_log;
 use async_trait::async_trait;
 use lldap_domain::{
     requests::{
@@ -12,9 +13,12 @@ use lldap_domain::{
 };
 use lldap_domain_handlers::handler::{
     BackendHandler, BindRequest, GroupBackendHandler, GroupListerBackendHandler,
-    GroupRequestFilter, LoginHandler, PosixBackendHandler, PosixSettings, ReadSchemaBackendHandler,
-    SchemaBackendHandler, SystemConfigBackendHandler, UserBackendHandler, UserListerBackendHandler,
-    UserRequestFilter,
+    GroupRequestFilter, LogBackendHandler, LoginHandler, PosixBackendHandler, PosixSettings,
+    ReadSchemaBackendHandler, SchemaBackendHandler, SystemConfigBackendHandler, UserBackendHandler,
+    UserListerBackendHandler, UserRequestFilter,
+};
+use lldap_domain_handlers::logging::{
+    LogActivity, LogBucket, LogCursor, LogDimension, LogFilter, LogKind, LogRecord,
 };
 use lldap_domain_model::error::Result;
 use lldap_opaque_handler::{OpaqueHandler, login, registration};
@@ -101,6 +105,12 @@ mockall::mock! {
     impl SystemConfigBackendHandler for TestBackendHandler {
         async fn get_allowed_ous(&self) -> Result<Vec<String>>;
         async fn set_system_config(&self, key: &str, value: String) -> Result<()>;
+    }
+    #[async_trait]
+    impl LogBackendHandler for TestBackendHandler {
+        async fn list_log_events(&self, filter: LogFilter, limit: u32, cursor: LogCursor) -> Result<Vec<LogRecord>>;
+        async fn summarize_log_events(&self, filter: LogFilter, group_by: Vec<LogDimension>, limit: u32) -> Result<Vec<LogBucket>>;
+        async fn log_activity(&self, actor: &UserId, kinds: Vec<LogKind>, since: Option<chrono::NaiveDateTime>) -> Result<LogActivity>;
     }
 }
 

@@ -177,6 +177,9 @@ pub struct RunOpts {
 
     #[clap(flatten)]
     pub healthcheck_opts: HealthcheckOpts,
+
+    #[clap(flatten)]
+    pub log_opts: LogOpts,
 }
 
 #[derive(Debug, Parser, Clone)]
@@ -282,6 +285,28 @@ pub struct HealthcheckOpts {
     /// present). Used by the healthcheck subcommand.
     #[clap(long = "kerberos", env = "LLDAP_KERBEROS_HEALTHCHECK")]
     pub healthcheck_kerberos: bool,
+}
+
+#[derive(Debug, Parser, Clone)]
+#[clap(next_help_heading = Some("LOGGING"))]
+pub struct LogOpts {
+    /// Persist the event log (logins, binds, directory changes, denials) to the database.
+    /// Default: true
+    #[clap(long, env = "LLDAP_LOG_OPTIONS__PERSIST")]
+    pub log_persist: Option<bool>,
+
+    /// Delete log events older than this many days; 0 keeps them forever. Default: 30
+    #[clap(long, env = "LLDAP_LOG_OPTIONS__RETENTION_DAYS")]
+    pub log_retention_days: Option<u32>,
+
+    /// Keep at most this many log events, oldest first; 0 means unlimited. Default: 50000
+    #[clap(long, env = "LLDAP_LOG_OPTIONS__MAX_ENTRIES")]
+    pub log_max_entries: Option<u64>,
+
+    /// Store one successful bind per user, protocol and address within this many seconds;
+    /// 0 stores every bind. Default: 300
+    #[clap(long, env = "LLDAP_LOG_OPTIONS__BIND_COALESCE_SECONDS")]
+    pub log_bind_coalesce_seconds: Option<u32>,
 }
 
 pub fn init() -> CLIOpts {

@@ -8,18 +8,20 @@ use lldap_domain::{
         UpdateUserRequest,
     },
     types::{
-        AttributeName, Group, GroupDetails, GroupId, LdapObjectClass, User, UserAndGroups, UserId,
+        AttributeName, Group, GroupDetails, GroupId, LdapObjectClass, TotpEnrollmentStart, User,
+        UserAndGroups, UserId,
     },
 };
 use lldap_domain_handlers::handler::{
     BackendHandler, BindRequest, GroupBackendHandler, GroupListerBackendHandler,
-    GroupRequestFilter, LogBackendHandler, LoginHandler, PosixBackendHandler, PosixSettings,
-    ReadSchemaBackendHandler, SchemaBackendHandler, SystemConfigBackendHandler, UserBackendHandler,
-    UserListerBackendHandler, UserRequestFilter,
+    GroupRequestFilter, LogBackendHandler, LoginHandler, MfaBackendHandler, PosixBackendHandler,
+    PosixSettings, ReadSchemaBackendHandler, SchemaBackendHandler, SystemConfigBackendHandler,
+    UserBackendHandler, UserListerBackendHandler, UserRequestFilter,
 };
 use lldap_domain_handlers::logging::{
     LogActivity, LogBucket, LogCursor, LogDimension, LogFilter, LogKind, LogRecord,
 };
+use lldap_domain_handlers::mfa::{MfaRequirement, MfaResetReason};
 use lldap_domain_model::error::Result;
 use lldap_opaque_handler::{OpaqueHandler, login, registration};
 use lldap_schema::PublicSchema;
@@ -74,6 +76,14 @@ mockall::mock! {
         async fn add_group_object_class(&self, request: &LdapObjectClass) -> Result<()>;
         async fn delete_user_object_class(&self, name: &LdapObjectClass) -> Result<()>;
         async fn delete_group_object_class(&self, name: &LdapObjectClass) -> Result<()>;
+    }
+    #[async_trait]
+    impl MfaBackendHandler for TestBackendHandler {
+        async fn mfa_requirement(&self, user_id: &UserId) -> Result<MfaRequirement>;
+        async fn start_totp_enrollment(&self, user_id: &UserId, current_code: Option<String>) -> Result<TotpEnrollmentStart>;
+        async fn finish_totp_enrollment(&self, user_id: &UserId, state: &str, code: &str) -> Result<()>;
+        async fn reset_user_mfa(&self, user_id: &UserId, reason: MfaResetReason) -> Result<()>;
+        async fn reset_own_mfa(&self, user_id: &UserId, code: &str) -> Result<()>;
     }
     #[async_trait]
     impl BackendHandler for TestBackendHandler {}
@@ -140,6 +150,7 @@ pub fn setup_default_ldap_mock(mock: &mut MockTestBackendHandler) {
             ),
             attributes: vec![],
             krb_principal_name: None,
+            mfa_type: None,
         })
     });
 

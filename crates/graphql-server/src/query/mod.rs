@@ -465,6 +465,7 @@ mod tests {
                         },
                     ],
                     krb_principal_name: None,
+                    mfa_type: None,
                 })
             });
         let mut groups = HashSet::new();
@@ -565,6 +566,7 @@ mod tests {
                             ),
                             attributes: Vec::new(),
                             krb_principal_name: None,
+                            mfa_type: None,
                         },
                         groups: None,
                     },
@@ -585,6 +587,7 @@ mod tests {
                             ),
                             attributes: Vec::new(),
                             krb_principal_name: None,
+                            mfa_type: None,
                         },
                         groups: None,
                     },

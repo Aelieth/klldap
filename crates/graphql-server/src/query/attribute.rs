@@ -322,6 +322,7 @@ mod tests {
             modified_date: ts(),
             password_modified_date: ts(),
             krb_principal_name: None,
+            mfa_type: None,
         };
         for name in [
             "userid",

@@ -73,6 +73,8 @@ pub enum LogKind {
     LogGap,
     BindFlood,
     AccessDeniedFlood,
+    MfaEnroll,
+    MfaReset,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

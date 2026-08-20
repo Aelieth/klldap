@@ -134,6 +134,7 @@ impl From<Model> for lldap_domain::types::User {
             modified_date: user.modified_date,
             password_modified_date: user.password_modified_date,
             krb_principal_name: user.krb_principal_name,
+            mfa_type: user.mfa_type,
         }
     }
 }

@@ -586,6 +586,7 @@ mod tests {
             uuid: lldap_domain::types::Uuid::from_name_and_date("bob", &epoch),
             attributes: vec![],
             krb_principal_name: None,
+            mfa_type: None,
         }
     }
 

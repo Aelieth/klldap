@@ -50,6 +50,8 @@ enum LogKind {
   LOG_GAP
   BIND_FLOOD
   ACCESS_DENIED_FLOOD
+  MFA_ENROLL
+  MFA_RESET
 }
 
 enum LogProtocol {

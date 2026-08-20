@@ -66,28 +66,28 @@ impl SqlBackendHandler {
 
     #[instrument(skip(self), level = "debug")]
     pub async fn is_user_disabled(&self, user_id: &UserId) -> Result<bool> {
+        // Membership in lldap_disabled blocks login and makes the LDAP layer synthesize
+        // loginDisabled=TRUE for SSSD access filters; leaving the group clears both.
+        self.is_member_of(user_id, "lldap_disabled").await
+    }
+
+    pub(crate) async fn is_member_of(&self, user_id: &UserId, group_name: &str) -> Result<bool> {
         use lldap_domain_model::model::{groups, memberships};
         use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
-        // Membership in lldap_disabled blocks login and makes the LDAP layer synthesize
-        // loginDisabled=TRUE for SSSD access filters; leaving the group clears both.
-        let group = groups::Entity::find()
-            .filter(groups::Column::DisplayName.eq("lldap_disabled"))
+        let Some(group) = groups::Entity::find()
+            .filter(groups::Column::DisplayName.eq(group_name))
             .one(&self.sql_pool)
-            .await?;
-
-        let Some(group) = group else {
-            debug!("lldap_disabled group not found - treating as not disabled");
+            .await?
+        else {
             return Ok(false);
         };
-
-        let membership = memberships::Entity::find()
+        Ok(memberships::Entity::find()
             .filter(memberships::Column::UserId.eq(user_id.as_str()))
             .filter(memberships::Column::GroupId.eq(group.group_id))
             .one(&self.sql_pool)
-            .await?;
-
-        Ok(membership.is_some())
+            .await?
+            .is_some())
     }
 }
 

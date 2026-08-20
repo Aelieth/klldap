@@ -3159,6 +3159,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "lldap_mfa"
+version = "0.1.1"
+dependencies = [
+ "base64 0.22.1",
+ "bincode",
+ "data-encoding",
+ "hmac",
+ "orion",
+ "percent-encoding",
+ "pretty_assertions",
+ "rand 0.8.6",
+ "serde",
+ "sha1 0.10.6",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "lldap_migration_tool"
 version = "0.4.3"
 dependencies = [
@@ -3225,6 +3242,7 @@ dependencies = [
  "lldap_domain",
  "lldap_domain_handlers",
  "lldap_domain_model",
+ "lldap_mfa",
  "lldap_opaque_handler",
  "lldap_schema",
  "lldap_test_utils",

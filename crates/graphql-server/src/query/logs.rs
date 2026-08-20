@@ -55,6 +55,8 @@ pub enum GraphQLLogKind {
     LogGap,
     BindFlood,
     AccessDeniedFlood,
+    MfaEnroll,
+    MfaReset,
 }
 
 #[derive(

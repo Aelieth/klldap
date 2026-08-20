@@ -1,6 +1,7 @@
 use crate::logging::{
     LogActivity, LogBucket, LogCursor, LogDimension, LogFilter, LogKind, LogRecord,
 };
+use crate::mfa::{MfaRequirement, MfaResetReason};
 use async_trait::async_trait;
 use ldap3_proto::proto::LdapSubstringFilter;
 use lldap_domain::{
@@ -10,7 +11,7 @@ use lldap_domain::{
     },
     types::{
         AttributeName, AttributeValue, Group, GroupDetails, GroupId, GroupName, LdapObjectClass,
-        User, UserAndGroups, UserId, Uuid,
+        TotpEnrollmentStart, User, UserAndGroups, UserId, Uuid,
     },
 };
 use lldap_domain_model::{error::Result, model::UserColumn};
@@ -216,6 +217,22 @@ pub trait LogBackendHandler: Send + Sync {
 }
 
 #[async_trait]
+pub trait MfaBackendHandler: Send + Sync {
+    /// What a login must present under the current policy; the doors and the refresh
+    /// path ask this, a per-group policy plugs in here.
+    async fn mfa_requirement(&self, user_id: &UserId) -> Result<MfaRequirement>;
+    async fn start_totp_enrollment(
+        &self,
+        user_id: &UserId,
+        current_code: Option<String>,
+    ) -> Result<TotpEnrollmentStart>;
+    async fn finish_totp_enrollment(&self, user_id: &UserId, state: &str, code: &str)
+    -> Result<()>;
+    async fn reset_user_mfa(&self, user_id: &UserId, reason: MfaResetReason) -> Result<()>;
+    async fn reset_own_mfa(&self, user_id: &UserId, code: &str) -> Result<()>;
+}
+
+#[async_trait]
 pub trait BackendHandler:
     Send
     + Sync
@@ -228,6 +245,7 @@ pub trait BackendHandler:
     + SystemConfigBackendHandler
     + PosixBackendHandler
     + LogBackendHandler
+    + MfaBackendHandler
 {
 }
 

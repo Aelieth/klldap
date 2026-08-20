@@ -492,6 +492,7 @@ pub struct User {
     pub modified_date: NaiveDateTime,
     pub password_modified_date: NaiveDateTime,
     pub krb_principal_name: Option<String>,
+    pub mfa_type: Option<String>,
 }
 
 impl User {
@@ -554,8 +555,22 @@ impl Default for User {
             modified_date: epoch,
             password_modified_date: epoch,
             krb_principal_name: None,
+            mfa_type: None,
         }
     }
+}
+
+/// Value of `mfa_type` while a TOTP authenticator is enrolled.
+pub const MFA_TYPE_TOTP: &str = "totp";
+
+#[derive(derive_more::Debug, Clone, PartialEq, Eq)]
+pub struct TotpEnrollmentStart {
+    #[debug(skip)]
+    pub otpauth_uri: String,
+    #[debug(skip)]
+    pub secret_base32: String,
+    #[debug(skip)]
+    pub state: String,
 }
 
 #[derive(
@@ -600,6 +615,7 @@ pub const BUILTIN_GROUPS: &[&str] = &[
     "lldap_strict_readonly",
     "lldap_disabled",
     "lldap_sudohost",
+    "lldap_mfa_disabled",
 ];
 
 pub fn is_builtin_group(name: &str) -> bool {
@@ -617,6 +633,8 @@ mod tests {
         assert!(is_builtin_group("lldap_admin"));
         assert!(is_builtin_group("LLDAP_ADMIN"));
         assert!(is_builtin_group("Lldap_Disabled"));
+        assert!(is_builtin_group("lldap_mfa_disabled"));
+        assert!(is_builtin_group("LLDAP_MFA_DISABLED"));
         assert!(!is_builtin_group("family"));
     }
 }

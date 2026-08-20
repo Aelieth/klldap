@@ -1123,6 +1123,7 @@ mod tests {
                 value: 1i64.into(),
             }],
             krb_principal_name: None,
+            mfa_type: None,
         }
     }
 

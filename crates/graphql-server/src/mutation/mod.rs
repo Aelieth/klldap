@@ -1113,6 +1113,7 @@ mod tests {
             modified_date: epoch(),
             password_modified_date: epoch(),
             krb_principal_name: None,
+            mfa_type: None,
         }
     }
 

@@ -2,8 +2,11 @@ use crate::sql_tables::DbConnection;
 use itertools::Itertools;
 use lldap_auth::opaque::server::ServerSetup;
 use lldap_domain::types::{Attribute, AttributeName, AttributeValue};
+use lldap_domain_handlers::mfa::MfaPolicy;
+use lldap_mfa::{FailedAttempts, UsedCodes};
 use lldap_schema::PublicSchema;
 use sea_orm::sea_query::{Cond, IntoCondition, SimpleExpr};
+use std::sync::Arc;
 
 pub(crate) fn bool_to_expr(b: bool) -> Cond {
     SimpleExpr::Value(b.into()).into_condition()
@@ -57,6 +60,10 @@ pub struct SqlBackendHandler {
     pub(crate) opaque_setup: ServerSetup,
     pub(crate) sql_pool: DbConnection,
     pub(crate) read_pool: DbConnection,
+    pub(crate) mfa_policy: MfaPolicy,
+    // Shared by the per-request clones, so a code is used once and attempts add up.
+    pub(crate) used_totp_codes: Arc<UsedCodes>,
+    pub(crate) failed_totp_attempts: Arc<FailedAttempts>,
 }
 
 impl SqlBackendHandler {
@@ -65,12 +72,20 @@ impl SqlBackendHandler {
             opaque_setup,
             read_pool: sql_pool.clone(),
             sql_pool,
+            mfa_policy: MfaPolicy::default(),
+            used_totp_codes: Arc::default(),
+            failed_totp_attempts: Arc::default(),
         }
     }
 
     /// The log lookups read on this pool, so a slow summary cannot queue binds behind it.
     pub fn with_read_pool(mut self, read_pool: DbConnection) -> Self {
         self.read_pool = read_pool;
+        self
+    }
+
+    pub fn with_mfa_policy(mut self, mfa_policy: MfaPolicy) -> Self {
+        self.mfa_policy = mfa_policy;
         self
     }
 

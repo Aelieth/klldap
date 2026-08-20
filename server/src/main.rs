@@ -198,7 +198,8 @@ async fn set_up_server(
     }
     let backend_handler =
         SqlBackendHandler::new(config.get_server_setup().clone(), sql_pool.clone())
-            .with_read_pool(setup_read_pool(&config.database_url, &sql_pool).await?);
+            .with_read_pool(setup_read_pool(&config.database_url, &sql_pool).await?)
+            .with_mfa_policy(config.mfa_policy());
     for group in BUILTIN_GROUPS {
         ensure_group_exists(&backend_handler, group).await?;
     }

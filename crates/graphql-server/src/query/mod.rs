@@ -1201,4 +1201,48 @@ mod tests {
             ))
         );
     }
+
+    #[tokio::test]
+    async fn test_mfa_enrolled_field_gated_to_admin_or_self() {
+        const QUERY: &str = r#"{ user(userId: "bob") { id mfaEnrolled } }"#;
+        for (viewer, permission, expected) in [
+            ("admin", Permission::Admin, serde_json::json!(true)),
+            ("bob", Permission::Regular, serde_json::json!(true)),
+            ("eve", Permission::Readonly, serde_json::Value::Null),
+        ] {
+            let mut mock = MockTestBackendHandler::new();
+            setup_default_schema(&mut mock);
+            mock.expect_get_user_details()
+                .with(eq(UserId::new("bob")))
+                .returning(|_| {
+                    let epoch = chrono::Utc.timestamp_opt(0, 0).unwrap().naive_utc();
+                    Ok(DomainUser {
+                        user_id: UserId::new("bob"),
+                        email: "bob@bobbers.on".into(),
+                        display_name: None,
+                        creation_date: epoch,
+                        modified_date: epoch,
+                        password_modified_date: epoch,
+                        uuid: lldap_domain::types::Uuid::from_name_and_date("bob", &epoch),
+                        attributes: vec![],
+                        krb_principal_name: None,
+                        mfa_type: Some("totp".to_owned()),
+                    })
+                });
+            let context = Context::<MockTestBackendHandler>::new_for_tests(
+                mock,
+                ValidationResults {
+                    user: UserId::new(viewer),
+                    permission,
+                },
+            );
+            let schema = schema(Query::<MockTestBackendHandler>::new());
+            let (value, errors) = execute(QUERY, None, &schema, &Variables::new(), &context)
+                .await
+                .unwrap();
+            assert_eq!(errors.len(), 0, "{viewer}: {errors:?}");
+            let value = serde_json::to_value(&value).unwrap();
+            assert_eq!(value["user"]["mfaEnrolled"], expected, "{viewer}");
+        }
+    }
 }

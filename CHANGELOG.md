@@ -2,6 +2,29 @@
 
 ## [0.7.5] unreleased
 
+### Multi-factor authentication
+
+- A TOTP second factor (RFC 6238: SHA-1, six digits, 30-second steps, one step of
+  clock skew). `enable_mfa` (`LLDAP_ENABLE_MFA`, `--enable-mfa`): `false` (the default)
+  changes nothing, `true` lets users enroll an authenticator, `"always"` requires every
+  user to enroll; members of the new built-in group `lldap_mfa_disabled` are exempt. The
+  group is created at boot like the other built-in groups.
+- Enrollment and reset over GraphQL: `startMfaEnrollment(currentCode)` returns the
+  `otpauth://` URI, the base32 secret and a sealed state valid for five minutes,
+  `finishMfaEnrollment(state, code)` proves possession, `resetOwnMfa(code)` and the
+  administrative `resetUserMfa(userId)` (admins; password managers for non-admin users)
+  clear the factor, and `User.mfaEnrolled` is visible to the user and to admins.
+  Replacing an authenticator needs a code from the current one. Secrets are sealed with a
+  key derived from the server key and never leave the database. A login, own-reset or
+  replacement code is accepted once; five wrong codes per 30-second step lock that step
+  (enrollment confirmation is not attempt-limited).
+- Under `"always"` a session that has not enrolled yet can only read its own user and
+  enroll; every other query or mutation is refused until enrollment completes.
+- New log kinds `mfa_enroll` and `mfa_reset`.
+- Login-time enforcement (`yourpassword:123456` at the web form, `/auth/simple/login`
+  and LDAP bind) is the next change; until then an enrolled user still signs in with the
+  password alone.
+
 ### Logging
 
 - Security-relevant events are now recorded in the database (`logs` table, part of the

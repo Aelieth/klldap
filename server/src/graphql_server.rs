@@ -10,8 +10,9 @@ use juniper::{
         playground::playground_source,
     },
 };
-use lldap_domain_handlers::handler::BackendHandler;
+use lldap_domain_handlers::handler::{BackendHandler, MfaBackendHandler};
 use lldap_domain_handlers::logging::{Protocol, current_request, with_actor, with_request};
+use lldap_domain_handlers::mfa::{MfaPolicy, MfaRequirement};
 use lldap_graphql_server::api::Context;
 use lldap_graphql_server::api::schema;
 
@@ -134,9 +135,19 @@ async fn graphql_route<Handler: BackendHandler + lldap_opaque_handler::OpaqueHan
         let bearer = BearerAuth::from_request(&req, &mut inner_payload).await?;
         let validation_result = check_if_token_is_valid(&data, bearer.token()).await?;
         let actor = validation_result.user.clone();
+        // Under "always" an unenrolled session is confined to reading itself and enrolling.
+        let mfa_enrollment_pending = data.mfa_policy == MfaPolicy::Always
+            && data
+                .get_mfa_handler()
+                .mfa_requirement(&actor)
+                .await
+                .map_err(actix_web::error::ErrorInternalServerError)?
+                == MfaRequirement::Enrollment;
         let context = Context::<Handler> {
             handler: data.backend_handler.clone(),
             validation_result,
+            mfa_policy: data.mfa_policy,
+            mfa_enrollment_pending,
         };
         let schema = &schema();
         let context = &context;

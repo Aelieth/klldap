@@ -2896,6 +2896,7 @@ dependencies = [
  "lldap_frontend_options",
  "lldap_graphql_server",
  "lldap_ldap",
+ "lldap_mfa",
  "lldap_opaque_handler",
  "lldap_sql_backend_handler",
  "lldap_test_utils",

@@ -121,6 +121,10 @@ path = "../crates/auth"
 path = "../crates/domain"
 features = ["test"]
 
+[dev-dependencies.lldap_mfa]
+path = "../crates/mfa"
+default-features = false
+
 [dev-dependencies.lldap_opaque_handler]
 path = "../crates/opaque-handler"
 

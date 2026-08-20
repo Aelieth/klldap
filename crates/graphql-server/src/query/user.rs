@@ -4,7 +4,9 @@ use crate::api::Context;
 use chrono::TimeZone;
 use juniper::{FieldResult, graphql_object};
 use lldap_access_control::UserReadableBackendHandler;
-use lldap_domain::types::{User as DomainUser, UserAndGroups as DomainUserAndGroups};
+use lldap_domain::types::{
+    MFA_TYPE_TOTP, User as DomainUser, UserAndGroups as DomainUserAndGroups,
+};
 use lldap_domain_handlers::handler::BackendHandler;
 use lldap_opaque_handler::OpaqueHandler;
 use lldap_schema::PublicSchema;
@@ -142,6 +144,13 @@ impl<Handler: BackendHandler + OpaqueHandler> User<Handler> {
         self.groups
             .as_ref()
             .is_some_and(|groups| groups.iter().any(|g| g.display_name == "lldap_disabled"))
+    }
+
+    /// Whether the user has a second factor enrolled (admin or self).
+    fn mfa_enrolled(&self, context: &Context<Handler>) -> Option<bool> {
+        (context.validation_result.is_admin()
+            || context.validation_result.user == self.user.user_id)
+            .then(|| self.user.mfa_type.as_deref() == Some(MFA_TYPE_TOTP))
     }
 
     /// User-defined attributes, including ou and sshpublickey for legacy clients.

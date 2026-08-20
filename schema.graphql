@@ -337,6 +337,16 @@ type LogEntry {
   detail: String
 }
 
+"A pending TOTP enrollment, to be completed with `finishMfaEnrollment`."
+type MfaEnrollmentStart {
+  "The otpauth:// URI to display as a QR code."
+  otpauthUri: String!
+  "The TOTP secret in base32, for manual entry."
+  secretBase32: String!
+  "Opaque server-sealed state to echo back on finish."
+  state: String!
+}
+
 type Mutation {
   createUser(user: CreateUserInput!): User!
   setUserPassword(userId: String!, password: String!): Success!
@@ -371,6 +381,10 @@ type Mutation {
   reassignUserHomedirectories: PosixSettingsResponse!
   reassignUserLoginshells: PosixSettingsResponse!
   reassignGidNumbers: PosixSettingsResponse!
+  resetUserMfa(userId: String!): Success!
+  resetOwnMfa(code: String!): Success!
+  startMfaEnrollment(currentCode: String): MfaEnrollmentStart!
+  finishMfaEnrollment(state: String!, code: String!): Success!
 }
 
 type ObjectClassInfo {
@@ -464,6 +478,8 @@ type User {
   uuid: String!
   "Whether the user is a member of the built-in lldap_disabled group."
   isDisabled: Boolean!
+  "Whether the user has a second factor enrolled (admin or self)."
+  mfaEnrolled: Boolean
   "User-defined attributes, including ou and sshpublickey for legacy clients."
   attributes: [AttributeValue!]!
   "The groups to which this user belongs."

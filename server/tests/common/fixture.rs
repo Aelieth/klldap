@@ -58,6 +58,10 @@ const MAX_HEALTHCHECK_ATTEMPS: u8 = 30;
 
 impl LLDAPFixture {
     pub fn new() -> Self {
+        Self::new_with_env(&[])
+    }
+
+    pub fn new_with_env(extra_env: &[(&str, &str)]) -> Self {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let db_path = format!("sqlite://{}/users.db?mode=rwc", dir.path().display());
         let ldap_port = free_port();
@@ -65,6 +69,7 @@ impl LLDAPFixture {
         let child = create_lldap_command("run", &db_path)
             .env("LLDAP_LDAP_PORT", ldap_port.to_string())
             .env("LLDAP_HTTP_PORT", http_port.to_string())
+            .envs(extra_env.iter().copied())
             .arg("--verbose")
             .spawn()
             .expect("Unable to start server");
@@ -74,6 +79,7 @@ impl LLDAPFixture {
             let status = create_lldap_command("healthcheck", &db_path)
                 .env("LLDAP_LDAP_PORT", ldap_port.to_string())
                 .env("LLDAP_HTTP_PORT", http_port.to_string())
+                .envs(extra_env.iter().copied())
                 .status()
                 .expect("healthcheck command failed to execute");
 

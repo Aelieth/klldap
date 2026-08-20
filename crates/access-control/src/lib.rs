@@ -14,8 +14,9 @@ use lldap_domain::{
 };
 use lldap_domain_handlers::handler::{
     BackendHandler, GroupBackendHandler, GroupListerBackendHandler, GroupRequestFilter,
-    LogBackendHandler, PosixBackendHandler, ReadSchemaBackendHandler, SchemaBackendHandler,
-    SystemConfigBackendHandler, UserBackendHandler, UserListerBackendHandler, UserRequestFilter,
+    LogBackendHandler, MfaBackendHandler, PosixBackendHandler, ReadSchemaBackendHandler,
+    SchemaBackendHandler, SystemConfigBackendHandler, UserBackendHandler, UserListerBackendHandler,
+    UserRequestFilter,
 };
 use lldap_domain_model::error::Result;
 use lldap_opaque_handler::OpaqueHandler;
@@ -232,6 +233,22 @@ impl<Handler: BackendHandler + OpaqueHandler> AccessControlledBackendHandler<Han
         validation_result
             .can_read(&user_id)
             .then_some(&self.handler)
+    }
+
+    pub fn get_mfa_reset_handler<'a>(
+        &'a self,
+        validation_result: &ValidationResults,
+        user_id: &UserId,
+        user_is_admin: bool,
+    ) -> Option<&'a (impl MfaBackendHandler + 'a)> {
+        validation_result
+            .can_reset_mfa(user_id, user_is_admin)
+            .then_some(&self.handler)
+    }
+
+    // These only ever target the authenticated user, so there is no check.
+    pub fn get_mfa_self_handler(&self) -> &(impl MfaBackendHandler + '_) {
+        &self.handler
     }
 
     pub fn get_user_restricted_lister_handler(

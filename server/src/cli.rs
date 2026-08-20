@@ -169,6 +169,11 @@ pub struct RunOpts {
     #[clap(long, env = "LLDAP_FORCE_UPDATE_PRIVATE_KEY")]
     pub force_update_private_key: Option<bool>,
 
+    /// Second factor (TOTP): false = off, true = only users who enrolled present a code,
+    /// "always" = every user must enroll. Members of lldap_mfa_disabled are exempt.
+    #[clap(long, env = "LLDAP_ENABLE_MFA")]
+    pub enable_mfa: Option<TrueFalseAlways>,
+
     #[clap(flatten)]
     pub smtp_opts: SmtpOpts,
 

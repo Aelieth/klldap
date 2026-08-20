@@ -1,4 +1,5 @@
 use juniper::{GraphQLInputObject, GraphQLObject};
+use lldap_domain::types::TotpEnrollmentStart;
 
 #[derive(Clone, PartialEq, Eq, Debug, GraphQLInputObject)]
 // This conflicts with the attribute values returned by the user/group queries.
@@ -96,5 +97,26 @@ impl Success {
 impl Default for Success {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[derive(GraphQLObject)]
+/// A pending TOTP enrollment, to be completed with `finishMfaEnrollment`.
+pub struct MfaEnrollmentStart {
+    /// The otpauth:// URI to display as a QR code.
+    pub otpauth_uri: String,
+    /// The TOTP secret in base32, for manual entry.
+    pub secret_base32: String,
+    /// Opaque server-sealed state to echo back on finish.
+    pub state: String,
+}
+
+impl From<TotpEnrollmentStart> for MfaEnrollmentStart {
+    fn from(start: TotpEnrollmentStart) -> Self {
+        Self {
+            otpauth_uri: start.otpauth_uri,
+            secret_base32: start.secret_base32,
+            state: start.state,
+        }
     }
 }

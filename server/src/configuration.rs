@@ -16,6 +16,7 @@ use lldap_auth::opaque::{
     server::{ServerSetup, generate_random_private_key},
 };
 use lldap_domain::types::{AttributeName, UserId};
+use lldap_domain_handlers::mfa::MfaPolicy;
 use lldap_sql_backend_handler::sql_tables::{
     ConfigLocation, PrivateKeyHash, PrivateKeyInfo, PrivateKeyLocation,
 };
@@ -148,6 +149,8 @@ pub struct Configuration {
     pub force_ldap_user_pass_reset: TrueFalseAlways,
     #[builder(default = "false")]
     pub force_update_private_key: bool,
+    #[builder(default)]
+    pub enable_mfa: TrueFalseAlways,
     #[builder(default = r#"DatabaseUrl::from("sqlite://users.db?mode=rwc")"#)]
     pub database_url: DatabaseUrl,
     #[builder(default)]
@@ -218,6 +221,14 @@ impl Configuration {
 
     pub fn get_server_keys(&self) -> &KeyPair {
         self.get_server_setup().keypair()
+    }
+
+    pub fn mfa_policy(&self) -> MfaPolicy {
+        match self.enable_mfa {
+            TrueFalseAlways::False => MfaPolicy::Disabled,
+            TrueFalseAlways::True => MfaPolicy::Enrolled,
+            TrueFalseAlways::Always => MfaPolicy::Always,
+        }
     }
 
     pub fn get_private_key_info(&self) -> PrivateKeyInfo {
@@ -501,6 +512,9 @@ impl ConfigOverrider for RunOpts {
             .inspect(|&force_update_private_key| {
                 config.force_update_private_key = force_update_private_key;
             });
+
+        self.enable_mfa
+            .inspect(|&enable_mfa| config.enable_mfa = enable_mfa);
 
         self.smtp_opts.override_config(config);
         self.ldaps_opts.override_config(config);
@@ -1089,6 +1103,30 @@ mod tests {
             assert_eq!(config.log_options.retention_days, 90);
             assert_eq!(config.log_options.max_entries, 7);
             assert_eq!(config.log_options.bind_coalesce_seconds, 0);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_enable_mfa_defaults_file_env_and_cli_precedence() {
+        Jail::expect_with(|jail| {
+            jail.clear_env();
+            jail.set_env("LLDAP_JWT_SECRET", "secret");
+            let config = init(default_run_opts()).unwrap();
+            assert_eq!(config.mfa_policy(), MfaPolicy::Disabled);
+
+            jail.create_file("lldap_config.toml", "enable_mfa = true\n")?;
+            let config = init(default_run_opts()).unwrap();
+            assert_eq!(config.mfa_policy(), MfaPolicy::Enrolled);
+
+            jail.set_env("LLDAP_ENABLE_MFA", "always");
+            let config = init(default_run_opts()).unwrap();
+            assert_eq!(config.mfa_policy(), MfaPolicy::Always);
+
+            let mut opts = default_run_opts();
+            opts.enable_mfa = Some(TrueFalseAlways::False);
+            let config = init(opts).unwrap();
+            assert_eq!(config.mfa_policy(), MfaPolicy::Disabled);
             Ok(())
         });
     }

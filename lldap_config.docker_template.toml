@@ -97,6 +97,12 @@
 ## LLDAP_FORCE_UPDATE_PRIVATE_KEY
 # force_update_private_key = false
 
+## Second factor (TOTP). false = off (default); true = users who enrolled an
+## authenticator append their code to the password (yourpassword:123456); "always" =
+## every user must enroll. Members of the lldap_mfa_disabled group are exempt.
+## Env variable: LLDAP_ENABLE_MFA
+# enable_mfa = false
+
 ## Database URL.
 ## This encodes the type of database (SQlite, MySQL, or PostgreSQL)
 ## , the path, the user, password, and sometimes the mode (when

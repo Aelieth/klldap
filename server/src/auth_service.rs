@@ -20,11 +20,12 @@ use lldap_access_control::{ReadonlyBackendHandler, UserReadableBackendHandler};
 use lldap_auth::{
     JWTClaims, access_control::ValidationResults, login, password_reset, registration,
 };
-use lldap_domain::types::{GroupDetails, GroupName, UserId};
+use lldap_domain::types::{GroupDetails, GroupName, LoginOutcome, UserId};
 use lldap_domain_handlers::handler::{
-    BackendHandler, BindRequest, LoginHandler, UserRequestFilter,
+    BackendHandler, BindRequest, LoginHandler, MfaBackendHandler, UserRequestFilter,
 };
 use lldap_domain_handlers::logging::{self, LogKind, with_actor};
+use lldap_domain_handlers::mfa::{MfaRequirement, MfaResetReason};
 use lldap_domain_model::{error::DomainError, model::UserColumn};
 use lldap_opaque_handler::OpaqueHandler;
 use sha2::Sha512;
@@ -54,6 +55,7 @@ async fn create_jwt<Handler: TcpBackendHandler>(
     key: &Hmac<Sha512>,
     user: &UserId,
     groups: HashSet<GroupDetails>,
+    password_reset: bool,
 ) -> SignedToken {
     let claims = JWTClaims {
         exp: Utc::now() + chrono::Duration::days(1),
@@ -64,6 +66,7 @@ async fn create_jwt<Handler: TcpBackendHandler>(
             .into_iter()
             .map(|g| g.display_name.into_string())
             .collect(),
+        password_reset,
     };
     let expiry = claims.exp.naive_utc();
     let header = jwt::Header {
@@ -146,7 +149,9 @@ where
         )));
     }
     let groups = data.get_readonly_handler().get_user_groups(&user).await?;
-    let token = create_jwt(data.get_tcp_handler(), jwt_key, &user, groups).await;
+    let mfa_enrollment_pending =
+        data.get_mfa_handler().mfa_requirement(&user).await? == MfaRequirement::Enrollment;
+    let token = create_jwt(data.get_tcp_handler(), jwt_key, &user, groups, false).await;
     logging::record_as(Some(&user), LogKind::TokenRefresh, None, true, None);
     Ok(HttpResponse::Ok()
         .cookie(
@@ -160,6 +165,7 @@ where
         .json(&login::ServerLoginResponse {
             token: token.as_str().to_owned(),
             refresh_token: None,
+            mfa_enrollment_required: mfa_enrollment_pending.then_some(true),
         }))
 }
 
@@ -324,7 +330,14 @@ where
         None,
     );
     let groups = HashSet::new();
-    let token = create_jwt(data.get_tcp_handler(), &data.jwt_key, &user_id, groups).await;
+    let token = create_jwt(
+        data.get_tcp_handler(),
+        &data.jwt_key,
+        &user_id,
+        groups,
+        true,
+    )
+    .await;
     let mut path = data.server_url.path().to_string();
     if !path.ends_with('/') {
         path.push('/');
@@ -436,6 +449,7 @@ where
 async fn get_login_successful_response<Backend>(
     data: &web::Data<AppState<Backend>>,
     name: &UserId,
+    mfa_enrollment_pending: bool,
 ) -> TcpResult<HttpResponse>
 where
     Backend: TcpBackendHandler + BackendHandler,
@@ -444,7 +458,7 @@ where
     // token.
     let groups = data.get_readonly_handler().get_user_groups(name).await?;
     let (refresh_token, max_age) = data.get_tcp_handler().create_refresh_token(name).await?;
-    let token = create_jwt(data.get_tcp_handler(), &data.jwt_key, name, groups).await;
+    let token = create_jwt(data.get_tcp_handler(), &data.jwt_key, name, groups, false).await;
     let refresh_token_plus_name = refresh_token + "+" + name.as_str();
     let mut path = data.server_url.path().to_string();
     if !path.ends_with('/') {
@@ -470,6 +484,7 @@ where
         .json(&login::ServerLoginResponse {
             token: token.as_str().to_owned(),
             refresh_token: Some(refresh_token_plus_name),
+            mfa_enrollment_required: mfa_enrollment_pending.then_some(true),
         }))
 }
 
@@ -484,10 +499,16 @@ where
     match data
         .get_opaque_handler()
         .login_finish(request.into_inner())
-        .await
+        .await?
     {
-        Ok(name) => get_login_successful_response(&data, &name).await,
-        Err(e) => Err(e.into()),
+        LoginOutcome::Authenticated {
+            user_id,
+            mfa_enrollment_pending,
+        } => get_login_successful_response(&data, &user_id, mfa_enrollment_pending).await,
+        // The password verified; the client retries with password:code.
+        LoginOutcome::TotpRequired => {
+            Ok(HttpResponse::Ok().json(&login::ServerMfaRequiredResponse { mfa_required: true }))
+        }
     }
 }
 
@@ -517,7 +538,7 @@ where
         password,
     };
     data.get_login_handler().bind(bind_request).await?;
-    get_login_successful_response(&data, &username).await
+    get_login_successful_response(&data, &username, false).await
 }
 
 async fn simple_login_handler<Backend>(
@@ -616,17 +637,36 @@ where
     Backend: TcpBackendHandler + BackendHandler + OpaqueHandler + 'static,
 {
     use actix_web::FromRequest;
-    // The ceremony authenticates itself through server_data; the bearer only names the actor.
-    let actor = BearerAuth::from_request(&http_request, &mut actix_web::dev::Payload::None)
+    // The ceremony authenticates itself through server_data; the bearer only names the actor
+    // and, after a reset e-mail, marks the registration as a recovery.
+    let claims = BearerAuth::from_request(&http_request, &mut actix_web::dev::Payload::None)
         .await
         .ok()
-        .and_then(|bearer| actor_from_token(&data.jwt_key, bearer.token()));
-    with_actor(
-        actor,
+        .and_then(|bearer| verified_claims(&data.jwt_key, bearer.token()));
+    let actor = claims.as_ref().map(|claims| UserId::new(&claims.user));
+    let reset_user = claims
+        .filter(|claims| claims.password_reset)
+        .map(|claims| UserId::new(&claims.user));
+    let registered = with_actor(
+        actor.clone(),
         data.get_opaque_handler()
             .registration_finish(request.into_inner()),
     )
     .await?;
+    // A recovery clears the second factor only once the new password is committed.
+    if let Some(user_id) = reset_user {
+        if user_id != registered {
+            return Err(TcpError::UnauthorizedError(
+                "Password reset token does not match the registered user".to_string(),
+            ));
+        }
+        with_actor(
+            actor,
+            data.get_mfa_handler()
+                .reset_user_mfa(&user_id, MfaResetReason::PasswordReset),
+        )
+        .await?;
+    }
     Ok(HttpResponse::Ok().finish())
 }
 
@@ -713,9 +753,9 @@ async fn account_is_disabled<Backend: BackendHandler>(
 
 // Signature and expiry only: names the user without the blacklist and disabled-account
 // checks, and without recording anything.
-fn actor_from_token(jwt_key: &Hmac<Sha512>, token_str: &str) -> Option<UserId> {
+fn verified_claims(jwt_key: &Hmac<Sha512>, token_str: &str) -> Option<JWTClaims> {
     let token: Token<_> = VerifyWithKey::verify_with_key(token_str, jwt_key).ok()?;
-    (token.claims().exp > Utc::now()).then(|| UserId::new(&token.claims().user))
+    (token.claims().exp > Utc::now()).then(|| token.claims().clone())
 }
 
 #[instrument(skip_all, level = "debug", err, ret)]

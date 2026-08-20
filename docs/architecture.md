@@ -96,6 +96,11 @@ the password with RSA-OAEP for the `syncKerberosPassword` mutation, the LDAP and
 GraphQL password paths already hold it, and after the `kadmin` call it is dropped.
 KLLDAP keeps no copy; the KDC stores its own keys in its own database.
 
+The optional TOTP second factor ([mfa.md](mfa.md)) is checked by the same login handler
+that checks the password: `SqlBackendHandler::bind` and `login_finish` split
+`password:code` and verify it, so the three doors share one decision and the event log sees
+one row per login.
+
 ### JWTs and refresh tokens
 
 When logging in for the first time, users are provided with a refresh token

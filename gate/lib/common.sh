@@ -153,6 +153,7 @@ start_main_container() {
         -e LLDAP_LDAP_USER_PASS="$ADMIN_PASS" \
         -e LLDAP_DATABASE_URL="$GATE_DATABASE_URL" \
         -e LLDAP_VERBOSE=true \
+        -e LLDAP_ENABLE_MFA=true \
         "$GATE_IMAGE" >/dev/null
 }
 

@@ -112,6 +112,7 @@ read from a file instead by appending `_FILE` to the variable name
 | `LLDAP_IGNORED_USER_ATTRIBUTES` / `LLDAP_IGNORED_GROUP_ATTRIBUTES` | `[]` | Requested attributes to drop silently |
 | `LLDAP_FORCE_LDAP_USER_PASS_RESET` | `false` | Reset the admin password from `LLDAP_LDAP_USER_PASS` (`true` once, `always`) |
 | `LLDAP_FORCE_UPDATE_PRIVATE_KEY` | `false` | Accept a changed private key (invalidates every password) |
+| `LLDAP_ENABLE_MFA` | `false` | TOTP second factor: `true` for users who enroll, `always` for everyone (`lldap_mfa_disabled` members exempt), see [docs/mfa.md](docs/mfa.md) |
 | `LLDAP_LDAPS_OPTIONS__ENABLED` / `__PORT` / `__CERT_FILE` / `__KEY_FILE` | `false` / `6360` | LDAPS |
 | `LLDAP_SMTP_OPTIONS__ENABLE_PASSWORD_RESET`, `__SERVER`, `__PORT`, `__SMTP_ENCRYPTION`, `__USER`, `__PASSWORD`, `__FROM`, `__REPLY_TO` | off | Password-reset mail |
 | `LLDAP_HEALTHCHECK_OPTIONS__HTTP_HOST` / `__LDAP_HOST` / `__KERBEROS` | `localhost` / `false` (`true` in the image) | What `lldap healthcheck` probes; `__KERBEROS` also makes directory writes wait for the KDC after boot |
@@ -133,7 +134,7 @@ KDC, `749/tcp` kadmin. Volumes: `/data` (config, database, keytabs) and
   [changing database backend](docs/database_migration.md)
 - [Kerberos](docs/kerberos.md), [SSSD + Kerberos + Keycloak guide](docs/SSSD_LDAP_Kerberos_Setup_Guide.md)
 - [Scripting (LDAP and GraphQL)](docs/scripting.md), [event logging](docs/logging.md),
-  [architecture](docs/architecture.md)
+  [two-factor authentication](docs/mfa.md), [architecture](docs/architecture.md)
 - [FAQ](docs/faq.md), [building and testing](docs/testing.md), [changelog](CHANGELOG.md)
 
 ## Contributions

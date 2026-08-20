@@ -15,6 +15,7 @@ use lldap_auth::access_control::ValidationResults;
 use lldap_domain::types::{UserId, kerberos_sync_enabled};
 use lldap_domain_handlers::handler::{BackendHandler, BindRequest, LoginHandler};
 use lldap_domain_handlers::kerberos::kerberos_backend;
+use lldap_mfa::{MFA_ENROLLMENT_REQUIRED, TOTP_SEPARATOR, TotpFailure, totp_failure};
 use lldap_opaque_handler::OpaqueHandler;
 use tracing::{info, warn};
 
@@ -63,10 +64,24 @@ pub(crate) async fn bind(
         .await
     {
         Ok(()) => Ok(user_id),
-        Err(_) => Err(LdapError {
+        Err(e) => Err(LdapError {
             code: LdapResultCode::InvalidCredentials,
-            message: "".to_string(),
+            message: totp_diagnostic(&e.to_string()),
         }),
+    }
+}
+
+// The login handler emits these markers only after the password verified, so naming the
+// second factor here reveals nothing to a password guess.
+fn totp_diagnostic(message: &str) -> String {
+    match totp_failure(message) {
+        TotpFailure::CodeRequired => {
+            format!("TOTP code required: append '{TOTP_SEPARATOR}' and the code")
+        }
+        TotpFailure::EnrollmentRequired => MFA_ENROLLMENT_REQUIRED.to_owned(),
+        TotpFailure::Replayed => "TOTP code already used, wait for the next one".to_owned(),
+        TotpFailure::TooManyAttempts => "Too many TOTP attempts, wait for the next one".to_owned(),
+        TotpFailure::Other => String::new(),
     }
 }
 
@@ -225,6 +240,48 @@ pub mod tests {
     }
 
     #[tokio::test]
+    async fn test_bind_totp_diagnostics() {
+        use lldap_mfa::{TOTP_CODE_ALREADY_USED, TOTP_CODE_REQUIRED, TOTP_TOO_MANY_ATTEMPTS};
+        for (error, message) in [
+            (
+                format!("{TOTP_CODE_REQUIRED} for user \"bob\""),
+                "TOTP code required: append ':' and the code".to_owned(),
+            ),
+            (
+                format!("{MFA_ENROLLMENT_REQUIRED} for user \"bob\""),
+                MFA_ENROLLMENT_REQUIRED.to_owned(),
+            ),
+            (
+                format!("{TOTP_CODE_ALREADY_USED} for bob"),
+                "TOTP code already used, wait for the next one".to_owned(),
+            ),
+            (
+                format!("{TOTP_TOO_MANY_ATTEMPTS} for bob"),
+                "Too many TOTP attempts, wait for the next one".to_owned(),
+            ),
+            ("Invalid TOTP code for bob".to_owned(), String::new()),
+            ("for user \"bob\"".to_owned(), String::new()),
+        ] {
+            let mut mock = MockTestBackendHandler::new();
+            setup_default_ldap_mock(&mut mock);
+            mock.expect_bind().return_once(move |_| {
+                Err(lldap_domain_model::error::DomainError::AuthenticationError(
+                    error,
+                ))
+            });
+            let mut ldap_handler = LdapHandler::new_for_tests(mock, "dc=example,dc=com");
+            let request = LdapOp::BindRequest(LdapBindRequest {
+                dn: "uid=bob,ou=people,dc=example,dc=com".to_string(),
+                cred: LdapBindCred::Simple("pass:123456".to_string()),
+            });
+            assert_eq!(
+                ldap_handler.handle_ldap_message(request).await.unwrap(),
+                make_bind_result(LdapResultCode::InvalidCredentials, &message)
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_bind() {
         let mut mock = MockTestBackendHandler::new();
         setup_default_ldap_mock(&mut mock);
@@ -344,7 +401,7 @@ pub mod tests {
         });
         mock.expect_registration_finish()
             .times(1)
-            .return_once(|_| Ok(()));
+            .return_once(|_| Ok(UserId::new("bob")));
     }
 
     pub fn expect_password_change(mock: &mut MockTestBackendHandler, user: &str) {

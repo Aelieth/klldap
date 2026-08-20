@@ -43,9 +43,10 @@ use lldap_domain_handlers::logging::{LogKind, record};
 use lldap_kerberos::{live::LiveKerberos, paths::KerberosPaths};
 
 use lldap_domain_handlers::handler::{
-    GroupBackendHandler, GroupListerBackendHandler, GroupRequestFilter, UserBackendHandler,
-    UserListerBackendHandler, UserRequestFilter,
+    GroupBackendHandler, GroupListerBackendHandler, GroupRequestFilter, MfaBackendHandler,
+    UserBackendHandler, UserListerBackendHandler, UserRequestFilter,
 };
+use lldap_domain_handlers::mfa::MfaResetReason;
 
 const ADMIN_PASSWORD_MISSING_ERROR: &str = "The LDAP admin password must be initialized. \
             Either set the `ldap_user_pass` config value or the `LLDAP_LDAP_USER_PASS` environment variable. \
@@ -176,7 +177,7 @@ async fn set_up_server(
 ) -> Result<ServerBuilder> {
     let private_key_info = config.get_private_key_info();
     let force_update_private_key = config.force_update_private_key;
-    match (
+    let key_rotated = match (
         compare_private_key_hashes(
             get_private_key_info(&sql_pool).await?.as_ref(),
             &private_key_info,
@@ -188,18 +189,27 @@ async fn set_up_server(
                 "The private key has not changed, but force_update_private_key/LLDAP_FORCE_UPDATE_PRIVATE_KEY is set to true. Please set force_update_private_key to false and restart the server."
             );
         }
-        (Ok(true), _) | (Err(_), true) => {
+        (Ok(true), _) => {
             set_private_key_info(&sql_pool, private_key_info).await?;
+            false
         }
-        (Ok(false), false) => {}
+        (Err(_), true) => {
+            set_private_key_info(&sql_pool, private_key_info).await?;
+            true
+        }
+        (Ok(false), false) => false,
         (Err(e), false) => {
             return Err(anyhow!("The private key encoding the passwords has changed since last successful startup. Changing the private key will invalidate all existing passwords. If you want to proceed, restart the server with the CLI arg --force-update-private-key=true or the env variable LLDAP_FORCE_UPDATE_PRIVATE_KEY=true. You probably also want --force-ldap-user-pass-reset / LLDAP_FORCE_LDAP_USER_PASS_RESET=true to reset the admin password to the value in the configuration.").context(e));
         }
-    }
+    };
     let backend_handler =
         SqlBackendHandler::new(config.get_server_setup().clone(), sql_pool.clone())
             .with_read_pool(setup_read_pool(&config.database_url, &sql_pool).await?)
             .with_mfa_policy(config.mfa_policy());
+    // Every sealed TOTP secret was keyed from the old private key.
+    if key_rotated {
+        backend_handler.clear_all_mfa().await?;
+    }
     for group in BUILTIN_GROUPS {
         ensure_group_exists(&backend_handler, group).await?;
     }
@@ -252,6 +262,12 @@ async fn set_up_server(
             "while resetting admin password for {}",
             config.ldap_user_dn
         ))?;
+        // The one-shot reset is the break-glass: it also clears the admin's second factor.
+        if config.force_ldap_user_pass_reset.is_yes() {
+            backend_handler
+                .reset_user_mfa(&config.ldap_user_dn, MfaResetReason::ForcedAdminReset)
+                .await?;
+        }
         record(
             LogKind::AdminBootstrap,
             Some(config.ldap_user_dn.as_str()),

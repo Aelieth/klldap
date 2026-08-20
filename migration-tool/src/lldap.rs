@@ -160,6 +160,7 @@ fn try_login(
     let req = ClientLoginFinishRequest {
         server_data: login_start_response.server_data,
         credential_finalization: login_finish.message,
+        totp_code: None,
     };
     let response = client
         .post(format!("{}/auth/opaque/login/finish", lldap_server))
@@ -171,7 +172,16 @@ fn try_login(
             response.status().as_str()
         );
     }
-    let json = serde_json::from_str::<lldap_auth::login::ServerLoginResponse>(&response.text()?)
+    let body = response.text()?;
+    // An enrolled account answers with a challenge instead of a token.
+    if serde_json::from_str::<lldap_auth::login::ServerMfaRequiredResponse>(&body)
+        .is_ok_and(|response| response.mfa_required)
+    {
+        bail!(
+            "{username} has two-factor authentication enabled, which this tool does not support. Migrate with an unenrolled account, or one in the lldap_mfa_disabled group."
+        );
+    }
+    let json = serde_json::from_str::<lldap_auth::login::ServerLoginResponse>(&body)
         .context("Could not parse response")?;
     Ok(json.token)
 }

@@ -105,6 +105,7 @@ impl CommonComponent<LoginForm> for LoginForm {
                 let req = login::ClientLoginFinishRequest {
                     server_data: res.server_data,
                     credential_finalization: login_finish.message,
+                    totp_code: None,
                 };
                 self.common.call_backend(
                     ctx,

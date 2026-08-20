@@ -8,8 +8,8 @@ use lldap_domain::{
         UpdateUserRequest,
     },
     types::{
-        AttributeName, Group, GroupDetails, GroupId, LdapObjectClass, TotpEnrollmentStart, User,
-        UserAndGroups, UserId,
+        AttributeName, Group, GroupDetails, GroupId, LdapObjectClass, LoginOutcome,
+        TotpEnrollmentStart, User, UserAndGroups, UserId,
     },
 };
 use lldap_domain_handlers::handler::{
@@ -92,13 +92,13 @@ mockall::mock! {
         async fn login_start(
             &self, request: login::ClientLoginStartRequest
         ) -> Result<login::ServerLoginStartResponse>;
-        async fn login_finish(&self, request: login::ClientLoginFinishRequest) -> Result<UserId>;
+        async fn login_finish(&self, request: login::ClientLoginFinishRequest) -> Result<LoginOutcome>;
         async fn registration_start(
             &self, request: registration::ClientRegistrationStartRequest
         ) -> Result<registration::ServerRegistrationStartResponse>;
         async fn registration_finish(
             &self, request: registration::ClientRegistrationFinishRequest
-        ) -> Result<()>;
+        ) -> Result<UserId>;
     }
     #[async_trait]
     impl PosixBackendHandler for TestBackendHandler {

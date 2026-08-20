@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 use async_trait::async_trait;
-use lldap_domain::types::UserId;
+use lldap_domain::types::{LoginOutcome, UserId};
 use lldap_domain_model::error::Result;
 
 use lldap_auth::opaque;
@@ -12,7 +12,7 @@ pub trait OpaqueHandler: Send + Sync {
         &self,
         request: login::ClientLoginStartRequest,
     ) -> Result<login::ServerLoginStartResponse>;
-    async fn login_finish(&self, request: login::ClientLoginFinishRequest) -> Result<UserId>;
+    async fn login_finish(&self, request: login::ClientLoginFinishRequest) -> Result<LoginOutcome>;
     async fn registration_start(
         &self,
         request: registration::ClientRegistrationStartRequest,
@@ -20,7 +20,7 @@ pub trait OpaqueHandler: Send + Sync {
     async fn registration_finish(
         &self,
         request: registration::ClientRegistrationFinishRequest,
-    ) -> Result<()>;
+    ) -> Result<UserId>;
 }
 
 /// Runs the OPAQUE registration ceremony in-process, playing the client against `handler`.
@@ -49,4 +49,5 @@ pub async fn register_password(
             registration_upload: registration_finish.message,
         })
         .await
+        .map(|_| ())
 }

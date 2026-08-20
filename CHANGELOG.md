@@ -21,9 +21,23 @@
 - Under `"always"` a session that has not enrolled yet can only read its own user and
   enroll; every other query or mutation is refused until enrollment completes.
 - New log kinds `mfa_enroll` and `mfa_reset`.
-- Login-time enforcement (`yourpassword:123456` at the web form, `/auth/simple/login`
-  and LDAP bind) is the next change; until then an enrolled user still signs in with the
-  password alone.
+- Enrolled users present the code at every door by appending it to the password
+  (`yourpassword:123456`): the web login answers a password-only attempt with
+  `{"mfaRequired": true}` and the client retries with `totpCode`, `/auth/simple/login` and
+  LDAP simple bind split the suffix and say why only after the password verified (*TOTP
+  code required: append ':' and the code*, *TOTP code already used*, *Too many TOTP
+  attempts*). The check runs in the same login handler as the password, so the event log
+  keeps one `bind` / `login` row per ceremony (details `totp`, `invalid totp`,
+  `totp replayed`, `totp attempts exceeded`, `mfa enrollment required`). Under `"always"`
+  unenrolled users are refused on LDAP and simple login and admitted flagged on the web
+  login and the refresh.
+- A password reset by e-mail clears the factor once the new password is committed,
+  `--force-ldap-user-pass-reset=true` clears the admin's, and a changed private key
+  accepted with `--force-update-private-key=true` clears every factor (the sealed secrets
+  died with the old key). The migration tool refuses enrolled accounts by name. The gate
+  runs with `enable_mfa = true` and exercises enrollment, both doors, replay and reset.
+  Documented in `docs/mfa.md`; the web app's login form, change-password page and
+  enrollment page follow in the next change.
 
 ### Logging
 

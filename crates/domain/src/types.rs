@@ -573,6 +573,16 @@ pub struct TotpEnrollmentStart {
     pub state: String,
 }
 
+/// The web login after the password verified: a session, or a second factor to present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LoginOutcome {
+    Authenticated {
+        user_id: UserId,
+        mfa_enrollment_pending: bool,
+    },
+    TotpRequired,
+}
+
 #[derive(
     Copy, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, DeriveValueType, derive_more::Debug,
 )]

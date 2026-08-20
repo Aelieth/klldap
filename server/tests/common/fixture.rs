@@ -397,6 +397,15 @@ pub fn runtime() -> tokio::runtime::Runtime {
         .expect("tokio runtime")
 }
 
+pub fn exec_sql(db_url: &str, sql: &str) {
+    runtime().block_on(async {
+        let db = Database::connect(db_url).await.expect("connect db");
+        db.execute(Statement::from_string(DbBackend::Sqlite, sql.to_owned()))
+            .await
+            .expect("execute");
+    });
+}
+
 pub fn query_i64(db_url: &str, sql: &str) -> i64 {
     runtime().block_on(async {
         let db = Database::connect(db_url).await.expect("connect db");

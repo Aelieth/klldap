@@ -8,8 +8,8 @@ that build on them; the terminal lines are LLDAP's usual output plus these event
 
 | Kind | When | Actor / target / detail |
 |---|---|---|
-| `bind` | LDAP simple bind and `/auth/simple/login` (both go through the same login handler) | claimed user; `invalid credentials` (wrong password), `unknown user` (no such account, or an account with no password set — deliberately the same, visible only in this admin-only table; the client response does not differ), `account disabled`, `ou mismatch`, `Anonymous bind not allowed`, `SASL not supported`, a bad DN |
-| `login` | web (OPAQUE) login | claimed user; `invalid credentials`, `account disabled` |
+| `bind` | LDAP simple bind and `/auth/simple/login` (both go through the same login handler) | claimed user; `invalid credentials` (wrong password), `unknown user` (no such account, or an account with no password set — deliberately the same, visible only in this admin-only table; the client response does not differ), `account disabled`, `ou mismatch`, `Anonymous bind not allowed`, `SASL not supported`, a bad DN; with a second factor ([mfa.md](mfa.md)) the success detail is `totp`, the failures `invalid totp`, `totp replayed`, `totp attempts exceeded`, `totp re-enrollment required`, `mfa enrollment required` (the missing-code challenge records nothing) |
+| `login` | web (OPAQUE) login | claimed user; `invalid credentials`, `account disabled`, the same second-factor details, and success detail `mfa enrollment pending` for a user admitted under `enable_mfa = "always"` before enrolling |
 | `logout`, `token_refresh` | web session end / refresh | user; `invalid refresh token`, `account disabled` |
 | `password_reset_request`, `password_reset_complete` | reset mail requested / reset token used | target user (also unknown ones — the HTTP response stays silent, the log does not); the token itself is never recorded |
 | `password_change` | every path: web, GraphQL `setUserPassword`, LDAP `userPassword` modify, password-modify extended operation, `ldapadd` with `userPassword`, admin bootstrap | actor from the request, target user |
@@ -21,6 +21,8 @@ that build on them; the terminal lines are LLDAP's usual output plus these event
 | `posix_change` | the bulk uidNumber/gidNumber/home/shell reassignments | detail `reassign` |
 | `kerberos_sync`, `keytab_export` | principal sync/delete/enable/disable, keytab export | target principal user / host, detail = the operation |
 | `keycloak_change` | Federation tab: test connection, save config, push realm | target url / realm |
+| `mfa_enroll` | TOTP enrollment: a state minted (`started`), confirmed (`totp`, `replaced`), or refused (`invalid code`, `expired enrollment`, `stale enrollment`, `corrupt enrollment state`, `foreign enrollment state`; a refused current code on a replacement carries the rejection detail) | actor = target user |
+| `mfa_reset` | a second factor cleared: by an admin or password manager (no detail — the actor says who), by the user (`self`; a refused code carries the rejection detail), by a password reset (`password reset`), by the one-shot admin reset (`forced admin reset`), or for everyone after a private-key rotation (`private key changed`, `system`, no target) | target user |
 | `access_denied` | a GraphQL field or an LDAP operation refused for lack of rights, a rejected JWT (junk/`Invalid JWT`, `Expired JWT`, logged out, disabled account, wrong algorithm) | actor if known, detail = the refusal message. Like failed binds, the first 8 per client address and protocol are stored one-to-one; a flood past that coalesces into `access_denied_flood` |
 | `server_start`, `admin_bootstrap` | boot, admin created / password forced from the configuration | `system` |
 | `log_gap` | events dropped because the writer's queue overflowed | detail = how many |
@@ -198,6 +200,7 @@ state for others; this is which source answers what, and the query when it is th
 | Inactivity lockout | log, within the retention horizon | per user `logActivity(actor: "bob", kinds: [BIND, LOGIN, TOKEN_REFRESH, PASSWORD_RESET_COMPLETE]) { lastSuccess { timestamp } }`; per group `logSummary(filter: {memberOf: "staff", kinds: [BIND, LOGIN, TOKEN_REFRESH], success: true, since: "<now - 90 days>"}, groupBy: [ACTOR], limit: 1000) { actor last }` — members missing from the buckets are the candidates |
 | Progressive delay, max attempts before disable | log for the board and the review; the enforcement counts in memory (see the limits below) | board `logSummary(filter: {kinds: [BIND, LOGIN], success: false, since: "<now - 15 min>"}, groupBy: [ACTOR]) { actor count first last }`; per user `logActivity(actor: "bob") { lastFailure { timestamp peer detail } failuresSinceLastSuccess }`; per source `groupBy: [PEER]` |
 | Login time restrictions | configuration (windows and a time zone per group); the log profiles usage and audits refusals | `logSummary(filter: {actor: "bob", kinds: [BIND, LOGIN], success: true, since: "<now - 30 days>"}, groupBy: [HOUR]) { hour count }` (UTC hours) |
+| TOTP guessing, second-factor posture | log: a wrong code is a failed `bind`/`login` like a wrong password, so the lockout lookups above already count it; the detail tells them apart | `logs(filter: {actor: "bob", kinds: [BIND, LOGIN], success: false}) { detail peer }` (`invalid totp`, `totp replayed`, `totp attempts exceeded`); who still has to enroll under `"always"`: `logs(filter: {kinds: [LOGIN], success: true})` rows with detail `mfa enrollment pending`; the factor's history `logs(filter: {kinds: [MFA_ENROLL, MFA_RESET], target: "bob"})` |
 | IP restrictions | configuration (address ranges per group); the log builds allow lists and finds sources | `logSummary(filter: {actor: "bob", kinds: [BIND, LOGIN], success: true, since: ...}, groupBy: [PEER]) { peer count first last }`; sources of failures `logSummary(filter: {success: false, since: ...}, groupBy: [PEER])` |
 
 Limits to keep in mind:
@@ -250,5 +253,7 @@ privilege changes) without a database read per request. The table is the durable
 the lookup for admins and other services (`logs`, `logSummary`, `logActivity`, the same
 methods on `LogBackendHandler` for in-process code). The Kerberos side keeps its own state
 (last success, failure count, kadmin policies) that the policies will surface next to it.
+The second factor reports through the same rows ([mfa.md](mfa.md)): a TOTP guess is a
+failed `bind`/`login` like a wrong password, so a lockout keyed on `LOGIN_KINDS` counts it.
 The seam (`crates/domain-handlers/src/logging.rs`), the table, the writer and the queries
 are LLDAP-neutral; the Kerberos, Keycloak, OU and POSIX kinds are KLLDAP's.

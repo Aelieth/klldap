@@ -8,8 +8,8 @@ use lldap_domain::{
         UpdateUserRequest,
     },
     types::{
-        AttributeName, Group, GroupDetails, GroupId, GroupName, LdapObjectClass, User,
-        UserAndGroups, UserId,
+        AttributeName, Group, GroupDetails, GroupId, GroupName, LdapObjectClass, LoginOutcome,
+        User, UserAndGroups, UserId,
     },
 };
 use lldap_domain_handlers::handler::{
@@ -401,7 +401,7 @@ impl<Inner: OpaqueHandler + Send + Sync> OpaqueHandler for AccessControlledBacke
         self.handler.login_start(request).await
     }
 
-    async fn login_finish(&self, request: login::ClientLoginFinishRequest) -> Result<UserId> {
+    async fn login_finish(&self, request: login::ClientLoginFinishRequest) -> Result<LoginOutcome> {
         self.handler.login_finish(request).await
     }
 
@@ -415,7 +415,7 @@ impl<Inner: OpaqueHandler + Send + Sync> OpaqueHandler for AccessControlledBacke
     async fn registration_finish(
         &self,
         request: registration::ClientRegistrationFinishRequest,
-    ) -> Result<()> {
+    ) -> Result<UserId> {
         self.handler.registration_finish(request).await
     }
 }

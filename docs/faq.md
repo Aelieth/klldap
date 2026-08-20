@@ -26,6 +26,10 @@ set isn't working, try the following:
   matches the database: restore the right one, or restart once with
   `--force-update-private-key=true --force-ldap-user-pass-reset=true` and have every
   user reset their password.
+- If two-factor authentication is on and the account is enrolled, the password field
+  takes `yourpassword:123456` — password, a colon, the current code — and the bare
+  password is refused. Service accounts that cannot type a code belong in
+  `lldap_mfa_disabled`. See [mfa.md](mfa.md).
 - Make sure you restart the server.
 
 ## kinit fails for a user

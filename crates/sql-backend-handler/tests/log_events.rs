@@ -95,6 +95,10 @@ async fn test_every_directory_write_records_a_log_event() {
         .await
         .unwrap();
     handler
+        .set_system_config("future_secret", "hunter2".to_owned())
+        .await
+        .unwrap();
+    handler
         .add_user_attribute(attribute("nickname"))
         .await
         .unwrap();
@@ -148,6 +152,11 @@ async fn test_every_directory_write_records_a_log_event() {
             LogKind::SystemConfigChange,
             Some("allowedous"),
             Some(r#"["people","groups","lab"]"#),
+        ),
+        (
+            LogKind::SystemConfigChange,
+            Some("future_secret"),
+            Some("updated"),
         ),
         (
             LogKind::SchemaChange,
@@ -237,6 +246,12 @@ async fn test_bind_records_the_claimed_user_and_the_request_scope() {
     let ldap_peer: IpAddr = "10.0.0.5".parse().unwrap();
     let guard = LogGuard::install();
 
+    with_actor(
+        Some(UserId::new("admin")),
+        register_password(&handler, bob.clone(), b"bobbybobbob"),
+    )
+    .await
+    .unwrap();
     with_request(
         RequestMeta::ldap(None, Some(ldap_peer)),
         handler.bind(BindRequest {
@@ -279,6 +294,17 @@ async fn test_bind_records_the_claimed_user_and_the_request_scope() {
         .unwrap_err();
 
     let events = guard.recorder().take_events();
+    let changes: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == LogKind::PasswordChange)
+        .collect();
+    assert_eq!(changes.len(), 1);
+    assert_eq!(changes[0].actor.as_deref(), Some("admin"));
+    assert_eq!(changes[0].target.as_deref(), Some("bob"));
+    assert_eq!(
+        changes[0].to_string(),
+        "✅ password_change bob by admin (system)"
+    );
     let binds: Vec<_> = events.iter().filter(|e| e.kind == LogKind::Bind).collect();
     assert_eq!(binds.len(), 4);
     assert!(binds[0].success);
@@ -294,53 +320,4 @@ async fn test_bind_records_the_claimed_user_and_the_request_scope() {
     assert_eq!(binds[2].detail.as_deref(), Some("unknown user"));
     assert_eq!(binds[2].protocol, Protocol::System);
     assert_eq!(binds[3].detail.as_deref(), Some("account disabled"));
-}
-
-#[tokio::test]
-#[serial]
-async fn test_password_change_carries_the_scoped_actor() {
-    let handler = handler().await;
-    let bob = UserId::new("bob");
-    handler
-        .create_user(CreateUserRequest {
-            user_id: bob.clone(),
-            email: "bob@example.com".into(),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    let guard = LogGuard::install();
-
-    with_actor(
-        Some(UserId::new("admin")),
-        register_password(&handler, bob.clone(), b"bobbybobbob"),
-    )
-    .await
-    .unwrap();
-
-    let events = guard.recorder().take_events();
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].kind, LogKind::PasswordChange);
-    assert_eq!(events[0].actor.as_deref(), Some("admin"));
-    assert_eq!(events[0].target.as_deref(), Some("bob"));
-    assert_eq!(
-        events[0].to_string(),
-        "✅ password_change bob by admin (system)"
-    );
-}
-
-#[tokio::test]
-#[serial]
-async fn test_unknown_system_config_key_does_not_log_the_value() {
-    let handler = handler().await;
-    let guard = LogGuard::install();
-    handler
-        .set_system_config("future_secret", "hunter2".to_owned())
-        .await
-        .unwrap();
-    let events = guard.recorder().take_events();
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0].kind, LogKind::SystemConfigChange);
-    assert_eq!(events[0].target.as_deref(), Some("future_secret"));
-    assert_eq!(events[0].detail.as_deref(), Some("updated"));
 }

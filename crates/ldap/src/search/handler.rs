@@ -345,9 +345,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handler::tests::setup_bound_admin_handler;
+    use crate::handler::tests::{setup_bound_admin_handler, setup_bound_handler_with_group};
     use crate::search::make_search_request;
     use lldap_domain::types::{Attribute, GroupId, User, UserAndGroups, UserId, Uuid};
+    use lldap_domain_handlers::handler::UserRequestFilter;
+    use lldap_domain_model::error::DomainError;
     use lldap_test_utils::{MockTestBackendHandler, setup_default_ldap_mock};
     use pretty_assertions::assert_eq;
 
@@ -381,9 +383,9 @@ mod tests {
         }
     }
 
-    fn base_request(base: &str, filter: LdapFilter) -> LdapSearchRequest {
+    fn request(base: &str, scope: LdapSearchScope, filter: LdapFilter) -> LdapSearchRequest {
         let mut request = make_search_request(base, filter, vec!["objectClass"]);
-        request.scope = LdapSearchScope::Base;
+        request.scope = scope;
         request
     }
 
@@ -400,23 +402,150 @@ mod tests {
         LdapFilter::Equality("objectClass".to_string(), "person".to_string())
     }
 
+    fn present_filter() -> LdapFilter {
+        LdapFilter::Present("objectClass".to_string())
+    }
+
     #[tokio::test]
-    async fn test_base_search_on_a_user_returns_the_entry_and_success() {
+    async fn test_base_scope_lookup_matrix() {
+        type Setup = fn(&mut MockTestBackendHandler);
+        type Case<'a> = (
+            &'a str,
+            &'a str,
+            LdapSearchScope,
+            LdapFilter,
+            Setup,
+            Result<Vec<&'a str>, LdapResultCode>,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "a user that exists",
+                "uid=bob,ou=people,dc=example,dc=com",
+                LdapSearchScope::Base,
+                person_filter(),
+                |mock| {
+                    mock.expect_list_users()
+                        .returning(|_, _| Ok(vec![user_in("bob", "people")]));
+                },
+                Ok(vec!["uid=bob,ou=people,dc=example,dc=com"]),
+            ),
+            (
+                "a user that does not exist",
+                "uid=nobody,ou=people,dc=example,dc=com",
+                LdapSearchScope::Base,
+                person_filter(),
+                |mock| {
+                    mock.expect_list_users().returning(|_, _| Ok(vec![]));
+                },
+                Err(LdapResultCode::NoSuchObject),
+            ),
+            (
+                "a group that exists",
+                "cn=admins,ou=groups,dc=example,dc=com",
+                LdapSearchScope::Base,
+                present_filter(),
+                |mock| {
+                    mock.expect_list_groups()
+                        .returning(|_| Ok(vec![group_in("admins", "groups")]));
+                },
+                Ok(vec!["cn=admins,ou=groups,dc=example,dc=com"]),
+            ),
+            (
+                "a group that does not exist",
+                "cn=nobody,ou=groups,dc=example,dc=com",
+                LdapSearchScope::Base,
+                present_filter(),
+                |mock| {
+                    mock.expect_list_groups().returning(|_| Ok(vec![]));
+                },
+                Err(LdapResultCode::NoSuchObject),
+            ),
+            (
+                "an OU that does not exist is a success with no entries",
+                "ou=users,dc=example,dc=com",
+                LdapSearchScope::Subtree,
+                person_filter(),
+                |mock| {
+                    mock.expect_list_users()
+                        .returning(|_, _| Ok(vec![user_in("bob", "people")]));
+                    mock.expect_list_groups()
+                        .returning(|_| Ok(vec![group_in("admins", "groups")]));
+                },
+                Ok(vec![]),
+            ),
+            (
+                "a backend error",
+                "cn=admins,ou=groups,dc=example,dc=com",
+                LdapSearchScope::Base,
+                present_filter(),
+                |mock| {
+                    mock.expect_list_groups().returning(|_| {
+                        Err(DomainError::InternalError(
+                            "Error getting groups".to_string(),
+                        ))
+                    });
+                },
+                Err(LdapResultCode::Other),
+            ),
+        ];
+        for (label, base, scope, filter, setup, expected) in cases {
+            let mut mock = MockTestBackendHandler::new();
+            setup_default_ldap_mock(&mut mock);
+            setup(&mut mock);
+            let handler = setup_bound_admin_handler(mock).await;
+            let result = handler
+                .do_search_or_dse(&request(base, scope, filter))
+                .await;
+            match expected {
+                Ok(dns) => {
+                    let ops = result.unwrap_or_else(|e| panic!("{label}: {e:?}"));
+                    assert_eq!(entry_dns(&ops), dns, "{label}");
+                    assert_eq!(ops.len(), dns.len() + 1, "{label}");
+                    assert_eq!(ops.last(), Some(&make_search_success()), "{label}");
+                }
+                Err(code) => {
+                    let err = result
+                        .err()
+                        .unwrap_or_else(|| panic!("{label}: expected {code:?}"));
+                    assert_eq!(err.code, code, "{label}");
+                    if code == LdapResultCode::Other {
+                        assert!(
+                            err.message.starts_with("Error while listing groups"),
+                            "{label}: {}",
+                            err.message
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // A bind that cannot read the whole directory only ever asks the backend for itself.
+    #[tokio::test]
+    async fn test_regular_bind_search_is_narrowed_to_self() {
         let mut mock = MockTestBackendHandler::new();
         setup_default_ldap_mock(&mut mock);
         mock.expect_list_users()
-            .returning(|_, _| Ok(vec![user_in("bob", "people")]));
-        let handler = setup_bound_admin_handler(mock).await;
+            .withf(|filter, _| {
+                matches!(filter, Some(UserRequestFilter::And(parts))
+                    if parts.contains(&UserRequestFilter::UserId(UserId::new("test"))))
+            })
+            .times(1)
+            .returning(|_, _| Ok(vec![user_in("test", "people")]));
+        mock.expect_list_groups().returning(|_| Ok(vec![]));
+        let handler = setup_bound_handler_with_group(mock, "regular").await;
         let ops = handler
-            .do_search_or_dse(&base_request(
-                "uid=bob,ou=people,dc=example,dc=com",
+            .do_search_or_dse(&request(
+                "dc=example,dc=com",
+                LdapSearchScope::Subtree,
                 person_filter(),
             ))
             .await
             .unwrap();
-        assert_eq!(entry_dns(&ops), vec!["uid=bob,ou=people,dc=example,dc=com"]);
-        assert_eq!(ops.len(), 2);
-        assert_eq!(ops.last(), Some(&make_search_success()));
+        assert_eq!(
+            entry_dns(&ops),
+            vec!["uid=test,ou=people,dc=example,dc=com"]
+        );
     }
 
     #[tokio::test]
@@ -429,66 +558,14 @@ mod tests {
         mock.expect_list_users().return_once(|_, _| Ok(vec![]));
         let handler = setup_bound_admin_handler(mock).await;
         let ops = handler
-            .do_search_or_dse(&base_request(
+            .do_search_or_dse(&request(
                 "uid=bob,ou=people,dc=example,dc=com",
+                LdapSearchScope::Base,
                 LdapFilter::Equality("uid".to_string(), "alice".to_string()),
             ))
             .await
             .unwrap();
         assert_eq!(ops, vec![make_search_success()]);
-    }
-
-    #[tokio::test]
-    async fn test_base_search_on_a_missing_user_is_no_such_object() {
-        let mut mock = MockTestBackendHandler::new();
-        setup_default_ldap_mock(&mut mock);
-        mock.expect_list_users().returning(|_, _| Ok(vec![]));
-        let handler = setup_bound_admin_handler(mock).await;
-        let err = handler
-            .do_search_or_dse(&base_request(
-                "uid=nobody,ou=people,dc=example,dc=com",
-                person_filter(),
-            ))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code, LdapResultCode::NoSuchObject);
-    }
-
-    #[tokio::test]
-    async fn test_base_search_on_a_group_returns_the_entry_and_success() {
-        let mut mock = MockTestBackendHandler::new();
-        setup_default_ldap_mock(&mut mock);
-        mock.expect_list_groups()
-            .returning(|_| Ok(vec![group_in("admins", "groups")]));
-        let handler = setup_bound_admin_handler(mock).await;
-        let ops = handler
-            .do_search_or_dse(&base_request(
-                "cn=admins,ou=groups,dc=example,dc=com",
-                LdapFilter::Present("objectClass".to_string()),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(
-            entry_dns(&ops),
-            vec!["cn=admins,ou=groups,dc=example,dc=com"]
-        );
-        assert_eq!(ops.last(), Some(&make_search_success()));
-    }
-
-    #[tokio::test]
-    async fn test_base_search_on_a_missing_group_is_no_such_object() {
-        let mut mock = MockTestBackendHandler::new();
-        setup_default_ldap_mock(&mut mock);
-        mock.expect_list_groups().returning(|_| Ok(vec![]));
-        let handler = setup_bound_admin_handler(mock).await;
-        let err = handler
-            .do_search_or_dse(&base_request(
-                "cn=nobody,ou=groups,dc=example,dc=com",
-                LdapFilter::Present("objectClass".to_string()),
-            ))
-            .await
-            .unwrap_err();
-        assert_eq!(err.code, LdapResultCode::NoSuchObject);
     }
 
     #[tokio::test]

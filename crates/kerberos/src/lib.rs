@@ -157,19 +157,25 @@ fn lock_down_keytab(path: &Path) -> Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))
         .with_context(|| format!("while chmodding {}", path.display()))
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_sync_principal_rejects_krbtgt_before_touching_the_kdc() {
+    fn test_dangerous_inputs_are_rejected_before_kadmin() {
         let err = sync_kerberos_principal("krbtgt", "secret")
             .expect_err("krbtgt must never be synced")
             .to_string();
         assert!(
             err.contains("reserved"),
             "expected reserved-name error, got {err}"
+        );
+        let err = export_keytab_for_keycloak("foo\ndelprinc admin/admin")
+            .expect_err("newline hostname must be rejected")
+            .to_string();
+        assert!(
+            err.contains("hostname") || err.contains("invalid"),
+            "expected hostname validation error, got {err}"
         );
     }
 
@@ -182,16 +188,5 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         let _ = std::fs::remove_file(&path);
         assert_eq!(mode, 0o600, "exported keytab must not be world-readable");
-    }
-
-    #[test]
-    fn test_export_keytab_rejects_injected_hostname_before_kadmin() {
-        let err = export_keytab_for_keycloak("foo\ndelprinc admin/admin")
-            .expect_err("newline hostname must be rejected")
-            .to_string();
-        assert!(
-            err.contains("hostname") || err.contains("invalid"),
-            "expected hostname validation error, got {err}"
-        );
     }
 }

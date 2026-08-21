@@ -572,85 +572,58 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn test_create_user_with_password_syncs() {
+    async fn test_create_user_kerberos_matrix() {
         let guard = RecordingGuard::install();
-        let mut mock = MockTestBackendHandler::new();
-        mock.expect_create_user().times(1).return_once(|_| Ok(()));
-        expect_password_registration(&mut mock, "bob");
-        mock.expect_ensure_kerberos_principal_consistency()
-            .with(eq(UserId::new("bob")), eq(true))
-            .times(1)
-            .return_once(|_, _| Ok(()));
-        let ldap_handler = setup_bound_admin_handler(mock).await;
-        assert_eq!(
-            ldap_handler
-                .create_user_or_group(add_user_request(vec![
-                    LdapPartialAttribute {
-                        atype: "kerberossync".to_owned(),
-                        vals: vec![b"1".to_vec()],
-                    },
-                    LdapPartialAttribute {
-                        atype: "userPassword".to_owned(),
-                        vals: vec![b"s3cret".to_vec()],
-                    },
-                ]))
-                .await,
-            Ok(vec![make_add_response(
-                LdapResultCode::Success,
-                String::new()
-            )])
-        );
-        assert_eq!(
-            guard.recorder().take_ops(),
-            vec![KerberosOp::SyncPrincipal {
-                username: "bob".into(),
-                password: "s3cret".into(),
-            }]
-        );
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_create_user_without_sync_skips_principal() {
-        let guard = RecordingGuard::install();
-        let mut mock = MockTestBackendHandler::new();
-        mock.expect_create_user().times(1).return_once(|_| Ok(()));
-        expect_password_registration(&mut mock, "bob");
-        let ldap_handler = setup_bound_admin_handler(mock).await;
-        assert_eq!(
-            ldap_handler
-                .create_user_or_group(add_user_request(vec![LdapPartialAttribute {
-                    atype: "userPassword".to_owned(),
-                    vals: vec![b"s3cret".to_vec()],
-                }]))
-                .await,
-            Ok(vec![make_add_response(
-                LdapResultCode::Success,
-                String::new()
-            )])
-        );
-        assert!(guard.recorder().take_ops().is_empty());
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_create_user_sync_without_password_skips_principal() {
-        let guard = RecordingGuard::install();
-        let mut mock = MockTestBackendHandler::new();
-        mock.expect_create_user().times(1).return_once(|_| Ok(()));
-        let ldap_handler = setup_bound_admin_handler(mock).await;
-        assert_eq!(
-            ldap_handler
-                .create_user_or_group(add_user_request(vec![LdapPartialAttribute {
+        let cases = [
+            ("kerberossync with a password", true, true),
+            ("a password without kerberossync", false, true),
+            ("kerberossync without a password", true, false),
+        ];
+        for (label, synced, with_password) in cases {
+            let mut mock = MockTestBackendHandler::new();
+            mock.expect_create_user().times(1).return_once(|_| Ok(()));
+            if with_password {
+                expect_password_registration(&mut mock, "bob");
+            }
+            if synced && with_password {
+                mock.expect_ensure_kerberos_principal_consistency()
+                    .with(eq(UserId::new("bob")), eq(true))
+                    .times(1)
+                    .return_once(|_, _| Ok(()));
+            }
+            let mut extra = vec![];
+            if synced {
+                extra.push(LdapPartialAttribute {
                     atype: "kerberossync".to_owned(),
                     vals: vec![b"1".to_vec()],
-                }]))
-                .await,
-            Ok(vec![make_add_response(
-                LdapResultCode::Success,
-                String::new()
-            )])
-        );
-        assert!(guard.recorder().take_ops().is_empty());
+                });
+            }
+            if with_password {
+                extra.push(LdapPartialAttribute {
+                    atype: "userPassword".to_owned(),
+                    vals: vec![b"s3cret".to_vec()],
+                });
+            }
+            let ldap_handler = setup_bound_admin_handler(mock).await;
+            assert_eq!(
+                ldap_handler
+                    .create_user_or_group(add_user_request(extra))
+                    .await,
+                Ok(vec![make_add_response(
+                    LdapResultCode::Success,
+                    String::new()
+                )]),
+                "{label}"
+            );
+            let expected = if synced && with_password {
+                vec![KerberosOp::SyncPrincipal {
+                    username: "bob".into(),
+                    password: "s3cret".into(),
+                }]
+            } else {
+                vec![]
+            };
+            assert_eq!(guard.recorder().take_ops(), expected, "{label}");
+        }
     }
 }

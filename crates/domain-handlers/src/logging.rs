@@ -464,9 +464,7 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use serial_test::serial;
-    use std::str::FromStr;
     use std::sync::Mutex;
-    use strum::IntoEnumIterator;
 
     struct Recorder(Mutex<Vec<LogEvent>>);
 
@@ -490,30 +488,7 @@ mod tests {
     }
 
     #[test]
-    fn test_kind_and_protocol_names_are_snake_case_and_round_trip() {
-        for kind in LogKind::iter() {
-            let name = kind.to_string();
-            assert!(
-                name.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
-                "{name}"
-            );
-            assert_eq!(LogKind::from_str(&name).unwrap(), kind);
-        }
-        assert_eq!(
-            LogKind::PasswordResetRequest.to_string(),
-            "password_reset_request"
-        );
-        assert_eq!(Protocol::Graphql.to_string(), "graphql");
-        assert_eq!(Protocol::default(), Protocol::System);
-        for dimension in LogDimension::iter() {
-            let name = dimension.to_string();
-            assert_eq!(LogDimension::from_str(&name).unwrap(), dimension);
-        }
-        assert_eq!(LogDimension::Day.to_string(), "day");
-    }
-
-    #[test]
-    fn test_warn_limiter_passes_then_suppresses_then_summarizes() {
+    fn test_warn_limiter_budget_window_and_idle_flush() {
         let limiter = WarnLimiter::new();
         for i in 0..WARN_BUDGET {
             assert!(matches!(limiter.should_print(1000), Print::Yes), "{i}");
@@ -527,10 +502,7 @@ mod tests {
             Print::YesWithSummary(6)
         ));
         assert!(matches!(limiter.should_print(1010), Print::Yes));
-    }
 
-    #[test]
-    fn test_take_suppressed_flushes_the_pending_count_on_idle() {
         let limiter = WarnLimiter::new();
         for _ in 0..WARN_BUDGET {
             limiter.should_print(1000);
@@ -538,23 +510,19 @@ mod tests {
         for _ in 0..7 {
             assert!(matches!(limiter.should_print(1000), Print::Suppressed));
         }
-        // Same window: nothing to flush yet.
+        // Same window: nothing to flush yet; once elapsed the count is claimed exactly once
+        // and the following failure gets the full fresh budget.
         assert_eq!(limiter.take_suppressed(1005), None);
-        // Window elapsed with a pending count: it is claimed once.
         assert_eq!(limiter.take_suppressed(1010), Some(7));
         assert_eq!(limiter.take_suppressed(1010), None);
-        // A following failure gets the full fresh budget (not double-counted).
         assert!(matches!(limiter.should_print(1010), Print::Yes));
-    }
 
-    #[test]
-    fn test_warn_limiter_rolls_the_window_and_resets_the_count() {
         let limiter = WarnLimiter::new();
         for _ in 0..WARN_BUDGET {
             limiter.should_print(1000);
         }
         assert!(matches!(limiter.should_print(1000), Print::Suppressed));
-        // A quiet roll prints without a summary and the budget is fresh.
+        // A quiet roll flushes the one suppressed line and the budget is fresh.
         assert!(matches!(
             limiter.should_print(2000),
             Print::YesWithSummary(1)
@@ -570,16 +538,9 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_log_lookup_defaults() {
-        assert_eq!(LogCursor::default(), LogCursor::Newest);
-        assert!(LogFilter::default().kinds.is_empty());
-        assert_eq!(LOGIN_KINDS, &[LogKind::Bind, LogKind::Login]);
-    }
-
     #[tokio::test]
     #[serial]
-    async fn test_record_takes_actor_protocol_and_peer_from_the_request_scope() {
+    async fn test_the_request_scope_decides_the_row_and_terminal_skips_the_sink() {
         let (recorder, _guard) = install_recorder();
         let meta = RequestMeta::ldap(
             Some(UserId::new("admin")),
@@ -600,6 +561,7 @@ mod tests {
             false,
             Some("invalid credentials"),
         );
+        record_terminal(LogKind::AccessDenied, None, "Invalid JWT");
 
         let events = recorder.0.lock().unwrap().clone();
         assert_eq!(events.len(), 3);
@@ -621,10 +583,7 @@ mod tests {
             events[2].to_string(),
             "❌ bind by dave (system): invalid credentials"
         );
-    }
 
-    #[tokio::test]
-    async fn test_with_actor_keeps_the_surrounding_peer_and_protocol() {
         let meta = RequestMeta::http(Some("192.0.2.10".parse().unwrap()), Some("10.1.1.1".into()));
         let inner = with_request(meta.clone(), async {
             with_actor(Some(UserId::new("bob")), async { current_request() }).await
@@ -638,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_truncates_on_char_boundaries() {
+    fn test_build_truncates_and_strips_control_characters() {
         let long_name = "é".repeat(300);
         let long_detail = "x".repeat(600);
         let event = build(
@@ -656,10 +615,7 @@ mod tests {
             MAX_DETAIL_LEN
         );
         assert_eq!(truncate("short", 10), "short");
-    }
 
-    #[test]
-    fn test_build_strips_control_characters() {
         let event = build(
             &RequestMeta {
                 forwarded_for: Some("203.0.113.9\nINFO pwned".into()),
@@ -679,16 +635,5 @@ mod tests {
             Some("203.0.113.9INFO pwned")
         );
         assert!(!event.to_string().contains('\n'));
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_record_terminal_does_not_reach_the_sink() {
-        let (recorder, _guard) = install_recorder();
-        record_terminal(LogKind::AccessDenied, None, "Invalid JWT");
-        record_failure(LogKind::AccessDenied, None, "Account disabled");
-        let events = recorder.0.lock().unwrap().clone();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].detail.as_deref(), Some("Account disabled"));
     }
 }

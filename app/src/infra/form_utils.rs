@@ -94,7 +94,6 @@ pub fn read_all_form_attributes(
     }
     Ok(all_values)
 }
-
 #[cfg(test)]
 mod tests {
     use super::{AttributeValue, validate_email_attributes};
@@ -107,15 +106,15 @@ mod tests {
     }
 
     #[test]
-    fn accepts_single_valid_email() {
+    fn test_validate_email_attributes() {
         assert!(validate_email_attributes(&[attr("mail", &["a@b.com"])]).is_ok());
-    }
-
-    #[test]
-    fn rejects_missing_empty_multiple_and_invalid() {
-        assert!(validate_email_attributes(&[attr("other", &["x"])]).is_err());
-        assert!(validate_email_attributes(&[attr("mail", &[])]).is_err());
-        assert!(validate_email_attributes(&[attr("mail", &["a@b.com", "c@d.com"])]).is_err());
-        assert!(validate_email_attributes(&[attr("mail", &["not-an-email"])]).is_err());
+        for (label, attrs) in [
+            ("missing", vec![attr("other", &["x"])]),
+            ("empty", vec![attr("mail", &[])]),
+            ("multiple", vec![attr("mail", &["a@b.com", "c@d.com"])]),
+            ("invalid", vec![attr("mail", &["not-an-email"])]),
+        ] {
+            assert!(validate_email_attributes(&attrs).is_err(), "{label}");
+        }
     }
 }

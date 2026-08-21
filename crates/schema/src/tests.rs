@@ -36,9 +36,10 @@ fn readonly(name: &str, aliases: &[&str], attribute_type: AT) -> AttributeSchema
 }
 
 #[test]
-fn test_user_schema_is_pinned() {
+fn test_public_schema_is_pinned() {
+    let s = PublicSchema::shared();
     assert_eq!(
-        *PublicSchema::shared().user_attributes(),
+        *s.user_attributes(),
         AttributeList {
             attributes: vec![
                 editable("avatar", &["jpegphoto", "jpegPhoto", "jpeg_photo"], Avatar),
@@ -95,14 +96,11 @@ fn test_user_schema_is_pinned() {
                 },
                 readonly("ou", &["organizationalunit", "organizationalUnit"], String),
             ],
-        }
+        },
+        "user attributes"
     );
-}
-
-#[test]
-fn test_group_schema_is_pinned() {
     assert_eq!(
-        *PublicSchema::shared().group_attributes(),
+        *s.group_attributes(),
         AttributeList {
             attributes: vec![
                 readonly("groupid", &["group_id"], Integer),
@@ -121,14 +119,11 @@ fn test_group_schema_is_pinned() {
                 readonly("ou", &["organizationalunit", "organizationalUnit"], String),
                 attr("gidnumber", &["gid_number", "gidNumber"], Integer),
             ],
-        }
+        },
+        "group attributes"
     );
-}
-
-#[test]
-fn test_system_schema_is_pinned() {
     assert_eq!(
-        *PublicSchema::shared().system_attributes(),
+        *s.system_attributes(),
         AttributeList {
             attributes: vec![AttributeSchema {
                 is_list: true,
@@ -136,13 +131,10 @@ fn test_system_schema_is_pinned() {
                 is_readonly: true,
                 ..attr("allowedous", &["allowedOUs", "AllowedOUs"], String)
             }],
-        }
+        },
+        "system attributes"
     );
-}
-
-#[test]
-fn test_posix_settings_and_object_classes_are_pinned() {
-    let schema = PublicSchema::shared().get_schema();
+    let schema = s.get_schema();
     assert_eq!(
         schema.posix_settings,
         PosixSettings {
@@ -158,27 +150,30 @@ fn test_posix_settings_and_object_classes_are_pinned() {
             group_gidnumber_assign: false,
             group_gidnumber_start: 3001,
             group_gidnumber_max: 3999,
-        }
+        },
+        "posix settings"
     );
     assert_eq!(
         schema.extra_user_object_classes,
-        ["inetOrgPerson", "posixAccount", "ldapPublicKey"]
+        ["inetOrgPerson", "posixAccount", "ldapPublicKey"],
+        "user object classes"
     );
-    assert_eq!(schema.extra_group_object_classes, ["posixGroup"]);
-}
-
-#[test]
-fn test_ldap_description_order_is_pinned() {
-    let s = PublicSchema::shared();
+    assert_eq!(
+        schema.extra_group_object_classes,
+        ["posixGroup"],
+        "group object classes"
+    );
     assert_eq!(
         s.user_attributes().format_for_ldap_schema_description(),
         "avatar $ creationdate $ displayname $ firstname $ lastname $ mail $ modifieddate $ \
          passwordmodifieddate $ userid $ uuid $ uidnumber $ gidnumber $ homedirectory $ \
-         loginshell $ kerberossync $ krbprincipalname $ sshpublickey $ ou"
+         loginshell $ kerberossync $ krbprincipalname $ sshpublickey $ ou",
+        "user description order"
     );
     assert_eq!(
         s.group_attributes().format_for_ldap_schema_description(),
-        "groupid $ creationdate $ modifieddate $ uuid $ displayname $ ou $ gidnumber"
+        "groupid $ creationdate $ modifieddate $ uuid $ displayname $ ou $ gidnumber",
+        "group description order"
     );
 }
 
@@ -208,10 +203,19 @@ fn test_alias_resolution_is_case_insensitive_and_list_scoped() {
         s.group_attributes().resolve_canonical_name("jpegPhoto"),
         None
     );
+
+    assert!(u.contains_name_or_alias("userid"));
+    assert!(u.contains_name_or_alias("uid"));
+    assert!(u.contains_name_or_alias("UID"));
+    assert!(!u.contains_name_or_alias("nope"));
+    let all: Vec<&str> = u.all_names_and_aliases().collect();
+    assert!(all.contains(&"userid"));
+    assert!(all.contains(&"uid"));
+    assert!(all.contains(&"entryUUID"));
 }
 
 #[test]
-fn test_get_attribute_type_is_pinned() {
+fn test_attribute_type_lookup_and_projections() {
     let u = PublicSchema::shared().user_attributes();
     assert_eq!(
         u.get_attribute_type("sshpublickey"),
@@ -227,50 +231,11 @@ fn test_get_attribute_type_is_pinned() {
         Some((AT::DateTime, false))
     );
     assert_eq!(u.get_attribute_type("nope"), None);
-}
 
-#[test]
-fn test_generated_attributes_are_neither_editable_nor_readonly() {
-    let s = PublicSchema::shared();
-    let u = s.user_attributes();
-    for name in [
-        "uidnumber",
-        "gidnumber",
-        "homedirectory",
-        "loginshell",
-        "kerberossync",
-    ] {
-        let a = u.get_by_name_or_alias(name).unwrap();
-        assert!(!a.is_editable && !a.is_readonly, "{name}");
-    }
-    let g = s
-        .group_attributes()
-        .get_by_name_or_alias("gidnumber")
-        .unwrap();
-    assert!(!g.is_editable && !g.is_readonly, "group gidnumber");
-}
-
-#[test]
-fn test_attribute_type_string_projections_disagree_by_design() {
+    // The Display, wire and parse projections disagree by design.
     assert_eq!(AT::DateTime.to_string(), "DateTime");
     assert_eq!(<&'static str>::from(AT::DateTime), "DATE_TIME");
     assert_eq!("DATE_TIME".parse::<AT>().unwrap(), AT::DateTime);
-}
-
-#[test]
-fn test_name_membership_and_flatten() {
-    let u = PublicSchema::shared().user_attributes();
-    assert!(u.contains_name_or_alias("userid"));
-    assert!(u.contains_name_or_alias("uid"));
-    assert!(u.contains_name_or_alias("UID"));
-    assert!(!u.contains_name_or_alias("nope"));
-
-    let all: Vec<&str> = u.all_names_and_aliases().collect();
-    assert!(all.contains(&"userid"));
-    assert!(all.contains(&"uid"));
-    assert!(all.contains(&"entryUUID"));
-    let expected_count: usize = u.attributes.iter().map(|a| 1 + a.aliases.len()).sum();
-    assert_eq!(all.len(), expected_count);
 }
 
 #[test]

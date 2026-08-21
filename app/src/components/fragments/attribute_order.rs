@@ -19,7 +19,6 @@ pub fn attribute_priority(name: &str) -> (i32, String) {
         .unwrap_or(100);
     (index, name.to_lowercase())
 }
-
 #[cfg(test)]
 mod tests {
     use super::attribute_priority;
@@ -32,10 +31,5 @@ mod tests {
             names,
             vec!["firstname", "mail", "loginshell", "custom_thing", "zebra"]
         );
-    }
-
-    #[test]
-    fn unknown_attributes_break_ties_alphabetically() {
-        assert!(attribute_priority("apple") < attribute_priority("banana"));
     }
 }

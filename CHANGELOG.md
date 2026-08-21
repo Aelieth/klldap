@@ -114,6 +114,17 @@
   `access_denied` rows (they used to be terminal-only), so a token spammer is visible in the
   table and coalesces under load.
 
+### Testing
+
+- The test suite was consolidated from 534 to 288 tests without dropping coverage:
+  upstream LLDAP's tests are untouched; KLLDAP's one-test-per-branch additions became
+  scenario and table tests whose assert names the failing row, behaviour already pinned by
+  an e2e or the SQL handler is no longer pinned again below it, 25 duplicate or
+  language-level tests went, and bindgen's 61 layout tests for the krb5 bindings are off.
+  Two upstream cases the fork had dropped are back (unsupported LDAP filters are refused; a
+  regular bind's search is narrowed to itself). `#[serial]` tests 30 → 18, server boots in
+  `server/tests` 25 → 16. See `docs/testing.md`.
+
 ## [0.7.4] unreleased
 
 Everything since 0.7.2: the LLDAP migration path, a full audit of the LDAP layer, a

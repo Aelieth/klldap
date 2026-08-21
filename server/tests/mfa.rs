@@ -287,18 +287,30 @@ fn test_mfa_disabled_keeps_plain_binds() {
     assert!(body["token"].is_string(), "{body}");
 }
 
+// Enrollment, visibility, replacement and the three resets over GraphQL: self, admin,
+// and the password-reset link (an ordinary password change keeps the factor).
 #[test]
 fn test_mfa_enrollment_over_graphql() {
-    let mut fixture = LLDAPFixture::new_with_env(&[("LLDAP_ENABLE_MFA", "true")]);
-    fixture.load_state(&vec![User::new("bob", vec![]), User::new("eve", vec![])]);
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let db_url = format!("sqlite://{}/users.db?mode=rwc", dir.path().display());
+    let server = server_with_env(
+        &db_url,
+        &[
+            ("LLDAP_ENABLE_MFA", "true"),
+            ("LLDAP_SMTP_OPTIONS__ENABLE_PASSWORD_RESET", "true"),
+        ],
+    );
     let client = client();
-    let url = fixture.http_url();
+    let url = server.http_url();
     let admin = get_token(&client, &url);
-    set_password(&client, &url, &admin, "bob", "bobpass");
-    set_password(&client, &url, &admin, "eve", "evepass");
+    for user in ["bob", "eve", "kim"] {
+        create_user(&client, &url, &admin, user);
+        set_password(&client, &url, &admin, user, &format!("{user}pass"));
+    }
     add_to_group(&client, &url, &admin, "eve", "lldap_strict_readonly");
     let bob = get_token_for(&client, &url, "bob", "bobpass");
     let eve = get_token_for(&client, &url, "eve", "evepass");
+    let kim = get_token_for(&client, &url, "kim", "kimpass");
 
     let settings = settings(&client, &url);
     assert_eq!(settings["mfa_enabled"], true, "{settings}");
@@ -350,6 +362,28 @@ fn test_mfa_enrollment_over_graphql() {
     assert_eq!(body["data"]["resetUserMfa"]["ok"], true, "{body}");
     assert_eq!(mfa_enrolled(&client, &url, &bob, "bob"), false);
 
+    // An ordinary password change is not a recovery: the factor stays. A consumed reset
+    // link then a committed new password clears it.
+    enroll(&client, &url, &kim);
+    set_password(&client, &url, &admin, "kim", "kimpass2");
+    assert_eq!(mfa_enrolled(&client, &url, &admin, "kim"), true);
+    exec_sql(
+        &db_url,
+        "INSERT INTO password_reset_tokens (token, user_id, expiry_date) VALUES ('reset-token', 'kim', '2099-01-01 00:00:00')",
+    );
+    let reset: Value = client
+        .get(format!("{url}/auth/reset/step2/reset-token"))
+        .send()
+        .expect("reset step2 send")
+        .error_for_status()
+        .expect("reset step2 status")
+        .json()
+        .expect("reset step2 json");
+    let reset_jwt = reset["token"].as_str().expect("reset jwt");
+    register_password_over_http(&client, &url, reset_jwt, "kim", "kimpass3");
+    assert_eq!(mfa_enrolled(&client, &url, &admin, "kim"), false);
+    assert_eq!(ldap_bind(&server.ldap_url(), "kim", "kimpass3").0, 0);
+
     wait_for_rows(
         &client,
         &url,
@@ -361,6 +395,8 @@ fn test_mfa_enrollment_over_graphql() {
             ("bob", "MFA_ENROLL", true, Some("totp")),
             ("bob", "MFA_RESET", true, Some("self")),
             ("admin", "MFA_RESET", true, None),
+            ("kim", "MFA_ENROLL", true, Some("totp")),
+            ("kim", "MFA_RESET", true, Some("password reset")),
         ],
     );
 }
@@ -537,53 +573,4 @@ fn test_mfa_always_gates_api_and_doors() {
 
     let body = gql(&client, &url, &admin, RESET_USER, json!({"u": admin_name}));
     assert!(has_error(&body, "Cannot reset your own MFA"), "{body}");
-}
-
-#[test]
-fn test_password_reset_clears_mfa() {
-    let dir = tempfile::TempDir::new().expect("temp dir");
-    let db_url = format!("sqlite://{}/users.db?mode=rwc", dir.path().display());
-    let server = server_with_env(
-        &db_url,
-        &[
-            ("LLDAP_ENABLE_MFA", "true"),
-            ("LLDAP_SMTP_OPTIONS__ENABLE_PASSWORD_RESET", "true"),
-        ],
-    );
-    let client = client();
-    let url = server.http_url();
-    let admin = get_token(&client, &url);
-    create_user(&client, &url, &admin, "bob");
-    set_password(&client, &url, &admin, "bob", "bobpass");
-    let bob = get_token_for(&client, &url, "bob", "bobpass");
-    enroll(&client, &url, &bob);
-
-    // An ordinary password change is not a recovery: the factor stays.
-    set_password(&client, &url, &admin, "bob", "bobpass2");
-    assert_eq!(mfa_enrolled(&client, &url, &admin, "bob"), true);
-
-    // A consumed reset link then a committed new password clears it.
-    exec_sql(
-        &db_url,
-        "INSERT INTO password_reset_tokens (token, user_id, expiry_date) VALUES ('reset-token', 'bob', '2099-01-01 00:00:00')",
-    );
-    let reset: Value = client
-        .get(format!("{url}/auth/reset/step2/reset-token"))
-        .send()
-        .expect("reset step2 send")
-        .error_for_status()
-        .expect("reset step2 status")
-        .json()
-        .expect("reset step2 json");
-    let reset_jwt = reset["token"].as_str().expect("reset jwt");
-    register_password_over_http(&client, &url, reset_jwt, "bob", "bobpass3");
-    assert_eq!(mfa_enrolled(&client, &url, &admin, "bob"), false);
-    assert_eq!(ldap_bind(&server.ldap_url(), "bob", "bobpass3").0, 0);
-    wait_for_rows(
-        &client,
-        &url,
-        &admin,
-        "MFA_RESET",
-        &[("bob", "MFA_RESET", true, Some("password reset"))],
-    );
 }

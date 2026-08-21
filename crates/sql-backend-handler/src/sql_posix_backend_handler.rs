@@ -516,7 +516,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_update_keeps_the_users_own_uidnumber() {
+    async fn test_user_uidnumber_is_unique_ranged_and_resubmittable() {
         let fixture = TestFixture::new().await;
         for _ in 0..2 {
             fixture
@@ -529,16 +529,6 @@ mod tests {
             attribute_value(&fixture, "bob", "uidnumber").await,
             AttributeValue::Integer(Cardinality::Singleton(3005))
         );
-    }
-
-    #[tokio::test]
-    async fn test_update_rejects_another_users_uidnumber() {
-        let fixture = TestFixture::new().await;
-        fixture
-            .handler
-            .update_user(set_attribute("bob", integer("uidnumber", 3005)))
-            .await
-            .unwrap();
         let err = fixture
             .handler
             .update_user(set_attribute("patrick", integer("uidnumber", 3005)))

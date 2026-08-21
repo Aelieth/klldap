@@ -190,7 +190,6 @@ pub fn make_test_avatar_value() -> crate::types::AttributeValue {
     use crate::types::{AttributeValue, Avatar, Cardinality};
     AttributeValue::Avatar(Cardinality::Singleton(Avatar(make_test_jpeg_bytes())))
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -222,68 +221,44 @@ mod tests {
     }
 
     #[test]
-    fn test_valid_512_jpeg_passes() {
-        let jpeg = make_test_jpeg(512);
-        let result = process_avatar_input(&jpeg);
-        assert!(result.is_ok());
-        let out = result.unwrap();
-        assert!(!out.is_empty());
-        assert!(out.len() < MAX_AVATAR_JPEG_SIZE);
-        assert_eq!(&out[0..2], &[0xFF, 0xD8]);
-    }
-
-    #[test]
-    fn test_png_converts_to_jpeg() {
-        let png = make_test_png(512);
-        let result = process_avatar_input(&png);
-        assert!(result.is_ok());
-        let out = result.unwrap();
-        assert_eq!(&out[0..2], &[0xFF, 0xD8]);
-    }
-
-    #[test]
-    fn test_oversized_image_rejected() {
-        let jpeg = make_test_jpeg(600); // > 512 limit
-        let err = process_avatar_input(&jpeg).unwrap_err();
-        match err {
+    fn test_process_avatar_input() {
+        let out = process_avatar_input(&make_test_jpeg(512)).unwrap();
+        assert!(
+            !out.is_empty() && out.len() < MAX_AVATAR_JPEG_SIZE,
+            "jpeg under the size cap"
+        );
+        assert_eq!(&out[0..2], &[0xFF, 0xD8], "jpeg stays jpeg");
+        let out = process_avatar_input(&make_test_png(512)).unwrap();
+        assert_eq!(&out[0..2], &[0xFF, 0xD8], "png converts to jpeg");
+        assert!(
+            process_avatar_input(&[]).unwrap().is_empty(),
+            "empty input stays empty"
+        );
+        match process_avatar_input(&make_test_jpeg(600)).unwrap_err() {
             AvatarError::WrongDimensions { width, height } => {
-                assert_eq!(width, 600);
-                assert_eq!(height, 600);
+                assert_eq!((width, height), (600, 600))
             }
-            _ => panic!("Expected WrongDimensions, got {:?}", err),
+            err => panic!("expected WrongDimensions, got {err:?}"),
         }
-    }
-
-    #[test]
-    fn test_unsupported_format_rejected() {
         let gif = vec![
             0x47, 0x49, 0x46, 0x38, 0x39, 0x61, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x21,
             0xF9, 0x04, 0x01, 0x00, 0x00, 0x00, 0x00, 0x2C, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00,
             0x01, 0x00, 0x00, 0x02, 0x02, 0x4C, 0x01, 0x00, 0x3B,
         ];
-        let err = process_avatar_input(&gif).unwrap_err();
-        assert!(matches!(err, AvatarError::UnsupportedFormat));
+        assert!(matches!(
+            process_avatar_input(&gif).unwrap_err(),
+            AvatarError::UnsupportedFormat
+        ));
     }
 
     #[test]
-    fn test_empty_input_returns_empty() {
-        let result = process_avatar_input(&[]).unwrap();
-        assert!(result.is_empty());
-    }
-
-    #[test]
-    fn test_validate_stored_accepts_jpeg_and_png() {
-        let jpeg = make_test_jpeg(512);
-        assert!(validate_stored_avatar_bytes(&jpeg).is_ok());
-
-        let png = make_test_png(512);
-        assert!(validate_stored_avatar_bytes(&png).is_ok());
-    }
-
-    #[test]
-    fn test_processed_output_is_always_valid_for_validate() {
-        let png = make_test_png(400);
-        let processed = process_avatar_input(&png).unwrap();
-        assert!(validate_stored_avatar_bytes(&processed).is_ok());
+    fn test_validate_stored_avatar_bytes() {
+        assert!(validate_stored_avatar_bytes(&make_test_jpeg(512)).is_ok());
+        assert!(validate_stored_avatar_bytes(&make_test_png(512)).is_ok());
+        let processed = process_avatar_input(&make_test_png(400)).unwrap();
+        assert!(
+            validate_stored_avatar_bytes(&processed).is_ok(),
+            "processed output always validates"
+        );
     }
 }

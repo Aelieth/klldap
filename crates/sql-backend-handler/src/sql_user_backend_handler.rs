@@ -1641,13 +1641,30 @@ mod tests {
         );
     }
 
-    // Toggling lldap_disabled fires a best-effort Kerberos enable/disable that never
-    // becomes a hard error.
+    // Directory writes drive the KDC through the seam: a reserved name is refused before
+    // any call, toggling lldap_disabled is a best-effort enable/disable, and dropping the
+    // sync flag or the user deletes the principal after the commit.
     #[tokio::test]
     #[serial]
-    async fn test_toggle_lldap_disabled_runs_kerberos_hook_cleanly() {
+    async fn test_kerberos_hooks_on_directory_writes() {
         let guard = RecordingGuard::install();
         let fixture = TestFixture::new().await;
+
+        let err = fixture
+            .handler
+            .create_user(CreateUserRequest {
+                user_id: UserId::new("krbtgt"),
+                email: "krbtgt@example.com".into(),
+                display_name: None,
+                attributes: Vec::new(),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("reserved"),
+            "expected reserved principal rejection, got: {err}"
+        );
+        assert!(guard.recorder().take_ops().is_empty());
 
         fixture
             .handler
@@ -1662,7 +1679,6 @@ mod tests {
             })
             .await
             .unwrap();
-
         let disabled_gid = fixture
             .handler
             .create_group(CreateGroupRequest {
@@ -1671,7 +1687,6 @@ mod tests {
             })
             .await
             .unwrap();
-
         fixture
             .handler
             .add_user_to_group(&UserId::new("ksync"), disabled_gid)
@@ -1692,7 +1707,6 @@ mod tests {
                 enabled: false,
             }]
         );
-
         fixture
             .handler
             .remove_user_from_group(&UserId::new("ksync"), disabled_gid)
@@ -1713,12 +1727,44 @@ mod tests {
                 enabled: true,
             }]
         );
+
+        fixture
+            .handler
+            .update_user(UpdateUserRequest {
+                user_id: UserId::new("bob"),
+                email: None,
+                display_name: None,
+                delete_attributes: Vec::new(),
+                insert_attributes: vec![Attribute {
+                    name: "kerberossync".into(),
+                    value: 0i64.into(),
+                }],
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            guard.recorder().take_ops(),
+            vec![KerberosOp::DeletePrincipal {
+                username: "bob".into(),
+            }]
+        );
+
+        fixture
+            .handler
+            .delete_user(&UserId::new("bob"))
+            .await
+            .unwrap();
+        assert_eq!(
+            guard.recorder().take_ops(),
+            vec![KerberosOp::DeletePrincipal {
+                username: "bob".into(),
+            }]
+        );
     }
 
     #[tokio::test]
-    async fn test_cannot_remove_last_member_of_lldap_admin() {
+    async fn test_last_lldap_admin_cannot_be_removed_or_deleted() {
         let fixture = TestFixture::new().await;
-
         let admin_gid = fixture
             .handler
             .create_group(CreateGroupRequest {
@@ -1727,7 +1773,6 @@ mod tests {
             })
             .await
             .unwrap();
-
         fixture
             .handler
             .add_user_to_group(&UserId::new("bob"), admin_gid)
@@ -1741,34 +1786,15 @@ mod tests {
             .unwrap_err();
         assert!(
             err.to_string().contains("last member of lldap_admin"),
-            "expected last-admin protection, got: {}",
-            err
+            "expected last-admin protection, got: {err}"
         );
-
         let still_member = fixture
             .handler
             .list_users(Some(UserRequestFilter::MemberOfId(admin_gid)), false)
             .await
             .unwrap();
         assert_eq!(still_member.len(), 1);
-    }
 
-    #[tokio::test]
-    async fn test_cannot_delete_last_lldap_admin_user() {
-        let fixture = TestFixture::new().await;
-        let admin_gid = fixture
-            .handler
-            .create_group(CreateGroupRequest {
-                display_name: "lldap_admin".into(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        fixture
-            .handler
-            .add_user_to_group(&UserId::new("bob"), admin_gid)
-            .await
-            .unwrap();
         let err = fixture
             .handler
             .delete_user(&UserId::new("bob"))
@@ -1783,25 +1809,6 @@ mod tests {
             .get_user_details(&UserId::new("bob"))
             .await
             .expect("last admin must still exist");
-    }
-
-    #[tokio::test]
-    async fn test_create_user_rejects_reserved_kerberos_name() {
-        let fixture = TestFixture::new().await;
-        let err = fixture
-            .handler
-            .create_user(CreateUserRequest {
-                user_id: UserId::new("krbtgt"),
-                email: "krbtgt@example.com".into(),
-                display_name: None,
-                attributes: Vec::new(),
-            })
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("reserved"),
-            "expected reserved principal rejection, got: {err}"
-        );
     }
 
     #[tokio::test]
@@ -1856,50 +1863,5 @@ mod tests {
             })
             .await
             .unwrap_err();
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_disable_sync_deletes_principal_after_commit() {
-        let guard = RecordingGuard::install();
-        let fixture = TestFixture::new().await;
-        fixture
-            .handler
-            .update_user(UpdateUserRequest {
-                user_id: UserId::new("bob"),
-                email: None,
-                display_name: None,
-                delete_attributes: Vec::new(),
-                insert_attributes: vec![Attribute {
-                    name: "kerberossync".into(),
-                    value: 0i64.into(),
-                }],
-            })
-            .await
-            .unwrap();
-        assert_eq!(
-            guard.recorder().take_ops(),
-            vec![KerberosOp::DeletePrincipal {
-                username: "bob".into(),
-            }]
-        );
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_delete_user_emits_delete_principal() {
-        let guard = RecordingGuard::install();
-        let fixture = TestFixture::new().await;
-        fixture
-            .handler
-            .delete_user(&UserId::new("bob"))
-            .await
-            .unwrap();
-        assert_eq!(
-            guard.recorder().take_ops(),
-            vec![KerberosOp::DeletePrincipal {
-                username: "bob".into(),
-            }]
-        );
     }
 }

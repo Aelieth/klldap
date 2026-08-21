@@ -884,7 +884,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_writer_batches_events_and_flushes_when_the_sink_is_dropped() {
+    async fn test_writer_persists_batches_and_records_a_gap_row() {
         let pool = get_initialized_db().await;
         let (sink, rx) = channel_sink(16);
         let task = tokio::spawn(run_writer(
@@ -913,6 +913,35 @@ mod tests {
         assert_eq!(stored[0].peer.as_deref(), Some("127.0.0.1"));
         assert!(stored[0].success);
         assert_eq!(stored[2].actor.as_deref(), Some("dave"));
+
+        let pool = get_initialized_db().await;
+        let (sink, rx) = channel_sink(1);
+        sink.record(event(LogKind::Login, "bob", 0));
+        sink.record(event(LogKind::Login, "carol", 0));
+        sink.record(event(LogKind::Login, "dave", 0));
+        assert_eq!(sink.dropped.load(Ordering::Relaxed), 2);
+        let task = tokio::spawn(run_writer(
+            rx,
+            pool.clone(),
+            sink.dropped.clone(),
+            LogRetention::default(),
+            WriterCoalescers {
+                bind: BindCoalescer::new(0),
+                bind_flood: FloodCoalescer::new(FloodClass::UnknownBind, FLOOD_IDLE_SECONDS),
+                denied_flood: FloodCoalescer::new(FloodClass::AccessDenied, FLOOD_IDLE_SECONDS),
+            },
+            WRITER_TICK,
+        ));
+        drop(sink);
+        task.await.unwrap();
+
+        let stored = rows(&pool).await;
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].kind, "log_gap");
+        assert!(!stored[0].success);
+        assert_eq!(stored[0].protocol, "system");
+        assert_eq!(stored[0].detail.as_deref(), Some("dropped events: 2"));
+        assert_eq!(stored[1].actor.as_deref(), Some("bob"));
     }
 
     #[tokio::test]
@@ -948,40 +977,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_writer_records_a_gap_row_when_the_queue_overflows() {
-        let pool = get_initialized_db().await;
-        let (sink, rx) = channel_sink(1);
-        sink.record(event(LogKind::Login, "bob", 0));
-        sink.record(event(LogKind::Login, "carol", 0));
-        sink.record(event(LogKind::Login, "dave", 0));
-        assert_eq!(sink.dropped.load(Ordering::Relaxed), 2);
-        let task = tokio::spawn(run_writer(
-            rx,
-            pool.clone(),
-            sink.dropped.clone(),
-            LogRetention::default(),
-            WriterCoalescers {
-                bind: BindCoalescer::new(0),
-                bind_flood: FloodCoalescer::new(FloodClass::UnknownBind, FLOOD_IDLE_SECONDS),
-                denied_flood: FloodCoalescer::new(FloodClass::AccessDenied, FLOOD_IDLE_SECONDS),
-            },
-            WRITER_TICK,
-        ));
-        drop(sink);
-        task.await.unwrap();
-
-        let stored = rows(&pool).await;
-        assert_eq!(stored.len(), 2);
-        assert_eq!(stored[0].kind, "log_gap");
-        assert!(!stored[0].success);
-        assert_eq!(stored[0].protocol, "system");
-        assert_eq!(stored[0].detail.as_deref(), Some("dropped events: 2"));
-        assert_eq!(stored[1].actor.as_deref(), Some("bob"));
-    }
-
-    #[tokio::test]
     async fn test_enforce_log_retention_by_age_then_size_keeps_the_newest() {
         let pool = get_initialized_db().await;
+        insert_rows(&pool, vec![]).await.unwrap();
+        assert!(rows(&pool).await.is_empty());
         let mut events = vec![event(LogKind::UserCreate, "old", 40)];
         events.extend((0..5).map(|i| event(LogKind::UserCreate, &format!("new{i}"), 0)));
         insert_rows(&pool, events.into_iter().map(to_active_model).collect())
@@ -1049,15 +1048,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_list_log_events_filters_pages_and_skips_unknown_kinds() {
-        use crate::sql_backend_handler::tests::get_initialized_db;
+    async fn test_list_log_events_filters_cursors_and_membership() {
+        use crate::sql_backend_handler::tests::{
+            insert_group, insert_membership, insert_user_no_password,
+        };
         use lldap_auth::opaque::server::generate_random_private_key;
 
         let pool = get_initialized_db().await;
         let handler = SqlBackendHandler::new(generate_random_private_key(), pool.clone());
+        insert_user_no_password(&handler, "bob").await;
+        insert_user_no_password(&handler, "carol").await;
+        let devs = insert_group(&handler, "Devs").await;
+        insert_membership(&handler, devs, "bob").await;
         let mut events = vec![
             event(LogKind::Bind, "bob", 3),
-            event(LogKind::Bind, "carol", 2),
+            event(LogKind::Login, "carol", 2),
             event(LogKind::UserCreate, "admin", 1),
             event(LogKind::Bind, "bob", 0),
         ];
@@ -1077,60 +1082,60 @@ mod tests {
         .exec(&pool)
         .await
         .unwrap();
+        let list = |filter: LogFilter, limit: u32, cursor: LogCursor| {
+            let handler = &handler;
+            async move {
+                handler
+                    .list_log_events(filter, limit, cursor)
+                    .await
+                    .unwrap()
+            }
+        };
+        let ids = |records: &[LogRecord]| records.iter().map(|r| r.id).collect::<Vec<_>>();
+        let actor = |name: &str| LogFilter {
+            actor: Some(UserId::new(name)),
+            ..Default::default()
+        };
 
-        let all = handler
-            .list_log_events(LogFilter::default(), 100, LogCursor::Newest)
-            .await
-            .unwrap();
         assert_eq!(
-            all.iter().map(|r| r.id).collect::<Vec<_>>(),
+            ids(&list(LogFilter::default(), 100, LogCursor::Newest).await),
             vec![4, 3, 2, 1],
             "newest first, the unknown kind skipped"
         );
-
-        let bobs = handler
-            .list_log_events(
+        assert_eq!(
+            ids(&list(
                 LogFilter {
-                    actor: Some(UserId::new("bob")),
                     kinds: vec![LogKind::Bind],
-                    ..Default::default()
+                    ..actor("bob")
                 },
                 100,
                 LogCursor::Newest,
             )
-            .await
-            .unwrap();
-        assert_eq!(bobs.iter().map(|r| r.id).collect::<Vec<_>>(), vec![4, 1]);
-
-        let older = handler
-            .list_log_events(
-                LogFilter {
-                    actor: Some(UserId::new("bob")),
-                    ..Default::default()
-                },
-                100,
-                LogCursor::Before(4),
-            )
-            .await
-            .unwrap();
-        assert_eq!(older.iter().map(|r| r.id).collect::<Vec<_>>(), vec![1]);
-
-        let failed = handler
-            .list_log_events(
-                LogFilter {
-                    success: Some(false),
-                    ..Default::default()
-                },
-                100,
-                LogCursor::Newest,
-            )
-            .await
-            .unwrap();
+            .await),
+            vec![4, 1]
+        );
+        assert_eq!(
+            ids(&list(actor("BOB"), 100, LogCursor::Newest).await),
+            vec![4, 1],
+            "actors are lowercased user ids"
+        );
+        assert_eq!(
+            ids(&list(actor("bob"), 100, LogCursor::Before(4)).await),
+            vec![1]
+        );
+        let failed = list(
+            LogFilter {
+                success: Some(false),
+                ..Default::default()
+            },
+            100,
+            LogCursor::Newest,
+        )
+        .await;
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].event.actor.as_deref(), Some("carol"));
-
-        let graphql = handler
-            .list_log_events(
+        assert_eq!(
+            ids(&list(
                 LogFilter {
                     protocol: Some(Protocol::Graphql),
                     target: Some("dave".to_owned()),
@@ -1139,13 +1144,12 @@ mod tests {
                 100,
                 LogCursor::Newest,
             )
-            .await
-            .unwrap();
-        assert_eq!(graphql.iter().map(|r| r.id).collect::<Vec<_>>(), vec![3]);
-
+            .await),
+            vec![3]
+        );
         let now = chrono::Utc::now().naive_utc();
-        let recent = handler
-            .list_log_events(
+        assert_eq!(
+            ids(&list(
                 LogFilter {
                     since: Some(now - chrono::Duration::hours(36)),
                     until: Some(now),
@@ -1154,19 +1158,71 @@ mod tests {
                 100,
                 LogCursor::Newest,
             )
-            .await
-            .unwrap();
-        assert_eq!(recent.iter().map(|r| r.id).collect::<Vec<_>>(), vec![4, 3]);
+            .await),
+            vec![4, 3]
+        );
 
         // The unknown row is skipped after the limit, so a page can come back short.
-        let newest = handler
-            .list_log_events(LogFilter::default(), 2, LogCursor::Newest)
-            .await
-            .unwrap();
+        let newest = list(LogFilter::default(), 2, LogCursor::Newest).await;
         assert_eq!(newest.len(), 1);
         assert_eq!(newest[0].id, 4);
         assert_eq!(newest[0].event.actor.as_deref(), Some("bob"));
         assert_eq!(newest[0].event.peer.as_deref(), Some("127.0.0.1"));
+
+        let auth = LogFilter {
+            kinds: vec![LogKind::Bind, LogKind::Login],
+            ..Default::default()
+        };
+        assert_eq!(
+            ids(&list(auth.clone(), 2, LogCursor::Newest).await),
+            vec![4, 2]
+        );
+        assert_eq!(ids(&list(auth, 2, LogCursor::Before(2)).await), vec![1]);
+        assert_eq!(
+            ids(&list(LogFilter::default(), 2, LogCursor::After(1)).await),
+            vec![2, 3]
+        );
+        assert_eq!(
+            ids(&list(LogFilter::default(), 2, LogCursor::After(3)).await),
+            vec![4]
+        );
+        assert_eq!(
+            ids(&list(
+                LogFilter {
+                    member_of: Some("DEVS".to_owned()),
+                    ..Default::default()
+                },
+                2,
+                LogCursor::Newest,
+            )
+            .await),
+            vec![4, 1]
+        );
+        assert_eq!(
+            ids(&list(
+                LogFilter {
+                    member_of_id: Some(devs),
+                    kinds: vec![LogKind::Login],
+                    ..Default::default()
+                },
+                2,
+                LogCursor::Newest,
+            )
+            .await),
+            Vec::<i64>::new()
+        );
+        assert_eq!(
+            ids(&list(
+                LogFilter {
+                    member_of: Some("nobody".to_owned()),
+                    ..Default::default()
+                },
+                2,
+                LogCursor::Newest,
+            )
+            .await),
+            Vec::<i64>::new()
+        );
     }
 
     fn unknown_bind(actor: &str, peer: &str, timestamp: chrono::NaiveDateTime) -> LogEvent {
@@ -1195,7 +1251,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bind_flood_emits_started_then_resolved() {
+    fn test_bind_flood_lifecycle() {
         let mut flood = FloodCoalescer::new(FloodClass::UnknownBind, FLOOD_IDLE_SECONDS);
         let base = at(1, 9, 0);
         for i in 0..12 {
@@ -1226,7 +1282,8 @@ mod tests {
                 .is_empty()
         );
 
-        // Quiet past the idle threshold: one resolved row with the totals and span.
+        // Quiet past the idle threshold resolves it with no closing event: one row with
+        // the totals and the span, stamped with the last event.
         let closed = flood.flush(base + chrono::Duration::seconds(40), false);
         assert_eq!(closed.len(), 1);
         assert_eq!(closed[0].peer.as_deref(), Some("10.0.0.1"));
@@ -1237,7 +1294,33 @@ mod tests {
         assert_eq!(closed[0].timestamp, base + chrono::Duration::seconds(11));
         assert!(
             flood
-                .flush(base + chrono::Duration::seconds(999), true)
+                .flush(base + chrono::Duration::seconds(50), false)
+                .is_empty()
+        );
+
+        // A later burst from the same source is a new incident, not a continuation.
+        let second = base + chrono::Duration::seconds(60);
+        for i in 0..10 {
+            flood.keep(&unknown_bind(&format!("b{i}"), "10.0.0.1", second));
+        }
+        let closed = flood.flush(second + chrono::Duration::seconds(30), false);
+        assert_eq!(started_rows(&closed), 1);
+        assert_eq!(
+            resolved_rows(&closed)
+                .iter()
+                .map(|r| r.detail.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["unknown-user bind flood resolved: 2 binds, 2 names, 0s"]
+        );
+
+        // Exactly FLOOD_PASS failures from a source pass 1:1 and open nothing.
+        let third = second + chrono::Duration::seconds(60);
+        for i in 0..FLOOD_PASS {
+            assert!(flood.keep(&unknown_bind(&format!("c{i}"), "10.0.0.3", third)));
+        }
+        assert!(
+            flood
+                .flush(third + chrono::Duration::seconds(999), true)
                 .is_empty()
         );
     }
@@ -1319,67 +1402,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bind_flood_resolves_on_idle_not_only_on_close() {
-        let mut flood = FloodCoalescer::new(FloodClass::UnknownBind, FLOOD_IDLE_SECONDS);
-        let base = at(1, 9, 0);
-        for i in 0..10 {
-            flood.keep(&unknown_bind(&format!("a{i}"), "10.0.0.1", base));
-        }
-        // Drain the started row; the window is still recent, so it stays open.
-        assert_eq!(
-            started_rows(&flood.flush(base + chrono::Duration::seconds(5), false)),
-            1
-        );
-        assert!(
-            flood
-                .flush(base + chrono::Duration::seconds(5), false)
-                .is_empty()
-        );
-        // Quiet past the idle threshold resolves it with no closing event.
-        let closed = flood.flush(base + chrono::Duration::seconds(25), false);
-        assert_eq!(closed.len(), 1);
-        assert_eq!(
-            closed[0].detail.as_deref(),
-            Some("unknown-user bind flood resolved: 2 binds, 2 names, 0s")
-        );
-    }
-
-    #[test]
-    fn test_bind_flood_separates_distinct_bursts() {
-        let mut flood = FloodCoalescer::new(FloodClass::UnknownBind, FLOOD_IDLE_SECONDS);
-        let first = at(1, 9, 0);
-        for i in 0..10 {
-            flood.keep(&unknown_bind(&format!("a{i}"), "10.0.0.1", first));
-        }
-        let closed = flood.flush(first + chrono::Duration::seconds(30), false);
-        assert_eq!(started_rows(&closed), 1);
-        assert_eq!(resolved_rows(&closed).len(), 1);
-        // A later burst from the same source is a new incident, not a continuation.
-        let second = first + chrono::Duration::seconds(60);
-        for i in 0..10 {
-            flood.keep(&unknown_bind(&format!("b{i}"), "10.0.0.1", second));
-        }
-        let closed = flood.flush(second + chrono::Duration::seconds(30), true);
-        assert_eq!(started_rows(&closed), 1);
-        assert_eq!(resolved_rows(&closed).len(), 1);
-    }
-
-    #[test]
-    fn test_bind_flood_under_threshold_emits_nothing() {
-        let mut flood = FloodCoalescer::new(FloodClass::UnknownBind, FLOOD_IDLE_SECONDS);
-        let base = at(1, 9, 0);
-        for i in 0..FLOOD_PASS {
-            assert!(flood.keep(&unknown_bind(&format!("a{i}"), "10.0.0.1", base)));
-        }
-        assert!(
-            flood
-                .flush(base + chrono::Duration::seconds(999), true)
-                .is_empty()
-        );
-    }
-
-    #[test]
-    fn test_bind_flood_caps_the_window_map_without_losing_counts() {
+    fn test_coalescers_cap_their_maps() {
         let mut flood = FloodCoalescer::new(FloodClass::UnknownBind, FLOOD_IDLE_SECONDS);
         let base = at(1, 9, 0);
         for i in 0..10 {
@@ -1403,12 +1426,8 @@ mod tests {
             resolved[0].detail.as_deref(),
             Some("unknown-user bind flood resolved: 2 binds, 2 names, 0s")
         );
-    }
 
-    #[test]
-    fn test_bind_flood_reports_distinct_actors_with_a_cap() {
         let mut flood = FloodCoalescer::new(FloodClass::UnknownBind, FLOOD_IDLE_SECONDS);
-        let base = at(1, 9, 0);
         for i in 0..(8 + FLOOD_ACTOR_CAP + 10) {
             flood.keep(&unknown_bind(&format!("spray-{i}"), "10.0.0.1", base));
         }
@@ -1419,6 +1438,25 @@ mod tests {
             resolved[0].detail.as_deref(),
             Some("unknown-user bind flood resolved: 74 binds, 64+ names, 0s")
         );
+
+        let mut coalescer = BindCoalescer::new(300);
+        let now = chrono::Utc::now().naive_utc();
+        for i in 0..(COALESCE_CAP + 80) {
+            let bind = LogEvent {
+                timestamp: now,
+                kind: LogKind::Bind,
+                success: true,
+                protocol: Protocol::Ldap,
+                actor: Some(format!("u{i}")),
+                target: None,
+                peer: Some("127.0.0.1".to_owned()),
+                forwarded_for: None,
+                detail: None,
+            };
+            assert!(coalescer.keep(&bind));
+        }
+        assert!(coalescer.cached() <= COALESCE_CAP);
+        assert!(coalescer.cached() > 0);
     }
 
     fn denial(actor: Option<&str>, peer: &str, timestamp: chrono::NaiveDateTime) -> LogEvent {
@@ -1429,31 +1467,6 @@ mod tests {
             actor: actor.map(str::to_owned),
             ..event_at(LogKind::AccessDenied, actor.unwrap_or("nobody"), timestamp)
         }
-    }
-
-    #[test]
-    fn test_flood_classify_routes_kinds() {
-        let base = at(1, 9, 0);
-        assert_eq!(
-            FloodClass::classify(&unknown_bind("x", "10.0.0.1", base)),
-            Some(FloodClass::UnknownBind)
-        );
-        assert_eq!(
-            FloodClass::classify(&denial(Some("bob"), "10.0.0.1", base)),
-            Some(FloodClass::AccessDenied)
-        );
-        // A wrong-password bind, a success, and a login are not flood input.
-        let wrong = LogEvent {
-            detail: Some("invalid credentials".to_owned()),
-            ..unknown_bind("bob", "10.0.0.1", base)
-        };
-        assert_eq!(FloodClass::classify(&wrong), None);
-        let ok = LogEvent {
-            success: true,
-            detail: None,
-            ..unknown_bind("bob", "10.0.0.1", base)
-        };
-        assert_eq!(FloodClass::classify(&ok), None);
     }
 
     #[test]
@@ -1487,21 +1500,16 @@ mod tests {
             closed[0].detail.as_deref(),
             Some("access-denied flood resolved: 4 denials, 4 actors, 11s")
         );
-    }
 
-    #[test]
-    fn test_access_denied_flood_counts_anonymous_as_one_actor() {
-        let mut flood = FloodCoalescer::new(FloodClass::AccessDenied, FLOOD_IDLE_SECONDS);
-        let base = at(1, 9, 0);
-        // A junk-JWT flood: recorded denials with no actor.
+        // A junk-JWT flood: recorded denials with no actor count as one actor.
         for i in 0..20 {
             flood.keep(&denial(
                 None,
                 "10.0.0.8",
-                base + chrono::Duration::seconds(i),
+                base + chrono::Duration::seconds(50 + i),
             ));
         }
-        let rows = flood.flush(base + chrono::Duration::seconds(60), true);
+        let rows = flood.flush(base + chrono::Duration::seconds(120), true);
         let resolved: Vec<_> = rows
             .iter()
             .filter(|r| {
@@ -1548,7 +1556,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_writer_flushes_bind_flood_rows_on_shutdown() {
+    async fn test_writer_brackets_a_flood_on_shutdown_and_on_idle() {
         let pool = get_initialized_db().await;
         let (sink, rx) = channel_sink(64);
         let task = tokio::spawn(run_writer(
@@ -1595,10 +1603,7 @@ mod tests {
             resolved[0].detail.as_deref(),
             Some("unknown-user bind flood resolved: 4 binds, 4 names, 0s")
         );
-    }
 
-    #[tokio::test]
-    async fn test_writer_resolves_idle_flood_without_a_closing_event() {
         let pool = get_initialized_db().await;
         let (sink, rx) = channel_sink(64);
         let task = tokio::spawn(run_writer(
@@ -1694,13 +1699,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_insert_rows_accepts_an_empty_batch() {
-        let pool = get_initialized_db().await;
-        insert_rows(&pool, vec![]).await.unwrap();
-        assert!(rows(&pool).await.is_empty());
-    }
-
-    #[tokio::test]
     #[serial_test::serial]
     async fn test_start_log_writer_installs_the_sink_and_shutdown_flushes() {
         let pool = get_initialized_db().await;
@@ -1761,96 +1759,6 @@ mod tests {
         assert!(stored.iter().all(|r| r.kind == "bind"));
     }
 
-    #[tokio::test]
-    async fn test_list_log_events_kinds_member_of_and_after_cursor() {
-        use crate::sql_backend_handler::tests::{
-            insert_group, insert_membership, insert_user_no_password,
-        };
-        use lldap_auth::opaque::server::generate_random_private_key;
-
-        let pool = get_initialized_db().await;
-        let handler = SqlBackendHandler::new(generate_random_private_key(), pool.clone());
-        insert_user_no_password(&handler, "bob").await;
-        insert_user_no_password(&handler, "carol").await;
-        let devs = insert_group(&handler, "Devs").await;
-        insert_membership(&handler, devs, "bob").await;
-        let events = vec![
-            event(LogKind::Bind, "bob", 3),
-            event(LogKind::Login, "carol", 2),
-            event(LogKind::UserCreate, "admin", 1),
-            event(LogKind::Bind, "bob", 0),
-        ];
-        insert_rows(&pool, events.into_iter().map(to_active_model).collect())
-            .await
-            .unwrap();
-        let ids = |records: Vec<LogRecord>| records.iter().map(|r| r.id).collect::<Vec<_>>();
-        let list = |filter: LogFilter, cursor: LogCursor| {
-            let handler = &handler;
-            async move { ids(handler.list_log_events(filter, 2, cursor).await.unwrap()) }
-        };
-
-        let auth = LogFilter {
-            kinds: vec![LogKind::Bind, LogKind::Login],
-            ..Default::default()
-        };
-        assert_eq!(list(auth.clone(), LogCursor::Newest).await, vec![4, 2]);
-        assert_eq!(list(auth, LogCursor::Before(2)).await, vec![1]);
-        assert_eq!(
-            list(LogFilter::default(), LogCursor::After(1)).await,
-            vec![2, 3]
-        );
-        assert_eq!(
-            list(LogFilter::default(), LogCursor::After(3)).await,
-            vec![4]
-        );
-        assert_eq!(
-            list(
-                LogFilter {
-                    actor: Some(UserId::new("BOB")),
-                    ..Default::default()
-                },
-                LogCursor::Newest,
-            )
-            .await,
-            vec![4, 1],
-            "actors are lowercased user ids"
-        );
-        assert_eq!(
-            list(
-                LogFilter {
-                    member_of: Some("DEVS".to_owned()),
-                    ..Default::default()
-                },
-                LogCursor::Newest,
-            )
-            .await,
-            vec![4, 1]
-        );
-        assert_eq!(
-            list(
-                LogFilter {
-                    member_of_id: Some(devs),
-                    kinds: vec![LogKind::Login],
-                    ..Default::default()
-                },
-                LogCursor::Newest,
-            )
-            .await,
-            Vec::<i64>::new()
-        );
-        assert_eq!(
-            list(
-                LogFilter {
-                    member_of: Some("nobody".to_owned()),
-                    ..Default::default()
-                },
-                LogCursor::Newest,
-            )
-            .await,
-            Vec::<i64>::new()
-        );
-    }
-
     async fn insert_summary_fixture(pool: &DbConnection) {
         let mut events = vec![
             event_at(LogKind::Bind, "bob", at(1, 9, 0)),
@@ -1881,7 +1789,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_summarize_log_events_buckets_orders_and_limits() {
+    async fn test_summarize_log_events_buckets_periods_orders_and_limits() {
         use lldap_auth::opaque::server::generate_random_private_key;
 
         let pool = get_initialized_db().await;
@@ -2008,20 +1916,7 @@ mod tests {
         assert_eq!(failed_binds.len(), 1);
         assert_eq!(failed_binds[0].actor.as_deref(), Some("carol"));
         assert_eq!(failed_binds[0].count, 2);
-    }
-
-    #[tokio::test]
-    async fn test_summarize_log_events_by_day_and_hour_on_sqlite() {
-        use lldap_auth::opaque::server::generate_random_private_key;
-
-        let pool = get_initialized_db().await;
-        let handler = SqlBackendHandler::new(generate_random_private_key(), pool.clone());
-        insert_summary_fixture(&pool).await;
-
-        let by_day = handler
-            .summarize_log_events(LogFilter::default(), vec![LogDimension::Day], 100)
-            .await
-            .unwrap();
+        let by_day = summarize(LogFilter::default(), vec![LogDimension::Day], 100).await;
         assert_eq!(
             by_day
                 .iter()
@@ -2034,11 +1929,7 @@ mod tests {
             ]
         );
         assert_eq!(by_day[0].hour, None);
-
-        let by_hour = handler
-            .summarize_log_events(LogFilter::default(), vec![LogDimension::Hour], 100)
-            .await
-            .unwrap();
+        let by_hour = summarize(LogFilter::default(), vec![LogDimension::Hour], 100).await;
         assert_eq!(
             by_hour
                 .iter()
@@ -2046,15 +1937,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(Some(12), 4), (Some(23), 1), (Some(8), 1), (Some(9), 1)]
         );
-
-        let timeline = handler
-            .summarize_log_events(
-                LogFilter::default(),
-                vec![LogDimension::Day, LogDimension::Hour],
-                100,
-            )
-            .await
-            .unwrap();
+        let timeline = summarize(
+            LogFilter::default(),
+            vec![LogDimension::Day, LogDimension::Hour],
+            100,
+        )
+        .await;
         assert_eq!(
             timeline
                 .iter()
@@ -2069,18 +1957,15 @@ mod tests {
                 ("2024-05-01", 9, 1),
             ]
         );
-
-        let bob_days = handler
-            .summarize_log_events(
-                LogFilter {
-                    actor: Some(UserId::new("bob")),
-                    ..Default::default()
-                },
-                vec![LogDimension::Actor, LogDimension::Day],
-                100,
-            )
-            .await
-            .unwrap();
+        let bob_days = summarize(
+            LogFilter {
+                actor: Some(UserId::new("bob")),
+                ..Default::default()
+            },
+            vec![LogDimension::Actor, LogDimension::Day],
+            100,
+        )
+        .await;
         assert_eq!(
             bob_days
                 .iter()
@@ -2195,28 +2080,6 @@ mod tests {
                 statement.sql
             );
         }
-    }
-
-    #[test]
-    fn test_bind_coalescer_caps_the_map() {
-        let mut coalescer = BindCoalescer::new(300);
-        let now = chrono::Utc::now().naive_utc();
-        for i in 0..(COALESCE_CAP + 80) {
-            let event = LogEvent {
-                timestamp: now,
-                kind: LogKind::Bind,
-                success: true,
-                protocol: Protocol::Ldap,
-                actor: Some(format!("u{i}")),
-                target: None,
-                peer: Some("127.0.0.1".to_owned()),
-                forwarded_for: None,
-                detail: None,
-            };
-            assert!(coalescer.keep(&event));
-        }
-        assert!(coalescer.cached() <= COALESCE_CAP);
-        assert!(coalescer.cached() > 0);
     }
 
     #[tokio::test]

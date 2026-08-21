@@ -105,51 +105,19 @@ fn admin_search() {
     ldap.unbind().expect("failed to unbind");
 }
 
+// One server, one bind, five steps over the wire: a subtree search based at a leaf, OU
+// entries that respect the filter, a cn substring that matches display_name, the
+// cn/displayName/gecos emission, and RFC 2307 group membership.
 #[test]
-fn test_nested_ou_test() {
+fn test_ldap_search_surface() {
     let mut fixture = LLDAPFixture::new();
-    let prefix = "nested-ou-test-";
+    let prefix = "ldap-search-surface-";
     let user_name = new_id(Some(prefix));
     let group_name = new_id(Some(prefix));
-
-    let initial_state = vec![User::new(&user_name, vec![&group_name])];
-    fixture.load_state(&initial_state);
-
-    let mut ldap = LdapConn::new(&fixture.ldap_url()).expect("failed to create ldap connection");
-
-    let base_dn = env::base_dn();
-    let bind_dn = format!("uid={},ou=people,{}", env::admin_dn(), base_dn);
-    ldap.simple_bind(&bind_dn, env::admin_password().as_str())
-        .expect("failed to bind to ldap");
-
-    // A search from the root finds the user even under nested OUs.
-    let search_result = ldap
-        .search(
-            &base_dn,
-            Scope::Subtree,
-            "(objectclass=person)",
-            vec!["uid", "hasSubordinates"],
-        )
-        .expect("failed to search");
-
-    let users = parse_ldap_users(search_result);
-
-    assert!(
-        users.contains_key(&user_name),
-        "user not found under nested OU structure"
-    );
-
-    ldap.unbind().expect("failed to unbind");
-}
-
-#[test]
-fn test_subtree_search_at_leaf_returns_entry() {
-    // RFC 4511 §4.5.1.2: wholeSubtree includes the base entry, so a subtree search
-    // based at a user's own DN must return that user, not zero entries.
-    let mut fixture = LLDAPFixture::new();
-    let prefix = "ldap-subtree-leaf-";
-    let user_name = new_id(Some(prefix));
-    fixture.load_state(&vec![User::new(&user_name, vec![])]);
+    let display = "Shaia Aelieth Meow";
+    fixture.load_state(&vec![
+        User::new(&user_name, vec![&group_name]).with_display_name(display),
+    ]);
 
     let mut ldap = LdapConn::new(&fixture.ldap_url()).expect("failed to create ldap connection");
     let base_dn = env::base_dn();
@@ -157,38 +125,26 @@ fn test_subtree_search_at_leaf_returns_entry() {
     ldap.simple_bind(&bind_dn, env::admin_password().as_str())
         .expect("failed to bind to ldap");
 
+    // RFC 4511 4.5.1.2: wholeSubtree includes the base entry, so a subtree search based at
+    // a user's own DN must return that user, not zero entries.
     let user_dn = format!("uid={},ou=people,{}", user_name, base_dn);
-    let search_result = ldap
-        .search(
+    let found = parse_ldap_users(
+        ldap.search(
             &user_dn,
             Scope::Subtree,
             "(objectclass=person)",
             vec!["uid"],
         )
-        .expect("failed to search at leaf");
-
-    let found = parse_ldap_users(search_result);
+        .expect("failed to search at leaf"),
+    );
     assert!(
         found.contains_key(&user_name),
         "subtree search at leaf DN {} returned no entry (bug #4)",
         user_dn
     );
 
-    ldap.unbind().expect("failed to unbind");
-}
-
-#[test]
-fn test_ou_entries_respect_filter() {
     // A filter an OU cannot satisfy (a cn substring) must not return phantom OU entries,
     // while an objectClass filter that does match still returns them.
-    let fixture = LLDAPFixture::new();
-
-    let mut ldap = LdapConn::new(&fixture.ldap_url()).expect("failed to create ldap connection");
-    let base_dn = env::base_dn();
-    let bind_dn = format!("uid={},ou=people,{}", env::admin_dn(), base_dn);
-    ldap.simple_bind(&bind_dn, env::admin_password().as_str())
-        .expect("failed to bind to ldap");
-
     let phantom = ldap
         .search(
             &base_dn,
@@ -202,8 +158,6 @@ fn test_ou_entries_respect_filter() {
         0,
         "cn substring returned phantom OU entries (bug #3)"
     );
-
-    // Positive control: the OUs are still discoverable by objectClass.
     let real = ldap
         .search(
             &base_dn,
@@ -217,25 +171,7 @@ fn test_ou_entries_respect_filter() {
         "objectClass=organizationalUnit should still return OU entries"
     );
 
-    ldap.unbind().expect("failed to unbind");
-}
-
-#[test]
-fn test_cn_substring_matches_display_name() {
     // uid is random and does not contain the substring, so a match is via display_name.
-    let mut fixture = LLDAPFixture::new();
-    let prefix = "ldap-cn-substr-";
-    let user_name = new_id(Some(prefix));
-    fixture.load_state(&vec![
-        User::new(&user_name, vec![]).with_display_name("Shaia Aelieth Meow"),
-    ]);
-
-    let mut ldap = LdapConn::new(&fixture.ldap_url()).expect("failed to create ldap connection");
-    let base_dn = env::base_dn();
-    let bind_dn = format!("uid={},ou=people,{}", env::admin_dn(), base_dn);
-    ldap.simple_bind(&bind_dn, env::admin_password().as_str())
-        .expect("failed to bind to ldap");
-
     let found = parse_ldap_users(
         ldap.search(
             &base_dn,
@@ -250,29 +186,9 @@ fn test_cn_substring_matches_display_name() {
         "cn substring did not match the user's display_name (bug #5)"
     );
 
-    ldap.unbind().expect("failed to unbind");
-}
-
-#[test]
-fn test_display_name_emitted_for_cn_and_display_name() {
-    // A wildcard search returns both cn and displayName (same value); an explicit displayName
-    // request returns displayName over the wire.
-    let mut fixture = LLDAPFixture::new();
-    let prefix = "ldap-displayname-";
-    let user_name = new_id(Some(prefix));
-    let display = "Ninameow Aelieth";
-    fixture.load_state(&vec![
-        User::new(&user_name, vec![]).with_display_name(display),
-    ]);
-
-    let mut ldap = LdapConn::new(&fixture.ldap_url()).expect("failed to create ldap connection");
-    let base_dn = env::base_dn();
-    let bind_dn = format!("uid={},ou=people,{}", env::admin_dn(), base_dn);
-    ldap.simple_bind(&bind_dn, env::admin_password().as_str())
-        .expect("failed to bind to ldap");
-
+    // A wildcard search returns cn, displayName and gecos (same value); an explicit
+    // displayName request returns displayName over the wire.
     let filter = format!("(uid={})", user_name);
-
     let star = attrs_for_user(
         ldap.search(&base_dn, Scope::Subtree, &filter, vec!["*"])
             .expect("search failed"),
@@ -289,7 +205,6 @@ fn test_display_name_emitted_for_cn_and_display_name() {
         Some(display),
         "gecos on *"
     );
-
     let explicit = attrs_for_user(
         ldap.search(&base_dn, Scope::Subtree, &filter, vec!["displayName"])
             .expect("search failed"),
@@ -301,43 +216,10 @@ fn test_display_name_emitted_for_cn_and_display_name() {
         "explicit displayName"
     );
 
-    ldap.unbind().expect("failed to unbind");
-}
-
-/// First value of each attribute (lowercased atype) for the entry whose DN carries `uid=<uid>`.
-fn attrs_for_user(results: SearchResult, uid: &str) -> HashMap<String, String> {
-    let needle = format!("uid={}", uid).to_ascii_lowercase();
-    for entry in results.success().expect("search failed").0 {
-        let parsed = SearchEntry::construct(entry);
-        if parsed.dn.to_ascii_lowercase().contains(&needle) {
-            return parsed
-                .attrs
-                .iter()
-                .filter_map(|(k, v)| v.first().map(|val| (k.to_ascii_lowercase(), val.clone())))
-                .collect();
-        }
-    }
-    HashMap::new()
-}
-
-#[test]
-fn test_member_uid_lists_group_members() {
-    // memberUid (RFC 2307 posixGroup): a wildcard group search exposes member login names, and
-    // (memberUid=<user>) resolves the user's groups: the SSSD default rfc2307 membership path.
-    let mut fixture = LLDAPFixture::new();
-    let prefix = "ldap-memberuid-";
-    let user_name = new_id(Some(prefix));
-    let group_name = new_id(Some(prefix));
-    fixture.load_state(&vec![User::new(&user_name, vec![&group_name])]);
-
-    let mut ldap = LdapConn::new(&fixture.ldap_url()).expect("failed to create ldap connection");
-    let base_dn = env::base_dn();
-    let bind_dn = format!("uid={},ou=people,{}", env::admin_dn(), base_dn);
-    ldap.simple_bind(&bind_dn, env::admin_password().as_str())
-        .expect("failed to bind to ldap");
-
+    // memberUid (RFC 2307 posixGroup): a wildcard group search exposes member login names,
+    // member/uniqueMember (DNs) ride along (groupOf(Unique)Names MUST), and
+    // (memberUid=<user>) resolves the user's groups: the SSSD default rfc2307 path.
     let group_needle = format!("cn={}", group_name);
-
     let group_attrs = attrs_multi_for_dn(
         ldap.search(
             &base_dn,
@@ -357,8 +239,6 @@ fn test_member_uid_lists_group_members() {
         user_name,
         group_attrs.get("memberuid")
     );
-
-    // member/uniqueMember (DNs) also ride the wildcard fetch (RFC groupOf(Unique)Names MUST).
     let user_dn_frag = format!("uid={}", user_name);
     assert!(
         group_attrs
@@ -375,7 +255,6 @@ fn test_member_uid_lists_group_members() {
         group_attrs.contains_key("uniquemember"),
         "uniqueMember missing on wildcard group fetch"
     );
-
     let found = attrs_multi_for_dn(
         ldap.search(
             &base_dn,
@@ -394,6 +273,22 @@ fn test_member_uid_lists_group_members() {
     );
 
     ldap.unbind().expect("failed to unbind");
+}
+
+/// First value of each attribute (lowercased atype) for the entry whose DN carries `uid=<uid>`.
+fn attrs_for_user(results: SearchResult, uid: &str) -> HashMap<String, String> {
+    let needle = format!("uid={}", uid).to_ascii_lowercase();
+    for entry in results.success().expect("search failed").0 {
+        let parsed = SearchEntry::construct(entry);
+        if parsed.dn.to_ascii_lowercase().contains(&needle) {
+            return parsed
+                .attrs
+                .iter()
+                .filter_map(|(k, v)| v.first().map(|val| (k.to_ascii_lowercase(), val.clone())))
+                .collect();
+        }
+    }
+    HashMap::new()
 }
 
 /// All values of each attribute (lowercased atype) for the entry whose DN contains `dn_needle`.

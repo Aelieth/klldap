@@ -157,7 +157,6 @@ pub fn decode_attribute(
         ))),
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -225,7 +224,7 @@ mod tests {
     }
 
     #[test]
-    fn test_datetime_decode_tolerates_legacy_forms() {
+    fn test_decode_tolerates_legacy_and_empty_forms() {
         let expected = dt("2024-05-01T12:00:00");
         let epoch = Serialized(b"1714564800".to_vec());
         assert_eq!(
@@ -264,35 +263,38 @@ mod tests {
             .and_hms_opt(0, 0, 0)
             .unwrap();
         assert_eq!(chrono::NaiveDateTime::default(), default);
-    }
 
-    #[test]
-    fn test_empty_bytes_decode_to_empty_lists() {
         let empty = Serialized(vec![]);
-        assert_eq!(
-            decode_attribute_value(&empty, AttributeType::String, true),
-            AttributeValue::String(Cardinality::Unbounded(vec![]))
-        );
-        assert_eq!(
-            decode_attribute_value(&empty, AttributeType::Integer, true),
-            AttributeValue::Integer(Cardinality::Unbounded(vec![]))
-        );
-        assert_eq!(
-            decode_attribute_value(&empty, AttributeType::Avatar, true),
-            AttributeValue::Avatar(Cardinality::Unbounded(vec![]))
-        );
-        assert_eq!(
-            decode_attribute_value(&empty, AttributeType::DateTime, true),
-            AttributeValue::DateTime(Cardinality::Unbounded(vec![]))
-        );
-    }
-
-    #[test]
-    fn test_integer_list_tolerates_legacy_single_ascii() {
+        for (typ, expected) in [
+            (
+                AttributeType::String,
+                AttributeValue::String(Cardinality::Unbounded(vec![])),
+            ),
+            (
+                AttributeType::Integer,
+                AttributeValue::Integer(Cardinality::Unbounded(vec![])),
+            ),
+            (
+                AttributeType::Avatar,
+                AttributeValue::Avatar(Cardinality::Unbounded(vec![])),
+            ),
+            (
+                AttributeType::DateTime,
+                AttributeValue::DateTime(Cardinality::Unbounded(vec![])),
+            ),
+        ] {
+            let label = format!("empty {typ:?} list");
+            assert_eq!(
+                decode_attribute_value(&empty, typ, true),
+                expected,
+                "{label}"
+            );
+        }
         let legacy = Serialized(b"42".to_vec());
         assert_eq!(
             decode_attribute_value(&legacy, AttributeType::Integer, true),
-            AttributeValue::Integer(Cardinality::Unbounded(vec![42]))
+            AttributeValue::Integer(Cardinality::Unbounded(vec![42])),
+            "a legacy single ascii integer reads as a one-element list"
         );
     }
 }

@@ -299,7 +299,6 @@ impl<Handler: BackendHandler> AttributeValue<Handler> {
         all
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hardcoded_user_values_resolve_canonical_only() {
+    fn test_hardcoded_values_resolve_canonical_only() {
         let user = DomainUser {
             user_id: UserId::new("bob"),
             email: "bob@example.com".into(),
@@ -335,20 +334,23 @@ mod tests {
         ] {
             assert!(
                 get_hardcoded_user_value(&user, name).is_some(),
-                "canonical {name}"
+                "user canonical {name}"
             );
         }
-        for alias in ["uid", "user_id", "creation_date", "display_name", "cn"] {
+        for alias in [
+            "uid",
+            "user_id",
+            "creation_date",
+            "display_name",
+            "cn",
+            "nope",
+        ] {
             assert!(
                 get_hardcoded_user_value(&user, alias).is_none(),
-                "alias {alias}"
+                "user alias {alias}"
             );
         }
-        assert!(get_hardcoded_user_value(&user, "nope").is_none());
-    }
 
-    #[test]
-    fn test_hardcoded_group_values_resolve_canonical_only() {
         let group = DomainGroup {
             id: GroupId(1),
             display_name: "group".into(),
@@ -358,25 +360,6 @@ mod tests {
             attributes: vec![],
             modified_date: ts(),
         };
-        for name in [
-            "groupid",
-            "creationdate",
-            "modifieddate",
-            "uuid",
-            "displayname",
-        ] {
-            assert!(
-                get_hardcoded_group_value(&group, name).is_some(),
-                "canonical {name}"
-            );
-        }
-        for alias in ["creation_date", "display_name", "cn"] {
-            assert!(
-                get_hardcoded_group_value(&group, alias).is_none(),
-                "alias {alias}"
-            );
-        }
-
         let details = GroupDetails {
             group_id: GroupId(1),
             display_name: "group".into(),
@@ -393,10 +376,23 @@ mod tests {
             "displayname",
         ] {
             assert!(
+                get_hardcoded_group_value(&group, name).is_some(),
+                "group canonical {name}"
+            );
+            assert!(
                 get_hardcoded_group_details_value(&details, name).is_some(),
-                "canonical {name}"
+                "group details canonical {name}"
             );
         }
-        assert!(get_hardcoded_group_details_value(&details, "display_name").is_none());
+        for alias in ["creation_date", "display_name", "cn"] {
+            assert!(
+                get_hardcoded_group_value(&group, alias).is_none(),
+                "group alias {alias}"
+            );
+            assert!(
+                get_hardcoded_group_details_value(&details, alias).is_none(),
+                "group details alias {alias}"
+            );
+        }
     }
 }

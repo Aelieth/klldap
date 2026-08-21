@@ -299,64 +299,28 @@ pub fn make_ldap_subschema_entry(schema_manager: &SchemaManager, base_dn_str: &s
 mod tests {
     use super::*;
     use crate::schema::SchemaManager;
-    use pretty_assertions::assert_eq; // or wherever the real one lives
+    use pretty_assertions::assert_eq;
 
     #[test]
-    fn test_make_ldap_subschema_entry_basic_structure() {
-        let schema = SchemaManager::default();
-        let op = make_ldap_subschema_entry(&schema, "dc=example,dc=com");
-        if let LdapOp::SearchResultEntry(entry) = op {
-            assert_eq!(entry.dn, "cn=Subschema,dc=example,dc=com");
-            assert!(entry.attributes.iter().any(|a| a.atype == "attributeTypes"));
-            assert!(entry.attributes.iter().any(|a| a.atype == "objectClasses"));
-            let attr_types = entry
-                .attributes
-                .iter()
-                .find(|a| a.atype == "attributeTypes")
-                .unwrap();
-            assert!(!attr_types.vals.is_empty());
-
-            let attr_types_blob: String = attr_types
-                .vals
-                .iter()
-                .map(|v| String::from_utf8_lossy(v).to_string())
-                .collect::<Vec<_>>()
-                .join(" ");
-            assert!(
-                attr_types_blob.contains("1.3.6.1.4.1.15953.9.1.2")
-                    && (attr_types_blob.contains("'sudoHost'")
-                        || attr_types_blob.contains("sudoHost")),
-                "sudoHost (sudoers schema) attributeType missing from subschema"
-            );
-            assert!(
-                attr_types_blob.contains("2.16.840.1.113719.1.1.4.1.7")
-                    && (attr_types_blob.contains("'loginDisabled'")
-                        || attr_types_blob.contains("loginDisabled")),
-                "loginDisabled (NDS/eDirectory/SSSD) attributeType missing from subschema"
-            );
-            assert!(
-                attr_types_blob.contains("1.3.6.1.1.1.1.12")
-                    && attr_types_blob.contains("memberUid"),
-                "memberUid (RFC2307 posixGroup) attributeType missing from subschema"
-            );
-            assert!(
-                attr_types_blob.contains("1.3.6.1.1.1.1.2") && attr_types_blob.contains("'gecos'"),
-                "gecos (RFC2307 posixAccount) attributeType missing from subschema"
-            );
-        } else {
-            panic!("expected SearchResultEntry");
-        }
-    }
-
-    #[test]
-    fn test_op_entries_match_the_operational_source() {
-        // The blobs' bytes are pinned by operational.rs; this asserts the subschema emits them.
+    fn test_subschema_entry_publishes_the_schema() {
         let schema = SchemaManager::default();
         let LdapOp::SearchResultEntry(entry) =
             make_ldap_subschema_entry(&schema, "dc=example,dc=com")
         else {
             panic!("expected SearchResultEntry");
         };
+        assert_eq!(entry.dn, "cn=Subschema,dc=example,dc=com");
+        let names: Vec<&str> = entry.attributes.iter().map(|a| a.atype.as_str()).collect();
+        for name in [
+            "attributeTypes",
+            "objectClasses",
+            "createTimestamp",
+            "modifyTimestamp",
+        ] {
+            assert!(names.contains(&name), "{name}");
+        }
+
+        // The blobs' bytes are pinned by operational.rs; the subschema must emit them all.
         let blobs: HashSet<String> = entry
             .attributes
             .iter()
@@ -372,8 +336,17 @@ mod tests {
                 assert!(blobs.contains(&expected), "missing op_entry: {expected}");
             }
         }
-        let names: Vec<&str> = entry.attributes.iter().map(|a| a.atype.as_str()).collect();
-        assert!(names.contains(&"createTimestamp"));
-        assert!(names.contains(&"modifyTimestamp"));
+        let joined = blobs.iter().cloned().collect::<Vec<_>>().join(" ");
+        for (oid, name) in [
+            ("1.3.6.1.4.1.15953.9.1.2", "sudoHost"),
+            ("2.16.840.1.113719.1.1.4.1.7", "loginDisabled"),
+            ("1.3.6.1.1.1.1.12", "memberUid"),
+            ("1.3.6.1.1.1.1.2", "'gecos'"),
+        ] {
+            assert!(
+                joined.contains(oid) && joined.contains(name),
+                "{name} attributeType missing from subschema"
+            );
+        }
     }
 }

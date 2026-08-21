@@ -486,7 +486,6 @@ fn best_effort_repair_or_standardize(
     }
     Some(result)
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,38 +496,37 @@ mod tests {
     static TEST_DIR_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
-    fn test_plan_admin_keytab_healthy_restart_is_noop() {
-        assert_eq!(plan_admin_keytab(true, false), KeytabAction::UpToDate);
-    }
-
-    #[test]
-    fn test_plan_admin_keytab_missing_with_existing_db_regenerates() {
-        assert_eq!(
-            plan_admin_keytab(false, false),
-            KeytabAction::Regenerate {
-                create_principal: false
-            }
-        );
-    }
-
-    #[test]
-    fn test_plan_admin_keytab_first_run_creates_principal() {
-        assert_eq!(
-            plan_admin_keytab(false, true),
-            KeytabAction::Regenerate {
-                create_principal: true
-            }
-        );
-    }
-
-    #[test]
-    fn test_plan_admin_keytab_fresh_db_overwrites_stale_keytab() {
-        assert_eq!(
-            plan_admin_keytab(true, true),
-            KeytabAction::Regenerate {
-                create_principal: true
-            }
-        );
+    fn test_plan_admin_keytab() {
+        for (keytab_exists, fresh_db, expected) in [
+            (true, false, KeytabAction::UpToDate),
+            (
+                false,
+                false,
+                KeytabAction::Regenerate {
+                    create_principal: false,
+                },
+            ),
+            (
+                false,
+                true,
+                KeytabAction::Regenerate {
+                    create_principal: true,
+                },
+            ),
+            (
+                true,
+                true,
+                KeytabAction::Regenerate {
+                    create_principal: true,
+                },
+            ),
+        ] {
+            assert_eq!(
+                plan_admin_keytab(keytab_exists, fresh_db),
+                expected,
+                "keytab_exists={keytab_exists} fresh_db={fresh_db}"
+            );
+        }
     }
 
     fn with_temp_acl_setup<F>(f: F)
@@ -560,108 +558,94 @@ mod tests {
     }
 
     #[test]
-    fn test_has_sufficient_admin_entry() {
+    fn test_acl_predicates() {
         let admin = "admin/admin@TEST.EXAMPLE";
-        let good = format!("{}    *", admin);
-        let weak = format!("{}    l", admin);
+        let good = format!("{admin}    *");
         let other = "service/HTTP@TEST.EXAMPLE    x";
-        assert!(has_sufficient_admin_entry(&good, admin));
-        assert!(has_sufficient_admin_entry(
-            &format!("# comment\n{}", good),
-            admin
-        ));
-        assert!(has_sufficient_admin_entry(
-            &format!("{}\n{}", other, good),
-            admin
-        ));
-        assert!(!has_sufficient_admin_entry(&weak, admin));
-        assert!(!has_sufficient_admin_entry(other, admin));
-        assert!(!has_sufficient_admin_entry("", admin));
-        assert!(!has_sufficient_admin_entry("# only comments here", admin));
+        for (acl, sufficient) in [
+            (good.clone(), true),
+            (format!("# comment\n{good}"), true),
+            (format!("{other}\n{good}"), true),
+            (format!("{admin}    l"), false),
+            (other.to_owned(), false),
+            (String::new(), false),
+            ("# only comments here".to_owned(), false),
+        ] {
+            assert_eq!(
+                has_sufficient_admin_entry(&acl, admin),
+                sufficient,
+                "{acl:?}"
+            );
+        }
+        for (acl, valid) in [
+            ("admin/admin@TEST.EXAMPLE    *", true),
+            (
+                "# comments allowed\nservice/HTTP@TEST.EXAMPLE    x\nadmin/admin@TEST.EXAMPLE    *",
+                true,
+            ),
+            ("foo/bar@REALM    a", true),
+            ("", false),
+            ("# only comments and blank lines\n\n", false),
+            ("this line has no second token", false),
+            (
+                "!!!garbage!!!\njust one token\nno at sign or slash here at all",
+                false,
+            ),
+        ] {
+            assert_eq!(acl_structure_looks_valid(acl), valid, "{acl:?}");
+        }
     }
 
     #[test]
-    fn test_acl_structure_looks_valid() {
-        assert!(acl_structure_looks_valid("admin/admin@TEST.EXAMPLE    *"));
-        assert!(acl_structure_looks_valid(
-            "# comments allowed\nservice/HTTP@TEST.EXAMPLE    x\nadmin/admin@TEST.EXAMPLE    *"
-        ));
-        assert!(acl_structure_looks_valid("foo/bar@REALM    a"));
-        assert!(!acl_structure_looks_valid(""));
-        assert!(!acl_structure_looks_valid(
-            "# only comments and blank lines\n\n"
-        ));
-        assert!(!acl_structure_looks_valid("this line has no second token"));
-        assert!(!acl_structure_looks_valid(
-            "!!!garbage!!!\njust one token\nno at sign or slash here at all"
-        ));
-    }
-
-    #[test]
-    fn test_best_effort_repair_adds_admin_and_preserves_others() {
+    fn test_best_effort_repair() {
         let admin = "admin/admin@TEST.EXAMPLE";
-        let required = format!("{}    *", admin);
-        let input =
-            "# my custom rules\nservice/HTTP@TEST.EXAMPLE    x\nother/admin@TEST.EXAMPLE    l\n\n";
-        let result =
-            best_effort_repair_or_standardize(input, admin, &required).expect("should salvage");
+        let required = format!("{admin}    *");
+        let repair = |input: &str| best_effort_repair_or_standardize(input, admin, &required);
+
+        let result = repair(
+            "# my custom rules\nservice/HTTP@TEST.EXAMPLE    x\nother/admin@TEST.EXAMPLE    l\n\n",
+        )
+        .expect("should salvage");
         assert!(result.contains(&required), "admin with * must be present");
         assert!(result.contains("service/HTTP@TEST.EXAMPLE    x"));
         assert!(result.contains("other/admin@TEST.EXAMPLE    l"));
         assert!(result.contains("# my custom rules"));
         assert!(result.ends_with('\n'));
-    }
 
-    #[test]
-    fn test_best_effort_repair_upgrades_weak_admin_and_adds_if_missing() {
-        let admin = "admin/admin@TEST.EXAMPLE";
-        let required = format!("{}    *", admin);
-        let input = "admin/admin@TEST.EXAMPLE    l\n# keep this";
-        let result = best_effort_repair_or_standardize(input, admin, &required).unwrap();
-        assert!(result.contains(&required));
+        let result = repair("admin/admin@TEST.EXAMPLE    l\n# keep this").unwrap();
+        assert!(result.contains(&required), "a weak admin entry is upgraded");
         assert!(!result.contains("admin/admin@TEST.EXAMPLE    l"));
         assert!(result.contains("# keep this"));
-        let input2 = "some/service@TEST.EXAMPLE    x";
-        let result2 = best_effort_repair_or_standardize(input2, admin, &required).unwrap();
-        assert!(result2.contains(&required));
-        assert!(result2.contains("some/service@TEST.EXAMPLE    x"));
-    }
+        let result = repair("some/service@TEST.EXAMPLE    x").unwrap();
+        assert!(result.contains(&required), "a missing admin entry is added");
+        assert!(result.contains("some/service@TEST.EXAMPLE    x"));
 
-    #[test]
-    fn test_best_effort_repair_returns_none_for_too_garbled() {
-        let admin = "admin/admin@TEST.EXAMPLE";
-        let required = format!("{}    *", admin);
-        let garbled = "!!!\nfoo bar\n!!!\nno second token here\n!!!";
         assert!(
-            best_effort_repair_or_standardize(garbled, admin, &required).is_none(),
+            repair("!!!\nfoo bar\n!!!\nno second token here\n!!!").is_none(),
             "should signal remake for heavily corrupted input"
         );
-        let comments_only = "# nothing useful\n; also nothing\n";
-        let res = best_effort_repair_or_standardize(comments_only, admin, &required).unwrap();
-        assert!(res.contains(&required));
+        let result = repair("# nothing useful\n; also nothing\n").unwrap();
+        assert!(
+            result.contains(&required),
+            "comments only still gets the admin"
+        );
     }
 
     #[test]
-    fn test_ensure_kadm5_acl_creates_default_when_missing() {
+    fn test_ensure_kadm5_acl() {
         with_temp_acl_setup(|template, acl| {
             let config = make_test_config("TEST.EXAMPLE");
+            let required_line = "admin/admin@TEST.EXAMPLE    *";
             assert!(!acl.exists());
             ensure_kadm5_acl(acl, template, &config, "example")
                 .expect("ensure should succeed on create path");
             let content = fs::read_to_string(acl).expect("acl should exist after ensure");
-            assert!(
-                content.contains("admin/admin@TEST.EXAMPLE    *"),
+            assert_eq!(
+                content.trim(),
+                required_line,
                 "default admin line must be present"
             );
-            assert!(content.trim() == "admin/admin@TEST.EXAMPLE    *");
-        });
-    }
 
-    #[test]
-    fn test_ensure_kadm5_acl_repairs_adds_admin_preserves_custom_and_noops_when_good() {
-        with_temp_acl_setup(|template, acl| {
-            let config = make_test_config("TEST.EXAMPLE");
-            let required_line = "admin/admin@TEST.EXAMPLE    *";
             let initial =
                 "# custom comment\nservice/HTTP@TEST.EXAMPLE    x\nrestricted@TEST.EXAMPLE    l\n";
             fs::write(acl, initial).unwrap();
@@ -675,6 +659,7 @@ mod tests {
             assert!(repaired.contains("service/HTTP@TEST.EXAMPLE    x"));
             assert!(repaired.contains("restricted@TEST.EXAMPLE    l"));
             assert!(repaired.contains("# custom comment"));
+
             let good = "# production custom ACL\nservice/HTTP@TEST.EXAMPLE    x\nadmin/admin@TEST.EXAMPLE    *\nanother@TEST.EXAMPLE    a\n";
             fs::write(acl, good).unwrap();
             let before = fs::read_to_string(acl).unwrap();
@@ -687,6 +672,7 @@ mod tests {
             );
             assert!(after.contains(required_line));
             assert!(after.contains("another@TEST.EXAMPLE    a"));
+
             let garbage = "total\nnonsense\nwith no useful principal lines at all\n!!!\n";
             fs::write(acl, garbage).unwrap();
             ensure_kadm5_acl(acl, template, &config, "example")

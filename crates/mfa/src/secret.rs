@@ -146,26 +146,26 @@ mod tests {
     const UUID: &str = "550e8400-e29b-41d4-a716-446655440000";
 
     #[test]
-    fn test_seal_open_round_trip() {
+    fn test_seal_open_round_trip_and_grammar() {
         let seed = generate_seed();
         assert_ne!(seed, [0u8; TOTP_SEED_LEN]);
         let sealed = seal_totp_secret(IKM, UUID, &seed).unwrap();
         assert_eq!(sealed.len(), SEALED_BLOB_LEN);
-        assert!(sealed.starts_with("v1."));
-        let opened = open_totp_secret(IKM, UUID, &sealed).unwrap();
-        assert_eq!(opened, seed);
-    }
-
-    #[test]
-    fn test_seal_length_and_grammar() {
-        let seed = [7u8; TOTP_SEED_LEN];
-        let sealed = seal_totp_secret(IKM, UUID, &seed).unwrap();
         assert_eq!(sealed.len(), 57);
         let rest = sealed.strip_prefix("v1.").unwrap();
         assert_eq!(rest.len(), 54);
         assert!(
             rest.chars()
                 .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        );
+        assert_eq!(open_totp_secret(IKM, UUID, &sealed).unwrap(), seed);
+
+        let again = seal_totp_secret(IKM, UUID, &seed).unwrap();
+        assert_ne!(again, sealed);
+        assert_eq!(open_totp_secret(IKM, UUID, &again).unwrap(), seed);
+        assert_ne!(
+            seal_totp_secret(IKM, "uuid-a", &seed).unwrap(),
+            seal_totp_secret(IKM, "uuid-b", &seed).unwrap()
         );
         assert!(matches!(
             seal_totp_secret(IKM, UUID, &[0u8; TOTP_SEED_LEN - 1]),
@@ -174,21 +174,7 @@ mod tests {
     }
 
     #[test]
-    fn test_seal_is_randomised() {
-        let seed = [9u8; TOTP_SEED_LEN];
-        assert_ne!(
-            seal_totp_secret(IKM, "uuid-a", &seed).unwrap(),
-            seal_totp_secret(IKM, "uuid-b", &seed).unwrap()
-        );
-        let a = seal_totp_secret(IKM, UUID, &seed).unwrap();
-        let b = seal_totp_secret(IKM, UUID, &seed).unwrap();
-        assert_ne!(a, b);
-        assert_eq!(open_totp_secret(IKM, UUID, &a).unwrap(), seed);
-        assert_eq!(open_totp_secret(IKM, UUID, &b).unwrap(), seed);
-    }
-
-    #[test]
-    fn test_open_rejects_wrong_key_uuid_and_tampering() {
+    fn test_open_rejects_wrong_key_uuid_tampering_and_malformed() {
         let seed = generate_seed();
         let sealed = seal_totp_secret(IKM, UUID, &seed).unwrap();
         assert!(open_totp_secret(b"ff23456789abcdef0123456789abcdef", UUID, &sealed).is_err());
@@ -198,16 +184,15 @@ mod tests {
         bytes[i] = if bytes[i] == b'A' { b'B' } else { b'A' };
         let tampered = String::from_utf8(bytes).unwrap();
         assert!(open_totp_secret(IKM, UUID, &tampered).is_err());
-    }
-
-    #[test]
-    fn test_open_rejects_malformed() {
         let short = format!("{SEALED_PREFIX}{}", URL_SAFE_NO_PAD.encode([0u8; 30]));
         for bad in ["v0.abc", "not-sealed", short.as_str()] {
-            assert!(matches!(
-                open_totp_secret(IKM, UUID, bad),
-                Err(MfaError::InvalidSealedFormat)
-            ));
+            assert!(
+                matches!(
+                    open_totp_secret(IKM, UUID, bad),
+                    Err(MfaError::InvalidSealedFormat)
+                ),
+                "{bad}"
+            );
         }
     }
 
@@ -227,7 +212,7 @@ mod tests {
     }
 
     #[test]
-    fn test_enrollment_rejects_expired_wrong_key_and_tampered() {
+    fn test_enrollment_rejects_expired_wrong_key_tampered_and_other_kinds() {
         let seed = generate_seed();
         let sealed = seal_enrollment(IKM, "bob", &seed, false, 1000).unwrap();
         let expired = 1000 + TOTP_ENROLLMENT_TTL_SECS as i64;
@@ -242,10 +227,7 @@ mod tests {
         let i = bytes.len() - 2;
         bytes[i] = if bytes[i] == b'A' { b'B' } else { b'A' };
         assert!(open_enrollment(IKM, &String::from_utf8(bytes).unwrap(), 1000).is_err());
-    }
 
-    #[test]
-    fn test_enrollment_rejects_other_state_kinds() {
         let state = EnrollmentState {
             kind: STATE_KIND_ENROLLMENT + 1,
             user_id: "bob".to_owned(),

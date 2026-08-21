@@ -150,7 +150,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn test_kerberos_realm_name_from_base_dn_and_env() {
+    fn test_root_dse_always_emits_subschema_and_realm() {
         assert_eq!(
             kerberos_realm_name("dc=example,dc=com", None),
             "EXAMPLE.COM"
@@ -163,10 +163,7 @@ mod tests {
             kerberos_realm_name("dc=example,dc=com", Some("test.realm")),
             "TEST.REALM"
         );
-    }
 
-    #[test]
-    fn test_root_dse_always_emits_subschema_and_realm() {
         let LdapOp::SearchResultEntry(entry) = root_dse_response("dc=example,dc=com") else {
             panic!("expected SearchResultEntry");
         };

@@ -74,25 +74,22 @@ impl KerberosPaths {
         self.kdc_dir.join("principal")
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn test_default_matches_container_layout() {
-        let paths = KerberosPaths::default();
-        assert_eq!(paths.admin_keytab, PathBuf::from("/data/kadm5.keytab"));
+    fn test_paths_from_lookup() {
+        let defaults = KerberosPaths::from_lookup(|_| None);
+        assert_eq!(defaults, KerberosPaths::default());
+        assert_eq!(defaults.admin_keytab, PathBuf::from("/data/kadm5.keytab"));
         assert_eq!(
-            paths.kdc_principal(),
+            defaults.kdc_principal(),
             PathBuf::from("/var/kerberos/krb5kdc/principal")
         );
-        assert_eq!(paths.kdc_port, 88);
-    }
+        assert_eq!(defaults.kdc_port, 88);
 
-    #[test]
-    fn test_lookup_overrides_non_empty_values_only() {
         let paths = KerberosPaths::from_lookup(|key| match key {
             "LLDAP_KERB_ADMIN_KEYTAB" => Some("/tmp/sandbox/kadm5.keytab".to_owned()),
             "LLDAP_KERB_KDC_DIR" => Some(String::new()),
@@ -103,15 +100,19 @@ mod tests {
             paths.admin_keytab,
             PathBuf::from("/tmp/sandbox/kadm5.keytab")
         );
-        assert_eq!(paths.kdc_dir, PathBuf::from("/var/kerberos/krb5kdc"));
+        assert_eq!(
+            paths.kdc_dir,
+            PathBuf::from("/var/kerberos/krb5kdc"),
+            "an empty value falls back to the default"
+        );
         assert_eq!(paths.kdc_port, 18888);
-    }
 
-    #[test]
-    fn test_unparsable_port_falls_back_to_default() {
         let paths = KerberosPaths::from_lookup(|key| {
             (key == "LLDAP_KERB_KDC_PORT").then(|| "kdc".to_owned())
         });
-        assert_eq!(paths.kdc_port, 88);
+        assert_eq!(
+            paths.kdc_port, 88,
+            "an unparsable port falls back to the default"
+        );
     }
 }

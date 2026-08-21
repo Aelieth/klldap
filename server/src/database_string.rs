@@ -62,7 +62,6 @@ impl std::fmt::Debug for DatabaseUrl {
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,46 +81,25 @@ mod tests {
     }
 
     #[test]
-    fn test_sqlite_three_slash_data_path_gets_four_slashes_and_mode() {
-        assert_eq!(
-            normalize_sqlite_connect_url("sqlite:///data/custom.db"),
-            "sqlite:////data/custom.db?mode=rwc"
-        );
+    fn test_normalize_sqlite_connect_url() {
+        for (input, expected) in [
+            (
+                "sqlite:///data/custom.db",
+                "sqlite:////data/custom.db?mode=rwc",
+            ),
+            (
+                "sqlite:////data/users.db?mode=rwc",
+                "sqlite:////data/users.db?mode=rwc",
+            ),
+            ("sqlite::memory:", "sqlite::memory:"),
+            ("sqlite://users.db", "sqlite://users.db?mode=rwc"),
+            ("postgres://u:p@h/db", "postgres://u:p@h/db"),
+        ] {
+            assert_eq!(normalize_sqlite_connect_url(input), expected, "{input}");
+        }
         assert_eq!(
             DatabaseUrl::from("sqlite:///data/custom.db").to_connect_string(),
             "sqlite:////data/custom.db?mode=rwc"
-        );
-    }
-
-    #[test]
-    fn test_sqlite_already_correct_is_unchanged() {
-        assert_eq!(
-            normalize_sqlite_connect_url("sqlite:////data/users.db?mode=rwc"),
-            "sqlite:////data/users.db?mode=rwc"
-        );
-    }
-
-    #[test]
-    fn test_sqlite_memory_is_unchanged() {
-        assert_eq!(
-            normalize_sqlite_connect_url("sqlite::memory:"),
-            "sqlite::memory:"
-        );
-    }
-
-    #[test]
-    fn test_sqlite_relative_gets_mode_only() {
-        assert_eq!(
-            normalize_sqlite_connect_url("sqlite://users.db"),
-            "sqlite://users.db?mode=rwc"
-        );
-    }
-
-    #[test]
-    fn test_postgres_is_unchanged() {
-        assert_eq!(
-            normalize_sqlite_connect_url("postgres://u:p@h/db"),
-            "postgres://u:p@h/db"
         );
     }
 }

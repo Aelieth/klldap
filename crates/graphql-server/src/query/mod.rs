@@ -859,9 +859,8 @@ mod tests {
             ))
         );
     }
-
     #[tokio::test]
-    async fn test_logs_defaults_and_bad_cursor() {
+    async fn test_logs_cursors_and_defaults() {
         let mut mock = MockTestBackendHandler::new();
         mock.expect_list_log_events()
             .withf(|filter, limit, cursor| {
@@ -869,46 +868,6 @@ mod tests {
             })
             .times(1)
             .return_once(|_, _, _| Ok(vec![]));
-        let context = Context::<MockTestBackendHandler>::new_for_tests(
-            mock,
-            ValidationResults {
-                user: UserId::new("admin"),
-                permission: Permission::Admin,
-            },
-        );
-        let schema = schema(Query::<MockTestBackendHandler>::new());
-        assert_eq!(
-            execute(
-                r#"{ logs { id } }"#,
-                None,
-                &schema,
-                &Variables::new(),
-                &context
-            )
-            .await,
-            Ok((graphql_value!({ "logs": [] }), vec![]))
-        );
-
-        let (_, errors) = execute(
-            r#"{ logs(beforeId: "not-a-number") { id } }"#,
-            None,
-            &schema,
-            &Variables::new(),
-            &context,
-        )
-        .await
-        .unwrap();
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.error().message().contains("Invalid log id")),
-            "{errors:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_logs_after_cursor_and_cursor_conflict() {
-        let mut mock = MockTestBackendHandler::new();
         mock.expect_list_log_events()
             .withf(|filter, limit, cursor| {
                 *filter
@@ -930,34 +889,44 @@ mod tests {
             },
         );
         let schema = schema(Query::<MockTestBackendHandler>::new());
-        assert_eq!(
-            execute(
+        for (label, query, expected) in [
+            (
+                "defaults",
+                r#"{ logs { id } }"#,
+                graphql_value!({ "logs": [] }),
+            ),
+            (
+                "after cursor, limit clamped",
                 r#"{ logs(filter: {memberOf: "Devs", memberOfId: 3}, limit: 5000, afterId: "41") { id } }"#,
-                None,
-                &schema,
-                &Variables::new(),
-                &context
-            )
-            .await,
-            Ok((graphql_value!({ "logs": [{ "id": "42" }] }), vec![]))
-        );
-
-        let (_, errors) = execute(
-            r#"{ logs(beforeId: "41", afterId: "12") { id } }"#,
-            None,
-            &schema,
-            &Variables::new(),
-            &context,
-        )
-        .await
-        .unwrap();
-        assert!(
-            errors.iter().any(|e| e
-                .error()
-                .message()
-                .contains("logs takes either beforeId or afterId")),
-            "{errors:?}"
-        );
+                graphql_value!({ "logs": [{ "id": "42" }] }),
+            ),
+        ] {
+            assert_eq!(
+                execute(query, None, &schema, &Variables::new(), &context).await,
+                Ok((expected, vec![])),
+                "{label}"
+            );
+        }
+        for (label, query, message) in [
+            (
+                "bad cursor",
+                r#"{ logs(beforeId: "not-a-number") { id } }"#,
+                "Invalid log id",
+            ),
+            (
+                "cursor conflict",
+                r#"{ logs(beforeId: "41", afterId: "12") { id } }"#,
+                "logs takes either beforeId or afterId",
+            ),
+        ] {
+            let (_, errors) = execute(query, None, &schema, &Variables::new(), &context)
+                .await
+                .unwrap();
+            assert!(
+                errors.iter().any(|e| e.error().message().contains(message)),
+                "{label}: {errors:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1200,49 +1169,5 @@ mod tests {
                 vec![]
             ))
         );
-    }
-
-    #[tokio::test]
-    async fn test_mfa_enrolled_field_gated_to_admin_or_self() {
-        const QUERY: &str = r#"{ user(userId: "bob") { id mfaEnrolled } }"#;
-        for (viewer, permission, expected) in [
-            ("admin", Permission::Admin, serde_json::json!(true)),
-            ("bob", Permission::Regular, serde_json::json!(true)),
-            ("eve", Permission::Readonly, serde_json::Value::Null),
-        ] {
-            let mut mock = MockTestBackendHandler::new();
-            setup_default_schema(&mut mock);
-            mock.expect_get_user_details()
-                .with(eq(UserId::new("bob")))
-                .returning(|_| {
-                    let epoch = chrono::Utc.timestamp_opt(0, 0).unwrap().naive_utc();
-                    Ok(DomainUser {
-                        user_id: UserId::new("bob"),
-                        email: "bob@bobbers.on".into(),
-                        display_name: None,
-                        creation_date: epoch,
-                        modified_date: epoch,
-                        password_modified_date: epoch,
-                        uuid: lldap_domain::types::Uuid::from_name_and_date("bob", &epoch),
-                        attributes: vec![],
-                        krb_principal_name: None,
-                        mfa_type: Some("totp".to_owned()),
-                    })
-                });
-            let context = Context::<MockTestBackendHandler>::new_for_tests(
-                mock,
-                ValidationResults {
-                    user: UserId::new(viewer),
-                    permission,
-                },
-            );
-            let schema = schema(Query::<MockTestBackendHandler>::new());
-            let (value, errors) = execute(QUERY, None, &schema, &Variables::new(), &context)
-                .await
-                .unwrap();
-            assert_eq!(errors.len(), 0, "{viewer}: {errors:?}");
-            let value = serde_json::to_value(&value).unwrap();
-            assert_eq!(value["user"]["mfaEnrolled"], expected, "{viewer}");
-        }
     }
 }

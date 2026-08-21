@@ -929,82 +929,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_cannot_delete_builtin_group_by_name() {
+    async fn test_builtin_group_protection() {
         let fixture = TestFixture::new().await;
-        let gid = fixture
-            .handler
-            .create_group(CreateGroupRequest {
-                display_name: "lldap_sudohost".into(),
+        let create = |name: &str| {
+            fixture.handler.create_group(CreateGroupRequest {
+                display_name: name.into(),
                 ..Default::default()
             })
-            .await
-            .unwrap();
+        };
+        let rename = |group_id, name: &str| {
+            fixture.handler.update_group(UpdateGroupRequest {
+                group_id,
+                display_name: Some(name.into()),
+                delete_attributes: vec![],
+                insert_attributes: vec![],
+            })
+        };
 
-        let err = fixture.handler.delete_group(gid).await.unwrap_err();
+        let sudohost = create("lldap_sudohost").await.unwrap();
+        let err = fixture.handler.delete_group(sudohost).await.unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("built-in group") || msg.contains("Cannot delete"),
-            "expected built-in delete protection, got: {}",
-            msg
+            "expected built-in delete protection, got: {msg}"
         );
-    }
-
-    #[tokio::test]
-    async fn test_cannot_rename_builtin_group() {
-        let fixture = TestFixture::new().await;
-        let gid = fixture
-            .handler
-            .create_group(CreateGroupRequest {
-                display_name: "lldap_password_manager".into(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-
-        let err = fixture
-            .handler
-            .update_group(UpdateGroupRequest {
-                group_id: gid,
-                display_name: Some("renamed-pm".into()),
-                delete_attributes: vec![],
-                insert_attributes: vec![],
-            })
-            .await
-            .unwrap_err();
+        let password_manager = create("lldap_password_manager").await.unwrap();
+        let err = rename(password_manager, "renamed-pm").await.unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("built-in group") || msg.contains("Cannot rename"),
-            "expected built-in rename protection, got: {}",
-            msg
+            "expected built-in rename protection, got: {msg}"
         );
-    }
 
-    #[tokio::test]
-    async fn test_builtin_protection_does_not_affect_normal_groups() {
-        let fixture = TestFixture::new().await;
-        let gid = fixture
-            .handler
-            .create_group(CreateGroupRequest {
-                display_name: "my-custom-group".into(),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-
-        fixture
-            .handler
-            .update_group(UpdateGroupRequest {
-                group_id: gid,
-                display_name: Some("my-custom-renamed".into()),
-                delete_attributes: vec![],
-                insert_attributes: vec![],
-            })
-            .await
-            .unwrap();
-
-        let details = fixture.handler.get_group_details(gid).await.unwrap();
+        let custom = create("my-custom-group").await.unwrap();
+        rename(custom, "my-custom-renamed").await.unwrap();
+        let details = fixture.handler.get_group_details(custom).await.unwrap();
         assert_eq!(details.display_name.as_str(), "my-custom-renamed");
-
-        fixture.handler.delete_group(gid).await.unwrap();
+        fixture.handler.delete_group(custom).await.unwrap();
     }
 }

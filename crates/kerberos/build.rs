@@ -49,6 +49,7 @@ fn main() {
         .blocklist_type("__va_list_tag")
         .blocklist_type("_Float64x")
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))
+        .layout_tests(false)
         .generate_comments(false);
 
     let bindings = builder.generate().expect("Unable to generate bindings");

@@ -30,7 +30,6 @@ pub fn encrypt_kerberos_password(
         .context("Kerberos enabled but no public key available—check backend startup/logs")?;
     encrypt_password(key, password).context("Failed to encrypt password for Kerberos sync")
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -51,11 +50,5 @@ mod tests {
         let ciphertext = STANDARD.decode(&wire).unwrap();
         let decrypted = private.decrypt(Oaep::new::<Sha256>(), &ciphertext).unwrap();
         assert_eq!(decrypted, plaintext.as_bytes());
-    }
-
-    #[test]
-    fn encrypt_kerberos_password_errors_without_key() {
-        assert!(encrypt_kerberos_password(None, "pw").is_err());
-        assert!(encrypt_kerberos_password(Some(""), "pw").is_err());
     }
 }

@@ -34,6 +34,13 @@ nothing needs a KDC. The log sink is process-global like the Kerberos backend: a
 installs `LogGuard` must be `#[serial]`, and non-serial tests keep recording meanwhile, so
 assert on your own markers (a private peer address or actor), not on the whole recording.
 
+The suite is kept small on purpose: upstream LLDAP's tests stay as they are, and KLLDAP's
+additions are one scenario per door or handler and table tests whose assert message names
+the failing row, not one test per branch. A behaviour pinned at a higher level (an e2e in
+`server/tests`, the SQL handler) is not pinned again below it. `#[serial]` is reserved for
+the tests that install a process-global recorder. The krb5 bindings are generated with
+bindgen's layout tests off: they only compared bindgen's output with itself.
+
 ## The container gate
 
 `make test` builds the local image `klldap-test` from the working tree; `make test-run`

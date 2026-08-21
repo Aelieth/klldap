@@ -373,39 +373,19 @@ mod tests {
     }
 
     #[test]
-    fn test_expand_star_and_empty_are_user_attributes_only() {
-        for attrs in [&["*"][..], &[][..]] {
-            let exp = expand(attrs);
-            assert!(exp.include_custom_attributes, "{attrs:?}");
-            assert!(!exp.include_operational_attributes, "{attrs:?}");
-            let k = keys(&exp);
-            assert!(k.contains("uid"), "{attrs:?}");
-            assert!(k.contains("mail"), "{attrs:?}");
-            assert!(k.contains("objectclass"), "{attrs:?}");
-            for op in [
-                "createtimestamp",
-                "modifytimestamp",
-                "pwdchangedtime",
-                "entryuuid",
-                "hassubordinates",
-                "entrydn",
-                "memberof",
-                "creatorsname",
-                "modifiersname",
-            ] {
-                assert!(!k.contains(op), "{attrs:?} {op}");
-            }
-        }
-    }
-
-    #[test]
-    fn test_expand_plus_adds_all_always_operational() {
-        let exp = expand(&["+"]);
-        assert!(exp.include_custom_attributes);
-        assert!(exp.include_operational_attributes);
-        let k = keys(&exp);
-        assert!(k.contains("uid"));
-        for op in [
+    fn test_expand_attribute_wildcards_is_pinned() {
+        const OPERATIONAL: [&str; 9] = [
+            "createtimestamp",
+            "modifytimestamp",
+            "pwdchangedtime",
+            "entryuuid",
+            "hassubordinates",
+            "entrydn",
+            "memberof",
+            "creatorsname",
+            "modifiersname",
+        ];
+        const ALWAYS_OPERATIONAL: [&str; 11] = [
             "createtimestamp",
             "modifytimestamp",
             "pwdchangedtime",
@@ -417,102 +397,151 @@ mod tests {
             "memberof",
             "creatorsname",
             "modifiersname",
-        ] {
-            assert!(k.contains(op), "{op}");
+        ];
+        // Membership wires and gecos are builder inserts on `*`, not shared expand.
+        type Case<'a> = (
+            &'a str,
+            &'a [&'a str],
+            Option<bool>,
+            Option<bool>,
+            Vec<&'a str>,
+            Vec<&'a str>,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "*",
+                &["*"],
+                Some(true),
+                Some(false),
+                vec!["uid", "mail", "objectclass", "cn", "displayname"],
+                [
+                    OPERATIONAL.as_slice(),
+                    &["member", "uniquemember", "memberuid", "gecos"],
+                ]
+                .concat(),
+            ),
+            (
+                "nothing requested",
+                &[],
+                Some(true),
+                Some(false),
+                vec!["uid", "mail", "objectclass"],
+                OPERATIONAL.to_vec(),
+            ),
+            (
+                "+",
+                &["+"],
+                Some(true),
+                Some(true),
+                [&["uid"], ALWAYS_OPERATIONAL.as_slice()].concat(),
+                vec!["logindisabled", "sudohost"],
+            ),
+            (
+                "1.1",
+                &["1.1"],
+                Some(false),
+                Some(false),
+                vec![],
+                vec!["uid", "objectclass"],
+            ),
+            (
+                "displayName",
+                &["displayName"],
+                None,
+                None,
+                vec!["displayname"],
+                vec!["cn"],
+            ),
+            ("cn", &["cn"], None, None, vec!["cn"], vec!["displayname"]),
+            (
+                "memberUid",
+                &["memberUid"],
+                None,
+                None,
+                vec!["memberuid"],
+                vec![],
+            ),
+            ("uid", &["uid"], None, None, vec!["uid"], vec!["memberuid"]),
+            ("gecos", &["gecos"], None, None, vec!["gecos"], vec![]),
+            (
+                "createTimestamp",
+                &["createTimestamp"],
+                Some(false),
+                Some(true),
+                vec!["createtimestamp"],
+                vec![],
+            ),
+            (
+                "entryUUID",
+                &["entryUUID"],
+                None,
+                Some(true),
+                vec!["entryuuid"],
+                vec![],
+            ),
+            (
+                "entryDN",
+                &["entryDN"],
+                None,
+                Some(true),
+                vec!["entrydn"],
+                vec![],
+            ),
+            (
+                "creatorsName",
+                &["creatorsName"],
+                None,
+                Some(true),
+                vec!["creatorsname"],
+                vec![],
+            ),
+            (
+                "loginDisabled: deliberate, an explicit virtual does not switch the operational bucket on",
+                &["loginDisabled"],
+                None,
+                Some(false),
+                vec!["logindisabled"],
+                vec![],
+            ),
+            (
+                "sudoHost: deliberate, same rule",
+                &["sudoHost"],
+                None,
+                Some(false),
+                vec!["sudohost"],
+                vec![],
+            ),
+        ];
+        for (label, attrs, custom, operational, present, absent) in cases {
+            let exp = expand(attrs);
+            if let Some(custom) = custom {
+                assert_eq!(
+                    exp.include_custom_attributes, custom,
+                    "{label}: include_custom_attributes"
+                );
+            }
+            if let Some(operational) = operational {
+                assert_eq!(
+                    exp.include_operational_attributes, operational,
+                    "{label}: include_operational_attributes"
+                );
+            }
+            let k = keys(&exp);
+            for name in present {
+                assert!(k.contains(name), "{label}: missing {name}");
+            }
+            for name in absent {
+                assert!(!k.contains(name), "{label}: unexpected {name}");
+            }
         }
-        // loginDisabled/sudoHost stay explicit-only (not always_operational).
-        assert!(!k.contains("logindisabled"));
-        assert!(!k.contains("sudohost"));
-    }
-
-    #[test]
-    fn test_expand_one_one_is_empty() {
-        let exp = expand(&["1.1"]);
-        assert!(!exp.include_custom_attributes);
-        assert!(!exp.include_operational_attributes);
-        assert!(exp.attribute_keys.is_empty());
-    }
-
-    #[test]
-    fn test_expand_display_name_hybrid_emission() {
-        // explicit displayName → displayName only; explicit cn → cn only; * → both.
-        let dn = expand(&["displayName"]);
-        let dn_vals: Vec<&str> = dn.attribute_keys.values().map(String::as_str).collect();
-        assert!(dn_vals.contains(&"displayName"), "{dn_vals:?}");
-        assert!(
-            !keys(&dn).contains("cn"),
-            "explicit displayName must not add cn"
-        );
-
-        let cn = expand(&["cn"]);
-        assert!(keys(&cn).contains("cn"));
-        assert!(
-            !keys(&cn).contains("displayname"),
-            "explicit cn must not add displayName"
-        );
-
-        let star = expand(&["*"]);
-        let star_vals: Vec<&str> = star.attribute_keys.values().map(String::as_str).collect();
-        assert!(star_vals.contains(&"cn"), "{star_vals:?}");
-        assert!(star_vals.contains(&"displayName"), "{star_vals:?}");
-    }
-
-    #[test]
-    fn test_expand_membership_explicit_only() {
-        // Membership wires are group-builder inserts on `*`, not shared expand.
-        for wire in ["member", "uniquemember", "memberuid"] {
-            assert!(
-                !keys(&expand(&["*"])).contains(wire),
-                "* expand must not inject {wire} (user entries would log unknown)"
-            );
-        }
-        assert!(keys(&expand(&["memberUid"])).contains("memberuid"));
-        assert!(!keys(&expand(&["uid"])).contains("memberuid"));
-    }
-
-    #[test]
-    fn test_gecos_backs_display_name() {
-        // gecos resolves to the display_name column; explicit keeps the wire name.
-        // `*` insert is user-builder only (posixAccount), not shared expand.
-        let sm = SchemaManager::default();
-        assert_eq!(
-            sm.map_user_field(&AttributeName::from("gecos"), PublicSchema::shared()),
-            UserFieldType::PrimaryField(UserColumn::DisplayName)
-        );
-        assert!(
-            !keys(&expand(&["*"])).contains("gecos"),
-            "* expand must not inject gecos (group entries would log unknown)"
-        );
-        assert!(keys(&expand(&["gecos"])).contains("gecos"));
-    }
-
-    #[test]
-    fn test_expand_explicit_operational_requests_are_pinned() {
-        let ts = expand(&["createTimestamp"]);
-        assert!(ts.include_operational_attributes);
-        assert!(!ts.include_custom_attributes);
-        assert!(keys(&ts).contains("createtimestamp"));
-
-        let uuid = expand(&["entryUUID"]);
-        assert!(uuid.include_operational_attributes);
-        assert!(keys(&uuid).contains("entryuuid"));
-
-        let entry_dn = expand(&["entryDN"]);
-        assert!(entry_dn.include_operational_attributes);
-        assert!(keys(&entry_dn).contains("entrydn"));
-
-        let creators = expand(&["creatorsName"]);
-        assert!(creators.include_operational_attributes);
-        assert!(keys(&creators).contains("creatorsname"));
-
-        // loginDisabled/sudoHost are explicit-only virtuals: requesting them must not
-        // switch the operational bucket on.
-        let ld = expand(&["loginDisabled"]);
-        assert!(!ld.include_operational_attributes);
-        assert!(keys(&ld).contains("logindisabled"));
-        let sh = expand(&["sudoHost"]);
-        assert!(!sh.include_operational_attributes);
-        assert!(keys(&sh).contains("sudohost"));
+        assert!(expand(&["1.1"]).attribute_keys.is_empty());
+        // The wire case survives expansion.
+        let wire = |attrs: &[&str]| -> Vec<String> {
+            expand(attrs).attribute_keys.values().cloned().collect()
+        };
+        assert!(wire(&["displayName"]).contains(&"displayName".to_string()));
+        let star = wire(&["*"]);
+        assert!(star.contains(&"cn".to_string()) && star.contains(&"displayName".to_string()));
     }
 
     #[test]
@@ -526,7 +555,9 @@ mod tests {
                 Some(LogicalAttr::ObjectClass),
             ),
             ("memberof", true, "memberOf", Some(LogicalAttr::MemberOf)),
+            ("ismemberof", true, "memberOf", Some(LogicalAttr::MemberOf)),
             ("dn", false, "dn", Some(LogicalAttr::Dn)),
+            ("distinguishedname", false, "dn", Some(LogicalAttr::Dn)),
             ("entrydn", true, "entryDN", Some(LogicalAttr::EntryDn)),
             (
                 "hassubordinates",
@@ -601,6 +632,7 @@ mod tests {
                 "uid",
                 Some(LogicalAttr::Primary(UserColumn::UserId)),
             ),
+            ("nope", false, "nope", None),
         ];
         for &(name, operational, canon, ref logical) in cases {
             assert_eq!(
@@ -612,5 +644,10 @@ mod tests {
             let resolved = sm.resolve_attribute(name).map(|(l, _)| l);
             assert_eq!(resolved, *logical, "logical({name})");
         }
+        // gecos resolves to the display_name column.
+        assert_eq!(
+            sm.map_user_field(&AttributeName::from("gecos"), PublicSchema::shared()),
+            UserFieldType::PrimaryField(UserColumn::DisplayName)
+        );
     }
 }

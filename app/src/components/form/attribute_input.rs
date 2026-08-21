@@ -266,22 +266,21 @@ impl Component for ListAttributeInput {
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::attribute_display_name;
 
     #[test]
-    fn capitalizes_and_unslashes() {
-        assert_eq!(attribute_display_name("firstname"), "Firstname");
-        assert_eq!(attribute_display_name("home_directory"), "Home directory");
-        assert_eq!(attribute_display_name(""), "");
-    }
-
-    #[test]
-    fn does_not_panic_on_multibyte_first_char() {
-        // Regression: byte-slicing name[0..1] panicked on non-ASCII first bytes.
-        assert_eq!(attribute_display_name("émail"), "Émail");
-        assert_eq!(attribute_display_name("日本_語"), "日本 語");
+    fn test_attribute_display_name() {
+        for (input, expected) in [
+            ("firstname", "Firstname"),
+            ("home_directory", "Home directory"),
+            ("", ""),
+            // Regression: byte-slicing name[0..1] panicked on non-ASCII first bytes.
+            ("émail", "Émail"),
+            ("日本_語", "日本 語"),
+        ] {
+            assert_eq!(attribute_display_name(input), expected, "{input:?}");
+        }
     }
 }

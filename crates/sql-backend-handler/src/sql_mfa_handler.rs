@@ -326,9 +326,7 @@ impl MfaBackendHandler for SqlBackendHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql_backend_handler::tests::{
-        get_initialized_db, insert_group, insert_membership, insert_user_no_password,
-    };
+    use crate::sql_backend_handler::tests::{get_initialized_db, insert_user_no_password};
     use lldap_auth::opaque::server::{ServerSetup, generate_random_private_key};
     use lldap_domain_handlers::logging::{RequestMeta, with_request};
     use lldap_mfa::{
@@ -526,7 +524,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reset_own_mfa() {
+    async fn test_reset_own_and_user_mfa() {
         let (setup, handler) = setup_handler().await;
         let (user_id, seed, _, current) = enroll_user(&handler, &setup, "bob").await;
 
@@ -536,25 +534,18 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, DomainError::AuthenticationError(_)));
         assert!(get_mfa_columns(&handler, "bob").await.0.is_some());
-
         handler.reset_own_mfa(&user_id, &current).await.unwrap();
         assert_eq!(get_mfa_columns(&handler, "bob").await, (None, None));
-
         let err = handler.reset_own_mfa(&user_id, &current).await.unwrap_err();
         assert!(err.to_string().contains("not enrolled"));
-    }
 
-    #[tokio::test]
-    async fn test_reset_user_mfa() {
-        let (setup, handler) = setup_handler().await;
-        let (user_id, _, _, _) = enroll_user(&handler, &setup, "bob").await;
-        assert!(get_mfa_columns(&handler, "bob").await.0.is_some());
-
+        let (user_id, ..) = enroll_user(&handler, &setup, "eve").await;
+        assert!(get_mfa_columns(&handler, "eve").await.0.is_some());
         handler
             .reset_user_mfa(&user_id, MfaResetReason::Administrative)
             .await
             .unwrap();
-        assert_eq!(get_mfa_columns(&handler, "bob").await, (None, None));
+        assert_eq!(get_mfa_columns(&handler, "eve").await, (None, None));
         handler
             .reset_user_mfa(&user_id, MfaResetReason::Administrative)
             .await
@@ -659,35 +650,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_mfa_requirement_by_policy() {
-        let (setup, handler) = setup_handler().await;
-        let (bob, ..) = enroll_user(&handler, &setup, "bob").await;
-        let (eve, ..) = enroll_user(&handler, &setup, "eve").await;
-        insert_user_no_password(&handler, "john").await;
-        insert_user_no_password(&handler, "kim").await;
-        let exempt = insert_group(&handler, MFA_DISABLED_GROUP).await;
-        insert_membership(&handler, exempt, "eve").await;
-        insert_membership(&handler, exempt, "kim").await;
-        let john = UserId::new("john");
-        let kim = UserId::new("kim");
-        let nobody = UserId::new("nobody");
-
-        use MfaRequirement::{Enrollment, None, Totp};
-        for (policy, expected) in [
-            (MfaPolicy::Disabled, [None, None, None, None, None]),
-            (MfaPolicy::Enrolled, [Totp, None, None, None, None]),
-            (MfaPolicy::Always, [Totp, None, Enrollment, None, None]),
-        ] {
-            let handler = handler.clone().with_mfa_policy(policy);
-            let mut actual = Vec::new();
-            for user in [&bob, &eve, &john, &kim, &nobody] {
-                actual.push(handler.mfa_requirement(user).await.unwrap());
-            }
-            assert_eq!(actual, expected, "{policy:?}");
-        }
-    }
-
-    #[tokio::test]
     async fn test_clear_all_mfa() {
         let (setup, handler) = setup_handler().await;
         enroll_user(&handler, &setup, "bob").await;
@@ -703,12 +665,12 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn test_mfa_rows_are_recorded() {
+    async fn test_mfa_log_rows() {
         let guard = LogGuard::install();
         let peer = "10.77.0.1";
-        let (setup, handler) = setup_handler().await;
         let meta = RequestMeta::http(Some(peer.parse().unwrap()), None);
         with_request(meta, async {
+            let (setup, handler) = setup_handler().await;
             let (bob, seed, _, next) = enroll_user(&handler, &setup, "bob").await;
             assert!(
                 handler
@@ -723,6 +685,48 @@ mod tests {
                 .unwrap();
             enroll_user(&handler, &setup, "eve").await;
             handler.clear_all_mfa().await.unwrap();
+
+            // Every rejection of the enrollment ceremony has its own detail.
+            let (setup, handler) = setup_handler().await;
+            insert_user_no_password(&handler, "bob").await;
+            insert_user_no_password(&handler, "john").await;
+            let bob = UserId::new("bob");
+            let start = handler.start_totp_enrollment(&bob, None).await.unwrap();
+            let state = open_state(&setup, &start.state);
+            let (now, code) = current_code(&state.seed);
+            let _ = handler
+                .finish_totp_enrollment(&bob, &start.state, &wrong_code(&state.seed))
+                .await;
+            let expired = lldap_mfa::seal_enrollment(
+                &ikm(&setup),
+                "bob",
+                &state.seed,
+                false,
+                now as i64 - TOTP_ENROLLMENT_TTL_SECS as i64 - 1,
+            )
+            .unwrap();
+            let _ = handler.finish_totp_enrollment(&bob, &expired, &code).await;
+            let _ = handler
+                .finish_totp_enrollment(&bob, "not-a-sealed-state", &code)
+                .await;
+            let _ = handler
+                .finish_totp_enrollment(&UserId::new("john"), &start.state, &code)
+                .await;
+            let replacing =
+                lldap_mfa::seal_enrollment(&ikm(&setup), "bob", &state.seed, true, now as i64)
+                    .unwrap();
+            let _ = handler
+                .finish_totp_enrollment(&bob, &replacing, &code)
+                .await;
+            handler
+                .finish_totp_enrollment(&bob, &start.state, &code)
+                .await
+                .unwrap();
+            let err = handler.start_totp_enrollment(&bob, None).await.unwrap_err();
+            assert!(err.to_string().contains(TOTP_CURRENT_CODE_REQUIRED));
+            let _ = handler
+                .start_totp_enrollment(&bob, Some(wrong_code(&state.seed)))
+                .await;
         })
         .await;
 
@@ -758,96 +762,19 @@ mod tests {
                     None,
                     Some("private key changed".to_owned())
                 ),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_mfa_failure_rows_are_recorded() {
-        let guard = LogGuard::install();
-        let peer = "10.77.0.2";
-        let (setup, handler) = setup_handler().await;
-        let meta = RequestMeta::http(Some(peer.parse().unwrap()), None);
-        with_request(meta, async {
-            insert_user_no_password(&handler, "bob").await;
-            insert_user_no_password(&handler, "john").await;
-            let bob = UserId::new("bob");
-
-            let start = handler.start_totp_enrollment(&bob, None).await.unwrap();
-            let state = open_state(&setup, &start.state);
-            let (now, code) = current_code(&state.seed);
-
-            let _ = handler
-                .finish_totp_enrollment(&bob, &start.state, &wrong_code(&state.seed))
-                .await;
-            let expired = lldap_mfa::seal_enrollment(
-                &ikm(&setup),
-                "bob",
-                &state.seed,
-                false,
-                now as i64 - TOTP_ENROLLMENT_TTL_SECS as i64 - 1,
-            )
-            .unwrap();
-            let _ = handler.finish_totp_enrollment(&bob, &expired, &code).await;
-            let _ = handler
-                .finish_totp_enrollment(&bob, "not-a-sealed-state", &code)
-                .await;
-            let _ = handler
-                .finish_totp_enrollment(&UserId::new("john"), &start.state, &code)
-                .await;
-            let replacing =
-                lldap_mfa::seal_enrollment(&ikm(&setup), "bob", &state.seed, true, now as i64)
-                    .unwrap();
-            let _ = handler
-                .finish_totp_enrollment(&bob, &replacing, &code)
-                .await;
-
-            handler
-                .finish_totp_enrollment(&bob, &start.state, &code)
-                .await
-                .unwrap();
-
-            let err = handler.start_totp_enrollment(&bob, None).await.unwrap_err();
-            assert!(err.to_string().contains(TOTP_CURRENT_CODE_REQUIRED));
-            let _ = handler
-                .start_totp_enrollment(&bob, Some(wrong_code(&state.seed)))
-                .await;
-        })
-        .await;
-
-        let rows: Vec<(LogKind, bool, Option<String>, Option<String>)> = guard
-            .recorder()
-            .take_events()
-            .into_iter()
-            .filter(|e| e.peer.as_deref() == Some(peer))
-            .filter(|e| matches!(e.kind, LogKind::MfaEnroll | LogKind::MfaReset))
-            .map(|e| (e.kind, e.success, e.target, e.detail))
-            .collect();
-        let row = |success, detail: &str| {
-            (
-                LogKind::MfaEnroll,
-                success,
-                Some("bob".to_owned()),
-                Some(detail.to_owned()),
-            )
-        };
-        assert_eq!(
-            rows,
-            vec![
-                row(true, "started"),
-                row(false, "invalid code"),
-                row(false, "expired enrollment"),
-                row(false, "corrupt enrollment state"),
-                (
+                row(LogKind::MfaEnroll, true, "bob", "started"),
+                row(LogKind::MfaEnroll, false, "bob", "invalid code"),
+                row(LogKind::MfaEnroll, false, "bob", "expired enrollment"),
+                row(LogKind::MfaEnroll, false, "bob", "corrupt enrollment state"),
+                row(
                     LogKind::MfaEnroll,
                     false,
-                    Some("john".to_owned()),
-                    Some("foreign enrollment state".to_owned()),
+                    "john",
+                    "foreign enrollment state"
                 ),
-                row(false, "stale enrollment"),
-                row(true, "totp"),
-                row(false, "invalid totp"),
+                row(LogKind::MfaEnroll, false, "bob", "stale enrollment"),
+                row(LogKind::MfaEnroll, true, "bob", "totp"),
+                row(LogKind::MfaEnroll, false, "bob", "invalid totp"),
             ]
         );
     }

@@ -557,109 +557,14 @@ pub fn convert_group_filter(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ldap3_proto::LdapResultCode;
     use ldap3_proto::proto::LdapSubstringFilter;
+    use lldap_domain_model::model::UserColumn;
     use lldap_schema::PublicSchema;
     use pretty_assertions::assert_eq;
 
-    #[test]
-    fn test_convert_user_filter_substring_on_custom_string_attribute() {
-        let schema = PublicSchema::get();
-        let ldap_info = crate::core::utils::LdapInfo {
-            base_dn: vec![],
-            base_dn_str: "dc=example,dc=com".to_string(),
-            ignored_user_attributes: vec![],
-            ignored_group_attributes: vec![],
-        };
-
-        let filter = LdapFilter::Substring(
-            "givenName".to_string(),
-            LdapSubstringFilter {
-                initial: Some("jo".to_string()),
-                any: vec![],
-                final_: None,
-            },
-        );
-
-        let result = convert_user_filter(&ldap_info, &filter, &schema);
-        assert!(result.is_ok());
-
-        match result.unwrap() {
-            UserRequestFilter::AttributeSubString(name, _) => {
-                assert_eq!(name.as_str(), "firstname"); // canonical name
-            }
-            other => panic!("Expected AttributeSubString, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_convert_group_filter_memberof_points_to_member() {
-        let schema = PublicSchema::get();
-        let ldap_info = crate::core::utils::LdapInfo {
-            base_dn: vec![],
-            base_dn_str: "dc=example,dc=com".to_string(),
-            ignored_user_attributes: vec![],
-            ignored_group_attributes: vec![],
-        };
-
-        // memberof/ismemberof on a group filter mean Member.
-        let filter = LdapFilter::Equality("memberof".to_string(), "someuser".to_string());
-        let result = convert_group_filter(&ldap_info, &filter, &schema);
-        assert!(result.is_ok());
-        match result.unwrap() {
-            GroupRequestFilter::Member(uid) => {
-                assert_eq!(uid.as_str(), "someuser");
-            }
-            other => panic!("Expected Member for memberof group filter, got {:?}", other),
-        }
-
-        let filter2 = LdapFilter::Equality("member".to_string(), "bar".to_string());
-        let result2 = convert_group_filter(&ldap_info, &filter2, &schema);
-        assert!(result2.is_ok());
-        match result2.unwrap() {
-            GroupRequestFilter::Member(uid) => {
-                assert_eq!(uid.as_str(), "bar");
-            }
-            other => panic!("Expected Member for member group filter, got {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_group_filter_member_uid_resolves_to_member() {
-        // (memberUid=alice) finds groups containing alice (SSSD rfc2307 initgroups path).
-        match group_eq("memberUid", "alice") {
-            GroupRequestFilter::Member(uid) => assert_eq!(uid.as_str(), "alice"),
-            other => panic!("expected Member for memberUid, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_user_filter_gecos_maps_to_display_name() {
-        // gecos (POSIX GECOS = the full name) filters on display_name.
-        match user_eq("gecos", "bob") {
-            UserRequestFilter::Equality(lldap_domain_model::model::UserColumn::DisplayName, v) => {
-                assert_eq!(v, "bob");
-            }
-            other => panic!("expected DisplayName equality for gecos, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_group_filter_uid_is_false_not_unknown() {
-        // uid on a group search is a known user attribute: False, not unrecognized.
-        match group_eq("uid", "bob") {
-            GroupRequestFilter::False => {}
-            other => panic!("expected False for uid-on-group, got {other:?}"),
-        }
-        assert!(!is_unrecognized_attribute(&AttributeName::from("uid"), &[]));
-    }
-
     fn info() -> LdapInfo {
-        LdapInfo {
-            base_dn: vec![],
-            base_dn_str: "dc=example,dc=com".to_string(),
-            ignored_user_attributes: vec![],
-            ignored_group_attributes: vec![],
-        }
+        LdapInfo::new("dc=example,dc=com", vec![], vec![]).unwrap()
     }
 
     fn user_eq(name: &str, value: &str) -> UserRequestFilter {
@@ -670,6 +575,17 @@ mod tests {
     fn group_eq(name: &str, value: &str) -> GroupRequestFilter {
         let filter = LdapFilter::Equality(name.to_string(), value.to_string());
         convert_group_filter(&info(), &filter, &PublicSchema::get()).unwrap()
+    }
+
+    fn substring(name: &str, any: &str) -> LdapFilter {
+        LdapFilter::Substring(
+            name.to_string(),
+            LdapSubstringFilter {
+                initial: None,
+                any: vec![any.to_string()],
+                final_: None,
+            },
+        )
     }
 
     #[test]
@@ -701,30 +617,39 @@ mod tests {
                 "{name}"
             );
         }
+        // gecos (POSIX GECOS = the full name) filters on display_name.
+        assert_eq!(
+            user_eq("gecos", "bob"),
+            UserRequestFilter::Equality(UserColumn::DisplayName, "bob".to_string())
+        );
     }
 
     #[test]
-    fn test_user_filter_cn_substring_maps_to_display_name() {
+    fn test_user_filter_substrings() {
         for name in ["cn", "displayname", "display_name"] {
-            let filter = LdapFilter::Substring(
-                name.to_string(),
-                LdapSubstringFilter {
-                    initial: None,
-                    any: vec!["ae".to_string()],
-                    final_: None,
-                },
-            );
-            let got = convert_user_filter(&info(), &filter, &PublicSchema::get()).unwrap();
+            let got =
+                convert_user_filter(&info(), &substring(name, "ae"), &PublicSchema::get()).unwrap();
             assert!(
                 matches!(
                     got,
-                    UserRequestFilter::SubString(
-                        lldap_domain_model::model::UserColumn::DisplayName,
-                        _
-                    )
+                    UserRequestFilter::SubString(UserColumn::DisplayName, _)
                 ),
                 "{name}"
             );
+        }
+        let filter = LdapFilter::Substring(
+            "givenName".to_string(),
+            LdapSubstringFilter {
+                initial: Some("jo".to_string()),
+                any: vec![],
+                final_: None,
+            },
+        );
+        match convert_user_filter(&info(), &filter, &PublicSchema::get()).unwrap() {
+            UserRequestFilter::AttributeSubString(name, _) => {
+                assert_eq!(name.as_str(), "firstname");
+            }
+            other => panic!("expected AttributeSubString, got {other:?}"),
         }
     }
 
@@ -758,13 +683,27 @@ mod tests {
             user_eq("no_such_attr", "x"),
             UserRequestFilter::False
         ));
+        for value in ["cn=admins,ou=groups,dc=example,dc=com", "admins"] {
+            assert_eq!(
+                user_eq("memberOf", value),
+                UserRequestFilter::MemberOf("admins".into()),
+                "{value}"
+            );
+        }
     }
 
     #[test]
     fn test_group_filter_resolution_is_pinned() {
-        for n in ["memberof", "member", "uniquemember", "ismemberof"] {
+        // memberUid is the SSSD rfc2307 initgroups path.
+        for n in [
+            "memberof",
+            "member",
+            "uniquemember",
+            "ismemberof",
+            "memberUid",
+        ] {
             assert!(
-                matches!(group_eq(n, "bar"), GroupRequestFilter::Member(_)),
+                matches!(group_eq(n, "bar"), GroupRequestFilter::Member(uid) if uid.as_str() == "bar"),
                 "{n}"
             );
         }
@@ -778,6 +717,8 @@ mod tests {
             group_eq("no_such_attr", "x"),
             GroupRequestFilter::False
         ));
+        // uid on a group search is a known user attribute: False, not unrecognized.
+        assert!(matches!(group_eq("uid", "bob"), GroupRequestFilter::False));
     }
 
     #[test]
@@ -789,5 +730,47 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[test]
+    fn test_unsupported_filters_are_refused() {
+        let schema = PublicSchema::get();
+        let approx = LdapFilter::Approx("uid".to_string(), "bob".to_string());
+        let err = convert_user_filter(&info(), &approx, &schema).unwrap_err();
+        assert_eq!(err.code, LdapResultCode::UnwillingToPerform);
+        assert!(
+            err.message.starts_with("Unsupported user filter: Approx"),
+            "{}",
+            err.message
+        );
+        let err = convert_group_filter(&info(), &approx, &schema).unwrap_err();
+        assert_eq!(err.code, LdapResultCode::UnwillingToPerform);
+        assert!(
+            err.message.starts_with("Unsupported group filter: Approx"),
+            "{}",
+            err.message
+        );
+
+        let err = convert_user_filter(&info(), &substring("memberOf", "adm"), &schema).unwrap_err();
+        assert_eq!(err.code, LdapResultCode::UnwillingToPerform);
+        assert!(
+            err.message
+                .starts_with("Unsupported user attribute for substring filter"),
+            "{}",
+            err.message
+        );
+        let err = convert_group_filter(&info(), &substring("member", "bo"), &schema).unwrap_err();
+        assert_eq!(err.code, LdapResultCode::UnwillingToPerform);
+        assert!(
+            err.message
+                .starts_with("Unsupported group attribute for substring filter"),
+            "{}",
+            err.message
+        );
+        // An unknown attribute is no match, not an error.
+        assert_eq!(
+            convert_group_filter(&info(), &substring("nope", "x"), &schema).unwrap(),
+            GroupRequestFilter::False
+        );
     }
 }

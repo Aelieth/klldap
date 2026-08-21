@@ -136,7 +136,6 @@ pub async fn send_test_email(to: Mailbox, options: &MailOptions) -> Result<()> {
     )
     .await
 }
-
 #[cfg(test)]
 mod tests {
     use super::build_reset_url;
@@ -147,26 +146,30 @@ mod tests {
     }
 
     #[test]
-    fn test_reset_url_for_root_bases() {
-        assert_eq!(
-            reset("http://localhost"),
-            "http://localhost/reset-password/step2/TOK123"
-        );
-        assert_eq!(
-            reset("https://ui.example.com"),
-            "https://ui.example.com/reset-password/step2/TOK123"
-        );
-    }
-
-    #[test]
-    fn test_reset_url_for_subpath_bases_has_no_double_slash() {
-        assert_eq!(
-            reset("https://host/lldap"),
-            "https://host/lldap/reset-password/step2/TOK123"
-        );
-        assert_eq!(
-            reset("https://host/lldap/"),
-            "https://host/lldap/reset-password/step2/TOK123"
-        );
+    fn test_reset_url_join() {
+        for (base, expected) in [
+            (
+                "http://localhost",
+                "http://localhost/reset-password/step2/TOK123",
+            ),
+            (
+                "https://ui.example.com",
+                "https://ui.example.com/reset-password/step2/TOK123",
+            ),
+            (
+                "https://host/lldap",
+                "https://host/lldap/reset-password/step2/TOK123",
+            ),
+            (
+                "https://host/lldap/",
+                "https://host/lldap/reset-password/step2/TOK123",
+            ),
+        ] {
+            assert_eq!(
+                reset(base),
+                expected,
+                "{base}: one step2 path, no double slash"
+            );
+        }
     }
 }

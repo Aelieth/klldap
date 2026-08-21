@@ -31,18 +31,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_code_is_single_use_per_user() {
+    fn test_code_is_single_use_per_user_and_window() {
         let used = UsedCodes::new();
         assert!(used.mark_used("uuid-a", "123456", 1000));
         assert!(!used.mark_used("uuid-a", "123456", 1000));
         assert!(used.mark_used("uuid-b", "123456", 1000));
         assert!(used.mark_used("uuid-a", "654321", 1000));
-    }
-
-    #[test]
-    fn test_code_is_refused_for_its_whole_window() {
-        let used = UsedCodes::new();
-        assert!(used.mark_used("uuid-a", "123456", 1000));
         assert!(!used.mark_used("uuid-a", "123456", 999 + TOTP_ACCEPTANCE_WINDOW_SECS));
         assert!(used.mark_used("uuid-a", "123456", 1000 + TOTP_ACCEPTANCE_WINDOW_SECS));
     }

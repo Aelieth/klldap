@@ -231,7 +231,6 @@ pub fn deserialize_attribute(
         value,
     })
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,39 +252,40 @@ mod tests {
     }
 
     #[test]
-    fn test_datetime_input_parses_rfc3339() {
-        let schema = schema_of(AttributeSchema::editable("mydate", AttributeType::DateTime));
-        let attr = deserialize_attribute(
-            &schema,
-            attr_input("mydate", &["2024-05-01T12:00:00Z"]),
-            false,
-        )
-        .unwrap();
-        assert_eq!(
-            attr.value,
-            DomainValue::DateTime(Cardinality::Singleton(
-                "2024-05-01T12:00:00".parse().unwrap()
-            ))
-        );
-    }
-
-    #[test]
-    fn test_integer_list_input_parses_numbers() {
-        let schema = schema_of(AttributeSchema::editable("myints", AttributeType::Integer).list());
-        let attr =
-            deserialize_attribute(&schema, attr_input("myints", &["1", "-2"]), false).unwrap();
-        assert_eq!(
-            attr.value,
-            DomainValue::Integer(Cardinality::Unbounded(vec![1, -2]))
-        );
-    }
-
-    #[test]
-    fn test_non_list_rejects_empty_and_invalid_input() {
-        let schema = schema_of(AttributeSchema::editable("mydate", AttributeType::DateTime));
-        assert!(deserialize_attribute(&schema, attr_input("mydate", &[]), false).is_err());
-        assert!(
-            deserialize_attribute(&schema, attr_input("mydate", &["not-a-date"]), false).is_err()
-        );
+    fn test_deserialize_attribute_inputs() {
+        let date = schema_of(AttributeSchema::editable("mydate", AttributeType::DateTime));
+        let ints = schema_of(AttributeSchema::editable("myints", AttributeType::Integer).list());
+        for (label, schema, name, values, expected) in [
+            (
+                "rfc3339 datetime",
+                &date,
+                "mydate",
+                vec!["2024-05-01T12:00:00Z"],
+                Some(DomainValue::DateTime(Cardinality::Singleton(
+                    "2024-05-01T12:00:00".parse().unwrap(),
+                ))),
+            ),
+            (
+                "integer list",
+                &ints,
+                "myints",
+                vec!["1", "-2"],
+                Some(DomainValue::Integer(Cardinality::Unbounded(vec![1, -2]))),
+            ),
+            ("empty non-list", &date, "mydate", vec![], None),
+            (
+                "invalid datetime",
+                &date,
+                "mydate",
+                vec!["not-a-date"],
+                None,
+            ),
+        ] {
+            let result = deserialize_attribute(schema, attr_input(name, &values), false);
+            match expected {
+                Some(value) => assert_eq!(result.unwrap().value, value, "{label}"),
+                None => assert!(result.is_err(), "{label}"),
+            }
+        }
     }
 }

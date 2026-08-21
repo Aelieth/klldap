@@ -117,14 +117,13 @@ mod tests {
     }
 
     #[test]
-    fn test_ldap_info_new_valid_base_dn() {
+    fn test_ldap_info_new_parses_and_rejects() {
         let info = LdapInfo::new(
             "dc=example,dc=com",
             vec![AttributeName::from("mail")],
             vec![],
         )
         .expect("valid DN should parse");
-
         assert_eq!(
             info.base_dn,
             vec![
@@ -135,18 +134,22 @@ mod tests {
         assert_eq!(info.base_dn_str, "dc=example,dc=com");
         assert_eq!(info.ignored_user_attributes.len(), 1);
         assert!(info.ignored_group_attributes.is_empty());
-    }
-
-    #[test]
-    fn test_ldap_info_new_lowercases_and_trims() {
-        let info = LdapInfo::new("DC=Example, DC=COM", vec![], vec![]).unwrap();
-        assert_eq!(info.base_dn_str, "dc=example,dc=com");
-    }
-
-    #[test]
-    fn test_ldap_info_new_rejects_malformed_dn() {
-        assert!(LdapInfo::new("dc=example,dc", vec![], vec![]).is_err());
-        assert!(LdapInfo::new("dc=example,,dc=com", vec![], vec![]).is_err());
-        assert!(LdapInfo::new("dc=example=foo,dc=com", vec![], vec![]).is_err());
+        assert_eq!(
+            LdapInfo::new("DC=Example, DC=COM", vec![], vec![])
+                .unwrap()
+                .base_dn_str,
+            "dc=example,dc=com",
+            "lowercased and trimmed"
+        );
+        for malformed in [
+            "dc=example,dc",
+            "dc=example,,dc=com",
+            "dc=example=foo,dc=com",
+        ] {
+            assert!(
+                LdapInfo::new(malformed, vec![], vec![]).is_err(),
+                "{malformed}"
+            );
+        }
     }
 }

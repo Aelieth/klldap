@@ -212,8 +212,7 @@ pub mod tests {
     use crate::handler::{
         LdapHandler,
         tests::{
-            setup_bound_admin_handler, setup_bound_password_manager_handler,
-            setup_bound_readonly_handler,
+            setup_bound_admin_handler, setup_bound_handler_with_group, setup_bound_readonly_handler,
         },
     };
     use chrono::TimeZone;
@@ -413,95 +412,62 @@ pub mod tests {
     }
 
     #[tokio::test]
-    async fn test_self_service_password_change() {
-        let mut mock = MockTestBackendHandler::new();
-        setup_default_ldap_mock(&mut mock);
-        expect_password_change(&mut mock, "bob");
-        let mut ldap_handler = setup_bound_admin_handler(mock).await;
-        let request = LdapOp::ExtendedRequest(
-            LdapPasswordModifyRequest {
-                user_identity: Some("uid=bob,ou=people,dc=example,dc=com".to_string()),
-                old_password: None,
-                new_password: Some("newpassword".to_string()),
+    async fn test_password_modify_extended_matrix() {
+        let success = || make_extended_response(LdapResultCode::Success, "".to_string());
+        let cases = [
+            (
+                "admin changes a user's password",
+                "lldap_admin",
+                "bob",
+                true,
+                success(),
+            ),
+            (
+                "password manager changes a user's password",
+                "lldap_password_manager",
+                "bob",
+                true,
+                success(),
+            ),
+            (
+                "regular user changes their own password",
+                "",
+                "test",
+                true,
+                success(),
+            ),
+            (
+                "regular user changes another user's password",
+                "",
+                "bob",
+                false,
+                make_extended_response(
+                    LdapResultCode::InsufficentAccessRights,
+                    "User `test` cannot modify user `bob`".to_string(),
+                ),
+            ),
+        ];
+        for (label, group, target, changes, expected) in cases {
+            let mut mock = MockTestBackendHandler::new();
+            setup_default_ldap_mock(&mut mock);
+            if changes {
+                expect_password_change(&mut mock, target);
             }
-            .into(),
-        );
-        assert_eq!(
-            ldap_handler.handle_ldap_message(request).await,
-            Some(vec![make_extended_response(
-                LdapResultCode::Success,
-                "".to_string()
-            )])
-        );
-    }
-
-    #[tokio::test]
-    async fn test_admin_changes_user_password() {
-        let mut mock = MockTestBackendHandler::new();
-        setup_default_ldap_mock(&mut mock);
-        expect_password_change(&mut mock, "bob");
-        let mut ldap_handler = setup_bound_admin_handler(mock).await;
-        let request = LdapOp::ExtendedRequest(
-            LdapPasswordModifyRequest {
-                user_identity: Some("uid=bob,ou=people,dc=example,dc=com".to_string()),
-                old_password: None,
-                new_password: Some("newpassword".to_string()),
-            }
-            .into(),
-        );
-        assert_eq!(
-            ldap_handler.handle_ldap_message(request).await,
-            Some(vec![make_extended_response(
-                LdapResultCode::Success,
-                "".to_string()
-            )])
-        );
-    }
-
-    #[tokio::test]
-    async fn test_password_manager_changes_user_password() {
-        let mut mock = MockTestBackendHandler::new();
-        setup_default_ldap_mock(&mut mock);
-        expect_password_change(&mut mock, "bob");
-        let mut ldap_handler = setup_bound_password_manager_handler(mock).await;
-        let request = LdapOp::ExtendedRequest(
-            LdapPasswordModifyRequest {
-                user_identity: Some("uid=bob,ou=people,dc=example,dc=com".to_string()),
-                old_password: None,
-                new_password: Some("newpassword".to_string()),
-            }
-            .into(),
-        );
-        assert_eq!(
-            ldap_handler.handle_ldap_message(request).await,
-            Some(vec![make_extended_response(
-                LdapResultCode::Success,
-                "".to_string()
-            )])
-        );
-    }
-
-    #[tokio::test]
-    async fn test_password_change_unauthorized_regular_other() {
-        let mut mock = MockTestBackendHandler::new();
-        setup_default_ldap_mock(&mut mock);
-        let mut ldap_handler =
-            crate::handler::tests::setup_bound_handler_with_group(mock, "").await;
-        let request = LdapOp::ExtendedRequest(
-            LdapPasswordModifyRequest {
-                user_identity: Some("uid=bob,ou=people,dc=example,dc=com".to_string()),
-                old_password: None,
-                new_password: Some("newpassword".to_string()),
-            }
-            .into(),
-        );
-        assert_eq!(
-            ldap_handler.handle_ldap_message(request).await,
-            Some(vec![make_extended_response(
-                LdapResultCode::InsufficentAccessRights,
-                "User `test` cannot modify user `bob`".to_string(),
-            )])
-        );
+            let mut ldap_handler = setup_bound_handler_with_group(mock, group).await;
+            let request = LdapOp::ExtendedRequest(
+                LdapPasswordModifyRequest {
+                    user_identity: Some(format!("uid={target},ou=people,dc=example,dc=com")),
+                    old_password: None,
+                    new_password: Some("newpassword".to_string()),
+                }
+                .into(),
+            );
+            assert_eq!(
+                ldap_handler.handle_ldap_message(request).await,
+                Some(vec![expected]),
+                "{label}"
+            );
+        }
     }
 
     #[tokio::test]

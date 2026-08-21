@@ -513,14 +513,17 @@ pub mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn test_denied_write_records_access_denied_with_actor_and_peer() {
+    async fn test_access_denied_events() {
+        let guard = LogGuard::install();
         let mut mock = MockTestBackendHandler::new();
         setup_default_ldap_mock(&mut mock);
-        let mut handler = setup_bound_handler_with_group(mock, "regular").await;
-        handler.peer = Some("198.51.100.1".parse().unwrap());
-        let guard = LogGuard::install();
+        let mut bound = setup_bound_handler_with_group(mock, "regular").await;
+        bound.peer = Some("198.51.100.1".parse().unwrap());
+        let mut unbound =
+            LdapHandler::new_for_tests(MockTestBackendHandler::new(), "dc=example,dc=com");
+        unbound.peer = Some("198.51.100.2".parse().unwrap());
 
-        let response = handler
+        let response = bound
             .handle_ldap_message(LdapOp::DelRequest(
                 "uid=bob,ou=people,dc=example,dc=com".to_string(),
             ))
@@ -532,7 +535,6 @@ pub mod tests {
                 "Unauthorized write".to_string(),
             )])
         );
-
         let events = events_from(&guard, "198.51.100.1");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, LogKind::AccessDenied);
@@ -540,28 +542,36 @@ pub mod tests {
         assert_eq!(events[0].actor.as_deref(), Some("test"));
         assert_eq!(events[0].protocol, Protocol::Ldap);
         assert_eq!(events[0].detail.as_deref(), Some("Unauthorized write"));
-    }
 
-    #[tokio::test]
-    #[serial]
-    async fn test_unbound_request_records_access_denied_without_an_actor() {
-        let mut handler =
-            LdapHandler::new_for_tests(MockTestBackendHandler::new(), "dc=example,dc=com");
-        handler.peer = Some("198.51.100.2".parse().unwrap());
-        let guard = LogGuard::install();
-
-        handler
+        unbound
             .handle_ldap_message(LdapOp::ExtendedRequest(LdapExtendedRequest {
                 name: OID_WHOAMI.to_string(),
                 value: None,
             }))
             .await;
-
+        let request = crate::search::make_search_request(
+            "cn=Subschema,dc=example,dc=com",
+            ldap3_proto::LdapFilter::Present("objectClass".to_string()),
+            vec!["*", "+"],
+        );
+        assert_eq!(
+            unbound
+                .handle_ldap_message(LdapOp::SearchRequest(request))
+                .await,
+            Some(vec![crate::search::make_search_error(
+                LdapResultCode::InsufficentAccessRights,
+                "No user currently bound".to_string(),
+            )])
+        );
         let events = events_from(&guard, "198.51.100.2");
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].kind, LogKind::AccessDenied);
-        assert_eq!(events[0].actor, None);
-        assert_eq!(events[0].detail.as_deref(), Some("No user currently bound"));
+        let summary: Vec<_> = events
+            .iter()
+            .map(|e| (e.kind, e.actor.as_deref(), e.detail.as_deref()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![(LogKind::AccessDenied, None, Some("No user currently bound")); 2]
+        );
     }
 
     #[tokio::test]
@@ -658,25 +668,5 @@ pub mod tests {
         assert_eq!(events[0].kind, LogKind::Bind);
         assert_eq!(events[0].actor.as_deref(), Some("bob"));
         assert_eq!(events[0].detail.as_deref(), Some("ou mismatch"));
-    }
-
-    #[tokio::test]
-    async fn test_subschema_requires_bind() {
-        let mut handler =
-            LdapHandler::new_for_tests(MockTestBackendHandler::new(), "dc=example,dc=com");
-        let request = crate::search::make_search_request(
-            "cn=Subschema,dc=example,dc=com",
-            ldap3_proto::LdapFilter::Present("objectClass".to_string()),
-            vec!["*", "+"],
-        );
-        assert_eq!(
-            handler
-                .handle_ldap_message(LdapOp::SearchRequest(request))
-                .await,
-            Some(vec![crate::search::make_search_error(
-                LdapResultCode::InsufficentAccessRights,
-                "No user currently bound".to_string(),
-            )])
-        );
     }
 }

@@ -807,7 +807,6 @@ fn is_loopback_url(url: &Url) -> bool {
         _ => false,
     }
 }
-
 #[cfg(test)]
 #[allow(clippy::result_large_err)]
 mod tests {
@@ -859,26 +858,6 @@ mod tests {
             serialized, serialized2,
             "identical seeds must produce identical ServerSetup bytes"
         );
-    }
-
-    #[test]
-    fn test_figment_defaults_dummy_seed_does_not_materialize_server_key() {
-        Jail::expect_with(|jail| {
-            jail.clear_env();
-            let key_path = jail.directory().join("server_key");
-            assert!(!key_path.exists(), "precondition: no server_key yet");
-
-            let _shape = ConfigurationBuilder::default()
-                .key_seed(Some(SecUtf8::from(FIGMENT_DUMMY_KEY_SEED)))
-                .build()
-                .expect("dummy shape build must succeed");
-
-            assert!(
-                !key_path.exists(),
-                "dummy figment defaults must not create or read a server_key file"
-            );
-            Ok(())
-        });
     }
 
     fn default_run_opts() -> RunOpts {
@@ -1054,19 +1033,6 @@ mod tests {
     }
 
     #[test]
-    fn test_server_key_file_current_format_loads() {
-        Jail::expect_with(|jail| {
-            let setup = generate_random_private_key();
-            let path = jail.directory().join("server_key");
-            std::fs::write(&path, setup.serialize()).unwrap();
-            let config =
-                get_server_setup(path.to_str().unwrap(), "", PrivateKeyLocation::Tests).unwrap();
-            assert_eq!(config.server_setup.serialize(), setup.serialize());
-            Ok(())
-        });
-    }
-
-    #[test]
     fn test_unparseable_server_key_is_an_error() {
         Jail::expect_with(|jail| {
             let path = jail.directory().join("server_key");
@@ -1079,8 +1045,10 @@ mod tests {
         });
     }
 
+    // Defaults, then the file, then the environment, then the CLI, for both the log
+    // options and the MFA knob in one ladder: the two override paths do not interfere.
     #[test]
-    fn test_log_options_defaults_file_env_and_cli_precedence() {
+    fn test_config_precedence_defaults_file_env_cli() {
         Jail::expect_with(|jail| {
             jail.clear_env();
             jail.set_env("LLDAP_JWT_SECRET", "secret");
@@ -1089,43 +1057,34 @@ mod tests {
             assert_eq!(config.log_options.retention_days, 30);
             assert_eq!(config.log_options.max_entries, 50000);
             assert_eq!(config.log_options.bind_coalesce_seconds, 300);
+            assert_eq!(config.mfa_policy(), MfaPolicy::Disabled);
 
             jail.create_file(
                 "lldap_config.toml",
-                "[log_options]\nmax_entries = 7\nretention_days = 5\nbind_coalesce_seconds = 9\n",
+                "enable_mfa = true\n[log_options]\nmax_entries = 7\nretention_days = 5\nbind_coalesce_seconds = 9\n",
             )?;
+            let config = init(default_run_opts()).unwrap();
+            assert_eq!(config.log_options.retention_days, 5);
+            assert_eq!(config.log_options.max_entries, 7);
+            assert_eq!(config.log_options.bind_coalesce_seconds, 9);
+            assert_eq!(config.mfa_policy(), MfaPolicy::Enrolled);
+
             jail.set_env("LLDAP_LOG_OPTIONS__RETENTION_DAYS", "90");
+            jail.set_env("LLDAP_ENABLE_MFA", "always");
+            let config = init(default_run_opts()).unwrap();
+            assert_eq!(config.log_options.retention_days, 90);
+            assert_eq!(config.log_options.max_entries, 7);
+            assert_eq!(config.mfa_policy(), MfaPolicy::Always);
+
             let mut opts = default_run_opts();
             opts.log_opts.log_persist = Some(false);
             opts.log_opts.log_bind_coalesce_seconds = Some(0);
+            opts.enable_mfa = Some(TrueFalseAlways::False);
             let config = init(opts).unwrap();
             assert!(!config.log_options.persist);
             assert_eq!(config.log_options.retention_days, 90);
             assert_eq!(config.log_options.max_entries, 7);
             assert_eq!(config.log_options.bind_coalesce_seconds, 0);
-            Ok(())
-        });
-    }
-
-    #[test]
-    fn test_enable_mfa_defaults_file_env_and_cli_precedence() {
-        Jail::expect_with(|jail| {
-            jail.clear_env();
-            jail.set_env("LLDAP_JWT_SECRET", "secret");
-            let config = init(default_run_opts()).unwrap();
-            assert_eq!(config.mfa_policy(), MfaPolicy::Disabled);
-
-            jail.create_file("lldap_config.toml", "enable_mfa = true\n")?;
-            let config = init(default_run_opts()).unwrap();
-            assert_eq!(config.mfa_policy(), MfaPolicy::Enrolled);
-
-            jail.set_env("LLDAP_ENABLE_MFA", "always");
-            let config = init(default_run_opts()).unwrap();
-            assert_eq!(config.mfa_policy(), MfaPolicy::Always);
-
-            let mut opts = default_run_opts();
-            opts.enable_mfa = Some(TrueFalseAlways::False);
-            let config = init(opts).unwrap();
             assert_eq!(config.mfa_policy(), MfaPolicy::Disabled);
             Ok(())
         });

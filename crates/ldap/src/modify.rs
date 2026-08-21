@@ -494,32 +494,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_modify_password_bad_primary_dn() {
-        let mut mock = MockTestBackendHandler::new();
-        setup_default_ldap_mock(&mut mock);
-
-        let ldap_handler = setup_bound_admin_handler(mock).await;
-
-        let request = LdapModifyRequest {
-            dn: "uid=bob,ou=people,dc=example,dc=fr".to_string(),
-            changes: vec![LdapModify {
-                operation: LdapModifyType::Replace,
-                modification: ldap3_proto::LdapPartialAttribute {
-                    atype: "userPassword".to_string(),
-                    vals: vec![b"newpassword".to_vec()],
-                },
-            }],
-        };
-        assert_eq!(
-            ldap_handler.do_modify_request(&request).await,
-            make_modify_failure_response(
-                LdapResultCode::InvalidDNSyntax,
-                "Invalid username: Not a subtree of the base tree"
-            )
-        );
-    }
-
-    #[tokio::test]
     async fn test_modify_password_of_other_regular_as_regular() {
         let mut mock = MockTestBackendHandler::new();
         setup_default_ldap_mock(&mut mock);
@@ -593,347 +567,28 @@ mod tests {
         );
     }
 
-    fn make_profile_modify_request(
-        target_user: &str,
-        attr: &str,
-        value: &str,
-    ) -> LdapModifyRequest {
-        LdapModifyRequest {
-            dn: format!("uid={target_user},ou=people,dc=example,dc=com"),
-            changes: vec![LdapModify {
-                operation: LdapModifyType::Replace,
-                modification: ldap3_proto::LdapPartialAttribute {
-                    atype: attr.to_string(),
-                    vals: vec![value.as_bytes().to_vec()],
-                },
-            }],
-        }
-    }
-
-    #[tokio::test]
-    async fn test_modify_givenname_as_self() {
-        let mut mock = MockTestBackendHandler::new();
-        setup_default_ldap_mock(&mut mock);
-
-        mock.expect_update_user()
-            .with(mockall::predicate::function(
-                |req: &lldap_domain::requests::UpdateUserRequest| {
-                    req.user_id == UserId::new("test")
-                        && req
-                            .insert_attributes
-                            .iter()
-                            .any(|a| a.name.as_str() == "first_name")
-                },
-            ))
-            .times(1)
-            .return_once(|_| Ok(()));
-
-        let ldap_handler = setup_bound_handler_with_group(mock, "regular").await;
-        let request = make_profile_modify_request("test", "givenName", "Alice");
-        assert_eq!(
-            ldap_handler.do_modify_request(&request).await,
-            make_modify_success_response()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_modify_sn_as_admin() {
-        let mut mock = MockTestBackendHandler::new();
-        setup_default_ldap_mock(&mut mock);
-
-        mock.expect_update_user()
-            .with(mockall::predicate::function(
-                |req: &lldap_domain::requests::UpdateUserRequest| {
-                    req.user_id == UserId::new("bob")
-                        && req
-                            .insert_attributes
-                            .iter()
-                            .any(|a| a.name.as_str() == "last_name")
-                },
-            ))
-            .times(1)
-            .return_once(|_| Ok(()));
-
-        let ldap_handler = setup_bound_admin_handler(mock).await;
-        let request = make_profile_modify_request("bob", "sn", "Smith");
-        assert_eq!(
-            ldap_handler.do_modify_request(&request).await,
-            make_modify_success_response()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_modify_mail_as_admin() {
-        let mut mock = MockTestBackendHandler::new();
-        setup_default_ldap_mock(&mut mock);
-
-        mock.expect_update_user()
-            .with(mockall::predicate::function(
-                |req: &lldap_domain::requests::UpdateUserRequest| {
-                    req.user_id == UserId::new("bob") && req.email.is_some()
-                },
-            ))
-            .times(1)
-            .return_once(|_| Ok(()));
-
-        let ldap_handler = setup_bound_admin_handler(mock).await;
-        let request = make_profile_modify_request("bob", "mail", "bob.smith@example.com");
-        assert_eq!(
-            ldap_handler.do_modify_request(&request).await,
-            make_modify_success_response()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_modify_mail_as_password_manager_is_refused() {
-        let mut mock = MockTestBackendHandler::new();
-        setup_default_ldap_mock(&mut mock);
-        let ldap_handler = setup_bound_password_manager_handler(mock).await;
-        let request = make_profile_modify_request("bob", "mail", "bob.smith@example.com");
-        assert_eq!(
-            ldap_handler.do_modify_request(&request).await,
-            make_modify_failure_response(
-                LdapResultCode::InsufficentAccessRights,
-                "User `test` cannot modify user `bob` (no write permission)"
-            )
-        );
-    }
-
-    #[tokio::test]
-    async fn test_modify_cn_displayname_as_self() {
-        let mut mock = MockTestBackendHandler::new();
-        setup_default_ldap_mock(&mut mock);
-
-        mock.expect_update_user()
-            .with(mockall::predicate::function(
-                |req: &lldap_domain::requests::UpdateUserRequest| {
-                    req.user_id == UserId::new("test")
-                        && req.display_name == Some("Test User".to_string())
-                },
-            ))
-            .times(1)
-            .return_once(|_| Ok(()));
-
-        let ldap_handler = setup_bound_handler_with_group(mock, "regular").await;
-        let request = make_profile_modify_request("test", "cn", "Test User");
-        assert_eq!(
-            ldap_handler.do_modify_request(&request).await,
-            make_modify_success_response()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_modify_avatar_and_sshpublickey_as_admin() {
-        let mut mock = MockTestBackendHandler::new();
-        setup_default_ldap_mock(&mut mock);
-
-        mock.expect_update_user()
-            .times(2) // one for avatar, one for ssh
-            .returning(|_| Ok(()));
-
-        let ldap_handler = setup_bound_admin_handler(mock).await;
-
-        let avatar_req = make_profile_modify_request(
-            "bob",
-            "avatar",
-            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==",
-        );
-        assert_eq!(
-            ldap_handler.do_modify_request(&avatar_req).await,
-            make_modify_success_response()
-        );
-
-        let ssh_req = make_profile_modify_request(
-            "bob",
-            "sshPublicKey",
-            "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABCCCBAQCExampleRSAKeyForTestingOnly2048bit testuser@otherlab",
-        );
-        assert_eq!(
-            ldap_handler.do_modify_request(&ssh_req).await,
-            make_modify_success_response()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_modify_unsupported_attribute() {
-        let mut mock = MockTestBackendHandler::new();
-        setup_default_ldap_mock(&mut mock);
-        let ldap_handler = setup_bound_admin_handler(mock).await;
-
-        let request = make_profile_modify_request("bob", "title", "Manager");
-
-        assert_eq!(
-            ldap_handler.do_modify_request(&request).await,
-            make_modify_failure_response(
-                LdapResultCode::UnwillingToPerform,
-                "Unsupported attribute for LDAP Modify: title (supported: givenName, sn, cn, mail, avatar, sshPublicKey, userPassword)"
-            )
-        );
-    }
-
-    fn make_delete_modify_request(user: &str, atype: &str) -> LdapModifyRequest {
-        LdapModifyRequest {
-            dn: format!("uid={user},ou=people,dc=example,dc=com"),
-            changes: vec![LdapModify {
-                operation: LdapModifyType::Delete,
-                modification: ldap3_proto::LdapPartialAttribute {
-                    atype: atype.to_string(),
-                    vals: vec![],
-                },
-            }],
-        }
-    }
-
-    #[tokio::test]
-    async fn test_modify_delete_of_protected_attributes_rejected() {
-        for atype in ["mail", "email", "cn", "displayname", "commonname"] {
-            let mut mock = MockTestBackendHandler::new();
-            setup_default_ldap_mock(&mut mock);
-            let ldap_handler = setup_bound_admin_handler(mock).await;
-            assert_eq!(
-                ldap_handler
-                    .do_modify_request(&make_delete_modify_request("bob", atype))
-                    .await,
-                make_modify_failure_response(
-                    LdapResultCode::InsufficentAccessRights,
-                    &format!(
-                        "Deletion of `{atype}` is not allowed via LDAP Modify (use GraphQL or protected path)"
-                    )
-                )
-            );
-        }
-    }
-
-    fn make_add_modify_request(user: &str, atype: &str, value: &str) -> LdapModifyRequest {
-        LdapModifyRequest {
-            dn: format!("uid={user},ou=people,dc=example,dc=com"),
-            changes: vec![LdapModify {
-                operation: LdapModifyType::Add,
-                modification: ldap3_proto::LdapPartialAttribute {
-                    atype: atype.to_string(),
-                    vals: vec![value.as_bytes().to_vec()],
-                },
-            }],
-        }
-    }
-
-    // The five non-schema wire names route to the right sink on Replace.
-    #[tokio::test]
-    async fn test_modify_replace_non_schema_wire_names() {
-        async fn check(
-            atype: &str,
-            value: &str,
-            pred: fn(&lldap_domain::requests::UpdateUserRequest) -> bool,
-        ) {
-            let mut mock = MockTestBackendHandler::new();
-            setup_default_ldap_mock(&mut mock);
-            mock.expect_update_user()
-                .with(mockall::predicate::function(
-                    move |req: &lldap_domain::requests::UpdateUserRequest| {
-                        req.user_id == UserId::new("bob") && pred(req)
-                    },
-                ))
-                .times(1)
-                .return_once(|_| Ok(()));
-            let ldap_handler = setup_bound_admin_handler(mock).await;
-            let request = make_profile_modify_request("bob", atype, value);
-            assert_eq!(
-                ldap_handler.do_modify_request(&request).await,
-                make_modify_success_response()
-            );
-        }
-
-        const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
-        check("surname", "Smith", |r| {
-            r.insert_attributes
-                .iter()
-                .any(|a| a.name.as_str() == "last_name")
-        })
-        .await;
-        check("commonname", "Bob", |r| {
-            r.display_name == Some("Bob".to_string())
-        })
-        .await;
-        check("given_name", "Alice", |r| {
-            r.insert_attributes
-                .iter()
-                .any(|a| a.name.as_str() == "first_name")
-        })
-        .await;
-        check("jpeg_photo", PNG, |r| {
-            r.insert_attributes
-                .iter()
-                .any(|a| a.name.as_str() == "avatar")
-        })
-        .await;
-        check(
-            "ssh_public_key",
-            "ssh-rsa AAAAB3NzaC1yc2E testuser@host",
-            |r| {
-                r.insert_attributes
-                    .iter()
-                    .any(|a| a.name.as_str() == "sshpublickey")
-            },
-        )
-        .await;
-    }
-
-    #[tokio::test]
-    async fn test_modify_add_givenname_inserts_first_name() {
-        let mut mock = MockTestBackendHandler::new();
-        setup_default_ldap_mock(&mut mock);
-        mock.expect_update_user()
-            .with(mockall::predicate::function(
-                |req: &lldap_domain::requests::UpdateUserRequest| {
-                    req.user_id == UserId::new("bob")
-                        && req
-                            .insert_attributes
-                            .iter()
-                            .any(|a| a.name.as_str() == "first_name")
-                },
-            ))
-            .times(1)
-            .return_once(|_| Ok(()));
-        let ldap_handler = setup_bound_admin_handler(mock).await;
-        let request = make_add_modify_request("bob", "givenName", "Alice");
-        assert_eq!(
-            ldap_handler.do_modify_request(&request).await,
-            make_modify_success_response()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_modify_delete_givenname_deletes_first_name() {
-        let mut mock = MockTestBackendHandler::new();
-        setup_default_ldap_mock(&mut mock);
-        mock.expect_update_user()
-            .with(mockall::predicate::function(
-                |req: &lldap_domain::requests::UpdateUserRequest| {
-                    req.user_id == UserId::new("bob")
-                        && req
-                            .delete_attributes
-                            .iter()
-                            .any(|a| a.as_str() == "first_name")
-                },
-            ))
-            .times(1)
-            .return_once(|_| Ok(()));
-        let ldap_handler = setup_bound_admin_handler(mock).await;
-        let request = make_delete_modify_request("bob", "givenName");
-        assert_eq!(
-            ldap_handler.do_modify_request(&request).await,
-            make_modify_success_response()
-        );
-    }
-
     fn modify_request(
         user: &str,
         operation: LdapModifyType,
         atype: &str,
         vals: &[&str],
     ) -> LdapModifyRequest {
+        modify_request_at(
+            &format!("uid={user},ou=people,dc=example,dc=com"),
+            operation,
+            atype,
+            vals,
+        )
+    }
+
+    fn modify_request_at(
+        dn: &str,
+        operation: LdapModifyType,
+        atype: &str,
+        vals: &[&str],
+    ) -> LdapModifyRequest {
         LdapModifyRequest {
-            dn: format!("uid={user},ou=people,dc=example,dc=com"),
+            dn: dn.to_string(),
             changes: vec![LdapModify {
                 operation,
                 modification: ldap3_proto::LdapPartialAttribute {
@@ -941,6 +596,329 @@ mod tests {
                     vals: vals.iter().map(|v| v.as_bytes().to_vec()).collect(),
                 },
             }],
+        }
+    }
+
+    const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg==";
+
+    fn inserts(req: &UpdateUserRequest, name: &str) -> bool {
+        req.insert_attributes
+            .iter()
+            .any(|a| a.name.as_str() == name)
+    }
+
+    #[tokio::test]
+    async fn test_modify_replace_routes_wire_names() {
+        type Check = fn(&UpdateUserRequest) -> bool;
+        type Case<'a> = (
+            &'a str,
+            &'a str,
+            &'a str,
+            LdapModifyType,
+            &'a str,
+            &'a [&'a str],
+            Check,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "givenName as self",
+                "regular",
+                "test",
+                LdapModifyType::Replace,
+                "givenName",
+                &["Alice"],
+                |r| inserts(r, "first_name"),
+            ),
+            (
+                "sn as admin",
+                "lldap_admin",
+                "bob",
+                LdapModifyType::Replace,
+                "sn",
+                &["Smith"],
+                |r| inserts(r, "last_name"),
+            ),
+            (
+                "mail as admin",
+                "lldap_admin",
+                "bob",
+                LdapModifyType::Replace,
+                "mail",
+                &["bob.smith@example.com"],
+                |r| r.email.is_some(),
+            ),
+            (
+                "cn as self",
+                "regular",
+                "test",
+                LdapModifyType::Replace,
+                "cn",
+                &["Test User"],
+                |r| r.display_name == Some("Test User".to_string()),
+            ),
+            (
+                "avatar as admin",
+                "lldap_admin",
+                "bob",
+                LdapModifyType::Replace,
+                "avatar",
+                &[PNG],
+                |r| inserts(r, "avatar"),
+            ),
+            (
+                "sshPublicKey as admin",
+                "lldap_admin",
+                "bob",
+                LdapModifyType::Replace,
+                "sshPublicKey",
+                &[
+                    "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABCCCBAQCExampleRSAKeyForTestingOnly2048bit testuser@otherlab",
+                ],
+                |r| inserts(r, "sshpublickey"),
+            ),
+            (
+                "surname",
+                "lldap_admin",
+                "bob",
+                LdapModifyType::Replace,
+                "surname",
+                &["Smith"],
+                |r| inserts(r, "last_name"),
+            ),
+            (
+                "commonname",
+                "lldap_admin",
+                "bob",
+                LdapModifyType::Replace,
+                "commonname",
+                &["Bob"],
+                |r| r.display_name == Some("Bob".to_string()),
+            ),
+            (
+                "given_name",
+                "lldap_admin",
+                "bob",
+                LdapModifyType::Replace,
+                "given_name",
+                &["Alice"],
+                |r| inserts(r, "first_name"),
+            ),
+            (
+                "jpeg_photo",
+                "lldap_admin",
+                "bob",
+                LdapModifyType::Replace,
+                "jpeg_photo",
+                &[PNG],
+                |r| inserts(r, "avatar"),
+            ),
+            (
+                "ssh_public_key",
+                "lldap_admin",
+                "bob",
+                LdapModifyType::Replace,
+                "ssh_public_key",
+                &["ssh-rsa AAAAB3NzaC1yc2E testuser@host"],
+                |r| inserts(r, "sshpublickey"),
+            ),
+            (
+                "Add givenName",
+                "lldap_admin",
+                "bob",
+                LdapModifyType::Add,
+                "givenName",
+                &["Alice"],
+                |r| inserts(r, "first_name"),
+            ),
+            (
+                "Delete givenName",
+                "lldap_admin",
+                "bob",
+                LdapModifyType::Delete,
+                "givenName",
+                &[],
+                |r| {
+                    r.delete_attributes
+                        .iter()
+                        .any(|a| a.as_str() == "first_name")
+                },
+            ),
+        ];
+        for (label, group, target, operation, atype, vals, check) in cases {
+            let mut mock = MockTestBackendHandler::new();
+            setup_default_ldap_mock(&mut mock);
+            let target_id = UserId::new(target);
+            mock.expect_update_user()
+                .withf(move |req| req.user_id == target_id && check(req))
+                .times(1)
+                .return_once(|_| Ok(()));
+            let ldap_handler = setup_bound_handler_with_group(mock, group).await;
+            assert_eq!(
+                ldap_handler
+                    .do_modify_request(&modify_request(target, operation, atype, vals))
+                    .await,
+                make_modify_success_response(),
+                "{label}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_modify_refusals() {
+        let bob = "uid=bob,ou=people,dc=example,dc=com";
+        type Case<'a> = (
+            &'a str,
+            &'a str,
+            &'a str,
+            LdapModifyType,
+            &'a str,
+            &'a [&'a str],
+            LdapResultCode,
+            &'a str,
+        );
+        let cases: Vec<Case> = vec![
+            (
+                "password under a foreign base DN",
+                "lldap_admin",
+                "uid=bob,ou=people,dc=example,dc=fr",
+                LdapModifyType::Replace,
+                "userPassword",
+                &["newpassword"],
+                LdapResultCode::InvalidDNSyntax,
+                "Invalid username: Not a subtree of the base tree",
+            ),
+            (
+                "mail as password manager",
+                "lldap_password_manager",
+                bob,
+                LdapModifyType::Replace,
+                "mail",
+                &["bob.smith@example.com"],
+                LdapResultCode::InsufficentAccessRights,
+                "User `test` cannot modify user `bob` (no write permission)",
+            ),
+            (
+                "Replace of an unsupported attribute",
+                "lldap_admin",
+                bob,
+                LdapModifyType::Replace,
+                "title",
+                &["Manager"],
+                LdapResultCode::UnwillingToPerform,
+                "Unsupported attribute for LDAP Modify: title (supported: givenName, sn, cn, mail, avatar, sshPublicKey, userPassword)",
+            ),
+            (
+                "Delete of mail",
+                "lldap_admin",
+                bob,
+                LdapModifyType::Delete,
+                "mail",
+                &[],
+                LdapResultCode::InsufficentAccessRights,
+                "Deletion of `mail` is not allowed via LDAP Modify (use GraphQL or protected path)",
+            ),
+            (
+                "Delete of email",
+                "lldap_admin",
+                bob,
+                LdapModifyType::Delete,
+                "email",
+                &[],
+                LdapResultCode::InsufficentAccessRights,
+                "Deletion of `email` is not allowed via LDAP Modify (use GraphQL or protected path)",
+            ),
+            (
+                "Delete of cn",
+                "lldap_admin",
+                bob,
+                LdapModifyType::Delete,
+                "cn",
+                &[],
+                LdapResultCode::InsufficentAccessRights,
+                "Deletion of `cn` is not allowed via LDAP Modify (use GraphQL or protected path)",
+            ),
+            (
+                "Delete of displayname",
+                "lldap_admin",
+                bob,
+                LdapModifyType::Delete,
+                "displayname",
+                &[],
+                LdapResultCode::InsufficentAccessRights,
+                "Deletion of `displayname` is not allowed via LDAP Modify (use GraphQL or protected path)",
+            ),
+            (
+                "Delete of commonname",
+                "lldap_admin",
+                bob,
+                LdapModifyType::Delete,
+                "commonname",
+                &[],
+                LdapResultCode::InsufficentAccessRights,
+                "Deletion of `commonname` is not allowed via LDAP Modify (use GraphQL or protected path)",
+            ),
+            (
+                "Replace of ou",
+                "lldap_admin",
+                bob,
+                LdapModifyType::Replace,
+                "ou",
+                &["labs"],
+                LdapResultCode::UnwillingToPerform,
+                "Direct modification of 'ou' via LDAP Modify is not supported.",
+            ),
+            (
+                "Replace without values",
+                "lldap_admin",
+                bob,
+                LdapModifyType::Replace,
+                "givenName",
+                &[],
+                LdapResultCode::InvalidAttributeSyntax,
+                "No values provided for givenName",
+            ),
+            (
+                "Add without values",
+                "lldap_admin",
+                bob,
+                LdapModifyType::Add,
+                "givenName",
+                &[],
+                LdapResultCode::InvalidAttributeSyntax,
+                "No values provided for givenName",
+            ),
+            (
+                "Add of an unsupported attribute",
+                "lldap_admin",
+                bob,
+                LdapModifyType::Add,
+                "title",
+                &["Boss"],
+                LdapResultCode::UnwillingToPerform,
+                "Add not supported for title",
+            ),
+            (
+                "Delete of an unsupported attribute",
+                "lldap_admin",
+                bob,
+                LdapModifyType::Delete,
+                "title",
+                &[],
+                LdapResultCode::UnwillingToPerform,
+                "Deletion not supported for title",
+            ),
+        ];
+        for (label, group, dn, operation, atype, vals, code, message) in cases {
+            let mut mock = MockTestBackendHandler::new();
+            setup_default_ldap_mock(&mut mock);
+            let ldap_handler = setup_bound_handler_with_group(mock, group).await;
+            assert_eq!(
+                ldap_handler
+                    .do_modify_request(&modify_request_at(dn, operation, atype, vals))
+                    .await,
+                make_modify_failure_response(code, message),
+                "{label}"
+            );
         }
     }
 
@@ -984,126 +962,67 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_modify_ou_is_refused() {
-        let mut mock = MockTestBackendHandler::new();
-        setup_default_ldap_mock(&mut mock);
-        let ldap_handler = setup_bound_admin_handler(mock).await;
-        assert_eq!(
-            ldap_handler
-                .do_modify_request(&make_profile_modify_request("bob", "ou", "labs"))
-                .await,
-            make_modify_failure_response(
-                LdapResultCode::UnwillingToPerform,
-                "Direct modification of 'ou' via LDAP Modify is not supported."
-            )
+    async fn test_modify_ssh_key_list_ops() {
+        type Case<'a> = (
+            &'a str,
+            &'a [&'a str],
+            LdapModifyType,
+            &'a [&'a str],
+            Option<Vec<&'a str>>,
         );
-    }
-
-    #[tokio::test]
-    async fn test_modify_add_ssh_key_merges_with_existing_keys() {
-        let mut mock = mock_with_ssh_keys(&["ssh-ed25519 AAA old"]);
-        mock.expect_update_user()
-            .withf(|req| {
-                ssh_keys_of(req)
-                    == Some(vec![
-                        "ssh-ed25519 AAA old".to_string(),
-                        "ssh-ed25519 BBB new".to_string(),
-                    ])
-            })
-            .times(1)
-            .return_once(|_| Ok(()));
-        let ldap_handler = setup_bound_admin_handler(mock).await;
-        let request = modify_request(
-            "bob",
-            LdapModifyType::Add,
-            "sshPublicKey",
-            &["ssh-ed25519 BBB new", "ssh-ed25519 AAA old"],
-        );
-        assert_eq!(
-            ldap_handler.do_modify_request(&request).await,
-            make_modify_success_response()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_modify_delete_ssh_key_values_keeps_the_rest() {
-        let mut mock = mock_with_ssh_keys(&["ssh-ed25519 AAA", "ssh-ed25519 BBB"]);
-        mock.expect_update_user()
-            .withf(|req| ssh_keys_of(req) == Some(vec!["ssh-ed25519 BBB".to_string()]))
-            .times(1)
-            .return_once(|_| Ok(()));
-        let ldap_handler = setup_bound_admin_handler(mock).await;
-        let request = modify_request(
-            "bob",
-            LdapModifyType::Delete,
-            "sshPublicKey",
-            &["ssh-ed25519 AAA"],
-        );
-        assert_eq!(
-            ldap_handler.do_modify_request(&request).await,
-            make_modify_success_response()
-        );
-    }
-
-    #[tokio::test]
-    async fn test_modify_delete_all_ssh_keys_removes_the_attribute() {
-        for vals in [&[][..], &["ssh-ed25519 AAA"][..]] {
-            let mut mock = mock_with_ssh_keys(&["ssh-ed25519 AAA"]);
+        let cases: Vec<Case> = vec![
+            (
+                "Add merges with the stored keys and dedups",
+                &["ssh-ed25519 AAA old"],
+                LdapModifyType::Add,
+                &["ssh-ed25519 BBB new", "ssh-ed25519 AAA old"],
+                Some(vec!["ssh-ed25519 AAA old", "ssh-ed25519 BBB new"]),
+            ),
+            (
+                "Delete of one value keeps the rest",
+                &["ssh-ed25519 AAA", "ssh-ed25519 BBB"],
+                LdapModifyType::Delete,
+                &["ssh-ed25519 AAA"],
+                Some(vec!["ssh-ed25519 BBB"]),
+            ),
+            (
+                "Delete without values removes the attribute",
+                &["ssh-ed25519 AAA"],
+                LdapModifyType::Delete,
+                &[],
+                None,
+            ),
+            (
+                "Delete of the last value removes the attribute",
+                &["ssh-ed25519 AAA"],
+                LdapModifyType::Delete,
+                &["ssh-ed25519 AAA"],
+                None,
+            ),
+        ];
+        for (label, existing, operation, vals, kept) in cases {
+            let mut mock = mock_with_ssh_keys(existing);
+            let kept: Option<Vec<String>> =
+                kept.map(|keys| keys.into_iter().map(str::to_owned).collect());
             mock.expect_update_user()
-                .withf(|req| {
-                    req.insert_attributes.is_empty()
-                        && req.delete_attributes == vec![AttributeName::from("sshpublickey")]
+                .withf(move |req| match &kept {
+                    Some(keys) => ssh_keys_of(req) == Some(keys.clone()),
+                    None => {
+                        req.insert_attributes.is_empty()
+                            && req.delete_attributes == vec![AttributeName::from("sshpublickey")]
+                    }
                 })
                 .times(1)
                 .return_once(|_| Ok(()));
             let ldap_handler = setup_bound_admin_handler(mock).await;
-            let request = modify_request("bob", LdapModifyType::Delete, "sshPublicKey", vals);
             assert_eq!(
-                ldap_handler.do_modify_request(&request).await,
+                ldap_handler
+                    .do_modify_request(&modify_request("bob", operation, "sshPublicKey", vals))
+                    .await,
                 make_modify_success_response(),
-                "{vals:?}"
+                "{label}"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn test_modify_without_values_is_invalid_syntax() {
-        for operation in [LdapModifyType::Replace, LdapModifyType::Add] {
-            let mut mock = MockTestBackendHandler::new();
-            setup_default_ldap_mock(&mut mock);
-            let ldap_handler = setup_bound_admin_handler(mock).await;
-            let request = modify_request("bob", operation, "givenName", &[]);
-            assert_eq!(
-                ldap_handler.do_modify_request(&request).await,
-                make_modify_failure_response(
-                    LdapResultCode::InvalidAttributeSyntax,
-                    "No values provided for givenName"
-                )
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn test_modify_add_of_unsupported_attribute_is_refused() {
-        let mut mock = MockTestBackendHandler::new();
-        setup_default_ldap_mock(&mut mock);
-        let ldap_handler = setup_bound_admin_handler(mock).await;
-        let request = make_add_modify_request("bob", "title", "Boss");
-        assert_eq!(
-            ldap_handler.do_modify_request(&request).await,
-            make_modify_failure_response(
-                LdapResultCode::UnwillingToPerform,
-                "Add not supported for title"
-            )
-        );
-        let request = modify_request("bob", LdapModifyType::Delete, "title", &[]);
-        assert_eq!(
-            ldap_handler.do_modify_request(&request).await,
-            make_modify_failure_response(
-                LdapResultCode::UnwillingToPerform,
-                "Deletion not supported for title"
-            )
-        );
     }
 
     fn synced_user(uid: &lldap_domain::types::UserId) -> lldap_domain::types::User {
@@ -1127,100 +1046,70 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    #[serial]
-    async fn test_modify_password_syncs_when_enabled() {
-        use mockall::predicate::eq;
-        let guard = RecordingGuard::install();
-        let mut mock = MockTestBackendHandler::new();
-        mock.expect_get_user_details()
-            .with(eq(UserId::new("bob")))
-            .returning(|uid| Ok(synced_user(uid)));
-        setup_default_ldap_mock(&mut mock);
-        expect_password_change(&mut mock, "bob");
-        let ldap_handler = setup_bound_admin_handler(mock).await;
-        assert_eq!(
-            ldap_handler
-                .do_modify_request(&make_password_modify_request("bob"))
-                .await,
-            make_modify_success_response()
-        );
-        assert_eq!(
-            guard.recorder().take_ops(),
-            vec![KerberosOp::SyncPrincipal {
-                username: "bob".into(),
-                password: "newpassword".into(),
-            }]
-        );
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_modify_password_skips_when_sync_disabled() {
-        let guard = RecordingGuard::install();
-        let mut mock = MockTestBackendHandler::new();
-        setup_default_ldap_mock(&mut mock);
-        expect_password_change(&mut mock, "bob");
-        let ldap_handler = setup_bound_admin_handler(mock).await;
-        assert_eq!(
-            ldap_handler
-                .do_modify_request(&make_password_modify_request("bob"))
-                .await,
-            make_modify_success_response()
-        );
-        assert!(guard.recorder().take_ops().is_empty());
+    fn lldap_disabled_membership() -> HashSet<GroupDetails> {
+        let mut set = HashSet::new();
+        set.insert(GroupDetails {
+            group_id: GroupId(2),
+            display_name: "lldap_disabled".into(),
+            creation_date: chrono::Utc::now().naive_utc(),
+            modified_date: chrono::Utc::now().naive_utc(),
+            uuid: lldap_domain::types::Uuid::from_name_and_date(
+                "lldap_disabled",
+                &chrono::Utc::now().naive_utc(),
+            ),
+            attributes: vec![],
+        });
+        set
     }
 
     // Setting a password for a kerberossync=1 user already in lldap_disabled must still
     // succeed: re-asserting -allow_tix is best-effort.
     #[tokio::test]
     #[serial]
-    async fn test_modify_password_born_disabled_reasserts_and_succeeds() {
+    async fn test_modify_password_kerberos_matrix() {
         use mockall::predicate::eq;
         let guard = RecordingGuard::install();
-        let mut mock = MockTestBackendHandler::new();
-        mock.expect_get_user_details()
-            .with(eq(UserId::new("bob")))
-            .returning(|uid| Ok(synced_user(uid)));
-        mock.expect_get_user_groups()
-            .with(eq(UserId::new("bob")))
-            .returning(|_| {
-                let mut set = HashSet::new();
-                set.insert(GroupDetails {
-                    group_id: GroupId(2),
-                    display_name: "lldap_disabled".into(),
-                    creation_date: chrono::Utc::now().naive_utc(),
-                    modified_date: chrono::Utc::now().naive_utc(),
-                    uuid: lldap_domain::types::Uuid::from_name_and_date(
-                        "lldap_disabled",
-                        &chrono::Utc::now().naive_utc(),
-                    ),
-                    attributes: vec![],
-                });
-                Ok(set)
-            });
-        setup_default_ldap_mock(&mut mock);
-        expect_password_change(&mut mock, "bob");
-
-        let ldap_handler = setup_bound_admin_handler(mock).await;
-        assert_eq!(
-            ldap_handler
-                .do_modify_request(&make_password_modify_request("bob"))
-                .await,
-            make_modify_success_response()
-        );
-        assert_eq!(
-            guard.recorder().take_ops(),
-            vec![
-                KerberosOp::SyncPrincipal {
+        let cases = [
+            ("sync enabled", true, false),
+            ("sync disabled", false, false),
+            ("born disabled reasserts and succeeds", true, true),
+        ];
+        for (label, synced, disabled) in cases {
+            let mut mock = MockTestBackendHandler::new();
+            if synced {
+                mock.expect_get_user_details()
+                    .with(eq(UserId::new("bob")))
+                    .returning(|uid| Ok(synced_user(uid)));
+            }
+            if disabled {
+                mock.expect_get_user_groups()
+                    .with(eq(UserId::new("bob")))
+                    .returning(|_| Ok(lldap_disabled_membership()));
+            }
+            setup_default_ldap_mock(&mut mock);
+            expect_password_change(&mut mock, "bob");
+            let ldap_handler = setup_bound_admin_handler(mock).await;
+            assert_eq!(
+                ldap_handler
+                    .do_modify_request(&make_password_modify_request("bob"))
+                    .await,
+                make_modify_success_response(),
+                "{label}"
+            );
+            let mut expected = vec![];
+            if synced {
+                expected.push(KerberosOp::SyncPrincipal {
                     username: "bob".into(),
                     password: "newpassword".into(),
-                },
-                KerberosOp::SetEnabled {
+                });
+            }
+            if disabled {
+                expected.push(KerberosOp::SetEnabled {
                     username: "bob".into(),
                     enabled: false,
-                },
-            ]
-        );
+                });
+            }
+            assert_eq!(guard.recorder().take_ops(), expected, "{label}");
+        }
     }
 }

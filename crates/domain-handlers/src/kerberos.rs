@@ -210,17 +210,13 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[test]
-    fn test_domain_from_base_dn_joins_dc_components() {
+    fn test_domain_and_realm_from_base_dn() {
         assert_eq!(domain_from_base_dn("dc=gate,dc=test"), "gate.test");
         assert_eq!(domain_from_base_dn("dc=Example,dc=COM"), "example.com");
         assert_eq!(
             domain_from_base_dn("ou=people,dc=example,dc=com"),
             "example.com"
         );
-    }
-
-    #[test]
-    fn test_realm_prefers_non_empty_override_and_uppercases() {
         assert_eq!(realm_from(None, "dc=gate,dc=test"), "GATE.TEST");
         assert_eq!(realm_from(Some(""), "dc=gate,dc=test"), "GATE.TEST");
         assert_eq!(
@@ -230,15 +226,7 @@ mod tests {
     }
 
     #[test]
-    fn test_principal_name_is_user_at_realm() {
-        assert_eq!(
-            format!("bob@{}", realm_from(Some("gate.test"), "dc=unused,dc=com")),
-            "bob@GATE.TEST"
-        );
-    }
-
-    #[test]
-    fn test_validate_kerberos_username_accepts_directory_ids() {
+    fn test_username_validators() {
         for name in [
             "bob",
             "admin",
@@ -249,23 +237,6 @@ mod tests {
         ] {
             assert_eq!(validate_kerberos_username(name), Ok(()), "{name}");
         }
-    }
-
-    #[test]
-    fn test_validate_directory_username_allows_quotes_rejects_reserved() {
-        assert_eq!(
-            validate_directory_username(r#"bob"e"i'o;aü"#),
-            Ok(()),
-            "SQL-injection fixture ids must still insert"
-        );
-        assert!(validate_directory_username("krbtgt").is_err());
-        assert!(validate_directory_username("bob/admin").is_err());
-        assert!(validate_directory_username("bob@realm").is_err());
-        assert!(validate_directory_username("bob principal").is_err());
-    }
-
-    #[test]
-    fn test_validate_kerberos_username_rejects_injection_and_reserved() {
         for name in [
             "",
             "bob/admin",
@@ -284,17 +255,24 @@ mod tests {
                 "expected {name:?} to be rejected"
             );
         }
-    }
-
-    #[test]
-    fn test_validate_keytab_hostname_accepts_dns_and_ipv4() {
-        for host in ["keycloak", "keycloak.example.com", "192.168.1.10"] {
-            assert_eq!(validate_keytab_hostname(host), Ok(()), "{host}");
+        assert_eq!(
+            validate_directory_username(r#"bob"e"i'o;aü"#),
+            Ok(()),
+            "SQL-injection fixture ids must still insert"
+        );
+        for name in ["krbtgt", "bob/admin", "bob@realm", "bob principal"] {
+            assert!(
+                validate_directory_username(name).is_err(),
+                "expected {name:?} to be rejected"
+            );
         }
     }
 
     #[test]
-    fn test_validate_keytab_hostname_rejects_kadmin_injection() {
+    fn test_validate_keytab_hostname() {
+        for host in ["keycloak", "keycloak.example.com", "192.168.1.10"] {
+            assert_eq!(validate_keytab_hostname(host), Ok(()), "{host}");
+        }
         for host in [
             "",
             "foo\ndelprinc admin/admin",

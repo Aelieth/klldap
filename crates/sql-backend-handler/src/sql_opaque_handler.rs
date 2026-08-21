@@ -481,12 +481,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_disabled_user_cannot_login() {
+    async fn test_disabled_membership_refuses_the_bind_without_leaking_why() {
         let sql_pool = get_initialized_db().await;
         let handler = SqlOpaqueHandler::new(generate_random_private_key(), sql_pool.clone());
         insert_user(&handler, "bob", "bob00").await;
+        assert!(
+            !handler.is_user_disabled(&UserId::new("bob")).await.unwrap(),
+            "fresh user is not disabled"
+        );
         let disabled_gid = insert_group(&handler, "lldap_disabled").await;
         insert_membership(&handler, disabled_gid, "bob").await;
+        assert!(
+            handler.is_user_disabled(&UserId::new("bob")).await.unwrap(),
+            "membership in lldap_disabled must be detected"
+        );
 
         let err = handler
             .bind(BindRequest {
@@ -503,23 +511,6 @@ mod tests {
         assert!(
             !msg.to_lowercase().contains("disabled"),
             "must not leak account-disabled to the client: {msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_is_user_disabled_follows_membership() {
-        let sql_pool = get_initialized_db().await;
-        let handler = SqlOpaqueHandler::new(generate_random_private_key(), sql_pool.clone());
-        insert_user(&handler, "bob", "bob00").await;
-        assert!(
-            !handler.is_user_disabled(&UserId::new("bob")).await.unwrap(),
-            "fresh user is not disabled"
-        );
-        let disabled_gid = insert_group(&handler, "lldap_disabled").await;
-        insert_membership(&handler, disabled_gid, "bob").await;
-        assert!(
-            handler.is_user_disabled(&UserId::new("bob")).await.unwrap(),
-            "membership in lldap_disabled must be detected"
         );
     }
 
@@ -625,54 +616,50 @@ mod tests {
                     .await
                     .unwrap_err();
                 assert!(err.to_string().contains("already used"), "{err}");
+
+                // Spend the next step too, or a boundary crossed mid-test refills the
+                // allowance; reserving it first prunes the older steps' counts.
+                let uuid = model::User::find_by_id(UserId::new("bob"))
+                    .one(&handler.sql_pool)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .uuid;
+                let next_step = chrono::Utc::now().timestamp() as u64 + TOTP_STEP_SECS;
+                for _ in 0..TOTP_MAX_ATTEMPTS_PER_STEP {
+                    assert!(
+                        handler
+                            .failed_totp_attempts
+                            .reserve(uuid.as_str(), next_step)
+                    );
+                }
+                for _ in 0..TOTP_MAX_ATTEMPTS_PER_STEP {
+                    let (_, wrong) = fresh_and_wrong(&seed);
+                    let _ = handler
+                        .bind(bind_request("bob", &format!("bob00:{wrong}")))
+                        .await;
+                }
+                // The gate runs before verification: even a valid code is refused.
+                let (fresh, _) = fresh_and_wrong(&seed);
+                let err = handler
+                    .bind(bind_request("bob", &format!("bob00:{fresh}")))
+                    .await
+                    .unwrap_err();
+                assert!(err.to_string().contains("Too many TOTP attempts"), "{err}");
             },
         )
         .await;
         let row =
             |success, detail: Option<&str>| (LogKind::Bind, success, detail.map(str::to_owned));
-        assert_eq!(
-            auth_rows(&guard, peer),
-            vec![
-                row(false, Some("invalid totp")),
-                row(false, Some("invalid credentials")),
-                row(true, Some("totp")),
-                row(false, Some("totp replayed")),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn test_bind_totp_attempts_are_limited() {
-        let handler = mfa_handler(MfaPolicy::Enrolled).await;
-        insert_user(&handler, "bob", "bob00").await;
-        let seed = enroll(&handler, "bob").await;
-        let uuid = model::User::find_by_id(UserId::new("bob"))
-            .one(&handler.sql_pool)
-            .await
-            .unwrap()
-            .unwrap()
-            .uuid;
-        // Spend the next step too, or a boundary crossed mid-test refills the allowance.
-        let next_step = chrono::Utc::now().timestamp() as u64 + TOTP_STEP_SECS;
-        for _ in 0..TOTP_MAX_ATTEMPTS_PER_STEP {
-            assert!(
-                handler
-                    .failed_totp_attempts
-                    .reserve(uuid.as_str(), next_step)
-            );
-        }
-        for _ in 0..TOTP_MAX_ATTEMPTS_PER_STEP {
-            let (_, wrong) = fresh_and_wrong(&seed);
-            let _ = handler
-                .bind(bind_request("bob", &format!("bob00:{wrong}")))
-                .await;
-        }
-        let (fresh, _) = fresh_and_wrong(&seed);
-        let err = handler
-            .bind(bind_request("bob", &format!("bob00:{fresh}")))
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("Too many TOTP attempts"), "{err}");
+        let mut expected = vec![
+            row(false, Some("invalid totp")),
+            row(false, Some("invalid credentials")),
+            row(true, Some("totp")),
+            row(false, Some("totp replayed")),
+        ];
+        expected.extend((0..TOTP_MAX_ATTEMPTS_PER_STEP).map(|_| row(false, Some("invalid totp"))));
+        expected.push(row(false, Some("totp attempts exceeded")));
+        assert_eq!(auth_rows(&guard, peer), expected);
     }
 
     #[tokio::test]

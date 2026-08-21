@@ -506,74 +506,6 @@ mod tests {
     use pretty_assertions::assert_eq;
     use std::collections::{BTreeMap, HashSet};
 
-    #[test]
-    fn test_default_object_classes_include_the_hub_extras() {
-        let users: Vec<String> = get_default_user_object_classes()
-            .into_iter()
-            .map(|c| c.to_string())
-            .collect();
-        for class in [
-            "top",
-            "person",
-            "inetOrgPerson",
-            "posixAccount",
-            "ldapPublicKey",
-        ] {
-            assert!(users.contains(&class.to_string()), "{class}");
-        }
-        let groups: Vec<String> = get_default_group_object_classes()
-            .into_iter()
-            .map(|c| c.to_string())
-            .collect();
-        for class in ["groupOfUniqueNames", "groupOfNames", "posixGroup"] {
-            assert!(groups.contains(&class.to_string()), "{class}");
-        }
-    }
-
-    #[test]
-    fn test_cached_schema_names_include_canonical_names_and_aliases() {
-        assert!(USER_SCHEMA_ATTRIBUTE_NAMES.contains("mail"));
-        assert!(USER_SCHEMA_ATTRIBUTE_NAMES.contains("email"));
-        assert!(!USER_SCHEMA_ATTRIBUTE_NAMES.contains("mycustomattr"));
-        assert!(GROUP_SCHEMA_ATTRIBUTE_NAMES.contains("displayname"));
-        assert!(GROUP_SCHEMA_ATTRIBUTE_NAMES.contains("cn"));
-        assert!(!GROUP_SCHEMA_ATTRIBUTE_NAMES.contains("mycustomattr"));
-    }
-
-    #[test]
-    fn test_result_entry_emits_custom_attribute_and_hides_schema_named_one() {
-        let user = User {
-            user_id: UserId::new("bob"),
-            email: "bob@example.com".into(),
-            attributes: vec![
-                Attribute {
-                    name: AttributeName::from("mycustomattr"),
-                    value: vec!["hello".to_string()].into(),
-                },
-                Attribute {
-                    name: AttributeName::from("mail"),
-                    value: vec!["skip".to_string()].into(),
-                },
-            ],
-            ..Default::default()
-        };
-        let expanded = ExpandedAttributes {
-            attribute_keys: BTreeMap::new(),
-            include_custom_attributes: true,
-            include_operational_attributes: false,
-        };
-        let entry = make_ldap_search_user_result_entry(
-            user,
-            "dc=example,dc=com",
-            expanded,
-            None,
-            &[],
-            PublicSchema::shared(),
-        );
-        assert!(entry.attributes.iter().any(|a| a.atype == "mycustomattr"));
-        assert!(!entry.attributes.iter().any(|a| a.atype == "mail"));
-    }
-
     fn sample_user() -> User {
         let epoch = chrono::Utc.timestamp_opt(0, 0).unwrap().naive_utc();
         User {
@@ -611,138 +543,33 @@ mod tests {
             .collect()
     }
 
-    fn expand_and_user(attrs: &[&str]) -> HashSet<String> {
-        let schema = PublicSchema::shared();
-        let expanded = crate::schema::SchemaManager::default().expand_attribute_wildcards(
+    fn expanded(attrs: &[&str]) -> ExpandedAttributes {
+        crate::schema::SchemaManager::default().expand_attribute_wildcards(
             &attrs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
-            schema,
-        );
-        emitted(&make_ldap_search_user_result_entry(
-            sample_user(),
-            "dc=example,dc=com",
-            expanded,
-            None,
-            &[],
-            schema,
-        ))
-    }
-
-    fn expand_and_group(attrs: &[&str]) -> HashSet<String> {
-        let schema = PublicSchema::shared();
-        let expanded = crate::schema::SchemaManager::default().expand_attribute_wildcards(
-            &attrs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
-            schema,
-        );
-        emitted(&make_ldap_search_group_result_entry(
-            sample_group(),
-            "dc=example,dc=com",
-            expanded,
-            &None,
-            &[],
-            schema,
-        ))
-    }
-
-    #[test]
-    fn test_user_result_star_excludes_operational_and_plus_injects() {
-        let star = expand_and_user(&["*"]);
-        assert!(star.contains("uid"));
-        assert!(star.contains("mail"));
-        assert!(star.contains("objectclass"));
-        for op in [
-            "createtimestamp",
-            "hassubordinates",
-            "creatorsname",
-            "entryuuid",
-            "entrydn",
-        ] {
-            assert!(!star.contains(op), "* {op}");
-        }
-
-        let plus = expand_and_user(&["+"]);
-        assert!(plus.contains("uid"));
-        assert!(plus.contains("createtimestamp"));
-        assert!(plus.contains("modifytimestamp"));
-        assert!(plus.contains("pwdchangedtime"));
-        assert!(plus.contains("entryuuid"));
-        assert!(plus.contains("entrydn"));
-        assert!(plus.contains("hassubordinates"));
-        assert!(plus.contains("structuralobjectclass"));
-        assert!(plus.contains("subschemasubentry"));
-        assert!(plus.contains("creatorsname"));
-        assert!(plus.contains("modifiersname"));
-        assert!(!plus.contains("logindisabled"));
-    }
-
-    #[test]
-    fn test_user_result_explicit_login_disabled_omits_injected_ops() {
-        // Explicit loginDisabled/sudoHost must not switch the injected operational
-        // attributes on.
-        for virt in ["loginDisabled", "sudoHost"] {
-            let e = expand_and_user(&[virt]);
-            for op in [
-                "hassubordinates",
-                "structuralobjectclass",
-                "subschemasubentry",
-                "creatorsname",
-                "modifiersname",
-            ] {
-                assert!(!e.contains(op), "{virt}: {op}");
-            }
-        }
-    }
-
-    #[test]
-    fn test_group_result_star_excludes_operational_and_plus_injects() {
-        let star = expand_and_group(&["*"]);
-        assert!(star.contains("cn"));
-        assert!(!star.contains("createtimestamp"));
-        assert!(!star.contains("hassubordinates"));
-
-        let plus = expand_and_group(&["+"]);
-        assert!(plus.contains("cn"));
-        assert!(plus.contains("createtimestamp"));
-        assert!(plus.contains("hassubordinates"));
-        assert!(plus.contains("creatorsname"));
-        assert!(plus.contains("entryuuid"));
+            PublicSchema::shared(),
+        )
     }
 
     fn user_entry(attrs: &[&str]) -> LdapSearchResultEntry {
-        let schema = PublicSchema::shared();
-        let expanded = crate::schema::SchemaManager::default().expand_attribute_wildcards(
-            &attrs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
-            schema,
-        );
         make_ldap_search_user_result_entry(
             sample_user(),
             "dc=example,dc=com",
-            expanded,
+            expanded(attrs),
             None,
             &[],
-            schema,
+            PublicSchema::shared(),
         )
     }
 
     fn group_entry(attrs: &[&str]) -> LdapSearchResultEntry {
-        let schema = PublicSchema::shared();
-        let expanded = crate::schema::SchemaManager::default().expand_attribute_wildcards(
-            &attrs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
-            schema,
-        );
         make_ldap_search_group_result_entry(
             sample_group(),
             "dc=example,dc=com",
-            expanded,
+            expanded(attrs),
             &None,
             &[],
-            schema,
+            PublicSchema::shared(),
         )
-    }
-
-    #[test]
-    fn test_group_entry_emits_the_primary_id_as_groupid() {
-        let entry = group_entry(&["groupid"]);
-        assert_eq!(atype_vals(&entry, "groupid"), Some(&vec![b"1".to_vec()]));
     }
 
     fn atype_vals<'a>(entry: &'a LdapSearchResultEntry, atype: &str) -> Option<&'a Vec<Vec<u8>>> {
@@ -751,6 +578,190 @@ mod tests {
             .iter()
             .find(|a| a.atype == atype)
             .map(|a| &a.vals)
+    }
+
+    #[test]
+    fn test_schema_statics_are_pinned() {
+        let users: Vec<String> = get_default_user_object_classes()
+            .into_iter()
+            .map(|c| c.to_string())
+            .collect();
+        for class in [
+            "top",
+            "person",
+            "inetOrgPerson",
+            "posixAccount",
+            "ldapPublicKey",
+        ] {
+            assert!(users.contains(&class.to_string()), "{class}");
+        }
+        let groups: Vec<String> = get_default_group_object_classes()
+            .into_iter()
+            .map(|c| c.to_string())
+            .collect();
+        for class in ["groupOfUniqueNames", "groupOfNames", "posixGroup"] {
+            assert!(groups.contains(&class.to_string()), "{class}");
+        }
+        assert!(USER_SCHEMA_ATTRIBUTE_NAMES.contains("mail"));
+        assert!(USER_SCHEMA_ATTRIBUTE_NAMES.contains("email"));
+        assert!(!USER_SCHEMA_ATTRIBUTE_NAMES.contains("mycustomattr"));
+        assert!(GROUP_SCHEMA_ATTRIBUTE_NAMES.contains("displayname"));
+        assert!(GROUP_SCHEMA_ATTRIBUTE_NAMES.contains("cn"));
+        assert!(!GROUP_SCHEMA_ATTRIBUTE_NAMES.contains("mycustomattr"));
+    }
+
+    #[test]
+    fn test_result_entry_emits_custom_attribute_and_hides_schema_named_one() {
+        let custom_only = || ExpandedAttributes {
+            attribute_keys: BTreeMap::new(),
+            include_custom_attributes: true,
+            include_operational_attributes: false,
+        };
+        let user = User {
+            user_id: UserId::new("bob"),
+            email: "bob@example.com".into(),
+            attributes: vec![
+                Attribute {
+                    name: AttributeName::from("mycustomattr"),
+                    value: vec!["hello".to_string()].into(),
+                },
+                Attribute {
+                    name: AttributeName::from("mail"),
+                    value: vec!["skip".to_string()].into(),
+                },
+            ],
+            ..Default::default()
+        };
+        let entry = make_ldap_search_user_result_entry(
+            user,
+            "dc=example,dc=com",
+            custom_only(),
+            None,
+            &[],
+            PublicSchema::shared(),
+        );
+        assert!(entry.attributes.iter().any(|a| a.atype == "mycustomattr"));
+        assert!(!entry.attributes.iter().any(|a| a.atype == "mail"));
+
+        let mut group = sample_group();
+        group.attributes = vec![
+            Attribute {
+                name: AttributeName::from("mycustomattr"),
+                value: vec!["hello".to_string()].into(),
+            },
+            Attribute {
+                name: AttributeName::from("displayname"),
+                value: vec!["skip".to_string()].into(),
+            },
+        ];
+        let entry = make_ldap_search_group_result_entry(
+            group,
+            "dc=example,dc=com",
+            custom_only(),
+            &None,
+            &[],
+            PublicSchema::shared(),
+        );
+        assert!(entry.attributes.iter().any(|a| a.atype == "mycustomattr"));
+        assert!(!entry.attributes.iter().any(|a| a.atype == "displayname"));
+    }
+
+    #[test]
+    fn test_entry_star_plus_and_explicit_virtuals() {
+        const INJECTED: [&str; 5] = [
+            "hassubordinates",
+            "structuralobjectclass",
+            "subschemasubentry",
+            "creatorsname",
+            "modifiersname",
+        ];
+        type Case<'a> = (&'a str, bool, &'a [&'a str], Vec<&'a str>, Vec<&'a str>);
+        let cases: Vec<Case> = vec![
+            (
+                "user *",
+                false,
+                &["*"],
+                vec!["uid", "mail", "objectclass"],
+                vec![
+                    "createtimestamp",
+                    "hassubordinates",
+                    "creatorsname",
+                    "entryuuid",
+                    "entrydn",
+                ],
+            ),
+            (
+                "user +",
+                false,
+                &["+"],
+                vec![
+                    "uid",
+                    "createtimestamp",
+                    "modifytimestamp",
+                    "pwdchangedtime",
+                    "entryuuid",
+                    "entrydn",
+                    "hassubordinates",
+                    "structuralobjectclass",
+                    "subschemasubentry",
+                    "creatorsname",
+                    "modifiersname",
+                ],
+                vec!["logindisabled"],
+            ),
+            (
+                "user loginDisabled: deliberate, an explicit virtual injects no operational attributes",
+                false,
+                &["loginDisabled"],
+                vec![],
+                INJECTED.to_vec(),
+            ),
+            (
+                "user sudoHost: deliberate, same rule",
+                false,
+                &["sudoHost"],
+                vec![],
+                INJECTED.to_vec(),
+            ),
+            (
+                "group *",
+                true,
+                &["*"],
+                vec!["cn"],
+                vec!["createtimestamp", "hassubordinates"],
+            ),
+            (
+                "group +",
+                true,
+                &["+"],
+                vec![
+                    "cn",
+                    "createtimestamp",
+                    "hassubordinates",
+                    "creatorsname",
+                    "entryuuid",
+                ],
+                vec![],
+            ),
+        ];
+        for (label, group, attrs, present, absent) in cases {
+            let names = if group {
+                emitted(&group_entry(attrs))
+            } else {
+                emitted(&user_entry(attrs))
+            };
+            for name in present {
+                assert!(names.contains(name), "{label}: missing {name}");
+            }
+            for name in absent {
+                assert!(!names.contains(name), "{label}: unexpected {name}");
+            }
+        }
+        assert_eq!(
+            atype_vals(&user_entry(&["+"]), "createTimestamp"),
+            Some(&vec![b"19700101000000.000000000Z".to_vec()]),
+            "generalized time"
+        );
     }
 
     #[test]
@@ -786,7 +797,7 @@ mod tests {
     }
 
     #[test]
-    fn test_membership_attributes_agree_and_honor_the_user_filter() {
+    fn test_group_membership_wires_and_group_id() {
         let mut group = sample_group();
         group.users = vec![
             lldap_domain::types::GroupMember {
@@ -823,50 +834,28 @@ mod tests {
         assert_eq!(values("member", Some("bob")), vec![dns[1].clone()]);
         assert_eq!(values("uniqueMember", Some("bob")), vec![dns[1].clone()]);
         assert_eq!(values("memberUid", Some("bob")), vec![b"bob".to_vec()]);
-    }
 
-    #[test]
-    fn test_member_uid_emits_login_names() {
-        // RFC 2307 posixGroup: memberUid is bare login names, sorted and deduped.
-        let mut group = sample_group();
-        group.users = vec![
-            lldap_domain::types::GroupMember {
-                user_id: UserId::new("bob"),
-                ou: "people".into(),
-            },
-            lldap_domain::types::GroupMember {
-                user_id: UserId::new("alice"),
-                ou: "people".into(),
-            },
-        ];
-        let schema = PublicSchema::shared();
+        // RFC 2307 posixGroup: memberUid is bare login names, sorted and deduped; on `*`,
+        // member and uniqueMember ride along (groupOf(Unique)Names MUST).
         let entry = |attrs: &[&str]| {
-            let expanded = crate::schema::SchemaManager::default().expand_attribute_wildcards(
-                &attrs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
-                schema,
-            );
             make_ldap_search_group_result_entry(
                 group.clone(),
                 "dc=example,dc=com",
-                expanded,
+                expanded(attrs),
                 &None,
                 &[],
                 schema,
             )
         };
-
         let expected = vec![b"alice".to_vec(), b"bob".to_vec()];
         assert_eq!(
             atype_vals(&entry(&["memberUid"]), "memberUid"),
             Some(&expected)
         );
         assert_eq!(atype_vals(&entry(&["*"]), "memberUid"), Some(&expected));
-
         let member_entry = entry(&["member"]);
-        let dns = atype_vals(&member_entry, "member").unwrap();
-        assert!(dns.iter().all(|v| v.starts_with(b"uid=")));
-
-        // On `*`, member and uniqueMember ride along (groupOf(Unique)Names MUST).
+        let member_dns = atype_vals(&member_entry, "member").unwrap();
+        assert!(member_dns.iter().all(|v| v.starts_with(b"uid=")));
         let star = entry(&["*"]);
         for atype in ["member", "uniqueMember"] {
             let vals = atype_vals(&star, atype).unwrap_or_else(|| panic!("* missing {atype}"));
@@ -875,15 +864,17 @@ mod tests {
                 "{atype} not DNs"
             );
         }
-    }
 
-    #[test]
-    fn test_empty_group_omits_membership_on_star() {
         // A memberless group must not emit empty member/uniqueMember/memberUid on `*`.
-        let star = group_entry(&["*"]);
-        assert!(atype_vals(&star, "member").is_none());
-        assert!(atype_vals(&star, "uniqueMember").is_none());
-        assert!(atype_vals(&star, "memberUid").is_none());
+        let empty = group_entry(&["*"]);
+        assert!(atype_vals(&empty, "member").is_none());
+        assert!(atype_vals(&empty, "uniqueMember").is_none());
+        assert!(atype_vals(&empty, "memberUid").is_none());
+
+        assert_eq!(
+            atype_vals(&group_entry(&["groupid"]), "groupid"),
+            Some(&vec![b"1".to_vec()])
+        );
     }
 
     #[test]
@@ -894,29 +885,25 @@ mod tests {
         assert!(atype_vals(&ustar, "member").is_none());
         assert!(atype_vals(&ustar, "uniqueMember").is_none());
         assert!(atype_vals(&ustar, "memberUid").is_none());
-        assert!(atype_vals(&ustar, "gecos").is_some());
-
-        let gstar = group_entry(&["*"]);
-        assert!(atype_vals(&gstar, "gecos").is_none());
-    }
-
-    #[test]
-    fn test_gecos_emits_display_name() {
-        // gecos mirrors display_name; a null display_name omits it.
         let expected = vec![b"Bob".to_vec()];
+        assert_eq!(atype_vals(&ustar, "gecos"), Some(&expected));
         assert_eq!(
             atype_vals(&user_entry(&["gecos"]), "gecos"),
             Some(&expected)
         );
-        assert_eq!(atype_vals(&user_entry(&["*"]), "gecos"), Some(&expected));
+        assert!(atype_vals(&group_entry(&["*"]), "gecos").is_none());
 
+        // gecos mirrors display_name; a null display_name omits it.
         let mut u = sample_user();
         u.display_name = None;
-        let schema = PublicSchema::shared();
-        let exp = crate::schema::SchemaManager::default()
-            .expand_attribute_wildcards(&["gecos".to_string()], schema);
-        let entry =
-            make_ldap_search_user_result_entry(u, "dc=example,dc=com", exp, None, &[], schema);
+        let entry = make_ldap_search_user_result_entry(
+            u,
+            "dc=example,dc=com",
+            expanded(&["gecos"]),
+            None,
+            &[],
+            PublicSchema::shared(),
+        );
         assert!(atype_vals(&entry, "gecos").is_none());
     }
 }

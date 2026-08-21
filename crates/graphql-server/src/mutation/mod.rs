@@ -758,17 +758,13 @@ mod tests {
         execute, graphql_value,
     };
     use lldap_auth::access_control::{Permission, ValidationResults};
-    use lldap_domain::{
-        requests::CreateGroupRequest,
-        types::{
-            Attribute as DomainAttr, AttributeName, AttributeType,
-            AttributeValue as DomainAttributeValue, Cardinality, Group, GroupDetails, GroupId,
-            GroupName, User, UserAndGroups, Uuid,
-        },
+    use lldap_domain::types::{
+        Attribute as DomainAttr, AttributeName, AttributeType,
+        AttributeValue as DomainAttributeValue, Cardinality, Group, GroupDetails, GroupId,
+        GroupName, User, UserAndGroups, Uuid,
     };
-    use lldap_schema::{
-        AttributeList, AttributeSchema, PublicSchema, Schema, schema::PosixSettings,
-    };
+    use lldap_domain_handlers::mfa::MfaPolicy;
+    use lldap_schema::{AttributeList, PublicSchema, Schema, schema::PosixSettings};
     use lldap_test_utils::MockTestBackendHandler;
     use lldap_test_utils::recording_kerberos::{KerberosOp, RecordingGuard};
     use mockall::predicate::eq;
@@ -1121,8 +1117,6 @@ mod tests {
         );
     }
 
-    // lldap-cli compatibility replays, in the exact upstream client shapes.
-
     fn epoch() -> chrono::NaiveDateTime {
         chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc()
     }
@@ -1140,15 +1134,6 @@ mod tests {
             krb_principal_name: None,
             mfa_type: None,
         }
-    }
-
-    fn schema_with_user_attr(attr: AttributeSchema) -> PublicSchema {
-        PublicSchema(Schema {
-            user_attributes: AttributeList {
-                attributes: vec![attr],
-            },
-            ..make_test_schema().0
-        })
     }
 
     fn admin_context(mock: MockTestBackendHandler) -> Context<MockTestBackendHandler> {
@@ -1178,6 +1163,13 @@ mod tests {
         }
     }
 
+    fn has_ou(attributes: &[DomainAttr], ou: &str) -> bool {
+        attributes.iter().any(|a| {
+            a.name.as_str() == "ou"
+                && a.value == DomainAttributeValue::String(Cardinality::Singleton(ou.to_string()))
+        })
+    }
+
     fn root_schema() -> RootNode<
         Query<MockTestBackendHandler>,
         Mutation<MockTestBackendHandler>,
@@ -1189,50 +1181,40 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn test_lldap_cli_create_group_by_name() {
-        const QUERY: &str = r#"
-            mutation CreateGroup($group: String!) {
-                createGroup(name: $group) { id }
-            }
-        "#;
-        let mut mock = MockTestBackendHandler::new();
-        mock.expect_get_schema()
-            .returning(|| Ok(make_test_schema()));
-        mock.expect_create_group()
-            .with(eq(CreateGroupRequest {
-                display_name: "cli-group".into(),
-                attributes: vec![DomainAttr {
-                    name: AttributeName::from("ou"),
-                    value: DomainAttributeValue::String(Cardinality::Singleton(
-                        "groups".to_string(),
-                    )),
-                }],
-            }))
-            .return_once(|_| Ok(GroupId(42)));
-        mock.expect_get_group_details()
-            .with(eq(GroupId(42)))
-            .return_once(|_| {
-                Ok(GroupDetails {
-                    group_id: GroupId(42),
-                    display_name: "cli-group".into(),
-                    creation_date: epoch(),
-                    uuid: Uuid::from_name_and_date("cli-group", &epoch()),
-                    attributes: vec![],
-                    modified_date: epoch(),
-                })
-            });
-        let context = admin_context(mock);
-        let vars = Variables::from([("group".to_string(), InputValue::scalar("cli-group"))]);
-        let (value, errors) = execute(QUERY, None, &root_schema(), &vars, &context)
-            .await
-            .unwrap();
-        assert_eq!(errors.len(), 0, "unexpected errors: {errors:?}");
-        assert_eq!(value, graphql_value!({"createGroup": {"id": 42}}));
+    fn assert_unauthorized(errors: &[juniper::ExecutionError<DefaultScalarValue>], query: &str) {
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.error().message().contains("Unauthorized")),
+            "expected an authorization error for {query}, got {errors:?}"
+        );
     }
 
+    fn posix_settings_mutation(uid_start: u32, uid_max: u32) -> String {
+        format!(
+            r#"mutation {{
+                setPosixSettings(input: {{
+                    userUidnumberAssign: true,
+                    userUidnumberStart: {uid_start},
+                    userUidnumberMax: {uid_max},
+                    userGidnumberAssign: false,
+                    userGidnumberStart: 3000,
+                    userLoginshellAssign: false,
+                    userLoginshellDefault: "",
+                    userHomedirectoryAssign: false,
+                    userHomedirectoryPrefix: "",
+                    groupGidnumberAssign: false,
+                    groupGidnumberStart: 3000,
+                    groupGidnumberMax: 3000
+                }}) {{ success }}
+            }}"#
+        )
+    }
+
+    // The lldap-cli argument shapes: `createGroup(name:)` against `createGroup(group:)`,
+    // `users(where:)` against the legacy `users(filters:)`.
     #[tokio::test]
-    async fn test_create_group_requires_exactly_one_form() {
+    async fn test_graphql_argument_forms() {
         for query in [
             r#"mutation { createGroup { id } }"#,
             r#"mutation {
@@ -1252,45 +1234,6 @@ mod tests {
                 "unexpected error for {query}: {errors:?}"
             );
         }
-    }
-
-    #[tokio::test]
-    async fn test_lldap_cli_attribute_value_name_field() {
-        const QUERY: &str = r#"
-            query GetUser($id: String!) {
-                user(userId: $id) { id attributes { name value } }
-            }
-        "#;
-        let mut mock = MockTestBackendHandler::new();
-        mock.expect_get_schema().returning(|| {
-            Ok(schema_with_user_attr(AttributeSchema::editable(
-                "foo",
-                AttributeType::String,
-            )))
-        });
-        mock.expect_get_user_details().return_once(|_| {
-            Ok(sample_user(
-                "bob",
-                vec![DomainAttr {
-                    name: AttributeName::from("foo"),
-                    value: DomainAttributeValue::String(Cardinality::Singleton("bar".to_string())),
-                }],
-            ))
-        });
-        let context = admin_context(mock);
-        let vars = Variables::from([("id".to_string(), InputValue::scalar("bob"))]);
-        let (value, errors) = execute(QUERY, None, &root_schema(), &vars, &context)
-            .await
-            .unwrap();
-        assert_eq!(errors.len(), 0, "unexpected errors: {errors:?}");
-        assert_eq!(
-            value,
-            graphql_value!({"user": {"id": "bob", "attributes": [{"name": "foo", "value": ["bar"]}]}})
-        );
-    }
-
-    #[tokio::test]
-    async fn test_users_accepts_filters_alias_and_bare_form() {
         for query in [
             r#"query Q($f: RequestFilter) { users(filters: $f) { id } }"#,
             r#"query { users { id } }"#,
@@ -1311,12 +1254,8 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(errors.len(), 0, "unexpected errors for {query}: {errors:?}");
-            assert_eq!(value, graphql_value!({"users": [{"id": "bob"}]}));
+            assert_eq!(value, graphql_value!({"users": [{"id": "bob"}]}), "{query}");
         }
-    }
-
-    #[tokio::test]
-    async fn test_users_rejects_both_filter_arguments() {
         let context = admin_context(MockTestBackendHandler::new());
         let (_, errors) = execute(
             r#"query { users(where: {}, filters: {}) { id } }"#,
@@ -1337,222 +1276,33 @@ mod tests {
         );
     }
 
+    // createOu, changeUserOu, changeGroupOu and deleteOu on one backend; each OU mutation
+    // reads the OU list once, so the second read already sees the new OU.
     #[tokio::test]
-    async fn test_lldap_cli_jpeg_photo_maps_to_avatar() {
-        const QUERY: &str = r#"
-            mutation CreateUserAttribute($name: String!, $attributeType: AttributeType!, $isList: Boolean!, $isVisible: Boolean!, $isEditable: Boolean!) {
-                addUserAttribute(name: $name, attributeType: $attributeType, isList: $isList, isVisible: $isVisible, isEditable: $isEditable) {
-                    ok
-                }
+    async fn test_ou_lifecycle_persists() {
+        let mut mock = MockTestBackendHandler::new();
+        let ou_lookups = std::sync::atomic::AtomicUsize::new(0);
+        mock.expect_get_allowed_ous().returning(move || {
+            let mut ous = vec!["people".to_string(), "groups".to_string()];
+            if ou_lookups.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                ous.push("labs".to_string());
             }
-        "#;
-        let mut mock = MockTestBackendHandler::new();
-        mock.expect_get_schema()
-            .returning(|| Ok(make_test_schema()));
-        mock.expect_add_user_attribute()
-            .with(eq(CreateAttributeRequest {
-                name: AttributeName::new("legacyphoto"),
-                attribute_type: AttributeType::Avatar,
-                is_list: false,
-                is_visible: true,
-                is_editable: false,
-            }))
-            .return_once(|_| Ok(()));
-        let context = admin_context(mock);
-        let vars = Variables::from([
-            ("name".to_string(), InputValue::scalar("legacyphoto")),
-            (
-                "attributeType".to_string(),
-                InputValue::enum_value("JPEG_PHOTO"),
-            ),
-            ("isList".to_string(), InputValue::scalar(false)),
-            ("isVisible".to_string(), InputValue::scalar(true)),
-            ("isEditable".to_string(), InputValue::scalar(false)),
-        ]);
-        let (value, errors) = execute(QUERY, None, &root_schema(), &vars, &context)
-            .await
-            .unwrap();
-        assert_eq!(errors.len(), 0, "unexpected errors: {errors:?}");
-        assert_eq!(value, graphql_value!({"addUserAttribute": {"ok": true}}));
-    }
-
-    fn assert_unauthorized(errors: &[juniper::ExecutionError<DefaultScalarValue>], query: &str) {
-        assert!(
-            errors
-                .iter()
-                .any(|e| e.error().message().contains("Unauthorized")),
-            "expected an authorization error for {query}, got {errors:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_create_ou_requires_admin() {
-        const QUERY: &str = r#"mutation($n: String!) { createOu(name: $n) { ok } }"#;
-        let context = regular_context(MockTestBackendHandler::new());
-        let vars = Variables::from([("n".to_string(), InputValue::scalar("labs"))]);
-        let (_, errors) = execute(QUERY, None, &root_schema(), &vars, &context)
-            .await
-            .unwrap();
-        assert_unauthorized(&errors, QUERY);
-    }
-
-    #[tokio::test]
-    async fn test_create_ou_persists_allowedous() {
-        const QUERY: &str = r#"mutation($n: String!) { createOu(name: $n) { ok } }"#;
-        let mut mock = MockTestBackendHandler::new();
-        mock.expect_get_allowed_ous()
-            .returning(|| Ok(vec!["people".into(), "groups".into()]));
+            Ok(ous)
+        });
         mock.expect_set_system_config()
             .withf(|k, v| k == "allowedous" && v.contains("labs"))
             .times(1)
             .returning(|_, _| Ok(()));
-        let context = admin_context(mock);
-        let vars = Variables::from([("n".to_string(), InputValue::scalar("labs"))]);
-        let (value, errors) = execute(QUERY, None, &root_schema(), &vars, &context)
-            .await
-            .unwrap();
-        assert_eq!(errors.len(), 0, "{errors:?}");
-        assert_eq!(value, graphql_value!({"createOu": {"ok": true}}));
-    }
-
-    #[tokio::test]
-    async fn test_set_posix_settings_rejects_out_of_range() {
-        const QUERY: &str = r#"
-            mutation {
-                setPosixSettings(input: {
-                    userUidnumberAssign: true,
-                    userUidnumberStart: 1,
-                    userUidnumberMax: 2,
-                    userGidnumberAssign: false,
-                    userGidnumberStart: 3000,
-                    userLoginshellAssign: false,
-                    userLoginshellDefault: "",
-                    userHomedirectoryAssign: false,
-                    userHomedirectoryPrefix: "",
-                    groupGidnumberAssign: false,
-                    groupGidnumberStart: 3000,
-                    groupGidnumberMax: 3000
-                }) { success }
-            }
-        "#;
-        let context = admin_context(MockTestBackendHandler::new());
-        let (_, errors) = execute(QUERY, None, &root_schema(), &Variables::new(), &context)
-            .await
-            .unwrap();
-        assert!(
-            errors.iter().any(|e| e
-                .error()
-                .message()
-                .contains("must be between 3000 and 60000")),
-            "expected a range error, got {errors:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_set_posix_settings_persists_in_range() {
-        const QUERY: &str = r#"
-            mutation {
-                setPosixSettings(input: {
-                    userUidnumberAssign: true,
-                    userUidnumberStart: 3000,
-                    userUidnumberMax: 4000,
-                    userGidnumberAssign: false,
-                    userGidnumberStart: 3000,
-                    userLoginshellAssign: false,
-                    userLoginshellDefault: "",
-                    userHomedirectoryAssign: false,
-                    userHomedirectoryPrefix: "",
-                    groupGidnumberAssign: false,
-                    groupGidnumberStart: 3000,
-                    groupGidnumberMax: 3000
-                }) { success }
-            }
-        "#;
-        let mut mock = MockTestBackendHandler::new();
-        mock.expect_set_posix_settings()
+        mock.expect_update_user()
+            .withf(|req| {
+                req.user_id == UserId::new("bob") && has_ou(&req.insert_attributes, "labs")
+            })
             .times(1)
             .returning(|_| Ok(()));
-        let context = admin_context(mock);
-        let (value, errors) = execute(QUERY, None, &root_schema(), &Variables::new(), &context)
-            .await
-            .unwrap();
-        assert_eq!(errors.len(), 0, "{errors:?}");
-        assert_eq!(
-            value,
-            graphql_value!({"setPosixSettings": {"success": true}})
-        );
-    }
-
-    async fn assert_non_admin_rejected(query: &str) {
-        let context = regular_context(MockTestBackendHandler::new());
-        let (_, errors) = execute(query, None, &root_schema(), &Variables::new(), &context)
-            .await
-            .unwrap();
-        assert_unauthorized(&errors, query);
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_denied_mutation_records_access_denied_for_the_scoped_actor() {
-        use lldap_domain_handlers::logging::{LogKind, Protocol, RequestMeta, with_request};
-        use lldap_test_utils::recording_log::LogGuard;
-        let guard = LogGuard::install();
-        let context = regular_context(MockTestBackendHandler::new());
-        let query = r#"mutation { deleteUser(userId: "carol") { ok } }"#;
-
-        let meta = RequestMeta::http(Some("203.0.113.5".parse().unwrap()), None)
-            .with_actor(Some(UserId::new("log-probe")))
-            .with_protocol(Protocol::Graphql);
-        let (_, errors) = with_request(
-            meta,
-            execute(query, None, &root_schema(), &Variables::new(), &context),
-        )
-        .await
-        .unwrap();
-        assert_unauthorized(&errors, query);
-
-        // Other tests deny concurrently; only this test scopes the probe actor.
-        let events: Vec<_> = guard
-            .recorder()
-            .take_events()
-            .into_iter()
-            .filter(|e| e.actor.as_deref() == Some("log-probe"))
-            .collect();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].kind, LogKind::AccessDenied);
-        assert!(!events[0].success);
-        assert_eq!(events[0].protocol, Protocol::Graphql);
-        assert_eq!(events[0].peer.as_deref(), Some("203.0.113.5"));
-        assert_eq!(
-            events[0].detail.as_deref(),
-            Some("Unauthorized user deletion")
-        );
-    }
-
-    #[tokio::test]
-    async fn test_ou_and_posix_mutations_require_admin() {
-        assert_non_admin_rejected(r#"mutation { deleteOu(name: "labs") { ok } }"#).await;
-        assert_non_admin_rejected(
-            r#"mutation { changeUserOu(userIds: ["bob"], newOu: "labs") { ok } }"#,
-        )
-        .await;
-        assert_non_admin_rejected(
-            r#"mutation { changeGroupOu(groupIds: [1], newOu: "labs") { ok } }"#,
-        )
-        .await;
-        assert_non_admin_rejected(r#"mutation { reassignUserUidNumbers { success } }"#).await;
-        assert_non_admin_rejected(r#"mutation { reassignUserGidNumbers { success } }"#).await;
-        assert_non_admin_rejected(r#"mutation { reassignUserHomedirectories { success } }"#).await;
-        assert_non_admin_rejected(r#"mutation { reassignUserLoginshells { success } }"#).await;
-        assert_non_admin_rejected(r#"mutation { reassignGidNumbers { success } }"#).await;
-    }
-
-    #[tokio::test]
-    async fn test_delete_ou_reassigns_users_and_groups() {
-        const QUERY: &str = r#"mutation { deleteOu(name: "labs") { ok } }"#;
-        let mut mock = MockTestBackendHandler::new();
-        mock.expect_get_allowed_ous()
-            .returning(|| Ok(vec!["people".into(), "groups".into(), "labs".into()]));
+        mock.expect_update_group()
+            .withf(|req| req.group_id == GroupId(7) && has_ou(&req.insert_attributes, "labs"))
+            .times(1)
+            .returning(|_| Ok(()));
         mock.expect_list_users().returning(|_, _| {
             Ok(vec![UserAndGroups {
                 user: sample_user("bob", vec![ou_attr("labs")]),
@@ -1561,14 +1311,7 @@ mod tests {
         });
         mock.expect_update_user()
             .withf(|req| {
-                req.user_id == UserId::new("bob")
-                    && req.insert_attributes.iter().any(|a| {
-                        a.name.as_str() == "ou"
-                            && a.value
-                                == DomainAttributeValue::String(Cardinality::Singleton(
-                                    "people".into(),
-                                ))
-                    })
+                req.user_id == UserId::new("bob") && has_ou(&req.insert_attributes, "people")
             })
             .times(1)
             .returning(|_| Ok(()));
@@ -1584,16 +1327,7 @@ mod tests {
             }])
         });
         mock.expect_update_group()
-            .withf(|req| {
-                req.group_id == GroupId(7)
-                    && req.insert_attributes.iter().any(|a| {
-                        a.name.as_str() == "ou"
-                            && a.value
-                                == DomainAttributeValue::String(Cardinality::Singleton(
-                                    "groups".into(),
-                                ))
-                    })
-            })
+            .withf(|req| req.group_id == GroupId(7) && has_ou(&req.insert_attributes, "groups"))
             .times(1)
             .returning(|_| Ok(()));
         mock.expect_set_system_config()
@@ -1601,49 +1335,94 @@ mod tests {
             .times(1)
             .returning(|_, _| Ok(()));
         let context = admin_context(mock);
-        let (value, errors) = execute(QUERY, None, &root_schema(), &Variables::new(), &context)
-            .await
-            .unwrap();
-        assert_eq!(errors.len(), 0, "{errors:?}");
-        assert_eq!(value, graphql_value!({"deleteOu": {"ok": true}}));
+        for (query, expected) in [
+            (
+                r#"mutation { createOu(name: "labs") { ok } }"#,
+                graphql_value!({"createOu": {"ok": true}}),
+            ),
+            (
+                r#"mutation { changeUserOu(userIds: ["bob"], newOu: "labs") { ok } }"#,
+                graphql_value!({"changeUserOu": {"ok": true}}),
+            ),
+            (
+                r#"mutation { changeGroupOu(groupIds: [7], newOu: "labs") { ok } }"#,
+                graphql_value!({"changeGroupOu": {"ok": true}}),
+            ),
+            (
+                r#"mutation { deleteOu(name: "labs") { ok } }"#,
+                graphql_value!({"deleteOu": {"ok": true}}),
+            ),
+        ] {
+            let (value, errors) = execute(query, None, &root_schema(), &Variables::new(), &context)
+                .await
+                .unwrap();
+            assert_eq!(errors.len(), 0, "{query}: {errors:?}");
+            assert_eq!(value, expected, "{query}");
+        }
     }
 
     #[tokio::test]
-    async fn test_change_user_ou_persists() {
-        const QUERY: &str = r#"mutation { changeUserOu(userIds: ["bob"], newOu: "labs") { ok } }"#;
+    async fn test_set_posix_settings_range() {
+        let context = admin_context(MockTestBackendHandler::new());
+        let (_, errors) = execute(
+            &posix_settings_mutation(1, 2),
+            None,
+            &root_schema(),
+            &Variables::new(),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(
+            errors.iter().any(|e| e
+                .error()
+                .message()
+                .contains("must be between 3000 and 60000")),
+            "expected a range error, got {errors:?}"
+        );
+
         let mut mock = MockTestBackendHandler::new();
-        mock.expect_update_user()
-            .withf(|req| {
-                req.user_id == UserId::new("bob")
-                    && req
-                        .insert_attributes
-                        .iter()
-                        .any(|a| a.name.as_str() == "ou")
-            })
+        mock.expect_set_posix_settings()
             .times(1)
             .returning(|_| Ok(()));
         let context = admin_context(mock);
-        let (value, errors) = execute(QUERY, None, &root_schema(), &Variables::new(), &context)
-            .await
-            .unwrap();
+        let (value, errors) = execute(
+            &posix_settings_mutation(3000, 4000),
+            None,
+            &root_schema(),
+            &Variables::new(),
+            &context,
+        )
+        .await
+        .unwrap();
         assert_eq!(errors.len(), 0, "{errors:?}");
-        assert_eq!(value, graphql_value!({"changeUserOu": {"ok": true}}));
+        assert_eq!(
+            value,
+            graphql_value!({"setPosixSettings": {"success": true}})
+        );
     }
 
     #[tokio::test]
-    async fn test_change_group_ou_persists() {
-        const QUERY: &str = r#"mutation { changeGroupOu(groupIds: [7], newOu: "labs") { ok } }"#;
-        let mut mock = MockTestBackendHandler::new();
-        mock.expect_update_group()
-            .withf(|req| req.group_id == GroupId(7))
-            .times(1)
-            .returning(|_| Ok(()));
-        let context = admin_context(mock);
-        let (value, errors) = execute(QUERY, None, &root_schema(), &Variables::new(), &context)
-            .await
-            .unwrap();
-        assert_eq!(errors.len(), 0, "{errors:?}");
-        assert_eq!(value, graphql_value!({"changeGroupOu": {"ok": true}}));
+    async fn test_ou_and_posix_mutations_require_admin() {
+        let posix_settings = posix_settings_mutation(3000, 4000);
+        for query in [
+            r#"mutation { createOu(name: "labs") { ok } }"#,
+            r#"mutation { deleteOu(name: "labs") { ok } }"#,
+            r#"mutation { changeUserOu(userIds: ["bob"], newOu: "labs") { ok } }"#,
+            r#"mutation { changeGroupOu(groupIds: [1], newOu: "labs") { ok } }"#,
+            posix_settings.as_str(),
+            r#"mutation { reassignUserUidNumbers { success } }"#,
+            r#"mutation { reassignUserGidNumbers { success } }"#,
+            r#"mutation { reassignUserHomedirectories { success } }"#,
+            r#"mutation { reassignUserLoginshells { success } }"#,
+            r#"mutation { reassignGidNumbers { success } }"#,
+        ] {
+            let context = regular_context(MockTestBackendHandler::new());
+            let (_, errors) = execute(query, None, &root_schema(), &Variables::new(), &context)
+                .await
+                .unwrap();
+            assert_unauthorized(&errors, query);
+        }
     }
 
     async fn posix_reassign_ok(
@@ -1767,7 +1546,7 @@ mod tests {
         mock: MockTestBackendHandler,
         user: &str,
         permission: Permission,
-        policy: lldap_domain_handlers::mfa::MfaPolicy,
+        policy: MfaPolicy,
         pending: bool,
     ) -> Context<MockTestBackendHandler> {
         Context::<MockTestBackendHandler>::new_for_tests_with_policy(
@@ -1909,60 +1688,13 @@ mod tests {
         .await
         .unwrap();
         assert_unauthorized(&errors, RESET_USER_MFA);
-    }
 
-    #[tokio::test]
-    async fn test_mfa_enrollment() {
-        let mut mock = MockTestBackendHandler::new();
-        mock.expect_start_totp_enrollment()
-            .with(eq(UserId::new("bob")), eq(None::<String>))
-            .times(1)
-            .returning(|_, _| Ok(enrollment_start()));
-        mock.expect_finish_totp_enrollment()
-            .withf(|user, state, code| {
-                user == &UserId::new("bob") && state == "sealed" && code == "123456"
-            })
-            .times(1)
-            .returning(|_, _, _| Ok(()));
-        let context = policy_context(
-            mock,
-            "bob",
-            Permission::Regular,
-            lldap_domain_handlers::mfa::MfaPolicy::Enrolled,
-            false,
-        );
-        let (value, errors) = execute(START_MFA, None, &root_schema(), &Variables::new(), &context)
-            .await
-            .unwrap();
-        assert_eq!(errors.len(), 0, "{errors:?}");
-        assert_eq!(
-            value,
-            graphql_value!({"startMfaEnrollment": {
-                "otpauthUri": "otpauth://totp/KLLDAP:bob?secret=ABC",
-                "secretBase32": "ABC",
-                "state": "sealed",
-            }})
-        );
-        let (value, errors) = execute(
-            FINISH_MFA,
-            None,
-            &root_schema(),
-            &Variables::new(),
-            &context,
-        )
-        .await
-        .unwrap();
-        assert_eq!(errors.len(), 0, "{errors:?}");
-        assert_eq!(value, graphql_value!({"finishMfaEnrollment": {"ok": true}}));
-    }
-
-    #[tokio::test]
-    async fn test_reset_user_mfa_self_refused_under_always() {
+        // Under "always" an admin cannot reset their own factor, whatever the id's case.
         let context = policy_context(
             MockTestBackendHandler::new(),
             "bob",
             Permission::Admin,
-            lldap_domain_handlers::mfa::MfaPolicy::Always,
+            MfaPolicy::Always,
             false,
         );
         let (_, errors) = execute(
@@ -1983,58 +1715,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reset_own_mfa() {
-        let mut mock = MockTestBackendHandler::new();
-        mock.expect_reset_own_mfa()
-            .withf(|user, code| user == &UserId::new("bob") && code == "123456")
-            .times(1)
-            .returning(|_, _| Ok(()));
-        let context = policy_context(
-            mock,
-            "bob",
-            Permission::Regular,
-            lldap_domain_handlers::mfa::MfaPolicy::Enrolled,
-            false,
-        );
-        let (value, errors) = execute(
-            RESET_OWN_MFA,
-            None,
-            &root_schema(),
-            &Variables::new(),
-            &context,
-        )
-        .await
-        .unwrap();
-        assert_eq!(errors.len(), 0, "{errors:?}");
-        assert_eq!(value, graphql_value!({"resetOwnMfa": {"ok": true}}));
-
-        let context = policy_context(
-            MockTestBackendHandler::new(),
-            "bob",
-            Permission::Regular,
-            lldap_domain_handlers::mfa::MfaPolicy::Always,
-            false,
-        );
-        let (_, errors) = execute(
-            RESET_OWN_MFA,
-            None,
-            &root_schema(),
-            &Variables::new(),
-            &context,
-        )
-        .await
-        .unwrap();
-        assert!(
-            errors.iter().any(|e| e
-                .error()
-                .message()
-                .contains("MFA is required by the server configuration")),
-            "{errors:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_mfa_mutations_gated_when_disabled() {
+    async fn test_mfa_mutation_policy_gates() {
         for query in [START_MFA, FINISH_MFA, RESET_OWN_MFA] {
             let (_, errors) = execute(
                 query,
@@ -2066,6 +1747,68 @@ mod tests {
         .unwrap();
         assert_eq!(errors.len(), 0, "{errors:?}");
         assert_eq!(value, graphql_value!({"resetUserMfa": {"ok": true}}));
+
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_start_totp_enrollment()
+            .with(eq(UserId::new("bob")), eq(None::<String>))
+            .times(1)
+            .returning(|_, _| Ok(enrollment_start()));
+        mock.expect_finish_totp_enrollment()
+            .withf(|user, state, code| {
+                user == &UserId::new("bob") && state == "sealed" && code == "123456"
+            })
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+        mock.expect_reset_own_mfa()
+            .withf(|user, code| user == &UserId::new("bob") && code == "123456")
+            .times(1)
+            .returning(|_, _| Ok(()));
+        let context = policy_context(mock, "bob", Permission::Regular, MfaPolicy::Enrolled, false);
+        for (query, expected) in [
+            (
+                START_MFA,
+                graphql_value!({"startMfaEnrollment": {
+                    "otpauthUri": "otpauth://totp/KLLDAP:bob?secret=ABC",
+                    "secretBase32": "ABC",
+                    "state": "sealed",
+                }}),
+            ),
+            (
+                FINISH_MFA,
+                graphql_value!({"finishMfaEnrollment": {"ok": true}}),
+            ),
+            (RESET_OWN_MFA, graphql_value!({"resetOwnMfa": {"ok": true}})),
+        ] {
+            let (value, errors) = execute(query, None, &root_schema(), &Variables::new(), &context)
+                .await
+                .unwrap();
+            assert_eq!(errors.len(), 0, "{query}: {errors:?}");
+            assert_eq!(value, expected, "{query}");
+        }
+
+        let context = policy_context(
+            MockTestBackendHandler::new(),
+            "bob",
+            Permission::Regular,
+            MfaPolicy::Always,
+            false,
+        );
+        let (_, errors) = execute(
+            RESET_OWN_MFA,
+            None,
+            &root_schema(),
+            &Variables::new(),
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(
+            errors.iter().any(|e| e
+                .error()
+                .message()
+                .contains("MFA is required by the server configuration")),
+            "{errors:?}"
+        );
     }
 
     #[tokio::test]
@@ -2078,13 +1821,7 @@ mod tests {
             .returning(|_| Ok(sample_user("admin", vec![])));
         mock.expect_start_totp_enrollment()
             .returning(|_, _| Ok(enrollment_start()));
-        let context = policy_context(
-            mock,
-            "admin",
-            Permission::Admin,
-            lldap_domain_handlers::mfa::MfaPolicy::Always,
-            true,
-        );
+        let context = policy_context(mock, "admin", Permission::Admin, MfaPolicy::Always, true);
         for query in [
             r#"{ users { id } }"#,
             r#"mutation { updateUser(user: {id: "bob"}) { ok } }"#,

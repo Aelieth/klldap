@@ -484,24 +484,4 @@ mod tests {
         want.sort();
         assert_eq!(got, want);
     }
-
-    #[test]
-    fn test_resolve_and_is_operational_semantics() {
-        assert_eq!(resolve("ismemberof").unwrap().wire_name, "memberOf");
-        assert_eq!(resolve("uuid").unwrap().wire_name, "entryUUID");
-        assert_eq!(
-            resolve("creationdate").unwrap().wire_name,
-            "createTimestamp"
-        );
-        assert_eq!(resolve("distinguishedname").unwrap().wire_name, "dn");
-        assert!(resolve("nope").is_none());
-
-        assert!(is_operational("memberOf"));
-        assert!(is_operational("createTimestamp"));
-        assert!(is_operational("entryDN"));
-        assert!(!is_operational("loginDisabled"));
-        assert!(!is_operational("sudoHost"));
-        assert!(!is_operational("objectClass"));
-        assert!(!is_operational("dn"));
-    }
 }

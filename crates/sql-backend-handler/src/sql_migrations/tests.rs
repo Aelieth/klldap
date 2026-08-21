@@ -998,6 +998,15 @@ async fn test_v12_via_version_gate_is_idempotent_and_repairs() {
             .await,
             b"1"
         );
+        assert_eq!(
+            PublicSchema::get()
+                .user_attributes()
+                .get_by_name_or_alias("kerberossync")
+                .unwrap()
+                .attribute_type,
+            AttributeType::Integer,
+            "the canonical bytes are the integer the schema declares"
+        );
 
         assert_eq!(
             text(
@@ -1331,16 +1340,6 @@ async fn test_v13_reencodes_lldap_bincode_values() {
     assert_v13_state(pool, jpeg, baddates).await;
 }
 
-#[test]
-fn test_public_schema_has_kerberossync_as_integer() {
-    let schema = PublicSchema::get();
-    let kerb = schema
-        .user_attributes()
-        .get_by_name_or_alias("kerberossync")
-        .expect("kerberossync attribute must exist");
-    assert_eq!(kerb.attribute_type, AttributeType::Integer);
-}
-
 async fn assert_full_rich_data_integrity(pool: &DbConnection, at_version: SchemaVersion) {
     let ver =
         JustSchemaVersion::find_by_statement(raw_statement(r#"SELECT version FROM metadata"#))
@@ -1587,30 +1586,6 @@ async fn assert_full_rich_data_integrity(pool: &DbConnection, at_version: Schema
     }
 }
 
-#[tokio::test]
-async fn test_v13_database_without_logs_gets_it_on_init() {
-    let pool = get_in_memory_db().await;
-    init_table(&pool).await.unwrap();
-    pool.execute(raw_statement(r#"DROP TABLE logs"#))
-        .await
-        .unwrap();
-
-    init_table(&pool).await.unwrap();
-
-    pool.execute(raw_statement(
-        r#"INSERT INTO logs (timestamp, kind, success, protocol)
-           VALUES ('2026-01-01 00:00:00', 'server_start', 1, 'system')"#,
-    ))
-    .await
-    .unwrap();
-    init_table(&pool).await.unwrap();
-    assert_eq!(
-        count(&pool, r#"SELECT COUNT(*) as c FROM logs"#).await,
-        1,
-        "re-init keeps the logs table and its rows"
-    );
-}
-
 const LOG_INDEXES: [&str; 5] = [
     "logs-timestamp",
     "logs-actor",
@@ -1620,7 +1595,7 @@ const LOG_INDEXES: [&str; 5] = [
 ];
 
 #[tokio::test]
-async fn test_v13_database_without_log_indexes_gets_them_on_init() {
+async fn test_init_repairs_the_logs_table_and_its_indexes() {
     let pool = get_in_memory_db().await;
     init_table(&pool).await.unwrap();
     for name in LOG_INDEXES {
@@ -1628,9 +1603,7 @@ async fn test_v13_database_without_log_indexes_gets_them_on_init() {
             .await
             .unwrap();
     }
-
     init_table(&pool).await.unwrap();
-
     #[derive(FromQueryResult)]
     struct NameRow {
         name: String,
@@ -1650,6 +1623,29 @@ async fn test_v13_database_without_log_indexes_gets_them_on_init() {
             "{index} restored: {names:?}"
         );
     }
+
+    pool.execute(raw_statement(
+        r#"INSERT INTO logs (timestamp, kind, success, protocol)
+           VALUES ('2026-01-01 00:00:00', 'server_start', 1, 'system')"#,
+    ))
+    .await
+    .unwrap();
+    init_table(&pool).await.unwrap();
+    assert_eq!(
+        count(&pool, r#"SELECT COUNT(*) as c FROM logs"#).await,
+        1,
+        "re-init keeps the logs table and its rows"
+    );
+
+    pool.execute(raw_statement(r#"DROP TABLE logs"#))
+        .await
+        .unwrap();
+    init_table(&pool).await.unwrap();
+    assert_eq!(
+        count(&pool, r#"SELECT COUNT(*) as c FROM logs"#).await,
+        0,
+        "a missing logs table is recreated"
+    );
 }
 
 async fn run_stepwise_migration_test(start_ver: SchemaVersion) {
@@ -1755,7 +1751,7 @@ async fn test_migration_from_v5_eav_with_legacy_names() {
     run_stepwise_migration_test(SchemaVersion(4)).await; // reach v5 state via the runner start
 }
 
-// These two #[ignore] tests DROP SCHEMA public; the lock stops parallel clobber.
+// The #[ignore] lane tests DROP SCHEMA public; the lock stops parallel clobber.
 static PG_LANE_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
@@ -1790,20 +1786,6 @@ async fn pg_user_attribute(pool: &DbConnection, user: &str, name: &str) -> Vec<u
     .unwrap_or_else(|| panic!("attribute {name} missing for {user}"))
     .try_get_by_index::<Vec<u8>>(0)
     .expect("value column")
-}
-
-#[tokio::test]
-#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
-async fn test_postgres_fresh_install_migrates() {
-    let _lane = PG_LANE_LOCK.lock().await;
-    let Some(pool) = connect_scratch_postgres().await else {
-        eprintln!("KLLDAP_TEST_DATABASE_URL not set; skipping");
-        return;
-    };
-    init_table(&pool).await.expect("fresh init on postgres");
-    assert_eq!(get_schema_version(&pool).await, Some(LAST_SCHEMA_VERSION));
-    init_table(&pool).await.expect("re-init must be idempotent");
-    assert_eq!(get_schema_version(&pool).await, Some(LAST_SCHEMA_VERSION));
 }
 
 #[tokio::test]
@@ -1939,8 +1921,15 @@ async fn test_postgres_stepwise_migration() {
 
 #[tokio::test]
 #[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
-async fn test_postgres_log_retention_trims_by_age_and_size() {
+async fn test_postgres_fresh_install_lookups_and_retention() {
+    use crate::sql_backend_handler::tests::{
+        insert_group, insert_membership, insert_user_no_password,
+    };
     use crate::sql_log_handler::{LogRetention, enforce_log_retention};
+    use lldap_domain_handlers::handler::LogBackendHandler;
+    use lldap_domain_handlers::logging::{
+        LOGIN_KINDS, LogCursor, LogDimension, LogFilter, LogKind,
+    };
     use lldap_domain_model::model::{Logs, LogsColumn, logs};
     use sea_orm::{ActiveValue::Set, EntityTrait, QueryOrder};
 
@@ -1950,60 +1939,10 @@ async fn test_postgres_log_retention_trims_by_age_and_size() {
         return;
     };
     init_table(&pool).await.expect("fresh init on postgres");
-    let row = |actor: &str, days_ago: i64| logs::ActiveModel {
-        timestamp: Set(chrono::Utc::now().naive_utc() - chrono::Duration::days(days_ago)),
-        kind: Set("bind".to_owned()),
-        success: Set(true),
-        protocol: Set("ldap".to_owned()),
-        actor: Set(Some(actor.to_owned())),
-        ..Default::default()
-    };
-    Logs::insert_many(
-        std::iter::once(row("old", 40)).chain((0..5).map(|i| row(&format!("new{i}"), 0))),
-    )
-    .exec(&pool)
-    .await
-    .expect("insert rows");
+    assert_eq!(get_schema_version(&pool).await, Some(LAST_SCHEMA_VERSION));
+    init_table(&pool).await.expect("re-init must be idempotent");
+    assert_eq!(get_schema_version(&pool).await, Some(LAST_SCHEMA_VERSION));
 
-    enforce_log_retention(
-        &pool,
-        LogRetention {
-            retention_days: 30,
-            max_entries: 3,
-        },
-    )
-    .await
-    .expect("retention on postgres");
-    let actors: Vec<_> = Logs::find()
-        .order_by_asc(LogsColumn::Id)
-        .all(&pool)
-        .await
-        .expect("query")
-        .into_iter()
-        .filter_map(|r| r.actor)
-        .collect();
-    assert_eq!(actors, vec!["new2", "new3", "new4"]);
-}
-
-#[tokio::test]
-#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
-async fn test_postgres_log_lookups_summarize_and_activity() {
-    use crate::sql_backend_handler::tests::{
-        insert_group, insert_membership, insert_user_no_password,
-    };
-    use lldap_domain_handlers::handler::LogBackendHandler;
-    use lldap_domain_handlers::logging::{
-        LOGIN_KINDS, LogCursor, LogDimension, LogFilter, LogKind,
-    };
-    use lldap_domain_model::model::{Logs, logs};
-    use sea_orm::{ActiveValue::Set, EntityTrait};
-
-    let _lane = PG_LANE_LOCK.lock().await;
-    let Some(pool) = connect_scratch_postgres().await else {
-        eprintln!("KLLDAP_TEST_DATABASE_URL not set; skipping");
-        return;
-    };
-    init_table(&pool).await.expect("fresh init on postgres");
     let handler = SqlBackendHandler::new(generate_random_private_key(), pool.clone());
     insert_user_no_password(&handler, "bob").await;
     let devs = insert_group(&handler, "Devs").await;
@@ -2114,4 +2053,38 @@ async fn test_postgres_log_lookups_summarize_and_activity() {
     for index in LOG_INDEXES {
         assert!(indexes.iter().any(|n| n == index), "{index}: {indexes:?}");
     }
+
+    Logs::delete_many().exec(&pool).await.expect("clear rows");
+    let aged = |actor: &str, days_ago: i64| logs::ActiveModel {
+        timestamp: Set(chrono::Utc::now().naive_utc() - chrono::Duration::days(days_ago)),
+        kind: Set("bind".to_owned()),
+        success: Set(true),
+        protocol: Set("ldap".to_owned()),
+        actor: Set(Some(actor.to_owned())),
+        ..Default::default()
+    };
+    Logs::insert_many(
+        std::iter::once(aged("old", 40)).chain((0..5).map(|i| aged(&format!("new{i}"), 0))),
+    )
+    .exec(&pool)
+    .await
+    .expect("insert rows");
+    enforce_log_retention(
+        &pool,
+        LogRetention {
+            retention_days: 30,
+            max_entries: 3,
+        },
+    )
+    .await
+    .expect("retention on postgres");
+    let actors: Vec<_> = Logs::find()
+        .order_by_asc(LogsColumn::Id)
+        .all(&pool)
+        .await
+        .expect("query")
+        .into_iter()
+        .filter_map(|r| r.actor)
+        .collect();
+    assert_eq!(actors, vec!["new2", "new3", "new4"]);
 }

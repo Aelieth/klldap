@@ -40,7 +40,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_attempts_are_capped_per_step_and_per_user() {
+    fn test_attempts_are_capped_per_step_and_refill() {
         let failed = FailedAttempts::new();
         for _ in 0..TOTP_MAX_ATTEMPTS_PER_STEP {
             assert!(failed.reserve("uuid-a", 1000));
@@ -49,14 +49,6 @@ mod tests {
         assert!(failed.reserve("uuid-b", 1000));
         failed.refund("uuid-a", 1000);
         assert!(failed.reserve("uuid-a", 1000));
-    }
-
-    #[test]
-    fn test_allowance_refills_on_the_next_step() {
-        let failed = FailedAttempts::new();
-        for _ in 0..TOTP_MAX_ATTEMPTS_PER_STEP {
-            assert!(failed.reserve("uuid-a", 1000));
-        }
         assert!(!failed.reserve("uuid-a", 1000));
         assert!(failed.reserve("uuid-a", 1000 + TOTP_STEP_SECS));
     }

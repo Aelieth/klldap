@@ -1,5 +1,5 @@
 use crate::common::{
-    auth::get_token,
+    auth::{get_token, get_token_for},
     env,
     fixture::{create_lldap_command, query_i64, spawn_and_wait_healthy},
     graphql::{
@@ -7,10 +7,10 @@ use crate::common::{
     },
 };
 use ldap3::LdapConn;
-use reqwest::blocking::ClientBuilder;
+use reqwest::blocking::{Client, ClientBuilder};
 mod common;
 
-fn client() -> reqwest::blocking::Client {
+fn client() -> Client {
     ClientBuilder::new()
         .connect_timeout(std::time::Duration::from_secs(2))
         .timeout(std::time::Duration::from_secs(5))
@@ -26,12 +26,7 @@ fn log_rows(db_url: &str, condition: &str) -> i64 {
 }
 
 // The whole response body: the log query is also asserted on its errors.
-fn gql_raw(
-    client: &reqwest::blocking::Client,
-    base_url: &str,
-    token: &str,
-    query: &str,
-) -> serde_json::Value {
+fn gql_raw(client: &Client, base_url: &str, token: &str, query: &str) -> serde_json::Value {
     client
         .post(format!("{base_url}/api/graphql"))
         .bearer_auth(token)
@@ -54,6 +49,26 @@ fn wait_for_row(db_url: &str, condition: &str) -> i64 {
     0
 }
 
+fn create_logged_user(client: &Client, base_url: &str, token: &String, id: &str) {
+    post::<CreateUser>(
+        client,
+        base_url,
+        token,
+        create_user::Variables {
+            user: create_user::CreateUserInput {
+                id: id.to_owned(),
+                email: Some(format!("{id}@example.com")),
+                display_name: None,
+                first_name: None,
+                last_name: None,
+                avatar: None,
+                attributes: None,
+            },
+        },
+    )
+    .expect("create user");
+}
+
 // Boot, act over HTTP and LDAP, stop: the rows are in the database with their peer,
 // survive a restart, and the writer flushes on shutdown.
 #[test]
@@ -67,23 +82,7 @@ fn test_logs_persist_across_a_restart() {
         let server = spawn_and_wait_healthy(command);
         let client = client();
         let token = get_token(&client, &server.http_url());
-        post::<CreateUser>(
-            &client,
-            &server.http_url(),
-            &token,
-            create_user::Variables {
-                user: create_user::CreateUserInput {
-                    id: "logged-user".to_owned(),
-                    email: Some("logged-user@example.com".to_owned()),
-                    display_name: None,
-                    first_name: None,
-                    last_name: None,
-                    avatar: None,
-                    attributes: None,
-                },
-            },
-        )
-        .expect("create user");
+        create_logged_user(&client, &server.http_url(), &token, "logged-user");
 
         // A proxied wrong-password login: the header travels with the row, the peer stays.
         let forwarded = client
@@ -216,6 +215,68 @@ fn test_logs_persist_across_a_restart() {
             older_id.parse::<i64>().unwrap() < first_id.parse::<i64>().unwrap(),
             "{first_id} then {older_id}"
         );
+
+        // A regular user is refused the logs; once disabled, their existing JWT is too.
+        create_logged_user(&client, &server.http_url(), &token, "disabled-logger");
+        let set_pw = gql_raw(
+            &client,
+            &server.http_url(),
+            &token,
+            r#"mutation { setUserPassword(userId: "disabled-logger", password: "DisabledPass2026!") { ok } }"#,
+        );
+        assert!(set_pw["errors"].is_null(), "{set_pw}");
+        let user_token = get_token_for(
+            &client,
+            &server.http_url(),
+            "disabled-logger",
+            "DisabledPass2026!",
+        );
+        let denied = gql_raw(
+            &client,
+            &server.http_url(),
+            &user_token,
+            "{ logs(limit: 1) { id } }",
+        );
+        assert!(
+            denied["errors"][0]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("Unauthorized to read the logs")),
+            "{denied}"
+        );
+        let groups = post::<ListGroups>(
+            &client,
+            &server.http_url(),
+            &token,
+            list_groups::Variables {},
+        )
+        .expect("list groups");
+        let disabled_id = groups
+            .groups
+            .iter()
+            .find(|g| g.display_name == "lldap_disabled")
+            .map(|g| g.id)
+            .expect("lldap_disabled exists at boot");
+        post::<AddUserToGroup>(
+            &client,
+            &server.http_url(),
+            &token,
+            add_user_to_group::Variables {
+                user: "disabled-logger".to_owned(),
+                group: disabled_id,
+            },
+        )
+        .expect("disable user");
+        let rejected = client
+            .post(format!("{}/api/graphql", server.http_url()))
+            .bearer_auth(&user_token)
+            .json(&serde_json::json!({"query": "query { apiVersion }"}))
+            .send()
+            .expect("disabled jwt");
+        assert_eq!(
+            rejected.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "disabled user's existing JWT must not reach GraphQL"
+        );
     }
 
     assert!(log_rows(&db_url, "kind = 'server_start'") >= 1);
@@ -263,6 +324,21 @@ fn test_logs_persist_across_a_restart() {
         ),
         1
     );
+    assert_eq!(
+        log_rows(
+            &db_url,
+            "kind = 'access_denied' AND detail = 'Unauthorized to read the logs' \
+             AND actor = 'disabled-logger' AND protocol = 'graphql'"
+        ),
+        1
+    );
+    assert_eq!(
+        log_rows(
+            &db_url,
+            "kind = 'access_denied' AND detail = 'Account disabled' AND actor = 'disabled-logger'"
+        ),
+        1
+    );
     let before_restart = log_rows(&db_url, "1 = 1");
 
     {
@@ -283,10 +359,11 @@ fn test_logs_persist_across_a_restart() {
     assert!(log_rows(&db_url, "kind = 'server_start'") >= 2);
 }
 
-// A unique-name spray stores its first rows one-to-one, opens a bind_flood incident the
-// moment it is flagged, and resolves it with the totals on shutdown.
+// A unique-name bind spray and a junk-JWT spray from one source: the first rows of each
+// are stored one-to-one, each flood opens the moment it is flagged and resolves with its
+// totals on shutdown, and the two windows do not see each other.
 #[test]
-fn test_unknown_bind_flood_is_bracketed_by_started_and_resolved() {
+fn test_floods_are_bracketed_by_started_and_resolved() {
     let dir = tempfile::TempDir::new().expect("temp dir");
     let db_url = format!("sqlite://{}/users.db?mode=rwc", dir.path().display());
     let command = |sub: &str| create_lldap_command(sub, &db_url);
@@ -302,6 +379,16 @@ fn test_unknown_bind_flood_is_bracketed_by_started_and_resolved() {
             assert_eq!(result.rc, 49, "attempt {i}: {result:?}");
         }
         let _ = ldap.unbind();
+        let client = client();
+        for _ in 0..12 {
+            let junk = client
+                .post(format!("{}/api/graphql", server.http_url()))
+                .header(reqwest::header::AUTHORIZATION, "Bearer not-a-jwt")
+                .json(&serde_json::json!({"query": "query { apiVersion }"}))
+                .send()
+                .expect("junk bearer");
+            assert_eq!(junk.status(), reqwest::StatusCode::UNAUTHORIZED);
+        }
     }
 
     assert_eq!(
@@ -330,37 +417,13 @@ fn test_unknown_bind_flood_is_bracketed_by_started_and_resolved() {
         1,
         "and resolves with the totals and duration"
     );
-}
-
-// A junk-JWT flood is recorded (first few one-to-one) and bracketed by an access_denied_flood
-// started/resolved pair, so an anonymous spammer is visible without filling the table.
-#[test]
-fn test_access_denied_flood_is_bracketed_by_started_and_resolved() {
-    let dir = tempfile::TempDir::new().expect("temp dir");
-    let db_url = format!("sqlite://{}/users.db?mode=rwc", dir.path().display());
-    let command = |sub: &str| create_lldap_command(sub, &db_url);
-
-    {
-        let server = spawn_and_wait_healthy(command);
-        let client = client();
-        for _ in 0..12 {
-            let junk = client
-                .post(format!("{}/api/graphql", server.http_url()))
-                .header(reqwest::header::AUTHORIZATION, "Bearer not-a-jwt")
-                .json(&serde_json::json!({"query": "query { apiVersion }"}))
-                .send()
-                .expect("junk bearer");
-            assert_eq!(junk.status(), reqwest::StatusCode::UNAUTHORIZED);
-        }
-    }
-
     assert_eq!(
         log_rows(
             &db_url,
             "kind = 'access_denied' AND detail = 'Invalid JWT' AND protocol = 'graphql'"
         ),
         8,
-        "the first denials are stored one-to-one"
+        "junk JWTs are recorded, the first denials one-to-one"
     );
     assert_eq!(
         log_rows(
@@ -394,143 +457,4 @@ fn test_log_persistence_can_be_disabled() {
         get_token(&client(), &server.http_url());
     }
     assert_eq!(log_rows(&db_url, "1 = 1"), 0);
-}
-
-#[test]
-fn test_junk_and_disabled_jwt_are_recorded_denials() {
-    let dir = tempfile::TempDir::new().expect("temp dir");
-    let db_url = format!("sqlite://{}/users.db?mode=rwc", dir.path().display());
-    let command = |sub: &str| create_lldap_command(sub, &db_url);
-    {
-        let server = spawn_and_wait_healthy(command);
-        let client = client();
-        let admin = get_token(&client, &server.http_url());
-        let junk = client
-            .post(format!("{}/api/graphql", server.http_url()))
-            .header(reqwest::header::AUTHORIZATION, "Bearer not-a-jwt")
-            .json(&serde_json::json!({"query": "query { apiVersion }"}))
-            .send()
-            .expect("junk bearer");
-        assert_eq!(junk.status(), reqwest::StatusCode::UNAUTHORIZED);
-
-        post::<CreateUser>(
-            &client,
-            &server.http_url(),
-            &admin,
-            create_user::Variables {
-                user: create_user::CreateUserInput {
-                    id: "disabled-logger".to_owned(),
-                    email: Some("disabled-logger@example.com".to_owned()),
-                    display_name: None,
-                    first_name: None,
-                    last_name: None,
-                    avatar: None,
-                    attributes: None,
-                },
-            },
-        )
-        .expect("create user");
-        let set_pw = client
-            .post(format!("{}/api/graphql", server.http_url()))
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {admin}"))
-            .json(&serde_json::json!({
-                "query": "mutation($id: String!, $password: String!) { setUserPassword(userId: $id, password: $password) { ok } }",
-                "variables": { "id": "disabled-logger", "password": "DisabledPass2026!" }
-            }))
-            .send()
-            .expect("setUserPassword")
-            .error_for_status()
-            .expect("setUserPassword HTTP");
-        let set_body: serde_json::Value = set_pw.json().expect("setUserPassword json");
-        assert!(
-            set_body.get("errors").and_then(|e| e.as_array()).is_none()
-                || set_body["errors"].as_array().unwrap().is_empty(),
-            "setUserPassword failed: {set_body}"
-        );
-        let login = client
-            .post(format!("{}/auth/simple/login", server.http_url()))
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .body(
-                serde_json::to_string(&lldap_auth::login::ClientSimpleLoginRequest {
-                    username: "disabled-logger".into(),
-                    password: "DisabledPass2026!".to_owned(),
-                })
-                .unwrap(),
-            )
-            .send()
-            .expect("login")
-            .error_for_status()
-            .expect("login HTTP");
-        let user_token = serde_json::from_str::<lldap_auth::login::ServerLoginResponse>(
-            &login.text().expect("login body"),
-        )
-        .expect("login json")
-        .token;
-        let denied = gql_raw(
-            &client,
-            &server.http_url(),
-            &user_token,
-            "{ logs(limit: 1) { id } }",
-        );
-        assert!(
-            denied["errors"][0]["message"]
-                .as_str()
-                .is_some_and(|m| m.contains("Unauthorized to read the logs")),
-            "{denied}"
-        );
-
-        let groups = post::<ListGroups>(
-            &client,
-            &server.http_url(),
-            &admin,
-            list_groups::Variables {},
-        )
-        .expect("list groups");
-        let disabled_id = groups
-            .groups
-            .iter()
-            .find(|g| g.display_name == "lldap_disabled")
-            .map(|g| g.id)
-            .expect("lldap_disabled");
-        post::<AddUserToGroup>(
-            &client,
-            &server.http_url(),
-            &admin,
-            add_user_to_group::Variables {
-                user: "disabled-logger".to_owned(),
-                group: disabled_id,
-            },
-        )
-        .expect("disable user");
-        let rejected = client
-            .post(format!("{}/api/graphql", server.http_url()))
-            .header(
-                reqwest::header::AUTHORIZATION,
-                format!("Bearer {user_token}"),
-            )
-            .json(&serde_json::json!({"query": "query { apiVersion }"}))
-            .send()
-            .expect("disabled jwt");
-        assert_eq!(rejected.status(), reqwest::StatusCode::UNAUTHORIZED);
-    }
-    // Junk JWTs are now recorded (so a spammer is visible), not terminal-only.
-    assert_eq!(
-        log_rows(&db_url, "kind = 'access_denied' AND detail = 'Invalid JWT'"),
-        1
-    );
-    assert_eq!(
-        log_rows(
-            &db_url,
-            "kind = 'access_denied' AND detail = 'Account disabled' AND actor = 'disabled-logger'"
-        ),
-        1
-    );
-    assert_eq!(
-        log_rows(
-            &db_url,
-            "kind = 'access_denied' AND detail = 'Unauthorized to read the logs' \
-             AND actor = 'disabled-logger' AND protocol = 'graphql'"
-        ),
-        1
-    );
 }

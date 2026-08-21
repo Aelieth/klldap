@@ -631,7 +631,6 @@ impl KeycloakClient {
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::{lldap_provider_dns, validate_keycloak_url};
@@ -650,13 +649,13 @@ mod tests {
     }
 
     #[test]
-    fn test_validate_keycloak_url_accepts_http_https() {
-        assert!(validate_keycloak_url("https://keycloak.example.com").is_ok());
-        assert!(validate_keycloak_url("http://127.0.0.1:8080/auth").is_ok());
-    }
-
-    #[test]
-    fn test_validate_keycloak_url_rejects_non_http_schemes() {
+    fn test_validate_keycloak_url() {
+        for url in ["https://keycloak.example.com", "http://127.0.0.1:8080/auth"] {
+            assert!(
+                validate_keycloak_url(url).is_ok(),
+                "expected {url:?} to be accepted"
+            );
+        }
         for url in [
             "file:///etc/passwd",
             "gopher://127.0.0.1:70/",

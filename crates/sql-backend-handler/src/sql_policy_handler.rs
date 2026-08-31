@@ -442,7 +442,7 @@ mod tests {
             .expect("block flag survives unlink");
         assert!(blocked.block_inheritance);
         assert!(blocked.policy_id.is_none());
-        let root_gone = states.iter().all(|s| s.ou_key != "");
+        let root_gone = states.iter().all(|s| !s.ou_key.is_empty());
         assert!(
             root_gone,
             "NULL,false root row is normalized away: {states:?}"

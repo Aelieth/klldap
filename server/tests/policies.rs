@@ -53,6 +53,22 @@ fn settings(client: &Client, base_url: &str) -> Value {
         .expect("settings json")
 }
 
+// The writer lingers before it inserts a batch.
+fn wait_for_policy_change_logs(client: &Client, base_url: &str, token: &str) -> Value {
+    let mut last = json!({});
+    for _ in 0..40 {
+        last = gql(client, base_url, token, LOGS, json!({}));
+        if last["data"]["logs"]
+            .as_array()
+            .is_some_and(|rows| !rows.is_empty())
+        {
+            return last;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    last
+}
+
 #[test]
 fn test_policy_lifecycle_over_graphql() {
     let mut fixture = LLDAPFixture::new();
@@ -116,8 +132,8 @@ fn test_policy_lifecycle_over_graphql() {
         &client,
         &url,
         &admin,
-        r#"mutation { createOu(name: "people\labs") { ok } }"#,
-        json!({}),
+        r#"mutation($n: String!) { createOu(name: $n) { ok } }"#,
+        json!({"n": "people\\labs"}),
     );
     assert_eq!(ou["data"]["createOu"]["ok"], true, "{ou}");
 
@@ -209,8 +225,8 @@ fn test_policy_lifecycle_over_graphql() {
         &client,
         &url,
         &admin,
-        r#"mutation { deleteOu(name: "people\labs") { ok } }"#,
-        json!({}),
+        r#"mutation($n: String!) { deleteOu(name: $n) { ok } }"#,
+        json!({"n": "people\\labs"}),
     );
     assert_eq!(delete_ou["data"]["deleteOu"]["ok"], true, "{delete_ou}");
     let states = gql(&client, &url, &admin, STATES, json!({}));
@@ -246,7 +262,7 @@ fn test_policy_lifecycle_over_graphql() {
     let settings = settings(&client, &url);
     assert_eq!(settings["domain"], "example.com", "{settings}");
 
-    let logs = gql(&client, &url, &admin, LOGS, json!({}));
+    let logs = wait_for_policy_change_logs(&client, &url, &admin);
     assert!(
         logs["data"]["logs"]
             .as_array()

@@ -29,8 +29,8 @@ fn fold_items(items: Option<Vec<PolicyItemInput>>) -> FieldResult<BTreeMap<Strin
     Ok(map)
 }
 
-async fn require_registered_ou<Handler: FullHandler + OpaqueHandler>(
-    handler: &(impl SystemConfigBackendHandler + Sync),
+async fn require_registered_ou(
+    handler: &impl SystemConfigBackendHandler,
     ou_key: &str,
 ) -> FieldResult<()> {
     if ou_key == ROOT_OU_KEY {
@@ -170,7 +170,7 @@ pub(super) async fn set_ou_policy<Handler: FullHandler + OpaqueHandler>(
             "Unauthorized to write policies",
         ))?;
     let ou_key = canonical_ou_key(&ou);
-    require_registered_ou::<Handler>(handler, &ou_key).await?;
+    require_registered_ou(handler, &ou_key).await?;
     handler
         .set_ou_policy(&ou_key, PolicyId(policy_id))
         .instrument(span)
@@ -216,7 +216,7 @@ pub(super) async fn set_ou_policy_inheritance<Handler: FullHandler + OpaqueHandl
     if ou_key == ROOT_OU_KEY {
         return Err("The domain root cannot block inheritance".into());
     }
-    require_registered_ou::<Handler>(handler, &ou_key).await?;
+    require_registered_ou(handler, &ou_key).await?;
     handler
         .set_ou_policy_inheritance(&ou_key, blocked)
         .instrument(span)

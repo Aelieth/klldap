@@ -75,6 +75,7 @@ pub enum LogKind {
     AccessDeniedFlood,
     MfaEnroll,
     MfaReset,
+    PolicyChange,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

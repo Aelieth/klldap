@@ -14,9 +14,9 @@ use lldap_domain::{
 };
 use lldap_domain_handlers::handler::{
     BackendHandler, GroupBackendHandler, GroupListerBackendHandler, GroupRequestFilter,
-    LogBackendHandler, MfaBackendHandler, PosixBackendHandler, ReadSchemaBackendHandler,
-    SchemaBackendHandler, SystemConfigBackendHandler, UserBackendHandler, UserListerBackendHandler,
-    UserRequestFilter,
+    LogBackendHandler, MfaBackendHandler, PolicyBackendHandler, PosixBackendHandler,
+    ReadSchemaBackendHandler, SchemaBackendHandler, SystemConfigBackendHandler, UserBackendHandler,
+    UserListerBackendHandler, UserRequestFilter,
 };
 use lldap_domain_model::error::Result;
 use lldap_opaque_handler::OpaqueHandler;
@@ -59,6 +59,7 @@ pub trait AdminBackendHandler:
     + SystemConfigBackendHandler
     + PosixBackendHandler
     + LogBackendHandler
+    + PolicyBackendHandler
     + OpaqueHandler
 {
     async fn create_user(&self, request: CreateUserRequest) -> Result<()>;

@@ -134,7 +134,8 @@ KDC, `749/tcp` kadmin. Volumes: `/data` (config, database, keytabs) and
   [changing database backend](docs/database_migration.md)
 - [Kerberos](docs/kerberos.md), [SSSD + Kerberos + Keycloak guide](docs/SSSD_LDAP_Kerberos_Setup_Guide.md)
 - [Scripting (LDAP and GraphQL)](docs/scripting.md), [event logging](docs/logging.md),
-  [two-factor authentication](docs/mfa.md), [architecture](docs/architecture.md)
+  [two-factor authentication](docs/mfa.md), [OU policies](docs/policies.md),
+  [architecture](docs/architecture.md)
 - [FAQ](docs/faq.md), [building and testing](docs/testing.md), [changelog](CHANGELOG.md)
 
 ## Contributions

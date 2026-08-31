@@ -5,6 +5,7 @@ pub(crate) mod sql_group_backend_handler;
 pub(crate) mod sql_log_handler;
 pub(crate) mod sql_mfa_handler;
 pub(crate) mod sql_opaque_handler;
+pub(crate) mod sql_policy_handler;
 pub(crate) mod sql_posix_backend_handler;
 pub(crate) mod sql_schema_backend_handler;
 pub(crate) mod sql_user_backend_handler;

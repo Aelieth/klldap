@@ -57,6 +57,7 @@ pub enum GraphQLLogKind {
     AccessDeniedFlood,
     MfaEnroll,
     MfaReset,
+    PolicyChange,
 }
 
 #[derive(

@@ -110,6 +110,24 @@ pub(crate) enum GroupObjectClasses {
 }
 
 #[derive(DeriveIden, Clone, Copy)]
+pub(crate) enum Policies {
+    Table,
+    Id,
+    Name,
+    LowercaseName,
+    Description,
+    Items,
+}
+
+#[derive(DeriveIden, Clone, Copy)]
+pub(crate) enum OuPolicies {
+    Table,
+    OuKey,
+    PolicyId,
+    BlockInheritance,
+}
+
+#[derive(DeriveIden, Clone, Copy)]
 pub(crate) enum Logs {
     Table,
     Id,
@@ -1539,6 +1557,94 @@ async fn ensure_logs(
     Ok(())
 }
 
+async fn ensure_policies(
+    transaction: &DatabaseTransaction,
+    backend: sea_orm::DbBackend,
+) -> Result<(), DbErr> {
+    let savepoint = transaction.begin().await?;
+    let probe = savepoint
+        .execute(backend.build(Query::select().expr(1).from(Policies::Table).limit(1)))
+        .await;
+    savepoint.rollback().await?;
+    if probe.is_err() {
+        transaction
+            .execute(
+                backend.build(
+                    Table::create()
+                        .table(Policies::Table)
+                        .if_not_exists()
+                        .col(
+                            ColumnDef::new(Policies::Id)
+                                .integer()
+                                .auto_increment()
+                                .not_null()
+                                .primary_key(),
+                        )
+                        .col(ColumnDef::new(Policies::Name).string_len(255).not_null())
+                        .col(
+                            ColumnDef::new(Policies::LowercaseName)
+                                .string_len(255)
+                                .not_null(),
+                        )
+                        .col(ColumnDef::new(Policies::Description).text().not_null())
+                        .col(ColumnDef::new(Policies::Items).text().not_null()),
+                ),
+            )
+            .await?;
+    }
+    let savepoint = transaction.begin().await?;
+    let probe = savepoint
+        .execute(backend.build(Query::select().expr(1).from(OuPolicies::Table).limit(1)))
+        .await;
+    savepoint.rollback().await?;
+    if probe.is_err() {
+        transaction
+            .execute(
+                backend.build(
+                    Table::create()
+                        .table(OuPolicies::Table)
+                        .if_not_exists()
+                        .col(
+                            ColumnDef::new(OuPolicies::OuKey)
+                                .string_len(255)
+                                .not_null()
+                                .primary_key(),
+                        )
+                        .col(ColumnDef::new(OuPolicies::PolicyId).integer().null())
+                        .col(
+                            ColumnDef::new(OuPolicies::BlockInheritance)
+                                .boolean()
+                                .not_null()
+                                .default(false),
+                        ),
+                ),
+            )
+            .await?;
+    }
+    ensure_index(
+        transaction,
+        backend,
+        Index::create()
+            .name("unique-policy-lower-name")
+            .table(Policies::Table)
+            .col(Policies::LowercaseName)
+            .unique()
+            .to_owned(),
+    )
+    .await?;
+    ensure_index(
+        transaction,
+        backend,
+        Index::create()
+            .name("ou-policies-policy-id")
+            .table(OuPolicies::Table)
+            .col(OuPolicies::PolicyId)
+            .to_owned(),
+    )
+    .await?;
+    Ok(())
+}
+
 async fn ensure_index(
     transaction: &DatabaseTransaction,
     backend: sea_orm::DbBackend,
@@ -1558,7 +1664,9 @@ async fn ensure_index(
 // at the next boot instead of through a new version.
 pub(crate) async fn ensure_v13_additions(pool: &DbConnection) -> Result<(), DbErr> {
     let transaction = pool.begin().await?;
-    ensure_logs(&transaction, transaction.get_database_backend()).await?;
+    let backend = transaction.get_database_backend();
+    ensure_logs(&transaction, backend).await?;
+    ensure_policies(&transaction, backend).await?;
     transaction.commit().await
 }
 
@@ -2139,6 +2247,7 @@ async fn migrate_to_v13(transaction: DatabaseTransaction) -> Result<DatabaseTran
     .await?;
     ensure_system_config(&transaction, backend).await?;
     ensure_logs(&transaction, backend).await?;
+    ensure_policies(&transaction, backend).await?;
 
     // v12 only repaired the row named 'avatar'; custom upstream JpegPhoto attrs hard-fail
     // the shared enum until their type is normalized too.

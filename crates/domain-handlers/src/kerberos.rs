@@ -12,7 +12,12 @@ pub fn base_dn_from_env() -> String {
 pub fn domain_from_base_dn(base_dn: &str) -> String {
     base_dn
         .split(',')
-        .filter_map(|part| part.strip_prefix("dc="))
+        .filter_map(|part| {
+            let part = part.trim();
+            part.get(..3)
+                .filter(|p| p.eq_ignore_ascii_case("dc="))
+                .map(|_| part[3..].to_owned())
+        })
         .collect::<Vec<_>>()
         .join(".")
         .to_lowercase()
@@ -213,6 +218,7 @@ mod tests {
     fn test_domain_and_realm_from_base_dn() {
         assert_eq!(domain_from_base_dn("dc=gate,dc=test"), "gate.test");
         assert_eq!(domain_from_base_dn("dc=Example,dc=COM"), "example.com");
+        assert_eq!(domain_from_base_dn("DC=Example, dc=COM"), "example.com");
         assert_eq!(
             domain_from_base_dn("ou=people,dc=example,dc=com"),
             "example.com"

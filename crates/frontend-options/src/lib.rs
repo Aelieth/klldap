@@ -8,4 +8,6 @@ pub struct Options {
     pub mfa_enabled: bool,
     #[serde(default)]
     pub mfa_required: bool,
+    #[serde(default)]
+    pub domain: String,
 }

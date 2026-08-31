@@ -14,14 +14,17 @@ use lldap_domain::{
 };
 use lldap_domain_handlers::handler::{
     BackendHandler, BindRequest, GroupBackendHandler, GroupListerBackendHandler,
-    GroupRequestFilter, LogBackendHandler, LoginHandler, MfaBackendHandler, PosixBackendHandler,
-    PosixSettings, ReadSchemaBackendHandler, SchemaBackendHandler, SystemConfigBackendHandler,
-    UserBackendHandler, UserListerBackendHandler, UserRequestFilter,
+    GroupRequestFilter, LogBackendHandler, LoginHandler, MfaBackendHandler, PolicyBackendHandler,
+    PosixBackendHandler, PosixSettings, ReadSchemaBackendHandler, SchemaBackendHandler,
+    SystemConfigBackendHandler, UserBackendHandler, UserListerBackendHandler, UserRequestFilter,
 };
 use lldap_domain_handlers::logging::{
     LogActivity, LogBucket, LogCursor, LogDimension, LogFilter, LogKind, LogRecord,
 };
 use lldap_domain_handlers::mfa::{MfaRequirement, MfaResetReason};
+use lldap_domain_handlers::policies::{
+    CreatePolicyRequest, OuPolicyState, Policy, PolicyId, PolicyLevel, UpdatePolicyRequest,
+};
 use lldap_domain_model::error::Result;
 use lldap_opaque_handler::{OpaqueHandler, login, registration};
 use lldap_schema::PublicSchema;
@@ -84,6 +87,20 @@ mockall::mock! {
         async fn finish_totp_enrollment(&self, user_id: &UserId, state: &str, code: &str) -> Result<()>;
         async fn reset_user_mfa(&self, user_id: &UserId, reason: MfaResetReason) -> Result<()>;
         async fn reset_own_mfa(&self, user_id: &UserId, code: &str) -> Result<()>;
+    }
+    #[async_trait]
+    impl PolicyBackendHandler for TestBackendHandler {
+        async fn list_policies(&self) -> Result<Vec<Policy>>;
+        async fn get_policy(&self, policy_id: PolicyId) -> Result<Policy>;
+        async fn create_policy(&self, request: CreatePolicyRequest) -> Result<PolicyId>;
+        async fn update_policy(&self, request: UpdatePolicyRequest) -> Result<()>;
+        async fn delete_policy(&self, policy_id: PolicyId) -> Result<()>;
+        async fn set_ou_policy(&self, ou: &str, policy_id: PolicyId) -> Result<()>;
+        async fn clear_ou_policy(&self, ou: &str) -> Result<()>;
+        async fn set_ou_policy_inheritance(&self, ou: &str, blocked: bool) -> Result<()>;
+        async fn list_ou_policy_states(&self) -> Result<Vec<OuPolicyState>>;
+        async fn get_policy_levels(&self, ou: &str) -> Result<Vec<PolicyLevel>>;
+        async fn delete_ou_policy_state(&self, ou: &str) -> Result<()>;
     }
     #[async_trait]
     impl BackendHandler for TestBackendHandler {}

@@ -2,6 +2,7 @@ pub mod attribute;
 pub mod filters;
 pub mod group;
 pub mod logs;
+pub mod policy;
 pub mod schema;
 pub mod user;
 
@@ -258,6 +259,36 @@ impl<Handler: FullHandler + OpaqueHandler> Query<Handler> {
             .get_allowed_ous()
             .await
             .map_err(|e| anyhow!("Failed to load allowedous: {e}"))?)
+    }
+
+    async fn policies(context: &Context<Handler>) -> FieldResult<Vec<policy::GraphQLPolicy>> {
+        policy::policies(context).await
+    }
+
+    async fn policy(
+        context: &Context<Handler>,
+        policy_id: i32,
+    ) -> FieldResult<policy::GraphQLPolicy> {
+        policy::policy(context, policy_id).await
+    }
+
+    async fn policy_item_catalog(
+        context: &Context<Handler>,
+    ) -> FieldResult<Vec<policy::GraphQLPolicyCatalogItem>> {
+        policy::policy_item_catalog(context)
+    }
+
+    async fn effective_policy_items(
+        context: &Context<Handler>,
+        ou: String,
+    ) -> FieldResult<Vec<policy::GraphQLEffectivePolicyItem>> {
+        policy::effective_policy_items(context, ou).await
+    }
+
+    async fn ou_policy_states(
+        context: &Context<Handler>,
+    ) -> FieldResult<Vec<policy::GraphQLOuPolicyState>> {
+        policy::ou_policy_states(context).await
     }
 
     async fn posix_settings(context: &Context<Handler>) -> FieldResult<PosixSettings> {
@@ -772,6 +803,41 @@ mod tests {
                     "{permission:?} {query}: {errors:?}"
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_policy_queries_require_admin() {
+        const QUERIES: [&str; 5] = [
+            r#"{ policies { id } }"#,
+            r#"{ policy(policyId: 1) { id } }"#,
+            r#"{ policyItemCatalog { key } }"#,
+            r#"{ effectivePolicyItems(ou: "") { key } }"#,
+            r#"{ ouPolicyStates { ou } }"#,
+        ];
+        for query in QUERIES {
+            let mut mock = MockTestBackendHandler::new();
+            mock.expect_list_policies().times(0);
+            mock.expect_get_policy().times(0);
+            mock.expect_get_policy_levels().times(0);
+            mock.expect_list_ou_policy_states().times(0);
+            let context = Context::<MockTestBackendHandler>::new_for_tests(
+                mock,
+                ValidationResults {
+                    user: UserId::new("bob"),
+                    permission: Permission::Regular,
+                },
+            );
+            let schema = schema(Query::<MockTestBackendHandler>::new());
+            let (_, errors) = execute(query, None, &schema, &Variables::new(), &context)
+                .await
+                .unwrap();
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.error().message().contains("Unauthorized")),
+                "{query}: {errors:?}"
+            );
         }
     }
 

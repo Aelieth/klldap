@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.7.6] unreleased
+
+### Organizational-unit policies
+
+- Named policies of items can be attached **one per OU**, including the domain root. Closest
+  wins; an OU may block inheritance (the root cannot). The v1 catalog is six user-scope
+  items (`require-mfa`, lockout threshold/duration, login hours, allowed networks,
+  inactivity days), all marked not yet enforced — nothing is checked at login or bind.
+  Admin GraphQL: `policies`, `policy`, `policyItemCatalog`, `effectivePolicyItems`,
+  `ouPolicyStates`, and the create/update/delete/set/clear/inheritance mutations. Writes
+  record `policy_change`. `/settings` exposes `domain` from the LDAP base DN (e.g.
+  `example.com`). See `docs/policies.md`.
+
 ## [0.7.5] unreleased
 
 ### Multi-factor authentication

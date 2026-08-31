@@ -9,7 +9,7 @@ use lldap_domain::{
     requests::{UpdateGroupRequest, UpdateUserRequest},
     types::{Attribute, GroupId, UserId},
 };
-use lldap_domain_handlers::handler::SystemConfigBackendHandler;
+use lldap_domain_handlers::handler::{PolicyBackendHandler, SystemConfigBackendHandler};
 use lldap_opaque_handler::OpaqueHandler;
 use tracing::{debug, debug_span, info, warn};
 
@@ -92,6 +92,9 @@ pub(super) async fn create_ou<Handler: FullHandler + OpaqueHandler>(
         )
         .into());
     }
+    if let Err(e) = handler.delete_ou_policy_state(&name_lower).await {
+        warn!("Failed to purge stale policy state for recreated OU '{name}': {e}");
+    }
     ous.push(name);
     ous.sort();
     set_allowed_ous(handler, &ous).await?;
@@ -172,6 +175,9 @@ pub(super) async fn delete_ou<Handler: FullHandler + OpaqueHandler>(
     }
     ous.retain(|ou| ou.to_lowercase() != name_lower);
     set_allowed_ous(handler, &ous).await?;
+    if let Err(e) = handler.delete_ou_policy_state(&name_lower).await {
+        warn!("Failed to drop policy state for deleted OU '{name}': {e}");
+    }
     info!("Organizational Unit '{name}' deleted.");
     Ok(Success::new())
 }

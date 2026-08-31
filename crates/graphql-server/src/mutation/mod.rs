@@ -4,6 +4,7 @@ mod kerberos;
 mod keycloak;
 mod mfa;
 mod ou;
+mod policy;
 mod posix;
 
 pub use inputs::{
@@ -424,6 +425,49 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         new_ou: String,
     ) -> FieldResult<Success> {
         ou::change_group_ou(context, group_ids, new_ou).await
+    }
+
+    async fn create_policy(
+        context: &Context<Handler>,
+        name: String,
+        description: Option<String>,
+        items: Option<Vec<policy::PolicyItemInput>>,
+    ) -> FieldResult<crate::query::policy::GraphQLPolicy> {
+        policy::create_policy(context, name, description, items).await
+    }
+
+    async fn update_policy(
+        context: &Context<Handler>,
+        policy_id: i32,
+        name: Option<String>,
+        description: Option<String>,
+        items: Option<Vec<policy::PolicyItemInput>>,
+    ) -> FieldResult<Success> {
+        policy::update_policy(context, policy_id, name, description, items).await
+    }
+
+    async fn delete_policy(context: &Context<Handler>, policy_id: i32) -> FieldResult<Success> {
+        policy::delete_policy(context, policy_id).await
+    }
+
+    async fn set_ou_policy(
+        context: &Context<Handler>,
+        ou: String,
+        policy_id: i32,
+    ) -> FieldResult<Success> {
+        policy::set_ou_policy(context, ou, policy_id).await
+    }
+
+    async fn clear_ou_policy(context: &Context<Handler>, ou: String) -> FieldResult<Success> {
+        policy::clear_ou_policy(context, ou).await
+    }
+
+    async fn set_ou_policy_inheritance(
+        context: &Context<Handler>,
+        ou: String,
+        blocked: bool,
+    ) -> FieldResult<Success> {
+        policy::set_ou_policy_inheritance(context, ou, blocked).await
     }
 
     async fn add_user_attribute(
@@ -1289,6 +1333,7 @@ mod tests {
             }
             Ok(ous)
         });
+        mock.expect_delete_ou_policy_state().returning(|_| Ok(()));
         mock.expect_set_system_config()
             .withf(|k, v| k == "allowedous" && v.contains("labs"))
             .times(1)
@@ -1416,6 +1461,12 @@ mod tests {
             r#"mutation { reassignUserHomedirectories { success } }"#,
             r#"mutation { reassignUserLoginshells { success } }"#,
             r#"mutation { reassignGidNumbers { success } }"#,
+            r#"mutation { createPolicy(name: "x") { id } }"#,
+            r#"mutation { updatePolicy(policyId: 1) { ok } }"#,
+            r#"mutation { deletePolicy(policyId: 1) { ok } }"#,
+            r#"mutation { setOuPolicy(ou: "", policyId: 1) { ok } }"#,
+            r#"mutation { clearOuPolicy(ou: "") { ok } }"#,
+            r#"mutation { setOuPolicyInheritance(ou: "people", blocked: true) { ok } }"#,
         ] {
             let context = regular_context(MockTestBackendHandler::new());
             let (_, errors) = execute(query, None, &root_schema(), &Variables::new(), &context)

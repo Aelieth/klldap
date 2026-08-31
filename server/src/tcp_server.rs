@@ -20,6 +20,7 @@ use anyhow::{Context, Result};
 use hmac::Hmac;
 use lldap_access_control::{AccessControlledBackendHandler, ReadonlyBackendHandler};
 use lldap_domain_handlers::handler::{BackendHandler, LoginHandler, MfaBackendHandler};
+use lldap_domain_handlers::kerberos::domain_from_base_dn;
 use lldap_domain_handlers::logging::{RequestMeta, with_request};
 use lldap_domain_handlers::mfa::MfaPolicy;
 use lldap_domain_model::error::DomainError;
@@ -138,6 +139,7 @@ async fn get_settings<Backend>(data: web::Data<AppState<Backend>>) -> HttpRespon
         password_reset_enabled: data.mail_options.enable_password_reset,
         mfa_enabled: data.mfa_policy != MfaPolicy::Disabled,
         mfa_required: data.mfa_policy == MfaPolicy::Always,
+        domain: data.domain.clone(),
     })
 }
 
@@ -148,6 +150,7 @@ struct WebOptions {
     assets_path: PathBuf,
     mail_options: MailOptions,
     mfa_policy: MfaPolicy,
+    domain: String,
 }
 
 fn http_config<Backend>(
@@ -164,6 +167,7 @@ fn http_config<Backend>(
         assets_path,
         mail_options,
         mfa_policy,
+        domain,
     } = options;
     let enable_password_reset = mail_options.enable_password_reset;
     cfg.app_data(web::Data::new(AppState::<Backend> {
@@ -174,6 +178,7 @@ fn http_config<Backend>(
         assets_path: assets_path.clone(),
         mail_options,
         mfa_policy,
+        domain,
     }))
     .route(
         "/health",
@@ -219,6 +224,7 @@ pub(crate) struct AppState<Backend> {
     pub assets_path: PathBuf,
     pub mail_options: MailOptions,
     pub mfa_policy: MfaPolicy,
+    pub domain: String,
 }
 
 impl<Backend: BackendHandler> AppState<Backend> {
@@ -265,6 +271,7 @@ where
         assets_path: config.assets_path.clone(),
         mail_options: config.smtp_options.clone(),
         mfa_policy: config.mfa_policy(),
+        domain: domain_from_base_dn(&config.ldap_base_dn),
     };
     let verbose = config.verbose;
     if !options.assets_path.join("index.html").exists() {

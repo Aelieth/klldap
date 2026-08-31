@@ -1648,6 +1648,63 @@ async fn test_init_repairs_the_logs_table_and_its_indexes() {
     );
 }
 
+#[tokio::test]
+async fn test_init_repairs_the_policy_tables_and_indexes() {
+    let pool = get_in_memory_db().await;
+    init_table(&pool).await.unwrap();
+    for name in ["unique-policy-lower-name", "ou-policies-policy-id"] {
+        pool.execute(raw_statement(&format!(r#"DROP INDEX "{name}""#)))
+            .await
+            .unwrap();
+    }
+    init_table(&pool).await.unwrap();
+    #[derive(FromQueryResult)]
+    struct NameRow {
+        name: String,
+    }
+    let names: Vec<String> = NameRow::find_by_statement(raw_statement(
+        r#"SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name IN ('policies', 'ou_policies')"#,
+    ))
+    .all(&pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|r| r.name)
+    .collect();
+    for index in ["unique-policy-lower-name", "ou-policies-policy-id"] {
+        assert!(
+            names.iter().any(|n| n == index),
+            "{index} restored: {names:?}"
+        );
+    }
+
+    pool.execute(raw_statement(
+        r#"INSERT INTO policies (name, lowercase_name, description, items)
+           VALUES ('Hours', 'hours', '', '{}')"#,
+    ))
+    .await
+    .unwrap();
+    init_table(&pool).await.unwrap();
+    assert_eq!(
+        count(&pool, r#"SELECT COUNT(*) as c FROM policies"#).await,
+        1,
+        "re-init keeps policy rows"
+    );
+
+    pool.execute(raw_statement(r#"DROP TABLE ou_policies"#))
+        .await
+        .unwrap();
+    pool.execute(raw_statement(r#"DROP TABLE policies"#))
+        .await
+        .unwrap();
+    init_table(&pool).await.unwrap();
+    assert_eq!(
+        count(&pool, r#"SELECT COUNT(*) as c FROM policies"#).await,
+        0,
+        "missing policy tables are recreated"
+    );
+}
+
 async fn run_stepwise_migration_test(start_ver: SchemaVersion) {
     crate::logging::init_for_tests();
 

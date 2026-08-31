@@ -2,6 +2,9 @@ use crate::logging::{
     LogActivity, LogBucket, LogCursor, LogDimension, LogFilter, LogKind, LogRecord,
 };
 use crate::mfa::{MfaRequirement, MfaResetReason};
+use crate::policies::{
+    CreatePolicyRequest, OuPolicyState, Policy, PolicyId, PolicyLevel, UpdatePolicyRequest,
+};
 use async_trait::async_trait;
 use ldap3_proto::proto::LdapSubstringFilter;
 use lldap_domain::{
@@ -233,6 +236,22 @@ pub trait MfaBackendHandler: Send + Sync {
 }
 
 #[async_trait]
+pub trait PolicyBackendHandler: Send + Sync {
+    async fn list_policies(&self) -> Result<Vec<Policy>>;
+    async fn get_policy(&self, policy_id: PolicyId) -> Result<Policy>;
+    async fn create_policy(&self, request: CreatePolicyRequest) -> Result<PolicyId>;
+    async fn update_policy(&self, request: UpdatePolicyRequest) -> Result<()>;
+    async fn delete_policy(&self, policy_id: PolicyId) -> Result<()>;
+    async fn set_ou_policy(&self, ou: &str, policy_id: PolicyId) -> Result<()>;
+    async fn clear_ou_policy(&self, ou: &str) -> Result<()>;
+    async fn set_ou_policy_inheritance(&self, ou: &str, blocked: bool) -> Result<()>;
+    async fn list_ou_policy_states(&self) -> Result<Vec<OuPolicyState>>;
+    /// Root-first levels for `ou`, including keys with no row. Enforcement consumes this.
+    async fn get_policy_levels(&self, ou: &str) -> Result<Vec<PolicyLevel>>;
+    async fn delete_ou_policy_state(&self, ou: &str) -> Result<()>;
+}
+
+#[async_trait]
 pub trait BackendHandler:
     Send
     + Sync
@@ -246,6 +265,7 @@ pub trait BackendHandler:
     + PosixBackendHandler
     + LogBackendHandler
     + MfaBackendHandler
+    + PolicyBackendHandler
 {
 }
 

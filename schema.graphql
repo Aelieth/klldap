@@ -52,6 +52,7 @@ enum LogKind {
   ACCESS_DENIED_FLOOD
   MFA_ENROLL
   MFA_RESET
+  POLICY_CHANGE
 }
 
 enum LogProtocol {
@@ -59,6 +60,21 @@ enum LogProtocol {
   HTTP
   GRAPHQL
   SYSTEM
+}
+
+enum PolicyScope {
+  USER
+  GROUP
+  COMPUTER
+  SERVER
+}
+
+enum PolicyValueKind {
+  BOOL
+  INT
+  ENUM
+  STRING
+  STRING_LIST
 }
 
 input AttributeValueInput {
@@ -122,6 +138,11 @@ input LogFilter {
   until: DateTime
   memberOf: String
   memberOfId: Int
+}
+
+input PolicyItemInput {
+  key: String!
+  value: String!
 }
 
 input PosixSettingsInput {
@@ -263,6 +284,49 @@ type ExportKeytabForKeycloakResponse {
   errorMsg: String!
 }
 
+type GraphQLEffectivePolicyItem {
+  key: String!
+  scope: PolicyScope!
+  value: String!
+  enforced: Boolean!
+  sourcePolicyId: Int
+  sourcePolicyName: String
+  sourceOu: String
+}
+
+type GraphQLOuPolicyState {
+  ou: String!
+  policyId: Int
+  policyName: String
+  blockInheritance: Boolean!
+}
+
+type GraphQLPolicy {
+  id: Int!
+  name: String!
+  description: String!
+  items: [GraphQLPolicyItem!]!
+  "Lowercase OU keys; the empty string is the domain root."
+  linkedOus: [String!]!
+}
+
+type GraphQLPolicyCatalogItem {
+  key: String!
+  scope: PolicyScope!
+  valueKind: PolicyValueKind!
+  intMin: Int
+  intMax: Int
+  allowedValues: [String!]
+  defaultValue: String!
+  enforced: Boolean!
+  description: String!
+}
+
+type GraphQLPolicyItem {
+  key: String!
+  value: String!
+}
+
 type Group {
   id: Int!
   displayName: String!
@@ -362,6 +426,12 @@ type Mutation {
   deleteOu(name: String!): Success!
   changeUserOu(userIds: [String!]!, newOu: String!): Success!
   changeGroupOu(groupIds: [Int!]!, newOu: String!): Success!
+  createPolicy(name: String!, description: String, items: [PolicyItemInput!]): GraphQLPolicy!
+  updatePolicy(policyId: Int!, name: String, description: String, items: [PolicyItemInput!]): Success!
+  deletePolicy(policyId: Int!): Success!
+  setOuPolicy(ou: String!, policyId: Int!): Success!
+  clearOuPolicy(ou: String!): Success!
+  setOuPolicyInheritance(ou: String!, blocked: Boolean!): Success!
   addUserAttribute(name: String!, attributeType: AttributeType!, isList: Boolean!, isVisible: Boolean!, isEditable: Boolean!): Success!
   addGroupAttribute(name: String!, attributeType: AttributeType!, isList: Boolean!, isVisible: Boolean!, isEditable: Boolean!): Success!
   deleteUserAttribute(name: String!): Success!
@@ -428,6 +498,11 @@ type Query {
   keycloakSuggestedConfig: KeycloakSuggestedConfig!
   keycloakConfig: KeycloakConfigResponse!
   listOus: [String!]!
+  policies: [GraphQLPolicy!]!
+  policy(policyId: Int!): GraphQLPolicy!
+  policyItemCatalog: [GraphQLPolicyCatalogItem!]!
+  effectivePolicyItems(ou: String!): [GraphQLEffectivePolicyItem!]!
+  ouPolicyStates: [GraphQLOuPolicyState!]!
   posixSettings: PosixSettings!
   "Newest first; `beforeId` pages back, `afterId` pages forward oldest first."
   logs(filter: LogFilter, limit: Int, beforeId: ID, afterId: ID): [LogEntry!]!

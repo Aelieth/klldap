@@ -16,6 +16,7 @@ const FINISH: &str =
 const RESET_OWN: &str = "mutation($c: String!) { resetOwnMfa(code: $c) { ok } }";
 const RESET_USER: &str = "mutation($u: String!) { resetUserMfa(userId: $u) { ok } }";
 const USERS: &str = "{ users { id } }";
+const SCHEMA: &str = "{ schema { userSchema { attributes { name } } } }";
 
 fn client() -> Client {
     ClientBuilder::new()
@@ -75,7 +76,7 @@ fn set_password(client: &Client, base_url: &str, admin_token: &str, user: &str, 
     assert_eq!(body["data"]["setUserPassword"]["ok"], true, "{body}");
 }
 
-fn add_to_group(client: &Client, base_url: &str, admin_token: &str, user: &str, group: &str) {
+fn group_id(client: &Client, base_url: &str, admin_token: &str, group: &str) -> Option<Value> {
     let groups = gql(
         client,
         base_url,
@@ -83,13 +84,27 @@ fn add_to_group(client: &Client, base_url: &str, admin_token: &str, user: &str, 
         "{ groups { id displayName } }",
         json!({}),
     );
-    let group_id = groups["data"]["groups"]
+    groups["data"]["groups"]
         .as_array()
         .expect("groups")
         .iter()
         .find(|g| g["displayName"] == group)
         .map(|g| g["id"].clone())
-        .unwrap_or_else(|| panic!("{group} exists at boot: {groups}"));
+}
+
+fn delete_group(client: &Client, base_url: &str, admin_token: &str, id: Value) -> Value {
+    gql(
+        client,
+        base_url,
+        admin_token,
+        "mutation($g: Int!) { deleteGroup(groupId: $g) { ok } }",
+        json!({"g": id}),
+    )
+}
+
+fn add_to_group(client: &Client, base_url: &str, admin_token: &str, user: &str, group: &str) {
+    let group_id = group_id(client, base_url, admin_token, group)
+        .unwrap_or_else(|| panic!("{group} exists at boot"));
     let body = gql(
         client,
         base_url,
@@ -273,6 +288,20 @@ fn test_mfa_disabled_keeps_plain_binds() {
     assert_eq!(settings["mfa_enabled"], false, "{settings}");
     assert_eq!(settings["mfa_required"], false, "{settings}");
 
+    // No exempt group is created, and one of that name is an ordinary group.
+    assert_eq!(group_id(&client, &url, &admin, "lldap_mfa_disabled"), None);
+    let body = gql(
+        &client,
+        &url,
+        &admin,
+        "mutation { createGroup(name: \"lldap_mfa_disabled\") { id } }",
+        json!({}),
+    );
+    let id = body["data"]["createGroup"]["id"].clone();
+    assert!(id.is_number(), "{body}");
+    let body = delete_group(&client, &url, &admin, id);
+    assert_eq!(body["data"]["deleteGroup"]["ok"], true, "{body}");
+
     let body = start_enrollment(&client, &url, &bob, None);
     assert!(has_error(&body, "MFA is disabled"), "{body}");
     let body = gql(&client, &url, &admin, RESET_USER, json!({"u": "bob"}));
@@ -416,6 +445,9 @@ fn test_mfa_enrollment_and_doors() {
         set_password(&client, &url, &admin, user, &format!("{user}pass"));
     }
     add_to_group(&client, &url, &admin, "sam", "lldap_mfa_disabled");
+    let exempt = group_id(&client, &url, &admin, "lldap_mfa_disabled").expect("exempt group");
+    let body = delete_group(&client, &url, &admin, exempt);
+    assert!(has_error(&body, "Cannot delete built-in group"), "{body}");
     let token_for = |user: &str| get_token_for(&client, &url, user, &format!("{user}pass"));
     let (bob, eve, kim, sam) = (
         token_for("bob"),
@@ -539,6 +571,8 @@ fn test_mfa_always_gates_api_and_doors() {
     // The API is confined to read-self and enrollment until the factor is in place.
     let body = gql(&client, &url, &admin, USERS, json!({}));
     assert!(has_error(&body, "Unauthorized"), "{body}");
+    let body = gql(&client, &url, &admin, SCHEMA, json!({}));
+    assert!(has_error(&body, "Unauthorized"), "{body}");
     assert_eq!(mfa_enrolled(&client, &url, &admin, &admin_name), false);
     let secret = enroll(&client, &url, &admin);
     let body = gql(&client, &url, &admin, USERS, json!({}));
@@ -548,6 +582,8 @@ fn test_mfa_always_gates_api_and_doors() {
             .as_array()
             .is_some_and(|users| !users.is_empty())
     );
+    let body = gql(&client, &url, &admin, SCHEMA, json!({}));
+    assert!(body["errors"].is_null(), "{body}");
     assert_eq!(mfa_enrolled(&client, &url, &admin, &admin_name), true);
     let (_, next) = fresh_codes(&secret);
     assert_eq!(

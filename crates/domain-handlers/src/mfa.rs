@@ -1,3 +1,5 @@
+use lldap_domain::is_builtin_group;
+
 pub const MFA_DISABLED_GROUP: &str = "lldap_mfa_disabled";
 
 /// `enable_mfa`: false, true (only enrolled users present a code), "always".
@@ -31,6 +33,12 @@ pub fn mfa_requirement(policy: MfaPolicy, status: Option<&MfaEnrollmentStatus>) 
         (MfaPolicy::Enrolled, Some(_)) => MfaRequirement::None,
         (MfaPolicy::Always, Some(_)) => MfaRequirement::Enrollment,
     }
+}
+
+// The exempt group is load-bearing only while the mode is on; off, the name is ordinary.
+pub fn is_protected_group(name: &str, policy: MfaPolicy) -> bool {
+    is_builtin_group(name)
+        || (policy != MfaPolicy::Disabled && name.eq_ignore_ascii_case(MFA_DISABLED_GROUP))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,6 +114,20 @@ mod tests {
                 expected,
                 "{policy:?} {status:?}"
             );
+        }
+    }
+
+    #[test]
+    fn test_protected_group_table() {
+        for policy in [MfaPolicy::Disabled, MfaPolicy::Enrolled, MfaPolicy::Always] {
+            for name in lldap_domain::BUILTIN_GROUPS {
+                assert!(is_protected_group(name, policy), "{name} {policy:?}");
+            }
+            assert!(!is_protected_group("family", policy), "{policy:?}");
+            let on = policy != MfaPolicy::Disabled;
+            for name in ["lldap_mfa_disabled", "LLDAP_MFA_DISABLED"] {
+                assert_eq!(is_protected_group(name, policy), on, "{name} {policy:?}");
+            }
         }
     }
 }

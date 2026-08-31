@@ -35,6 +35,7 @@ impl CommonComponent<LogoutButton> for LogoutButton {
                 res?;
                 delete_cookie("user_id")?;
                 delete_cookie("is_admin")?;
+                delete_cookie("mfa_exempt")?;
                 ctx.props().on_logged_out.emit(());
             }
         }

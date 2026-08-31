@@ -42,6 +42,7 @@ pub struct ResetPasswordStep2Form {
 #[derive(Clone, PartialEq, Eq, Properties)]
 pub struct Props {
     pub token: String,
+    pub mfa_enabled: bool,
 }
 
 pub enum Msg {
@@ -200,6 +201,13 @@ impl Component for ResetPasswordStep2Form {
                     html! {
                         <>
                         <h2>{"Reset your password"}</h2>
+                        { if ctx.props().mfa_enabled {
+                            html! {
+                              <p class="text-muted">
+                                {"Resetting your password also removes any two-factor authentication on this account; you can set it up again afterwards from your profile."}
+                              </p>
+                            }
+                        } else { html! {} }}
                         <form class="form">
                         <Field<FormModel>
                         label="New password"

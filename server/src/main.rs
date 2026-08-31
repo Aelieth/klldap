@@ -46,7 +46,7 @@ use lldap_domain_handlers::handler::{
     GroupBackendHandler, GroupListerBackendHandler, GroupRequestFilter, MfaBackendHandler,
     UserBackendHandler, UserListerBackendHandler, UserRequestFilter,
 };
-use lldap_domain_handlers::mfa::MfaResetReason;
+use lldap_domain_handlers::mfa::{MFA_DISABLED_GROUP, MfaResetReason};
 
 const ADMIN_PASSWORD_MISSING_ERROR: &str = "The LDAP admin password must be initialized. \
             Either set the `ldap_user_pass` config value or the `LLDAP_LDAP_USER_PASS` environment variable. \
@@ -212,6 +212,9 @@ async fn set_up_server(
     }
     for group in BUILTIN_GROUPS {
         ensure_group_exists(&backend_handler, group).await?;
+    }
+    if config.enable_mfa.is_positive() {
+        ensure_group_exists(&backend_handler, MFA_DISABLED_GROUP).await?;
     }
     let admin_present = if let Ok(admins) = backend_handler
         .list_users(

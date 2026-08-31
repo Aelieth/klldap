@@ -54,8 +54,8 @@ impl<Handler: FullHandler> Context<Handler> {
         }
     }
 
-    // An unenrolled session under "always" may only read itself and enroll
-    // (Query::get_schema's lister is schema-only).
+    // An unenrolled session under "always" may only read itself and enroll (the internal
+    // Query::get_schema lister is schema-only; the top-level `schema` query checks itself).
     pub fn get_admin_handler(&self) -> Option<&(impl AdminBackendHandler + Send + Sync + '_)> {
         if self.mfa_enrollment_pending {
             return None;

@@ -6,6 +6,7 @@ use crate::{
     components::{
         add_user_to_group::AddUserToGroupComponent,
         remove_user_from_group::RemoveUserFromGroupComponent,
+        reset_mfa::ResetMfa,
         router::{AppRoute, Link},
         user_details_form::UserDetailsForm,
     },
@@ -62,6 +63,7 @@ pub enum Msg {
     OnError(Error),
     OnUserAddedToGroup(Group),
     OnUserRemovedFromGroup((String, i64)),
+    OnMfaReset,
     Refresh,
     AddToLldapDisabled,
     AddToLldapDisabledResponse(Result<add_user_to_group::ResponseData>),
@@ -75,6 +77,9 @@ pub enum Msg {
 pub struct Props {
     pub username: String,
     pub is_admin: bool,
+    pub is_self: bool,
+    pub mfa_enabled: bool,
+    pub mfa_required: bool,
 }
 
 impl CommonComponent<UserDetails> for UserDetails {
@@ -107,6 +112,9 @@ impl CommonComponent<UserDetails> for UserDetails {
             }
             Msg::OnUserRemovedFromGroup((_, group_id)) => {
                 self.mut_groups().retain(|g| g.id != group_id);
+            }
+            Msg::OnMfaReset => {
+                self.user_and_schema.as_mut().unwrap().0.mfa_enrolled = Some(false);
             }
             Msg::Refresh => {
                 self.common.call_graphql::<GetUserDetails, _>(
@@ -246,23 +254,28 @@ impl Component for UserDetails {
     fn view(&self, ctx: &Context<Self>) -> Html {
         match (&self.user_and_schema, &self.common.error) {
             (Some((u, schema)), error) => {
-                let can_change_password = ctx.props().is_admin || ctx.props().username == u.id;
+                let can_change_password = ctx.props().is_admin || ctx.props().is_self;
                 let is_disabled = u.groups.iter().any(|g| g.display_name == "lldap_disabled");
+                let mfa_enrolled = u.mfa_enrolled.unwrap_or(false);
+                // Under "always" an account may not be left without a factor.
+                let own_reset_blocked = ctx.props().is_self && ctx.props().mfa_required;
 
                 let link = ctx.link();
 
-                let toggle_button = if ctx.props().is_admin {
+                // Its own row, whatever the two-factor buttons below it do.
+                let toggle_row = if ctx.props().is_admin {
                     let onclick = if is_disabled {
                         link.callback(|_| Msg::RemoveFromLldapDisabled)
                     } else {
                         link.callback(|_| Msg::AddToLldapDisabled)
                     };
                     let (label, btn_class) = if is_disabled {
-                        ("✖️ Disabled", "btn btn-outline-secondary me-2")
+                        ("✖️ Disabled", "btn btn-outline-secondary")
                     } else {
-                        ("🟢 Enabled", "btn btn-success me-2")
+                        ("🟢 Enabled", "btn btn-success")
                     };
                     html! {
+                        <div class="d-flex flex-row-reverse mb-2">
                         <button
                             class={btn_class}
                             onclick={onclick}
@@ -271,6 +284,7 @@ impl Component for UserDetails {
                         >
                             {label}
                         </button>
+                        </div>
                     }
                 } else {
                     html! {}
@@ -279,6 +293,7 @@ impl Component for UserDetails {
                 html! {
                   <>
                   <h3>{u.id.to_string()}</h3>
+                  {toggle_row}
                   <div class="d-flex flex-row-reverse">
                   { if can_change_password {
                     html! {
@@ -290,11 +305,48 @@ impl Component for UserDetails {
                       </Link>
                     }
                   } else { html! {} }}
-                  {toggle_button}
+                  { if ctx.props().is_self && ctx.props().mfa_enabled {
+                    html! {
+                      <Link
+                      to={AppRoute::RegisterMfa{user_id: u.id.clone()}}
+                      classes="btn btn-secondary me-2">
+                      <i class="bi-qr-code me-2"></i>
+                      { if mfa_enrolled { "Reconfigure two-factor" } else { "Set up two-factor" }}
+                      </Link>
+                    }
+                  } else { html! {} }}
+                  { if ctx.props().is_admin && ctx.props().mfa_enabled && !own_reset_blocked {
+                    html! {
+                      <ResetMfa
+                      username={u.id.clone()}
+                      disabled={!mfa_enrolled}
+                      on_mfa_reset={link.callback(|_| Msg::OnMfaReset)}
+                      on_error={link.callback(Msg::OnError)} />
+                    }
+                  } else if ctx.props().is_self && mfa_enrolled && !own_reset_blocked {
+                    html! {
+                      <Link
+                      to={AppRoute::ResetOwnMfa{user_id: u.id.clone()}}
+                      classes="btn btn-danger me-2">
+                      <i class="bi-qr-code me-2"></i>
+                      {"Reset two-factor"}
+                      </Link>
+                    }
+                  } else { html! {} }}
                   </div>
 
-                  <div>
+                  <div class="d-flex justify-content-between align-items-center">
                   <h5 class="row m-3 fw-bold">{"User details"}</h5>
+                  { if ctx.props().mfa_enabled && u.mfa_enrolled.is_some() {
+                    html! {
+                      <span class="my-3">
+                      {"Two-factor: "}
+                      <span class="border rounded px-1">
+                      { if mfa_enrolled { "Enabled" } else { "Disabled" }}
+                      </span>
+                      </span>
+                    }
+                  } else { html! {} }}
                   </div>
 
                   <UserDetailsForm

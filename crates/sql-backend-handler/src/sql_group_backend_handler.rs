@@ -4,7 +4,6 @@ use crate::sql_backend_handler::{
 };
 use async_trait::async_trait;
 use lldap_domain::{
-    is_builtin_group,
     requests::{CreateGroupRequest, UpdateGroupRequest},
     types::{
         Attribute, AttributeName, AttributeValue, Cardinality, Group, GroupDetails, GroupId,
@@ -17,6 +16,7 @@ use lldap_domain_handlers::handler::{
 };
 use lldap_domain_handlers::kerberos::require_kdc_ready;
 use lldap_domain_handlers::logging::{self, LogKind};
+use lldap_domain_handlers::mfa::is_protected_group;
 use lldap_domain_model::{
     error::{DomainError, Result},
     model::{self, GroupColumn, MembershipColumn, codec},
@@ -315,7 +315,7 @@ impl GroupBackendHandler for SqlBackendHandler {
             .ok_or_else(|| {
                 DomainError::EntityNotFound(format!("No such group: '{:?}'", request.group_id))
             })?;
-        if request.display_name.is_some() && is_builtin_group(&current_name) {
+        if request.display_name.is_some() && is_protected_group(&current_name, self.mfa_policy) {
             return Err(DomainError::InternalError(format!(
                 "Cannot rename built-in group '{current_name}'"
             )));
@@ -457,7 +457,7 @@ impl GroupBackendHandler for SqlBackendHandler {
         require_kdc_ready()?;
         let group_details = self.get_group_details(group_id).await?;
 
-        if is_builtin_group(group_details.display_name.as_str()) {
+        if is_protected_group(group_details.display_name.as_str(), self.mfa_policy) {
             return Err(DomainError::InternalError(format!(
                 "Cannot delete built-in group '{}'",
                 group_details.display_name

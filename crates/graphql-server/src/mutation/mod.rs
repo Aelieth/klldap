@@ -29,7 +29,6 @@ use lldap_access_control::{
     UserWriteableBackendHandler,
 };
 use lldap_domain::{
-    is_builtin_group,
     requests::{CreateAttributeRequest, CreateUserRequest, UpdateGroupRequest, UpdateUserRequest},
     types::{
         Attribute, AttributeName, Email, GroupId, LdapObjectClass, UserId, kerberos_sync_enabled,
@@ -37,6 +36,7 @@ use lldap_domain::{
 };
 use lldap_domain_handlers::handler::{BackendHandler, ReadSchemaBackendHandler, UserRequestFilter};
 use lldap_domain_handlers::kerberos::kerberos_backend;
+use lldap_domain_handlers::mfa::is_protected_group;
 use lldap_opaque_handler::OpaqueHandler;
 use lldap_schema::schema::AttributeList;
 use lldap_validation::attributes::{ALLOWED_CHARACTERS_DESCRIPTION, validate_attribute_name};
@@ -266,7 +266,7 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         });
         if new_display_name.is_some()
             && let Ok(details) = handler.get_group_details(GroupId(group.id)).await
-            && is_builtin_group(details.display_name.as_str())
+            && is_protected_group(details.display_name.as_str(), context.mfa_policy)
         {
             span.in_scope(|| debug!("Cannot rename built-in group '{}'", details.display_name));
             return Err(format!("Cannot rename built-in group '{}'", details.display_name).into());
@@ -390,7 +390,7 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             .get_admin_handler()
             .ok_or_else(field_error_callback(&span, "Unauthorized group deletion"))?;
         if let Ok(details) = handler.get_group_details(GroupId(group_id)).await
-            && is_builtin_group(details.display_name.as_str())
+            && is_protected_group(details.display_name.as_str(), context.mfa_policy)
         {
             span.in_scope(|| debug!("Cannot delete built-in group '{}'", details.display_name));
             return Err(format!("Cannot delete built-in group '{}'", details.display_name).into());
@@ -1824,6 +1824,7 @@ mod tests {
         let context = policy_context(mock, "admin", Permission::Admin, MfaPolicy::Always, true);
         for query in [
             r#"{ users { id } }"#,
+            r#"{ schema { userSchema { attributes { name } } } }"#,
             r#"mutation { updateUser(user: {id: "bob"}) { ok } }"#,
         ] {
             let (_, errors) = execute(query, None, &root_schema(), &Variables::new(), &context)

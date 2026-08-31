@@ -4,6 +4,7 @@ query ListUsersQuery($where: RequestFilter) {
     email
     displayName
     creationDate
+    mfaEnrolled
     isDisabled
     attributes {
       schema {

@@ -18,22 +18,31 @@ the command line:
 | `true` | Users may enroll an authenticator; only enrolled users must present a code. |
 | `"always"` | Every user must enroll. Until they do, the web login admits them flagged `mfaEnrollmentRequired` and the API is confined to reading their own user and enrolling, while `/auth/simple/login` and LDAP bind refuse them with *MFA enrollment required*. |
 
-Members of the built-in group `lldap_mfa_disabled` (created at boot like the other
-built-ins) are exempt under both positive modes: they authenticate with the password
-alone even if enrolled. The combined `password:code` string is not split for them, so
-it is a wrong password — use the bare password. Put service accounts there, and keep
-one admin exempt or unenrolled as the break-glass.
+While the mode is `true` or `"always"`, KLLDAP creates the group `lldap_mfa_disabled` at
+startup if it does not already exist, and its name is load-bearing: it cannot be renamed or
+deleted. With MFA off it is not created, and a group of that name is an ordinary group.
+Members are exempt under both positive modes: they authenticate with the password alone
+even if enrolled. The combined `password:code` string is not split for them, so it is a
+wrong password — use the bare password. Put service accounts there, and keep one admin
+exempt or unenrolled as the break-glass.
 
 ## Enrollment
 
-Over GraphQL today; the web page follows. `startMfaEnrollment(currentCode)` returns the
-`otpauth://` URI (issuer `KLLDAP`) to show as a QR code, the base32 secret for manual entry,
-and a sealed `state` valid for five minutes; `finishMfaEnrollment(state, code)` proves the
-authenticator holds the seed and stores the factor — nothing is persisted before that.
-Replacing an authenticator needs a code from the one being replaced, checked at
-`startMfaEnrollment` and recorded in the sealed state, so a stolen session cannot rebind
-the account to another device. If the old one is gone, an administrator resets the factor
-or the password-reset e-mail clears it.
+From your profile page, **Set up two-factor** opens the enrollment page: a QR code (issuer
+`KLLDAP`) and the base32 secret for manual entry. Scan or type it into an authenticator
+app, then confirm within five minutes by entering `yourpassword:123456` — the same string
+you will use to log in; the page says whether the code matches before you submit. Nothing
+is stored before the confirmation. Replacing an authenticator (**Reconfigure two-factor**)
+first asks for a code from the one being replaced, so a stolen session cannot rebind the
+account to another device; if the old one is gone, an administrator's **Reset two-factor**
+on the user's page or the password-reset e-mail clears the factor. **Reset two-factor** on
+your own page needs `password:code` too and is absent under `"always"`, where an account
+may not be left without a factor. Under `"always"` a web login that has not enrolled lands
+on the enrollment page and nothing else renders until it completes.
+
+Over GraphQL the same steps are `startMfaEnrollment(currentCode)` (the `otpauth://` URI,
+the base32 secret and a sealed `state` valid for five minutes), `finishMfaEnrollment(state,
+code)`, `resetOwnMfa(code)` and the administrative `resetUserMfa(userId)`.
 
 ## Logging in
 
@@ -43,9 +52,13 @@ Append a colon and the current code to the password:
 yourpassword:123456
 ```
 
+The web login form has no second step: type the combined string in the password field (a
+password-only attempt shows how), and the change-password page accepts either form for the
+current password.
+
 | Door | Code missing | Code wrong | Code replayed / attempts spent |
 |---|---|---|---|
-| Web login (`/auth/opaque/login/finish`) | `200 {"mfaRequired": true}` and no token; the client retries with the code in `totpCode` | `401` | `401`, naming the reason |
+| Web login (`/auth/opaque/login/finish`) | `200 {"mfaRequired": true}` and no token; the next attempt carries the code in `totp_code` | `401` | `401`, naming the reason |
 | `/auth/simple/login` | `401` … *TOTP code required* | `401` | `401` … *already used* / *Too many TOTP attempts* |
 | LDAP simple bind | `invalidCredentials`, diagnostic *TOTP code required: append ':' and the code* | `invalidCredentials`, empty diagnostic | `invalidCredentials`, *TOTP code already used, wait for the next one* / *Too many TOTP attempts, wait for the next one* |
 
@@ -101,7 +114,7 @@ One row per ceremony, in the same table as everything else ([logging.md](logging
 password right, code missing — records nothing. Enrollment and resets are `mfa_enroll`
 (`started`, `totp`, `replaced`, and the refusals) and `mfa_reset` (`self`,
 `password reset`, `forced admin reset`, `private key changed`; an administrative reset has
-no detail — the actor says who).
+no detail — the actor says who). A reset that finds no factor to clear records nothing.
 
 ## Configuration
 
@@ -116,8 +129,29 @@ enable_mfa = false
 the command line. The parameters — SHA-1, six digits, 30 seconds, ±1 step, a five-minute
 enrollment, a 90-second replay window, five attempts per step, issuer `KLLDAP` — are fixed.
 
+## Standards
+
+| Requirement | Source | Status |
+|---|---|---|
+| HMAC-SHA-1, six digits, 30-second step | RFC 6238 §4–5 | Met; the RFC's Appendix B vectors are unit tests. |
+| Validation window of at most one step either side | RFC 6238 §5.2 | Met: ±1 step, a code is accepted for 90 seconds. |
+| Throttle failed verification attempts | RFC 4226 §7.3 | Met: five attempts per 30-second step, per account. |
+| Resynchronisation for counter drift | RFC 4226 §7.4 | Not applicable to time-based codes; the ±1 step window absorbs clock drift. |
+| Authenticator secrets stored in encrypted form | NIST SP 800-63B §5.1.4.2 | Met: sealed with AEAD under a key HKDF-derived from the server's private key, a per-enrollment salt and the user UUID as associated data; never returned on any interface. |
+| Replay resistance | NIST SP 800-63B §5.2.8 | Met: a verified code is refused for the rest of its window, at every door. |
+| No more than 100 consecutive failed attempts | NIST SP 800-63B §5.2.2 | **Not met** — see below. |
+| One-time use, bounded validity, approved algorithm, protected key | OWASP ASVS V2.8.2–5 | Met, as above. |
+
 ## Limitations
 
+- No cap on consecutive failures and no lockout: the limiter paces guessing (five per
+  30-second step) instead of counting failures toward a ceiling — RFC 4226 §7.3's delay
+  scheme, chosen because a lockout turns a wrong digit into a denial of service, and the
+  counter is reachable only after the password verified. For a hard ceiling, rate-limit
+  `/auth/*` at the reverse proxy or point fail2ban at the failed `bind` / `login` rows.
+- The password check at enrollment is the browser's: the enrollment page runs the OPAQUE
+  handshake the change-password page uses and checks the result locally, so a caller driving
+  GraphQL directly can skip it. Every code check is the server's.
 - The replay and attempt records are per process and in memory.
 - No recovery codes: recovery is an administrator, the password-reset e-mail, or the exempt
   group.
@@ -129,8 +163,8 @@ enrollment, a 90-second replay window, five attempts per step, issuer `KLLDAP` �
   true of `lldap_mfa_disabled` members who are still enrolled.
 - The migration tool does not do TOTP: run it as an unenrolled account under `true`, an
   exempt one under `"always"`.
-- The web app's login form, change-password page and enrollment page are the next change;
-  until then enrolled users sign in over the API and LDAP, and enroll or reset over GraphQL.
+- The web login has no second step: enrolled users type `password:code` in the password
+  field.
 
 ## What builds on it
 
@@ -138,4 +172,4 @@ enrollment, a 90-second replay window, five attempts per step, issuer `KLLDAP` �
 present; the group policies plug in there — a requirement per group, the failure tracker at
 the log sink, an `mfa_enrolled_at` check that ends older sessions, a persisted last step for
 replicas, recovery codes. The engine (`crates/mfa`), the handler and the doors are
-LLDAP-neutral; the built-in group and the Kerberos notes are KLLDAP's.
+LLDAP-neutral; the exempt group and the Kerberos notes are KLLDAP's.

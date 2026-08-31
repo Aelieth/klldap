@@ -625,7 +625,6 @@ pub const BUILTIN_GROUPS: &[&str] = &[
     "lldap_strict_readonly",
     "lldap_disabled",
     "lldap_sudohost",
-    "lldap_mfa_disabled",
 ];
 
 pub fn is_builtin_group(name: &str) -> bool {
@@ -643,8 +642,6 @@ mod tests {
         assert!(is_builtin_group("lldap_admin"));
         assert!(is_builtin_group("LLDAP_ADMIN"));
         assert!(is_builtin_group("Lldap_Disabled"));
-        assert!(is_builtin_group("lldap_mfa_disabled"));
-        assert!(is_builtin_group("LLDAP_MFA_DISABLED"));
         assert!(!is_builtin_group("family"));
     }
 }

@@ -7,8 +7,9 @@
 - A TOTP second factor (RFC 6238: SHA-1, six digits, 30-second steps, one step of
   clock skew). `enable_mfa` (`LLDAP_ENABLE_MFA`, `--enable-mfa`): `false` (the default)
   changes nothing, `true` lets users enroll an authenticator, `"always"` requires every
-  user to enroll; members of the new built-in group `lldap_mfa_disabled` are exempt. The
-  group is created at boot like the other built-in groups.
+  user to enroll; members of the group `lldap_mfa_disabled` are exempt. The group is
+  created at startup while the mode is on, and only then is its name protected from renaming
+  and deletion; with MFA off it is not created and is an ordinary group if it exists.
 - Enrollment and reset over GraphQL: `startMfaEnrollment(currentCode)` returns the
   `otpauth://` URI, the base32 secret and a sealed state valid for five minutes,
   `finishMfaEnrollment(state, code)` proves possession, `resetOwnMfa(code)` and the
@@ -23,7 +24,7 @@
 - New log kinds `mfa_enroll` and `mfa_reset`.
 - Enrolled users present the code at every door by appending it to the password
   (`yourpassword:123456`): the web login answers a password-only attempt with
-  `{"mfaRequired": true}` and the client retries with `totpCode`, `/auth/simple/login` and
+  `{"mfaRequired": true}` and the client retries with `totp_code`, `/auth/simple/login` and
   LDAP simple bind split the suffix and say why only after the password verified (*TOTP
   code required: append ':' and the code*, *TOTP code already used*, *Too many TOTP
   attempts*). The check runs in the same login handler as the password, so the event log
@@ -36,8 +37,19 @@
   accepted with `--force-update-private-key=true` clears every factor (the sealed secrets
   died with the old key). The migration tool refuses enrolled accounts by name. The gate
   runs with `enable_mfa = true` and exercises enrollment, both doors, replay and reset.
-  Documented in `docs/mfa.md`; the web app's login form, change-password page and
-  enrollment page follow in the next change.
+  Documented in `docs/mfa.md`.
+- The web app: the login form splits `yourpassword:123456`, sends the code on the OPAQUE
+  finish and shows a help panel when an enrolled account tries the password alone (it also
+  understands the `mfaRequired` answer, which surfaced as *Could not parse response*
+  before); the change-password page accepts either form for the current password;
+  **Set up / Reconfigure two-factor** on your profile opens the enrollment page (QR code
+  and secret, confirmation with `password:code`, a live code check, a five-minute expiry);
+  **Reset two-factor** for oneself with `password:code` and, for administrators, on any
+  user's page; `mfaEnrolled` shows as a status on the user page and as an MFA column in
+  the user table; under `"always"` an unenrolled web session is held on the enrollment
+  page. The Enabled / Disabled toggle has its own row above the buttons, the two-factor
+  controls use the QR-code icon, and the icon font moves from bootstrap-icons 1.5.0 to
+  1.13.1.
 
 ### Logging
 

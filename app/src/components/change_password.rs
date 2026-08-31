@@ -1,4 +1,6 @@
-use crate::infra::opaque::{begin_registration, finish_registration};
+use crate::infra::opaque::{
+    LoginState, begin_login, begin_registration, finish_login, finish_registration,
+};
 use crate::infra::queries::{
     GetKerberosInfo, SyncKerberosPassword, get_kerberos_info, sync_kerberos_password,
 };
@@ -8,13 +10,14 @@ use crate::{
         router::AppRoute,
     },
     infra::{
-        api::HostService,
+        api::{HostService, LoginOutcome},
         common_component::{CommonComponent, CommonComponentParts},
         encrypt::encrypt_kerberos_password,
     },
 };
 use anyhow::{Result, bail};
 use lldap_auth::{login, opaque, registration};
+use lldap_mfa::split_totp_suffix;
 use validator_derive::Validate;
 use yew::prelude::*;
 use yew_form::Form;
@@ -25,7 +28,7 @@ use yew_router::{prelude::History, scope_ext::RouterScopeExt};
 enum OpaqueData {
     #[default]
     None,
-    Login(Box<opaque::client::login::ClientLogin>),
+    Login(Box<LoginState>, String, Option<String>, Option<String>),
     Registration(Box<opaque::client::registration::ClientRegistration>),
 }
 
@@ -68,13 +71,14 @@ pub struct ChangePasswordForm {
 pub struct Props {
     pub username: String,
     pub is_admin: bool,
+    pub mfa_enabled: bool,
 }
 
 pub enum Msg {
     FormUpdate,
     Submit,
     LoginStartResponse(Result<Box<login::ServerLoginStartResponse>>),
-    LoginFinishResponse(Result<(String, bool)>),
+    LoginFinishResponse(Result<LoginOutcome>),
     RegistrationStartResponse(Result<Box<registration::ServerRegistrationStartResponse>>),
     RegistrationFinishResponse(Result<()>),
     KerberosInfoResponse(Result<get_kerberos_info::ResponseData>),
@@ -106,16 +110,22 @@ impl CommonComponent<ChangePasswordForm> for ChangePasswordForm {
                     if old_password.is_empty() {
                         bail!("Current password is required for non-admin users");
                     }
-                    let mut rng = rand::rngs::OsRng;
-                    let login_start = opaque::client::login::start_login(&old_password, &mut rng)?;
-                    let req = login::ClientLoginStartRequest {
-                        username: ctx.props().username.clone().into(),
-                        login_start_request: login_start.message,
+                    // An enrolled user may confirm with `password:code`, as at the login form.
+                    let split = ctx
+                        .props()
+                        .mfa_enabled
+                        .then(|| split_totp_suffix(&old_password))
+                        .flatten();
+                    let (password, totp_code, retry) = match split {
+                        Some((p, c)) => (p.to_owned(), Some(c.to_owned()), Some(old_password)),
+                        None => (old_password, None, None),
                     };
-                    self.opaque_data = OpaqueData::Login(Box::new(login_start.state));
+                    let (state, request) = begin_login(&ctx.props().username, &password)?;
+                    self.opaque_data =
+                        OpaqueData::Login(Box::new(state), password, totp_code, retry);
                     self.common.call_backend(
                         ctx,
-                        HostService::login_start(req),
+                        HostService::login_start(request),
                         Msg::LoginStartResponse,
                     );
                     Ok(false)
@@ -123,29 +133,36 @@ impl CommonComponent<ChangePasswordForm> for ChangePasswordForm {
             }
             Msg::LoginStartResponse(res) => {
                 let res = res.context("Old password verification failed")?;
-                let login_state = match self.opaque_data.take() {
-                    OpaqueData::Login(s) => *s,
-                    _ => bail!("Invalid state"),
+                let OpaqueData::Login(state, password, totp_code, retry) = self.opaque_data.take()
+                else {
+                    bail!("Invalid state");
                 };
-                let login_finish = opaque::client::login::finish_login(
-                    login_state,
-                    self.form.model().old_password.as_bytes(),
-                    res.credential_response,
-                    &mut rand::rngs::OsRng,
-                )?;
-                let req = login::ClientLoginFinishRequest {
-                    server_data: res.server_data,
-                    credential_finalization: login_finish.message,
-                    totp_code: None,
+                let request = match finish_login(*state, &password, *res, totp_code) {
+                    Ok(request) => request,
+                    Err(e) => {
+                        // A password that itself ends in ':' and six digits was split: try it whole.
+                        let Some(original) = retry else {
+                            return Err(e).context("Old password verification failed");
+                        };
+                        let (state, request) = begin_login(&ctx.props().username, &original)?;
+                        self.opaque_data = OpaqueData::Login(Box::new(state), original, None, None);
+                        self.common.call_backend(
+                            ctx,
+                            HostService::login_start(request),
+                            Msg::LoginStartResponse,
+                        );
+                        return Ok(false);
+                    }
                 };
                 self.common.call_backend(
                     ctx,
-                    HostService::login_finish(req),
+                    HostService::login_finish(request),
                     Msg::LoginFinishResponse,
                 );
                 Ok(false)
             }
             Msg::LoginFinishResponse(res) => {
+                // The server proved the password either way; a missing code is the login's concern.
                 let _ = res.context("Old password incorrect")?;
                 self.handle_msg(ctx, Msg::SubmitNewPassword)
             }

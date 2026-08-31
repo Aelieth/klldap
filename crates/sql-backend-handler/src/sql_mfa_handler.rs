@@ -177,7 +177,9 @@ impl MfaBackendHandler for SqlBackendHandler {
 
     #[instrument(skip_all, level = "debug", err(level = "debug"))]
     async fn reset_user_mfa(&self, user_id: &UserId, reason: MfaResetReason) -> Result<()> {
-        self.get_user_model(user_id).await?;
+        if self.get_user_model(user_id).await?.mfa_type.is_none() {
+            return Ok(());
+        }
         self.write_mfa_columns(user_id, None, None).await?;
         info!(r#"Cleared MFA state for "{}""#, user_id);
         logging::record(LogKind::MfaReset, Some(user_id.as_str()), reason.detail());
@@ -680,7 +682,12 @@ mod tests {
             );
             handler.reset_own_mfa(&bob, &next).await.unwrap();
             handler
-                .reset_user_mfa(&bob, MfaResetReason::PasswordReset)
+                .reset_user_mfa(&bob, MfaResetReason::Administrative)
+                .await
+                .unwrap();
+            let (kim, ..) = enroll_user(&handler, &setup, "kim").await;
+            handler
+                .reset_user_mfa(&kim, MfaResetReason::PasswordReset)
                 .await
                 .unwrap();
             enroll_user(&handler, &setup, "eve").await;
@@ -753,7 +760,9 @@ mod tests {
                 row(LogKind::MfaEnroll, true, "bob", "totp"),
                 row(LogKind::MfaReset, false, "bob", "invalid totp"),
                 row(LogKind::MfaReset, true, "bob", "self"),
-                row(LogKind::MfaReset, true, "bob", "password reset"),
+                row(LogKind::MfaEnroll, true, "kim", "started"),
+                row(LogKind::MfaEnroll, true, "kim", "totp"),
+                row(LogKind::MfaReset, true, "kim", "password reset"),
                 row(LogKind::MfaEnroll, true, "eve", "started"),
                 row(LogKind::MfaEnroll, true, "eve", "totp"),
                 (

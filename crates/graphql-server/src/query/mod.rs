@@ -200,6 +200,10 @@ impl<Handler: FullHandler + OpaqueHandler> Query<Handler> {
 
     async fn schema(&self, context: &Context<Handler>) -> FieldResult<Schema<Handler>> {
         let span = debug_span!("[GraphQL query] get_schema");
+        if context.mfa_enrollment_pending {
+            span.in_scope(|| debug!("Unauthorized schema read"));
+            return Err("Unauthorized schema read".into());
+        }
         self.get_schema(context, span).await.map(Into::into)
     }
 

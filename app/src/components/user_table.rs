@@ -183,9 +183,14 @@ impl UserTable {
     }
 }
 
+#[derive(Properties, PartialEq)]
+pub struct Props {
+    pub mfa_enabled: bool,
+}
+
 impl Component for UserTable {
     type Message = Msg;
-    type Properties = ();
+    type Properties = Props;
 
     fn create(ctx: &Context<Self>) -> Self {
         let mut table = UserTable {
@@ -326,6 +331,9 @@ impl UserTable {
             <th class="fw-bold fs-8">{"Last name"}</th>
             <th class="fw-bold fs-8">{"Creation date"}</th>
             <th class="fw-bold fs-8">{"Kerberos Sync"}</th>
+            { if ctx.props().mfa_enabled {
+                html! { <th class="fw-bold fs-8">{"MFA"}</th> }
+            } else { html! {} }}
             </tr>
             </thead>
             <tbody>
@@ -378,6 +386,17 @@ impl UserTable {
                 html! { <span class="text-muted">{"–"}</span> }
             }}
             </td>
+            { if ctx.props().mfa_enabled {
+                html! {
+                    <td>
+                    {if user.mfa_enrolled.unwrap_or(false) {
+                        html! { <span class="border rounded px-1"><i class="bi-qr-code"></i></span> }
+                    } else {
+                        html! { <span class="text-muted">{"–"}</span> }
+                    }}
+                    </td>
+                }
+            } else { html! {} }}
             </tr>
         }
     }

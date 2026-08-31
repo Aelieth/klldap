@@ -38,10 +38,11 @@ are a later pass.
 
 ## What is recorded
 
-`policy_change` rows: creating/updating/deleting a policy (target = name; update detail
-lists field names), attaching or clearing an OU (target = the OU, or `(root)`; detail
-`policy set: {name}` / `policy cleared: {name}`), inheritance toggles, and dropping
-state when an OU is deleted (`ou removed`). A no-op inheritance toggle is not logged.
+`policy_change` rows: creating/updating/deleting a policy (target = name; detail
+`created` / `updated: {field names}` / `deleted`), attaching or clearing an OU
+(target = the OU, or `(root)`; detail `policy set: {name}` / `policy cleared: {name}`),
+inheritance toggles, and dropping state when an OU is deleted (`ou removed`). A
+no-op inheritance toggle is not logged.
 
 ## Configuration
 

@@ -132,7 +132,7 @@ impl PolicyBackendHandler for SqlBackendHandler {
         }
         .insert(&self.sql_pool)
         .await?;
-        logging::record(LogKind::PolicyChange, Some(&request.name), None);
+        logging::record(LogKind::PolicyChange, Some(&request.name), Some("created"));
         Ok(PolicyId(inserted.id))
     }
 
@@ -191,7 +191,7 @@ impl PolicyBackendHandler for SqlBackendHandler {
             .exec(&transaction)
             .await?;
         transaction.commit().await?;
-        logging::record(LogKind::PolicyChange, Some(&existing.name), None);
+        logging::record(LogKind::PolicyChange, Some(&existing.name), Some("deleted"));
         Ok(())
     }
 
@@ -433,6 +433,9 @@ mod tests {
             .set_ou_policy_inheritance("people\\labs", true)
             .await
             .unwrap();
+        let levels = handler.get_policy_levels("people\\labs").await.unwrap();
+        assert!(levels[2].blocked, "stored block flag reaches the levels");
+        assert!(!levels[0].blocked && !levels[1].blocked);
         handler.set_ou_policy("people\\labs", id).await.unwrap();
         handler.delete_policy(id).await.unwrap();
         let states = handler.list_ou_policy_states().await.unwrap();
@@ -503,7 +506,11 @@ mod tests {
         assert_eq!(
             rows,
             vec![
-                (LogKind::PolicyChange, Some("Hours".into()), None),
+                (
+                    LogKind::PolicyChange,
+                    Some("Hours".into()),
+                    Some("created".into())
+                ),
                 (
                     LogKind::PolicyChange,
                     Some("Hours".into()),
@@ -529,7 +536,11 @@ mod tests {
                     Some("people".into()),
                     Some("ou removed".into())
                 ),
-                (LogKind::PolicyChange, Some("Hours".into()), None),
+                (
+                    LogKind::PolicyChange,
+                    Some("Hours".into()),
+                    Some("deleted".into())
+                ),
             ]
         );
     }

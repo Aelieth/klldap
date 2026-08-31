@@ -69,12 +69,14 @@ fn value_kind(spec: &PolicyItemSpec) -> GraphQLPolicyValueKind {
 }
 
 #[derive(GraphQLObject)]
+#[graphql(name = "PolicyItem")]
 pub struct GraphQLPolicyItem {
     pub key: String,
     pub value: String,
 }
 
 #[derive(GraphQLObject)]
+#[graphql(name = "Policy")]
 pub struct GraphQLPolicy {
     pub id: i32,
     pub name: String,
@@ -85,6 +87,7 @@ pub struct GraphQLPolicy {
 }
 
 #[derive(GraphQLObject)]
+#[graphql(name = "PolicyCatalogItem")]
 pub struct GraphQLPolicyCatalogItem {
     pub key: String,
     pub scope: GraphQLPolicyScope,
@@ -98,6 +101,7 @@ pub struct GraphQLPolicyCatalogItem {
 }
 
 #[derive(GraphQLObject)]
+#[graphql(name = "EffectivePolicyItem")]
 pub struct GraphQLEffectivePolicyItem {
     pub key: String,
     pub scope: GraphQLPolicyScope,
@@ -109,6 +113,7 @@ pub struct GraphQLEffectivePolicyItem {
 }
 
 #[derive(GraphQLObject)]
+#[graphql(name = "OuPolicyState")]
 pub struct GraphQLOuPolicyState {
     pub ou: String,
     pub policy_id: Option<i32>,

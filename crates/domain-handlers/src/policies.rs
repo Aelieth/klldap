@@ -211,7 +211,7 @@ pub fn catalog_item(key: &str) -> Option<&'static PolicyItemSpec> {
 
 pub fn validate_policy_name(name: &str) -> Result<String, String> {
     let trimmed = name.trim();
-    if trimmed.is_empty() || trimmed.len() > 64 {
+    if trimmed.is_empty() || trimmed.chars().count() > 64 {
         return Err("Policy name must be 1 to 64 characters".to_owned());
     }
     if trimmed.chars().any(char::is_control) {
@@ -326,6 +326,9 @@ pub fn validate_cidr(value: &str) -> Result<(), String> {
     let (addr, prefix) = value
         .split_once('/')
         .ok_or_else(|| "CIDR must include an explicit prefix".to_owned())?;
+    if prefix.is_empty() || !prefix.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("CIDR prefix must be a number".to_owned());
+    }
     let prefix: u32 = prefix
         .parse()
         .map_err(|_| "CIDR prefix must be a number".to_owned())?;
@@ -458,6 +461,7 @@ mod tests {
         err(&[("lockout-threshold", "101")], "between");
         err(&[("lockout-threshold", "-1")], "between");
         err(&[("allowed-networks", "10.0.0.0")], "explicit prefix");
+        err(&[("allowed-networks", "10.0.0.0/+24")], "must be a number");
         err(&[("allowed-networks", "10.0.0.0/33")], "IPv4 prefix");
         err(&[("allowed-networks", "not-an-ip/24")], "valid IP");
         err(&[("login-hours", "funday 08:00-09:00")], "unknown day");

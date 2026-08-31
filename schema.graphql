@@ -278,13 +278,7 @@ type AttributeValue {
   schema: AttributeSchema!
 }
 
-type ExportKeytabForKeycloakResponse {
-  ok: Boolean!
-  path: String!
-  errorMsg: String!
-}
-
-type GraphQLEffectivePolicyItem {
+type EffectivePolicyItem {
   key: String!
   scope: PolicyScope!
   value: String!
@@ -294,37 +288,10 @@ type GraphQLEffectivePolicyItem {
   sourceOu: String
 }
 
-type GraphQLOuPolicyState {
-  ou: String!
-  policyId: Int
-  policyName: String
-  blockInheritance: Boolean!
-}
-
-type GraphQLPolicy {
-  id: Int!
-  name: String!
-  description: String!
-  items: [GraphQLPolicyItem!]!
-  "Lowercase OU keys; the empty string is the domain root."
-  linkedOus: [String!]!
-}
-
-type GraphQLPolicyCatalogItem {
-  key: String!
-  scope: PolicyScope!
-  valueKind: PolicyValueKind!
-  intMin: Int
-  intMax: Int
-  allowedValues: [String!]
-  defaultValue: String!
-  enforced: Boolean!
-  description: String!
-}
-
-type GraphQLPolicyItem {
-  key: String!
-  value: String!
+type ExportKeytabForKeycloakResponse {
+  ok: Boolean!
+  path: String!
+  errorMsg: String!
 }
 
 type Group {
@@ -426,7 +393,7 @@ type Mutation {
   deleteOu(name: String!): Success!
   changeUserOu(userIds: [String!]!, newOu: String!): Success!
   changeGroupOu(groupIds: [Int!]!, newOu: String!): Success!
-  createPolicy(name: String!, description: String, items: [PolicyItemInput!]): GraphQLPolicy!
+  createPolicy(name: String!, description: String, items: [PolicyItemInput!]): Policy!
   updatePolicy(policyId: Int!, name: String, description: String, items: [PolicyItemInput!]): Success!
   deletePolicy(policyId: Int!): Success!
   setOuPolicy(ou: String!, policyId: Int!): Success!
@@ -460,6 +427,39 @@ type Mutation {
 type ObjectClassInfo {
   objectClass: String!
   isHardcoded: Boolean!
+}
+
+type OuPolicyState {
+  ou: String!
+  policyId: Int
+  policyName: String
+  blockInheritance: Boolean!
+}
+
+type Policy {
+  id: Int!
+  name: String!
+  description: String!
+  items: [PolicyItem!]!
+  "Lowercase OU keys; the empty string is the domain root."
+  linkedOus: [String!]!
+}
+
+type PolicyCatalogItem {
+  key: String!
+  scope: PolicyScope!
+  valueKind: PolicyValueKind!
+  intMin: Int
+  intMax: Int
+  allowedValues: [String!]
+  defaultValue: String!
+  enforced: Boolean!
+  description: String!
+}
+
+type PolicyItem {
+  key: String!
+  value: String!
 }
 
 type PosixSettings {
@@ -498,11 +498,11 @@ type Query {
   keycloakSuggestedConfig: KeycloakSuggestedConfig!
   keycloakConfig: KeycloakConfigResponse!
   listOus: [String!]!
-  policies: [GraphQLPolicy!]!
-  policy(policyId: Int!): GraphQLPolicy!
-  policyItemCatalog: [GraphQLPolicyCatalogItem!]!
-  effectivePolicyItems(ou: String!): [GraphQLEffectivePolicyItem!]!
-  ouPolicyStates: [GraphQLOuPolicyState!]!
+  policies: [Policy!]!
+  policy(policyId: Int!): Policy!
+  policyItemCatalog: [PolicyCatalogItem!]!
+  effectivePolicyItems(ou: String!): [EffectivePolicyItem!]!
+  ouPolicyStates: [OuPolicyState!]!
   posixSettings: PosixSettings!
   "Newest first; `beforeId` pages back, `afterId` pages forward oldest first."
   logs(filter: LogFilter, limit: Int, beforeId: ID, afterId: ID): [LogEntry!]!

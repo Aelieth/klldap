@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.8.0] unreleased
+
+Next release. The KDC becomes kerber-rust inside the `lldap` process,
+sharing one database with the directory. Nothing of that has landed
+yet. 0.7.4, 0.7.5 and 0.7.6 stay unreleased on their own branches.
+
 ## [0.7.6] unreleased
 
 ### Organizational-unit policies

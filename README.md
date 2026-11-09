@@ -1,11 +1,11 @@
 <h1 align="center">KLLDAP - Light LDAP with an integrated Kerberos KDC</h1>
 
 <p align="center">
-  <a href="https://github.com/Aelieth/klldap/actions/workflows/rust.yml?query=branch%3A0.7.4">
-    <img src="https://github.com/Aelieth/klldap/actions/workflows/rust.yml/badge.svg?branch=0.7.4" alt="Build"/>
+  <a href="https://github.com/Aelieth/klldap/actions/workflows/rust.yml?query=branch%3A0.8.0">
+    <img src="https://github.com/Aelieth/klldap/actions/workflows/rust.yml/badge.svg?branch=0.8.0" alt="Build"/>
   </a>
-  <a href="https://github.com/Aelieth/klldap/actions/workflows/gate.yml?query=branch%3A0.7.4">
-    <img src="https://github.com/Aelieth/klldap/actions/workflows/gate.yml/badge.svg?branch=0.7.4" alt="Gate"/>
+  <a href="https://github.com/Aelieth/klldap/actions/workflows/gate.yml?query=branch%3A0.8.0">
+    <img src="https://github.com/Aelieth/klldap/actions/workflows/gate.yml/badge.svg?branch=0.8.0" alt="Gate"/>
   </a>
 </p>
 

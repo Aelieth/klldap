@@ -2,8 +2,8 @@ name: Gate
 
 on:
   push:
-    # 0.7.4 is the current development line; drop it when this tree lands on main.
-    branches: [ main, 0.7.4 ]
+    # 0.8.0 is the current development line; drop it when this tree lands on main.
+    branches: [ main, 0.8.0 ]
   pull_request:
     types: [opened, reopened, synchronize]
     paths:

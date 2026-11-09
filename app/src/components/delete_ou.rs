@@ -52,7 +52,8 @@ impl CommonComponent<DeleteOu> for DeleteOu {
                     || ctx.props().ou == "All"
                 {
                     ctx.link().send_message(Msg::ShowStatus(
-                        "Cannot delete built-in OU 'people', 'groups', or 'All'".to_string(),
+                        "Cannot delete built-in OU 'people', 'groups', or the domain root"
+                            .to_string(),
                         false,
                     ));
                     return Ok(true);

@@ -1,0 +1,5 @@
+mutation DeletePolicyQuery($policyId: Int!) {
+  deletePolicy(policyId: $policyId) {
+    ok
+  }
+}

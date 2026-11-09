@@ -46,6 +46,14 @@ pub fn banner(props: &Props) -> Html {
                   <li>
                     <Link
                       classes="nav-link px-2 h6"
+                      to={AppRoute::ListPolicies}>
+                      <i class="bi-journal-check me-2"></i>
+                      {"Policies"}
+                    </Link>
+                  </li>
+                  <li>
+                    <Link
+                      classes="nav-link px-2 h6"
                       to={AppRoute::ListUserSchema}>
                       <i class="bi-list-ul me-2"></i>
                       {"User schema"}

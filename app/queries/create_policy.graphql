@@ -1,0 +1,12 @@
+mutation CreatePolicy($name: String!, $description: String, $items: [PolicyItemInput!]) {
+  createPolicy(name: $name, description: $description, items: $items) {
+    id
+    name
+    description
+    items {
+      key
+      value
+    }
+    linkedOus
+  }
+}

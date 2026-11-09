@@ -186,6 +186,7 @@ impl UserTable {
 #[derive(Properties, PartialEq)]
 pub struct Props {
     pub mfa_enabled: bool,
+    pub domain: Option<String>,
 }
 
 impl Component for UserTable {
@@ -262,6 +263,7 @@ impl Component for UserTable {
             on_error={ctx.link().callback(|e: Error| Msg::CreateOuError(e.to_string()))}
             error={self.common.error.as_ref().map(|e| e.to_string())}
             default_primary={"people".to_string()}
+            domain={ctx.props().domain.clone()}
             />
             <hr class="my-4" />
 

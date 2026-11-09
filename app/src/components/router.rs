@@ -26,6 +26,8 @@ pub enum AppRoute {
     ListGroups,
     #[at("/group/:group_id")]
     GroupDetails { group_id: i64 },
+    #[at("/policies")]
+    ListPolicies,
     #[at("/user-attributes")]
     ListUserSchema,
     #[at("/user-attributes/create")]

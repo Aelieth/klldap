@@ -14,6 +14,25 @@ pub(crate) enum AttributeType {
     Avatar,
 }
 
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Hash, Display)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum PolicyScope {
+    User,
+    Group,
+    Computer,
+    Server,
+}
+
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq, Hash, Display)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum PolicyValueKind {
+    Bool,
+    Int,
+    Enum,
+    String,
+    StringList,
+}
+
 pub fn validate_attribute_type(attribute_type: &str) -> Result<(), ValidationError> {
     AttributeType::try_from(attribute_type)
         .map_err(|_| ValidationError::new("Invalid attribute type"))?;

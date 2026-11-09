@@ -33,8 +33,34 @@ mutation { setOuPolicyInheritance(ou: "people", blocked: true) { ok } }
 { ouPolicyStates { ou policyId policyName blockInheritance } }
 ```
 
-`ou` `""` is the domain root. `linkedOus` on a policy uses the same keys. The web pages
-are a later pass.
+`ou` `""` is the domain root. `linkedOus` on a policy uses the same keys.
+
+## Pages
+
+Admin navbar **Policies** — one workbench page at `/policies`. The left pane is the OU
+tree (root shown as the uppercase domain from `/settings`, e.g. `EXAMPLE.COM`; `All` if
+the field is empty), with the same branch glyphs as the users/groups OU selector. Each
+row carries at most one chip: a **solid** colored chip is the policy set on that OU, a
+**dashed** faded `↓ Name` chip is the governing policy inherited from above, and a red
+stop icon marks an OU that blocks inheritance. Chip colors are per policy, so OUs
+sharing one match at a glance.
+
+The right pane inspects the selected OU. **Rules above blocked/inherited** is the block
+toggle (not on the root). An OU with its own policy shows it as a tinted card with
+Edit / Swap / Remove; one without shows where its rules flow in from and an **Attach a
+policy** button opening the picker (attach = replace — an OU holds one policy). Picking
+also offers **Make a new policy and attach it here**. The editor edits name,
+description and the catalog rules as tick-to-set rows; editing a policy linked to
+several OUs warns that changes apply to all of them, and **Delete this policy
+everywhere** confirms before deleting (OUs fall back to inherited policies). Switching
+OUs discards an unsaved draft.
+
+**Current OU policy** always lists every catalog item with its resolved value and
+source (`Policy · OU`, or `built-in default`) straight from `effectivePolicyItems` —
+the page never recomputes closest-wins values client-side.
+
+Users and groups still filter on the sentinel value `All`; only the visible label of
+that option is the domain name.
 
 ## What is recorded
 
@@ -60,4 +86,4 @@ None. The surface is always on, admin-only, and inert until an enforcement pass.
 
 `PolicyBackendHandler::get_policy_levels` plus `resolve_effective_items` is the seam
 each later enforcement pass consumes (per-OU MFA, lockout, login hours, networks,
-inactivity). The UI pass adds the pages and shows the domain root as `EXAMPLE.COM`.
+inactivity).

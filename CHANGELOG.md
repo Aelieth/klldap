@@ -12,6 +12,12 @@
   `ouPolicyStates`, and the create/update/delete/set/clear/inheritance mutations. Writes
   record `policy_change`. `/settings` exposes `domain` from the LDAP base DN (e.g.
   `example.com`). See `docs/policies.md`.
+- Web app: **Policies** in the admin navbar (`bi-journal-check`) — a single workbench
+  page: an OU tree with per-policy colored chips (solid = set here, dashed = inherited,
+  stop icon = blocked) beside an inspector that attaches/swaps/clears the one policy
+  per OU, toggles inheritance, edits policies in place with tick-to-set catalog rules,
+  and always shows the server-resolved effective items. The former **All** label is the
+  uppercase domain (`EXAMPLE.COM`); the filter value stays `All`.
 
 ## [0.7.5] unreleased
 

@@ -12,6 +12,8 @@ pub struct OuTableProps {
     pub on_error: Callback<Error>,
     pub error: Option<String>,
     pub default_primary: String,
+    #[prop_or_default]
+    pub domain: Option<String>,
 }
 
 #[function_component(OuTable)]
@@ -24,7 +26,8 @@ pub fn ou_table(props: &OuTableProps) -> Html {
                     ous={props.ous.clone()}
                     current_ou={props.ou_filter.clone()}
                     on_ou_changed={props.on_ou_changed.clone()}
-                    show_all={true} />
+                    show_all={true}
+                    domain={props.domain.clone()} />
             </div>
 
             { if let Some(err) = &props.error {

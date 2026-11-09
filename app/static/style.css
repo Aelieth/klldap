@@ -34,3 +34,93 @@ html.dark .nav-link {
 .app-content {
   padding-bottom: 80px;
 }
+
+/* Policies workbench (per-policy colors stay inline; shape lives here) */
+.wb-frame {
+  min-height: 600px;
+}
+
+.wb-pane-tree {
+  width: 330px;
+  flex: none;
+}
+
+.wb-tree-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.3rem 0.75rem 0.3rem 0.9rem;
+  cursor: pointer;
+  border-left: 3px solid transparent;
+}
+
+.wb-tree-row:hover {
+  background-color: rgba(128, 128, 128, 0.12);
+}
+
+.wb-tree-row.wb-selected {
+  border-left-color: #0d6efd;
+  background-color: rgba(13, 110, 253, 0.12);
+}
+
+.wb-glyph {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  white-space: pre;
+  color: #adb5bd;
+}
+
+.pol-chip {
+  display: inline-block;
+  max-width: 150px;
+  border: 1.5px solid;
+  border-radius: 99px;
+  padding: 0 0.6em;
+  font-size: 0.8rem;
+  line-height: 1.6;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+}
+
+.pol-chip-inherited {
+  border-style: dashed;
+  opacity: 0.6;
+}
+
+.pol-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.pol-card {
+  border: 1.5px solid;
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.pol-card-header {
+  border-bottom: 1px solid;
+}
+
+.wb-dashed-box {
+  border: 2px dashed #ced4da;
+  border-radius: 10px;
+}
+
+html.dark .wb-dashed-box {
+  border-color: #495057;
+}
+
+.wb-rule-row-off {
+  opacity: 0.55;
+}
+
+.wb-block-switch:checked {
+  background-color: #dc3545;
+  border-color: #dc3545;
+}

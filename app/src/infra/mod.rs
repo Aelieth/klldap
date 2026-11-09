@@ -8,6 +8,7 @@ pub mod functional;
 pub mod graphql;
 pub mod modal;
 pub mod opaque;
+pub mod ou_policy;
 pub mod queries;
 pub mod schema;
 pub mod tooltip;

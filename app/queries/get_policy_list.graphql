@@ -1,0 +1,12 @@
+query GetPolicyList {
+  policies {
+    id
+    name
+    description
+    items {
+      key
+      value
+    }
+    linkedOus
+  }
+}

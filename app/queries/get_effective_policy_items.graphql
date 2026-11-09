@@ -1,0 +1,11 @@
+query GetEffectivePolicyItems($ou: String!) {
+  effectivePolicyItems(ou: $ou) {
+    key
+    scope
+    value
+    enforced
+    sourcePolicyId
+    sourcePolicyName
+    sourceOu
+  }
+}

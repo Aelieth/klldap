@@ -1,0 +1,5 @@
+mutation SetOuPolicyQuery($ou: String!, $policyId: Int!) {
+  setOuPolicy(ou: $ou, policyId: $policyId) {
+    ok
+  }
+}

@@ -1,0 +1,8 @@
+query GetOuPolicyStates {
+  ouPolicyStates {
+    ou
+    policyId
+    policyName
+    blockInheritance
+  }
+}

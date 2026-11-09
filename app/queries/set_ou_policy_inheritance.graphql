@@ -1,0 +1,5 @@
+mutation SetOuPolicyInheritanceQuery($ou: String!, $blocked: Boolean!) {
+  setOuPolicyInheritance(ou: $ou, blocked: $blocked) {
+    ok
+  }
+}

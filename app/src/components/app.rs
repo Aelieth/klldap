@@ -11,6 +11,7 @@ use crate::{
         group_schema_table::ListGroupSchema,
         group_table::GroupTable,
         login::LoginForm,
+        policy_workbench::PolicyWorkbench,
         register_mfa::RegisterMfa,
         reset_own_mfa::ResetOwnMfaForm,
         reset_password_step1::ResetPasswordStep1Form,
@@ -52,6 +53,7 @@ pub struct App {
     mfa_enabled: Option<bool>,
     mfa_required: bool,
     mfa_enrollment_pending: bool,
+    domain: Option<String>,
 }
 
 // Session state the routes need, kept together so dispatch_route keeps a readable signature.
@@ -60,6 +62,7 @@ struct SessionRouting {
     mfa_enabled: Option<bool>,
     mfa_required: bool,
     mfa_enrollment_pending: bool,
+    domain: Option<String>,
 }
 
 pub enum Msg {
@@ -94,6 +97,7 @@ impl Component for App {
             mfa_enabled: None,
             mfa_required: false,
             mfa_enrollment_pending: false,
+            domain: None,
         };
         ctx.link()
             .send_future(async move { Msg::SettingsReceived(HostService::get_settings().await) });
@@ -137,6 +141,7 @@ impl Component for App {
                 self.password_reset_enabled = Some(settings.password_reset_enabled);
                 self.mfa_enabled = Some(settings.mfa_enabled);
                 self.mfa_required = settings.mfa_required;
+                self.domain = Some(settings.domain).filter(|d| !d.is_empty());
             }
             Msg::SettingsReceived(Err(err)) => {
                 error!(err.to_string());
@@ -165,6 +170,7 @@ impl Component for App {
             mfa_enabled: self.mfa_enabled,
             mfa_required: self.mfa_required,
             mfa_enrollment_pending: self.mfa_enrollment_pending,
+            domain: self.domain.clone(),
         };
         html! {
           <div>
@@ -242,12 +248,10 @@ impl App {
         let logged_in_user = session.user.as_deref();
         let is_self =
             |user_id: &str| logged_in_user.is_some_and(|u| u.eq_ignore_ascii_case(user_id));
-        let SessionRouting {
-            mfa_enabled,
-            mfa_required,
-            mfa_enrollment_pending,
-            ..
-        } = *session;
+        let mfa_enabled = session.mfa_enabled;
+        let mfa_required = session.mfa_required;
+        let mfa_enrollment_pending = session.mfa_enrollment_pending;
+        let domain = session.domain.clone();
         // Under "always" an unenrolled session may only enroll: every other page redirects
         // there until the server has affirmatively said two-factor is off.
         if mfa_enrollment_pending
@@ -268,7 +272,7 @@ impl App {
             },
             AppRoute::Index | AppRoute::ListUsers => {
                 html! {
-                    <UserTable mfa_enabled={mfa_enabled.unwrap_or(false)} />
+                    <UserTable mfa_enabled={mfa_enabled.unwrap_or(false)} domain={domain.clone()} />
                 }
             }
             AppRoute::CreateGroup => html! {
@@ -282,9 +286,12 @@ impl App {
             },
             AppRoute::ListGroups => {
                 html! {
-                    <GroupTable />
+                    <GroupTable domain={domain.clone()} />
                 }
             }
+            AppRoute::ListPolicies => html! {
+                <PolicyWorkbench domain={domain.clone()} />
+            },
             AppRoute::ListUserSchema => html! {
                 <ListUserSchema />
             },

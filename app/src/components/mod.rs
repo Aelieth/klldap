@@ -28,6 +28,7 @@ pub mod login;
 pub mod logout;
 pub mod ou_selector;
 pub mod ou_table;
+pub mod policy_workbench;
 pub mod posix_options;
 pub mod register_mfa;
 pub mod remove_user_from_group;

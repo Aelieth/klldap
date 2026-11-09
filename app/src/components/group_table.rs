@@ -177,9 +177,14 @@ impl GroupTable {
     }
 }
 
+#[derive(Properties, PartialEq)]
+pub struct Props {
+    pub domain: Option<String>,
+}
+
 impl Component for GroupTable {
     type Message = Msg;
-    type Properties = ();
+    type Properties = Props;
 
     fn create(ctx: &Context<Self>) -> Self {
         let mut table = GroupTable {
@@ -243,6 +248,7 @@ impl Component for GroupTable {
             on_error={ctx.link().callback(|e: Error| Msg::CreateOuError(e.to_string()))}
             error={self.common.error.as_ref().map(|e| e.to_string())}
             default_primary={"groups".to_string()}
+            domain={ctx.props().domain.clone()}
             />
             <hr class="my-4" />
 

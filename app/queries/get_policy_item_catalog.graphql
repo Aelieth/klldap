@@ -1,0 +1,13 @@
+query GetPolicyItemCatalog {
+  policyItemCatalog {
+    key
+    scope
+    valueKind
+    intMin
+    intMax
+    allowedValues
+    defaultValue
+    enforced
+    description
+  }
+}

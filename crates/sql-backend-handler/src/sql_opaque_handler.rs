@@ -618,7 +618,14 @@ mod tests {
                 assert!(err.to_string().contains("already used"), "{err}");
 
                 // Spend the next step too, or a boundary crossed mid-test refills the
-                // allowance; reserving it first prunes the older steps' counts.
+                // allowance; reserving it first prunes the older steps' counts. The
+                // wrong binds must then all land in the current step, or the tail of
+                // the loop hits that reserved step: wait out a near boundary first.
+                let remaining =
+                    TOTP_STEP_SECS - (chrono::Utc::now().timestamp() as u64 % TOTP_STEP_SECS);
+                if remaining < 5 {
+                    tokio::time::sleep(std::time::Duration::from_secs(remaining)).await;
+                }
                 let uuid = model::User::find_by_id(UserId::new("bob"))
                     .one(&handler.sql_pool)
                     .await

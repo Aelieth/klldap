@@ -16,6 +16,7 @@ use reqwest::blocking::{Client, ClientBuilder};
 use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
 use std::collections::{HashMap, HashSet};
 use std::process::{Child as ChildProcess, Command};
+use std::sync::{LazyLock, Mutex};
 use std::{fs::canonicalize, thread, time::Duration};
 use uuid::Uuid;
 
@@ -290,11 +291,18 @@ pub fn http_url(port: u16) -> String {
 }
 
 pub fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind an ephemeral port")
-        .local_addr()
-        .expect("local addr")
-        .port()
+    static HANDED_OUT: LazyLock<Mutex<HashSet<u16>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+    let mut handed_out = HANDED_OUT.lock().expect("port set");
+    loop {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind an ephemeral port")
+            .local_addr()
+            .expect("local addr")
+            .port();
+        if handed_out.insert(port) {
+            return port;
+        }
+    }
 }
 
 pub fn create_lldap_command(subcommand: &str, db_url: &str) -> Command {

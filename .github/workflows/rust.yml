@@ -119,4 +119,4 @@ jobs:
           shellcheck --severity=error
           entrypoint.sh start-lldap.sh generate_secrets.sh export_schema.sh
           prepare-release.sh app/build.sh scripts/*.sh
-          gate/run-gate.sh gate/kdc-sandbox.sh gate/lib/*.sh gate/phases.d/*.sh
+          gate/run-gate.sh gate/embed-cell.sh gate/kdc-sandbox.sh gate/lib/*.sh gate/phases.d/*.sh

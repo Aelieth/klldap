@@ -141,11 +141,12 @@ lwhoami() { t ldapwhoami -x -H "$(ldap_url)" -D "$(admin_dn)" -w "$ADMIN_PASS"; 
 # ---- Container lifecycle ----
 
 # start_main_container: boots $CONTAINER from $GATE_IMAGE on the run network with
-# per-run volumes and ephemeral published ports.
+# per-run volumes and ephemeral published ports, plus any GATE_EXTRA_RUN_ARGS.
 start_main_container() {
     docker run -d --name "$CONTAINER" \
         --network "$NET" \
         -p "127.0.0.1::3890" -p "127.0.0.1::17170" \
+        "${GATE_EXTRA_RUN_ARGS[@]}" \
         -v "$VOL_DATA:/data" -v "$VOL_KDC:/var/kerberos/krb5kdc" \
         -e LLDAP_JWT_SECRET="$JWT_SECRET" \
         -e LLDAP_KEY_SEED="$KEY_SEED" \

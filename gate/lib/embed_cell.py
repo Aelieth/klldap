@@ -14,13 +14,14 @@ import threading
 import time
 import urllib.request
 
-# rate stays None until the saturation run's ceiling R sets it (0.6 x R).
+# rate is 0.6 x the ceiling R a --saturation run measured on today's MIT image
+# (1.708 writes/s, 2026-11-10), rounded down to 0.5/s.
 FROZEN = {
     "users": 200,
     "window": 300.0,
     "idle": 90.0,
     "burst": 120.0,
-    "rate": None,
+    "rate": 1.0,
     "writers": 4,
     "verify_every": 10,
     "kinit_interval": 0.1,

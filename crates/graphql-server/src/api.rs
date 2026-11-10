@@ -1,5 +1,5 @@
 use crate::{mutation::Mutation, query::Query};
-use juniper::{EmptySubscription, FieldError, FieldResult, RootNode};
+use juniper::{EmptyMutation, EmptySubscription, FieldError, FieldResult, RootNode};
 use lldap_access_control::{
     AccessControlledBackendHandler, AdminBackendHandler, ReadonlyBackendHandler,
     UserReadableBackendHandler, UserWriteableBackendHandler,
@@ -126,6 +126,15 @@ pub fn schema<Handler: FullHandler>() -> Schema<Handler> {
     Schema::new(
         Query::<Handler>::new(),
         Mutation::<Handler>::default(),
+        EmptySubscription::<Context<Handler>>::new(),
+    )
+}
+
+pub fn query_schema<Handler: FullHandler>()
+-> RootNode<Query<Handler>, EmptyMutation<Context<Handler>>, EmptySubscription<Context<Handler>>> {
+    RootNode::new(
+        Query::<Handler>::new(),
+        EmptyMutation::<Context<Handler>>::new(),
         EmptySubscription::<Context<Handler>>::new(),
     )
 }

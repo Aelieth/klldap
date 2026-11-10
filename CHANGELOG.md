@@ -26,6 +26,11 @@ yet. 0.7.4, 0.7.5 and 0.7.6 stay unreleased on their own branches.
   `constraintViolation`. A refused ADD creates no user.
 - GraphQL gives Kerberos the directory's user id, so `Alice` and `alice` name the same principal.
 
+### Security
+
+- GraphQL refuses a mutation sent by GET. Queries by GET still answer, so send
+  mutations by POST.
+
 ## [0.7.6] unreleased
 
 ### Organizational-unit policies

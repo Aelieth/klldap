@@ -4,7 +4,7 @@ use actix_web::HttpMessage;
 use actix_web::{Error, HttpRequest, HttpResponse, error::JsonPayloadError, web};
 use actix_web_httpauth::extractors::bearer::BearerAuth;
 use juniper::{
-    ScalarValue,
+    Definition, OperationType, ScalarValue, SchemaType,
     http::{
         GraphQLBatchRequest, GraphQLRequest, graphiql::graphiql_source,
         playground::playground_source,
@@ -14,7 +14,7 @@ use lldap_domain_handlers::handler::{BackendHandler, MfaBackendHandler};
 use lldap_domain_handlers::logging::{Protocol, current_request, with_actor, with_request};
 use lldap_domain_handlers::mfa::{MfaPolicy, MfaRequirement};
 use lldap_graphql_server::api::Context;
-use lldap_graphql_server::api::schema;
+use lldap_graphql_server::api::{query_schema, schema};
 
 async fn graphiql_route() -> Result<HttpResponse, Error> {
     let html = graphiql_source("/api/graphql", None);
@@ -54,6 +54,39 @@ where
     }
 }
 
+fn get_refuses_operation<S: ScalarValue>(
+    query: &str,
+    operation_name: Option<&str>,
+    schema: &SchemaType<S>,
+) -> bool {
+    let Ok(document) = juniper::parser::parse_document_source::<S>(query, schema) else {
+        return true;
+    };
+    let operations: Vec<_> = document
+        .iter()
+        .filter_map(|def| match def {
+            Definition::Operation(op) => Some(op),
+            Definition::Fragment(_) => None,
+        })
+        .collect();
+    let selected = if let Some(wanted) = operation_name {
+        operations
+            .into_iter()
+            .find(|op| op.item.name.as_ref().map(|name| name.item) == Some(wanted))
+    } else if operations.len() == 1 {
+        Some(operations[0])
+    } else {
+        None
+    };
+    let Some(op) = selected else {
+        return true;
+    };
+    matches!(
+        op.item.operation_type,
+        OperationType::Mutation | OperationType::Subscription
+    )
+}
+
 /// Actix GraphQL Handler for GET requests
 pub async fn get_graphql_handler<Query, Mutation, Subscription, CtxT, S>(
     schema: &juniper::RootNode<Query, Mutation, Subscription, S>,
@@ -73,6 +106,13 @@ where
     let get_req = web::Query::<GetGraphQLRequest>::from_query(req.query_string())?;
     let req = GraphQLRequest::try_from(get_req.into_inner())
         .map_err(actix_web::error::ErrorBadRequest)?;
+    if get_refuses_operation(&req.query, req.operation_name.as_deref(), &schema.schema) {
+        return Ok(HttpResponse::BadRequest()
+            .content_type("application/json")
+            .body(
+                r#"{"data":null,"errors":[{"message":"Only a single query operation is accepted over GET"}]}"#,
+            ));
+    }
     let gql_response = req.execute(schema, context).await;
     let body_response = serde_json::to_string(&gql_response)?;
     let mut response = match gql_response.is_ok() {
@@ -149,14 +189,17 @@ async fn graphql_route<Handler: BackendHandler + lldap_opaque_handler::OpaqueHan
             mfa_policy: data.mfa_policy,
             mfa_enrollment_pending,
         };
-        let schema = &schema();
         let context = &context;
         with_actor(Some(actor), async {
             match *req.method() {
                 actix_http::Method::POST => {
+                    let schema = &schema();
                     post_graphql_handler(schema, context, req, inner_payload).await
                 }
-                actix_http::Method::GET => get_graphql_handler(schema, context, req).await,
+                actix_http::Method::GET => {
+                    let schema = &query_schema();
+                    get_graphql_handler(schema, context, req).await
+                }
                 _ => Err(actix_web::error::UrlGenerationError::ResourceNotFound.into()),
             }
         })
@@ -190,4 +233,30 @@ where
     );
     cfg.service(web::resource("/graphql/playground").route(web::get().to(playground_route)));
     cfg.service(web::resource("/graphql/graphiql").route(web::get().to(graphiql_route)));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::get_refuses_operation;
+    use super::query_schema;
+    use juniper::DefaultScalarValue;
+    use lldap_sql_backend_handler::SqlBackendHandler;
+
+    fn refuses(query: &str, operation_name: Option<&str>) -> bool {
+        let root = query_schema::<SqlBackendHandler>();
+        get_refuses_operation::<DefaultScalarValue>(query, operation_name, &root.schema)
+    }
+
+    #[test]
+    fn get_operation_refusal() {
+        let mixed = "query Q { __typename } mutation M { __typename }";
+        assert!(refuses(mixed, Some("M")));
+        assert!(!refuses(mixed, Some("Q")));
+        assert!(!refuses("{ __typename }", None));
+        assert!(refuses("mutation { __typename }", None));
+        assert!(refuses("subscription S { __typename }", None));
+        assert!(refuses(mixed, None));
+        assert!(refuses(mixed, Some("Nope")));
+        assert!(refuses("this is not graphql", None));
+    }
 }

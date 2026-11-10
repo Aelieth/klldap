@@ -45,7 +45,7 @@ On top of LLDAP it adds:
   (`lldap_disabled`).
 
 This is a personal project, developed for a home lab and shared as-is under the
-AGPL-3.0. It is not supported by the LLDAP team; if you do not need Kerberos or
+GPL-3.0. It is not supported by the LLDAP team; if you do not need Kerberos or
 POSIX, use [LLDAP](https://github.com/lldap/lldap). Stock LLDAP 0.6.x databases can
 move to KLLDAP with their data (users set a new password), see the
 [migration guide](docs/migration_guides/v0.7-from-lldap.md).
@@ -146,4 +146,4 @@ sent there.
 
 ## License
 
-AGPL-3.0-only, see [LICENSE](LICENSE). KLLDAP contains LLDAP, © the LLDAP authors.
+GPL-3.0-only, see [LICENSE](LICENSE). KLLDAP contains LLDAP, © the LLDAP authors.

@@ -1,0 +1,7 @@
+KLLDAP
+Copyright (C) 2026 Aelieth
+SPDX-License-Identifier: GPL-3.0-only
+
+KLLDAP contains LLDAP, Copyright (C) the LLDAP authors, GPL-3.0-only.
+
+Third-party crate licenses are gated by deny.toml.

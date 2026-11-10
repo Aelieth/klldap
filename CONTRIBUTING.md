@@ -12,10 +12,11 @@ The Kerberos FFI needs the libkrb5 headers and clang (for bindgen):
 - Fedora: `sudo dnf install krb5-devel clang pkgconf-pkg-config`
 - Debian/Ubuntu: `sudo apt-get install libkrb5-dev clang pkg-config`
 
-Before a change lands, run the safety dance:
+Before a change lands, `cargo-deny` has to be on `PATH` (CI pins 0.20.2).
+Then run the safety dance:
 
 ```sh
-make safety   # fmt, build, test, clippy -D warnings, schema.graphql drift check
+make safety   # fmt, build, test, clippy -D warnings, cargo deny check licenses sources, schema.graphql drift check
 ```
 
 `--workspace` matters — `default-members` is the server only, so a bare `cargo test`

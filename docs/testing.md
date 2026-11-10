@@ -13,13 +13,15 @@ a fraction of the tree. The frontend builds with `./app/build.sh` (wasm-pack).
 
 ## The safety dance
 
-`make safety` is the pre-commit check, in this order:
+`cargo-deny` has to be on `PATH`; CI uses 0.20.2. `make safety` is the
+pre-commit check, in this order:
 
 ```sh
 cargo fmt --all
 cargo build --workspace
 cargo test --workspace
 cargo clippy --tests --all -- -D warnings
+cargo deny check licenses sources
 ./export_schema.sh && git diff --exit-code schema.graphql   # schema.graphql must not drift
 ```
 
@@ -76,6 +78,8 @@ on the host: Fedora `krb5-server krb5-workstation`, Debian/Ubuntu
 
 ## CI
 
-`.github/workflows/rust.yml` runs the safety dance, the live-KDC lane, a shellcheck pass
-and a PostgreSQL migration lane; `.github/workflows/gate.yml` builds the image and runs
-the gate on SQLite and PostgreSQL. Both run on pushes and pull requests.
+`.github/workflows/rust.yml` runs the safety dance, a `licenses` job
+(`cargo deny check licenses sources`), the live-KDC lane, a shellcheck
+pass, and a PostgreSQL migration lane. `.github/workflows/gate.yml`
+builds the image and runs the gate on SQLite and PostgreSQL. Both run
+on pushes and pull requests.

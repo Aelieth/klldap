@@ -146,4 +146,5 @@ HEALTHCHECK --start-period=90s --interval=30s --retries=3 \
 ARG VERSION=dev
 LABEL maintainer="Aelieth <https://github.com/Aelieth>" \
       version="${VERSION}" \
-      description="KLLDAP"
+      description="KLLDAP" \
+      org.opencontainers.image.licenses="GPL-3.0-only"

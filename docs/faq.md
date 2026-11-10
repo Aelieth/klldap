@@ -85,7 +85,7 @@ several instances.
 
 ## Is KLLDAP supported? Can we depend on it?
 
-KLLDAP is a personal project shared as-is (AGPL-3.0), developed for its author's home
+KLLDAP is a personal project shared as-is (GPL-3.0), developed for its author's home
 lab; the bus factor is one, and there is no support channel. The suites in
 [testing.md](testing.md) are what keeps it honest. Treat it as hobbyist software: use
 it where you can maintain or fork it yourself.

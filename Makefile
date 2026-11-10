@@ -100,7 +100,7 @@ test-run:
 	@echo "logs: docker logs -f klldap-test"
 
 # ---- Verification ----
-# - safety        → the pre-commit dance: fmt, build, test, clippy, schema drift
+# - safety        → the pre-commit dance: fmt, build, test, clippy, cargo deny, schema drift
 # - gate          → build the test image and run the full container gate
 # - gate-fast     → run the gate against the existing klldap-test image
 # - gate-postgres → gate with a gate-managed postgres:16 backend
@@ -112,6 +112,7 @@ safety:
 	cargo build --workspace
 	cargo test --workspace
 	cargo clippy --tests --all -- -D warnings
+	cargo deny check licenses sources
 	./export_schema.sh
 	git diff --exit-code schema.graphql
 

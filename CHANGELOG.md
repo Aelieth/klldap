@@ -6,6 +6,10 @@ Next release. The KDC becomes kerber-rust inside the `lldap` process,
 sharing one database with the directory. Nothing of that has landed
 yet. 0.7.4, 0.7.5 and 0.7.6 stay unreleased on their own branches.
 
+### License
+
+- KLLDAP is GPL-3.0-only again, the license LLDAP uses; `cargo deny` gates third-party licenses.
+
 ## [0.7.6] unreleased
 
 ### Organizational-unit policies

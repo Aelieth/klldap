@@ -372,7 +372,7 @@ impl App {
               </a>
             </div>
             <div>
-              <span>{"License "}<a href="https://github.com/Aelieth/klldap/blob/main/LICENSE" class="link-secondary">{"AGPL-3.0"}</a></span>
+              <span>{"License "}<a href="https://github.com/Aelieth/klldap/blob/main/LICENSE" class="link-secondary">{"GPL-3.0"}</a></span>
             </div>
           </footer>
         }

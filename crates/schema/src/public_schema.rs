@@ -1,15 +1,3 @@
-//! The built-in attribute schema. Attributes are declared with the `AttributeSchema::{editable,
-//! generated, readonly, hidden}` builders; every one is hardcoded and single-valued unless
-//! `.list()` is chained.
-//!
-//! - `editable`: visible to all, writable by users and admins (mail, displayName, avatar, ...).
-//! - `generated`: visible to all, settable only by admins; the server assigns the value
-//!   (uidNumber, gidNumber, homeDirectory, loginShell, kerberosSync).
-//! - `readonly`: visible to all, writable by nobody, advertised NO-USER-MODIFICATION over LDAP
-//!   (userId, uuid, timestamps, ou, groupId).
-//! - `hidden`: readonly and stripped from the schema and values for non-admins
-//!   (krbPrincipalName, allowedOUs).
-//!
 //! The mutation path checks `is_readonly` before `is_editable`, so `readonly` freezes a value
 //! for everyone while `generated` blocks only regular users.
 use crate::schema::{AttributeList, AttributeSchema, AttributeType, PosixSettings, Schema};
@@ -37,7 +25,6 @@ impl PublicSchema {
         use AttributeType::{Avatar, DateTime, Integer, String};
 
         let user_attributes = vec![
-            // Core
             AttributeSchema {
                 aliases: vec!["jpegphoto".into(), "jpegPhoto".into(), "jpeg_photo".into()],
                 ..A::editable("avatar", Avatar)
@@ -78,7 +65,6 @@ impl PublicSchema {
                 aliases: vec!["entryUUID".into(), "entryuuid".into()],
                 ..A::readonly("uuid", String)
             },
-            // POSIX
             AttributeSchema {
                 aliases: vec!["uid_number".into(), "uidNumber".into()],
                 ..A::generated("uidnumber", Integer)
@@ -95,7 +81,6 @@ impl PublicSchema {
                 aliases: vec!["login_shell".into(), "loginShell".into()],
                 ..A::generated("loginshell", String)
             },
-            // Kerberos
             AttributeSchema {
                 aliases: vec!["kerberos_sync".into(), "kerberosSync".into()],
                 ..A::generated(KERBEROS_SYNC, Integer)
@@ -104,7 +89,6 @@ impl PublicSchema {
                 aliases: vec!["krb_principal_name".into(), "krbPrincipalName".into()],
                 ..A::hidden("krbprincipalname", String)
             },
-            // SSH
             AttributeSchema {
                 aliases: vec![
                     "sshPublicKey".into(),
@@ -113,7 +97,6 @@ impl PublicSchema {
                 ],
                 ..A::editable("sshpublickey", String).list()
             },
-            // OU
             AttributeSchema {
                 aliases: vec!["organizationalunit".into(), "organizationalUnit".into()],
                 ..A::readonly("ou", String)
@@ -121,7 +104,6 @@ impl PublicSchema {
         ];
 
         let group_attributes = vec![
-            // Core
             AttributeSchema {
                 aliases: vec!["group_id".into()],
                 ..A::readonly("groupid", Integer)
@@ -142,25 +124,20 @@ impl PublicSchema {
                 aliases: vec!["display_name".into(), "cn".into(), "commonname".into()],
                 ..A::editable("displayname", String)
             },
-            // OU
             AttributeSchema {
                 aliases: vec!["organizationalunit".into(), "organizationalUnit".into()],
                 ..A::readonly("ou", String)
             },
-            // POSIX
             AttributeSchema {
                 aliases: vec!["gid_number".into(), "gidNumber".into()],
                 ..A::generated("gidnumber", Integer)
             },
         ];
 
-        let system_attributes = vec![
-            // Access control
-            AttributeSchema {
-                aliases: vec!["allowedOUs".into(), "AllowedOUs".into()],
-                ..A::hidden("allowedous", String).list()
-            },
-        ];
+        let system_attributes = vec![AttributeSchema {
+            aliases: vec!["allowedOUs".into(), "AllowedOUs".into()],
+            ..A::hidden("allowedous", String).list()
+        }];
 
         PublicSchema(Schema {
             user_attributes: AttributeList {

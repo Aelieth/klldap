@@ -36,20 +36,22 @@ pub(super) async fn sync_kerberos_password<Handler: FullHandler + OpaqueHandler>
     let sync_enabled = kerberos_sync_enabled(&user.attributes);
     if sync_enabled {
         kerberos_backend()
-            .sync_principal(&user_id, &plain_password)
+            .sync_principal(target_user_id.as_str(), &plain_password)
             .await
             .map_err(|e| anyhow!("Kerberos sync failed: {e}"))?;
-        info!("Kerberos principal synced for user {user_id}");
+        info!("Kerberos principal synced for user {target_user_id}");
         // A first password for an already-disabled user would otherwise mint a live principal.
         if let Ok(groups) = handler.get_user_groups(&target_user_id).await
             && groups
                 .iter()
                 .any(|g| g.display_name == "lldap_disabled".into())
         {
-            kerberos_backend().reassert_disabled(&user_id).await;
+            kerberos_backend()
+                .reassert_disabled(target_user_id.as_str())
+                .await;
         }
     } else {
-        info!("Kerberos sync disabled for user {user_id}, skipping");
+        info!("Kerberos sync disabled for user {target_user_id}, skipping");
     }
     if let Err(e) = handler
         .ensure_kerberos_principal_consistency(&target_user_id, sync_enabled)

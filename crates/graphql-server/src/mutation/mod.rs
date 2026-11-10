@@ -124,9 +124,24 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         let span = debug_span!("[GraphQL mutation] set_user_password");
         let target_user_id = UserId::new(&user_id);
         span.in_scope(|| debug!("Setting password for user: {target_user_id}"));
-        let handler = context
-            .get_writeable_handler(target_user_id.clone())
-            .ok_or_else(field_error_callback(&span, "Unauthorized password set"))?;
+        if context.mfa_enrollment_pending {
+            return Err(field_error_callback(&span, "Unauthorized password set")());
+        }
+        let groups = context
+            .get_readable_handler(target_user_id.clone())
+            .ok_or_else(field_error_callback(&span, "Unauthorized password set"))?
+            .get_user_groups(&target_user_id)
+            .await?;
+        let user_is_admin = groups
+            .iter()
+            .any(|g| g.display_name == "lldap_admin".into());
+        if !context
+            .validation_result
+            .can_change_password(&target_user_id, user_is_admin)
+        {
+            return Err(field_error_callback(&span, "Unauthorized password set")());
+        }
+        let handler = context.handler.unsafe_get_handler();
         lldap_opaque_handler::register_password(
             handler,
             target_user_id.clone(),
@@ -155,7 +170,6 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         }
         // A first password for an already-disabled user would otherwise mint a live principal.
         if sync_enabled
-            && let Ok(groups) = handler.get_user_groups(&target_user_id).await
             && groups
                 .iter()
                 .any(|g| g.display_name == "lldap_disabled".into())
@@ -1659,6 +1673,80 @@ mod tests {
                 password: "s3cret".into(),
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn test_set_user_password_password_manager() {
+        use lldap_auth::{opaque, registration};
+        let mut rng = rand::rngs::OsRng;
+        let registration_start_request =
+            opaque::client::registration::start_registration(b"s3cret", &mut rng).unwrap();
+        let request = registration::ClientRegistrationStartRequest {
+            username: "bob".into(),
+            registration_start_request: registration_start_request.message,
+        };
+        let start_response = opaque::server::registration::start_registration(
+            &opaque::server::ServerSetup::new(&mut rng),
+            request.registration_start_request,
+            &request.username,
+        )
+        .unwrap();
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_get_user_groups()
+            .with(eq(UserId::new("bob")))
+            .times(1)
+            .returning(|_| Ok(std::collections::HashSet::new()));
+        mock.expect_registration_start()
+            .times(1)
+            .return_once(move |_| {
+                Ok(registration::ServerRegistrationStartResponse {
+                    server_data: String::new(),
+                    registration_response: start_response.message,
+                })
+            });
+        mock.expect_registration_finish()
+            .times(1)
+            .return_once(|_| Ok(UserId::new("bob")));
+        mock.expect_get_user_details()
+            .with(eq(UserId::new("bob")))
+            .returning(|uid| Ok(sample_user(uid.as_str(), vec![])));
+        mock.expect_ensure_kerberos_principal_consistency()
+            .with(eq(UserId::new("bob")), eq(false))
+            .times(1)
+            .returning(|_, _| Ok(()));
+        let (value, errors) = execute(
+            r#"mutation($id: String!, $password: String!) { setUserPassword(userId: $id, password: $password) { ok } }"#,
+            None,
+            &root_schema(),
+            &Variables::from([
+                ("id".to_string(), InputValue::scalar("bob")),
+                ("password".to_string(), InputValue::scalar("s3cret")),
+            ]),
+            &password_manager_context(mock),
+        )
+        .await
+        .unwrap();
+        assert_eq!(errors.len(), 0, "{errors:?}");
+        assert_eq!(value, graphql_value!({"setUserPassword": {"ok": true}}));
+
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_get_user_groups()
+            .with(eq(UserId::new("alice")))
+            .times(1)
+            .returning(|_| Ok(group_set("lldap_admin")));
+        let (_, errors) = execute(
+            r#"mutation($id: String!, $password: String!) { setUserPassword(userId: $id, password: $password) { ok } }"#,
+            None,
+            &root_schema(),
+            &Variables::from([
+                ("id".to_string(), InputValue::scalar("alice")),
+                ("password".to_string(), InputValue::scalar("s3cret")),
+            ]),
+            &password_manager_context(mock),
+        )
+        .await
+        .unwrap();
+        assert_unauthorized(&errors, "setUserPassword");
     }
 
     fn password_manager_context(mock: MockTestBackendHandler) -> Context<MockTestBackendHandler> {

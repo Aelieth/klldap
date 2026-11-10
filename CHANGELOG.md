@@ -30,6 +30,8 @@ yet. 0.7.4, 0.7.5 and 0.7.6 stay unreleased on their own branches.
 
 - GraphQL refuses a mutation sent by GET. Queries by GET still answer, so send
   mutations by POST.
+- A password manager may call `setUserPassword` for a non-admin, the same rule as
+  the LDAP password doors.
 
 ## [0.7.6] unreleased
 

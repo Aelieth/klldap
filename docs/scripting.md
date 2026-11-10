@@ -55,9 +55,10 @@ Beyond LLDAP's users, groups, attributes and object classes, the schema exposes:
   `logSummary(filter, groupBy, limit)` for counts, `logActivity(actor, kinds, since)` for
   one account — see [logging](logging.md).
 
-`setUserPassword(userId, password)` sets a password over the API (self or admin): the
-server runs the OPAQUE registration itself, so nothing but the OPAQUE record is stored,
-and the KDC principal is updated when the user has `kerberosSync` on. Send
+`setUserPassword(userId, password)` sets a password over the API. An admin may set
+anyone's, a password manager may set a non-admin's, and a user may set their own.
+The server runs the OPAQUE registration itself, so nothing but the OPAQUE record is
+stored, and the KDC principal is updated when the user has `kerberosSync` on. Send
 mutations by POST: a mutation sent by GET is refused. Queries may use GET. Use the
 API over HTTPS only.
 

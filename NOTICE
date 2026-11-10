@@ -5,3 +5,20 @@ SPDX-License-Identifier: GPL-3.0-only
 KLLDAP contains LLDAP, Copyright (C) the LLDAP authors, GPL-3.0-only.
 
 Third-party crate licenses are gated by deny.toml.
+
+KLLDAP links kerber-rust v1.2.1 (https://github.com/Aelieth/kerber-rust).
+Its NOTICE follows; the paths in it are kerber-rust's.
+
+kerber-rust
+Copyright 2026 Aelieth
+
+This product is dual-licensed under Apache-2.0 OR MIT. See LICENSE,
+LICENSE-APACHE, and LICENSE-MIT.
+
+This product includes cryptographic software. The cryptographic
+posture, an honest ECCN 5D002 / TSU §740.13(e) note, and distributor
+obligations are in docs/export-control.md.
+
+Third-party Rust crates used by this workspace are restricted to the
+license allowlist in deny.toml (MIT, Apache-2.0, BSD-3-Clause,
+Unicode-3.0). cargo deny in CI fails red on a crate outside that list.

@@ -10,6 +10,13 @@ yet. 0.7.4, 0.7.5 and 0.7.6 stay unreleased on their own branches.
 
 - KLLDAP is GPL-3.0-only again, the license LLDAP uses; `cargo deny` gates third-party licenses.
 
+### Dependencies
+
+- kerber-rust v1.2.1 (`krb5-kdc`, `krb5-admin`, `krb5-config`, `krb5-types`, `krb5-crypto`,
+  `krb5-log`, `krb5-protocol`) is a git dependency at its tag, linked but not yet used. Its
+  `rasn` patch is carried in `[patch.crates-io]`, and `.cargo/config.toml` sets
+  `--cfg p384_backend="fiat"` so P-384 uses p384's constant-time field.
+
 ## [0.7.6] unreleased
 
 ### Organizational-unit policies

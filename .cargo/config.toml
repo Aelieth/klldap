@@ -1,0 +1,3 @@
+# kerber-rust refuses P-384 unless p384 is built on its constant-time field.
+[target.'cfg(all())']
+rustflags = ["--cfg", "p384_backend=\"fiat\""]

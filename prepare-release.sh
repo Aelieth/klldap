@@ -9,7 +9,7 @@ set -x
 # that would make the binary incompatible with older x86_64 processors.
 # The previous release apparently picked up v3 instructions (likely via native build
 # on a modern CPU or implicit optimization).
-RUSTFLAGS="-C target-cpu=x86-64" cargo build --release -p lldap
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=x86-64" cargo build --release -p lldap
 
 cargo install cross
 

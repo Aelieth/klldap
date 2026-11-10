@@ -13,6 +13,13 @@ rust-version.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+krb5-admin = { workspace = true }
+krb5-config = { workspace = true }
+krb5-crypto = { workspace = true }
+krb5-kdc = { workspace = true }
+krb5-log = { workspace = true }
+krb5-protocol = { workspace = true }
+krb5-types = { workspace = true }
 minijinja = "2.0"
 serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true }

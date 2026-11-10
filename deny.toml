@@ -25,6 +25,7 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
     "https://github.com/jfbilodeau/yew_form",
+    "https://github.com/Aelieth/kerber-rust",
 ]
 
 [bans]

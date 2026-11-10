@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use lldap_domain_model::error::DomainError;
 use std::env;
 use std::sync::{Arc, LazyLock, RwLock};
@@ -135,32 +136,33 @@ pub fn validate_keytab_hostname(hostname: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[async_trait]
 pub trait KerberosSync: Send + Sync {
     /// Whether the KDC has been reachable at least once since the process started.
     fn ready(&self) -> bool {
         true
     }
-    fn sync_principal(&self, username: &str, password: &str) -> Result<(), String>;
-    fn sync_if_enabled(
+    async fn sync_principal(&self, username: &str, password: &str) -> Result<(), String>;
+    async fn sync_if_enabled(
         &self,
         sync_enabled: bool,
         username: &str,
         password: &str,
     ) -> Result<(), String> {
         if sync_enabled {
-            self.sync_principal(username, password)
+            self.sync_principal(username, password).await
         } else {
             Ok(())
         }
     }
-    fn delete_principal(&self, username: &str) -> Result<(), String>;
-    fn set_principal_enabled(&self, username: &str, enabled: bool) -> Result<(), String>;
-    fn reassert_disabled(&self, username: &str) {
-        if let Err(e) = self.set_principal_enabled(username, false) {
+    async fn delete_principal(&self, username: &str) -> Result<(), String>;
+    async fn set_principal_enabled(&self, username: &str, enabled: bool) -> Result<(), String>;
+    async fn reassert_disabled(&self, username: &str) {
+        if let Err(e) = self.set_principal_enabled(username, false).await {
             warn!("Failed to re-assert Kerberos disable for {username} after password set: {e}");
         }
     }
-    fn export_keytab_for_keycloak(&self, hostname: &str) -> Result<String, String>;
+    async fn export_keytab_for_keycloak(&self, hostname: &str) -> Result<String, String>;
 }
 
 const NOT_REGISTERED: &str = "Kerberos backend not registered";
@@ -169,17 +171,18 @@ const NOT_REGISTERED: &str = "Kerberos backend not registered";
 // operations that must reach the KDC fail, so a missing registration stays visible.
 pub struct NoopKerberos;
 
+#[async_trait]
 impl KerberosSync for NoopKerberos {
-    fn sync_principal(&self, _: &str, _: &str) -> Result<(), String> {
+    async fn sync_principal(&self, _: &str, _: &str) -> Result<(), String> {
         Err(NOT_REGISTERED.to_owned())
     }
-    fn delete_principal(&self, _: &str) -> Result<(), String> {
+    async fn delete_principal(&self, _: &str) -> Result<(), String> {
         Ok(())
     }
-    fn set_principal_enabled(&self, _: &str, _: bool) -> Result<(), String> {
+    async fn set_principal_enabled(&self, _: &str, _: bool) -> Result<(), String> {
         Ok(())
     }
-    fn export_keytab_for_keycloak(&self, _: &str) -> Result<String, String> {
+    async fn export_keytab_for_keycloak(&self, _: &str) -> Result<String, String> {
         Err(NOT_REGISTERED.to_owned())
     }
 }

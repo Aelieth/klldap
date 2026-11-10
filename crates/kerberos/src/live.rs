@@ -2,18 +2,25 @@ use crate::{
     delete_kerberos_principal, export_keytab_for_keycloak, paths::KerberosPaths,
     set_kerberos_principal_enabled, sync_kerberos_principal,
 };
+use async_trait::async_trait;
 use lldap_domain_handlers::kerberos::KerberosSync;
-use lldap_domain_handlers::logging::{LogKind, record_outcome};
+use lldap_domain_handlers::logging::{LogKind, current_request, record_outcome, with_request_sync};
 use std::{
     net::{SocketAddr, TcpStream},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
+use tokio::sync::Mutex;
+use tracing::Span;
 
 pub struct LiveKerberos {
     kdc_port: u16,
     wait_for_kdc: bool,
     seen_kdc: AtomicBool,
+    kadm5: Arc<Mutex<()>>,
 }
 
 impl LiveKerberos {
@@ -28,10 +35,38 @@ impl LiveKerberos {
             kdc_port,
             wait_for_kdc,
             seen_kdc: AtomicBool::new(false),
+            kadm5: Arc::new(Mutex::new(())),
         }
+    }
+
+    // One kadm5 call at a time; lock and log row go with the call, so a dropped caller keeps both.
+    async fn logged<T: Send + 'static>(
+        &self,
+        kind: LogKind,
+        target: &str,
+        op: &'static str,
+        f: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+    ) -> Result<T, String> {
+        let meta = current_request();
+        let span = Span::current();
+        let target = target.to_owned();
+        let serial = self.kadm5.clone().lock_owned().await;
+        tokio::task::spawn_blocking(move || {
+            let _serial = serial;
+            span.in_scope(|| {
+                with_request_sync(meta, || {
+                    let result = f().map_err(|e| format!("{e:#}"));
+                    record_outcome(kind, Some(&target), result.is_ok(), Some(op));
+                    result
+                })
+            })
+        })
+        .await
+        .unwrap_or_else(|e| Err(format!("Kerberos call did not complete: {e}")))
     }
 }
 
+#[async_trait]
 impl KerberosSync for LiveKerberos {
     // Latch: wait once after boot; a later KDC death is the healthcheck's job.
     fn ready(&self) -> bool {
@@ -45,44 +80,45 @@ impl KerberosSync for LiveKerberos {
         }
         up
     }
-    fn sync_principal(&self, username: &str, password: &str) -> Result<(), String> {
-        logged(LogKind::KerberosSync, username, "sync", || {
-            sync_kerberos_principal(username, password)
+    async fn sync_principal(&self, username: &str, password: &str) -> Result<(), String> {
+        let (user, password) = (username.to_owned(), password.to_owned());
+        self.logged(LogKind::KerberosSync, username, "sync", move || {
+            sync_kerberos_principal(&user, &password)
         })
+        .await
     }
-    fn delete_principal(&self, username: &str) -> Result<(), String> {
-        logged(LogKind::KerberosSync, username, "delete", || {
-            delete_kerberos_principal(username)
+    async fn delete_principal(&self, username: &str) -> Result<(), String> {
+        let user = username.to_owned();
+        self.logged(LogKind::KerberosSync, username, "delete", move || {
+            delete_kerberos_principal(&user)
         })
+        .await
     }
-    fn set_principal_enabled(&self, username: &str, enabled: bool) -> Result<(), String> {
+    async fn set_principal_enabled(&self, username: &str, enabled: bool) -> Result<(), String> {
         let op = if enabled { "enable" } else { "disable" };
-        logged(LogKind::KerberosSync, username, op, || {
-            set_kerberos_principal_enabled(username, enabled)
+        let user = username.to_owned();
+        self.logged(LogKind::KerberosSync, username, op, move || {
+            set_kerberos_principal_enabled(&user, enabled)
         })
+        .await
     }
-    fn export_keytab_for_keycloak(&self, hostname: &str) -> Result<String, String> {
-        logged(LogKind::KeytabExport, hostname, "keycloak", || {
-            export_keytab_for_keycloak(hostname)
+    async fn export_keytab_for_keycloak(&self, hostname: &str) -> Result<String, String> {
+        let host = hostname.to_owned();
+        self.logged(LogKind::KeytabExport, hostname, "keycloak", move || {
+            export_keytab_for_keycloak(&host)
         })
+        .await
     }
-}
-
-fn logged<T>(
-    kind: LogKind,
-    target: &str,
-    op: &str,
-    f: impl FnOnce() -> anyhow::Result<T>,
-) -> Result<T, String> {
-    let result = f().map_err(|e| format!("{e:#}"));
-    record_outcome(kind, Some(target), result.is_ok(), Some(op));
-    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
+    use lldap_domain::types::UserId;
+    use lldap_domain_handlers::logging::{Protocol, RequestMeta, with_request};
+    use lldap_test_utils::recording_log::LogGuard;
+    use serial_test::serial;
+    use std::{net::TcpListener, sync::mpsc};
 
     #[test]
     fn test_ready_latches_once_the_kdc_port_answers() {
@@ -100,25 +136,21 @@ mod tests {
         drop(listener);
         assert!(live.ready(), "latched: a KDC seen once counts as up");
     }
-}
 
-#[cfg(test)]
-mod log_tests {
-    use super::*;
-    use lldap_domain_handlers::logging::{LogKind, Protocol};
-    use lldap_test_utils::recording_log::LogGuard;
-    use serial_test::serial;
-
-    #[test]
+    #[tokio::test]
     #[serial]
-    fn test_principal_operations_record_kerberos_sync_events() {
+    async fn test_principal_operations_record_kerberos_sync_events() {
         let guard = LogGuard::install();
         let live = LiveKerberos::on_port(1, false);
 
         // No KDC: the delete is a no-op success, the sync a failure; both are recorded.
-        assert!(live.delete_principal("bob").is_ok());
-        assert!(live.sync_principal("bob", "pw").is_err());
-        assert!(live.export_keytab_for_keycloak("host.example.com").is_err());
+        assert!(live.delete_principal("bob").await.is_ok());
+        assert!(live.sync_principal("bob", "pw").await.is_err());
+        assert!(
+            live.export_keytab_for_keycloak("host.example.com")
+                .await
+                .is_err()
+        );
 
         let events = guard.recorder().take_events();
         let summary: Vec<_> = events
@@ -139,5 +171,41 @@ mod log_tests {
             ]
         );
         assert!(events.iter().all(|e| e.protocol == Protocol::System));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_dropped_caller_keeps_the_kadm5_lock_and_its_log_row() {
+        let guard = LogGuard::install();
+        let live = LiveKerberos::on_port(1, false);
+        let (release, held) = mpsc::channel::<()>();
+        let alice = RequestMeta::ldap(Some(UserId::new("alice")), None);
+        let call = live.logged(LogKind::KerberosSync, "bob", "sync", move || {
+            Ok(held.recv()?)
+        });
+        let waited =
+            tokio::time::timeout(Duration::from_millis(50), with_request(alice, call)).await;
+        assert!(
+            waited.is_err(),
+            "the caller gives up while the call is blocked"
+        );
+        assert!(
+            live.kadm5.try_lock().is_err(),
+            "a dropped caller freed the lock mid-call"
+        );
+
+        release.send(()).unwrap();
+        drop(live.kadm5.lock().await);
+        let rows: Vec<_> = guard
+            .recorder()
+            .take_events()
+            .into_iter()
+            .map(|e| (e.target, e.actor))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(Some("bob".to_owned()), Some("alice".to_owned()))],
+            "the dropped call's row keeps its request's actor"
+        );
     }
 }

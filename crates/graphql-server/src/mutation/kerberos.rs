@@ -37,6 +37,7 @@ pub(super) async fn sync_kerberos_password<Handler: FullHandler + OpaqueHandler>
     if sync_enabled {
         kerberos_backend()
             .sync_principal(&user_id, &plain_password)
+            .await
             .map_err(|e| anyhow!("Kerberos sync failed: {e}"))?;
         info!("Kerberos principal synced for user {user_id}");
         // A first password for an already-disabled user would otherwise mint a live principal.
@@ -45,7 +46,7 @@ pub(super) async fn sync_kerberos_password<Handler: FullHandler + OpaqueHandler>
                 .iter()
                 .any(|g| g.display_name == "lldap_disabled".into())
         {
-            kerberos_backend().reassert_disabled(&user_id);
+            kerberos_backend().reassert_disabled(&user_id).await;
         }
     } else {
         info!("Kerberos sync disabled for user {user_id}, skipping");
@@ -68,7 +69,10 @@ pub(super) async fn export_keytab_for_keycloak<Handler: FullHandler + OpaqueHand
     context
         .get_admin_handler()
         .ok_or_else(field_error_callback(&span, "Unauthorized keytab export"))?;
-    match kerberos_backend().export_keytab_for_keycloak(&hostname) {
+    match kerberos_backend()
+        .export_keytab_for_keycloak(&hostname)
+        .await
+    {
         Ok(path) => Ok(ExportKeytabForKeycloakResponse {
             ok: true,
             path,

@@ -48,9 +48,10 @@ Data storage:
   between front and back-end (OPAQUE structures, JWT format).
 * `crates/domain`, `crates/domain-model`, `crates/domain-handlers`: domain types,
   SeaORM models, and the backend-handler traits, including the `KerberosSync` seam
-  that ldap/sql/graphql call and the server binds to the real KDC, and the logging seam
-  (`logging.rs`: event model, per-request context, sink registry) that the handlers
-  record into and the server binds to the SQL writer.
+  that ldap/sql/graphql call and the server binds to the real KDC (async: the live binding
+  runs each KDC write, one at a time, on tokio's blocking pool, never on the actix worker),
+  and the logging seam (`logging.rs`: event model, per-request context, sink registry)
+  that the handlers record into and the server binds to the SQL writer.
 * `crates/sql-backend-handler`: the SQL implementation of the handlers, the
   migrations (v12/v13 are KLLDAP's; v13 carries the `logs` table through
   `ensure_logs`), the log writer (batched, coalescing repeated binds), retention and the

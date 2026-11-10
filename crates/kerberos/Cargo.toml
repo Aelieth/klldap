@@ -12,8 +12,10 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+async-trait = { workspace = true }
 minijinja = "2.0"
 serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true }
 toml = "0.8"
 tracing = { workspace = true }
 
@@ -31,6 +33,9 @@ path = "src/bin/kerberos_manager.rs"
 [dev-dependencies]
 pretty_assertions = { workspace = true }
 serial_test = { workspace = true }
+
+[dev-dependencies.lldap_domain]
+path = "../domain"
 
 [dev-dependencies.lldap_test_utils]
 path = "../test-utils"

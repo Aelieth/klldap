@@ -124,6 +124,10 @@ pub async fn with_request<F: Future>(meta: RequestMeta, f: F) -> F::Output {
     REQUEST.scope(meta, f).await
 }
 
+pub fn with_request_sync<T>(meta: RequestMeta, f: impl FnOnce() -> T) -> T {
+    REQUEST.sync_scope(meta, f)
+}
+
 pub async fn with_actor<F: Future>(actor: Option<UserId>, f: F) -> F::Output {
     with_request(current_request().with_actor(actor), f).await
 }

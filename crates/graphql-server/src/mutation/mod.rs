@@ -139,7 +139,10 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             .await
             .map_err(|e| anyhow!("Failed to fetch user for Kerberos sync check: {e}"))?;
         let sync_enabled = kerberos_sync_enabled(&user.attributes);
-        if let Err(e) = kerberos_backend().sync_if_enabled(sync_enabled, &user_id, &password) {
+        if let Err(e) = kerberos_backend()
+            .sync_if_enabled(sync_enabled, &user_id, &password)
+            .await
+        {
             warn!("Kerberos sync failed after password set: {e}");
         } else if sync_enabled {
             info!("Kerberos principal synced for user {user_id}");
@@ -157,7 +160,7 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
                 .iter()
                 .any(|g| g.display_name == "lldap_disabled".into())
         {
-            kerberos_backend().reassert_disabled(&user_id);
+            kerberos_backend().reassert_disabled(&user_id).await;
         }
         Ok(Success::new())
     }

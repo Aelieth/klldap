@@ -109,7 +109,10 @@ pub(crate) async fn sync_kerberos_after_password_change(
         }
     };
     let sync_enabled = kerberos_sync_enabled(&user.attributes);
-    if let Err(e) = kerberos_backend().sync_if_enabled(sync_enabled, user_id.as_str(), password) {
+    if let Err(e) = kerberos_backend()
+        .sync_if_enabled(sync_enabled, user_id.as_str(), password)
+        .await
+    {
         warn!("Kerberos sync failed after LDAP password change: {e}");
     } else if sync_enabled {
         info!("Kerberos principal synced for user {user_id} (LDAP password change)");
@@ -120,7 +123,7 @@ pub(crate) async fn sync_kerberos_after_password_change(
             .iter()
             .any(|g| g.display_name == "lldap_disabled".into())
     {
-        kerberos_backend().reassert_disabled(user_id.as_str());
+        kerberos_backend().reassert_disabled(user_id.as_str()).await;
     }
     sync_enabled
 }

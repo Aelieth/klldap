@@ -230,7 +230,10 @@ async fn create_user(
                 message: format!("Error while setting the password: {e:#?}"),
             })?;
         if kerberossync_enabled && let Ok(plain) = std::str::from_utf8(password) {
-            match kerberos_backend().sync_principal(user_id.as_str(), plain) {
+            match kerberos_backend()
+                .sync_principal(user_id.as_str(), plain)
+                .await
+            {
                 Ok(()) => {
                     if let Err(e) = backend_handler
                         .ensure_kerberos_principal_consistency(&user_id, true)

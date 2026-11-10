@@ -2939,7 +2939,9 @@ name = "lldap-kerberos"
 version = "0.2.1"
 dependencies = [
  "anyhow",
+ "async-trait",
  "bindgen",
+ "lldap_domain",
  "lldap_domain_handlers",
  "lldap_test_utils",
  "minijinja",
@@ -2947,6 +2949,7 @@ dependencies = [
  "pretty_assertions",
  "serde",
  "serial_test",
+ "tokio",
  "toml",
  "tracing",
 ]

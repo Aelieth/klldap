@@ -433,7 +433,6 @@ impl SystemConfigBackendHandler for SqlBackendHandler {
 }
 
 impl SqlBackendHandler {
-    /// Best-effort: mirror `lldap_disabled` group membership onto the user's Kerberos principal via
     /// Best-effort: mirror `lldap_disabled` membership onto the principal's DISALLOW_ALL_TIX,
     /// only for kerberossync-managed users. Kerberos is advisory here, like `delete_user`.
     async fn reflect_kerberos_disabled(&self, user_id: &UserId, disabled: bool) {
@@ -451,7 +450,10 @@ impl SqlBackendHandler {
         if !synced {
             return; // no KLLDAP-managed principal to touch
         }
-        if let Err(e) = kerberos_backend().set_principal_enabled(user_id.as_str(), !disabled) {
+        if let Err(e) = kerberos_backend()
+            .set_principal_enabled(user_id.as_str(), !disabled)
+            .await
+        {
             tracing::warn!(
                 "Failed to {} Kerberos principal for {} (non-fatal): {}",
                 if disabled { "disable" } else { "enable" },
@@ -641,7 +643,9 @@ impl UserBackendHandler for SqlBackendHandler {
             .await?;
         logging::record(LogKind::UserUpdate, Some(user_id.as_str()), Some(&changes));
         // KDC side effects run after commit so a rollback cannot orphan a deleted principal.
-        if delete_principal && let Err(e) = kerberos_backend().delete_principal(user_id.as_str()) {
+        if delete_principal
+            && let Err(e) = kerberos_backend().delete_principal(user_id.as_str()).await
+        {
             tracing::warn!(
                 "Failed to delete Kerberos principal for user {} when disabling sync: {}",
                 user_id,
@@ -672,7 +676,7 @@ impl UserBackendHandler for SqlBackendHandler {
             }
         }
         // Removed before the row delete, and idempotent, so a missing principal is fine.
-        if let Err(e) = kerberos_backend().delete_principal(user_id.as_str()) {
+        if let Err(e) = kerberos_backend().delete_principal(user_id.as_str()).await {
             tracing::warn!(
                 "Failed to delete Kerberos principal for user {} during deletion (non-fatal): {}",
                 user_id,

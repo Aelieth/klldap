@@ -62,7 +62,7 @@ async fn delete_user(
             code: LdapResultCode::OperationsError,
             message: format!("Error while deleting user: {e:?}"),
         })?;
-    if let Err(e) = kerberos_backend().delete_principal(user_id.as_str()) {
+    if let Err(e) = kerberos_backend().delete_principal(user_id.as_str()).await {
         tracing::warn!(
             "Failed to delete Kerberos principal for deleted user {}: {}",
             user_id,

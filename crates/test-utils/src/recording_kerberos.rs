@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use lldap_domain_handlers::kerberos::{KerberosSync, NoopKerberos, set_kerberos_backend};
 use std::sync::{Arc, Mutex};
 
@@ -25,8 +26,9 @@ impl RecordingKerberos {
     }
 }
 
+#[async_trait]
 impl KerberosSync for RecordingKerberos {
-    fn sync_principal(&self, username: &str, password: &str) -> Result<(), String> {
+    async fn sync_principal(&self, username: &str, password: &str) -> Result<(), String> {
         self.ops
             .lock()
             .expect("ops")
@@ -36,7 +38,7 @@ impl KerberosSync for RecordingKerberos {
             });
         Ok(())
     }
-    fn delete_principal(&self, username: &str) -> Result<(), String> {
+    async fn delete_principal(&self, username: &str) -> Result<(), String> {
         self.ops
             .lock()
             .expect("ops")
@@ -45,14 +47,14 @@ impl KerberosSync for RecordingKerberos {
             });
         Ok(())
     }
-    fn set_principal_enabled(&self, username: &str, enabled: bool) -> Result<(), String> {
+    async fn set_principal_enabled(&self, username: &str, enabled: bool) -> Result<(), String> {
         self.ops.lock().expect("ops").push(KerberosOp::SetEnabled {
             username: username.to_owned(),
             enabled,
         });
         Ok(())
     }
-    fn export_keytab_for_keycloak(&self, hostname: &str) -> Result<String, String> {
+    async fn export_keytab_for_keycloak(&self, hostname: &str) -> Result<String, String> {
         self.ops
             .lock()
             .expect("ops")
@@ -88,20 +90,21 @@ impl Drop for RecordingGuard {
 // The KDC has not come up yet: directory writes must be refused.
 pub struct NotReadyKerberos;
 
+#[async_trait]
 impl KerberosSync for NotReadyKerberos {
     fn ready(&self) -> bool {
         false
     }
-    fn sync_principal(&self, _: &str, _: &str) -> Result<(), String> {
+    async fn sync_principal(&self, _: &str, _: &str) -> Result<(), String> {
         Err("KDC not ready".to_owned())
     }
-    fn delete_principal(&self, _: &str) -> Result<(), String> {
+    async fn delete_principal(&self, _: &str) -> Result<(), String> {
         Err("KDC not ready".to_owned())
     }
-    fn set_principal_enabled(&self, _: &str, _: bool) -> Result<(), String> {
+    async fn set_principal_enabled(&self, _: &str, _: bool) -> Result<(), String> {
         Err("KDC not ready".to_owned())
     }
-    fn export_keytab_for_keycloak(&self, _: &str) -> Result<String, String> {
+    async fn export_keytab_for_keycloak(&self, _: &str) -> Result<String, String> {
         Err("KDC not ready".to_owned())
     }
 }

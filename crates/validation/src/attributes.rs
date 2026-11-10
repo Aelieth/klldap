@@ -1,4 +1,3 @@
-// Description of allowed characters. Intended for error messages.
 pub const ALLOWED_CHARACTERS_DESCRIPTION: &str = "a-z, A-Z, 0-9, and dash (-)";
 
 pub fn validate_attribute_name(attribute_name: &str) -> Result<(), Vec<char>> {

@@ -6,35 +6,35 @@ use lldap_auth::{opaque, registration};
 use reqwest::Url;
 use serde::Serialize;
 
-/// Set the password for a user in LLDAP.
 #[derive(Debug, Parser, Clone)]
+#[command(about = "Set the password for a user in LLDAP")]
 pub struct CliOpts {
-    /// Base LLDAP url, e.g. "https://lldap/".
-    #[clap(short, long)]
+    #[clap(short, long, help = "Base LLDAP url, e.g. \"https://lldap/\"")]
     pub base_url: Url,
 
-    /// Admin username.
-    #[clap(long, default_value = "admin")]
+    #[clap(long, default_value = "admin", help = "Admin username")]
     pub admin_username: String,
 
-    /// Admin password.
-    #[clap(long)]
+    #[clap(long, help = "Admin password")]
     pub admin_password: Option<String>,
 
-    /// Connection token (JWT).
-    #[clap(short, long)]
+    #[clap(short, long, help = "Connection token (JWT)")]
     pub token: Option<String>,
 
-    /// Username.
-    #[clap(short, long)]
+    #[clap(short, long, help = "Username")]
     pub username: String,
 
-    /// New password for the user. Can also be passed as the environment variable LLDAP_USER_PASSWORD.
-    #[clap(short, long)]
+    #[clap(
+        short,
+        long,
+        help = "New password for the user. Can also be passed as the environment variable LLDAP_USER_PASSWORD"
+    )]
     pub password: Option<String>,
 
-    /// Bypass password requirements such as minimum length. Unsafe.
-    #[clap(long)]
+    #[clap(
+        long,
+        help = "Bypass password requirements such as minimum length. Unsafe"
+    )]
     pub bypass_password_policy: bool,
 }
 

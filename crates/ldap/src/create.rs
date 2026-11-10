@@ -209,6 +209,14 @@ async fn create_user(
     );
 
     let kerberossync_enabled = lldap_domain::types::kerberos_sync_enabled(&new_user_attributes);
+    let plain_password =
+        if let Some(password) = attributes.get("userpassword") {
+            Some(std::str::from_utf8(password).map_err(|_| {
+                constraint_violation("userPassword must be valid UTF-8".to_string())
+            })?)
+        } else {
+            None
+        };
     backend_handler
         .create_user(CreateUserRequest {
             user_id: user_id.clone(),
@@ -222,14 +230,14 @@ async fn create_user(
             message: format!("Could not create user: {e:#?}"),
         })?;
 
-    if let Some(password) = attributes.get("userpassword") {
-        crate::password::change_password(backend_handler, user_id.clone(), password)
+    if let Some(plain) = plain_password {
+        crate::password::change_password(backend_handler, user_id.clone(), plain.as_bytes())
             .await
             .map_err(|e| LdapError {
                 code: LdapResultCode::Other,
                 message: format!("Error while setting the password: {e:#?}"),
             })?;
-        if kerberossync_enabled && let Ok(plain) = std::str::from_utf8(password) {
+        if kerberossync_enabled {
             match kerberos_backend()
                 .sync_principal(user_id.as_str(), plain)
                 .await
@@ -338,6 +346,26 @@ mod tests {
                 LdapResultCode::Success,
                 String::new()
             )])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_create_user_rejects_non_utf8_password() {
+        let mock = MockTestBackendHandler::new();
+        let ldap_handler = setup_bound_admin_handler(mock).await;
+        let request = LdapAddRequest {
+            dn: "uid=bob,ou=people,dc=example,dc=com".to_owned(),
+            attributes: vec![LdapPartialAttribute {
+                atype: "userPassword".to_owned(),
+                vals: vec![vec![0xff, 0xfe]],
+            }],
+        };
+        assert_eq!(
+            ldap_handler.create_user_or_group(request).await,
+            Err(LdapError {
+                code: LdapResultCode::ConstraintViolation,
+                message: "userPassword must be valid UTF-8".to_string(),
+            })
         );
     }
 

@@ -83,6 +83,10 @@ async fn handle_password_modify<Handler: BackendHandler + OpaqueHandler>(
             ),
         });
     };
+    let plain_pass = std::str::from_utf8(value).map_err(|_| LdapError {
+        code: LdapResultCode::ConstraintViolation,
+        message: "userPassword must be valid UTF-8".to_string(),
+    })?;
     password::change_password(opaque_handler, user_id.clone(), value)
         .await
         .map_err(|e| LdapError {
@@ -90,16 +94,13 @@ async fn handle_password_modify<Handler: BackendHandler + OpaqueHandler>(
             message: format!("Error while changing the password: {e:#?}"),
         })?;
 
-    if let Ok(plain_pass) = std::str::from_utf8(value) {
-        let sync_enabled =
-            password::sync_kerberos_after_password_change(readable_handler, &user_id, plain_pass)
-                .await;
-        if let Err(e) = backend_handler
-            .ensure_kerberos_principal_consistency(&user_id, sync_enabled)
-            .await
-        {
-            warn!("Failed to record Kerberos principal name for {user_id}: {e}");
-        }
+    let sync_enabled =
+        password::sync_kerberos_after_password_change(readable_handler, &user_id, plain_pass).await;
+    if let Err(e) = backend_handler
+        .ensure_kerberos_principal_consistency(&user_id, sync_enabled)
+        .await
+    {
+        warn!("Failed to record Kerberos principal name for {user_id}: {e}");
     }
     Ok(())
 }
@@ -563,6 +564,30 @@ mod tests {
             make_modify_failure_response(
                 LdapResultCode::InvalidAttributeSyntax,
                 "Wrong number of values for password attribute: 2"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_modify_password_rejects_non_utf8() {
+        let mut mock = MockTestBackendHandler::new();
+        setup_default_ldap_mock(&mut mock);
+        let ldap_handler = setup_bound_admin_handler(mock).await;
+        let request = LdapModifyRequest {
+            dn: "uid=bob,ou=people,dc=example,dc=com".to_string(),
+            changes: vec![LdapModify {
+                operation: LdapModifyType::Replace,
+                modification: ldap3_proto::LdapPartialAttribute {
+                    atype: "userPassword".to_string(),
+                    vals: vec![vec![0xff, 0xfe]],
+                },
+            }],
+        };
+        assert_eq!(
+            ldap_handler.do_modify_request(&request).await,
+            make_modify_failure_response(
+                LdapResultCode::ConstraintViolation,
+                "userPassword must be valid UTF-8"
             )
         );
     }

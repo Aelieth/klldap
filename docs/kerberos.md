@@ -57,7 +57,8 @@ The KDC's master password is random and exists only as the stash file `.k5.<REAL
 - `kerberosSync` (attribute `kerberossync`, alias `kerberos_sync`) is a per-user switch
   that admins set. While it is on, every password set — web UI, `setUserPassword`, LDAP
   Modify `userPassword`, `ldappasswd`, LDAP ADD with `userPassword` — creates or updates
-  the principal. Turning it off deletes the principal; deleting the user deletes it too.
+  the principal. A password must be valid UTF-8 on every door. Turning it off deletes
+  the principal; deleting the user deletes it too.
 - Users in `lldap_disabled` have their principal disabled (`DISALLOW_ALL_TIX`), and a
   password sync while disabled leaves it disabled. Leaving the group re-enables it.
 - The read-only, admin-visible `krbPrincipalName` attribute shows the principal recorded

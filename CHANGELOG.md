@@ -20,6 +20,11 @@ yet. 0.7.4, 0.7.5 and 0.7.6 stay unreleased on their own branches.
   0.10, hmac 0.12 and digest 0.10 remain, pinned by `opaque-ke` 4, `rsa` 0.9, `jwt` 0.16 and
   `sqlx` 0.8; `sqlx` also keeps sha1 0.10 and md-5 0.10.
 
+### Fixed
+
+- LDAP Modify and ADD refuse a `userPassword` that is not valid UTF-8, with
+  `constraintViolation`. A refused ADD creates no user.
+
 ## [0.7.6] unreleased
 
 ### Organizational-unit policies

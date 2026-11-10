@@ -46,6 +46,11 @@ yet. 0.7.4, 0.7.5 and 0.7.6 stay unreleased on their own branches.
 - A password manager may call `setUserPassword` for a non-admin, the same rule as
   the LDAP password doors.
 
+### Performance
+
+- OPAQUE key stretching for a cleartext bind or a password set runs on the blocking
+  pool, at most four at once. Four at once is about 200 MB.
+
 ## [0.7.6] unreleased
 
 ### Organizational-unit policies

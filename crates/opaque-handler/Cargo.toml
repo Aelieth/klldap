@@ -12,6 +12,7 @@ rust-version.workspace = true
 [dependencies]
 async-trait = { workspace = true }
 rand = { workspace = true }
+tokio = { workspace = true }
 
 [dependencies.lldap_auth]
 path = "../auth"

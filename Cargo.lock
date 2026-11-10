@@ -3725,6 +3725,7 @@ dependencies = [
  "lldap_domain",
  "lldap_domain_model",
  "rand 0.8.6",
+ "tokio",
 ]
 
 [[package]]

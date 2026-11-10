@@ -67,6 +67,8 @@ Data storage:
   bootstrap and supervision (`kerberos_manager` binary), and the live `KerberosSync`.
 * `crates/keycloak`: the Keycloak admin client used by the Federation tab.
 * `crates/opaque-handler`: the OPAQUE registration ceremony.
+  Cleartext binds and password sets do their OPAQUE key stretching
+  on the blocking pool, at most four at once.
 * `crates/validation`, `crates/frontend-options`, `crates/test-utils`.
 * `migration-tool/`, `set-password/`: the upstream command-line tools.
 * `gate/`: the container gate suite (see [testing.md](testing.md)).

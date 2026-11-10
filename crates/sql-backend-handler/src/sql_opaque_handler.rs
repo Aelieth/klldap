@@ -13,39 +13,46 @@ use lldap_domain_model::{
     model::{self, UserColumn},
 };
 use lldap_mfa::{MFA_ENROLLMENT_REQUIRED, TOTP_CODE_REQUIRED, split_totp_suffix};
-use lldap_opaque_handler::{OpaqueHandler, login, registration};
+use lldap_opaque_handler::{OpaqueHandler, STRETCH_FAILED, login, registration, stretch};
 use sea_orm::{ActiveModelTrait, ActiveValue, EntityTrait, QuerySelect};
 use tracing::{debug, info, instrument, warn};
 
 type SqlOpaqueHandler = SqlBackendHandler;
 
 #[instrument(skip_all, level = "debug", err(level = "debug"), fields(username = %username.as_str()))]
-fn passwords_match(
+async fn passwords_match(
     password_file_bytes: &[u8],
     clear_password: &str,
     opaque_setup: &opaque::server::ServerSetup,
     username: &UserId,
 ) -> Result<()> {
-    use opaque::{client, server};
-    let mut rng = rand::rngs::OsRng;
-    let client_login_start_result = client::login::start_login(clear_password, &mut rng)?;
-
-    let password_file = server::ServerRegistration::deserialize(password_file_bytes)
-        .map_err(opaque::AuthenticationError::ProtocolError)?;
-    let server_login_start_result = server::login::start_login(
-        &mut rng,
-        opaque_setup,
-        Some(password_file),
-        client_login_start_result.message,
-        username,
-    )?;
-    client::login::finish_login(
-        client_login_start_result.state,
-        clear_password.as_bytes(),
-        server_login_start_result.message,
-        &mut rng,
-    )?;
-    Ok(())
+    let password_file_bytes = password_file_bytes.to_vec();
+    let clear_password = clear_password.to_owned();
+    let opaque_setup = opaque_setup.clone();
+    let username = username.clone();
+    stretch(move || {
+        use opaque::{client, server};
+        let mut rng = rand::rngs::OsRng;
+        let client_login_start_result = client::login::start_login(&clear_password, &mut rng)?;
+        let password_file = server::ServerRegistration::deserialize(&password_file_bytes)
+            .map_err(opaque::AuthenticationError::ProtocolError)?;
+        let server_login_start_result = server::login::start_login(
+            &mut rng,
+            &opaque_setup,
+            Some(password_file),
+            client_login_start_result.message,
+            &username,
+        )?;
+        client::login::finish_login(
+            client_login_start_result.state,
+            clear_password.as_bytes(),
+            server_login_start_result.message,
+            &mut rng,
+        )?;
+        Ok(())
+    })
+    .await
+    .map_err(|_| DomainError::InternalError(STRETCH_FAILED.to_string()))?
 }
 
 impl SqlBackendHandler {
@@ -134,7 +141,10 @@ impl LoginHandler for SqlBackendHandler {
             return Err(invalid_credentials(&name));
         };
         debug!(r#"Login attempt for "{}""#, &name);
-        if passwords_match(&password_hash, password, &self.opaque_setup, &name).is_err() {
+        if passwords_match(&password_hash, password, &self.opaque_setup, &name)
+            .await
+            .is_err()
+        {
             logging::record_as(
                 Some(&name),
                 LogKind::Bind,
@@ -463,6 +473,47 @@ mod tests {
             })
             .await
             .unwrap_err();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_bind_stretches_off_the_worker() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let sql_pool = get_initialized_db().await;
+        let handler = SqlOpaqueHandler::new(generate_random_private_key(), sql_pool);
+        insert_user(&handler, "bob", "bob00").await;
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticks_for_ticker = Arc::clone(&ticks);
+        let ticker = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(10));
+            loop {
+                interval.tick().await;
+                ticks_for_ticker.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        while ticks.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        let baseline = ticks.load(Ordering::SeqCst);
+        let bind = handler.bind(BindRequest {
+            name: UserId::new("bob"),
+            password: "bob00".to_string(),
+        });
+        tokio::pin!(bind);
+        tokio::select! {
+            _ = async {
+                loop {
+                    if ticks.load(Ordering::SeqCst) > baseline {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            } => {}
+            result = &mut bind => panic!("bind returned before the counter moved: {result:?}"),
+        }
+        bind.await.unwrap();
+        ticker.abort();
     }
 
     #[tokio::test]

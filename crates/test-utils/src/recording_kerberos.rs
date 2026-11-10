@@ -1,6 +1,9 @@
 use async_trait::async_trait;
+use lldap_domain::types::UserId;
 use lldap_domain_handlers::kerberos::{KerberosSync, NoopKerberos, set_kerberos_backend};
 use std::sync::{Arc, Mutex};
+
+pub const RECORDER_REALM: &str = "RECORDER.TEST";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KerberosOp {
@@ -28,28 +31,31 @@ impl RecordingKerberos {
 
 #[async_trait]
 impl KerberosSync for RecordingKerberos {
-    async fn sync_principal(&self, username: &str, password: &str) -> Result<(), String> {
+    fn realm(&self) -> &str {
+        RECORDER_REALM
+    }
+    async fn sync_principal(&self, user: &UserId, password: &str) -> Result<(), String> {
         self.ops
             .lock()
             .expect("ops")
             .push(KerberosOp::SyncPrincipal {
-                username: username.to_owned(),
+                username: user.as_str().to_owned(),
                 password: password.to_owned(),
             });
         Ok(())
     }
-    async fn delete_principal(&self, username: &str) -> Result<(), String> {
+    async fn delete_principal(&self, user: &UserId) -> Result<(), String> {
         self.ops
             .lock()
             .expect("ops")
             .push(KerberosOp::DeletePrincipal {
-                username: username.to_owned(),
+                username: user.as_str().to_owned(),
             });
         Ok(())
     }
-    async fn set_principal_enabled(&self, username: &str, enabled: bool) -> Result<(), String> {
+    async fn set_principal_enabled(&self, user: &UserId, enabled: bool) -> Result<(), String> {
         self.ops.lock().expect("ops").push(KerberosOp::SetEnabled {
-            username: username.to_owned(),
+            username: user.as_str().to_owned(),
             enabled,
         });
         Ok(())
@@ -83,7 +89,7 @@ impl RecordingGuard {
 
 impl Drop for RecordingGuard {
     fn drop(&mut self) {
-        set_kerberos_backend(Arc::new(NoopKerberos));
+        set_kerberos_backend(Arc::new(NoopKerberos::default()));
     }
 }
 
@@ -95,13 +101,16 @@ impl KerberosSync for NotReadyKerberos {
     fn ready(&self) -> bool {
         false
     }
-    async fn sync_principal(&self, _: &str, _: &str) -> Result<(), String> {
+    fn realm(&self) -> &str {
+        RECORDER_REALM
+    }
+    async fn sync_principal(&self, _: &UserId, _: &str) -> Result<(), String> {
         Err("KDC not ready".to_owned())
     }
-    async fn delete_principal(&self, _: &str) -> Result<(), String> {
+    async fn delete_principal(&self, _: &UserId) -> Result<(), String> {
         Err("KDC not ready".to_owned())
     }
-    async fn set_principal_enabled(&self, _: &str, _: bool) -> Result<(), String> {
+    async fn set_principal_enabled(&self, _: &UserId, _: bool) -> Result<(), String> {
         Err("KDC not ready".to_owned())
     }
     async fn export_keytab_for_keycloak(&self, _: &str) -> Result<String, String> {
@@ -120,6 +129,6 @@ impl NotReadyGuard {
 
 impl Drop for NotReadyGuard {
     fn drop(&mut self) {
-        set_kerberos_backend(Arc::new(NoopKerberos));
+        set_kerberos_backend(Arc::new(NoopKerberos::default()));
     }
 }

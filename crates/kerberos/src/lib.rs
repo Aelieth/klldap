@@ -13,8 +13,7 @@ pub mod manager;
 pub mod paths;
 
 pub use lldap_domain_handlers::kerberos::{
-    derive_domain_from_base_dn, derive_realm_from_base_dn, domain_from_base_dn, principal_name,
-    validate_kerberos_username, validate_keytab_hostname,
+    domain_from_base_dn, validate_kerberos_username, validate_keytab_hostname,
 };
 use paths::KerberosPaths;
 
@@ -36,9 +35,8 @@ fn admin_handle(realm: &str) -> Result<Kadm5Handle> {
     })
 }
 
-pub fn delete_kerberos_principal(username: &str) -> Result<()> {
+pub fn delete_kerberos_principal(username: &str, realm: &str) -> Result<()> {
     validate_kerberos_username(username).map_err(anyhow::Error::msg)?;
-    let realm = derive_realm_from_base_dn();
     let full_principal = format!("{username}@{realm}");
     info!(
         "Attempting to delete Kerberos principal via FFI: {}",
@@ -46,7 +44,7 @@ pub fn delete_kerberos_principal(username: &str) -> Result<()> {
     );
 
     // No admin handle: Kerberos is off or not bootstrapped; delete is a no-op.
-    let handle = match admin_handle(&realm) {
+    let handle = match admin_handle(realm) {
         Ok(handle) => handle,
         Err(e) => {
             info!(
@@ -61,10 +59,9 @@ pub fn delete_kerberos_principal(username: &str) -> Result<()> {
 }
 
 /// `enabled == false` sets DISALLOW_ALL_TIX; a missing admin handle is a no-op.
-pub fn set_kerberos_principal_enabled(username: &str, enabled: bool) -> Result<()> {
+pub fn set_kerberos_principal_enabled(username: &str, realm: &str, enabled: bool) -> Result<()> {
     validate_kerberos_username(username).map_err(anyhow::Error::msg)?;
-    let realm = derive_realm_from_base_dn();
-    let handle = match admin_handle(&realm) {
+    let handle = match admin_handle(realm) {
         Ok(handle) => handle,
         Err(e) => {
             info!(
@@ -77,18 +74,17 @@ pub fn set_kerberos_principal_enabled(username: &str, enabled: bool) -> Result<(
             return Ok(());
         }
     };
-    handle.set_principal_allow_tickets(username, &realm, enabled)
+    handle.set_principal_allow_tickets(username, realm, enabled)
 }
 
-pub fn sync_kerberos_principal(username: &str, plain_password: &str) -> Result<()> {
+pub fn sync_kerberos_principal(username: &str, realm: &str, plain_password: &str) -> Result<()> {
     validate_kerberos_username(username).map_err(anyhow::Error::msg)?;
-    let realm = derive_realm_from_base_dn();
     let full_principal = format!("{username}@{realm}");
     info!("Kerberos sync started for principal: {}", full_principal);
-    let handle = admin_handle(&realm)?;
+    let handle = admin_handle(realm)?;
 
     if handle
-        .chpass_principal(username, plain_password, &realm)
+        .chpass_principal(username, plain_password, realm)
         .is_ok()
     {
         info!(
@@ -100,7 +96,7 @@ pub fn sync_kerberos_principal(username: &str, plain_password: &str) -> Result<(
 
     warn!("Change password failed (likely principal does not exist), creating new principal...");
     handle
-        .create_principal(username, plain_password, &realm)
+        .create_principal(username, plain_password, realm)
         .context("while creating the Kerberos principal")?;
     info!(
         "✅ Kerberos principal created and password set for {}",
@@ -109,17 +105,20 @@ pub fn sync_kerberos_principal(username: &str, plain_password: &str) -> Result<(
     Ok(())
 }
 
-pub fn export_keytab_for_keycloak(hostname_input: &str) -> Result<String> {
-    let realm = derive_realm_from_base_dn();
+pub fn export_keytab_for_keycloak(
+    hostname_input: &str,
+    realm: &str,
+    domain: &str,
+) -> Result<String> {
     let hostname = match hostname_input.trim() {
-        "" | "keycloak" => format!("keycloak.{}", derive_domain_from_base_dn()),
+        "" | "keycloak" => format!("keycloak.{domain}"),
         hostname => hostname.to_owned(),
     };
     validate_keytab_hostname(&hostname).map_err(anyhow::Error::msg)?;
     let principal = format!("HTTP/{hostname}@{realm}");
     info!("Generating Keycloak keytab for principal: {}", principal);
     let paths = KerberosPaths::from_env();
-    let handle = admin_handle(&realm)?;
+    let handle = admin_handle(realm)?;
     let keytab_path = &paths.keycloak_keytab;
     if let Some(dir) = keytab_path.parent() {
         fs::create_dir_all(dir).with_context(|| format!("while creating {}", dir.display()))?;
@@ -163,16 +162,17 @@ mod tests {
 
     #[test]
     fn test_dangerous_inputs_are_rejected_before_kadmin() {
-        let err = sync_kerberos_principal("krbtgt", "secret")
+        let err = sync_kerberos_principal("krbtgt", "EXAMPLE.COM", "secret")
             .expect_err("krbtgt must never be synced")
             .to_string();
         assert!(
             err.contains("reserved"),
             "expected reserved-name error, got {err}"
         );
-        let err = export_keytab_for_keycloak("foo\ndelprinc admin/admin")
-            .expect_err("newline hostname must be rejected")
-            .to_string();
+        let err =
+            export_keytab_for_keycloak("foo\ndelprinc admin/admin", "EXAMPLE.COM", "example.com")
+                .expect_err("newline hostname must be rejected")
+                .to_string();
         assert!(
             err.contains("hostname") || err.contains("invalid"),
             "expected hostname validation error, got {err}"

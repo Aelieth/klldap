@@ -28,7 +28,7 @@ free_port() {
 KDC_PORT="${KDC_PORT:-$(free_port)}"
 KADMIN_PORT="${KADMIN_PORT:-$(free_port)}"
 KPASSWD_PORT="${KPASSWD_PORT:-$(free_port)}"
-REALM="${LLDAP_KERB_REALM_NAME:-SANDBOX.TEST}"
+REALM="${KLLDAP_TEST_REALM:-SANDBOX.TEST}"
 
 mkdir -p "$ROOT/kdc" "$ROOT/data"
 cat >"$ROOT/krb5.conf" <<CONF
@@ -98,7 +98,7 @@ export LLDAP_KERB_KRB5_CONF="$ROOT/krb5.conf"
 export LLDAP_KERB_KDC_CONF="$ROOT/kdc.conf"
 export LLDAP_KERB_KADM5_ACL="$ROOT/kdc/kadm5.acl"
 export LLDAP_KERB_KDC_PORT="$KDC_PORT"
-export LLDAP_KERB_REALM_NAME="$REALM"
+export KLLDAP_TEST_REALM="$REALM"
 export LLDAP_LDAP_BASE_DN="dc=sandbox,dc=test"
 export KLLDAP_TEST_KDC=1
 

@@ -20,6 +20,19 @@ yet. 0.7.4, 0.7.5 and 0.7.6 stay unreleased on their own branches.
   0.10, hmac 0.12 and digest 0.10 remain, pinned by `opaque-ke` 4, `rsa` 0.9, `jwt` 0.16 and
   `sqlx` 0.8; `sqlx` also keeps sha1 0.10 and md-5 0.10.
 
+### Configuration
+
+- New `[kerberos_options]` section (`LLDAP_KERBEROS_OPTIONS__*`): `enabled`, `realm`,
+  `ticket_lifetime`, `renew_lifetime`, `forwardable`. Durations are checked at startup.
+- `kerberos_options.enabled` replaces `healthcheck_options.kerberos`
+  (`LLDAP_HEALTHCHECK_OPTIONS__KERBEROS`) and the `healthcheck --kerberos` flag
+  (`LLDAP_KERBEROS_HEALTHCHECK`), which are removed: it gates the Kerberos sync, makes
+  directory writes wait for the KDC after boot, and adds the KDC to the healthcheck. A compose
+  file that overrides the healthcheck with `--kerberos` must drop the flag.
+- `LLDAP_KERB_REALM_NAME` is removed; use `kerberos_options.realm`. It now warns as unknown.
+- The server writes the realm, base DN and ticket settings to `/data/kerberos_config.toml`
+  at every boot for the KDC bootstrap; hand edits to that file are overwritten.
+
 ### Fixed
 
 - LDAP Modify and ADD refuse a `userPassword` that is not valid UTF-8, with

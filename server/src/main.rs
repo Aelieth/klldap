@@ -38,9 +38,13 @@ use tracing::{Instrument, Level, debug, error, info, instrument, span, warn};
 
 use lldap_domain::requests::{CreateGroupRequest, CreateUserRequest};
 use lldap_domain::types::{Attribute, BUILTIN_GROUPS};
-use lldap_domain_handlers::kerberos::set_kerberos_backend;
+use lldap_domain_handlers::kerberos::{NoopKerberos, domain_from_base_dn, set_kerberos_backend};
 use lldap_domain_handlers::logging::{LogKind, record};
-use lldap_kerberos::{live::LiveKerberos, paths::KerberosPaths};
+use lldap_kerberos::{
+    live::LiveKerberos,
+    manager::{ServerSettings, write_server_settings},
+    paths::KerberosPaths,
+};
 
 use lldap_domain_handlers::handler::{
     GroupBackendHandler, GroupListerBackendHandler, GroupRequestFilter, MfaBackendHandler,
@@ -175,6 +179,8 @@ async fn set_up_server(
     config: Configuration,
     sql_pool: DatabaseConnection,
 ) -> Result<ServerBuilder> {
+    let realm = config.kerberos_realm();
+    set_kerberos_backend(Arc::new(NoopKerberos::new(realm.clone())));
     let private_key_info = config.get_private_key_info();
     let force_update_private_key = config.force_update_private_key;
     let key_rotated = match (
@@ -282,11 +288,25 @@ async fn set_up_server(
             "Restart the server without --force-update-private-key or --force-ldap-user-pass-reset to continue."
         );
     }
-    // The KDC boots after the server, so the guard on directory writes must not see the
-    // built-in group and admin creation above.
-    set_kerberos_backend(Arc::new(LiveKerberos::new(
-        config.healthcheck_options.kerberos,
-    )));
+    if config.kerberos_options.enabled {
+        write_server_settings(
+            &KerberosPaths::from_env().kerberos_config,
+            &ServerSettings {
+                realm: realm.clone(),
+                base_dn: config.ldap_base_dn.clone(),
+                ticket_lifetime: config.kerberos_options.ticket_lifetime.clone(),
+                renew_lifetime: config.kerberos_options.renew_lifetime.clone(),
+                forwardable: config.kerberos_options.forwardable,
+            },
+        )
+        .context("while writing the Kerberos settings for kerberos_manager")?;
+        // The KDC boots after the server, so the guard on directory writes must not see the
+        // built-in group and admin creation above.
+        set_kerberos_backend(Arc::new(LiveKerberos::new(
+            &realm,
+            &domain_from_base_dn(&config.ldap_base_dn),
+        )));
+    }
     let server_builder = ldap_server::build_ldap_server(
         &config,
         backend_handler.clone(),
@@ -360,7 +380,7 @@ async fn run_healthcheck(opts: RunOpts) -> Result<()> {
     let delay = Duration::from_millis(3000);
     let paths = KerberosPaths::from_env();
     let kerberos = async {
-        if config.healthcheck_options.kerberos {
+        if config.kerberos_options.enabled {
             healthcheck::check_kerberos(
                 &config.healthcheck_options.ldap_host,
                 paths.kdc_port,

@@ -44,7 +44,7 @@ Environment=LLDAP_LDAP_USER_PASS_FILE=/run/secrets/lldap-ldap-user-pass
 
 
 # health check (the KDC bootstraps after the server is up, hence the start period)
-HealthCmd=/app/lldap healthcheck --config-file /data/lldap_config.toml --kerberos
+HealthCmd=/app/lldap healthcheck --config-file /data/lldap_config.toml
 HealthInterval=30s
 HealthRetries=3
 HealthStartPeriod=90s

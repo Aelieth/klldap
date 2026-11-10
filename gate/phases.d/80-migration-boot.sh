@@ -72,7 +72,7 @@ else
         # The KDC bootstraps after LLDAP is healthy; wait for the Kerberos leg too.
         for _ in $(seq 1 90); do
             if docker exec "$MIG_CONTAINER" /app/lldap healthcheck \
-                --config-file /data/lldap_config.toml --kerberos >/dev/null 2>&1; then
+                --config-file /data/lldap_config.toml >/dev/null 2>&1; then
                 break
             fi
             sleep 1

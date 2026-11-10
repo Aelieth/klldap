@@ -8,17 +8,17 @@ and principals follow the users.
 ## Realm
 
 The realm is the base DN's `dc` components, joined and uppercased: `dc=example,dc=com`
-gives realm `EXAMPLE.COM` and domain `example.com`. `LLDAP_KERB_REALM_NAME` overrides the
-realm. Principals are `<user id>@REALM`.
+gives realm `EXAMPLE.COM` and domain `example.com`. `kerberos_options.realm`
+(`LLDAP_KERBEROS_OPTIONS__REALM`) overrides the realm. Principals are `<user id>@REALM`.
 
 ## Bootstrap
 
 The entrypoint starts the server, waits until it is healthy, then runs
 `kerberos_manager`, which:
 
-1. copies `/app/kerberos_config.template.toml` to `/data/kerberos_config.toml` on first
-   run and reads it (`ticket_lifetime`, `renew_lifetime`, `forwardable`, `rdns`; the
-   realm and base DN come from the environment),
+1. reads `/data/kerberos_config.toml`, which the server rewrites at every boot from
+   `[kerberos_options]` (realm, base DN, `ticket_lifetime`, `renew_lifetime`,
+   `forwardable`; hand edits are overwritten),
 2. renders `/etc/krb5.conf`, `/var/kerberos/krb5kdc/kdc.conf` and
    `/var/kerberos/krb5kdc/kadm5.acl` from the templates in `/app`,
 3. creates the KDC database (`kdb5_util create -s`) with a random master password that
@@ -38,15 +38,15 @@ missing keytab is recreated from the surviving database (`/data` and
 overwritten on restart; it is checked for the `admin/admin@REALM *` grant and repaired
 (or restored from the template when unparsable), so extra grants survive.
 
-The container's healthcheck runs `lldap healthcheck --kerberos`: the KDC port must
-accept connections and the admin keytab must exist, otherwise the container reports
-unhealthy. The image also sets `LLDAP_HEALTHCHECK_OPTIONS__KERBEROS=true`, which tells
-the server that a KDC is part of the deployment: **directory writes (users, groups,
+The image sets `LLDAP_KERBEROS_OPTIONS__ENABLED=true`, which tells the server that a KDC is
+part of the deployment. The container's healthcheck (`lldap healthcheck`) then also requires
+the KDC port to accept connections and the admin keytab to exist, otherwise the container
+reports unhealthy, and **directory writes (users, groups,
 passwords, attributes, settings) are refused with "Kerberos KDC unavailable" until the KDC
 has answered once after boot**, so nothing changes that the KDC could not follow. Logins
 and reads are never gated, and a KDC that dies later does not block writes — that is the
-healthcheck's job. Outside the image (no KDC), leave the option unset and writes never
-wait.
+healthcheck's job. Outside the image (no KDC), leave the option unset: writes never wait
+and no principals are synced.
 
 The KDC's master password is random and exists only as the stash file `.k5.<REALM>` in
 `/var/kerberos/krb5kdc`, next to the database it unlocks; `kadmin.local` and `kdb5_util`
@@ -87,11 +87,22 @@ Java accepts). Mount `/data/keytab` read-only into Keycloak; **Push To Keycloak*
 a realm with KLLDAP as an LDAP + Kerberos user-federation provider. See
 [the SSSD guide, section 7](SSSD_LDAP_Kerberos_Setup_Guide.md#7-keycloak-integration--spnego-sso).
 
-## Environment
+## Configuration
+
+`[kerberos_options]` in `lldap_config.toml`, or `LLDAP_KERBEROS_OPTIONS__<NAME>`:
+
+| Option | Default |
+|---|---|
+| `enabled` | `false` (`true` in the image) |
+| `realm` | derived from the base DN |
+| `ticket_lifetime` / `renew_lifetime` | `24h` / `7d` |
+| `forwardable` | `true` |
+
+File locations and the KDC port are still read from the environment by the KDC bootstrap
+and the server:
 
 | Variable | Default |
 |---|---|
-| `LLDAP_KERB_REALM_NAME` | derived from the base DN |
 | `LLDAP_KERB_CONFIG` / `LLDAP_KERB_CONFIG_TEMPLATE` | `/data/kerberos_config.toml` / `/app/kerberos_config.template.toml` |
 | `LLDAP_KERB_KRB5_CONF` / `LLDAP_KERB_KRB5_TEMPLATE` | `/etc/krb5.conf` / `/app/krb5.template.conf` |
 | `LLDAP_KERB_KDC_CONF` / `LLDAP_KERB_KDC_TEMPLATE` | `/var/kerberos/krb5kdc/kdc.conf` / `/app/kdc.template.conf` |

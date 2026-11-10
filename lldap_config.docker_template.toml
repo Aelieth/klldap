@@ -189,9 +189,25 @@ key_seed = "RanD0m STR1ng"
 ## If "ldap_host" is set to a specific IP address, this must be set to match if the built-in
 ## healthcheck command is used.
 #ldap_host = "localhost"
-## Also require the Kerberos KDC to accept connections and the admin keytab to exist.
-## The image's HEALTHCHECK passes --kerberos on the command line, which has the same effect.
-#kerberos = false
+
+## Options for the Kerberos realm that runs beside the directory.
+## To set these options from environment variables, use the following format
+## (example with realm): LLDAP_KERBEROS_OPTIONS__REALM
+[kerberos_options]
+## Run Kerberos with the directory: directory writes wait for the KDC after boot, users with
+## kerberossync get principals, and the healthcheck also requires the KDC and the admin
+## keytab. The image sets this to true.
+#enabled = false
+## The realm. Defaults to the domain of ldap_base_dn, uppercased (dc=example,dc=com gives
+## EXAMPLE.COM).
+#realm = "EXAMPLE.COM"
+## Ticket lifetimes, as Kerberos durations ("24h", "7d", "1d 12h").
+#ticket_lifetime = "24h"
+#renew_lifetime = "7d"
+## Issue forwardable tickets.
+#forwardable = true
+## The server writes these settings to /data/kerberos_config.toml at every boot for the KDC
+## bootstrap; edits made to that file by hand are overwritten.
 
 ## Options to configure the event log.
 ## To set these options from environment variables, use the following format
@@ -208,9 +224,6 @@ key_seed = "RanD0m STR1ng"
 ## service accounts that bind constantly do not fill max_entries. 0 stores every bind.
 #bind_coalesce_seconds = 300
 
-## Kerberos and Keycloak are configured outside this file:
-##  - the realm comes from ldap_base_dn (LLDAP_KERB_REALM_NAME overrides it) and the
-##    ticket settings from /data/kerberos_config.toml (see docs/kerberos.md);
-##  - Keycloak federation settings are written by the Federation tab to
-##    /data/keycloak_config.toml (LLDAP_KEYCLOAK_CONFIG); the admin password is
-##    LLDAP_KEYCLOAK_ADMIN_PASS.
+## Keycloak is configured outside this file: the Federation tab writes its settings to
+## /data/keycloak_config.toml (LLDAP_KEYCLOAK_CONFIG); the admin password is
+## LLDAP_KEYCLOAK_ADMIN_PASS.

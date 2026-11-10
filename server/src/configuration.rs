@@ -16,7 +16,8 @@ use lldap_auth::opaque::{
     server::{ServerSetup, generate_random_private_key},
 };
 use lldap_domain::types::{AttributeName, UserId};
-use lldap_domain_handlers::mfa::MfaPolicy;
+use lldap_domain_handlers::{kerberos::realm_from, mfa::MfaPolicy};
+use lldap_kerberos::paths::ENV_KEYS;
 use lldap_sql_backend_handler::sql_tables::{
     ConfigLocation, PrivateKeyHash, PrivateKeyInfo, PrivateKeyLocation,
 };
@@ -91,13 +92,49 @@ pub struct HealthcheckOptions {
     pub http_host: String,
     #[builder(default = r#"String::from("localhost")"#)]
     pub ldap_host: String,
-    #[builder(default = "false")]
-    pub kerberos: bool,
 }
 
 impl std::default::Default for HealthcheckOptions {
     fn default() -> Self {
         HealthcheckOptionsBuilder::default().build().unwrap()
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, derive_builder::Builder)]
+#[builder(pattern = "owned")]
+pub struct KerberosOptions {
+    #[builder(default = "false")]
+    pub enabled: bool,
+    #[builder(default)]
+    pub realm: Option<String>,
+    #[builder(default = r#"String::from("24h")"#)]
+    pub ticket_lifetime: String,
+    #[builder(default = r#"String::from("7d")"#)]
+    pub renew_lifetime: String,
+    #[builder(default = "true")]
+    pub forwardable: bool,
+}
+
+impl std::default::Default for KerberosOptions {
+    fn default() -> Self {
+        KerberosOptionsBuilder::default().build().unwrap()
+    }
+}
+
+impl KerberosOptions {
+    fn check_durations(&self) -> Result<()> {
+        for (name, value) in [
+            ("ticket_lifetime", &self.ticket_lifetime),
+            ("renew_lifetime", &self.renew_lifetime),
+        ] {
+            if !krb5_types::deltat::parse(value).is_ok_and(|seconds| seconds > 0) {
+                bail!(
+                    "kerberos_options.{name} = {value:?} is not a positive Kerberos duration \
+                     such as \"24h\" or \"7d\""
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -178,6 +215,8 @@ pub struct Configuration {
     #[builder(default)]
     pub healthcheck_options: HealthcheckOptions,
     #[builder(default)]
+    pub kerberos_options: KerberosOptions,
+    #[builder(default)]
     pub log_options: LogOptions,
 }
 
@@ -221,6 +260,10 @@ impl Configuration {
 
     pub fn get_server_keys(&self) -> &KeyPair {
         self.get_server_setup().keypair()
+    }
+
+    pub fn kerberos_realm(&self) -> String {
+        realm_from(self.kerberos_options.realm.as_deref(), &self.ldap_base_dn)
     }
 
     pub fn mfa_policy(&self) -> MfaPolicy {
@@ -604,10 +647,6 @@ impl ConfigOverrider for HealthcheckOpts {
         self.healthcheck_ldap_host
             .as_ref()
             .inspect(|host| config.healthcheck_options.ldap_host.clone_from(host));
-
-        if self.healthcheck_kerberos {
-            config.healthcheck_options.kerberos = true;
-        }
     }
 }
 
@@ -658,7 +697,6 @@ fn expected_keys(dict: &figment::value::Dict) -> HashSet<String> {
     // CLI-only values.
     keys.insert("LLDAP_CONFIG_FILE".to_string());
     keys.insert("LLDAP_TEST_EMAIL_TO".to_string());
-    keys.insert("LLDAP_KERBEROS_HEALTHCHECK".to_string());
     // Container knobs read by the entrypoint.
     keys.insert("LLDAP_UID".to_string());
     keys.insert("LLDAP_GID".to_string());
@@ -683,11 +721,11 @@ fn check_for_unexpected_env_variables<P: Provider>(env_variable_provider: P) {
         .data()
         .unwrap()[&Profile::default()],
     );
-    // LLDAP_KERB_* and LLDAP_KEYCLOAK_* belong to the kerberos and keycloak crates.
+    // The KDC's file paths and LLDAP_KEYCLOAK_* are read by the kerberos and keycloak crates.
     extract_keys(&env_variable_provider.data().unwrap()[&Profile::default()])
         .iter()
         .filter(|k| !expected_keys.contains(k.as_str()))
-        .filter(|k| !k.starts_with("LLDAP_KERB_") && !k.starts_with("LLDAP_KEYCLOAK_"))
+        .filter(|k| !ENV_KEYS.contains(&k.as_str()) && !k.starts_with("LLDAP_KEYCLOAK_"))
         .for_each(|k| {
             eprintln!("WARNING: Unknown environment variable: {k}");
         });
@@ -756,6 +794,7 @@ where
     let mut config: Configuration = figment_config.extract()?;
 
     overrides.override_config(&mut config);
+    config.kerberos_options.check_durations()?;
     if config.verbose {
         println!("Configuration: {:#?}", config);
     }
@@ -1047,6 +1086,60 @@ mod tests {
 
     // Defaults, then the file, then the environment, then the CLI, for both the log
     // options and the MFA knob in one ladder: the two override paths do not interfere.
+    #[test]
+    fn test_kerberos_options_from_env() {
+        type Expected = Result<(bool, &'static str, &'static str), &'static str>;
+        let rows: [(&[(&str, &str)], Expected); 5] = [
+            (&[], Ok((false, "EXAMPLE.COM", "24h"))),
+            (
+                &[
+                    ("LLDAP_KERBEROS_OPTIONS__ENABLED", "true"),
+                    ("LLDAP_KERBEROS_OPTIONS__REALM", "corp.example"),
+                ],
+                Ok((true, "CORP.EXAMPLE", "24h")),
+            ),
+            (
+                &[("LLDAP_KERBEROS_OPTIONS__TICKET_LIFETIME", "10h")],
+                Ok((false, "EXAMPLE.COM", "10h")),
+            ),
+            (
+                &[("LLDAP_KERBEROS_OPTIONS__TICKET_LIFETIME", "forever")],
+                Err("ticket_lifetime"),
+            ),
+            (
+                &[("LLDAP_KERBEROS_OPTIONS__RENEW_LIFETIME", "-1d")],
+                Err("renew_lifetime"),
+            ),
+        ];
+        for (env, expected) in rows {
+            Jail::expect_with(|jail| {
+                jail.clear_env();
+                jail.set_env("LLDAP_JWT_SECRET", "secret");
+                for (key, value) in env {
+                    jail.set_env(key, value);
+                }
+                let loaded = init(default_run_opts()).map(|config| {
+                    let options = &config.kerberos_options;
+                    (
+                        options.enabled,
+                        config.kerberos_realm(),
+                        options.ticket_lifetime.clone(),
+                    )
+                });
+                match (loaded, expected) {
+                    (Ok(got), Ok((enabled, realm, lifetime))) => assert_eq!(
+                        got,
+                        (enabled, realm.to_owned(), lifetime.to_owned()),
+                        "{env:?}"
+                    ),
+                    (Err(e), Err(field)) => assert!(e.to_string().contains(field), "{env:?}: {e}"),
+                    (loaded, _) => panic!("{env:?}: unexpected {loaded:?}"),
+                }
+                Ok(())
+            });
+        }
+    }
+
     #[test]
     fn test_config_precedence_defaults_file_env_cli() {
         Jail::expect_with(|jail| {

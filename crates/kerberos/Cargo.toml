@@ -26,6 +26,9 @@ tokio = { workspace = true }
 toml = "0.8"
 tracing = { workspace = true }
 
+[dependencies.lldap_domain]
+path = "../domain"
+
 [dependencies.lldap_domain_handlers]
 path = "../domain-handlers"
 
@@ -40,9 +43,6 @@ path = "src/bin/kerberos_manager.rs"
 [dev-dependencies]
 pretty_assertions = { workspace = true }
 serial_test = { workspace = true }
-
-[dev-dependencies.lldap_domain]
-path = "../domain"
 
 [dev-dependencies.lldap_test_utils]
 path = "../test-utils"

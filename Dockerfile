@@ -131,17 +131,17 @@ EXPOSE 3890 17170 88/tcp 88/udp 749/tcp
 ENV UID=1000 GID=1000 LLDAP_UID=1000 LLDAP_GID=1000
 # The KDC is part of this image: the healthcheck covers it and directory writes wait for it
 # to come up after boot.
-ENV LLDAP_HEALTHCHECK_OPTIONS__KERBEROS=true
+ENV LLDAP_KERBEROS_OPTIONS__ENABLED=true
 
 # Entry & health — pass --config-file explicitly (like upstream LLDAP) so the prepared
 # /data/lldap_config.toml (with key_seed, database_url pointing at the volume, etc.) is
-# always used for both the long-lived server and healthchecks. The --kerberos leg makes
-# a dead KDC (or missing admin keytab) turn the container unhealthy; the start period
-# covers LLDAP boot + KDC bootstrap on first run.
+# always used for both the long-lived server and healthchecks. With kerberos_options
+# enabled, a dead KDC (or missing admin keytab) turns the container unhealthy; the start
+# period covers LLDAP boot + KDC bootstrap on first run.
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["run", "--config-file", "/data/lldap_config.toml"]
 HEALTHCHECK --start-period=90s --interval=30s --retries=3 \
-    CMD ["/app/lldap", "healthcheck", "--config-file", "/data/lldap_config.toml", "--kerberos"]
+    CMD ["/app/lldap", "healthcheck", "--config-file", "/data/lldap_config.toml"]
 
 ARG VERSION=dev
 LABEL maintainer="Aelieth <https://github.com/Aelieth>" \

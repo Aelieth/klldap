@@ -1,7 +1,7 @@
 ## Installing the quadlet lldap user service
 
 These quadlets are upstream LLDAP's, adapted to the KLLDAP image (two volumes, the
-Kerberos ports and the `--kerberos` healthcheck). KLLDAP under rootless Podman is
+Kerberos ports and the healthcheck's Kerberos leg). KLLDAP under rootless Podman is
 **untested**: the container runs its KDC bootstrap as root inside its user namespace,
 which Podman provides, but nobody has confirmed the result yet — please report what you
 find.

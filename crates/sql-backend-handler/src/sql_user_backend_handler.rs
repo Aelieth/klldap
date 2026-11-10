@@ -16,7 +16,7 @@ use lldap_domain_handlers::handler::{
     UserBackendHandler, UserListerBackendHandler, UserRequestFilter,
 };
 use lldap_domain_handlers::kerberos::{
-    kerberos_backend, principal_name, require_kdc_ready, validate_directory_username,
+    kerberos_backend, require_kdc_ready, validate_directory_username,
 };
 use lldap_domain_handlers::logging::{self, LogKind};
 use lldap_domain_model::{
@@ -451,7 +451,7 @@ impl SqlBackendHandler {
             return; // no KLLDAP-managed principal to touch
         }
         if let Err(e) = kerberos_backend()
-            .set_principal_enabled(user_id.as_str(), !disabled)
+            .set_principal_enabled(user_id, !disabled)
             .await
         {
             tracing::warn!(
@@ -643,9 +643,7 @@ impl UserBackendHandler for SqlBackendHandler {
             .await?;
         logging::record(LogKind::UserUpdate, Some(user_id.as_str()), Some(&changes));
         // KDC side effects run after commit so a rollback cannot orphan a deleted principal.
-        if delete_principal
-            && let Err(e) = kerberos_backend().delete_principal(user_id.as_str()).await
-        {
+        if delete_principal && let Err(e) = kerberos_backend().delete_principal(&user_id).await {
             tracing::warn!(
                 "Failed to delete Kerberos principal for user {} when disabling sync: {}",
                 user_id,
@@ -676,7 +674,7 @@ impl UserBackendHandler for SqlBackendHandler {
             }
         }
         // Removed before the row delete, and idempotent, so a missing principal is fine.
-        if let Err(e) = kerberos_backend().delete_principal(user_id.as_str()).await {
+        if let Err(e) = kerberos_backend().delete_principal(user_id).await {
             tracing::warn!(
                 "Failed to delete Kerberos principal for user {} during deletion (non-fatal): {}",
                 user_id,
@@ -842,7 +840,7 @@ impl UserBackendHandler for SqlBackendHandler {
         let now = Utc::now().naive_utc();
 
         if enabled {
-            let principal = principal_name(user_id.as_str());
+            let principal = kerberos_backend().principal_name(user_id);
             tracing::info!(
                 "Kerberos sync succeeded → injecting protected krbPrincipalName = {} for user {}",
                 principal,
@@ -889,7 +887,7 @@ mod tests {
     use lldap_domain::types::Attribute;
     use lldap_domain_handlers::handler::SubStringFilter;
     use lldap_domain_model::model::UserColumn;
-    use lldap_test_utils::recording_kerberos::{KerberosOp, RecordingGuard};
+    use lldap_test_utils::recording_kerberos::{KerberosOp, RECORDER_REALM, RecordingGuard};
     use pretty_assertions::{assert_eq, assert_ne};
     use serial_test::serial;
 
@@ -1683,6 +1681,21 @@ mod tests {
             })
             .await
             .unwrap();
+        fixture
+            .handler
+            .ensure_kerberos_principal_consistency(&UserId::new("ksync"), true)
+            .await
+            .unwrap();
+        assert_eq!(
+            fixture
+                .handler
+                .get_user_details(&UserId::new("ksync"))
+                .await
+                .unwrap()
+                .krb_principal_name,
+            Some(format!("ksync@{RECORDER_REALM}")),
+            "the principal is named by the registered backend, not the environment"
+        );
         let disabled_gid = fixture
             .handler
             .create_group(CreateGroupRequest {

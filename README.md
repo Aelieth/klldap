@@ -115,9 +115,9 @@ read from a file instead by appending `_FILE` to the variable name
 | `LLDAP_ENABLE_MFA` | `false` | TOTP second factor: `true` for users who enroll, `always` for everyone (`lldap_mfa_disabled` members exempt), see [docs/mfa.md](docs/mfa.md) |
 | `LLDAP_LDAPS_OPTIONS__ENABLED` / `__PORT` / `__CERT_FILE` / `__KEY_FILE` | `false` / `6360` | LDAPS |
 | `LLDAP_SMTP_OPTIONS__ENABLE_PASSWORD_RESET`, `__SERVER`, `__PORT`, `__SMTP_ENCRYPTION`, `__USER`, `__PASSWORD`, `__FROM`, `__REPLY_TO` | off | Password-reset mail |
-| `LLDAP_HEALTHCHECK_OPTIONS__HTTP_HOST` / `__LDAP_HOST` / `__KERBEROS` | `localhost` / `false` (`true` in the image) | What `lldap healthcheck` probes; `__KERBEROS` also makes directory writes wait for the KDC after boot |
+| `LLDAP_HEALTHCHECK_OPTIONS__HTTP_HOST` / `__LDAP_HOST` | `localhost` | What `lldap healthcheck` probes |
 | `LLDAP_LOG_OPTIONS__PERSIST` / `__RETENTION_DAYS` / `__MAX_ENTRIES` / `__BIND_COALESCE_SECONDS` | `true` / `30` / `50000` / `300` | Persistent event log (logins, binds, directory changes, denials) in the `logs` table, see [docs/logging.md](docs/logging.md); `0` removes an age or size limit; the trim also runs with `PERSIST=false`; repeated successful binds are stored once per coalescing window (`0` stores all) |
-| `LLDAP_KERB_REALM_NAME` | derived | Kerberos realm override |
+| `LLDAP_KERBEROS_OPTIONS__ENABLED` / `__REALM` / `__TICKET_LIFETIME` / `__RENEW_LIFETIME` / `__FORWARDABLE` | `false` (`true` in the image) / from the base DN / `24h` / `7d` / `true` | Kerberos beside the directory: when enabled, directory writes wait for the KDC after boot and the healthcheck also requires it, see [docs/kerberos.md](docs/kerberos.md) |
 | `LLDAP_KERB_ADMIN_KEYTAB`, `_CONFIG`, `_KRB5_CONF`, `_KDC_CONF`, `_KADM5_ACL`, `_KDC_DIR`, `_KEYCLOAK_KEYTAB`, `_KDC_PORT` (+ `_*_TEMPLATE`) | container layout | Kerberos file locations and KDC port, see [docs/kerberos.md](docs/kerberos.md) |
 | `LLDAP_KEYCLOAK_ADMIN_PASS` | `admin` | Keycloak admin password used by the Federation tab |
 | `LLDAP_KEYCLOAK_CONFIG` | `/data/keycloak_config.toml` | Where the Federation tab stores URL, realm and admin user |

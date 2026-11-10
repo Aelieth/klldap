@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use lldap_domain_handlers::kerberos::{derive_domain_from_base_dn, derive_realm_from_base_dn};
+use lldap_domain_handlers::kerberos::{domain_from_base_dn, kerberos_backend};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::path::PathBuf;
@@ -11,6 +11,10 @@ pub struct KeycloakConfig {
     pub url: String,
     pub realm: String,
     pub admin_user: String,
+}
+
+pub(crate) fn base_dn_from_env() -> String {
+    env::var("LLDAP_LDAP_BASE_DN").unwrap_or_else(|_| "dc=example,dc=com".to_owned())
 }
 
 impl KeycloakConfig {
@@ -26,9 +30,9 @@ impl KeycloakConfig {
         Self {
             url: format!(
                 "http://{SUGGESTED_HOSTNAME}.{}",
-                derive_domain_from_base_dn()
+                domain_from_base_dn(&base_dn_from_env())
             ),
-            realm: derive_realm_from_base_dn().to_lowercase(),
+            realm: kerberos_backend().realm().to_lowercase(),
             admin_user: "admin".to_owned(),
         }
     }

@@ -200,7 +200,7 @@ wait_kerberos_healthy() {
     local limit="${1:-90}" i=0
     while [ "$i" -lt "$limit" ]; do
         if docker exec "$CONTAINER" /app/lldap healthcheck \
-            --config-file /data/lldap_config.toml --kerberos >/dev/null 2>&1; then
+            --config-file /data/lldap_config.toml >/dev/null 2>&1; then
             return 0
         fi
         sleep 1

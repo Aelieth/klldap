@@ -10,7 +10,8 @@ model:
 
 Placeholders used below: realm `EXAMPLE.COM`, base DN `dc=example,dc=com`, KLLDAP host
 `192.0.2.10`. Replace them with yours; the realm is derived from your base DN
-(`dc=example,dc=com` → `EXAMPLE.COM`) unless `LLDAP_KERB_REALM_NAME` overrides it.
+(`dc=example,dc=com` → `EXAMPLE.COM`) unless `kerberos_options.realm`
+(`LLDAP_KERBEROS_OPTIONS__REALM`) overrides it.
 
 ---
 

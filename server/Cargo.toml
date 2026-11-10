@@ -36,6 +36,7 @@ futures-util = "0"
 hmac = "0.12"
 juniper = { workspace = true }
 jwt = { workspace = true }
+krb5-types = { workspace = true }
 ldap3_proto = { workspace = true }
 lettre = { version = "0.11.19", features = ["builder", "serde", "smtp-transport", "tokio1-rustls-tls"], default-features = false }
 log = { workspace = true }

@@ -20,7 +20,7 @@ docker run -d --name "$UID_CONTAINER" --network "$NET" \
 uid_healthy=""
 for _ in $(seq 1 120); do
     if docker exec "$UID_CONTAINER" /app/lldap healthcheck \
-        --config-file /data/lldap_config.toml --kerberos >/dev/null 2>&1; then
+        --config-file /data/lldap_config.toml >/dev/null 2>&1; then
         uid_healthy=1
         break
     fi

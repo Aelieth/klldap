@@ -44,7 +44,7 @@ for _ in $(seq 1 60); do
     # Also pass --config-file so we reliably load the /data copy (with key_seed etc.),
     # matching upstream LLDAP docker CMD + HEALTHCHECK behavior.
     # The KDC starts after this loop, so this probe must not require it.
-    if LLDAP_HEALTHCHECK_OPTIONS__KERBEROS=false gosu "${LLDAP_UID}:${LLDAP_GID}" /app/lldap healthcheck --config-file "$CONFIG_FILE" >/dev/null 2>&1; then
+    if LLDAP_KERBEROS_OPTIONS__ENABLED=false gosu "${LLDAP_UID}:${LLDAP_GID}" /app/lldap healthcheck --config-file "$CONFIG_FILE" >/dev/null 2>&1; then
         echo "LLDAP is ready!"
         ready=1
         break

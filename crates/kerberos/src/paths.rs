@@ -36,6 +36,21 @@ impl Default for KerberosPaths {
     }
 }
 
+pub const ENV_KEYS: [&str; 12] = [
+    "LLDAP_KERB_ADMIN_KEYTAB",
+    "LLDAP_KERB_CONFIG",
+    "LLDAP_KERB_CONFIG_TEMPLATE",
+    "LLDAP_KERB_KRB5_CONF",
+    "LLDAP_KERB_KRB5_TEMPLATE",
+    "LLDAP_KERB_KDC_CONF",
+    "LLDAP_KERB_KDC_TEMPLATE",
+    "LLDAP_KERB_KADM5_ACL",
+    "LLDAP_KERB_KADM5_ACL_TEMPLATE",
+    "LLDAP_KERB_KDC_DIR",
+    "LLDAP_KERB_KEYCLOAK_KEYTAB",
+    "LLDAP_KERB_KDC_PORT",
+];
+
 impl KerberosPaths {
     pub fn from_env() -> Self {
         Self::from_lookup(|key| env::var(key).ok())
@@ -81,8 +96,17 @@ mod tests {
 
     #[test]
     fn test_paths_from_lookup() {
-        let defaults = KerberosPaths::from_lookup(|_| None);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let defaults = KerberosPaths::from_lookup(|key| {
+            asked.borrow_mut().push(key.to_owned());
+            None
+        });
         assert_eq!(defaults, KerberosPaths::default());
+        let mut asked = asked.into_inner();
+        asked.sort();
+        let mut listed = ENV_KEYS.map(str::to_owned).to_vec();
+        listed.sort();
+        assert_eq!(asked, listed, "ENV_KEYS must list every key read here");
         assert_eq!(defaults.admin_keytab, PathBuf::from("/data/kadm5.keytab"));
         assert_eq!(
             defaults.kdc_principal(),

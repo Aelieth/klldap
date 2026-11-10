@@ -1,6 +1,6 @@
+use crate::domain_from_base_dn;
 use crate::paths::KerberosPaths;
-use crate::{derive_realm_from_base_dn, domain_from_base_dn};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use minijinja::{Environment, context};
 use serde::Deserialize;
 use std::env;
@@ -152,15 +152,61 @@ pub fn load_config(paths: &KerberosPaths) -> Result<(KerberosConfig, String)> {
         .get("kerberos")
         .context("Missing [kerberos] table")?
         .clone();
-    let mut config: KerberosConfig = kerberos_value
+    let config: KerberosConfig = kerberos_value
         .try_into()
         .context("while reading the [kerberos] table")?;
-    config.realm_name = derive_realm_from_base_dn();
-    config.base_dn = env::var("LLDAP_LDAP_BASE_DN").unwrap_or_else(|_| config.base_dn.clone());
+    if config.realm_name.is_empty() || config.base_dn.is_empty() {
+        bail!(
+            "{} has no realm or base DN: the server writes them at boot, so start it first",
+            paths.kerberos_config.display()
+        );
+    }
     let domain = domain_from_base_dn(&config.base_dn);
     println!("Calculated DOMAIN: {}", domain);
     println!("Effective REALM_NAME: {}", config.realm_name);
     Ok((config, domain))
+}
+
+/// The server's resolved settings, written over `kerberos_config.toml` at every server boot.
+pub struct ServerSettings {
+    pub realm: String,
+    pub base_dn: String,
+    pub ticket_lifetime: String,
+    pub renew_lifetime: String,
+    pub forwardable: bool,
+}
+
+pub fn write_server_settings(path: &Path, settings: &ServerSettings) -> Result<()> {
+    let mut file: toml::Table = match fs::read_to_string(path) {
+        Ok(text) => {
+            toml::from_str(&text).with_context(|| format!("while parsing {}", path.display()))?
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+        Err(e) => return Err(e).with_context(|| format!("while reading {}", path.display())),
+    };
+    let Some(kerberos) = file
+        .entry("kerberos")
+        .or_insert_with(|| toml::Table::new().into())
+        .as_table_mut()
+    else {
+        bail!("[kerberos] in {} is not a table", path.display());
+    };
+    kerberos.insert("realm_name".into(), settings.realm.clone().into());
+    kerberos.insert("base_dn".into(), settings.base_dn.clone().into());
+    kerberos.insert(
+        "ticket_lifetime".into(),
+        settings.ticket_lifetime.clone().into(),
+    );
+    kerberos.insert(
+        "renew_lifetime".into(),
+        settings.renew_lifetime.clone().into(),
+    );
+    kerberos.insert("forwardable".into(), settings.forwardable.into());
+    kerberos.entry("rdns").or_insert(false.into());
+    let staged = path.with_extension("toml.new");
+    fs::write(&staged, toml::to_string(&file)?)
+        .with_context(|| format!("while writing {}", staged.display()))?;
+    fs::rename(&staged, path).with_context(|| format!("while replacing {}", path.display()))
 }
 
 pub fn admin_principal(config: &KerberosConfig) -> String {

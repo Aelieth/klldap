@@ -3,8 +3,7 @@ use reqwest::Client as HttpClient;
 use serde_json::json;
 use tracing::info;
 
-use crate::config::{KeycloakConfig, admin_password};
-use lldap_domain_handlers::kerberos::base_dn_from_env;
+use crate::config::{KeycloakConfig, admin_password, base_dn_from_env};
 
 struct LldapProviderDns {
     bind_dn: String,

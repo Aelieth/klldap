@@ -1,7 +1,6 @@
-## Copied to /data/kerberos_config.toml on first start (see docs/kerberos.md).
-## realm_name and base_dn are always taken from the environment
-## (LLDAP_KERB_REALM_NAME or the realm derived from LLDAP_LDAP_BASE_DN); the values below
-## are rendered into krb5.conf.
+## Copied to /data/kerberos_config.toml on first start (see docs/kerberos.md). The server
+## overwrites realm_name, base_dn, ticket_lifetime, renew_lifetime and forwardable at every
+## boot from [kerberos_options]; the values are rendered into krb5.conf.
 [kerberos]
 realm_name = ""
 base_dn = ""

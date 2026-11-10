@@ -285,11 +285,6 @@ pub struct HealthcheckOpts {
     /// Change the LDAP Host to test the health of.  Default: "localhost"
     #[clap(long, env = "LLDAP_HEALTHCHECK_OPTIONS__LDAP_HOST")]
     pub healthcheck_ldap_host: Option<String>,
-
-    /// Also require a healthy Kerberos stack (KDC reachable on port 88, admin keytab
-    /// present). Used by the healthcheck subcommand.
-    #[clap(long = "kerberos", env = "LLDAP_KERBEROS_HEALTHCHECK")]
-    pub healthcheck_kerberos: bool,
 }
 
 #[derive(Debug, Parser, Clone)]

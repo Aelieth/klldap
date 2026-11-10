@@ -1,6 +1,6 @@
 use lldap_kerberos::{
-    delete_kerberos_principal, derive_realm_from_base_dn, export_keytab_for_keycloak,
-    principal_name, set_kerberos_principal_enabled, sync_kerberos_principal,
+    delete_kerberos_principal, export_keytab_for_keycloak, set_kerberos_principal_enabled,
+    sync_kerberos_principal,
 };
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -11,6 +11,10 @@ fn require_live_kdc() {
     if std::env::var("KLLDAP_TEST_KDC").ok().as_deref() != Some("1") {
         panic!("{IGNORE_REASON}");
     }
+}
+
+fn realm() -> String {
+    std::env::var("KLLDAP_TEST_REALM").expect("the sandbox exports its realm")
 }
 
 fn kadmin_local(query: &str) -> String {
@@ -51,34 +55,30 @@ fn kinit(principal: &str, password: &str) -> bool {
 #[ignore = "needs a live KDC: run through gate/kdc-sandbox.sh (make test-kdc)"]
 fn test_live_create_chpass_disable_delete() {
     require_live_kdc();
-    let principal = principal_name("livebob");
-    assert_eq!(
-        principal,
-        format!("livebob@{}", derive_realm_from_base_dn())
-    );
+    let principal = format!("livebob@{}", realm());
 
-    sync_kerberos_principal("livebob", "LiveBobPass2026!").expect("create");
+    sync_kerberos_principal("livebob", &realm(), "LiveBobPass2026!").expect("create");
     assert!(kadmin_local("getprinc livebob").contains(&format!("Principal: {principal}")));
     assert!(
         kinit(&principal, "LiveBobPass2026!"),
         "kinit with the initial password"
     );
 
-    set_kerberos_principal_enabled("livebob", false).expect("disallow tix");
+    set_kerberos_principal_enabled("livebob", &realm(), false).expect("disallow tix");
     assert!(kadmin_local("getprinc livebob").contains("DISALLOW_ALL_TIX"));
     assert!(
         !kinit(&principal, "LiveBobPass2026!"),
         "kinit must fail while disabled"
     );
 
-    set_kerberos_principal_enabled("livebob", true).expect("allow tix");
+    set_kerberos_principal_enabled("livebob", &realm(), true).expect("allow tix");
     assert!(!kadmin_local("getprinc livebob").contains("DISALLOW_ALL_TIX"));
     assert!(
         kinit(&principal, "LiveBobPass2026!"),
         "kinit after re-enable"
     );
 
-    sync_kerberos_principal("livebob", "LiveBobRotated2026!").expect("chpass");
+    sync_kerberos_principal("livebob", &realm(), "LiveBobRotated2026!").expect("chpass");
     assert!(
         !kinit(&principal, "LiveBobPass2026!"),
         "old password must stop working"
@@ -88,7 +88,7 @@ fn test_live_create_chpass_disable_delete() {
         "kinit with the rotated password"
     );
 
-    delete_kerberos_principal("livebob").expect("delete");
+    delete_kerberos_principal("livebob", &realm()).expect("delete");
     assert!(kadmin_local("getprinc livebob").contains("does not exist"));
 }
 
@@ -96,7 +96,8 @@ fn test_live_create_chpass_disable_delete() {
 #[ignore = "needs a live KDC: run through gate/kdc-sandbox.sh (make test-kdc)"]
 fn test_live_export_keytab_for_keycloak() {
     require_live_kdc();
-    let path = export_keytab_for_keycloak("kc.sandbox.test").expect("export");
+    let path =
+        export_keytab_for_keycloak("kc.sandbox.test", &realm(), "sandbox.test").expect("export");
     assert_eq!(
         path,
         std::env::var("LLDAP_KERB_KEYCLOAK_KEYTAB").expect("sandbox exports the keytab path")
@@ -107,6 +108,6 @@ fn test_live_export_keytab_for_keycloak() {
         .output()
         .expect("klist");
     let listing = String::from_utf8_lossy(&listing.stdout);
-    let service = format!("HTTP/kc.sandbox.test@{}", derive_realm_from_base_dn());
+    let service = format!("HTTP/kc.sandbox.test@{}", realm());
     assert!(listing.contains(&service), "{listing}");
 }

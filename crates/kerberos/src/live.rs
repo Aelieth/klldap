@@ -3,6 +3,7 @@ use crate::{
     set_kerberos_principal_enabled, sync_kerberos_principal,
 };
 use async_trait::async_trait;
+use lldap_domain::types::UserId;
 use lldap_domain_handlers::kerberos::KerberosSync;
 use lldap_domain_handlers::logging::{LogKind, current_request, record_outcome, with_request_sync};
 use std::{
@@ -17,23 +18,23 @@ use tokio::sync::Mutex;
 use tracing::Span;
 
 pub struct LiveKerberos {
+    realm: String,
+    domain: String,
     kdc_port: u16,
-    wait_for_kdc: bool,
     seen_kdc: AtomicBool,
     kadm5: Arc<Mutex<()>>,
 }
 
 impl LiveKerberos {
-    /// `wait_for_kdc` is the deployment saying a KDC is part of it (the image sets
-    /// `healthcheck_options.kerberos`); without it, directory writes never wait.
-    pub fn new(wait_for_kdc: bool) -> Self {
-        Self::on_port(KerberosPaths::from_env().kdc_port, wait_for_kdc)
+    pub fn new(realm: &str, domain: &str) -> Self {
+        Self::on_port(realm, domain, KerberosPaths::from_env().kdc_port)
     }
 
-    pub fn on_port(kdc_port: u16, wait_for_kdc: bool) -> Self {
+    pub fn on_port(realm: &str, domain: &str, kdc_port: u16) -> Self {
         Self {
+            realm: realm.to_owned(),
+            domain: domain.to_owned(),
             kdc_port,
-            wait_for_kdc,
             seen_kdc: AtomicBool::new(false),
             kadm5: Arc::new(Mutex::new(())),
         }
@@ -68,9 +69,12 @@ impl LiveKerberos {
 
 #[async_trait]
 impl KerberosSync for LiveKerberos {
+    fn realm(&self) -> &str {
+        &self.realm
+    }
     // Latch: wait once after boot; a later KDC death is the healthcheck's job.
     fn ready(&self) -> bool {
-        if !self.wait_for_kdc || self.seen_kdc.load(Ordering::Relaxed) {
+        if self.seen_kdc.load(Ordering::Relaxed) {
             return true;
         }
         let addr = SocketAddr::from(([127, 0, 0, 1], self.kdc_port));
@@ -80,32 +84,36 @@ impl KerberosSync for LiveKerberos {
         }
         up
     }
-    async fn sync_principal(&self, username: &str, password: &str) -> Result<(), String> {
-        let (user, password) = (username.to_owned(), password.to_owned());
-        self.logged(LogKind::KerberosSync, username, "sync", move || {
-            sync_kerberos_principal(&user, &password)
+    async fn sync_principal(&self, user: &UserId, password: &str) -> Result<(), String> {
+        let (name, realm, password) = (
+            user.as_str().to_owned(),
+            self.realm.clone(),
+            password.to_owned(),
+        );
+        self.logged(LogKind::KerberosSync, user.as_str(), "sync", move || {
+            sync_kerberos_principal(&name, &realm, &password)
         })
         .await
     }
-    async fn delete_principal(&self, username: &str) -> Result<(), String> {
-        let user = username.to_owned();
-        self.logged(LogKind::KerberosSync, username, "delete", move || {
-            delete_kerberos_principal(&user)
+    async fn delete_principal(&self, user: &UserId) -> Result<(), String> {
+        let (name, realm) = (user.as_str().to_owned(), self.realm.clone());
+        self.logged(LogKind::KerberosSync, user.as_str(), "delete", move || {
+            delete_kerberos_principal(&name, &realm)
         })
         .await
     }
-    async fn set_principal_enabled(&self, username: &str, enabled: bool) -> Result<(), String> {
+    async fn set_principal_enabled(&self, user: &UserId, enabled: bool) -> Result<(), String> {
         let op = if enabled { "enable" } else { "disable" };
-        let user = username.to_owned();
-        self.logged(LogKind::KerberosSync, username, op, move || {
-            set_kerberos_principal_enabled(&user, enabled)
+        let (name, realm) = (user.as_str().to_owned(), self.realm.clone());
+        self.logged(LogKind::KerberosSync, user.as_str(), op, move || {
+            set_kerberos_principal_enabled(&name, &realm, enabled)
         })
         .await
     }
     async fn export_keytab_for_keycloak(&self, hostname: &str) -> Result<String, String> {
-        let host = hostname.to_owned();
+        let (host, realm, domain) = (hostname.to_owned(), self.realm.clone(), self.domain.clone());
         self.logged(LogKind::KeytabExport, hostname, "keycloak", move || {
-            export_keytab_for_keycloak(&host)
+            export_keytab_for_keycloak(&host, &realm, &domain)
         })
         .await
     }
@@ -120,17 +128,16 @@ mod tests {
     use serial_test::serial;
     use std::{net::TcpListener, sync::mpsc};
 
+    const REALM: &str = "EXAMPLE.COM";
+    const DOMAIN: &str = "example.com";
+
     #[test]
     fn test_ready_latches_once_the_kdc_port_answers() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         drop(listener);
-        let live = LiveKerberos::on_port(port, true);
+        let live = LiveKerberos::on_port(REALM, DOMAIN, port);
         assert!(!live.ready(), "nothing listens yet");
-        assert!(
-            LiveKerberos::on_port(port, false).ready(),
-            "no KDC expected: never waits"
-        );
         let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
         assert!(live.ready(), "the KDC port answers");
         drop(listener);
@@ -141,11 +148,12 @@ mod tests {
     #[serial]
     async fn test_principal_operations_record_kerberos_sync_events() {
         let guard = LogGuard::install();
-        let live = LiveKerberos::on_port(1, false);
+        let live = LiveKerberos::on_port(REALM, DOMAIN, 1);
 
         // No KDC: the delete is a no-op success, the sync a failure; both are recorded.
-        assert!(live.delete_principal("bob").await.is_ok());
-        assert!(live.sync_principal("bob", "pw").await.is_err());
+        let bob = UserId::new("bob");
+        assert!(live.delete_principal(&bob).await.is_ok());
+        assert!(live.sync_principal(&bob, "pw").await.is_err());
         assert!(
             live.export_keytab_for_keycloak("host.example.com")
                 .await
@@ -177,7 +185,7 @@ mod tests {
     #[serial]
     async fn test_a_dropped_caller_keeps_the_kadm5_lock_and_its_log_row() {
         let guard = LogGuard::install();
-        let live = LiveKerberos::on_port(1, false);
+        let live = LiveKerberos::on_port(REALM, DOMAIN, 1);
         let (release, held) = mpsc::channel::<()>();
         let alice = RequestMeta::ldap(Some(UserId::new("alice")), None);
         let call = live.logged(LogKind::KerberosSync, "bob", "sync", move || {

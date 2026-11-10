@@ -54,7 +54,7 @@ services:
       - LLDAP_LDAP_USER_PASS=CHANGE_ME
       - LLDAP_LDAP_BASE_DN=dc=example,dc=com
       # Optional:
-      # - LLDAP_KERB_REALM_NAME=EXAMPLE.COM
+      # - LLDAP_KERBEROS_OPTIONS__REALM=EXAMPLE.COM
       # - LLDAP_KEYCLOAK_ADMIN_PASS=admin
       # - LLDAP_DATABASE_URL=postgres://user:password@postgres/lldap
       # - LLDAP_LDAPS_OPTIONS__ENABLED=true
@@ -80,7 +80,8 @@ it creates the Kerberos database with a random, stash-only master password, the
 `admin/admin@REALM` principal and `/data/kadm5.keytab`, renders `krb5.conf`,
 `kdc.conf` and `kadm5.acl` from the templates in `/app`, and starts
 `krb5kdc` and `kadmind`. Later starts skip what already exists. The container's
-healthcheck (`lldap healthcheck --kerberos`) fails until the KDC is up, and directory
+healthcheck (`lldap healthcheck`, which the image's `LLDAP_KERBEROS_OPTIONS__ENABLED=true`
+extends to the KDC) fails until the KDC is up, and directory
 writes are refused ("Kerberos KDC unavailable") until it has answered once — logins and
 reads work throughout.
 

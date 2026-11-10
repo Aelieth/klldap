@@ -1,14 +1,8 @@
 use async_trait::async_trait;
+use lldap_domain::types::UserId;
 use lldap_domain_model::error::DomainError;
-use std::env;
 use std::sync::{Arc, LazyLock, RwLock};
 use tracing::warn;
-
-const DEFAULT_BASE_DN: &str = "dc=example,dc=com";
-
-pub fn base_dn_from_env() -> String {
-    env::var("LLDAP_LDAP_BASE_DN").unwrap_or_else(|_| DEFAULT_BASE_DN.to_owned())
-}
 
 pub fn domain_from_base_dn(base_dn: &str) -> String {
     base_dn
@@ -24,27 +18,12 @@ pub fn domain_from_base_dn(base_dn: &str) -> String {
         .to_lowercase()
 }
 
-pub fn derive_domain_from_base_dn() -> String {
-    domain_from_base_dn(&base_dn_from_env())
-}
-
-fn realm_from(realm_override: Option<&str>, base_dn: &str) -> String {
+pub fn realm_from(realm_override: Option<&str>, base_dn: &str) -> String {
     realm_override
         .filter(|realm| !realm.is_empty())
         .map(str::to_owned)
         .unwrap_or_else(|| domain_from_base_dn(base_dn))
         .to_uppercase()
-}
-
-pub fn derive_realm_from_base_dn() -> String {
-    realm_from(
-        env::var("LLDAP_KERB_REALM_NAME").ok().as_deref(),
-        &base_dn_from_env(),
-    )
-}
-
-pub fn principal_name(username: &str) -> String {
-    format!("{username}@{}", derive_realm_from_base_dn())
 }
 
 const RESERVED_PRINCIPALS: &[&str] = &["krbtgt", "kadmin", "kiprop", "wellknown"];
@@ -142,24 +121,28 @@ pub trait KerberosSync: Send + Sync {
     fn ready(&self) -> bool {
         true
     }
-    async fn sync_principal(&self, username: &str, password: &str) -> Result<(), String>;
+    fn realm(&self) -> &str;
+    fn principal_name(&self, user: &UserId) -> String {
+        format!("{}@{}", user.as_str(), self.realm())
+    }
+    async fn sync_principal(&self, user: &UserId, password: &str) -> Result<(), String>;
     async fn sync_if_enabled(
         &self,
         sync_enabled: bool,
-        username: &str,
+        user: &UserId,
         password: &str,
     ) -> Result<(), String> {
         if sync_enabled {
-            self.sync_principal(username, password).await
+            self.sync_principal(user, password).await
         } else {
             Ok(())
         }
     }
-    async fn delete_principal(&self, username: &str) -> Result<(), String>;
-    async fn set_principal_enabled(&self, username: &str, enabled: bool) -> Result<(), String>;
-    async fn reassert_disabled(&self, username: &str) {
-        if let Err(e) = self.set_principal_enabled(username, false).await {
-            warn!("Failed to re-assert Kerberos disable for {username} after password set: {e}");
+    async fn delete_principal(&self, user: &UserId) -> Result<(), String>;
+    async fn set_principal_enabled(&self, user: &UserId, enabled: bool) -> Result<(), String>;
+    async fn reassert_disabled(&self, user: &UserId) {
+        if let Err(e) = self.set_principal_enabled(user, false).await {
+            warn!("Failed to re-assert Kerberos disable for {user} after password set: {e}");
         }
     }
     async fn export_keytab_for_keycloak(&self, hostname: &str) -> Result<String, String>;
@@ -169,17 +152,29 @@ const NOT_REGISTERED: &str = "Kerberos backend not registered";
 
 // Mirrors the FFI functions without a reachable KDC: idempotent cleanups succeed,
 // operations that must reach the KDC fail, so a missing registration stays visible.
-pub struct NoopKerberos;
+#[derive(Default)]
+pub struct NoopKerberos {
+    realm: String,
+}
+
+impl NoopKerberos {
+    pub fn new(realm: String) -> Self {
+        Self { realm }
+    }
+}
 
 #[async_trait]
 impl KerberosSync for NoopKerberos {
-    async fn sync_principal(&self, _: &str, _: &str) -> Result<(), String> {
+    fn realm(&self) -> &str {
+        &self.realm
+    }
+    async fn sync_principal(&self, _: &UserId, _: &str) -> Result<(), String> {
         Err(NOT_REGISTERED.to_owned())
     }
-    async fn delete_principal(&self, _: &str) -> Result<(), String> {
+    async fn delete_principal(&self, _: &UserId) -> Result<(), String> {
         Ok(())
     }
-    async fn set_principal_enabled(&self, _: &str, _: bool) -> Result<(), String> {
+    async fn set_principal_enabled(&self, _: &UserId, _: bool) -> Result<(), String> {
         Ok(())
     }
     async fn export_keytab_for_keycloak(&self, _: &str) -> Result<String, String> {
@@ -190,7 +185,7 @@ impl KerberosSync for NoopKerberos {
 // Process-global so ldap/sql call sites stay one-liners; tests that install a
 // recorder must be #[serial] and restore the default on drop.
 static BACKEND: LazyLock<RwLock<Arc<dyn KerberosSync>>> =
-    LazyLock::new(|| RwLock::new(Arc::new(NoopKerberos)));
+    LazyLock::new(|| RwLock::new(Arc::new(NoopKerberos::default())));
 
 pub fn kerberos_backend() -> Arc<dyn KerberosSync> {
     BACKEND.read().expect("kerberos backend").clone()

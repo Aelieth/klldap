@@ -1,31 +1,10 @@
 use ldap3_proto::proto::{
     LdapOp, LdapSearchRequest, LdapSearchScope, OID_PASSWORD_MODIFY, OID_WHOAMI,
 };
-
-pub(crate) fn kerberos_realm_name(base_dn: &str, env_realm: Option<&str>) -> String {
-    env_realm
-        .filter(|s| !s.is_empty())
-        .map(|s| s.to_ascii_uppercase())
-        .unwrap_or_else(|| {
-            base_dn
-                .split(',')
-                .filter_map(|part| part.strip_prefix("dc="))
-                .collect::<Vec<_>>()
-                .join(".")
-                .to_ascii_uppercase()
-        })
-}
+use lldap_domain_handlers::kerberos::kerberos_backend;
 
 pub fn root_dse_response(base_dn: &str) -> LdapOp {
-    let realm = kerberos_realm_name(
-        base_dn,
-        std::env::var("LLDAP_KERB_REALM_NAME")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .as_deref(),
-    );
-
-    let realm_bytes = realm.into_bytes();
+    let realm_bytes = kerberos_backend().realm().as_bytes().to_vec();
     let full_subschema_dn = format!("cn=Subschema,{}", base_dn);
 
     LdapOp::SearchResultEntry(ldap3_proto::LdapSearchResultEntry {
@@ -151,19 +130,6 @@ mod tests {
 
     #[test]
     fn test_root_dse_always_emits_subschema_and_realm() {
-        assert_eq!(
-            kerberos_realm_name("dc=example,dc=com", None),
-            "EXAMPLE.COM"
-        );
-        assert_eq!(
-            kerberos_realm_name("dc=example,dc=com", Some("")),
-            "EXAMPLE.COM"
-        );
-        assert_eq!(
-            kerberos_realm_name("dc=example,dc=com", Some("test.realm")),
-            "TEST.REALM"
-        );
-
         let LdapOp::SearchResultEntry(entry) = root_dse_response("dc=example,dc=com") else {
             panic!("expected SearchResultEntry");
         };

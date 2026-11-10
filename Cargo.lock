@@ -3393,6 +3393,7 @@ dependencies = [
  "hmac 0.12.1",
  "juniper",
  "jwt",
+ "krb5-types",
  "ldap3",
  "ldap3_proto",
  "lettre",

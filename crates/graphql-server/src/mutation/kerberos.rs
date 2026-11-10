@@ -36,7 +36,7 @@ pub(super) async fn sync_kerberos_password<Handler: FullHandler + OpaqueHandler>
     let sync_enabled = kerberos_sync_enabled(&user.attributes);
     if sync_enabled {
         kerberos_backend()
-            .sync_principal(target_user_id.as_str(), &plain_password)
+            .sync_principal(&target_user_id, &plain_password)
             .await
             .map_err(|e| anyhow!("Kerberos sync failed: {e}"))?;
         info!("Kerberos principal synced for user {target_user_id}");
@@ -46,9 +46,7 @@ pub(super) async fn sync_kerberos_password<Handler: FullHandler + OpaqueHandler>
                 .iter()
                 .any(|g| g.display_name == "lldap_disabled".into())
         {
-            kerberos_backend()
-                .reassert_disabled(target_user_id.as_str())
-                .await;
+            kerberos_backend().reassert_disabled(&target_user_id).await;
         }
     } else {
         info!("Kerberos sync disabled for user {target_user_id}, skipping");

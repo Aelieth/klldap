@@ -10,7 +10,6 @@ use uuid::Uuid;
 pub mod access_control;
 pub mod opaque;
 
-/// The messages for the 3-step OPAQUE and simple login process.
 pub mod login {
     use super::{types::UserId, *};
 
@@ -28,17 +27,15 @@ pub mod login {
 
     #[derive(Serialize, Deserialize, Clone)]
     pub struct ServerLoginStartResponse {
-        /// Base64, encrypted ServerData to be passed back to the server.
+        /// Base64, encrypted; the client returns it unchanged.
         pub server_data: String,
         pub credential_response: opaque::client::login::CredentialResponse,
     }
 
     #[derive(Serialize, Deserialize, Clone)]
     pub struct ClientLoginFinishRequest {
-        /// Encrypted ServerData from the previous step.
         pub server_data: String,
         pub credential_finalization: opaque::client::login::CredentialFinalization,
-        /// TOTP code when the account requires a second factor.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub totp_code: Option<String>,
     }
@@ -63,7 +60,6 @@ pub mod login {
         pub token: String,
         #[serde(rename = "refreshToken", skip_serializing_if = "Option::is_none")]
         pub refresh_token: Option<String>,
-        /// Set when the policy requires a second factor the user has not enrolled yet.
         #[serde(
             rename = "mfaEnrollmentRequired",
             default,
@@ -72,8 +68,7 @@ pub mod login {
         pub mfa_enrollment_required: Option<bool>,
     }
 
-    /// Returned instead of tokens when the password was correct but the TOTP code was
-    /// missing: retry with `password:123456` in the password field.
+    /// Missing TOTP after a right password: retry with `password:123456`.
     #[derive(Serialize, Deserialize, Clone)]
     pub struct ServerMfaRequiredResponse {
         #[serde(rename = "mfaRequired")]
@@ -81,8 +76,6 @@ pub mod login {
     }
 }
 
-/// The messages for the 3-step OPAQUE registration process.
-/// It is used to reset a user's password.
 pub mod registration {
     use super::{types::UserId, *};
 
@@ -99,21 +92,18 @@ pub mod registration {
 
     #[derive(Serialize, Deserialize, Clone)]
     pub struct ServerRegistrationStartResponse {
-        /// Base64, encrypted ServerData to be passed back to the server.
+        /// Base64, encrypted; the client returns it unchanged.
         pub server_data: String,
         pub registration_response: opaque::client::registration::RegistrationResponse,
     }
 
     #[derive(Serialize, Deserialize, Clone)]
     pub struct ClientRegistrationFinishRequest {
-        /// Encrypted ServerData from the previous step.
         pub server_data: String,
         pub registration_upload: opaque::server::registration::RegistrationUpload,
     }
 }
 
-/// The messages for the 3-step OPAQUE registration process.
-/// It is used to reset a user's password.
 pub mod password_reset {
     use super::*;
 

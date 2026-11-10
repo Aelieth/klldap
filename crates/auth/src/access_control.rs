@@ -48,8 +48,8 @@ impl ValidationResults {
         self.permission == Permission::Admin || &self.user == user
     }
 
-    // A password manager cannot drop its own factor. Under "always", GraphQL refuses
-    // self-reset; admins can still clear others (an admin session could mint a new admin).
+    // A password manager cannot drop its own factor. Under "always", GraphQL refuses a self-reset.
+    // Admins can still clear others: an admin session could mint a new admin.
     #[must_use]
     pub fn can_reset_mfa(&self, user: &UserId, user_is_admin: bool) -> bool {
         self.permission == Permission::Admin

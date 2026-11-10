@@ -19,8 +19,7 @@ pub const SEALED_PREFIX: &str = "v1.";
 pub const SEALED_BLOB_LEN: usize =
     SEALED_PREFIX.len() + ((SEAL_SALT_LEN + TOTP_SEED_LEN + SEAL_TAG_LEN) * 4).div_ceil(3);
 
-// Error markers: the doors and the web client classify failures by these, through the
-// GraphQL and anyhow layers, so they are matched anywhere in the message.
+// Doors and the web client match these anywhere in the message, past GraphQL and anyhow.
 pub const TOTP_CODE_ALREADY_USED: &str = "TOTP code already used";
 pub const TOTP_ENROLLMENT_EXPIRED: &str = "Expired TOTP enrollment";
 pub const TOTP_TOO_MANY_ATTEMPTS: &str = "Too many TOTP attempts";

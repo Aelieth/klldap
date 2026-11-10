@@ -89,13 +89,11 @@ fn derive_enrollment_key(ikm: &[u8]) -> Result<aead::SecretKey> {
 
 #[derive(Serialize, Deserialize)]
 pub struct EnrollmentState {
-    // Discriminates the sealed blob: bincode ignores trailing bytes, so an
-    // unrelated payload could otherwise be parsed as an enrollment.
+    // bincode ignores trailing bytes, so this tag stops another payload parsing as enrollment.
     kind: u8,
     pub user_id: String,
     pub seed: [u8; TOTP_SEED_LEN],
-    // Whether a factor was already enrolled when this state was issued, so a
-    // state minted before enrollment cannot be replayed to replace one.
+    // A state from before enrollment must not be replayed to replace a factor.
     pub replaces_existing: bool,
     expiry_unix: i64,
 }

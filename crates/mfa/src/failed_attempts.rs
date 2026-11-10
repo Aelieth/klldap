@@ -11,8 +11,7 @@ impl FailedAttempts {
         Self::default()
     }
 
-    // Spent per step and refilled by the next code, so a mistyped digit costs a wait.
-    // One lock: checking and counting apart lets concurrent requests all pass the gate.
+    // One lock: checking and counting apart lets concurrent requests all pass.
     pub fn reserve(&self, user_uuid: &str, now_unix: u64) -> bool {
         let step = now_unix / TOTP_STEP_SECS;
         let mut failed = self.0.lock().unwrap_or_else(PoisonError::into_inner);

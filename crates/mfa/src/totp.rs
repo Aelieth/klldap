@@ -38,8 +38,7 @@ fn parse_code(code: &str) -> Option<u32> {
     code.parse().ok()
 }
 
-// Optimizer barrier so windows are not short-circuited. black_box is not constant-time;
-// the surrounding HMAC dominates.
+// black_box stops the compare from short-circuiting. It is not constant-time; the HMAC dominates.
 fn barrier_eq_u32(a: u32, b: u32) -> bool {
     std::hint::black_box(a ^ b) == 0
 }

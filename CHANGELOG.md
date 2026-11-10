@@ -16,6 +16,9 @@ yet. 0.7.4, 0.7.5 and 0.7.6 stay unreleased on their own branches.
   `krb5-log`, `krb5-protocol`) is a git dependency at its tag, linked but not yet used. Its
   `rasn` patch is carried in `[patch.crates-io]`, and `.cargo/config.toml` sets
   `--cfg p384_backend="fiat"` so P-384 uses p384's constant-time field.
+- `lldap_mfa` moves to hmac 0.13 and sha1 0.11, kerber-rust's RustCrypto generation. sha2
+  0.10, hmac 0.12 and digest 0.10 remain, pinned by `opaque-ke` 4, `rsa` 0.9, `jwt` 0.16 and
+  `sqlx` 0.8; `sqlx` also keeps sha1 0.10 and md-5 0.10.
 
 ## [0.7.6] unreleased
 

@@ -8,7 +8,9 @@ use lldap_auth::{access_control::ValidationResults, types::UserId};
 use lldap_domain_handlers::handler::{BackendHandler, MfaBackendHandler};
 use lldap_domain_handlers::logging::{self, LogKind};
 use lldap_domain_handlers::mfa::MfaPolicy;
+use lldap_keycloak::KeycloakSettings;
 use lldap_opaque_handler::OpaqueHandler;
+use std::sync::Arc;
 use tracing::debug;
 
 pub trait FullHandler: BackendHandler + OpaqueHandler {}
@@ -20,6 +22,7 @@ pub struct Context<Handler: FullHandler> {
     pub validation_result: ValidationResults,
     pub mfa_policy: MfaPolicy,
     pub mfa_enrollment_pending: bool,
+    pub keycloak: Arc<KeycloakSettings>,
 }
 
 pub fn field_error_callback<'a>(
@@ -51,6 +54,9 @@ impl<Handler: FullHandler> Context<Handler> {
             validation_result,
             mfa_policy,
             mfa_enrollment_pending,
+            keycloak: Arc::new(KeycloakSettings {
+                base_dn: "dc=example,dc=com".into(),
+            }),
         }
     }
 

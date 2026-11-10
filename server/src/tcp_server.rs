@@ -24,11 +24,12 @@ use lldap_domain_handlers::kerberos::domain_from_base_dn;
 use lldap_domain_handlers::logging::{RequestMeta, with_request};
 use lldap_domain_handlers::mfa::MfaPolicy;
 use lldap_domain_model::error::DomainError;
+use lldap_keycloak::KeycloakSettings;
 use lldap_opaque_handler::OpaqueHandler;
 use sha2::Sha512;
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use tracing::{info, warn};
 
 async fn log_request_scope(
@@ -151,6 +152,7 @@ struct WebOptions {
     mail_options: MailOptions,
     mfa_policy: MfaPolicy,
     domain: String,
+    keycloak: Arc<KeycloakSettings>,
 }
 
 fn http_config<Backend>(
@@ -168,6 +170,7 @@ fn http_config<Backend>(
         mail_options,
         mfa_policy,
         domain,
+        keycloak,
     } = options;
     let enable_password_reset = mail_options.enable_password_reset;
     cfg.app_data(web::Data::new(AppState::<Backend> {
@@ -179,6 +182,7 @@ fn http_config<Backend>(
         mail_options,
         mfa_policy,
         domain,
+        keycloak,
     }))
     .route(
         "/health",
@@ -225,6 +229,7 @@ pub(crate) struct AppState<Backend> {
     pub mail_options: MailOptions,
     pub mfa_policy: MfaPolicy,
     pub domain: String,
+    pub keycloak: Arc<KeycloakSettings>,
 }
 
 impl<Backend: BackendHandler> AppState<Backend> {
@@ -272,6 +277,9 @@ where
         mail_options: config.smtp_options.clone(),
         mfa_policy: config.mfa_policy(),
         domain: domain_from_base_dn(&config.ldap_base_dn),
+        keycloak: Arc::new(KeycloakSettings {
+            base_dn: config.ldap_base_dn.clone(),
+        }),
     };
     let verbose = config.verbose;
     if !options.assets_path.join("index.html").exists() {

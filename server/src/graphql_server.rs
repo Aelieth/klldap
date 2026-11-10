@@ -188,6 +188,7 @@ async fn graphql_route<Handler: BackendHandler + lldap_opaque_handler::OpaqueHan
             validation_result,
             mfa_policy: data.mfa_policy,
             mfa_enrollment_pending,
+            keycloak: data.keycloak.clone(),
         };
         let context = &context;
         with_actor(Some(actor), async {

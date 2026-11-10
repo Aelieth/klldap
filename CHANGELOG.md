@@ -38,6 +38,8 @@ yet. 0.7.4, 0.7.5 and 0.7.6 stay unreleased on their own branches.
 - LDAP Modify and ADD refuse a `userPassword` that is not valid UTF-8, with
   `constraintViolation`. A refused ADD creates no user.
 - GraphQL gives Kerberos the directory's user id, so `Alice` and `alice` name the same principal.
+- The Keycloak realm push and the suggested Keycloak URL use the configured
+  base DN, also when it is set only in the configuration file.
 
 ### Security
 

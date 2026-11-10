@@ -1,20 +1,20 @@
 use anyhow::{Context, Result};
-use lldap_domain_handlers::kerberos::{domain_from_base_dn, kerberos_backend};
+use lldap_domain_handlers::kerberos::domain_from_base_dn;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::path::PathBuf;
 
 pub const SUGGESTED_HOSTNAME: &str = "keycloak";
 
+pub struct KeycloakSettings {
+    pub base_dn: String,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct KeycloakConfig {
     pub url: String,
     pub realm: String,
     pub admin_user: String,
-}
-
-pub(crate) fn base_dn_from_env() -> String {
-    env::var("LLDAP_LDAP_BASE_DN").unwrap_or_else(|_| "dc=example,dc=com".to_owned())
 }
 
 impl KeycloakConfig {
@@ -26,21 +26,21 @@ impl KeycloakConfig {
             .unwrap_or_else(|| PathBuf::from("/data/keycloak_config.toml"))
     }
 
-    pub fn suggested() -> Self {
+    pub fn suggested(base_dn: &str, realm: &str) -> Self {
         Self {
             url: format!(
                 "http://{SUGGESTED_HOSTNAME}.{}",
-                domain_from_base_dn(&base_dn_from_env())
+                domain_from_base_dn(base_dn)
             ),
-            realm: kerberos_backend().realm().to_lowercase(),
+            realm: realm.to_lowercase(),
             admin_user: "admin".to_owned(),
         }
     }
 
-    pub fn load() -> Result<Self> {
+    pub fn load(base_dn: &str, realm: &str) -> Result<Self> {
         let path = Self::path();
         if !path.exists() {
-            return Ok(Self::suggested());
+            return Ok(Self::suggested(base_dn, realm));
         }
         let contents = std::fs::read_to_string(&path)
             .with_context(|| format!("while reading {}", path.display()))?;
@@ -81,5 +81,23 @@ mod tests {
             super::admin_password_from(Some("s3cret")).unwrap(),
             "s3cret"
         );
+    }
+
+    #[test]
+    fn suggested_uses_the_base_dn_and_lowercases_the_realm() {
+        let rows = [
+            (
+                "dc=Example,dc=Com",
+                "Example.COM",
+                "example.com",
+                "example.com",
+            ),
+            ("dc=gate,dc=test", "GATE.TEST", "gate.test", "gate.test"),
+        ];
+        for (base_dn, realm, domain, lowered) in rows {
+            let cfg = super::KeycloakConfig::suggested(base_dn, realm);
+            assert_eq!(cfg.url, format!("http://keycloak.{domain}"));
+            assert_eq!(cfg.realm, lowered);
+        }
     }
 }

@@ -27,6 +27,7 @@ use lldap_domain::types::{GroupId, UserId};
 use lldap_domain_handlers::handler::{
     BackendHandler, PosixBackendHandler, ReadSchemaBackendHandler, SystemConfigBackendHandler,
 };
+use lldap_domain_handlers::kerberos::kerberos_backend;
 use lldap_keycloak::{KeycloakConfig, SUGGESTED_HOSTNAME};
 use lldap_opaque_handler::OpaqueHandler;
 use lldap_schema::PublicSchema;
@@ -224,7 +225,7 @@ impl<Handler: FullHandler + OpaqueHandler> Query<Handler> {
                 &span,
                 "Unauthorized to read Keycloak config",
             ))?;
-        let cfg = KeycloakConfig::suggested();
+        let cfg = KeycloakConfig::suggested(&context.keycloak.base_dn, kerberos_backend().realm());
         Ok(KeycloakSuggestedConfig {
             url: cfg.url,
             realm: cfg.realm,
@@ -241,7 +242,7 @@ impl<Handler: FullHandler + OpaqueHandler> Query<Handler> {
                 &span,
                 "Unauthorized to read Keycloak config",
             ))?;
-        let cfg = KeycloakConfig::load()
+        let cfg = KeycloakConfig::load(&context.keycloak.base_dn, kerberos_backend().realm())
             .map_err(|e| anyhow!("Could not read the Keycloak config: {e:#}"))?;
         Ok(KeycloakConfigResponse {
             url: cfg.url,
@@ -1238,6 +1239,47 @@ mod tests {
                 }),
                 vec![]
             ))
+        );
+    }
+
+    #[tokio::test]
+    async fn keycloak_suggested_config_uses_the_context_base_dn() {
+        const QUERY: &str = r#"{
+            keycloakSuggestedConfig { url realm }
+        }"#;
+        let schema = schema(Query::<MockTestBackendHandler>::new());
+        let mut context = Context::<MockTestBackendHandler>::new_for_tests(
+            MockTestBackendHandler::new(),
+            ValidationResults {
+                user: UserId::new("admin"),
+                permission: Permission::Admin,
+            },
+        );
+        context.keycloak = Arc::new(lldap_keycloak::KeycloakSettings {
+            base_dn: "dc=gate,dc=test".into(),
+        });
+        let (value, errors) = execute(QUERY, None, &schema, &Variables::new(), &context)
+            .await
+            .expect("query");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            value,
+            graphql_value!({
+                "keycloakSuggestedConfig": {
+                    "url": "http://keycloak.gate.test",
+                    "realm": lldap_domain_handlers::kerberos::kerberos_backend()
+                        .realm()
+                        .to_lowercase(),
+                }
+            })
+        );
+
+        context.validation_result.permission = Permission::Regular;
+        let refused = execute(QUERY, None, &schema, &Variables::new(), &context).await;
+        let message = format!("{refused:?}");
+        assert!(
+            message.contains("Unauthorized to read Keycloak config"),
+            "{message}"
         );
     }
 }

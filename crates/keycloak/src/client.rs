@@ -3,7 +3,7 @@ use reqwest::Client as HttpClient;
 use serde_json::json;
 use tracing::info;
 
-use crate::config::{KeycloakConfig, admin_password, base_dn_from_env};
+use crate::config::{KeycloakConfig, admin_password};
 
 struct LldapProviderDns {
     bind_dn: String,
@@ -82,6 +82,7 @@ impl KeycloakClient {
 
     pub async fn setup_realm(
         &self,
+        base_dn: &str,
         lldap_url: String,
         sync_username: String,
         sync_password: String,
@@ -102,7 +103,13 @@ impl KeycloakClient {
         self.create_realm(&token, enable_hsts, enable_brute_force)
             .await?;
         let provider_id = self
-            .create_ldap_kerberos_component(&token, &lldap_url, &sync_username, &sync_password)
+            .create_ldap_kerberos_component(
+                &token,
+                base_dn,
+                &lldap_url,
+                &sync_username,
+                &sync_password,
+            )
             .await?;
         self.clear_default_mappers(&token, &provider_id).await?;
         self.create_custom_mappers(&token, &provider_id).await?;
@@ -212,12 +219,13 @@ impl KeycloakClient {
     async fn create_ldap_kerberos_component(
         &self,
         token: &str,
+        base_dn: &str,
         lldap_url: &str,
         sync_username: &str,
         sync_password: &str,
     ) -> Result<String> {
         info!("   → Adding LDAP+Kerberos provider...");
-        let dns = lldap_provider_dns(&base_dn_from_env(), sync_username);
+        let dns = lldap_provider_dns(base_dn, sync_username);
         let component_json = json!({
             "name": "lldap-with-kerberos",
             "providerId": "ldap",

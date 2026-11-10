@@ -144,6 +144,7 @@ pub(super) async fn push_realm_to_keycloak<Handler: FullHandler + OpaqueHandler>
     )?;
     let result = client
         .setup_realm(
+            &context.keycloak.base_dn,
             input.lldap_url,
             input.sync_username,
             input.sync_password,

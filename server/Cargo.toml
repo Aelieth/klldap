@@ -89,6 +89,9 @@ path = "../crates/frontend-options"
 [dependencies.lldap_graphql_server]
 path = "../crates/graphql-server"
 
+[dependencies.lldap_keycloak]
+path = "../crates/keycloak"
+
 [dependencies.lldap_ldap]
 path = "../crates/ldap"
 

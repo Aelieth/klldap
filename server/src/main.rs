@@ -38,13 +38,9 @@ use tracing::{Instrument, Level, debug, error, info, instrument, span, warn};
 
 use lldap_domain::requests::{CreateGroupRequest, CreateUserRequest};
 use lldap_domain::types::{Attribute, BUILTIN_GROUPS};
-use lldap_domain_handlers::kerberos::{NoopKerberos, domain_from_base_dn, set_kerberos_backend};
+use lldap_domain_handlers::kerberos::{NoopKerberos, set_kerberos_backend};
 use lldap_domain_handlers::logging::{LogKind, record};
-use lldap_kerberos::{
-    live::LiveKerberos,
-    manager::{ServerSettings, write_server_settings},
-    paths::KerberosPaths,
-};
+use lldap_kerberos::embedded::{EmbeddedKerberos, RealmThreads};
 
 use lldap_domain_handlers::handler::{
     GroupBackendHandler, GroupListerBackendHandler, GroupRequestFilter, MfaBackendHandler,
@@ -178,7 +174,7 @@ fn log_retention(config: &Configuration) -> LogRetention {
 async fn set_up_server(
     config: Configuration,
     sql_pool: DatabaseConnection,
-) -> Result<ServerBuilder> {
+) -> Result<(ServerBuilder, Option<RealmThreads>)> {
     let realm = config.kerberos_realm();
     set_kerberos_backend(Arc::new(NoopKerberos::new(realm.clone())));
     let private_key_info = config.get_private_key_info();
@@ -288,25 +284,15 @@ async fn set_up_server(
             "Restart the server without --force-update-private-key or --force-ldap-user-pass-reset to continue."
         );
     }
-    if config.kerberos_options.enabled {
-        write_server_settings(
-            &KerberosPaths::from_env().kerberos_config,
-            &ServerSettings {
-                realm: realm.clone(),
-                base_dn: config.ldap_base_dn.clone(),
-                ticket_lifetime: config.kerberos_options.ticket_lifetime.clone(),
-                renew_lifetime: config.kerberos_options.renew_lifetime.clone(),
-                forwardable: config.kerberos_options.forwardable,
-            },
-        )
-        .context("while writing the Kerberos settings for kerberos_manager")?;
-        // The KDC boots after the server, so the guard on directory writes must not see the
-        // built-in group and admin creation above.
-        set_kerberos_backend(Arc::new(LiveKerberos::new(
-            &realm,
-            &domain_from_base_dn(&config.ldap_base_dn),
-        )));
-    }
+    let realm_threads = if config.kerberos_options.enabled {
+        let (embedded, threads) = EmbeddedKerberos::start(&config.kerberos_settings()?)
+            .context("while starting the Kerberos realm")?;
+        set_kerberos_backend(embedded.clone());
+        reconcile_principals(&backend_handler, &embedded).await?;
+        Some(threads)
+    } else {
+        None
+    };
     let server_builder = ldap_server::build_ldap_server(
         &config,
         backend_handler.clone(),
@@ -319,7 +305,47 @@ async fn set_up_server(
     // Run every hour.
     let scheduler = Scheduler::new("0 0 * * * * *", sql_pool, log_retention(&config));
     scheduler.start();
-    Ok(server_builder)
+    Ok((server_builder, realm_threads))
+}
+
+async fn reconcile_principals(
+    handler: &SqlBackendHandler,
+    embedded: &EmbeddedKerberos,
+) -> Result<()> {
+    let users = handler
+        .list_users(None, false)
+        .await?
+        .into_iter()
+        .filter(|u| {
+            u.user
+                .krb_principal_name
+                .as_deref()
+                .is_some_and(|n| !n.is_empty())
+        })
+        .map(|u| u.user.user_id)
+        .collect();
+    let (updated, missing) = embedded.reconcile(users).await?;
+    info!("🎟️ Kerberos reconcile: {updated} principals updated, {missing} without a principal");
+    Ok(())
+}
+
+async fn serve(server: ServerBuilder, realm: Option<RealmThreads>) -> Result<()> {
+    let server = server.workers(1).run();
+    let Some(mut realm) = realm else {
+        return server.await.context("while starting the server");
+    };
+    let handle = server.handle();
+    let served = tokio::select! {
+        served = server => served.context("while starting the server"),
+        cause = realm.died() => {
+            handle.stop(true).await;
+            Err(anyhow!("the Kerberos realm stopped: {cause}"))
+        }
+    };
+    tokio::task::spawn_blocking(move || realm.stop())
+        .await
+        .context("while stopping the Kerberos realm")?;
+    served
 }
 
 async fn run_server_command(opts: RunOpts) -> Result<()> {
@@ -340,13 +366,9 @@ async fn run_server_command(opts: RunOpts) -> Result<()> {
 
     // One exit path, so the one-shot force flags and errors flush the log too.
     let result = match set_up_server(config, sql_pool.clone()).await {
-        Ok(server) => {
+        Ok((server, realm)) => {
             record(LogKind::ServerStart, None, Some(env!("CARGO_PKG_VERSION")));
-            server
-                .workers(1)
-                .run()
-                .await
-                .context("while starting the server")
+            serve(server, realm).await
         }
         Err(e) => Err(e),
     };
@@ -378,13 +400,12 @@ async fn run_healthcheck(opts: RunOpts) -> Result<()> {
 
     use tokio::time::timeout;
     let delay = Duration::from_millis(3000);
-    let paths = KerberosPaths::from_env();
     let kerberos = async {
         if config.kerberos_options.enabled {
             healthcheck::check_kerberos(
                 &config.healthcheck_options.ldap_host,
-                paths.kdc_port,
-                &paths.admin_keytab,
+                config.kerberos_options.kdc_port,
+                &config.kerberos_options.admin_keytab,
             )
             .await
         } else {

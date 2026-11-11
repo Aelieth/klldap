@@ -16,14 +16,18 @@ use lldap_auth::opaque::{
     server::{ServerSetup, generate_random_private_key},
 };
 use lldap_domain::types::{AttributeName, UserId};
-use lldap_domain_handlers::{kerberos::realm_from, mfa::MfaPolicy};
-use lldap_kerberos::paths::ENV_KEYS;
+use lldap_domain_handlers::{
+    kerberos::{domain_from_base_dn, realm_from},
+    mfa::MfaPolicy,
+};
+use lldap_kerberos::boot::{RealmSettings, parse_enctypes};
 use lldap_sql_backend_handler::sql_tables::{
     ConfigLocation, PrivateKeyHash, PrivateKeyInfo, PrivateKeyLocation,
 };
 use secstr::SecUtf8;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use url::Url;
 
@@ -111,8 +115,28 @@ pub struct KerberosOptions {
     pub ticket_lifetime: String,
     #[builder(default = r#"String::from("7d")"#)]
     pub renew_lifetime: String,
+    #[builder(default = r#"String::from("7d")"#)]
+    pub max_renewable_life: String,
     #[builder(default = "true")]
     pub forwardable: bool,
+    #[builder(default = r#"vec![String::from("aes256-cts-hmac-sha1-96")]"#)]
+    pub supported_enctypes: Vec<String>,
+    #[builder(default = "IpAddr::from([0, 0, 0, 0])")]
+    pub kdc_bind: IpAddr,
+    #[builder(default = "88")]
+    pub kdc_port: u16,
+    #[builder(default = "SocketAddr::from(([127, 0, 0, 1], 749))")]
+    pub kadmin_bind: SocketAddr,
+    #[builder(default)]
+    pub kadmin_acl_file: Option<PathBuf>,
+    #[builder(default = r#"PathBuf::from("/var/kerberos/krb5kdc")"#)]
+    pub data_dir: PathBuf,
+    #[builder(default = r#"PathBuf::from("/data/kadm5.keytab")"#)]
+    pub admin_keytab: PathBuf,
+    #[builder(default = r#"PathBuf::from("/data/keytab/keycloak-http.keytab")"#)]
+    pub keycloak_keytab: PathBuf,
+    #[builder(default = r#"PathBuf::from("/data/krb5.conf")"#)]
+    pub client_config: PathBuf,
 }
 
 impl std::default::Default for KerberosOptions {
@@ -137,19 +161,35 @@ impl std::default::Default for KeycloakOptions {
 }
 
 impl KerberosOptions {
-    fn check_durations(&self) -> Result<()> {
-        for (name, value) in [
-            ("ticket_lifetime", &self.ticket_lifetime),
-            ("renew_lifetime", &self.renew_lifetime),
-        ] {
-            if !krb5_types::deltat::parse(value).is_ok_and(|seconds| seconds > 0) {
-                bail!(
-                    "kerberos_options.{name} = {value:?} is not a positive Kerberos duration \
-                     such as \"24h\" or \"7d\""
-                );
-            }
-        }
-        Ok(())
+    fn realm_settings(&self, realm: String, domain: String) -> Result<RealmSettings> {
+        Ok(RealmSettings {
+            realm,
+            domain,
+            ticket_lifetime: seconds("ticket_lifetime", &self.ticket_lifetime)?,
+            renew_lifetime: seconds("renew_lifetime", &self.renew_lifetime)?,
+            max_renewable_life: seconds("max_renewable_life", &self.max_renewable_life)?,
+            forwardable: self.forwardable,
+            supported_enctypes: parse_enctypes(&self.supported_enctypes)
+                .context("while reading kerberos_options.supported_enctypes")?,
+            kdc_bind: self.kdc_bind,
+            kdc_port: self.kdc_port,
+            kadmin_bind: self.kadmin_bind,
+            kadmin_acl_file: self.kadmin_acl_file.clone(),
+            data_dir: self.data_dir.clone(),
+            admin_keytab: self.admin_keytab.clone(),
+            keycloak_keytab: self.keycloak_keytab.clone(),
+            client_config: self.client_config.clone(),
+        })
+    }
+}
+
+fn seconds(name: &str, value: &str) -> Result<u64> {
+    match krb5_types::deltat::parse(value).map(u64::try_from) {
+        Ok(Ok(seconds)) if seconds > 0 => Ok(seconds),
+        _ => bail!(
+            "kerberos_options.{name} = {value:?} is not a positive Kerberos duration \
+             such as \"24h\" or \"7d\""
+        ),
     }
 }
 
@@ -281,6 +321,13 @@ impl Configuration {
 
     pub fn kerberos_realm(&self) -> String {
         realm_from(self.kerberos_options.realm.as_deref(), &self.ldap_base_dn)
+    }
+
+    pub fn kerberos_settings(&self) -> Result<RealmSettings> {
+        self.kerberos_options.realm_settings(
+            self.kerberos_realm(),
+            domain_from_base_dn(&self.ldap_base_dn),
+        )
     }
 
     pub fn mfa_policy(&self) -> MfaPolicy {
@@ -744,12 +791,10 @@ fn unexpected_env_variables<P: Provider>(env_variable_provider: P) -> Vec<String
         .data()
         .unwrap()[&Profile::default()],
     );
-    // The KDC's file paths are read by the kerberos crate.
     let mut names: Vec<String> =
         extract_keys(&env_variable_provider.data().unwrap()[&Profile::default()])
             .into_iter()
             .filter(|k| !expected_keys.contains(k.as_str()))
-            .filter(|k| !ENV_KEYS.contains(&k.as_str()))
             .collect();
     names.sort();
     names
@@ -802,7 +847,7 @@ where
         overrides.general_config().config_file
     );
 
-    let ignore_keys = ["key_file", "cert_file", "config_file"];
+    let ignore_keys = ["key_file", "cert_file", "config_file", "kadmin_acl_file"];
     let env_variable_provider =
         || FileAdapter::wrap(Env::prefixed("LLDAP_").split("__")).ignore(&ignore_keys);
     let figment_config = Figment::from(Serialized::defaults(
@@ -818,7 +863,7 @@ where
     let mut config: Configuration = figment_config.extract()?;
 
     overrides.override_config(&mut config);
-    config.kerberos_options.check_durations()?;
+    config.kerberos_settings()?;
     if config.verbose {
         println!("Configuration: {:#?}", config);
     }
@@ -943,7 +988,7 @@ mod tests {
             jail.clear_env();
             jail.set_env("LLDAP_KEY_SEED", "a123");
             jail.set_env("LLDAP_JWT_SECRET", "secret");
-            let ignore_keys = ["key_file", "cert_file", "config_file"];
+            let ignore_keys = ["key_file", "cert_file", "config_file", "kadmin_acl_file"];
             let figment_config = Figment::from(Serialized::defaults(
                 ConfigurationBuilder::default()
                     .key_seed(Some(SecUtf8::from(FIGMENT_DUMMY_KEY_SEED)))
@@ -1112,19 +1157,27 @@ mod tests {
     // options and the MFA knob in one ladder: the two override paths do not interfere.
     #[test]
     fn test_kerberos_options_from_env() {
-        type Expected = Result<(bool, &'static str, &'static str), &'static str>;
-        let rows: [(&[(&str, &str)], Expected); 5] = [
-            (&[], Ok((false, "EXAMPLE.COM", "24h"))),
+        type Expected =
+            Result<(bool, &'static str, &'static str, Option<&'static str>), &'static str>;
+        let rows: [(&[(&str, &str)], Expected); 7] = [
+            (&[], Ok((false, "EXAMPLE.COM", "24h", None))),
             (
                 &[
                     ("LLDAP_KERBEROS_OPTIONS__ENABLED", "true"),
                     ("LLDAP_KERBEROS_OPTIONS__REALM", "corp.example"),
                 ],
-                Ok((true, "CORP.EXAMPLE", "24h")),
+                Ok((true, "CORP.EXAMPLE", "24h", None)),
             ),
             (
                 &[("LLDAP_KERBEROS_OPTIONS__TICKET_LIFETIME", "10h")],
-                Ok((false, "EXAMPLE.COM", "10h")),
+                Ok((false, "EXAMPLE.COM", "10h", None)),
+            ),
+            (
+                &[(
+                    "LLDAP_KERBEROS_OPTIONS__KADMIN_ACL_FILE",
+                    "/etc/klldap/kadm5.acl",
+                )],
+                Ok((false, "EXAMPLE.COM", "24h", Some("/etc/klldap/kadm5.acl"))),
             ),
             (
                 &[("LLDAP_KERBEROS_OPTIONS__TICKET_LIFETIME", "forever")],
@@ -1133,6 +1186,13 @@ mod tests {
             (
                 &[("LLDAP_KERBEROS_OPTIONS__RENEW_LIFETIME", "-1d")],
                 Err("renew_lifetime"),
+            ),
+            (
+                &[(
+                    "LLDAP_KERBEROS_OPTIONS__SUPPORTED_ENCTYPES",
+                    "[no-such-enctype]",
+                )],
+                Err("supported_enctypes"),
             ),
         ];
         for (env, expected) in rows {
@@ -1148,12 +1208,18 @@ mod tests {
                         options.enabled,
                         config.kerberos_realm(),
                         options.ticket_lifetime.clone(),
+                        options.kadmin_acl_file.clone(),
                     )
                 });
                 match (loaded, expected) {
-                    (Ok(got), Ok((enabled, realm, lifetime))) => assert_eq!(
+                    (Ok(got), Ok((enabled, realm, lifetime, acl))) => assert_eq!(
                         got,
-                        (enabled, realm.to_owned(), lifetime.to_owned()),
+                        (
+                            enabled,
+                            realm.to_owned(),
+                            lifetime.to_owned(),
+                            acl.map(PathBuf::from)
+                        ),
                         "{env:?}"
                     ),
                     (Err(e), Err(field)) => assert!(e.to_string().contains(field), "{env:?}: {e}"),

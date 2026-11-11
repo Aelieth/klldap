@@ -40,7 +40,7 @@ pub fn init(config: &Configuration) -> anyhow::Result<()> {
         EnvFilter::new(if config.verbose {
             "sqlx=warn,reqwest=warn,debug"
         } else {
-            "sqlx=warn,reqwest=warn,info"
+            "sqlx=warn,reqwest=warn,krb5_kdc=warn,info"
         })
     });
     let registry = tracing_subscriber::registry()

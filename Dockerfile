@@ -46,8 +46,7 @@ COPY --chown=lldap:lldap . .
 RUN cargo build --release \
     -p lldap \
     -p lldap_migration_tool \
-    -p lldap_set_password \
-    -p lldap-kerberos
+    -p lldap_set_password
 
 # Install wasm tools
 RUN cargo install wasm-pack --locked
@@ -100,15 +99,10 @@ COPY --from=builder --chown=lldap:lldap /app/target/release/lldap /app/target/re
 COPY --from=builder --chown=lldap:lldap /app/app/static /app/app/static
 COPY --from=builder --chown=lldap:lldap /app/app/pkg /app/app/pkg
 COPY --from=builder --chown=lldap:lldap /app/app/index.html /app/app/index.html
-COPY --from=builder --chown=lldap:lldap /app/target/release/kerberos_manager /app/
 
 # Copy configs and templates
 COPY --chown=lldap:lldap lldap_config.docker_template.toml /app/
 COPY --chown=lldap:lldap scripts/bootstrap.sh /app/
-COPY --chown=lldap:lldap kerberos/kerberos_config.template.toml /app/kerberos_config.template.toml
-COPY --chown=lldap:lldap kerberos/krb5.template.conf /app/krb5.template.conf
-COPY --chown=lldap:lldap kerberos/kdc.template.conf /app/kdc.template.conf
-COPY --chown=lldap:lldap kerberos/kadm5.template.acl /app/kadm5.template.acl
 
 # Combined entrypoint
 COPY --chown=lldap:lldap entrypoint.sh /entrypoint.sh

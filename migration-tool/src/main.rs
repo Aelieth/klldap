@@ -1,3 +1,4 @@
+#![forbid(unsafe_code)]
 #![allow(clippy::uninlined_format_args)]
 
 use std::collections::HashSet;

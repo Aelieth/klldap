@@ -1,7 +1,7 @@
 [package]
 name = "lldap-kerberos"
 version = "0.2.1"
-description = "MIT Kerberos KDC integration for KLLDAP"
+description = "The Kerberos realm KLLDAP runs in-process, on kerber-rust"
 authors.workspace = true
 documentation.workspace = true
 edition.workspace = true
@@ -21,24 +21,15 @@ krb5-log = { workspace = true }
 krb5-protocol = { workspace = true }
 krb5-types = { workspace = true }
 minijinja = "2.0"
-serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true }
-toml = "0.8"
 tracing = { workspace = true }
+zeroize = "1"
 
 [dependencies.lldap_domain]
 path = "../domain"
 
 [dependencies.lldap_domain_handlers]
 path = "../domain-handlers"
-
-[build-dependencies]
-bindgen = { version = "0.69.4", features = ["runtime"] }
-pkg-config = "0.3.30"
-
-[[bin]]
-name = "kerberos_manager"
-path = "src/bin/kerberos_manager.rs"
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }

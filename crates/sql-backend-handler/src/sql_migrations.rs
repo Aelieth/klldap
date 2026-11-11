@@ -142,6 +142,38 @@ pub(crate) enum Logs {
     Detail,
 }
 
+#[derive(DeriveIden, Clone, Copy)]
+pub(crate) enum KerberosPrincipals {
+    Table,
+    Name,
+    UserId,
+    Record,
+    HasKeys,
+    Disabled,
+    Kvno,
+    Expiration,
+    PasswordExpiration,
+    Policy,
+    ModifiedDate,
+}
+
+#[derive(DeriveIden, Clone, Copy)]
+pub(crate) enum KerberosPolicies {
+    Table,
+    Name,
+    Record,
+}
+
+#[derive(DeriveIden, Clone, Copy)]
+pub(crate) enum KerberosRealm {
+    Table,
+    Id,
+    Realm,
+    Generation,
+    Open,
+    State,
+}
+
 // Metadata about the SQL DB.
 #[derive(DeriveIden)]
 pub(crate) enum Metadata {
@@ -1660,6 +1692,150 @@ async fn ensure_index(
     }
 }
 
+async fn relation_missing(
+    transaction: &DatabaseTransaction,
+    backend: sea_orm::DbBackend,
+    table: DynIden,
+) -> Result<bool, DbErr> {
+    let savepoint = transaction.begin().await?;
+    let missing = savepoint
+        .execute(backend.build(Query::select().expr(1).from(table).limit(1)))
+        .await
+        .is_err();
+    savepoint.rollback().await?;
+    Ok(missing)
+}
+
+async fn ensure_kerberos(
+    transaction: &DatabaseTransaction,
+    backend: sea_orm::DbBackend,
+) -> Result<(), DbErr> {
+    if relation_missing(transaction, backend, KerberosPrincipals::Table.into_iden()).await? {
+        transaction
+            .execute(
+                backend.build(
+                    Table::create()
+                        .table(KerberosPrincipals::Table)
+                        .if_not_exists()
+                        .col(
+                            ColumnDef::new(KerberosPrincipals::Name)
+                                .string_len(255)
+                                .not_null()
+                                .primary_key(),
+                        )
+                        .col(
+                            ColumnDef::new(KerberosPrincipals::UserId)
+                                .string_len(255)
+                                .null(),
+                        )
+                        .col(ColumnDef::new(KerberosPrincipals::Record).blob().not_null())
+                        .col(
+                            ColumnDef::new(KerberosPrincipals::HasKeys)
+                                .boolean()
+                                .not_null(),
+                        )
+                        .col(
+                            ColumnDef::new(KerberosPrincipals::Disabled)
+                                .boolean()
+                                .not_null(),
+                        )
+                        .col(
+                            ColumnDef::new(KerberosPrincipals::Kvno)
+                                .integer()
+                                .not_null(),
+                        )
+                        .col(
+                            ColumnDef::new(KerberosPrincipals::Expiration)
+                                .date_time()
+                                .null(),
+                        )
+                        .col(
+                            ColumnDef::new(KerberosPrincipals::PasswordExpiration)
+                                .date_time()
+                                .null(),
+                        )
+                        .col(
+                            ColumnDef::new(KerberosPrincipals::Policy)
+                                .string_len(255)
+                                .null(),
+                        )
+                        .col(
+                            ColumnDef::new(KerberosPrincipals::ModifiedDate)
+                                .date_time()
+                                .not_null(),
+                        )
+                        .foreign_key(
+                            ForeignKey::create()
+                                .name("KerberosPrincipalUserForeignKey")
+                                .from(KerberosPrincipals::Table, KerberosPrincipals::UserId)
+                                .to(Users::Table, Users::UserId)
+                                .on_delete(ForeignKeyAction::Cascade),
+                        ),
+                ),
+            )
+            .await?;
+    }
+    ensure_index(
+        transaction,
+        backend,
+        Index::create()
+            .name("kerberos-principals-user-id")
+            .table(KerberosPrincipals::Table)
+            .col(KerberosPrincipals::UserId)
+            .unique()
+            .to_owned(),
+    )
+    .await?;
+    if relation_missing(transaction, backend, KerberosPolicies::Table.into_iden()).await? {
+        transaction
+            .execute(
+                backend.build(
+                    Table::create()
+                        .table(KerberosPolicies::Table)
+                        .if_not_exists()
+                        .col(
+                            ColumnDef::new(KerberosPolicies::Name)
+                                .string_len(255)
+                                .not_null()
+                                .primary_key(),
+                        )
+                        .col(ColumnDef::new(KerberosPolicies::Record).blob().not_null()),
+                ),
+            )
+            .await?;
+    }
+    if relation_missing(transaction, backend, KerberosRealm::Table.into_iden()).await? {
+        transaction
+            .execute(
+                backend.build(
+                    Table::create()
+                        .table(KerberosRealm::Table)
+                        .if_not_exists()
+                        .col(
+                            ColumnDef::new(KerberosRealm::Id)
+                                .integer()
+                                .not_null()
+                                .primary_key(),
+                        )
+                        .col(
+                            ColumnDef::new(KerberosRealm::Realm)
+                                .string_len(255)
+                                .not_null(),
+                        )
+                        .col(
+                            ColumnDef::new(KerberosRealm::Generation)
+                                .big_integer()
+                                .not_null(),
+                        )
+                        .col(ColumnDef::new(KerberosRealm::Open).boolean().not_null())
+                        .col(ColumnDef::new(KerberosRealm::State).blob().not_null()),
+                ),
+            )
+            .await?;
+    }
+    Ok(())
+}
+
 // v13 is the pre-release schema: databases already stamped 13 pick up its later additions
 // at the next boot instead of through a new version.
 pub(crate) async fn ensure_v13_additions(pool: &DbConnection) -> Result<(), DbErr> {
@@ -1667,6 +1843,7 @@ pub(crate) async fn ensure_v13_additions(pool: &DbConnection) -> Result<(), DbEr
     let backend = transaction.get_database_backend();
     ensure_logs(&transaction, backend).await?;
     ensure_policies(&transaction, backend).await?;
+    ensure_kerberos(&transaction, backend).await?;
     transaction.commit().await
 }
 

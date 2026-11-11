@@ -2145,3 +2145,344 @@ async fn test_postgres_fresh_install_lookups_and_retention() {
         .collect();
     assert_eq!(actors, vec!["new2", "new3", "new4"]);
 }
+
+fn kerberos_stamp() -> chrono::NaiveDateTime {
+    chrono::NaiveDateTime::parse_from_str("2026-01-01 00:00:00", "%Y-%m-%d %H:%M:%S").unwrap()
+}
+
+async fn insert_directory_user(pool: &DbConnection, user_id: &str, uuid: &str) {
+    let when = kerberos_stamp();
+    pool.execute(
+        pool.get_database_backend().build(
+            Query::insert()
+                .into_table(Users::Table)
+                .columns([
+                    Users::UserId,
+                    Users::Email,
+                    Users::LowercaseEmail,
+                    Users::CreationDate,
+                    Users::Uuid,
+                    Users::ModifiedDate,
+                    Users::PasswordModifiedDate,
+                ])
+                .values_panic([
+                    user_id.into(),
+                    format!("{user_id}@ex.com").into(),
+                    format!("{user_id}@ex.com").into(),
+                    when.into(),
+                    uuid.into(),
+                    when.into(),
+                    when.into(),
+                ]),
+        ),
+    )
+    .await
+    .unwrap();
+}
+
+async fn insert_principal(
+    pool: &DbConnection,
+    name: &str,
+    user_id: Option<&str>,
+) -> Result<(), sea_orm::DbErr> {
+    let user_value = match user_id {
+        Some(id) => Value::String(Some(Box::new(id.to_owned()))),
+        None => Value::String(None),
+    };
+    pool.execute(
+        pool.get_database_backend().build(
+            Query::insert()
+                .into_table(KerberosPrincipals::Table)
+                .columns([
+                    KerberosPrincipals::Name,
+                    KerberosPrincipals::UserId,
+                    KerberosPrincipals::Record,
+                    KerberosPrincipals::HasKeys,
+                    KerberosPrincipals::Disabled,
+                    KerberosPrincipals::Kvno,
+                    KerberosPrincipals::ModifiedDate,
+                ])
+                .values_panic([
+                    name.into(),
+                    user_value.into(),
+                    vec![1u8].into(),
+                    true.into(),
+                    false.into(),
+                    1i32.into(),
+                    kerberos_stamp().into(),
+                ]),
+        ),
+    )
+    .await
+    .map(|_| ())
+}
+
+async fn delete_directory_user(pool: &DbConnection, user_id: &str) {
+    pool.execute(
+        pool.get_database_backend().build(
+            Query::delete()
+                .from_table(Users::Table)
+                .and_where(Expr::col(Users::UserId).eq(user_id)),
+        ),
+    )
+    .await
+    .unwrap();
+}
+
+async fn count_sql(pool: &DbConnection, sql: &str) -> i64 {
+    CountRow::find_by_statement(sea_orm::Statement::from_string(
+        pool.get_database_backend(),
+        sql.to_owned(),
+    ))
+    .one(pool)
+    .await
+    .unwrap()
+    .unwrap()
+    .c
+}
+
+async fn assert_principal_user_rules(pool: &DbConnection) {
+    insert_directory_user(pool, "alice", "11111111-1111-1111-1111-111111111111").await;
+    insert_principal(pool, "alice", Some("alice"))
+        .await
+        .unwrap();
+    delete_directory_user(pool, "alice").await;
+    assert_eq!(
+        count_sql(
+            pool,
+            "SELECT COUNT(*) as c FROM kerberos_principals WHERE name = 'alice'",
+        )
+        .await,
+        0,
+        "deleting the user removes the principal row"
+    );
+
+    insert_principal(pool, "svc/a", None).await.unwrap();
+    insert_principal(pool, "svc/b", None).await.unwrap();
+    assert_eq!(
+        count_sql(
+            pool,
+            "SELECT COUNT(*) as c FROM kerberos_principals WHERE user_id IS NULL",
+        )
+        .await,
+        2,
+        "two principals may have a null user id"
+    );
+
+    insert_directory_user(pool, "bob", "22222222-2222-2222-2222-222222222222").await;
+    insert_principal(pool, "bob", Some("bob")).await.unwrap();
+    assert!(
+        insert_principal(pool, "bob/admin", Some("bob"))
+            .await
+            .is_err(),
+        "a user id may point at only one principal"
+    );
+    assert!(
+        insert_principal(pool, "ghost", Some("no-such-user"))
+            .await
+            .is_err(),
+        "a principal user id must name a user"
+    );
+}
+
+#[tokio::test]
+async fn test_ensure_kerberos_tables() {
+    let pool = get_in_memory_db().await;
+    init_table(&pool).await.unwrap();
+    #[derive(FromQueryResult)]
+    struct FkFlag {
+        foreign_keys: i32,
+    }
+    assert_eq!(
+        FkFlag::find_by_statement(raw_statement("PRAGMA foreign_keys"))
+            .one(&pool)
+            .await
+            .unwrap()
+            .unwrap()
+            .foreign_keys,
+        1,
+        "foreign keys stay on after init"
+    );
+    for table in ["kerberos_principals", "kerberos_policies", "kerberos_realm"] {
+        assert_eq!(
+            count(&pool, &format!("SELECT COUNT(*) as c FROM {table}")).await,
+            0,
+            "{table} is created empty"
+        );
+    }
+
+    #[derive(FromQueryResult)]
+    struct ColInfo {
+        name: String,
+        nn: i32,
+        col_type: String,
+    }
+    let columns = |table: &'static str| {
+        let pool = &pool;
+        async move {
+            ColInfo::find_by_statement(raw_statement(&format!(
+                "SELECT name, \"notnull\" as nn, type as col_type FROM pragma_table_info('{table}')"
+            )))
+            .all(pool)
+            .await
+            .unwrap()
+        }
+    };
+    let principal_cols = columns("kerberos_principals").await;
+    let expect = [
+        ("name", 1, "varchar(255)"),
+        ("user_id", 0, "varchar(255)"),
+        ("record", 1, "BLOB"),
+        ("has_keys", 1, "boolean"),
+        ("disabled", 1, "boolean"),
+        ("kvno", 1, "INTEGER"),
+        ("expiration", 0, "datetime_text"),
+        ("password_expiration", 0, "datetime_text"),
+        ("policy", 0, "varchar(255)"),
+        ("modified_date", 1, "datetime_text"),
+    ];
+    assert_eq!(principal_cols.len(), expect.len());
+    for (col, (name, notnull, col_type)) in principal_cols.iter().zip(expect) {
+        assert_eq!(col.name, name);
+        assert_eq!(col.nn, notnull, "{name}");
+        assert_eq!(col.col_type, col_type, "{name}");
+    }
+    let policy_cols = columns("kerberos_policies").await;
+    assert_eq!(
+        policy_cols
+            .iter()
+            .map(|c| (c.name.as_str(), c.nn, c.col_type.as_str()))
+            .collect::<Vec<_>>(),
+        vec![("name", 1, "varchar(255)"), ("record", 1, "BLOB")]
+    );
+    let realm_cols = columns("kerberos_realm").await;
+    assert_eq!(
+        realm_cols
+            .iter()
+            .map(|c| (c.name.as_str(), c.nn, c.col_type.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("id", 1, "INTEGER"),
+            ("realm", 1, "varchar(255)"),
+            ("generation", 1, "bigint"),
+            ("open", 1, "boolean"),
+            ("state", 1, "BLOB"),
+        ]
+    );
+    #[derive(FromQueryResult)]
+    struct SqlRow {
+        sql: String,
+    }
+    let realm_sql = SqlRow::find_by_statement(raw_statement(
+        "SELECT sql FROM sqlite_master WHERE name = 'kerberos_realm'",
+    ))
+    .one(&pool)
+    .await
+    .unwrap()
+    .unwrap()
+    .sql;
+    assert!(
+        !realm_sql.to_ascii_uppercase().contains("AUTOINCREMENT"),
+        "{realm_sql}"
+    );
+
+    #[derive(FromQueryResult)]
+    struct FkInfo {
+        src: String,
+        dest: String,
+        on_update: String,
+        on_delete: String,
+    }
+    let fks = FkInfo::find_by_statement(raw_statement(
+        "SELECT \"from\" as src, \"table\" as dest, on_update, on_delete \
+         FROM pragma_foreign_key_list('kerberos_principals')",
+    ))
+    .all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(fks.len(), 1);
+    assert_eq!(fks[0].src, "user_id");
+    assert_eq!(fks[0].dest, "users");
+    assert_eq!(fks[0].on_delete, "CASCADE");
+    assert_eq!(fks[0].on_update, "NO ACTION");
+
+    #[derive(Debug, FromQueryResult)]
+    struct IndexInfo {
+        name: String,
+        is_unique: i32,
+    }
+    let indexes = IndexInfo::find_by_statement(raw_statement(
+        "SELECT name, \"unique\" as is_unique FROM pragma_index_list('kerberos_principals')",
+    ))
+    .all(&pool)
+    .await
+    .unwrap();
+    assert!(
+        indexes
+            .iter()
+            .any(|i| i.name == "kerberos-principals-user-id" && i.is_unique == 1),
+        "{indexes:?}"
+    );
+
+    assert_principal_user_rules(&pool).await;
+
+    #[derive(FromQueryResult)]
+    struct NameRow {
+        name: String,
+    }
+    let index_names = || {
+        let pool = &pool;
+        async move {
+            let mut names: Vec<String> = NameRow::find_by_statement(raw_statement(
+                "SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name IN \
+                 ('kerberos_principals', 'kerberos_policies', 'kerberos_realm') ORDER BY name",
+            ))
+            .all(pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.name)
+            .collect();
+            names.sort();
+            names
+        }
+    };
+    let before = index_names().await;
+    insert_principal(&pool, "HTTP/kept.example.com", None)
+        .await
+        .unwrap();
+    ensure_v13_additions(&pool).await.unwrap();
+    assert_eq!(index_names().await, before);
+    assert_eq!(
+        count_sql(
+            &pool,
+            "SELECT COUNT(*) as c FROM kerberos_principals WHERE name = 'HTTP/kept.example.com'",
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_ensure_kerberos_tables() {
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres().await else {
+        eprintln!("KLLDAP_TEST_DATABASE_URL not set; skipping");
+        return;
+    };
+    init_table(&pool).await.unwrap();
+    assert_principal_user_rules(&pool).await;
+    insert_principal(&pool, "HTTP/kept.example.com", None)
+        .await
+        .unwrap();
+    ensure_v13_additions(&pool).await.unwrap();
+    assert_eq!(
+        count_sql(
+            &pool,
+            "SELECT COUNT(*) as c FROM kerberos_principals WHERE name = 'HTTP/kept.example.com'",
+        )
+        .await,
+        1
+    );
+}

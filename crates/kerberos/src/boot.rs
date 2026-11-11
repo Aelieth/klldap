@@ -1,3 +1,4 @@
+use crate::policy::LiveClients;
 use anyhow::{Context, Result, bail};
 use krb5_config::{KdcConf, KdcPaths, Krb5Conf, ProfileSet, listen::ListenAddr};
 use krb5_crypto::{EncryptionType, parse_enctype_list};
@@ -8,6 +9,7 @@ use std::fs;
 use std::net::{IpAddr, SocketAddr, TcpListener, UdpSocket};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tracing::{info, warn};
 
 const MASTER_KEY_TYPE: &str = "aes256-cts-hmac-sha1-96";
@@ -72,7 +74,11 @@ pub(crate) fn open(settings: &RealmSettings) -> Result<OpenRealm> {
         bail!("this build lacks --cfg p384_backend=\"fiat\" (.cargo/config.toml), so P-384 is off");
     }
     let profile = profile(settings);
-    let store = open_store(settings, &profile)?;
+    let mut store = open_store(settings, &profile)?;
+    store
+        .policy
+        .plugins
+        .register_kdcpolicy(Arc::new(LiveClients));
     write_client_config(settings)?;
 
     let kdc_addr = ListenAddr {

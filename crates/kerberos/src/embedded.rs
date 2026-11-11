@@ -522,7 +522,7 @@ pub(crate) mod tests {
             }
         }
 
-        fn embedded(&self) -> (EmbeddedKerberos, SharedDump) {
+        pub(crate) fn embedded(&self) -> (EmbeddedKerberos, SharedDump) {
             let profile = boot::profile(&self.settings);
             let store = krb5_kdc::shared_dump(boot::open_store(&self.settings, &profile).unwrap());
             let ready = Arc::new(AtomicBool::new(true));

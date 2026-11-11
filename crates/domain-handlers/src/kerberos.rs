@@ -228,6 +228,114 @@ pub fn set_kerberos_backend(backend: Arc<dyn KerberosSync>) {
     *BACKEND.write().expect("kerberos backend") = backend;
 }
 
+pub fn user_id_for_principal_name(name: &str) -> Option<&str> {
+    if name.is_empty() || name.contains('/') || name.contains('@') {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrincipalRow {
+    pub name: String,
+    pub record: Vec<u8>,
+    pub has_keys: bool,
+    pub disabled: bool,
+    pub kvno: i32,
+    pub expiration: Option<chrono::NaiveDateTime>,
+    pub password_expiration: Option<chrono::NaiveDateTime>,
+    pub policy: Option<String>,
+    pub modified_date: chrono::NaiveDateTime,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadedPrincipal {
+    pub name: String,
+    pub record: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PolicyRow {
+    pub name: String,
+    pub record: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RealmState {
+    pub realm: String,
+    pub state: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadedRealm {
+    pub principals: Vec<LoadedPrincipal>,
+    pub policies: Vec<PolicyRow>,
+    pub realm: Option<RealmState>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RealmBatch {
+    pub upsert_principals: Vec<PrincipalRow>,
+    pub delete_principals: Vec<String>,
+    pub put_policies: Vec<PolicyRow>,
+    pub delete_policies: Vec<String>,
+    pub realm: Option<RealmState>,
+}
+
+#[derive(Clone, Debug)]
+pub enum KerberosStoreError {
+    NotReady(String),
+    Failed(String),
+    Refused(String),
+}
+
+impl std::fmt::Display for KerberosStoreError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotReady(reason) => write!(f, "Kerberos store not ready: {reason}"),
+            Self::Failed(reason) => write!(f, "Kerberos store failed: {reason}"),
+            Self::Refused(reason) => write!(f, "Kerberos store refused the change: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for KerberosStoreError {}
+
+pub trait KerberosStore: Send + Sync {
+    fn load(&self) -> Result<LoadedRealm, KerberosStoreError>;
+    fn commit(&self, batch: RealmBatch) -> Result<(), KerberosStoreError>;
+}
+
+const STORE_NOT_REGISTERED: &str = "Kerberos store not registered";
+
+pub struct NoopKerberosStore;
+
+impl KerberosStore for NoopKerberosStore {
+    fn load(&self) -> Result<LoadedRealm, KerberosStoreError> {
+        Err(KerberosStoreError::NotReady(
+            STORE_NOT_REGISTERED.to_owned(),
+        ))
+    }
+
+    fn commit(&self, _: RealmBatch) -> Result<(), KerberosStoreError> {
+        Err(KerberosStoreError::NotReady(
+            STORE_NOT_REGISTERED.to_owned(),
+        ))
+    }
+}
+
+static STORE: LazyLock<RwLock<Arc<dyn KerberosStore>>> =
+    LazyLock::new(|| RwLock::new(Arc::new(NoopKerberosStore)));
+
+pub fn kerberos_store() -> Arc<dyn KerberosStore> {
+    STORE.read().expect("kerberos store").clone()
+}
+
+pub fn set_kerberos_store(store: Arc<dyn KerberosStore>) {
+    *STORE.write().expect("kerberos store") = store;
+}
+
 /// Directory writes are refused until the KDC has come up, so nothing changes that the
 /// KDC could not follow.
 pub fn require_kdc_ready() -> Result<(), DomainError> {
@@ -246,6 +354,96 @@ pub fn require_kdc_ready() -> Result<(), DomainError> {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use serial_test::serial;
+    use std::sync::Mutex;
+
+    struct RestoreStore;
+    impl Drop for RestoreStore {
+        fn drop(&mut self) {
+            set_kerberos_store(Arc::new(NoopKerberosStore));
+        }
+    }
+
+    struct MockStore {
+        loaded: LoadedRealm,
+        committed: Mutex<Option<RealmBatch>>,
+    }
+
+    impl KerberosStore for MockStore {
+        fn load(&self) -> Result<LoadedRealm, KerberosStoreError> {
+            Ok(self.loaded.clone())
+        }
+
+        fn commit(&self, batch: RealmBatch) -> Result<(), KerberosStoreError> {
+            *self.committed.lock().expect("mock batch") = Some(batch);
+            Ok(())
+        }
+    }
+
+    fn sample_batch() -> RealmBatch {
+        RealmBatch {
+            upsert_principals: vec![PrincipalRow {
+                name: "alice".to_owned(),
+                record: vec![1],
+                has_keys: true,
+                disabled: false,
+                kvno: 1,
+                expiration: None,
+                password_expiration: None,
+                policy: None,
+                modified_date: chrono::NaiveDateTime::parse_from_str(
+                    "1970-01-01 00:00:00",
+                    "%Y-%m-%d %H:%M:%S",
+                )
+                .unwrap(),
+            }],
+            delete_principals: vec!["bob".to_owned()],
+            put_policies: vec![PolicyRow {
+                name: "default".to_owned(),
+                record: vec![2],
+            }],
+            delete_policies: vec!["old".to_owned()],
+            realm: Some(RealmState {
+                realm: "EXAMPLE.COM".to_owned(),
+                state: vec![3],
+            }),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_kerberos_store_registration() {
+        let restore = RestoreStore;
+        let loaded = LoadedRealm {
+            principals: vec![LoadedPrincipal {
+                name: "alice".to_owned(),
+                record: vec![1],
+            }],
+            policies: vec![],
+            realm: Some(RealmState {
+                realm: "EXAMPLE.COM".to_owned(),
+                state: vec![3],
+            }),
+        };
+        let mock = Arc::new(MockStore {
+            loaded: loaded.clone(),
+            committed: Mutex::new(None),
+        });
+        set_kerberos_store(mock.clone());
+        assert_eq!(kerberos_store().load().unwrap(), loaded);
+        let batch = sample_batch();
+        kerberos_store().commit(batch.clone()).unwrap();
+        assert_eq!(mock.committed.lock().unwrap().clone().unwrap(), batch);
+        drop(restore);
+        assert!(kerberos_store().load().is_err());
+    }
+
+    #[test]
+    fn test_user_id_for_principal_name() {
+        assert_eq!(user_id_for_principal_name("alice"), Some("alice"));
+        assert_eq!(user_id_for_principal_name("HTTP/kc.example.com"), None);
+        assert_eq!(user_id_for_principal_name("krbtgt/REALM"), None);
+    }
 
     #[test]
     fn test_domain_and_realm_from_base_dn() {

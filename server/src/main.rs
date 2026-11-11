@@ -28,9 +28,9 @@ use actix_server::ServerBuilder;
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::TryFutureExt;
 use lldap_sql_backend_handler::{
-    LogRetention, SqlBackendHandler, register_password,
+    KerberosLost, LogRetention, SqlBackendHandler, register_password,
     sql_tables::{self, get_private_key_info, set_private_key_info},
-    start_log_writer,
+    sqlite_full_synchronous, start_kerberos_committer, start_log_writer, warn_database_durability,
 };
 use sea_orm::{Database, DatabaseConnection};
 use std::{net::IpAddr, sync::Arc, time::Duration};
@@ -153,6 +153,9 @@ async fn setup_sql_tables(database_url: &DatabaseUrl) -> Result<DatabaseConnecti
             .max_connections(num_connections)
             .sqlx_logging(true)
             .sqlx_logging_level(log::LevelFilter::Debug);
+        if database_url.db_type() == "sqlite" {
+            sql_opt.map_sqlx_sqlite_opts(sqlite_full_synchronous);
+        }
         Database::connect(sql_opt).await?
     };
     sql_tables::init_table(&sql_pool)
@@ -288,25 +291,30 @@ async fn set_up_server(
     }
     let (realm_threads, embedded) = match config.kerberos_options.enabled {
         false => (None, None),
-        true => match EmbeddedKerberos::start(&config.kerberos_settings()?) {
-            Ok((embedded, threads)) => {
-                set_kerberos_backend(embedded.clone());
-                reconcile_principals(&backend_handler, &embedded).await?;
-                (Some(threads), Some(embedded))
+        true => {
+            warn_database_durability(&sql_pool)
+                .await
+                .context("while reading database durability")?;
+            match EmbeddedKerberos::start(&config.kerberos_settings()?) {
+                Ok((embedded, threads)) => {
+                    set_kerberos_backend(embedded.clone());
+                    reconcile_principals(&backend_handler, &embedded).await?;
+                    (Some(threads), Some(embedded))
+                }
+                Err(e) => {
+                    let cause = format!("the Kerberos realm {realm} did not open: {e:#}");
+                    error!("{cause}");
+                    set_kerberos_backend(Arc::new(DegradedKerberos::new(realm.clone(), cause)));
+                    config.ldap_host = loopback(&config.ldap_host);
+                    config.http_host = loopback(&config.http_host);
+                    warn!(
+                        "Only admins may sign in, over LDAP on {} and HTTP on {}",
+                        config.ldap_host, config.http_host
+                    );
+                    (None, None)
+                }
             }
-            Err(e) => {
-                let cause = format!("the Kerberos realm {realm} did not open: {e:#}");
-                error!("{cause}");
-                set_kerberos_backend(Arc::new(DegradedKerberos::new(realm.clone(), cause)));
-                config.ldap_host = loopback(&config.ldap_host);
-                config.http_host = loopback(&config.http_host);
-                warn!(
-                    "Only admins may sign in, over LDAP on {} and HTTP on {}",
-                    config.ldap_host, config.http_host
-                );
-                (None, None)
-            }
-        },
+        }
     };
     let server_builder = ldap_server::build_ldap_server(
         &config,
@@ -351,23 +359,61 @@ async fn reconcile_principals(
     Ok(())
 }
 
-async fn serve(server: ServerBuilder, realm: Option<RealmThreads>) -> Result<()> {
+async fn serve(
+    server: ServerBuilder,
+    realm: Option<RealmThreads>,
+    lost: Option<tokio::sync::watch::Receiver<Option<KerberosLost>>>,
+) -> Result<()> {
+    if lost.as_ref().is_some_and(|lost| lost.borrow().is_some()) {
+        return realm_lost(lost.as_ref().unwrap());
+    }
     let server = server.workers(1).run();
-    let Some(mut realm) = realm else {
-        return server.await.context("while starting the server");
-    };
-    let handle = server.handle();
-    let served = tokio::select! {
-        served = server => served.context("while starting the server"),
-        cause = realm.died() => {
-            handle.stop(true).await;
-            Err(anyhow!("the Kerberos realm stopped: {cause}"))
+    match (realm, lost) {
+        (None, None) => server.await.context("while starting the server"),
+        (None, Some(mut lost)) => tokio::select! {
+            served = server => served.context("while starting the server"),
+            _ = lost.changed() => realm_lost(&lost),
+        },
+        (Some(mut realm), None) => {
+            let handle = server.handle();
+            let served = tokio::select! {
+                served = server => served.context("while starting the server"),
+                cause = realm.died() => {
+                    handle.stop(true).await;
+                    Err(anyhow!("the Kerberos realm stopped: {cause}"))
+                }
+            };
+            tokio::task::spawn_blocking(move || realm.stop())
+                .await
+                .context("while stopping the Kerberos realm")?;
+            served
         }
-    };
-    tokio::task::spawn_blocking(move || realm.stop())
-        .await
-        .context("while stopping the Kerberos realm")?;
-    served
+        (Some(mut realm), Some(mut lost)) => {
+            let handle = server.handle();
+            let served = tokio::select! {
+                served = server => served.context("while starting the server"),
+                cause = realm.died() => {
+                    handle.stop(true).await;
+                    Err(anyhow!("the Kerberos realm stopped: {cause}"))
+                }
+                _ = lost.changed() => {
+                    handle.stop(true).await;
+                    realm_lost(&lost)
+                }
+            };
+            tokio::task::spawn_blocking(move || realm.stop())
+                .await
+                .context("while stopping the Kerberos realm")?;
+            served
+        }
+    }
+}
+
+fn realm_lost(lost: &tokio::sync::watch::Receiver<Option<KerberosLost>>) -> Result<()> {
+    match lost.borrow().clone() {
+        Some(cause) => Err(anyhow!("the Kerberos realm was lost: {cause}")),
+        None => Err(anyhow!("the Kerberos realm was lost")),
+    }
 }
 
 async fn run_server_command(opts: RunOpts) -> Result<()> {
@@ -378,6 +424,11 @@ async fn run_server_command(opts: RunOpts) -> Result<()> {
     info!("Starting LLDAP version {}", env!("CARGO_PKG_VERSION"));
 
     let sql_pool = setup_sql_tables(&config.database_url).await?;
+    let committer = config
+        .kerberos_options
+        .enabled
+        .then(|| start_kerberos_committer(sql_pool.clone()));
+    let lost = committer.as_ref().map(|committer| committer.lost());
     let log_writer = config.log_options.persist.then(|| {
         start_log_writer(
             sql_pool.clone(),
@@ -390,10 +441,13 @@ async fn run_server_command(opts: RunOpts) -> Result<()> {
     let result = match set_up_server(config, sql_pool.clone()).await {
         Ok((server, realm)) => {
             record(LogKind::ServerStart, None, Some(env!("CARGO_PKG_VERSION")));
-            serve(server, realm).await
+            serve(server, realm, lost).await
         }
         Err(e) => Err(e),
     };
+    if let Some(committer) = committer {
+        committer.shutdown().await;
+    }
     if let Some(writer) = log_writer {
         writer.shutdown().await;
     }

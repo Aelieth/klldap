@@ -2486,3 +2486,38 @@ async fn test_postgres_ensure_kerberos_tables() {
         1
     );
 }
+
+#[tokio::test]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_kerberos_batch() {
+    use crate::sql_kerberos_handler::tests::{
+        scenario_batch_round_trip, scenario_failure_rolls_back, scenario_stale_generation,
+    };
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres().await else {
+        eprintln!("KLLDAP_TEST_DATABASE_URL not set; skipping");
+        return;
+    };
+    scenario_batch_round_trip(&pool).await;
+    let Some(pool) = connect_scratch_postgres().await else {
+        eprintln!("KLLDAP_TEST_DATABASE_URL not set; skipping");
+        return;
+    };
+    scenario_stale_generation(&pool).await;
+    let Some(pool) = connect_scratch_postgres().await else {
+        eprintln!("KLLDAP_TEST_DATABASE_URL not set; skipping");
+        return;
+    };
+    scenario_failure_rolls_back(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_take_one_wins() {
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres().await else {
+        eprintln!("KLLDAP_TEST_DATABASE_URL not set; skipping");
+        return;
+    };
+    crate::sql_kerberos_handler::tests::scenario_take_one_wins(&pool).await;
+}

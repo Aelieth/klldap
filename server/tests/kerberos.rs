@@ -126,8 +126,20 @@ fn kinit(krb: &KrbClient, password: &str) -> Output {
     krb.run("kinit", &["-r", "1d", USER], Some(password))
 }
 
-#[test]
-fn kerberos_lifecycle() {
+fn kinit_user(krb: &KrbClient, user: &str, password: &str) -> Output {
+    krb.run("kinit", &["-r", "1d", user], Some(password))
+}
+
+struct Realm {
+    _dir: tempfile::TempDir,
+    fixture: LLDAPFixture,
+    krb: KrbClient,
+    admin_keytab: PathBuf,
+    keycloak_keytab: PathBuf,
+    client_config: PathBuf,
+}
+
+fn start_realm(capture_log: bool) -> Realm {
     let realm_dir = tempfile::TempDir::new().expect("realm dir");
     let kdc_port = free_port();
     let kadmin_port = free_port();
@@ -161,14 +173,52 @@ fn kerberos_lifecycle() {
             client_config_s.as_str(),
         ),
     ];
-    let mut fixture = LLDAPFixture::new_with_env(&env);
-    let http = client();
-    let base = fixture.http_url();
-    let mut token = get_token(&http, &base);
+    let fixture = if capture_log {
+        LLDAPFixture::new_with_env_logged(&env)
+    } else {
+        LLDAPFixture::new_with_env(&env)
+    };
     let krb = KrbClient {
         config: client_config.clone(),
         ccache,
     };
+    Realm {
+        _dir: realm_dir,
+        fixture,
+        krb,
+        admin_keytab,
+        keycloak_keytab,
+        client_config,
+    }
+}
+
+fn expect_revoked(output: &Output, what: &str) {
+    expect_fail(output, what);
+    let text = output_text(output);
+    assert!(
+        text.contains("credentials have been revoked"),
+        "{what}: {text}"
+    );
+}
+
+fn assert_log_line(fixture: &LLDAPFixture, line: &str) {
+    let log = fixture.server_log();
+    assert!(log.contains(line), "missing {line}\n{log}");
+}
+
+#[test]
+fn kerberos_lifecycle() {
+    let mut realm = start_realm(false);
+    let http = client();
+    let base = realm.fixture.http_url();
+    let mut token = get_token(&http, &base);
+    let krb = KrbClient {
+        config: realm.krb.config.clone(),
+        ccache: realm.krb.ccache.clone(),
+    };
+    let admin_keytab_s = realm.admin_keytab.display().to_string();
+    let keycloak_keytab_s = realm.keycloak_keytab.display().to_string();
+    let client_config = realm.client_config.clone();
 
     let created = gql(
         &http,
@@ -262,15 +312,15 @@ fn kerberos_lifecycle() {
     expect_fail(&kinit(&krb, FIRST), "kinit with the old password");
     expect_ok(&kinit(&krb, SECOND), "kinit with the new password");
 
-    let keytab_before = std::fs::metadata(&admin_keytab)
+    let keytab_before = std::fs::metadata(&admin_keytab_s)
         .expect("admin keytab")
         .modified()
         .unwrap_or(SystemTime::UNIX_EPOCH);
     std::thread::sleep(Duration::from_secs(1));
-    fixture.restart();
+    realm.fixture.restart();
     token = get_token(&http, &base);
     expect_ok(&kinit(&krb, SECOND), "kinit after restart");
-    let keytab_after = std::fs::metadata(&admin_keytab)
+    let keytab_after = std::fs::metadata(&admin_keytab_s)
         .expect("admin keytab after restart")
         .modified()
         .unwrap_or(SystemTime::UNIX_EPOCH);
@@ -329,4 +379,115 @@ fn kerberos_lifecycle() {
         output_text(&listed_keytab)
     );
     assert!(Path::new(&client_config).is_file());
+}
+
+#[test]
+fn kerberos_disabled_ticket() {
+    const BOB: &str = "bob";
+    const PASS: &str = "BobSmoke-2026!";
+    const SERVICE_HOST: &str = "kc.example.com";
+    let principal = format!("{BOB}@{REALM}");
+    let service = format!("HTTP/{SERVICE_HOST}@{REALM}");
+    let realm = start_realm(true);
+    let http = client();
+    let base = realm.fixture.http_url();
+    let token = get_token(&http, &base);
+    let krb = &realm.krb;
+
+    let created = gql(
+        &http,
+        &base,
+        &token,
+        "mutation($u: CreateUserInput!) { createUser(user: $u) { id } }",
+        json!({"u": {
+            "id": BOB,
+            "email": "bob@example.com",
+            "attributes": [{"name": "kerberossync", "value": ["1"]}]
+        }}),
+    );
+    assert_eq!(created["data"]["createUser"]["id"], BOB, "{created}");
+    let set = gql(
+        &http,
+        &base,
+        &token,
+        "mutation($id: String!, $password: String!) { setUserPassword(userId: $id, password: $password) { ok } }",
+        json!({"id": BOB, "password": PASS}),
+    );
+    assert_eq!(set["data"]["setUserPassword"]["ok"], true, "{set}");
+    let exported = gql(
+        &http,
+        &base,
+        &token,
+        "mutation($h: String!) { exportKeytabForKeycloak(hostname: $h) { ok path errorMsg } }",
+        json!({"h": SERVICE_HOST}),
+    );
+    assert_eq!(
+        exported["data"]["exportKeytabForKeycloak"]["ok"], true,
+        "{exported}"
+    );
+
+    expect_ok(&kinit_user(krb, BOB, PASS), "kinit bob");
+    expect_ok(&krb.run("kvno", &[service.as_str()], None), "control kvno");
+    expect_ok(&krb.run("kinit", &["-R"], None), "control kinit -R");
+
+    let disabled = group_id(&http, &base, &token, "lldap_disabled");
+    let added = gql(
+        &http,
+        &base,
+        &token,
+        "mutation($u: String!, $g: Int!) { addUserToGroup(userId: $u, groupId: $g) { ok } }",
+        json!({"u": BOB, "g": disabled}),
+    );
+    assert_eq!(added["data"]["addUserToGroup"]["ok"], true, "{added}");
+    expect_revoked(&krb.run("kvno", &[service.as_str()], None), "disabled kvno");
+    expect_revoked(&krb.run("kinit", &["-R"], None), "disabled kinit -R");
+    let listed = krb.run("klist", &[], None);
+    expect_ok(&listed, "klist while disabled");
+    assert!(
+        output_text(&listed).contains(&format!("krbtgt/{REALM}@{REALM}")),
+        "{}",
+        output_text(&listed)
+    );
+    assert_log_line(
+        &realm.fixture,
+        &format!("Refused a Kerberos ticket request from {principal}: the principal is disabled"),
+    );
+
+    let removed = gql(
+        &http,
+        &base,
+        &token,
+        "mutation($u: String!, $g: Int!) { removeUserFromGroup(userId: $u, groupId: $g) { ok } }",
+        json!({"u": BOB, "g": disabled}),
+    );
+    assert_eq!(
+        removed["data"]["removeUserFromGroup"]["ok"], true,
+        "{removed}"
+    );
+    expect_ok(&krb.run("kvno", &[service.as_str()], None), "enabled kvno");
+    expect_ok(&krb.run("kinit", &["-R"], None), "enabled kinit -R");
+
+    let deleted = gql(
+        &http,
+        &base,
+        &token,
+        "mutation($id: String!) { deleteUser(userId: $id) { ok } }",
+        json!({"id": BOB}),
+    );
+    assert_eq!(deleted["data"]["deleteUser"]["ok"], true, "{deleted}");
+    expect_revoked(&krb.run("kvno", &[service.as_str()], None), "deleted kvno");
+    expect_revoked(&krb.run("kinit", &["-R"], None), "deleted kinit -R");
+    let listed = krb.run("klist", &[], None);
+    expect_ok(&listed, "klist after delete");
+    assert!(
+        output_text(&listed).contains(&format!("krbtgt/{REALM}@{REALM}")),
+        "{}",
+        output_text(&listed)
+    );
+    assert_log_line(
+        &realm.fixture,
+        &format!(
+            "Refused a Kerberos ticket request from {principal}: the principal no longer exists"
+        ),
+    );
 }

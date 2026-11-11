@@ -15,7 +15,9 @@ use nix::{
 use reqwest::blocking::{Client, ClientBuilder};
 use sea_orm::{ConnectionTrait, Database, DbBackend, Statement};
 use std::collections::{HashMap, HashSet};
-use std::process::{Child as ChildProcess, Command};
+use std::fs::OpenOptions;
+use std::path::{Path, PathBuf};
+use std::process::{Child as ChildProcess, Command, Stdio};
 use std::sync::{LazyLock, Mutex};
 use std::{fs::canonicalize, thread, time::Duration};
 use uuid::Uuid;
@@ -54,6 +56,7 @@ pub struct LLDAPFixture {
     http_port: u16,
     db_url: String,
     extra_env: Vec<(String, String)>,
+    server_log: Option<PathBuf>,
     _dir: tempfile::TempDir,
 }
 
@@ -65,7 +68,16 @@ impl LLDAPFixture {
     }
 
     pub fn new_with_env(extra_env: &[(&str, &str)]) -> Self {
+        Self::start(extra_env, false)
+    }
+
+    pub fn new_with_env_logged(extra_env: &[(&str, &str)]) -> Self {
+        Self::start(extra_env, true)
+    }
+
+    fn start(extra_env: &[(&str, &str)], capture_log: bool) -> Self {
         let dir = tempfile::TempDir::new().expect("temp dir");
+        let server_log = capture_log.then(|| dir.path().join("server.log"));
         let db_url = format!("sqlite://{}/users.db?mode=rwc", dir.path().display());
         let ldap_port = free_port();
         let http_port = free_port();
@@ -73,7 +85,13 @@ impl LLDAPFixture {
             .iter()
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect::<Vec<_>>();
-        let child = spawn_server(&db_url, ldap_port, http_port, &extra_env);
+        let child = spawn_server(
+            &db_url,
+            ldap_port,
+            http_port,
+            &extra_env,
+            server_log.as_deref(),
+        );
         wait_until_healthy(&db_url, ldap_port, http_port, &extra_env);
 
         let client = ClientBuilder::new()
@@ -94,8 +112,17 @@ impl LLDAPFixture {
             http_port,
             db_url,
             extra_env,
+            server_log,
             _dir: dir,
         }
+    }
+
+    pub fn server_log(&self) -> String {
+        let path = self
+            .server_log
+            .as_ref()
+            .expect("server log was not requested");
+        std::fs::read_to_string(path).unwrap_or_default()
     }
 
     pub fn restart(&mut self) {
@@ -105,6 +132,7 @@ impl LLDAPFixture {
             self.ldap_port,
             self.http_port,
             &self.extra_env,
+            self.server_log.as_deref(),
         );
         wait_until_healthy(
             &self.db_url,
@@ -266,11 +294,20 @@ fn spawn_server(
     ldap_port: u16,
     http_port: u16,
     extra_env: &[(String, String)],
+    log: Option<&Path>,
 ) -> ChildProcess {
-    server_command("run", db_url, ldap_port, http_port, extra_env)
-        .arg("--verbose")
-        .spawn()
-        .expect("Unable to start server")
+    let mut cmd = server_command("run", db_url, ldap_port, http_port, extra_env);
+    cmd.arg("--verbose");
+    if let Some(path) = log {
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("server log");
+        let err = file.try_clone().expect("server log");
+        cmd.stdout(Stdio::from(file)).stderr(Stdio::from(err));
+    }
+    cmd.spawn().expect("Unable to start server")
 }
 
 fn wait_until_healthy(

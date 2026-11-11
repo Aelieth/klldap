@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use lldap_domain::types::UserId;
-use lldap_domain_handlers::kerberos::{KerberosSync, NoopKerberos, set_kerberos_backend};
+use lldap_domain_handlers::kerberos::{
+    DegradedKerberos, KerberosSync, NoopKerberos, set_kerberos_backend,
+};
 use std::sync::{Arc, Mutex};
 
 pub const RECORDER_REALM: &str = "RECORDER.TEST";
@@ -128,6 +130,26 @@ impl NotReadyGuard {
 }
 
 impl Drop for NotReadyGuard {
+    fn drop(&mut self) {
+        set_kerberos_backend(Arc::new(NoopKerberos::default()));
+    }
+}
+
+pub const DEGRADED_CAUSE: &str = "the Kerberos realm did not open: test";
+
+pub struct DegradedGuard;
+
+impl DegradedGuard {
+    pub fn install() -> Self {
+        set_kerberos_backend(Arc::new(DegradedKerberos::new(
+            RECORDER_REALM.to_owned(),
+            DEGRADED_CAUSE.to_owned(),
+        )));
+        Self
+    }
+}
+
+impl Drop for DegradedGuard {
     fn drop(&mut self) {
         set_kerberos_backend(Arc::new(NoopKerberos::default()));
     }

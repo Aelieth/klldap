@@ -10,7 +10,7 @@ use lldap_domain_handlers::handler::{
 };
 use lldap_domain_model::error::DomainError;
 use lldap_sql_backend_handler::{SqlBackendHandler, register_password, sql_tables::init_table};
-use lldap_test_utils::recording_kerberos::NotReadyGuard;
+use lldap_test_utils::recording_kerberos::{DEGRADED_CAUSE, DegradedGuard, NotReadyGuard};
 use sea_orm::Database;
 
 #[tokio::test]
@@ -44,6 +44,19 @@ async fn test_directory_writes_wait_for_the_kdc() {
         "password registration must wait for the KDC"
     );
     assert_eq!(handler.list_users(None, false).await.unwrap().len(), 1);
+    drop(_kdc);
+
+    let _kdc = DegradedGuard::install();
+    let refused = handler
+        .create_group(CreateGroupRequest {
+            display_name: "late".into(),
+            ..Default::default()
+        })
+        .await;
+    assert!(
+        matches!(&refused, Err(DomainError::KdcUnavailable(cause)) if cause == DEGRADED_CAUSE),
+        "{refused:?}"
+    );
     drop(_kdc);
 
     handler

@@ -19,9 +19,10 @@ use ldap3_proto::proto::{
     LdapResult as LdapResultOp, LdapResultCode, LdapSearchRequest, OID_PASSWORD_MODIFY, OID_WHOAMI,
 };
 use lldap_access_control::AccessControlledBackendHandler;
-use lldap_auth::access_control::ValidationResults;
+use lldap_auth::access_control::{Permission, ValidationResults};
 use lldap_domain::types::UserId;
 use lldap_domain_handlers::handler::{BackendHandler, LoginHandler};
+use lldap_domain_handlers::kerberos::kerberos_backend;
 use lldap_domain_handlers::logging::{self, LogKind, RequestMeta, with_request};
 use lldap_opaque_handler::OpaqueHandler;
 use lldap_schema::PublicSchema;
@@ -183,10 +184,13 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
             Ok(user_id) => {
                 self.user_info = self
                     .backend_handler
-                    .get_permissions_for_user(user_id)
+                    .get_permissions_for_user(user_id.clone())
                     .await
                     .ok();
-                (LdapResultCode::Success, "".to_string())
+                match self.refuse_unless_admin(&user_id) {
+                    Some(cause) => (LdapResultCode::Unavailable, cause),
+                    None => (LdapResultCode::Success, "".to_string()),
+                }
             }
             Err(err) => (err.code, err.message),
         };
@@ -199,6 +203,22 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
             },
             saslcreds: None,
         })]
+    }
+
+    fn refuse_unless_admin(&mut self, user_id: &UserId) -> Option<String> {
+        let cause = kerberos_backend().unavailable()?;
+        if (self.user_info.as_ref()).is_some_and(|info| info.permission == Permission::Admin) {
+            return None;
+        }
+        self.user_info = None;
+        logging::record_as(
+            Some(user_id),
+            LogKind::AccessDenied,
+            Some(user_id.as_str()),
+            false,
+            Some("only admins may bind while Kerberos is unavailable"),
+        );
+        Some(cause)
     }
 
     // A known user bound under the wrong OU is refused before any password work, so the
@@ -456,11 +476,14 @@ fn result_of(op: &LdapOp) -> Option<&LdapResultOp> {
 pub mod tests {
     use super::*;
     use lldap_auth::access_control::{Permission, ValidationResults};
-    use lldap_domain::types::UserId;
+    use lldap_domain::types::{GroupDetails, GroupId, UserId, Uuid};
     use lldap_domain_handlers::logging::Protocol;
     use lldap_domain_model::error::DomainError;
     use lldap_test_utils::{
-        MockTestBackendHandler, recording_log::LogGuard, setup_default_ldap_mock,
+        MockTestBackendHandler,
+        recording_kerberos::{DEGRADED_CAUSE, DegradedGuard},
+        recording_log::LogGuard,
+        setup_default_ldap_mock,
     };
     use pretty_assertions::assert_eq;
     use serial_test::serial;
@@ -509,6 +532,81 @@ pub mod tests {
         mock: MockTestBackendHandler,
     ) -> LdapHandler<MockTestBackendHandler> {
         setup_bound_handler_with_group(mock, "lldap_strict_readonly").await
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_only_admins_bind_while_kerberos_is_unavailable() {
+        use ldap3_proto::proto::LdapBindCred;
+        let guard = LogGuard::install();
+        let _kdc = DegradedGuard::install();
+        let rows = [
+            ("lldap_admin", "pass", LdapResultCode::Success),
+            ("lldap_admin", "wrong", LdapResultCode::InvalidCredentials),
+            ("regular", "pass", LdapResultCode::Unavailable),
+            ("regular", "wrong", LdapResultCode::InvalidCredentials),
+            (
+                "lldap_password_manager",
+                "pass",
+                LdapResultCode::Unavailable,
+            ),
+            ("lldap_strict_readonly", "pass", LdapResultCode::Unavailable),
+        ];
+        for (n, (group, password, code)) in rows.into_iter().enumerate() {
+            let refused = code == LdapResultCode::Unavailable;
+            let mut mock = MockTestBackendHandler::new();
+            mock.expect_bind()
+                .times(1)
+                .returning(|request| match request.password.as_str() {
+                    "pass" => Ok(()),
+                    _ => Err(DomainError::AuthenticationError("bad".to_owned())),
+                });
+            mock.expect_get_user_groups().returning(move |_| {
+                let date = chrono::DateTime::UNIX_EPOCH.naive_utc();
+                Ok([GroupDetails {
+                    group_id: GroupId(1),
+                    display_name: group.into(),
+                    creation_date: date,
+                    uuid: Uuid::from_name_and_date(group, &date),
+                    attributes: vec![],
+                    modified_date: date,
+                }]
+                .into())
+            });
+            setup_default_ldap_mock(&mut mock);
+            let mut handler = LdapHandler::new_for_tests(mock, "dc=example,dc=com");
+            let peer = format!("198.51.100.{}", 10 + n);
+            handler.peer = Some(peer.parse().unwrap());
+            let response = handler
+                .handle_ldap_message(LdapOp::BindRequest(LdapBindRequest {
+                    dn: "uid=bob,ou=people,dc=example,dc=com".to_string(),
+                    cred: LdapBindCred::Simple(password.to_string()),
+                }))
+                .await
+                .unwrap();
+            let Some(LdapOp::BindResponse(LdapBindResponse { res, .. })) = response.first() else {
+                panic!("{response:?}");
+            };
+            let denied = events_from(&guard, &peer)
+                .iter()
+                .filter(|e| e.kind == LogKind::AccessDenied && !e.success)
+                .count();
+            assert_eq!(
+                (
+                    &res.code,
+                    res.message.as_str(),
+                    handler.user_info.is_some(),
+                    denied
+                ),
+                (
+                    &code,
+                    if refused { DEGRADED_CAUSE } else { "" },
+                    code == LdapResultCode::Success,
+                    usize::from(refused),
+                ),
+                "{group} {password}"
+            );
+        }
     }
 
     #[tokio::test]

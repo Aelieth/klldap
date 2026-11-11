@@ -6,7 +6,7 @@ use actix_web::{
     HttpRequest, HttpResponse,
     cookie::{Cookie, SameSite},
     dev::{Service, ServiceRequest, ServiceResponse, Transform},
-    error::{ErrorBadRequest, ErrorUnauthorized},
+    error::{ErrorBadRequest, ErrorServiceUnavailable, ErrorUnauthorized},
     web,
 };
 use actix_web_httpauth::extractors::bearer::BearerAuth;
@@ -18,12 +18,15 @@ use hmac::Hmac;
 use jwt::{SignWithKey, VerifyWithKey};
 use lldap_access_control::{ReadonlyBackendHandler, UserReadableBackendHandler};
 use lldap_auth::{
-    JWTClaims, access_control::ValidationResults, login, password_reset, registration,
+    JWTClaims,
+    access_control::{Permission, ValidationResults},
+    login, password_reset, registration,
 };
 use lldap_domain::types::{GroupDetails, GroupName, LoginOutcome, UserId};
 use lldap_domain_handlers::handler::{
     BackendHandler, BindRequest, LoginHandler, MfaBackendHandler, UserRequestFilter,
 };
+use lldap_domain_handlers::kerberos::kerberos_backend;
 use lldap_domain_handlers::logging::{self, LogKind, with_actor};
 use lldap_domain_handlers::mfa::{MfaRequirement, MfaResetReason};
 use lldap_domain_model::{error::DomainError, model::UserColumn};
@@ -149,6 +152,11 @@ where
         )));
     }
     let groups = data.get_readonly_handler().get_user_groups(&user).await?;
+    if let Some(cause) =
+        refusal_while_degraded(&user, is_admin(&groups), kerberos_backend().unavailable())
+    {
+        return Err(TcpError::DomainError(DomainError::KdcUnavailable(cause)));
+    }
     let mfa_enrollment_pending =
         data.get_mfa_handler().mfa_requirement(&user).await? == MfaRequirement::Enrollment;
     let token = create_jwt(data.get_tcp_handler(), jwt_key, &user, groups, false).await;
@@ -457,6 +465,11 @@ where
     // The authentication was successful, we need to fetch the groups to create the JWT
     // token.
     let groups = data.get_readonly_handler().get_user_groups(name).await?;
+    if let Some(cause) =
+        refusal_while_degraded(name, is_admin(&groups), kerberos_backend().unavailable())
+    {
+        return Err(TcpError::DomainError(DomainError::KdcUnavailable(cause)));
+    }
     let (refresh_token, max_age) = data.get_tcp_handler().create_refresh_token(name).await?;
     let token = create_jwt(data.get_tcp_handler(), &data.jwt_key, name, groups, false).await;
     let refresh_token_plus_name = refresh_token + "+" + name.as_str();
@@ -808,14 +821,46 @@ pub(crate) async fn check_if_token_is_valid<Backend: BackendHandler + OpaqueHand
         );
         return Err(ErrorUnauthorized("Account disabled"));
     }
-    Ok(state.backend_handler.get_permissions_from_groups(
+    let validation = state.backend_handler.get_permissions_from_groups(
         user,
         token
             .claims()
             .groups
             .iter()
             .map(|s| GroupName::from(s.as_str())),
-    ))
+    );
+    if let Some(cause) = refusal_while_degraded(
+        &validation.user,
+        validation.permission == Permission::Admin,
+        kerberos_backend().unavailable(),
+    ) {
+        return Err(ErrorServiceUnavailable(cause));
+    }
+    Ok(validation)
+}
+
+const ADMINS_ONLY: &str = "only admins may sign in while Kerberos is unavailable";
+
+fn is_admin(groups: &HashSet<GroupDetails>) -> bool {
+    groups
+        .iter()
+        .any(|g| g.display_name == "lldap_admin".into())
+}
+
+fn refusal_while_degraded(
+    user: &UserId,
+    is_admin: bool,
+    unavailable: Option<String>,
+) -> Option<String> {
+    let cause = unavailable.filter(|_| !is_admin)?;
+    logging::record_as(
+        Some(user),
+        LogKind::AccessDenied,
+        None,
+        false,
+        Some(ADMINS_ONLY),
+    );
+    Some(cause)
 }
 
 pub fn configure_server<Backend>(cfg: &mut web::ServiceConfig, enable_password_reset: bool)
@@ -857,5 +902,26 @@ where
         cfg.service(
             web::resource("/reset/step1/{user_id}").route(web::post().to(HttpResponse::NotFound)),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn test_only_admins_keep_a_session_while_kerberos_is_unavailable() {
+        let cause = || Some("the Kerberos realm did not open".to_owned());
+        let rows = [
+            (true, None, None),
+            (false, None, None),
+            (true, cause(), None),
+            (false, cause(), cause()),
+        ];
+        for (admin, unavailable, expected) in rows {
+            let got = refusal_while_degraded(&UserId::new("bob"), admin, unavailable.clone());
+            assert_eq!(got, expected, "admin {admin}, unavailable {unavailable:?}");
+        }
     }
 }

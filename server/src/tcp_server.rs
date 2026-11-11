@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use hmac::Hmac;
 use lldap_access_control::{AccessControlledBackendHandler, ReadonlyBackendHandler};
 use lldap_domain_handlers::handler::{BackendHandler, LoginHandler, MfaBackendHandler};
-use lldap_domain_handlers::kerberos::domain_from_base_dn;
+use lldap_domain_handlers::kerberos::{domain_from_base_dn, kerberos_backend};
 use lldap_domain_handlers::logging::{RequestMeta, with_request};
 use lldap_domain_handlers::mfa::MfaPolicy;
 use lldap_domain_model::error::DomainError;
@@ -79,6 +79,13 @@ pub enum TcpError {
 }
 
 pub type TcpResult<T> = std::result::Result<T, TcpError>;
+
+fn health(unavailable: Option<String>) -> HttpResponse {
+    match unavailable {
+        Some(cause) => HttpResponse::ServiceUnavailable().body(cause),
+        None => HttpResponse::Ok().finish(),
+    }
+}
 
 pub(crate) fn error_to_http_response(error: TcpError) -> HttpResponse {
     match error {
@@ -186,7 +193,7 @@ fn http_config<Backend>(
     }))
     .route(
         "/health",
-        web::get().to(async || HttpResponse::Ok().finish()),
+        web::get().to(async || health(kerberos_backend().unavailable())),
     )
     .route("/settings", web::get().to(get_settings::<Backend>))
     .service(
@@ -328,4 +335,22 @@ where
                 config.http_port
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use actix_web::body::to_bytes;
+    use pretty_assertions::assert_eq;
+
+    #[actix_web::test]
+    async fn test_health_names_the_cause() {
+        let cause = "the Kerberos realm did not open";
+        for (unavailable, status, body) in [(None, 200, ""), (Some(cause.to_owned()), 503, cause)] {
+            let response = health(unavailable);
+            let got_status = response.status().as_u16();
+            let got_body = to_bytes(response.into_body()).await.unwrap();
+            assert_eq!((got_status, &got_body[..]), (status, body.as_bytes()));
+        }
+    }
 }

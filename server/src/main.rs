@@ -33,12 +33,12 @@ use lldap_sql_backend_handler::{
     start_log_writer,
 };
 use sea_orm::{Database, DatabaseConnection};
-use std::{sync::Arc, time::Duration};
+use std::{net::IpAddr, sync::Arc, time::Duration};
 use tracing::{Instrument, Level, debug, error, info, instrument, span, warn};
 
 use lldap_domain::requests::{CreateGroupRequest, CreateUserRequest};
 use lldap_domain::types::{Attribute, BUILTIN_GROUPS};
-use lldap_domain_handlers::kerberos::{NoopKerberos, set_kerberos_backend};
+use lldap_domain_handlers::kerberos::{DegradedKerberos, NoopKerberos, set_kerberos_backend};
 use lldap_domain_handlers::logging::{LogKind, record};
 use lldap_kerberos::embedded::{EmbeddedKerberos, RealmThreads};
 
@@ -172,7 +172,7 @@ fn log_retention(config: &Configuration) -> LogRetention {
 
 #[instrument(skip_all)]
 async fn set_up_server(
-    config: Configuration,
+    mut config: Configuration,
     sql_pool: DatabaseConnection,
 ) -> Result<(ServerBuilder, Option<RealmThreads>)> {
     let realm = config.kerberos_realm();
@@ -284,14 +284,27 @@ async fn set_up_server(
             "Restart the server without --force-update-private-key or --force-ldap-user-pass-reset to continue."
         );
     }
-    let realm_threads = if config.kerberos_options.enabled {
-        let (embedded, threads) = EmbeddedKerberos::start(&config.kerberos_settings()?)
-            .context("while starting the Kerberos realm")?;
-        set_kerberos_backend(embedded.clone());
-        reconcile_principals(&backend_handler, &embedded).await?;
-        Some(threads)
-    } else {
-        None
+    let realm_threads = match config.kerberos_options.enabled {
+        false => None,
+        true => match EmbeddedKerberos::start(&config.kerberos_settings()?) {
+            Ok((embedded, threads)) => {
+                set_kerberos_backend(embedded.clone());
+                reconcile_principals(&backend_handler, &embedded).await?;
+                Some(threads)
+            }
+            Err(e) => {
+                let cause = format!("the Kerberos realm {realm} did not open: {e:#}");
+                error!("{cause}");
+                set_kerberos_backend(Arc::new(DegradedKerberos::new(realm.clone(), cause)));
+                config.ldap_host = loopback(&config.ldap_host);
+                config.http_host = loopback(&config.http_host);
+                warn!(
+                    "Only admins may sign in, over LDAP on {} and HTTP on {}",
+                    config.ldap_host, config.http_host
+                );
+                None
+            }
+        },
     };
     let server_builder = ldap_server::build_ldap_server(
         &config,
@@ -306,6 +319,13 @@ async fn set_up_server(
     let scheduler = Scheduler::new("0 0 * * * * *", sql_pool, log_retention(&config));
     scheduler.start();
     Ok((server_builder, realm_threads))
+}
+
+fn loopback(host: &str) -> String {
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V6(_)) => "::1".to_owned(),
+        _ => "127.0.0.1".to_owned(),
+    }
 }
 
 async fn reconcile_principals(
@@ -457,5 +477,26 @@ async fn main() -> Result<()> {
         Command::HealthCheck(opts) => run_healthcheck(opts).await,
         Command::SendTestEmail(opts) => send_test_email_command(opts).await,
         Command::CreateSchema(opts) => create_schema_command(opts).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    #[test]
+    fn test_loopback_for_the_degraded_listeners() {
+        let rows = [
+            ("0.0.0.0", "127.0.0.1"),
+            ("192.0.2.7", "127.0.0.1"),
+            ("::", "::1"),
+            ("2001:db8::7", "::1"),
+            ("lldap.example.com", "127.0.0.1"),
+            ("", "127.0.0.1"),
+        ];
+        for (host, expected) in rows {
+            assert_eq!(loopback(host), expected, "{host}");
+        }
     }
 }

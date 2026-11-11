@@ -121,6 +121,9 @@ pub trait KerberosSync: Send + Sync {
     fn ready(&self) -> bool {
         true
     }
+    fn unavailable(&self) -> Option<String> {
+        None
+    }
     fn realm(&self) -> &str;
     fn principal_name(&self, user: &UserId) -> String {
         format!("{}@{}", user.as_str(), self.realm())
@@ -182,6 +185,42 @@ impl KerberosSync for NoopKerberos {
     }
 }
 
+pub struct DegradedKerberos {
+    realm: String,
+    cause: String,
+}
+
+impl DegradedKerberos {
+    pub fn new(realm: String, cause: String) -> Self {
+        Self { realm, cause }
+    }
+}
+
+#[async_trait]
+impl KerberosSync for DegradedKerberos {
+    fn ready(&self) -> bool {
+        false
+    }
+    fn unavailable(&self) -> Option<String> {
+        Some(self.cause.clone())
+    }
+    fn realm(&self) -> &str {
+        &self.realm
+    }
+    async fn sync_principal(&self, _: &UserId, _: &str) -> Result<(), String> {
+        Err(self.cause.clone())
+    }
+    async fn delete_principal(&self, _: &UserId) -> Result<(), String> {
+        Err(self.cause.clone())
+    }
+    async fn set_principal_enabled(&self, _: &UserId, _: bool) -> Result<(), String> {
+        Err(self.cause.clone())
+    }
+    async fn export_keytab_for_keycloak(&self, _: &str) -> Result<String, String> {
+        Err(self.cause.clone())
+    }
+}
+
 // Process-global so ldap/sql call sites stay one-liners; tests that install a
 // recorder must be #[serial] and restore the default on drop.
 static BACKEND: LazyLock<RwLock<Arc<dyn KerberosSync>>> =
@@ -198,13 +237,15 @@ pub fn set_kerberos_backend(backend: Arc<dyn KerberosSync>) {
 /// Directory writes are refused until the KDC has come up, so nothing changes that the
 /// KDC could not follow.
 pub fn require_kdc_ready() -> Result<(), DomainError> {
-    if kerberos_backend().ready() {
-        Ok(())
-    } else {
-        Err(DomainError::KdcUnavailable(
-            "the Kerberos KDC is still starting; retry shortly".to_owned(),
-        ))
+    let backend = kerberos_backend();
+    if backend.ready() {
+        return Ok(());
     }
+    Err(DomainError::KdcUnavailable(
+        backend
+            .unavailable()
+            .unwrap_or_else(|| "the Kerberos KDC is still starting; retry shortly".to_owned()),
+    ))
 }
 
 #[cfg(test)]

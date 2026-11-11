@@ -188,9 +188,11 @@ pub async fn check_ldaps(host: &str, ldaps_options: &LdapsOptions) -> Result<()>
 
 #[instrument(level = "info", err)]
 pub async fn check_api(host: &str, port: u16) -> Result<()> {
-    reqwest::get(format!("http://{host}:{port}/health"))
-        .await?
-        .error_for_status()?;
+    let response = reqwest::get(format!("http://{host}:{port}/health")).await?;
+    let status = response.status();
+    if !status.is_success() {
+        bail!("{status}: {}", response.text().await.unwrap_or_default());
+    }
     info!("Success");
     Ok(())
 }

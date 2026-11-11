@@ -645,4 +645,22 @@ pub(crate) mod tests {
             "the dropped call's row keeps its request's actor"
         );
     }
+
+    #[test]
+    fn test_a_realm_that_cannot_open_fails_to_start() {
+        let held = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut port_taken = TempRealm::new();
+        port_taken.settings.kdc_port = held.local_addr().unwrap().port();
+        let dir_is_a_file = TempRealm::new();
+        let parent = dir_is_a_file.settings.data_dir.parent().unwrap();
+        std::fs::create_dir_all(parent).unwrap();
+        std::fs::write(&dir_is_a_file.settings.data_dir, b"").unwrap();
+        for (temp, cause) in [
+            (&port_taken, "while binding the KDC on UDP"),
+            (&dir_is_a_file, "while creating"),
+        ] {
+            let error = EmbeddedKerberos::start(&temp.settings).err().unwrap();
+            assert!(format!("{error:#}").contains(cause), "{error:#}");
+        }
+    }
 }

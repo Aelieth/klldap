@@ -171,15 +171,15 @@ and
 The old `LLDAP_KERB_*` variables are unknown. They warn at startup and are
 ignored. Use the options above.
 
-## Upgrading from 0.7.x
+## Upgrading from 0.7.2
 
-0.7.x kept the realm in MIT's db2 format, which 0.8.0 cannot read. Before the first 0.8.0
-start, write a dump of it into the same directory with the 0.7.x image you were running, either
-in its running container or in a one-off container on the same KDC volume:
+0.7.2 kept the realm in MIT's db2 format, which 0.8.0 cannot read. Before the first 0.8.0
+start, write a dump of it into the same directory with the 0.7.2 image, either in the running
+0.7.2 container or in a one-off container on the same KDC volume:
 
-    docker exec <your 0.7.x container> kdb5_util -r <REALM> dump /var/kerberos/krb5kdc/principal.dump
+    docker exec <your 0.7.2 container> kdb5_util -r <REALM> dump /var/kerberos/krb5kdc/principal.dump
     docker run --rm --entrypoint kdb5_util -v <kdc volume>:/var/kerberos/krb5kdc \
-        <your 0.7.x image> -r <REALM> dump /var/kerberos/krb5kdc/principal.dump
+        aelieth/klldap:0.7.2 -r <REALM> dump /var/kerberos/krb5kdc/principal.dump
 
 On its first start, 0.8.0 finds `principal.dump` beside the stash, loads it, and moves the MIT
 files (`principal`, `principal.kadm5`, `principal.ok`, `principal.kadm5.lock`, `kadm5.acl`,
@@ -194,6 +194,10 @@ grants in `kadm5.acl` beyond the admin line (name them in `kadmin_acl_file`), an
 Without a dump the realm does not open: the server comes up in the degraded state and the
 cause names the file to write. A dump for a realm other than `kerberos_options.realm`, or a
 dump without its stash, is refused the same way, and nothing is moved.
+
+0.7.2 took the realm's name from `realm_name` in `kerberos_config.toml`. Where that was set to
+something other than the name the base DN gives, set `kerberos_options.realm` to it before the
+first 0.8.0 start; otherwise the migration is refused and the cause names both realms.
 
 ## Losing a volume
 

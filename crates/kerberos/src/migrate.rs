@@ -58,7 +58,7 @@ pub(crate) fn detect(dir: &Path) -> Result<Found> {
     })
 }
 
-/// Turns an MIT realm (0.7.x) into ours: loaded from its dump into a staging directory, then the
+/// Turns an MIT realm (0.7.2) into ours: loaded from its dump into a staging directory, then the
 /// MIT files move to `mit-db2.bak/` and the new database into place, last.
 pub(crate) fn migrate(settings: &RealmSettings) -> Result<()> {
     let dir = &settings.data_dir;
@@ -71,8 +71,8 @@ pub(crate) fn migrate(settings: &RealmSettings) -> Result<()> {
             dir.join(BACKUP).display()
         ),
         Found::MitOnly => bail!(
-            "{} holds the MIT database of KLLDAP 0.7.x, which 0.8.0 cannot open; write its dump to \
-             {} with the 0.7.x image you were running (docs/kerberos.md, Upgrading from 0.7.x) and start again",
+            "{} holds the MIT database of KLLDAP 0.7.2, which 0.8.0 cannot open; write its dump to \
+             {} with the 0.7.2 image (docs/kerberos.md, Upgrading from 0.7.2) and start again",
             dir.display(),
             dir.join(DUMP).display()
         ),

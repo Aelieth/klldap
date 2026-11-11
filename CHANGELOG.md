@@ -67,8 +67,8 @@ Next release. The KDC is kerber-rust inside the `lldap` process.
   are not started. The admin keytab is rewritten at every boot at mode 0600; keep
   `/data/kadm5.keytab` out of any backup that is not secured as tightly as the
   machine itself. `data_dir` is mode 0700.
-- A 0.7.x realm moves over on the first start from a `principal.dump` written with the
-  0.7.x image you were running (`kdb5_util dump`, see docs/kerberos.md); its MIT files are kept in
+- A 0.7.2 realm moves over on the first start from a `principal.dump` written with the
+  0.7.2 image (`kdb5_util dump`, see docs/kerberos.md); its MIT files are kept in
   `mit-db2.bak/`. Without a dump, or with a dump for another realm or without its
   stash, the realm does not open and the cause says why. A database lost after a
   migration is reported, not replaced by a new realm.

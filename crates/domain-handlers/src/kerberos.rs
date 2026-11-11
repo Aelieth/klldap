@@ -150,8 +150,8 @@ pub trait KerberosSync: Send + Sync {
 
 const NOT_REGISTERED: &str = "Kerberos backend not registered";
 
-// Mirrors the FFI functions without a reachable KDC: idempotent cleanups succeed,
-// operations that must reach the KDC fail, so a missing registration stays visible.
+// Stands in when no realm is registered: idempotent cleanups succeed, operations that
+// need the realm fail, so a missing registration stays visible.
 #[derive(Default)]
 pub struct NoopKerberos {
     realm: String,

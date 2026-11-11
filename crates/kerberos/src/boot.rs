@@ -8,6 +8,7 @@ use std::fs;
 use std::net::{IpAddr, SocketAddr, TcpListener, UdpSocket};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
+use tracing::{info, warn};
 
 const MASTER_KEY_TYPE: &str = "aes256-cts-hmac-sha1-96";
 const CLIENT_CONFIG_TEMPLATE: &str = include_str!("../../../kerberos/krb5.template.conf");
@@ -31,9 +32,30 @@ pub struct RealmSettings {
     pub client_config: PathBuf,
 }
 
+const DEPRECATED: [EncryptionType; 2] = [EncryptionType::Des3CbcSha1, EncryptionType::Rc4Hmac];
+const ENCTYPE_FAMILIES: [&str; 5] = ["default", "aes", "camellia", "des3", "rc4"];
+
+/// MIT's enctype list syntax. Refuses unknown names, 3DES and RC4 (RFC 8429), and Camellia.
 pub fn parse_enctypes(names: &[String]) -> Result<Vec<EncryptionType>> {
-    parse_enctype_list(&names.join(" "), false)
-        .with_context(|| format!("no supported, non-weak enctype in {names:?}"))
+    let list = names.join(" ");
+    for token in list.split(|c: char| c.is_ascii_whitespace() || c == ',') {
+        let name = token.trim_start_matches(['+', '-']);
+        let known = name.is_empty()
+            || ENCTYPE_FAMILIES.contains(&name.to_ascii_lowercase().as_str())
+            || EncryptionType::from_mit_name(name).is_ok();
+        if !known {
+            bail!("{token:?} is not an encryption type this realm supports");
+        }
+    }
+    let etypes = parse_enctype_list(&list, false)
+        .with_context(|| format!("no supported encryption type in {names:?}"))?;
+    if let Some(old) = etypes.iter().find(|etype| DEPRECATED.contains(etype)) {
+        bail!("{} is deprecated (RFC 8429) and refused", old.to_mit_name());
+    }
+    if let Some(weak) = etypes.iter().find(|etype| etype.is_weak()) {
+        bail!("{} is not served by this KDC", weak.to_mit_name());
+    }
+    Ok(etypes)
 }
 
 pub(crate) struct OpenRealm {
@@ -76,8 +98,7 @@ pub(crate) fn open(settings: &RealmSettings) -> Result<OpenRealm> {
 /// Opens the realm's database, creating it on first boot, and writes the admin keytab.
 pub(crate) fn open_store(settings: &RealmSettings, profile: &ProfileSet) -> Result<PrincipalStore> {
     let realm = &settings.realm;
-    fs::create_dir_all(&settings.data_dir)
-        .with_context(|| format!("while creating {}", settings.data_dir.display()))?;
+    secure_dir(&settings.data_dir)?;
     let paths = KdcPaths {
         profile: PathBuf::new(),
         conf: profile.kdc.clone(),
@@ -175,6 +196,30 @@ fn write_client_config(settings: &RealmSettings) -> Result<()> {
     )
 }
 
+// The database and stash are owner-only; the directory follows. One we cannot change is the
+// operator's arrangement, so it only warns.
+fn secure_dir(dir: &Path) -> Result<()> {
+    let existed = dir.exists();
+    fs::create_dir_all(dir).with_context(|| format!("while creating {}", dir.display()))?;
+    let mode = fs::metadata(dir)
+        .with_context(|| format!("while reading {}", dir.display()))?
+        .permissions()
+        .mode()
+        & 0o777;
+    if mode == 0o700 {
+        return Ok(());
+    }
+    match fs::set_permissions(dir, fs::Permissions::from_mode(0o700)) {
+        Ok(()) if existed => info!("Tightened {} from {mode:o} to 700", dir.display()),
+        Ok(()) => {}
+        Err(e) => warn!(
+            "{} is {mode:o}, not 700, and was left so: {e}",
+            dir.display()
+        ),
+    }
+    Ok(())
+}
+
 fn loopback_for(bind: IpAddr) -> IpAddr {
     if bind.is_unspecified() {
         IpAddr::from([127, 0, 0, 1])
@@ -197,6 +242,79 @@ mod tests {
     use super::*;
     use crate::embedded::tests::TempRealm;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn test_parse_enctypes() {
+        let rows = [
+            (
+                "aes256-cts-hmac-sha1-96",
+                Ok(vec![EncryptionType::Aes256CtsHmacSha196]),
+            ),
+            (
+                "aes256-cts aes128-sha1",
+                Ok(vec![
+                    EncryptionType::Aes256CtsHmacSha196,
+                    EncryptionType::Aes128CtsHmacSha196,
+                ]),
+            ),
+            ("aes256-cts no-such-type", Err("not an encryption type")),
+            ("des-cbc-crc", Err("not an encryption type")),
+            ("des3-cbc-sha1", Err("des3-cbc-sha1 is deprecated")),
+            ("des3-cbc-sha1-kd", Err("des3-cbc-sha1 is deprecated")),
+            ("des3-hmac-sha1", Err("des3-cbc-sha1 is deprecated")),
+            ("des3", Err("des3-cbc-sha1 is deprecated")),
+            ("arcfour-hmac", Err("arcfour-hmac is deprecated")),
+            ("rc4-hmac", Err("arcfour-hmac is deprecated")),
+            ("arcfour-hmac-md5", Err("arcfour-hmac is deprecated")),
+            ("rc4", Err("arcfour-hmac is deprecated")),
+            (
+                "camellia256-cts-cmac",
+                Err("camellia256-cts-cmac is not served"),
+            ),
+            (
+                "camellia128-cts-cmac",
+                Err("camellia128-cts-cmac is not served"),
+            ),
+            (
+                "aes256-cts camellia",
+                Err("camellia256-cts-cmac is not served"),
+            ),
+            ("default", Err("des3-cbc-sha1 is deprecated")),
+            ("default -des3 -rc4", Err("is not served")),
+            (
+                "default -des3 -rc4 -camellia",
+                Ok(vec![
+                    EncryptionType::Aes256CtsHmacSha196,
+                    EncryptionType::Aes128CtsHmacSha196,
+                    EncryptionType::Aes256CtsHmacSha384192,
+                    EncryptionType::Aes128CtsHmacSha256128,
+                ]),
+            ),
+        ];
+        for (names, expected) in rows {
+            let parsed = parse_enctypes(&[names.to_owned()]).map_err(|e| e.to_string());
+            match (parsed, expected) {
+                (Ok(got), Ok(want)) => assert_eq!(got, want, "{names}"),
+                (Err(e), Err(want)) => assert!(e.contains(want), "{names}: {e}"),
+                (got, _) => panic!("{names}: unexpected {got:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_data_dir_is_owner_only() {
+        for looser in [None, Some(0o755)] {
+            let temp = TempRealm::new();
+            let dir = &temp.settings.data_dir;
+            if let Some(mode) = looser {
+                fs::create_dir_all(dir).unwrap();
+                fs::set_permissions(dir, fs::Permissions::from_mode(mode)).unwrap();
+            }
+            open_store(&temp.settings, &profile(&temp.settings)).unwrap();
+            let mode = fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "existing mode {looser:?}");
+        }
+    }
 
     #[test]
     fn test_profile_from_settings() {

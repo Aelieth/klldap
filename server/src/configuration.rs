@@ -1159,7 +1159,7 @@ mod tests {
     fn test_kerberos_options_from_env() {
         type Expected =
             Result<(bool, &'static str, &'static str, Option<&'static str>), &'static str>;
-        let rows: [(&[(&str, &str)], Expected); 7] = [
+        let rows: [(&[(&str, &str)], Expected); 10] = [
             (&[], Ok((false, "EXAMPLE.COM", "24h", None))),
             (
                 &[
@@ -1191,6 +1191,27 @@ mod tests {
                 &[(
                     "LLDAP_KERBEROS_OPTIONS__SUPPORTED_ENCTYPES",
                     "[no-such-enctype]",
+                )],
+                Err("supported_enctypes"),
+            ),
+            (
+                &[(
+                    "LLDAP_KERBEROS_OPTIONS__SUPPORTED_ENCTYPES",
+                    "[des3-cbc-sha1]",
+                )],
+                Err("supported_enctypes"),
+            ),
+            (
+                &[(
+                    "LLDAP_KERBEROS_OPTIONS__SUPPORTED_ENCTYPES",
+                    "[arcfour-hmac]",
+                )],
+                Err("supported_enctypes"),
+            ),
+            (
+                &[(
+                    "LLDAP_KERBEROS_OPTIONS__SUPPORTED_ENCTYPES",
+                    "[camellia256-cts-cmac]",
                 )],
                 Err("supported_enctypes"),
             ),

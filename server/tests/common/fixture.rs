@@ -52,6 +52,8 @@ pub struct LLDAPFixture {
     groups: HashMap<String, i64>,
     ldap_port: u16,
     http_port: u16,
+    db_url: String,
+    extra_env: Vec<(String, String)>,
     _dir: tempfile::TempDir,
 }
 
@@ -64,39 +66,15 @@ impl LLDAPFixture {
 
     pub fn new_with_env(extra_env: &[(&str, &str)]) -> Self {
         let dir = tempfile::TempDir::new().expect("temp dir");
-        let db_path = format!("sqlite://{}/users.db?mode=rwc", dir.path().display());
+        let db_url = format!("sqlite://{}/users.db?mode=rwc", dir.path().display());
         let ldap_port = free_port();
         let http_port = free_port();
-        let child = create_lldap_command("run", &db_path)
-            .env("LLDAP_LDAP_PORT", ldap_port.to_string())
-            .env("LLDAP_HTTP_PORT", http_port.to_string())
-            .envs(extra_env.iter().copied())
-            .arg("--verbose")
-            .spawn()
-            .expect("Unable to start server");
-
-        let mut started = false;
-        for attempt in 0..MAX_HEALTHCHECK_ATTEMPS {
-            let status = create_lldap_command("healthcheck", &db_path)
-                .env("LLDAP_LDAP_PORT", ldap_port.to_string())
-                .env("LLDAP_HTTP_PORT", http_port.to_string())
-                .envs(extra_env.iter().copied())
-                .status()
-                .expect("healthcheck command failed to execute");
-
-            if status.success() {
-                started = true;
-                break;
-            }
-            if attempt == MAX_HEALTHCHECK_ATTEMPS - 1 {
-                panic!(
-                    "LLDAP failed to start after {} attempts. Check lldap_test_*.log if logs were captured.",
-                    MAX_HEALTHCHECK_ATTEMPS
-                );
-            }
-            thread::sleep(Duration::from_millis(800));
-        }
-        assert!(started, "Server did not become healthy");
+        let extra_env = extra_env
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect::<Vec<_>>();
+        let child = spawn_server(&db_url, ldap_port, http_port, &extra_env);
+        wait_until_healthy(&db_url, ldap_port, http_port, &extra_env);
 
         let client = ClientBuilder::new()
             .connect_timeout(std::time::Duration::from_secs(3))
@@ -114,8 +92,27 @@ impl LLDAPFixture {
             groups: HashMap::new(),
             ldap_port,
             http_port,
+            db_url,
+            extra_env,
             _dir: dir,
         }
+    }
+
+    pub fn restart(&mut self) {
+        stop_child(&mut self.child);
+        self.child = spawn_server(
+            &self.db_url,
+            self.ldap_port,
+            self.http_port,
+            &self.extra_env,
+        );
+        wait_until_healthy(
+            &self.db_url,
+            self.ldap_port,
+            self.http_port,
+            &self.extra_env,
+        );
+        self.token = get_token(&self.client, &self.http_url());
     }
 
     pub fn ldap_url(&self) -> String {
@@ -242,39 +239,98 @@ impl Drop for LLDAPFixture {
         for group in self.groups.keys().cloned().collect::<Vec<_>>() {
             self.delete_group(&group);
         }
-        let result = signal::kill(
-            Pid::from_raw(self.child.id().try_into().unwrap()),
-            Signal::SIGTERM,
-        );
-
-        if let Err(err) = result {
-            println!("Failed to send SIGTERM: {err:?}");
-            let _ = self.child.kill();
-            return;
-        }
-
-        for _ in 0..12 {
-            match self.child.try_wait() {
-                Ok(Some(status)) => {
-                    if !status.success() {
-                        println!("LLDAP exited with status {status}");
-                    }
-                    return;
-                }
-                Ok(None) => {
-                    println!("LLDAP still running, sleeping for 1 second...");
-                }
-                Err(e) => {
-                    println!("Error waiting for LLDAP: {e}");
-                    break;
-                }
-            }
-            thread::sleep(Duration::from_millis(1000));
-        }
-
-        println!("LLDAP did not exit gracefully after 12s, forcing kill.");
-        let _ = self.child.kill();
+        stop_child(&mut self.child);
     }
+}
+
+fn server_command(
+    subcommand: &str,
+    db_url: &str,
+    ldap_port: u16,
+    http_port: u16,
+    extra_env: &[(String, String)],
+) -> Command {
+    let mut cmd = create_lldap_command(subcommand, db_url);
+    cmd.env("LLDAP_LDAP_PORT", ldap_port.to_string())
+        .env("LLDAP_HTTP_PORT", http_port.to_string())
+        .envs(
+            extra_env
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        );
+    cmd
+}
+
+fn spawn_server(
+    db_url: &str,
+    ldap_port: u16,
+    http_port: u16,
+    extra_env: &[(String, String)],
+) -> ChildProcess {
+    server_command("run", db_url, ldap_port, http_port, extra_env)
+        .arg("--verbose")
+        .spawn()
+        .expect("Unable to start server")
+}
+
+fn wait_until_healthy(
+    db_url: &str,
+    ldap_port: u16,
+    http_port: u16,
+    extra_env: &[(String, String)],
+) {
+    let mut started = false;
+    for attempt in 0..MAX_HEALTHCHECK_ATTEMPS {
+        let status = server_command("healthcheck", db_url, ldap_port, http_port, extra_env)
+            .status()
+            .expect("healthcheck command failed to execute");
+        if status.success() {
+            started = true;
+            break;
+        }
+        if attempt == MAX_HEALTHCHECK_ATTEMPS - 1 {
+            panic!(
+                "LLDAP failed to start after {} attempts. Check lldap_test_*.log if logs were captured.",
+                MAX_HEALTHCHECK_ATTEMPS
+            );
+        }
+        thread::sleep(Duration::from_millis(800));
+    }
+    assert!(started, "Server did not become healthy");
+}
+
+fn stop_child(child: &mut ChildProcess) {
+    let result = signal::kill(
+        Pid::from_raw(child.id().try_into().unwrap()),
+        Signal::SIGTERM,
+    );
+    if let Err(err) = result {
+        println!("Failed to send SIGTERM: {err:?}");
+        let _ = child.kill();
+        let _ = child.wait();
+        return;
+    }
+    for _ in 0..12 {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    println!("LLDAP exited with status {status}");
+                }
+                return;
+            }
+            Ok(None) => {
+                println!("LLDAP still running, sleeping for 1 second...");
+            }
+            Err(e) => {
+                println!("Error waiting for LLDAP: {e}");
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(1000));
+    }
+    println!("LLDAP did not exit gracefully after 12s, forcing kill.");
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 pub fn new_id(prefix: Option<&str>) -> String {

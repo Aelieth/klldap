@@ -206,8 +206,29 @@ key_seed = "RanD0m STR1ng"
 #renew_lifetime = "7d"
 ## Issue forwardable tickets.
 #forwardable = true
-## The server writes these settings to /data/kerberos_config.toml at every boot for the KDC
-## bootstrap; edits made to that file by hand are overwritten.
+## How long a ticket may be renewed.
+#max_renewable_life = "7d"
+## Session and long-term keys. Accepts aes256-cts-hmac-sha1-96,
+## aes128-cts-hmac-sha1-96, aes256-cts-hmac-sha384-192 and
+## aes128-cts-hmac-sha256-128. 3DES and RC4 are refused as deprecated
+## (RFC 8429). Camellia is refused because the embedded KDC does not serve it.
+## The family name "default" is refused because it includes them.
+#supported_enctypes = ["aes256-cts-hmac-sha1-96"]
+## KDC listen address and port (UDP and TCP).
+#kdc_bind = "0.0.0.0"
+#kdc_port = 88
+## kadmin listen address, on the container's loopback. Use it with docker exec.
+#kadmin_bind = "127.0.0.1:749"
+## Extra kadmin ACL lines. admin/admin@REALM * is always granted.
+#kadmin_acl_file = "/data/kadm5.acl"
+## Database and stash. The directory itself is mode 0700.
+#data_dir = "/var/kerberos/krb5kdc"
+## Admin keytab, rewritten every boot at mode 0600.
+#admin_keytab = "/data/kadm5.keytab"
+## Keycloak HTTP keytab, written by Export keytab.
+#keycloak_keytab = "/data/keytab/keycloak-http.keytab"
+## Client krb5.conf written at every boot, for tools inside the container.
+#client_config = "/data/krb5.conf"
 
 ## Options to configure the event log.
 ## To set these options from environment variables, use the following format

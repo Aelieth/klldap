@@ -12,7 +12,7 @@
 # Single-sourced from [workspace.package] in Cargo.toml (first version line in the file).
 VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 
-# Native prepare-release (run directly — needs Rust, cross, Docker, and system deps like krb5-devel)
+# Native prepare-release (run directly — needs Rust, cross and Docker)
 prepare-release:
 	./prepare-release.sh
 

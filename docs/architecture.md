@@ -63,8 +63,8 @@ Data storage:
   groups, OUs, POSIX, Kerberos, Keycloak) and the admin-only log queries (`logs`,
   `logSummary`, `logActivity`).
 * `crates/schema`: the attribute schema hub.
-* `crates/kerberos`: the libkadm5/libkrb5 FFI (the only unsafe code), the KDC
-  bootstrap and supervision (`kerberos_manager` binary), and the live `KerberosSync`.
+* `crates/kerberos`: the embedded KDC and kadmin (`kerber-rust` on the server's
+  threads) and the `KerberosSync` that keeps principals in step with the directory.
 * `crates/keycloak`: the Keycloak admin client used by the Federation tab.
 * `crates/opaque-handler`: the OPAQUE registration ceremony.
   Cleartext binds and password sets do their OPAQUE key stretching

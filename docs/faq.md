@@ -35,11 +35,16 @@ set isn't working, try the following:
 ## kinit fails for a user
 
 - The user needs `kerberosSync` on, and a password set (or changed) after that: the
-  principal is created on the password sync. `docker exec klldap kadmin.local -q
-  listprincs` shows what exists.
+  principal is created on the password sync. This shows what exists:
+
+  ```sh
+  docker exec -e KRB5_CONFIG=/data/krb5.conf klldap \
+    kadmin -k -t /data/kadm5.keytab -p admin/admin -q listprincs
+  ```
 - A user in `lldap_disabled` cannot get tickets by design.
-- Check the client's `krb5.conf` realm and KDC address, and that ports 88 (tcp+udp)
-  and 749 reach the container. See [kerberos.md](kerberos.md).
+- Check the client's `krb5.conf` realm and KDC address, and that port 88 (tcp and
+  udp) reaches the container. kadmin listens on loopback inside the container and
+  is not published. See [kerberos.md](kerberos.md).
 
 ## Migrating from SQLite
 

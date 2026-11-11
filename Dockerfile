@@ -1,4 +1,4 @@
-# Use almalinux minimal for builder and runtime (glibc consistency + reliable bindgen)
+# Use almalinux minimal for builder and runtime (one glibc for both)
 FROM quay.io/almalinuxorg/10-minimal AS chef
 
 # Install build deps (Fedora packages)

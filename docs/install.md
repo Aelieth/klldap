@@ -1,8 +1,10 @@
 # Installing KLLDAP
 
-KLLDAP is Docker-only: the MIT Kerberos KDC (`krb5kdc`, `kadmind`) runs inside the
-image beside the server, bootstrapped by the entrypoint. There are no packages, and
-bare-metal installs are not supported.
+KLLDAP is Docker-only: the Kerberos KDC runs inside the `lldap` process. There
+are no packages, and bare-metal installs are not supported.
+
+**Set a restart policy. If a Kerberos thread dies, the process exits non-zero,
+and without a restart policy the container stays down.**
 
 - [With Docker](#with-docker)
 - [First start](#first-start)
@@ -41,7 +43,6 @@ services:
       - "17170:17170"     # Web UI and API
       - "88:88/tcp"       # Kerberos KDC
       - "88:88/udp"
-      - "749:749/tcp"     # Kerberos admin (kadmin)
     volumes:
       - lldap_data:/data
       - kerberos_db:/var/kerberos/krb5kdc
@@ -75,15 +76,13 @@ Secrets can come from files instead of the environment by appending `_FILE`
 
 ### First start
 
-The entrypoint starts the server, waits for it to be healthy, then bootstraps the KDC:
-it creates the Kerberos database with a random, stash-only master password, the
-`admin/admin@REALM` principal and `/data/kadm5.keytab`, renders `krb5.conf`,
-`kdc.conf` and `kadm5.acl` from the templates in `/app`, and starts
-`krb5kdc` and `kadmind`. Later starts skip what already exists. The container's
-healthcheck (`lldap healthcheck`, which the image's `LLDAP_KERBEROS_OPTIONS__ENABLED=true`
-extends to the KDC) fails until the KDC is up, and directory
-writes are refused ("Kerberos KDC unavailable") until it has answered once — logins and
-reads work throughout.
+The entrypoint starts the server. With `LLDAP_KERBEROS_OPTIONS__ENABLED=true` the
+server opens the KDC itself: it creates the database with a random, stash-only
+master key, writes `admin/admin@REALM` to `/data/kadm5.keytab` (mode 0600) and
+writes `/data/krb5.conf`. Later starts keep the database and rewrite the keytab.
+The container's healthcheck (`lldap healthcheck`) fails until the KDC is up, and
+directory writes are refused ("Kerberos KDC unavailable") until it has answered
+once — logins and reads work throughout.
 
 Then:
 
@@ -92,14 +91,16 @@ Then:
   (it is created when their password is set),
 - point Keycloak at KLLDAP from the Federation tab, if you use it.
 
-`docker logs klldap` shows the bootstrap; `docker exec klldap kadmin.local -q listprincs`
-lists the principals. See [kerberos.md](kerberos.md) for the details and
+`docker logs klldap` shows the realm coming up. kadmin listens on loopback
+inside the container and is used with `docker exec` and
+`KRB5_CONFIG=/data/krb5.conf`. See [kerberos.md](kerberos.md), and
 [faq.md](faq.md) if you cannot log in.
 
 ### With Podman
 
-Untested. The container needs to run as root inside its own namespace (it chowns
-`/data`, runs `kdb5_util` and spawns the daemons), which rootless Podman provides;
+Untested. The container needs to run as root inside its own namespace so the
+entrypoint can chown `/data` and `/app` before it drops to `LLDAP_UID`, which
+rootless Podman provides;
 the [quadlets](../example_configs/podman-quadlets/) are adapted to KLLDAP as a
 starting point. Please report what you find.
 

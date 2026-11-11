@@ -21,10 +21,10 @@ Image=docker.io/aelieth/klldap:latest
 Volume=lldap-data.volume:/data:Z
 Volume=lldap-kdc.volume:/var/kerberos/krb5kdc:Z
 
-# Kerberos clients need the KDC (88) and kadmin (749); publish them on the host.
+# Kerberos clients need the KDC (88). kadmin listens on loopback inside the
+# container and is not published.
 PublishPort=88:88/tcp
 PublishPort=88:88/udp
-PublishPort=749:749/tcp
 
 # using multiple networks for traefik and db, not essential
 Network=lldap-frontend.network

@@ -2,9 +2,8 @@
 
 ## [0.8.0] unreleased
 
-Next release. The KDC becomes kerber-rust inside the `lldap` process,
-sharing one database with the directory. Nothing of that has landed
-yet. 0.7.4, 0.7.5 and 0.7.6 stay unreleased on their own branches.
+Next release. The KDC is kerber-rust inside the `lldap` process.
+0.7.4, 0.7.5 and 0.7.6 stay unreleased on their own branches.
 
 ### License
 
@@ -13,8 +12,8 @@ yet. 0.7.4, 0.7.5 and 0.7.6 stay unreleased on their own branches.
 ### Dependencies
 
 - kerber-rust v1.2.1 (`krb5-kdc`, `krb5-admin`, `krb5-config`, `krb5-types`, `krb5-crypto`,
-  `krb5-log`, `krb5-protocol`) is a git dependency at its tag, linked but not yet used. Its
-  `rasn` patch is carried in `[patch.crates-io]`, and `.cargo/config.toml` sets
+  `krb5-log`, `krb5-protocol`) is a git dependency at its tag and is the KDC inside the
+  server. Its `rasn` patch is carried in `[patch.crates-io]`, and `.cargo/config.toml` sets
   `--cfg p384_backend="fiat"` so P-384 uses p384's constant-time field.
 - `lldap_mfa` moves to hmac 0.13 and sha1 0.11, kerber-rust's RustCrypto generation. sha2
   0.10, hmac 0.12 and digest 0.10 remain, pinned by `opaque-ke` 4, `rsa` 0.9, `jwt` 0.16 and
@@ -23,15 +22,16 @@ yet. 0.7.4, 0.7.5 and 0.7.6 stay unreleased on their own branches.
 ### Configuration
 
 - New `[kerberos_options]` section (`LLDAP_KERBEROS_OPTIONS__*`): `enabled`, `realm`,
-  `ticket_lifetime`, `renew_lifetime`, `forwardable`. Durations are checked at startup.
+  `ticket_lifetime`, `renew_lifetime`, `max_renewable_life`, `forwardable`,
+  `supported_enctypes`, `kdc_bind`, `kdc_port`, `kadmin_bind`, `kadmin_acl_file`,
+  `data_dir`, `admin_keytab`, `keycloak_keytab`, `client_config`. Durations are
+  checked at startup.
 - `kerberos_options.enabled` replaces `healthcheck_options.kerberos`
   (`LLDAP_HEALTHCHECK_OPTIONS__KERBEROS`) and the `healthcheck --kerberos` flag
   (`LLDAP_KERBEROS_HEALTHCHECK`), which are removed: it gates the Kerberos sync, makes
   directory writes wait for the KDC after boot, and adds the KDC to the healthcheck. A compose
   file that overrides the healthcheck with `--kerberos` must drop the flag.
 - `LLDAP_KERB_REALM_NAME` is removed; use `kerberos_options.realm`. It now warns as unknown.
-- The server writes the realm, base DN and ticket settings to `/data/kerberos_config.toml`
-  at every boot for the KDC bootstrap; hand edits to that file are overwritten.
 - `[keycloak_options]` holds `config_file` (default `/data/keycloak_config.toml`,
   `LLDAP_KEYCLOAK_OPTIONS__CONFIG_FILE`) and `admin_pass` (no default,
   `LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS`, or `LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS_FILE`
@@ -39,9 +39,48 @@ yet. 0.7.4, 0.7.5 and 0.7.6 stay unreleased on their own branches.
   `LLDAP_KEYCLOAK_ADMIN_PASS` now warn as unknown and are ignored. An operator who
   keeps the old admin password gets a realm push that fails with "admin password is
   not set".
-- `config_file` stays exempt from the file provider, with `key_file` and `cert_file`.
-  The exemption matches that name at any depth, so a missing `LLDAP_CONFIG_FILE` starts
-  the server on defaults, the same as a missing `--config-file`.
+- `config_file` and `kadmin_acl_file` stay exempt from the file provider, with
+  `key_file` and `cert_file`. The exemption matches that name at any depth, so a
+  missing `LLDAP_CONFIG_FILE` starts the server on defaults, the same as a missing
+  `--config-file`.
+- `LLDAP_KERB_ADMIN_KEYTAB` is `kerberos_options.admin_keytab` (default
+  `/data/kadm5.keytab`). `LLDAP_KERB_KDC_DIR` is `data_dir` (default
+  `/var/kerberos/krb5kdc`). `LLDAP_KERB_KDC_PORT` is `kdc_port` (default `88`), with
+  `kdc_bind` (default `0.0.0.0`) and `kadmin_bind` (default `127.0.0.1:749`).
+  `LLDAP_KERB_KRB5_CONF` defaulted to `/etc/krb5.conf`. It and
+  `LLDAP_KERB_KRB5_TEMPLATE` are `client_config`, and that default moved to
+  `/data/krb5.conf`. `/etc/krb5.conf` is no longer written. Tools run inside the
+  container need `KRB5_CONFIG=/data/krb5.conf`. `LLDAP_KERB_KEYCLOAK_KEYTAB` is `keycloak_keytab` (default
+  `/data/keytab/keycloak-http.keytab`). `LLDAP_KERB_KADM5_ACL` and
+  `LLDAP_KERB_KADM5_ACL_TEMPLATE` are `kadmin_acl_file` (no default;
+  `admin/admin@REALM *` is always granted). `LLDAP_KERB_CONFIG`,
+  `LLDAP_KERB_CONFIG_TEMPLATE`, `LLDAP_KERB_KDC_CONF`, `LLDAP_KERB_KDC_TEMPLATE` and
+  `/data/kerberos_config.toml` are gone. Every one of those old names warns as unknown
+  and is ignored.
+
+### Kerberos
+
+- The KDC and kadmin run inside `lldap`. `kerberos_manager`, `krb5kdc` and `kadmind`
+  are not started. The admin keytab is rewritten at every boot at mode 0600; keep
+  `/data/kadm5.keytab` out of any backup that is not secured as tightly as the
+  machine itself. `data_dir` is mode 0700.
+- A Kerberos thread that dies stops the server with a non-zero exit. Without a
+  restart policy the container stays down.
+- kadmin is no longer reachable on port 749 from outside the container. It
+  listens on the container's loopback (`kadmin_bind`, default `127.0.0.1:749`)
+  and is used with `docker exec` and `KRB5_CONFIG=/data/krb5.conf`.
+- `supported_enctypes` accepts `aes256-cts-hmac-sha1-96`, `aes128-cts-hmac-sha1-96`,
+  `aes256-cts-hmac-sha384-192` and `aes128-cts-hmac-sha256-128`. `des3-cbc-sha1`, `arcfour-hmac` and
+  their aliases are refused as deprecated (RFC 8429 section 7,
+  https://www.rfc-editor.org/rfc/rfc8429). `camellia128-cts-cmac`,
+  `camellia256-cts-cmac` and the `camellia` family are refused because the embedded
+  KDC does not serve them; MIT does not mark Camellia deprecated
+  (https://web.mit.edu/kerberos/krb5-latest/doc/admin/enctypes.html). `des-cbc-crc`
+  and `des-cbc-md5` are not encryption types this KDC knows. The name `default` is
+  refused too, because it expands to AES plus 3DES, RC4 and Camellia. The shipped
+  default remains `aes256-cts-hmac-sha1-96`, and `allow_rc4` / `allow_des3` stay
+  off (MIT's default,
+  https://web.mit.edu/kerberos/krb5-latest/doc/admin/conf_files/krb5_conf.html).
 
 ### Fixed
 

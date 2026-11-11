@@ -38,8 +38,6 @@ includedir /etc/krb5.conf.d/
 
 [logging]
     default = FILE:/var/log/krb5libs.log
-    kdc = FILE:/var/log/krb5kdc.log
-    admin_server = FILE:/var/log/kadmind.log
 
 [libdefaults]
     dns_lookup_realm = false
@@ -58,7 +56,6 @@ includedir /etc/krb5.conf.d/
 [realms]
     EXAMPLE.COM = {
         kdc = 192.0.2.10
-        admin_server = 192.0.2.10
     }
 
 [domain_realm]
@@ -86,7 +83,6 @@ includedir /etc/krb5.conf.d/
 [realms]
     EXAMPLE.COM = {
         kdc = 192.0.2.10:88
-        admin_server = 192.0.2.10:749
     }
 
 [domain_realm]
@@ -97,9 +93,11 @@ includedir /etc/krb5.conf.d/
 This version explicitly prefers **AES256** encryption, which helps avoid the "Cannot
 find key of appropriate type" errors with Java applications like Keycloak.
 
-KLLDAP's image publishes the KDC (88) and kadmin (749) ports but not kpasswd (464):
-passwords are changed through KLLDAP (web UI, GraphQL, or LDAP), which updates the KDC.
-Leave `kpasswd_server` out.
+KLLDAP's image publishes the KDC (88) and not kpasswd (464): passwords are changed
+through KLLDAP (web UI, GraphQL, or LDAP), which updates the KDC. Leave
+`kpasswd_server` out. kadmin listens on loopback inside the container, so these
+client files set no `admin_server`. An `admin_server` line applies only if the
+operator has changed `kadmin_bind`.
 
 Test it:
 
@@ -439,7 +437,7 @@ curl -v --negotiate -u : http://keycloak.example.com:8080/realms/your-realm/acco
 | Encryption type error (`AES256`)            | Keytab missing strong encryption types    | Regenerate keytab with `aes256-cts-hmac-sha1-96` |
 | SPNEGO not working in browser               | Wrong hostname or Browser not configured  | Use matching hostname + configure Firefox `trusted-uris` |
 | `krb5_validate = true` breaks login         | No host keytab or incorrect permissions   | Create host keytab or set `krb5_validate = false` |
-| User lookup works but authentication fails  | Kerberos misconfiguration, or the user has no principal (`kerberosSync` off, or no password set since) | Verify `krb5.conf` and `krb5_server`; `kadmin.local -q listprincs` in the container |
+| User lookup works but authentication fails  | Kerberos misconfiguration, or the user has no principal (`kerberosSync` off, or no password set since) | Verify `krb5.conf` and `krb5_server`; `docker exec -e KRB5_CONFIG=/data/krb5.conf klldap kadmin -k -t /data/kadm5.keytab -p admin/admin -q listprincs` |
 | Keytab changes not picked up by Keycloak    | Keycloak cached old path / permissions    | Restart Keycloak after updating keytab |
 | `groups: cannot find name for group ID`     | Group not present in LDAP or caching      | Create matching group in LDAP + clear cache |
 

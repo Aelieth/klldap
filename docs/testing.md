@@ -2,10 +2,9 @@
 
 ## Building
 
-The Kerberos FFI needs the libkrb5 headers and clang (for bindgen):
-
-- Fedora: `sudo dnf install krb5-devel clang pkgconf-pkg-config`
-- Debian/Ubuntu: `sudo apt-get install libkrb5-dev clang pkg-config`
+The server build does not need Kerberos headers or clang. The Kerberos
+end-to-end test needs `kinit` (`krb5-workstation` on Fedora, `krb5-user` on
+Debian/Ubuntu).
 
 `cargo build --workspace` builds the server, the tools and every crate. `--workspace`
 matters: `default-members` is the server only, so a bare `cargo build`/`cargo test` covers
@@ -40,8 +39,7 @@ The suite is kept small on purpose: upstream LLDAP's tests stay as they are, and
 additions are one scenario per door or handler and table tests whose assert message names
 the failing row, not one test per branch. A behaviour pinned at a higher level (an e2e in
 `server/tests`, the SQL handler) is not pinned again below it. `#[serial]` is reserved for
-the tests that install a process-global recorder. The krb5 bindings are generated with
-bindgen's layout tests off: they only compared bindgen's output with itself.
+the tests that install a process-global recorder.
 
 ## The container gate
 
@@ -69,17 +67,17 @@ inputs are given, migration boot and a real lldap-cli run. It needs docker, the 
   boot phase against an existing volume set. The header of `gate/run-gate.sh` is the
   full environment contract.
 
-## The live KDC
+## The Kerberos end-to-end test
 
-`make test-kdc` runs the Kerberos FFI tests against a throwaway KDC on ephemeral ports
-(`gate/kdc-sandbox.sh`; the tests are `#[ignore]` without it). It needs the KDC packages
-on the host: Fedora `krb5-server krb5-workstation`, Debian/Ubuntu
-`krb5-kdc krb5-admin-server krb5-user`.
+`server/tests/kerberos.rs` starts the server with the embedded KDC and drives
+`kinit`, `klist` and `kadmin` against it. `make safety` runs it. The host needs
+`krb5-workstation` (Fedora) or `krb5-user` (Debian/Ubuntu). It does not use the
+host's `/etc/krb5.conf` or the login credential cache.
 
 ## CI
 
 `.github/workflows/rust.yml` runs the safety dance, a `licenses` job
-(`cargo deny check licenses sources`), the live-KDC lane, a shellcheck
+(`cargo deny check licenses sources`), a shellcheck
 pass, and a PostgreSQL migration lane. `.github/workflows/gate.yml`
 builds the image and runs the gate on SQLite and PostgreSQL. Both run
 on pushes and pull requests.

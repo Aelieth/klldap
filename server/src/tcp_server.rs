@@ -24,6 +24,7 @@ use lldap_domain_handlers::kerberos::{domain_from_base_dn, kerberos_backend};
 use lldap_domain_handlers::logging::{RequestMeta, with_request};
 use lldap_domain_handlers::mfa::MfaPolicy;
 use lldap_domain_model::error::DomainError;
+use lldap_kerberos::boot::with_port_hint;
 use lldap_keycloak::KeycloakSettings;
 use lldap_opaque_handler::OpaqueHandler;
 use sha2::Sha512;
@@ -329,6 +330,7 @@ where
                     .tcp()
             },
         )
+        .map_err(|e| with_port_hint(e, config.http_port))
         .with_context(|| {
             format!(
                 "While bringing up the TCP server with port {}",

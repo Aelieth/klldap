@@ -106,7 +106,7 @@ pub(crate) fn open(settings: &RealmSettings) -> Result<OpenRealm> {
 }
 
 // The one bind failure an operator fixes with a capability or a higher port, not a restart.
-fn with_port_hint(e: io::Error, port: u16) -> anyhow::Error {
+pub fn with_port_hint(e: io::Error, port: u16) -> anyhow::Error {
     let refused = e.kind() == io::ErrorKind::PermissionDenied && port < 1024;
     let e = anyhow::Error::new(e);
     if refused {

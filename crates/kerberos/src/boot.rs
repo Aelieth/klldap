@@ -6,6 +6,7 @@ use krb5_kdc::{Acl, AdminSpec, PrincipalStore, SharedDump};
 use krb5_types::PrincipalName;
 use minijinja::{Environment, context};
 use std::fs;
+use std::io;
 use std::net::{IpAddr, SocketAddr, TcpListener, UdpSocket};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -86,10 +87,13 @@ pub(crate) fn open(settings: &RealmSettings) -> Result<OpenRealm> {
         port: settings.kdc_port,
     };
     let kdc_udp = krb5_kdc::bind_udp_listeners(std::slice::from_ref(&kdc_addr))
+        .map_err(|e| with_port_hint(e, settings.kdc_port))
         .with_context(|| format!("while binding the KDC on UDP {kdc_addr:?}"))?;
     let kdc_tcp = krb5_kdc::bind_tcp_listeners(std::slice::from_ref(&kdc_addr))
+        .map_err(|e| with_port_hint(e, settings.kdc_port))
         .with_context(|| format!("while binding the KDC on TCP {kdc_addr:?}"))?;
     let kadmin = TcpListener::bind(settings.kadmin_bind)
+        .map_err(|e| with_port_hint(e, settings.kadmin_bind.port()))
         .with_context(|| format!("while binding kadmin on {}", settings.kadmin_bind))?;
     Ok(OpenRealm {
         store: krb5_kdc::shared_dump(store),
@@ -99,6 +103,19 @@ pub(crate) fn open(settings: &RealmSettings) -> Result<OpenRealm> {
         kdc_tcp,
         kadmin,
     })
+}
+
+// The one bind failure an operator fixes with a capability or a higher port, not a restart.
+fn with_port_hint(e: io::Error, port: u16) -> anyhow::Error {
+    let refused = e.kind() == io::ErrorKind::PermissionDenied && port < 1024;
+    let e = anyhow::Error::new(e);
+    if refused {
+        e.context(format!(
+            "port {port} needs CAP_NET_BIND_SERVICE or a port above 1023; see the install guide"
+        ))
+    } else {
+        e
+    }
 }
 
 /// Opens the realm's database, creating it on first boot, and writes the admin keytab.
@@ -304,6 +321,32 @@ mod tests {
                 (Err(e), Err(want)) => assert!(e.contains(want), "{names}: {e}"),
                 (got, _) => panic!("{names}: unexpected {got:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn test_a_refused_low_port_says_what_it_needs() {
+        use io::ErrorKind::{AddrInUse, PermissionDenied};
+        let rows = [
+            (PermissionDenied, 88, true),
+            (PermissionDenied, 749, true),
+            (PermissionDenied, 1023, true),
+            (PermissionDenied, 1024, false),
+            (PermissionDenied, 8888, false),
+            (AddrInUse, 88, false),
+        ];
+        for (kind, port, hinted) in rows {
+            let message = format!("{:#}", with_port_hint(io::Error::new(kind, "bind"), port));
+            let hint = format!("port {port} needs CAP_NET_BIND_SERVICE or a port above 1023");
+            assert_eq!(
+                message.contains(&hint),
+                hinted,
+                "{kind:?} on {port}: {message}"
+            );
+            assert!(
+                message.ends_with("bind"),
+                "the io error stays in the chain: {message}"
+            );
         }
     }
 

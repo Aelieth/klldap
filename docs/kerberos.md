@@ -171,6 +171,30 @@ and
 The old `LLDAP_KERB_*` variables are unknown. They warn at startup and are
 ignored. Use the options above.
 
+## Upgrading from 0.7.x
+
+0.7.x kept the realm in MIT's db2 format, which 0.8.0 cannot read. Before the first 0.8.0
+start, write a dump of it into the same directory with the 0.7.x image you were running, either
+in its running container or in a one-off container on the same KDC volume:
+
+    docker exec <your 0.7.x container> kdb5_util -r <REALM> dump /var/kerberos/krb5kdc/principal.dump
+    docker run --rm --entrypoint kdb5_util -v <kdc volume>:/var/kerberos/krb5kdc \
+        <your 0.7.x image> -r <REALM> dump /var/kerberos/krb5kdc/principal.dump
+
+On its first start, 0.8.0 finds `principal.dump` beside the stash, loads it, and moves the MIT
+files (`principal`, `principal.kadm5`, `principal.ok`, `principal.kadm5.lock`, `kadm5.acl`,
+`kdc.conf` and the dump) into `mit-db2.bak/` in the same directory, mode 0700. Nothing is
+deleted: remove that directory once the realm works. The dump holds every principal's key
+data, encrypted in the master key, so keep the backup as safe as the database.
+
+What carries over: the realm, the master key (the stash stays), every principal with its keys
+and attributes, and `admin/admin`, whose keytab is written again from its key. What does not:
+grants in `kadm5.acl` beyond the admin line (name them in `kadmin_acl_file`), and MIT's logs.
+
+Without a dump the realm does not open: the server comes up in the degraded state and the
+cause names the file to write. A dump for a realm other than `kerberos_options.realm`, or a
+dump without its stash, is refused the same way, and nothing is moved.
+
 ## Losing a volume
 
 - `data_dir` lost (database and stash go together; the default path is
@@ -179,6 +203,9 @@ ignored. Use the options above.
   the admin keytab. Existing users have no principal until their password is
   next set (or an admin sets one for them); the Keycloak keytab has to be
   exported again.
+- `data_dir` lost after a migration, with `mit-db2.bak/` still there: the realm does not
+  open, and the cause names the backup, so a lost database is not silently replaced by a
+  new realm. Restore the database, or move `mit-db2.bak/` away to start a fresh realm.
 - `/data` lost: the directory database and `server_key` are gone with it.
   Restore them from backup. The admin keytab is rewritten from the surviving
   KDC database on the next boot.

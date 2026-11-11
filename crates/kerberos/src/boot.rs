@@ -122,6 +122,7 @@ pub fn with_port_hint(e: io::Error, port: u16) -> anyhow::Error {
 pub(crate) fn open_store(settings: &RealmSettings, profile: &ProfileSet) -> Result<PrincipalStore> {
     let realm = &settings.realm;
     secure_dir(&settings.data_dir)?;
+    crate::migrate::migrate(settings)?;
     let paths = KdcPaths {
         profile: PathBuf::new(),
         conf: profile.kdc.clone(),

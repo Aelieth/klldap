@@ -13,7 +13,7 @@ LLDAP_GID="${LLDAP_GID:-$(printenv GID || echo 1000)}"
 # Create required persistent directories (kerberos_manager now owns its own dirs)
 mkdir -p /data /data/keytab /data/cert
 
-# Repair ownership on /data and /app so the target user can read/write its files
+# Repair ownership on /data, /app and the KDC directory so the target user can read/write its files
 # (including the config we may copy, the sqlite DB, and any key material if not using seed).
 # We attempt this when running as root (the normal container ENTRYPOINT case).
 # In true rootless (non-root from the start) we skip to avoid `set -e` aborts on
@@ -24,6 +24,7 @@ echo "[start-lldap] Ensuring ownership for UID=${LLDAP_UID} GID=${LLDAP_GID}"
 if [ "$(id -u)" -eq 0 ]; then
   find /app \! -user "${LLDAP_UID}" -exec chown "${LLDAP_UID}:${LLDAP_GID}" '{}' + || true
   find /data \! -user "${LLDAP_UID}" -exec chown "${LLDAP_UID}:${LLDAP_GID}" '{}' + || true
+  find /var/kerberos/krb5kdc \! -user "${LLDAP_UID}" -exec chown "${LLDAP_UID}:${LLDAP_GID}" '{}' + || true
 else
   echo "[start-lldap] Not root; skipping ownership repair (rely on volume setup)."
 fi

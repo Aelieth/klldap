@@ -37,6 +37,27 @@ credential for the realm.
 **If either Kerberos thread dies, the process exits non-zero. Without a restart
 policy, the container stays down.**
 
+**When the realm cannot open.** If Kerberos is enabled and the realm does not
+open at startup (for example, the KDC port is taken, or the realm's database or
+directory cannot be read), the server starts in a degraded state instead of
+exiting:
+
+- LDAP, LDAPS and the web interface listen on loopback only (`127.0.0.1`, or
+  `::1` when the configured host is IPv6). The KDC and kadmin do not listen.
+- Only members of `lldap_admin` can sign in. Another user with the right
+  password is refused with LDAP result 52 (unavailable) or HTTP 503; a wrong
+  password is still invalid credentials (49, 401). Other users' existing
+  sessions are refused too.
+- Directory changes are refused, with the cause.
+- `/health` answers 503 with the cause, and `lldap healthcheck` prints it and
+  fails.
+- The log names the cause: `the Kerberos realm <REALM> did not open: …`.
+
+Fix the cause and restart. At startup the server tries the realm again and, if
+it opens, serves normally. Nothing in the product repairs the realm. In a
+container, loopback is the container's own, so reach the server with `docker
+exec klldap /app/lldap healthcheck --config-file /data/lldap_config.toml`.
+
 The image sets `LLDAP_KERBEROS_OPTIONS__ENABLED=true`. The container's
 healthcheck (`lldap healthcheck`) then also requires the KDC port to accept
 connections and the admin keytab to exist, otherwise the container reports

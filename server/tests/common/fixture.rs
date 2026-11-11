@@ -75,7 +75,15 @@ impl LLDAPFixture {
         Self::start(extra_env, true)
     }
 
+    pub fn new_with_env_answering(extra_env: &[(&str, &str)]) -> Self {
+        Self::start_ready(extra_env, false, true)
+    }
+
     fn start(extra_env: &[(&str, &str)], capture_log: bool) -> Self {
+        Self::start_ready(extra_env, capture_log, false)
+    }
+
+    fn start_ready(extra_env: &[(&str, &str)], capture_log: bool, answering: bool) -> Self {
         let dir = tempfile::TempDir::new().expect("temp dir");
         let server_log = capture_log.then(|| dir.path().join("server.log"));
         let db_url = format!("sqlite://{}/users.db?mode=rwc", dir.path().display());
@@ -92,7 +100,11 @@ impl LLDAPFixture {
             &extra_env,
             server_log.as_deref(),
         );
-        wait_until_healthy(&db_url, ldap_port, http_port, &extra_env);
+        if answering {
+            wait_until_answering(http_port);
+        } else {
+            wait_until_healthy(&db_url, ldap_port, http_port, &extra_env);
+        }
 
         let client = ClientBuilder::new()
             .connect_timeout(std::time::Duration::from_secs(3))
@@ -141,6 +153,33 @@ impl LLDAPFixture {
             &self.extra_env,
         );
         self.token = get_token(&self.client, &self.http_url());
+    }
+
+    pub fn restart_after<T>(&mut self, between: impl FnOnce() -> T) -> T {
+        stop_child(&mut self.child);
+        let value = between();
+        self.child = spawn_server(
+            &self.db_url,
+            self.ldap_port,
+            self.http_port,
+            &self.extra_env,
+            self.server_log.as_deref(),
+        );
+        wait_until_answering(self.http_port);
+        self.token = get_token(&self.client, &self.http_url());
+        value
+    }
+
+    pub fn healthcheck_output(&self) -> std::process::Output {
+        server_command(
+            "healthcheck",
+            &self.db_url,
+            self.ldap_port,
+            self.http_port,
+            &self.extra_env,
+        )
+        .output()
+        .expect("healthcheck command failed to execute")
     }
 
     pub fn ldap_url(&self) -> String {
@@ -334,6 +373,25 @@ fn wait_until_healthy(
         thread::sleep(Duration::from_millis(800));
     }
     assert!(started, "Server did not become healthy");
+}
+
+fn wait_until_answering(http_port: u16) {
+    let client = ClientBuilder::new()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(Duration::from_secs(8))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("failed to make http client");
+    let url = format!("{}/health", http_url(http_port));
+    for attempt in 0..MAX_HEALTHCHECK_ATTEMPS {
+        if client.get(&url).send().is_ok() {
+            return;
+        }
+        if attempt == MAX_HEALTHCHECK_ATTEMPS - 1 {
+            panic!("LLDAP did not answer /health after {MAX_HEALTHCHECK_ATTEMPS} attempts");
+        }
+        thread::sleep(Duration::from_millis(800));
+    }
 }
 
 fn stop_child(child: &mut ChildProcess) {

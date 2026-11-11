@@ -1,0 +1,17 @@
+# Secrets stay in /etc/klldap/klldap.env. This file holds none.
+database_url = "sqlite:///var/lib/klldap/users.db?mode=rwc"
+key_file = "/var/lib/klldap/server_key"
+assets_path = "/usr/local/share/klldap/app"
+
+# The Kerberos realm follows from the base DN. Set it before the first start.
+#ldap_base_dn = "dc=example,dc=com"
+
+[kerberos_options]
+enabled = true
+data_dir = "/var/lib/klldap/krb5kdc"
+admin_keytab = "/var/lib/klldap/kadm5.keytab"
+keycloak_keytab = "/var/lib/klldap/keycloak-http.keytab"
+client_config = "/var/lib/klldap/krb5.conf"
+
+[keycloak_options]
+config_file = "/var/lib/klldap/keycloak_config.toml"

@@ -1,0 +1,21 @@
+[Unit]
+Description=KLLDAP
+After=network.target
+
+[Service]
+Type=exec
+User=klldap
+Group=klldap
+StateDirectory=klldap
+WorkingDirectory=/var/lib/klldap
+EnvironmentFile=-/etc/klldap/klldap.env
+ExecStart=/usr/local/bin/lldap run --config-file /etc/klldap/lldap_config.toml
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+ProtectSystem=strict
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

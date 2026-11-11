@@ -62,10 +62,11 @@ impl KeycloakClient {
         realm: String,
         admin_user: String,
         admin_pass: String,
+        configured_pass: Option<&str>,
     ) -> Result<Self> {
         validate_keycloak_url(&url)?;
         let pass = if admin_pass.trim().is_empty() {
-            admin_password()?
+            admin_password(configured_pass)?
         } else {
             admin_pass
         };

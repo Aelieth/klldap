@@ -119,8 +119,8 @@ read from a file instead by appending `_FILE` to the variable name
 | `LLDAP_LOG_OPTIONS__PERSIST` / `__RETENTION_DAYS` / `__MAX_ENTRIES` / `__BIND_COALESCE_SECONDS` | `true` / `30` / `50000` / `300` | Persistent event log (logins, binds, directory changes, denials) in the `logs` table, see [docs/logging.md](docs/logging.md); `0` removes an age or size limit; the trim also runs with `PERSIST=false`; repeated successful binds are stored once per coalescing window (`0` stores all) |
 | `LLDAP_KERBEROS_OPTIONS__ENABLED` / `__REALM` / `__TICKET_LIFETIME` / `__RENEW_LIFETIME` / `__FORWARDABLE` | `false` (`true` in the image) / from the base DN / `24h` / `7d` / `true` | Kerberos beside the directory: when enabled, directory writes wait for the KDC after boot and the healthcheck also requires it, see [docs/kerberos.md](docs/kerberos.md) |
 | `LLDAP_KERB_ADMIN_KEYTAB`, `_CONFIG`, `_KRB5_CONF`, `_KDC_CONF`, `_KADM5_ACL`, `_KDC_DIR`, `_KEYCLOAK_KEYTAB`, `_KDC_PORT` (+ `_*_TEMPLATE`) | container layout | Kerberos file locations and KDC port, see [docs/kerberos.md](docs/kerberos.md) |
-| `LLDAP_KEYCLOAK_ADMIN_PASS` | `admin` | Keycloak admin password used by the Federation tab |
-| `LLDAP_KEYCLOAK_CONFIG` | `/data/keycloak_config.toml` | Where the Federation tab stores URL, realm and admin user |
+| `LLDAP_KEYCLOAK_OPTIONS__CONFIG_FILE` | `/data/keycloak_config.toml` | Where the Federation tab stores URL, realm and admin user |
+| `LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS` | none | Keycloak admin password used by the Federation tab. `LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS_FILE` reads it from a file; if both are set, the plain value wins |
 | `LLDAP_UID` / `LLDAP_GID` | `1000` / `1000` | User the server runs as inside the container (`UID`/`GID` still honored) |
 | `LLDAP_CONFIG_FILE`, `LLDAP_SERVER_KEY_FILE`, `LLDAP_SERVER_KEY_SEED` | | Command-line equivalents of the config file / key settings |
 

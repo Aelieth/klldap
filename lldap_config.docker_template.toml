@@ -224,6 +224,13 @@ key_seed = "RanD0m STR1ng"
 ## service accounts that bind constantly do not fill max_entries. 0 stores every bind.
 #bind_coalesce_seconds = 300
 
-## Keycloak is configured outside this file: the Federation tab writes its settings to
-## /data/keycloak_config.toml (LLDAP_KEYCLOAK_CONFIG); the admin password is
-## LLDAP_KEYCLOAK_ADMIN_PASS.
+## Options for the Keycloak federation tab.
+## To set these options from environment variables, use the following format
+## (example with admin_pass): LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS
+## A secret may also be read from a file: LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS_FILE
+## If both are set, the plain value wins.
+[keycloak_options]
+## Where the Federation tab stores the URL, realm and admin user.
+#config_file = "/data/keycloak_config.toml"
+## Keycloak admin password. No default. Not written into the file above.
+#admin_pass = "changeme"

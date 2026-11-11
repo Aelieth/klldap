@@ -242,8 +242,12 @@ impl<Handler: FullHandler + OpaqueHandler> Query<Handler> {
                 &span,
                 "Unauthorized to read Keycloak config",
             ))?;
-        let cfg = KeycloakConfig::load(&context.keycloak.base_dn, kerberos_backend().realm())
-            .map_err(|e| anyhow!("Could not read the Keycloak config: {e:#}"))?;
+        let cfg = KeycloakConfig::load(
+            &context.keycloak.base_dn,
+            kerberos_backend().realm(),
+            &context.keycloak.config_file,
+        )
+        .map_err(|e| anyhow!("Could not read the Keycloak config: {e:#}"))?;
         Ok(KeycloakConfigResponse {
             url: cfg.url,
             realm: cfg.realm,
@@ -1257,6 +1261,8 @@ mod tests {
         );
         context.keycloak = Arc::new(lldap_keycloak::KeycloakSettings {
             base_dn: "dc=gate,dc=test".into(),
+            config_file: std::path::PathBuf::from("/data/keycloak_config.toml"),
+            admin_pass: None,
         });
         let (value, errors) = execute(QUERY, None, &schema, &Variables::new(), &context)
             .await

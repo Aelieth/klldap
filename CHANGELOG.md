@@ -32,6 +32,16 @@ yet. 0.7.4, 0.7.5 and 0.7.6 stay unreleased on their own branches.
 - `LLDAP_KERB_REALM_NAME` is removed; use `kerberos_options.realm`. It now warns as unknown.
 - The server writes the realm, base DN and ticket settings to `/data/kerberos_config.toml`
   at every boot for the KDC bootstrap; hand edits to that file are overwritten.
+- `[keycloak_options]` holds `config_file` (default `/data/keycloak_config.toml`,
+  `LLDAP_KEYCLOAK_OPTIONS__CONFIG_FILE`) and `admin_pass` (no default,
+  `LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS`, or `LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS_FILE`
+  for a file; if both are set, the plain value wins). `LLDAP_KEYCLOAK_CONFIG` and
+  `LLDAP_KEYCLOAK_ADMIN_PASS` now warn as unknown and are ignored. An operator who
+  keeps the old admin password gets a realm push that fails with "admin password is
+  not set".
+- `config_file` stays exempt from the file provider, with `key_file` and `cert_file`.
+  The exemption matches that name at any depth, so a missing `LLDAP_CONFIG_FILE` starts
+  the server on defaults, the same as a missing `--config-file`.
 
 ### Fixed
 

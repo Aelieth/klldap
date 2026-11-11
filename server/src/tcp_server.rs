@@ -279,6 +279,8 @@ where
         domain: domain_from_base_dn(&config.ldap_base_dn),
         keycloak: Arc::new(KeycloakSettings {
             base_dn: config.ldap_base_dn.clone(),
+            config_file: config.keycloak_options.config_file.clone(),
+            admin_pass: config.keycloak_options.admin_pass.clone(),
         }),
     };
     let verbose = config.verbose;

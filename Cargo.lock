@@ -3650,6 +3650,7 @@ dependencies = [
  "lldap_domain_handlers",
  "pretty_assertions",
  "reqwest",
+ "secstr",
  "serde",
  "serde_json",
  "toml",

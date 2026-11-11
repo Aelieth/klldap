@@ -121,6 +121,21 @@ impl std::default::Default for KerberosOptions {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, derive_builder::Builder)]
+#[builder(pattern = "owned")]
+pub struct KeycloakOptions {
+    #[builder(default = r#"PathBuf::from("/data/keycloak_config.toml")"#)]
+    pub config_file: PathBuf,
+    #[builder(default)]
+    pub admin_pass: Option<SecUtf8>,
+}
+
+impl std::default::Default for KeycloakOptions {
+    fn default() -> Self {
+        KeycloakOptionsBuilder::default().build().unwrap()
+    }
+}
+
 impl KerberosOptions {
     fn check_durations(&self) -> Result<()> {
         for (name, value) in [
@@ -216,6 +231,8 @@ pub struct Configuration {
     pub healthcheck_options: HealthcheckOptions,
     #[builder(default)]
     pub kerberos_options: KerberosOptions,
+    #[builder(default)]
+    pub keycloak_options: KeycloakOptions,
     #[builder(default)]
     pub log_options: LogOptions,
 }
@@ -710,6 +727,12 @@ fn expected_keys(dict: &figment::value::Dict) -> HashSet<String> {
 }
 
 fn check_for_unexpected_env_variables<P: Provider>(env_variable_provider: P) {
+    for name in unexpected_env_variables(env_variable_provider) {
+        eprintln!("WARNING: Unknown environment variable: {name}");
+    }
+}
+
+fn unexpected_env_variables<P: Provider>(env_variable_provider: P) -> Vec<String> {
     use figment::Profile;
     let expected_keys = expected_keys(
         &Figment::from(Serialized::defaults(
@@ -721,14 +744,15 @@ fn check_for_unexpected_env_variables<P: Provider>(env_variable_provider: P) {
         .data()
         .unwrap()[&Profile::default()],
     );
-    // The KDC's file paths and LLDAP_KEYCLOAK_* are read by the kerberos and keycloak crates.
-    extract_keys(&env_variable_provider.data().unwrap()[&Profile::default()])
-        .iter()
-        .filter(|k| !expected_keys.contains(k.as_str()))
-        .filter(|k| !ENV_KEYS.contains(&k.as_str()) && !k.starts_with("LLDAP_KEYCLOAK_"))
-        .for_each(|k| {
-            eprintln!("WARNING: Unknown environment variable: {k}");
-        });
+    // The KDC's file paths are read by the kerberos crate.
+    let mut names: Vec<String> =
+        extract_keys(&env_variable_provider.data().unwrap()[&Profile::default()])
+            .into_iter()
+            .filter(|k| !expected_keys.contains(k.as_str()))
+            .filter(|k| !ENV_KEYS.contains(&k.as_str()))
+            .collect();
+    names.sort();
+    names
 }
 
 fn generate_jwt_sample_error() -> String {
@@ -778,7 +802,7 @@ where
         overrides.general_config().config_file
     );
 
-    let ignore_keys = ["key_file", "cert_file"];
+    let ignore_keys = ["key_file", "cert_file", "config_file"];
     let env_variable_provider =
         || FileAdapter::wrap(Env::prefixed("LLDAP_").split("__")).ignore(&ignore_keys);
     let figment_config = Figment::from(Serialized::defaults(
@@ -919,7 +943,7 @@ mod tests {
             jail.clear_env();
             jail.set_env("LLDAP_KEY_SEED", "a123");
             jail.set_env("LLDAP_JWT_SECRET", "secret");
-            let ignore_keys = ["key_file", "cert_file"];
+            let ignore_keys = ["key_file", "cert_file", "config_file"];
             let figment_config = Figment::from(Serialized::defaults(
                 ConfigurationBuilder::default()
                     .key_seed(Some(SecUtf8::from(FIGMENT_DUMMY_KEY_SEED)))
@@ -1179,6 +1203,150 @@ mod tests {
             assert_eq!(config.log_options.max_entries, 7);
             assert_eq!(config.log_options.bind_coalesce_seconds, 0);
             assert_eq!(config.mfa_policy(), MfaPolicy::Disabled);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_keycloak_options_from_env() {
+        type Env = &'static [(&'static str, &'static str)];
+        type Row = (Env, &'static str, Option<&'static str>);
+        let rows: [Row; 3] = [
+            (&[], "/data/keycloak_config.toml", None),
+            (
+                &[("LLDAP_KEYCLOAK_OPTIONS__CONFIG_FILE", "/data/realm.toml")],
+                "/data/realm.toml",
+                None,
+            ),
+            (
+                &[("LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS", "s3cret")],
+                "/data/keycloak_config.toml",
+                Some("s3cret"),
+            ),
+        ];
+        for (env, path, pass) in rows {
+            Jail::expect_with(|jail| {
+                jail.clear_env();
+                jail.set_env("LLDAP_JWT_SECRET", "secret");
+                for (key, value) in env {
+                    jail.set_env(key, value);
+                }
+                let config = init(default_run_opts()).unwrap();
+                assert_eq!(
+                    config.keycloak_options.config_file,
+                    std::path::PathBuf::from(path),
+                    "{env:?}"
+                );
+                assert_eq!(
+                    config
+                        .keycloak_options
+                        .admin_pass
+                        .as_ref()
+                        .map(secstr::SecUtf8::unsecure),
+                    pass,
+                    "{env:?}"
+                );
+                Ok(())
+            });
+        }
+
+        Jail::expect_with(|jail| {
+            jail.clear_env();
+            jail.set_env("LLDAP_JWT_SECRET", "secret");
+            jail.create_file("secret", "from-file")?;
+            jail.set_env("LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS_FILE", "secret");
+            let config = init(default_run_opts()).unwrap();
+            assert_eq!(
+                config
+                    .keycloak_options
+                    .admin_pass
+                    .as_ref()
+                    .map(secstr::SecUtf8::unsecure),
+                Some("from-file")
+            );
+            Ok(())
+        });
+
+        Jail::expect_with(|jail| {
+            jail.clear_env();
+            jail.set_env("LLDAP_JWT_SECRET", "secret");
+            jail.create_file("secret", "from-file")?;
+            jail.set_env("LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS_FILE", "secret");
+            jail.set_env("LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS", "plain");
+            let config = init(default_run_opts()).unwrap();
+            assert_eq!(
+                config
+                    .keycloak_options
+                    .admin_pass
+                    .as_ref()
+                    .map(secstr::SecUtf8::unsecure),
+                Some("plain")
+            );
+            Ok(())
+        });
+
+        Jail::expect_with(|jail| {
+            jail.clear_env();
+            jail.set_env("LLDAP_JWT_SECRET", "secret");
+            jail.set_env("LLDAP_KEYCLOAK_ADMIN_PASS", "old");
+            jail.set_env("LLDAP_KEYCLOAK_CONFIG", "/tmp/old.toml");
+            jail.set_env("LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS", "new");
+            let config = init(default_run_opts()).unwrap();
+            assert_eq!(
+                config
+                    .keycloak_options
+                    .admin_pass
+                    .as_ref()
+                    .map(secstr::SecUtf8::unsecure),
+                Some("new")
+            );
+            let names =
+                super::unexpected_env_variables(figment_file_provider_adapter::FileAdapter::wrap(
+                    figment::providers::Env::prefixed("LLDAP_").split("__"),
+                ));
+            assert!(
+                names.iter().any(|name| name == "LLDAP_KEYCLOAK_ADMIN_PASS"),
+                "{names:?}"
+            );
+            assert!(
+                names.iter().any(|name| name == "LLDAP_KEYCLOAK_CONFIG"),
+                "{names:?}"
+            );
+            assert!(
+                names
+                    .iter()
+                    .all(|name| !name.starts_with("LLDAP_KEYCLOAK_OPTIONS__")),
+                "{names:?}"
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_keycloak_missing_config_file_uses_defaults() {
+        fn assert_defaults(config: &Configuration) {
+            assert_eq!(config.ldap_port, 3890);
+            assert_eq!(config.ldap_base_dn, "dc=example,dc=com");
+            assert_eq!(
+                config.keycloak_options.config_file,
+                std::path::PathBuf::from("/data/keycloak_config.toml")
+            );
+            assert!(config.keycloak_options.admin_pass.is_none());
+        }
+        let missing = "/no/such/kco-lldap-config.toml";
+        Jail::expect_with(|jail| {
+            jail.clear_env();
+            jail.set_env("LLDAP_JWT_SECRET", "secret");
+            jail.set_env("LLDAP_CONFIG_FILE", missing);
+            let config = init(RunOpts::parse_from::<_, std::ffi::OsString>([])).unwrap();
+            assert_defaults(&config);
+            Ok(())
+        });
+        Jail::expect_with(|jail| {
+            jail.clear_env();
+            jail.set_env("LLDAP_JWT_SECRET", "secret");
+            let config = init(RunOpts::parse_from(["lldap", "--config-file", missing])).unwrap();
+            assert_defaults(&config);
             Ok(())
         });
     }

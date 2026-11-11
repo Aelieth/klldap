@@ -428,7 +428,7 @@ impl Component for KeycloakSettings {
 
                                     <div class="d-flex align-items-center mb-3">
                                         <label class="form-label me-3" style="min-width: 140px;">{ "Admin Password" }</label>
-                                        <input type="password" class="form-control flex-grow-1" value={self.admin_password.clone()} oninput={on_admin_password} placeholder="LLDAP_KEYCLOAK_ADMIN_PASS" />
+                                        <input type="password" class="form-control flex-grow-1" value={self.admin_password.clone()} oninput={on_admin_password} placeholder="LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS" />
                                     </div>
 
                                     <div class="text-end">

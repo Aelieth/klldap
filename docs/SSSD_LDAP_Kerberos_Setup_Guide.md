@@ -367,8 +367,8 @@ the admin account.
 1. **Go to the Federation page** in the web UI.
 2. **Test Connection** (left side):
    - Fill in your Keycloak URL, Realm (usually `master`), and Admin credentials.
-   - The admin password can come from the environment variable
-     `LLDAP_KEYCLOAK_ADMIN_PASS`.
+   - The admin password can come from `keycloak_options.admin_pass`
+     (`LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS`).
    - Click **Test Settings**. This tests against the master realm.
 3. Once the test succeeds, the right side ("New Realm Settings") becomes active.
 4. Fill in:
@@ -514,7 +514,7 @@ services:
       - ./data/keytab:/keytab:ro
     environment:
       - KEYCLOAK_ADMIN=admin
-      - KEYCLOAK_ADMIN_PASSWORD=${LLDAP_KEYCLOAK_ADMIN_PASS}
+      - KEYCLOAK_ADMIN_PASSWORD=${LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS}
     # ...
 ```
 

@@ -56,6 +56,8 @@ impl<Handler: FullHandler> Context<Handler> {
             mfa_enrollment_pending,
             keycloak: Arc::new(KeycloakSettings {
                 base_dn: "dc=example,dc=com".into(),
+                config_file: std::path::PathBuf::from("/data/keycloak_config.toml"),
+                admin_pass: None,
             }),
         }
     }

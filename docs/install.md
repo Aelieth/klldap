@@ -55,7 +55,7 @@ services:
       - LLDAP_LDAP_BASE_DN=dc=example,dc=com
       # Optional:
       # - LLDAP_KERBEROS_OPTIONS__REALM=EXAMPLE.COM
-      # - LLDAP_KEYCLOAK_ADMIN_PASS=admin
+      # - LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS=admin
       # - LLDAP_DATABASE_URL=postgres://user:password@postgres/lldap
       # - LLDAP_LDAPS_OPTIONS__ENABLED=true
       # - LLDAP_LDAPS_OPTIONS__CERT_FILE=/data/cert/cert.pem

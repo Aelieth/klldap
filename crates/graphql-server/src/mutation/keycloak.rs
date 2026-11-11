@@ -68,6 +68,7 @@ pub(super) async fn test_keycloak_connection<Handler: FullHandler + OpaqueHandle
         input.realm,
         input.admin_user,
         input.admin_pass,
+        context.keycloak.admin_pass_str(),
     )?;
     let result = client.test_connection().await;
     logging::record_outcome(
@@ -102,7 +103,7 @@ pub(super) async fn save_keycloak_config<Handler: FullHandler + OpaqueHandler>(
         realm: input.realm,
         admin_user: input.admin_user,
     };
-    let result = config.save();
+    let result = config.save(&context.keycloak.config_file);
     logging::record_outcome(
         LogKind::KeycloakChange,
         Some(&config.url),
@@ -113,7 +114,7 @@ pub(super) async fn save_keycloak_config<Handler: FullHandler + OpaqueHandler>(
         Ok(path) => Ok(SaveKeycloakConfigResponse {
             ok: true,
             message: format!(
-                "✅ Keycloak settings saved to {} (password remains in-memory/env only)",
+                "✅ Keycloak settings saved to {} (the admin password is not written to this file)",
                 path.display()
             ),
         }),
@@ -141,6 +142,7 @@ pub(super) async fn push_realm_to_keycloak<Handler: FullHandler + OpaqueHandler>
         input.realm,
         input.admin_user,
         input.admin_pass,
+        context.keycloak.admin_pass_str(),
     )?;
     let result = client
         .setup_realm(

@@ -141,6 +141,7 @@ struct Realm {
     admin_keytab: PathBuf,
     keycloak_keytab: PathBuf,
     client_config: PathBuf,
+    data_dir: PathBuf,
     kdc_port: u16,
 }
 
@@ -149,6 +150,16 @@ fn start_realm(capture_log: bool) -> Realm {
 }
 
 fn start_realm_at(capture_log: bool, answering: bool, kdc_port: u16) -> Realm {
+    start_realm_seeded(capture_log, answering, kdc_port, &[], |_| {})
+}
+
+fn start_realm_seeded(
+    capture_log: bool,
+    answering: bool,
+    kdc_port: u16,
+    extra_env: &[(&str, &str)],
+    seed: impl FnOnce(&Path),
+) -> Realm {
     let realm_dir = tempfile::TempDir::new().expect("realm dir");
     let kadmin_port = free_port();
     let data_dir = realm_dir.path().join("data");
@@ -162,7 +173,7 @@ fn start_realm_at(capture_log: bool, answering: bool, kdc_port: u16) -> Realm {
     let admin_keytab_s = admin_keytab.display().to_string();
     let keycloak_keytab_s = keycloak_keytab.display().to_string();
     let client_config_s = client_config.display().to_string();
-    let env = [
+    let mut env = vec![
         ("LLDAP_KERBEROS_OPTIONS__ENABLED", "true"),
         ("LLDAP_KERBEROS_OPTIONS__KDC_BIND", "127.0.0.1"),
         ("LLDAP_KERBEROS_OPTIONS__KDC_PORT", kdc_port_s.as_str()),
@@ -181,6 +192,8 @@ fn start_realm_at(capture_log: bool, answering: bool, kdc_port: u16) -> Realm {
             client_config_s.as_str(),
         ),
     ];
+    env.extend_from_slice(extra_env);
+    seed(&data_dir);
     let fixture = if answering {
         LLDAPFixture::new_with_env_answering(&env)
     } else if capture_log {
@@ -199,6 +212,7 @@ fn start_realm_at(capture_log: bool, answering: bool, kdc_port: u16) -> Realm {
         admin_keytab,
         keycloak_keytab,
         client_config,
+        data_dir,
         kdc_port,
     }
 }
@@ -643,4 +657,33 @@ fn kerberos_degraded() {
     assert_eq!(bind_rc(&fresh.fixture.ldap_url(), &admin, &admin_pass), 0);
     drop(fresh);
     drop(fresh_holder);
+}
+
+#[test]
+fn kerberos_migrates_a_dump() {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/krb5kdc");
+    let mut realm = start_realm_seeded(
+        true,
+        false,
+        free_port(),
+        &[("LLDAP_KERBEROS_OPTIONS__REALM", "LIVEBOB.TEST")],
+        |data_dir| {
+            std::fs::create_dir_all(data_dir).expect("data dir");
+            for name in [".k5.LIVEBOB.TEST", "principal.dump"] {
+                std::fs::copy(fixture.join(name), data_dir.join(name)).expect(name);
+            }
+        },
+    );
+    expect_ok(
+        &kinit(&realm.krb, FIRST),
+        "kinit livebob on the migrated realm",
+    );
+    assert!(realm.data_dir.join("mit-db2.bak/principal.dump").is_file());
+    realm.fixture.restart();
+    expect_ok(
+        &kinit(&realm.krb, FIRST),
+        "kinit livebob after the second boot",
+    );
+    let log = realm.fixture.server_log();
+    assert_eq!(log.matches("Migrated the MIT realm").count(), 1, "{log}");
 }

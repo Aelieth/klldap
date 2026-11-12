@@ -108,7 +108,8 @@ else
     p_bad "access_denied row for $LOG_USER missing"
 fi
 
-if gexec /app/lldap run --help 2>/dev/null | grep -q -- "--log-retention-days"; then
+if gexec /app/lldap run --help >"$D/run-help.txt" 2>/dev/null \
+    && grep -q -- "--log-retention-days" "$D/run-help.txt"; then
     p_ok "--log-retention-days is on the command line"
 else
     p_bad "--log-retention-days missing from lldap run --help"

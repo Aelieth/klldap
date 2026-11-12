@@ -8,7 +8,7 @@ OU_USER="gateoumover"
 
 graphql 'mutation($n: String!) { createOu(name: $n) { ok } }' '{"n": "'"$OU_NAME"'"}' \
     >"$D/create-ou.json" 2>&1 || p_bad "createOu failed"
-if graphql '{ listOus }' '{}' | grep -q "\"$OU_NAME\""; then
+if graphql '{ listOus }' '{}' >"$D/list-ous.json" && grep -q "\"$OU_NAME\"" "$D/list-ous.json"; then
     p_ok "createOu → listOus shows $OU_NAME"
 else
     p_bad "listOus does not show $OU_NAME"
@@ -21,8 +21,8 @@ graphql 'mutation($ids: [String!]!, $ou: String!) { changeUserOu(userIds: $ids, 
     '{"ids": ["'"$OU_USER"'"], "ou": "'"$OU_NAME"'"}' >"$D/change-ou.json" 2>&1 \
     || p_bad "changeUserOu failed"
 
-if lsearch -b "ou=$OU_NAME,$BASE_DN" -s sub "(objectClass=person)" uid 2>"$D/search.err" \
-    | grep -q "^uid: $OU_USER"; then
+if lsearch -b "ou=$OU_NAME,$BASE_DN" -s sub "(objectClass=person)" uid 2>"$D/search.err" >"$D/search-moved.txt" \
+    && grep -q "^uid: $OU_USER" "$D/search-moved.txt"; then
     p_ok "subtree search under ou=$OU_NAME finds the moved user"
 else
     p_bad "moved user not found under ou=$OU_NAME"
@@ -30,14 +30,14 @@ fi
 
 graphql 'mutation($n: String!) { deleteOu(name: $n) { ok } }' '{"n": "'"$OU_NAME"'"}' \
     >"$D/delete-ou.json" 2>&1 || p_bad "deleteOu failed"
-if graphql '{ listOus }' '{}' | grep -q "\"$OU_NAME\""; then
+if graphql '{ listOus }' '{}' >"$D/list-ous.json" && grep -q "\"$OU_NAME\"" "$D/list-ous.json"; then
     p_bad "$OU_NAME still listed after deleteOu"
 else
     p_ok "deleteOu removes the OU"
 fi
 # Reassignment branch: members of a deleted OU return to the default people OU.
-if lsearch -b "ou=people,$BASE_DN" -s sub "(uid=$OU_USER)" uid 2>>"$D/search.err" \
-    | grep -q "^uid: $OU_USER"; then
+if lsearch -b "ou=people,$BASE_DN" -s sub "(uid=$OU_USER)" uid 2>>"$D/search.err" >"$D/search-reassigned.txt" \
+    && grep -q "^uid: $OU_USER" "$D/search-reassigned.txt"; then
     p_ok "deleteOu reassigned the member back to ou=people"
 else
     p_bad "member not reassigned to ou=people after deleteOu"

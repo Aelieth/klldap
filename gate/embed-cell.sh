@@ -41,7 +41,7 @@ ADMIN_PASS="GateAdminPass2026!"
 JWT_SECRET="gate-jwt-secret-not-for-production"
 KEY_SEED="gate-key-seed-not-for-production"
 GATE_DATABASE_URL="sqlite:////data/users.db?mode=rwc"
-GATE_EXTRA_RUN_ARGS=(-p "127.0.0.1:$KDC_PORT:88/udp" -p "127.0.0.1:$KDC_PORT:88/tcp")
+GATE_EXTRA_RUN_ARGS=(-p "127.0.0.1:$KDC_PORT:$KDC_INNER_PORT/udp" -p "127.0.0.1:$KDC_PORT:$KDC_INNER_PORT/tcp")
 LDAP_PORT=""
 HTTP_PORT=""
 TOKEN=""
@@ -65,7 +65,7 @@ docker image inspect "$GATE_IMAGE" >/dev/null 2>&1 || {
 note "Embed cell: image=$GATE_IMAGE users=$USERS kdc=127.0.0.1:$KDC_PORT run=$RUNID"
 docker network create "$NET" >/dev/null || exit 1
 start_main_container || exit 1
-wait_kerberos_healthy 120 || {
+wait_healthy 120 || {
     p_bad "container not healthy with its KDC within 120s"
     exit 1
 }

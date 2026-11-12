@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# KLLDAP container gate: boots the real image (entrypoint.sh and all) and asserts the
+# KLLDAP container gate: boots the real image (docker-entrypoint.sh and all) and asserts the
 # full stack from boot through OU/user lifecycle to Kerberos attributes, as CLI
 # invocations. See working docs / CONTRIBUTING for the phase list.
 #

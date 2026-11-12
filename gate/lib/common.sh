@@ -8,6 +8,9 @@ if [ -t 1 ]; then
 fi
 
 PASS_N=0; FAIL_N=0; SKIP_N=0
+# The image's ports inside the container (its Dockerfile ENV).
+KDC_INNER_PORT=1088
+KADMIN_INNER_PORT=1749
 PHASE="setup"
 
 note() { printf '%s\n' "$*"; }
@@ -51,8 +54,6 @@ uid_of_comm() {
         done
         exit 1'
 }
-
-proc_running() { uid_of_comm "$1" >/dev/null 2>&1; }
 
 # ---- HTTP / GraphQL (host-driven; python3 for JSON, no jq dependency) ----
 
@@ -189,28 +190,10 @@ file_contains() {
         "$1" "$2"
 }
 
-# file_digest <path>: content digest inside the container (sha256sum, cksum fallback).
-file_digest() {
-    gexec sh -c 'sha256sum "$0" 2>/dev/null || cksum "$0"' "$1" | awk '{print $1}'
-}
+# kadmin_q <query>: kadmin inside the container, authenticated by the admin keytab.
+kadmin_q() { gexec kadmin -k -t /data/kadm5.keytab -p "admin/admin@$REALM" -q "$1"; }
 
-# wait_kerberos_healthy [seconds]: poll the full healthcheck including the Kerberos leg
-# (the KDC bootstraps after LLDAP is ready, so plain health races ahead of it).
-wait_kerberos_healthy() {
-    local limit="${1:-90}" i=0
-    while [ "$i" -lt "$limit" ]; do
-        if docker exec "$CONTAINER" /app/lldap healthcheck \
-            --config-file /data/lldap_config.toml >/dev/null 2>&1; then
-            return 0
-        fi
-        sleep 1
-        i=$((i + 1))
-    done
-    return 1
-}
-
-# kadmin_q <query>: kadmin.local inside the container.
-kadmin_q() { gexec kadmin.local -q "$1"; }
+admin_kvno() { kadmin_q "getprinc admin/admin@$REALM" | awk '/Key: vno/ {print $3; exit}' | tr -d ','; }
 
 # kinit_pw <principal> <password>: password kinit inside the container, isolated cache.
 kinit_pw() {

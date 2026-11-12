@@ -8,7 +8,9 @@ SYNC_USER="gatesync"
 NOSYNC_USER="gatenosync"
 SYNC_PASS="GateSyncPass2026!"
 
-principal_exists() { kadmin_q "getprinc $1" 2>/dev/null | grep -q "^Principal: $1@$REALM"; }
+principal_exists() {
+    kadmin_q "getprinc $1" >"$D/getprinc.txt" 2>/dev/null && grep -q "^Principal: $1@$REALM" "$D/getprinc.txt"
+}
 principal_attrs() { kadmin_q "getprinc $1" 2>/dev/null | grep "^Attributes:"; }
 
 graphql 'mutation($u: CreateUserInput!) { createUser(user: $u) { id } }' \
@@ -63,7 +65,7 @@ graphql 'mutation($u: String!, $g: Int!) { addUserToGroup(userId: $u, groupId: $
     '{"u": "'"$SYNC_USER"'", "g": '"${disabled_gid:-0}"'}' >"$D/disable.json" 2>&1 \
     || p_bad "addUserToGroup lldap_disabled failed"
 
-if principal_attrs "$SYNC_USER" | grep -q DISALLOW_ALL_TIX; then
+if principal_attrs "$SYNC_USER" >"$D/attrs.txt" && grep -q DISALLOW_ALL_TIX "$D/attrs.txt"; then
     p_ok "disabled membership reflects to DISALLOW_ALL_TIX"
 else
     p_bad "principal not marked DISALLOW_ALL_TIX after disable"
@@ -77,7 +79,7 @@ fi
 graphql 'mutation($u: String!, $g: Int!) { removeUserFromGroup(userId: $u, groupId: $g) { ok } }' \
     '{"u": "'"$SYNC_USER"'", "g": '"${disabled_gid:-0}"'}' >"$D/enable.json" 2>&1 \
     || p_bad "removeUserFromGroup lldap_disabled failed"
-if principal_attrs "$SYNC_USER" | grep -q DISALLOW_ALL_TIX; then
+if principal_attrs "$SYNC_USER" >"$D/attrs.txt" && grep -q DISALLOW_ALL_TIX "$D/attrs.txt"; then
     p_bad "DISALLOW_ALL_TIX not cleared after re-enable"
 else
     p_ok "re-enable clears DISALLOW_ALL_TIX"
@@ -96,7 +98,7 @@ graphql 'mutation($u: String!, $g: Int!) { addUserToGroup(userId: $u, groupId: $
 graphql 'mutation($id: String!, $pw: String!) { setUserPassword(userId: $id, password: $pw) { ok } }' \
     '{"id": "'"$SYNC_USER"'", "pw": "'"$SYNC_PASS"'x"}' >"$D/setpw-disabled.json" 2>&1 \
     || p_bad "setUserPassword while disabled failed"
-if principal_attrs "$SYNC_USER" | grep -q DISALLOW_ALL_TIX; then
+if principal_attrs "$SYNC_USER" >"$D/attrs.txt" && grep -q DISALLOW_ALL_TIX "$D/attrs.txt"; then
     p_ok "password change while disabled keeps DISALLOW_ALL_TIX"
 else
     p_bad "password change while disabled dropped DISALLOW_ALL_TIX"

@@ -31,7 +31,8 @@ EOF
 if lmodify -f "$D/add-user.ldif" >"$D/ldapadd.log" 2>&1; then
     p_ok "ldapadd creates a user over the wire"
     if lsearch -b "uid=$LDIF_USER,ou=people,$BASE_DN" -s base "(objectClass=*)" gatecustom \
-        2>>"$D/ldapadd.log" | grep -q "^gatecustom: brought by ldapadd"; then
+        2>>"$D/ldapadd.log" >"$D/ldapadd-readback.txt" \
+        && grep -q "^gatecustom: brought by ldapadd" "$D/ldapadd-readback.txt"; then
         p_ok "custom attribute from ldapadd persists"
     else
         p_bad "custom attribute silently dropped by ldapadd"
@@ -51,7 +52,8 @@ EOF
 if lmodify -f "$D/add-group.ldif" >"$D/ldapadd-group.log" 2>&1; then
     p_ok "ldapadd creates a group over the wire"
     if lsearch -b "cn=$LDIF_GROUP,ou=groups,$BASE_DN" -s base "(objectClass=*)" gidNumber \
-        2>>"$D/ldapadd-group.log" | grep -qi "^gidNumber: 4242"; then
+        2>>"$D/ldapadd-group.log" >"$D/ldapadd-group-readback.txt" \
+        && grep -qi "^gidNumber: 4242" "$D/ldapadd-group-readback.txt"; then
         p_ok "gidNumber from group ldapadd persists"
     else
         p_bad "gidNumber silently dropped by group ldapadd"
@@ -68,7 +70,8 @@ sshPublicKey: ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCGateTestKeyNotReal gate@tes
 EOF
 if lmodify -f "$D/add-ssh.ldif" >"$D/add-ssh.log" 2>&1 \
     && lsearch -b "uid=$LDIF_USER,ou=people,$BASE_DN" -s base "(objectClass=*)" sshPublicKey \
-        2>>"$D/add-ssh.log" | grep -q "^sshPublicKey: ssh-rsa"; then
+        2>>"$D/add-ssh.log" >"$D/add-ssh-readback.txt" \
+    && grep -q "^sshPublicKey: ssh-rsa" "$D/add-ssh-readback.txt"; then
     p_ok "ldapmodify add sshPublicKey + read-back"
 else
     p_bad "sshPublicKey add/read-back failed"

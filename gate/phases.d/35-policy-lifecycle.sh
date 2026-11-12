@@ -18,7 +18,8 @@ graphql 'mutation($o: String!, $p: Int!) { setOuPolicy(ou: $o, policyId: $p) { o
 
 graphql 'query($o: String!) { effectivePolicyItems(ou: $o) { key value sourceOu } }' \
     '{"o": "'"$OU_NAME"'"}' >"$D/effective.json" 2>&1 || p_bad "effectivePolicyItems failed"
-if json_get effectivePolicyItems <"$D/effective.json" | grep -q always; then
+if json_get effectivePolicyItems <"$D/effective.json" >"$D/effective-items.txt" \
+    && grep -q always "$D/effective-items.txt"; then
     p_ok "effectivePolicyItems shows require-mfa=always from $OU_NAME"
 else
     p_bad "effectivePolicyItems missing always: $(cat "$D/effective.json")"

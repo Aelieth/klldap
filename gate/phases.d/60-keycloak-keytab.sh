@@ -1,7 +1,6 @@
 # shellcheck shell=bash
 # Phase: Keycloak keytab export — the GraphQL mutation must produce a real keytab with
-# the HTTP service principal and modern enctypes (kadmin.local run by the server user
-# against the KDB it owns).
+# the HTTP service principal and modern enctypes.
 
 D="$(phase_dir)"
 KC_HOST="keycloak.gate.test"
@@ -25,7 +24,7 @@ if grep -q "HTTP/$KC_HOST@$REALM" "$D/klist.txt"; then
 else
     p_bad "service principal missing from the exported keytab"
 fi
-if gexec klist -kte /data/keytab/keycloak-http.keytab | grep -q "aes256-cts"; then
+if gexec klist -kte /data/keytab/keycloak-http.keytab >"$D/klist-e.txt" && grep -q "aes256-cts" "$D/klist-e.txt"; then
     p_ok "keytab uses aes256"
 else
     p_bad "keytab lacks aes256 enctype"

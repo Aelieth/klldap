@@ -1,37 +1,42 @@
 # shellcheck shell=bash
-# Phase: bootstrap idempotence — re-running the manager's bootstrap against a live,
-# already-bootstrapped system must take the existing-database path and change nothing.
+# Phase: bootstrap idempotence — a restart reopens the existing realm without creating or
+# losing principals, and a deleted admin keytab is written again with the same key version.
 
 D="$(phase_dir)"
 
-keytab_before="$(file_digest /data/kadm5.keytab)"
-kvno_before="$(kadmin_q "getprinc admin/admin@$REALM" | grep -m1 "vno" | awk '{print $3}' | tr -d ',')"
+kadmin_q listprincs 2>/dev/null | grep '@' | sort >"$D/listprincs-before.txt"
+kvno_before="$(admin_kvno)"
+gexec rm -f /data/kadm5.keytab
+restart_stamp="$(date +%s)"
 
-if gexec /app/kerberos_manager --bootstrap-only >"$D/bootstrap-only.log" 2>&1; then
-    p_ok "second --bootstrap-only run exits cleanly"
+if t docker restart "$CONTAINER" >/dev/null 2>&1 && wait_healthy 90; then
+    p_ok "healthy again after a restart without the admin keytab"
 else
-    p_bad "second --bootstrap-only run failed (see bootstrap-only.log)"
+    p_bad "container did not become healthy after the restart"
 fi
-if grep -q "Existing KDC database detected" "$D/bootstrap-only.log"; then
-    p_ok "re-run takes the existing-database path"
-else
-    p_bad "re-run did not report the existing database"
-fi
-if grep -q "addprinc" "$D/bootstrap-only.log"; then
-    p_bad "re-run created principals"
-else
-    p_ok "re-run created no principals"
-fi
+discover_ports || p_bad "port discovery failed after restart"
+TOKEN="$(gate_login)" || p_bad "admin login failed after restart"
 
-keytab_after="$(file_digest /data/kadm5.keytab)"
-kvno_after="$(kadmin_q "getprinc admin/admin@$REALM" | grep -m1 "vno" | awk '{print $3}' | tr -d ',')"
-if [ -n "$keytab_before" ] && [ "$keytab_before" = "$keytab_after" ]; then
-    p_ok "keytab untouched by the re-run"
+docker logs --since "$restart_stamp" "$CONTAINER" >"$D/restart-docker.log" 2>&1
+if grep -q "Kerberos realm $REALM serving" "$D/restart-docker.log"; then
+    p_ok "the realm reopened"
 else
-    p_bad "keytab changed on re-run"
+    p_bad "no 'Kerberos realm $REALM serving' after restart"
 fi
+if gexec sh -c '[ -s /data/kadm5.keytab ]'; then
+    p_ok "the deleted admin keytab is back"
+else
+    p_bad "/data/kadm5.keytab was not written again"
+fi
+kadmin_q listprincs 2>/dev/null | grep '@' | sort >"$D/listprincs-after.txt"
+if [ -s "$D/listprincs-before.txt" ] && cmp -s "$D/listprincs-before.txt" "$D/listprincs-after.txt"; then
+    p_ok "the restart created and lost no principals"
+else
+    p_bad "principals differ across the restart (see listprincs-before/after.txt)"
+fi
+kvno_after="$(admin_kvno)"
 if [ -n "$kvno_before" ] && [ "$kvno_before" = "$kvno_after" ]; then
-    p_ok "admin key vno untouched by the re-run ($kvno_after)"
+    p_ok "admin key vno unchanged ($kvno_after)"
 else
-    p_bad "admin key vno changed on re-run ($kvno_before → $kvno_after)"
+    p_bad "admin key vno changed ($kvno_before → $kvno_after)"
 fi

@@ -99,6 +99,9 @@ docker exec klldap \
   kadmin -k -t /data/kadm5.keytab -p admin/admin -q "getprinc bob"
 ```
 
+On a host, skip `docker exec` and set `KRB5_CONFIG=krb5.conf`, the file in
+the unit's working directory.
+
 `getprinc` shows attributes such as `REQUIRES_PRE_AUTH` and `DISALLOW_ALL_TIX`.
 
 ## Ports and clients

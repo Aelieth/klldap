@@ -124,7 +124,8 @@ The binary is `target/release/lldap`.
 `./app/build.sh` needs `wasm-pack` (`cargo install wasm-pack` if it is missing) and `gzip`.
 It runs `wasm-pack build --target web --release`.
 
-<!-- BLANK (HOST-c): upstream's two lines, pointing at example_configs/lldap.service. -->
+You can also install it as a systemd service, see
+[lldap.service](../example_configs/lldap.service).
 
 ### Cross-compilation
 

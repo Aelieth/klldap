@@ -1,0 +1,22 @@
+[Unit]
+Description=KLLDAP
+Documentation=https://github.com/Aelieth/klldap
+
+# Only sqlite
+After=network.target
+
+[Service]
+# The user/group KLLDAP is run under. The working directory (see below) should allow write and read access to this user/group.
+User=klldap
+Group=klldap
+
+# The location of the compiled binary
+ExecStart=/opt/nitnelave/lldap \
+  run
+
+# Only allow writes to the following directory and set it to the working directory (user and password data are stored here, and so is the Kerberos realm).
+WorkingDirectory=/opt/nitnelave/
+ReadWriteDirectories=/opt/nitnelave/
+
+[Install]
+WantedBy=multi-user.target

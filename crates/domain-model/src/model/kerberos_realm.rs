@@ -1,4 +1,5 @@
 use sea_orm::entity::prelude::*;
+use sea_orm::sea_query::extension::mysql::MySqlType;
 
 #[derive(Clone, Debug, PartialEq, Eq, DeriveEntityModel)]
 #[sea_orm(table_name = "kerberos_realm")]
@@ -9,7 +10,7 @@ pub struct Model {
     pub realm: String,
     pub generation: i64,
     pub open: bool,
-    #[sea_orm(column_type = "Blob")]
+    #[sea_orm(column_type = "Custom(SeaRc::new(MySqlType::LongBlob))")]
     pub state: Vec<u8>,
 }
 

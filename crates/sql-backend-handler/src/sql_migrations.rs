@@ -1706,6 +1706,18 @@ async fn relation_missing(
     Ok(missing)
 }
 
+fn kerberos_bytes(mut column: ColumnDef, backend: sea_orm::DbBackend) -> ColumnDef {
+    match backend {
+        sea_orm::DbBackend::MySql => {
+            column.custom(sea_orm::sea_query::extension::mysql::MySqlType::LongBlob);
+        }
+        sea_orm::DbBackend::Postgres | sea_orm::DbBackend::Sqlite => {
+            column.blob();
+        }
+    }
+    column
+}
+
 async fn ensure_kerberos(
     transaction: &DatabaseTransaction,
     backend: sea_orm::DbBackend,
@@ -1728,7 +1740,10 @@ async fn ensure_kerberos(
                                 .string_len(255)
                                 .null(),
                         )
-                        .col(ColumnDef::new(KerberosPrincipals::Record).blob().not_null())
+                        .col(
+                            kerberos_bytes(ColumnDef::new(KerberosPrincipals::Record), backend)
+                                .not_null(),
+                        )
                         .col(
                             ColumnDef::new(KerberosPrincipals::HasKeys)
                                 .boolean()
@@ -1799,7 +1814,10 @@ async fn ensure_kerberos(
                                 .not_null()
                                 .primary_key(),
                         )
-                        .col(ColumnDef::new(KerberosPolicies::Record).blob().not_null()),
+                        .col(
+                            kerberos_bytes(ColumnDef::new(KerberosPolicies::Record), backend)
+                                .not_null(),
+                        ),
                 ),
             )
             .await?;
@@ -1828,7 +1846,10 @@ async fn ensure_kerberos(
                                 .not_null(),
                         )
                         .col(ColumnDef::new(KerberosRealm::Open).boolean().not_null())
-                        .col(ColumnDef::new(KerberosRealm::State).blob().not_null()),
+                        .col(
+                            kerberos_bytes(ColumnDef::new(KerberosRealm::State), backend)
+                                .not_null(),
+                        ),
                 ),
             )
             .await?;

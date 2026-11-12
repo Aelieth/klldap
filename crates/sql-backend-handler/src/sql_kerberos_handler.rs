@@ -279,7 +279,16 @@ async fn upsert_principal(
     principal: &PrincipalRow,
     realm_name: &str,
 ) -> Result<(), KerberosSqlError> {
-    let user_id = user_id_for_principal_name(&principal.name).map(str::to_owned);
+    if principal.name.chars().count() > 255 {
+        return Err(KerberosSqlError::Refused(
+            "a principal name is longer than 255 characters".to_owned(),
+        ));
+    }
+    let user_id = if principal.alias_target.is_some() {
+        None
+    } else {
+        user_id_for_principal_name(&principal.name).map(str::to_owned)
+    };
     if let Some(user_id) = &user_id
         && !user_exists(transaction, user_id).await?
     {
@@ -549,6 +558,7 @@ pub(crate) mod tests {
             password_expiration: None,
             policy: None,
             modified_date: stamp(),
+            alias_target: None,
         }
     }
 
@@ -801,6 +811,44 @@ pub(crate) mod tests {
             krb_name(pool, "carol").await,
             Some("carol@EXAMPLE.COM".to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn test_long_principal_name_is_refused() {
+        let pool = memory().await;
+        init_table(&pool).await.unwrap();
+        let err = commit(
+            &pool,
+            &realm_batch(vec![9], vec![principal(&"a".repeat(256), vec![1])]),
+            0,
+        )
+        .await
+        .unwrap_err();
+        let KerberosSqlError::Refused(reason) = err else {
+            panic!("expected a refusal, got {err}");
+        };
+        assert_eq!(reason, "a principal name is longer than 255 characters");
+        let (loaded, generation) = load_realm(&pool).await.unwrap();
+        assert_eq!(generation, 0);
+        assert!(loaded.principals.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_alias_target_is_not_bound() {
+        let pool = memory().await;
+        init_table(&pool).await.unwrap();
+        insert_user(&pool, "alice", "11111111-1111-1111-1111-111111111111").await;
+        let mut row = principal("alice", vec![1]);
+        row.alias_target = Some("HTTP/kc.example.com".to_owned());
+        commit(&pool, &realm_batch(vec![9], vec![row]), 0)
+            .await
+            .unwrap();
+        assert_eq!(principal_user(&pool, "alice").await, None);
+        assert_eq!(krb_name(&pool, "alice").await, None);
+        let (loaded, generation) = load_realm(&pool).await.unwrap();
+        assert_eq!(generation, 1);
+        assert_eq!(loaded.principals.len(), 1);
+        assert_eq!(loaded.principals[0].name, "alice");
     }
 
     #[tokio::test]

@@ -247,6 +247,7 @@ pub struct PrincipalRow {
     pub password_expiration: Option<chrono::NaiveDateTime>,
     pub policy: Option<String>,
     pub modified_date: chrono::NaiveDateTime,
+    pub alias_target: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -396,6 +397,7 @@ mod tests {
                     "%Y-%m-%d %H:%M:%S",
                 )
                 .unwrap(),
+                alias_target: None,
             }],
             delete_principals: vec!["bob".to_owned()],
             put_policies: vec![PolicyRow {

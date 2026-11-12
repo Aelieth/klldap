@@ -2285,6 +2285,30 @@ async fn assert_principal_user_rules(pool: &DbConnection) {
     );
 }
 
+#[test]
+fn test_kerberos_bytes_are_longblob_on_mysql() {
+    for (backend, expect) in [
+        (DbBackend::MySql, "longblob"),
+        (DbBackend::Postgres, "bytea"),
+        (DbBackend::Sqlite, "blob"),
+    ] {
+        for name in ["record", "state"] {
+            let sql = backend
+                .build(
+                    Table::create()
+                        .table(Alias::new("t"))
+                        .col(kerberos_bytes(ColumnDef::new(Alias::new(name)), backend).not_null()),
+                )
+                .to_string()
+                .to_ascii_lowercase();
+            assert!(sql.contains(expect), "{backend:?} {name}: {sql}");
+            if !matches!(backend, DbBackend::MySql) {
+                assert!(!sql.contains("longblob"), "{backend:?} {name}: {sql}");
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_ensure_kerberos_tables() {
     let pool = get_in_memory_db().await;

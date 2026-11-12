@@ -677,6 +677,7 @@ mod tests {
                 password_expiration: None,
                 policy: None,
                 modified_date: when,
+                alias_target: None,
             }],
             delete_principals: Vec::new(),
             put_policies: vec![PolicyRow {

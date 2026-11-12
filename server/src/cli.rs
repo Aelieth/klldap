@@ -73,11 +73,9 @@ impl<'de> Deserialize<'de> for TrueFalseAlways {
     }
 }
 
-/// lldap is a lightweight LDAP server
 #[derive(Debug, Parser, Clone)]
-#[clap(version, author)]
+#[clap(version, author, about = "lldap is a lightweight LDAP server")]
 pub struct CLIOpts {
-    /// Export
     #[clap(subcommand)]
     pub command: Command,
 }
@@ -85,36 +83,36 @@ pub struct CLIOpts {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Parser, Clone)]
 pub enum Command {
-    /// Export the GraphQL schema to *.graphql.
-    #[clap(name = "export_graphql_schema")]
+    #[clap(
+        name = "export_graphql_schema",
+        about = "Export the GraphQL schema to *.graphql"
+    )]
     ExportGraphQLSchema(ExportGraphQLSchemaOpts),
-    /// Run the LDAP and GraphQL server.
-    #[clap(name = "run")]
+    #[clap(name = "run", about = "Run the LDAP and GraphQL server")]
     Run(RunOpts),
-    /// Test whether the LDAP and GraphQL server are responsive.
-    #[clap(name = "healthcheck")]
+    #[clap(
+        name = "healthcheck",
+        about = "Test whether the LDAP and GraphQL server are responsive"
+    )]
     HealthCheck(RunOpts),
-    /// Send a test email.
-    #[clap(name = "send_test_email")]
+    #[clap(name = "send_test_email", about = "Send a test email")]
     SendTestEmail(TestEmailOpts),
-    /// Create database schema.
-    #[clap(name = "create_schema")]
+    #[clap(name = "create_schema", about = "Create database schema")]
     CreateSchema(RunOpts),
 }
 
 #[derive(Debug, Parser, Clone)]
 pub struct GeneralConfigOpts {
-    /// Change config file name.
     #[clap(
         short,
         long,
         default_value = "lldap_config.toml",
-        env = "LLDAP_CONFIG_FILE"
+        env = "LLDAP_CONFIG_FILE",
+        help = "Change config file name"
     )]
     pub config_file: String,
 
-    /// Set verbose logging.
-    #[clap(short, long)]
+    #[clap(short, long, help = "Set verbose logging")]
     pub verbose: bool,
 }
 
@@ -123,55 +121,82 @@ pub struct RunOpts {
     #[clap(flatten)]
     pub general_config: GeneralConfigOpts,
 
-    /// Path to the file that contains the private server key.
-    /// It will be created if it doesn't exist.
-    /// Alternatively, you can set `server_key_seed`. If `server_key_seed` is given,
-    /// `server_key_file` will be ignored.
-    #[clap(long, env = "LLDAP_SERVER_KEY_FILE")]
+    #[clap(
+        long,
+        env = "LLDAP_SERVER_KEY_FILE",
+        help = "Path to the file that contains the private server key. It will be created if it doesn't exist. Alternatively, you can set `server_key_seed`. If `server_key_seed` is given, `server_key_file` will be ignored"
+    )]
     pub server_key_file: Option<String>,
 
-    /// Seed used to generate the private server key.
-    /// Takes precedence over `server_key_file`.
-    #[clap(long, env = "LLDAP_SERVER_KEY_SEED")]
+    #[clap(
+        long,
+        env = "LLDAP_SERVER_KEY_SEED",
+        help = "Seed used to generate the private server key. Takes precedence over `server_key_file`"
+    )]
     pub server_key_seed: Option<String>,
 
-    /// Change ldap host. Default: "0.0.0.0"
-    #[clap(long, env = "LLDAP_LDAP_HOST")]
+    #[clap(
+        long,
+        env = "LLDAP_LDAP_HOST",
+        help = "Change ldap host. Default: \"0.0.0.0\""
+    )]
     pub ldap_host: Option<String>,
 
-    /// Change ldap port. Default: 3890
-    #[clap(long, env = "LLDAP_LDAP_PORT")]
+    #[clap(
+        long,
+        env = "LLDAP_LDAP_PORT",
+        help = "Change ldap port. Default: 3890"
+    )]
     pub ldap_port: Option<u16>,
 
-    /// Change HTTP API host. Default: "0.0.0.0"
-    #[clap(long, env = "LLDAP_HTTP_HOST")]
+    #[clap(
+        long,
+        env = "LLDAP_HTTP_HOST",
+        help = "Change HTTP API host. Default: \"0.0.0.0\""
+    )]
     pub http_host: Option<String>,
 
-    /// Change HTTP API port. Default: 17170
-    #[clap(long, env = "LLDAP_HTTP_PORT")]
+    #[clap(
+        long,
+        env = "LLDAP_HTTP_PORT",
+        help = "Change HTTP API port. Default: 17170"
+    )]
     pub http_port: Option<u16>,
 
-    /// URL of the server, for password reset links.
-    #[clap(long, env = "LLDAP_HTTP_URL")]
+    #[clap(
+        long,
+        env = "LLDAP_HTTP_URL",
+        help = "URL of the server, for password reset links"
+    )]
     pub http_url: Option<Url>,
 
-    /// Database connection URL
-    #[clap(short, long, env = "LLDAP_DATABASE_URL")]
+    #[clap(
+        short,
+        long,
+        env = "LLDAP_DATABASE_URL",
+        help = "Database connection URL"
+    )]
     pub database_url: Option<DatabaseUrl>,
 
-    /// Force admin password reset to the config value.
-    /// If set to true, it will be a one-time reset that doesn't start the server.
-    /// You can set it to "always" to force a reset every time the server starts.
-    #[clap(long, env = "LLDAP_FORCE_LDAP_USER_PASS_RESET")]
+    #[clap(
+        long,
+        env = "LLDAP_FORCE_LDAP_USER_PASS_RESET",
+        help = "Force admin password reset to the config value. If set to true, it will be a one-time reset that doesn't start the server. You can set it to \"always\" to force a reset every time the server starts"
+    )]
     pub force_ldap_user_pass_reset: Option<TrueFalseAlways>,
 
-    /// Force update of the private key after a key change.
-    #[clap(long, env = "LLDAP_FORCE_UPDATE_PRIVATE_KEY")]
+    #[clap(
+        long,
+        env = "LLDAP_FORCE_UPDATE_PRIVATE_KEY",
+        help = "Force update of the private key after a key change"
+    )]
     pub force_update_private_key: Option<bool>,
 
-    /// Second factor (TOTP): false = off, true = only users who enrolled present a code,
-    /// "always" = every user must enroll. Members of lldap_mfa_disabled are exempt.
-    #[clap(long, env = "LLDAP_ENABLE_MFA")]
+    #[clap(
+        long,
+        env = "LLDAP_ENABLE_MFA",
+        help = "Second factor (TOTP): false = off, true = only users who enrolled present a code, \"always\" = every user must enroll. Members of lldap_mfa_disabled are exempt"
+    )]
     pub enable_mfa: Option<TrueFalseAlways>,
 
     #[clap(flatten)]
@@ -192,8 +217,11 @@ pub struct TestEmailOpts {
     #[clap(flatten)]
     pub general_config: GeneralConfigOpts,
 
-    /// Email address to send an email to.
-    #[clap(long, env = "LLDAP_TEST_EMAIL_TO")]
+    #[clap(
+        long,
+        env = "LLDAP_TEST_EMAIL_TO",
+        help = "Email address to send an email to"
+    )]
     pub to: String,
 
     #[clap(flatten)]
@@ -203,20 +231,32 @@ pub struct TestEmailOpts {
 #[derive(Debug, Parser, Clone)]
 #[clap(next_help_heading = Some("LDAPS"))]
 pub struct LdapsOpts {
-    /// Enable LDAPS. Default: false.
-    #[clap(long, env = "LLDAP_LDAPS_OPTIONS__ENABLED")]
+    #[clap(
+        long,
+        env = "LLDAP_LDAPS_OPTIONS__ENABLED",
+        help = "Enable LDAPS. Default: false"
+    )]
     pub ldaps_enabled: Option<bool>,
 
-    /// Change ldap ssl port. Default: 6360
-    #[clap(long, env = "LLDAP_LDAPS_OPTIONS__PORT")]
+    #[clap(
+        long,
+        env = "LLDAP_LDAPS_OPTIONS__PORT",
+        help = "Change ldap ssl port. Default: 6360"
+    )]
     pub ldaps_port: Option<u16>,
 
-    /// Ldaps certificate file. Default: cert.pem
-    #[clap(long, env = "LLDAP_LDAPS_OPTIONS__CERT_FILE")]
+    #[clap(
+        long,
+        env = "LLDAP_LDAPS_OPTIONS__CERT_FILE",
+        help = "Ldaps certificate file. Default: cert.pem"
+    )]
     pub ldaps_cert_file: Option<String>,
 
-    /// Ldaps certificate key file. Default: key.pem
-    #[clap(long, env = "LLDAP_LDAPS_OPTIONS__KEY_FILE")]
+    #[clap(
+        long,
+        env = "LLDAP_LDAPS_OPTIONS__KEY_FILE",
+        help = "Ldaps certificate key file. Default: key.pem"
+    )]
     pub ldaps_key_file: Option<String>,
 }
 
@@ -232,36 +272,46 @@ pub enum SmtpEncryption {
 #[derive(Debug, Parser, Clone)]
 #[clap(next_help_heading = Some("SMTP"))]
 pub struct SmtpOpts {
-    /// Enable password reset.
-    #[clap(long, env = "LLDAP_SMTP_OPTIONS__ENABLE_PASSWORD_RESET")]
+    #[clap(
+        long,
+        env = "LLDAP_SMTP_OPTIONS__ENABLE_PASSWORD_RESET",
+        help = "Enable password reset"
+    )]
     pub smtp_enable_password_reset: Option<bool>,
 
-    /// Sender email address.
-    #[clap(long, env = "LLDAP_SMTP_OPTIONS__FROM")]
+    #[clap(long, env = "LLDAP_SMTP_OPTIONS__FROM", help = "Sender email address")]
     pub smtp_from: Option<Mailbox>,
 
-    /// Reply-to email address.
-    #[clap(long, env = "LLDAP_SMTP_OPTIONS__TO")]
+    #[clap(long, env = "LLDAP_SMTP_OPTIONS__TO", help = "Reply-to email address")]
     pub smtp_reply_to: Option<Mailbox>,
 
-    /// SMTP server.
-    #[clap(long, env = "LLDAP_SMTP_OPTIONS__SERVER")]
+    #[clap(long, env = "LLDAP_SMTP_OPTIONS__SERVER", help = "SMTP server")]
     pub smtp_server: Option<String>,
 
-    /// SMTP port, 587 by default.
-    #[clap(long, env = "LLDAP_SMTP_OPTIONS__PORT")]
+    #[clap(
+        long,
+        env = "LLDAP_SMTP_OPTIONS__PORT",
+        help = "SMTP port, 587 by default"
+    )]
     pub smtp_port: Option<u16>,
 
-    /// SMTP user.
-    #[clap(long, env = "LLDAP_SMTP_OPTIONS__USER")]
+    #[clap(long, env = "LLDAP_SMTP_OPTIONS__USER", help = "SMTP user")]
     pub smtp_user: Option<String>,
 
-    /// SMTP password.
-    #[clap(long, env = "LLDAP_SMTP_OPTIONS__PASSWORD", hide_env_values = true)]
+    #[clap(
+        long,
+        env = "LLDAP_SMTP_OPTIONS__PASSWORD",
+        hide_env_values = true,
+        help = "SMTP password"
+    )]
     pub smtp_password: Option<String>,
 
-    /// Whether TLS should be used to connect to SMTP.
-    #[clap(long, env = "LLDAP_SMTP_OPTIONS__TLS_REQUIRED", hide = true)]
+    #[clap(
+        long,
+        env = "LLDAP_SMTP_OPTIONS__TLS_REQUIRED",
+        hide = true,
+        help = "Whether TLS should be used to connect to SMTP"
+    )]
     pub smtp_tls_required: Option<bool>,
 
     #[clap(long, env = "LLDAP_SMTP_OPTIONS__SMTP_ENCRYPTION", value_parser = EnumValueParser::<SmtpEncryption>::new(), ignore_case = true)]
@@ -270,42 +320,61 @@ pub struct SmtpOpts {
 
 #[derive(Debug, Parser, Clone)]
 pub struct ExportGraphQLSchemaOpts {
-    /// Output to a file. If not specified, the config is printed to the standard output.
-    #[clap(short, long)]
+    #[clap(
+        short,
+        long,
+        help = "Output to a file. If not specified, the config is printed to the standard output"
+    )]
     pub output_file: Option<String>,
 }
 
 #[derive(Debug, Parser, Clone)]
 #[clap(next_help_heading = Some("HEALTHCHECK"))]
 pub struct HealthcheckOpts {
-    /// Change the HTTP Host to test the health of.  Default: "localhost"
-    #[clap(long, env = "LLDAP_HEALTHCHECK_OPTIONS__HTTP_HOST")]
+    #[clap(
+        long,
+        env = "LLDAP_HEALTHCHECK_OPTIONS__HTTP_HOST",
+        help = "Change the HTTP Host to test the health of.  Default: \"localhost\""
+    )]
     pub healthcheck_http_host: Option<String>,
 
-    /// Change the LDAP Host to test the health of.  Default: "localhost"
-    #[clap(long, env = "LLDAP_HEALTHCHECK_OPTIONS__LDAP_HOST")]
+    #[clap(
+        long,
+        env = "LLDAP_HEALTHCHECK_OPTIONS__LDAP_HOST",
+        help = "Change the LDAP Host to test the health of.  Default: \"localhost\""
+    )]
     pub healthcheck_ldap_host: Option<String>,
 }
 
 #[derive(Debug, Parser, Clone)]
 #[clap(next_help_heading = Some("LOGGING"))]
 pub struct LogOpts {
-    /// Persist the event log (logins, binds, directory changes, denials) to the database.
-    /// Default: true
-    #[clap(long, env = "LLDAP_LOG_OPTIONS__PERSIST")]
+    #[clap(
+        long,
+        env = "LLDAP_LOG_OPTIONS__PERSIST",
+        help = "Persist the event log (logins, binds, directory changes, denials) to the database. Default: true"
+    )]
     pub log_persist: Option<bool>,
 
-    /// Delete log events older than this many days; 0 keeps them forever. Default: 30
-    #[clap(long, env = "LLDAP_LOG_OPTIONS__RETENTION_DAYS")]
+    #[clap(
+        long,
+        env = "LLDAP_LOG_OPTIONS__RETENTION_DAYS",
+        help = "Delete log events older than this many days; 0 keeps them forever. Default: 30"
+    )]
     pub log_retention_days: Option<u32>,
 
-    /// Keep at most this many log events, oldest first; 0 means unlimited. Default: 50000
-    #[clap(long, env = "LLDAP_LOG_OPTIONS__MAX_ENTRIES")]
+    #[clap(
+        long,
+        env = "LLDAP_LOG_OPTIONS__MAX_ENTRIES",
+        help = "Keep at most this many log events, oldest first; 0 means unlimited. Default: 50000"
+    )]
     pub log_max_entries: Option<u64>,
 
-    /// Store one successful bind per user, protocol and address within this many seconds;
-    /// 0 stores every bind. Default: 300
-    #[clap(long, env = "LLDAP_LOG_OPTIONS__BIND_COALESCE_SECONDS")]
+    #[clap(
+        long,
+        env = "LLDAP_LOG_OPTIONS__BIND_COALESCE_SECONDS",
+        help = "Store one successful bind per user, protocol and address within this many seconds; 0 stores every bind. Default: 300"
+    )]
     pub log_bind_coalesce_seconds: Option<u32>,
 }
 

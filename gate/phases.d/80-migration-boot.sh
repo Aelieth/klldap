@@ -70,18 +70,17 @@ cp -a "$GATE_FIXTURE_DATA" "$B/data"
 cp -a "$GATE_FIXTURE_KDC" "$B/krb5kdc"
 rm -f "$B/krb5kdc/principal.dump" "$B/krb5kdc/principal.dump.dump_ok"
 
-# The 0.7.2 LLDAP database is adopted under a fresh key: one run with the force flags (the
-# server exits after applying them, before the realm), then the boot under test.
-force_env=(-e LLDAP_FORCE_UPDATE_PRIVATE_KEY=true -e LLDAP_FORCE_LDAP_USER_PASS_RESET=true)
+# B4 binds as admin with a known password: one run sets it (the server exits after applying
+# the flag, before the realm). A 0.7.2 install's data keeps its own key.
 if [ -n "${GATE_FIXTURE_ADMIN_PASS:-}" ]; then
-    force_env+=(-e LLDAP_LDAP_USER_PASS="$GATE_FIXTURE_ADMIN_PASS")
+    timeout 120 docker run --rm --name "$MIG_B-prep" \
+        -v "$B/data:/data" -v "$B/krb5kdc:$KDC" \
+        -e LLDAP_JWT_SECRET="$JWT_SECRET" -e LLDAP_LDAP_BASE_DN="$GATE_FIXTURE_BASE_DN" \
+        -e LLDAP_FORCE_LDAP_USER_PASS_RESET=true -e LLDAP_LDAP_USER_PASS="$GATE_FIXTURE_ADMIN_PASS" \
+        "$GATE_IMAGE" >"$D/branch-b-pass-reset.log" 2>&1
+    grep -q "Restart the server without" "$D/branch-b-pass-reset.log" \
+        || p_bad "branch B's admin password reset did not apply (see branch-b-pass-reset.log)"
 fi
-timeout 120 docker run --rm --name "$MIG_B-prep" \
-    -v "$B/data:/data" -v "$B/krb5kdc:$KDC" \
-    -e LLDAP_JWT_SECRET="$JWT_SECRET" -e LLDAP_LDAP_BASE_DN="$GATE_FIXTURE_BASE_DN" \
-    "${force_env[@]}" "$GATE_IMAGE" >"$D/branch-b-force-reset.log" 2>&1
-grep -q "Restart the server without" "$D/branch-b-force-reset.log" \
-    || p_bad "branch B's force-reset run did not apply the flags (see branch-b-force-reset.log)"
 
 docker run -d --name "$MIG_B" --network "$NET" \
     -v "$B/data:/data" -v "$B/krb5kdc:$KDC" \

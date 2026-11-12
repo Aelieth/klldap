@@ -1674,6 +1674,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_set_user_password_password_manager() {
         use lldap_auth::{opaque, registration};
         let mut rng = rand::rngs::OsRng;

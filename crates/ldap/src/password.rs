@@ -224,6 +224,7 @@ pub mod tests {
     use lldap_test_utils::{MockTestBackendHandler, setup_default_ldap_mock};
     use mockall::predicate::eq;
     use pretty_assertions::assert_eq;
+    use serial_test::serial;
     use std::collections::HashSet;
     pub fn make_bind_result(code: LdapResultCode, message: &str) -> Vec<LdapOp> {
         vec![LdapOp::BindResponse(LdapBindResponse {
@@ -284,6 +285,7 @@ pub mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_bind() {
         let mut mock = MockTestBackendHandler::new();
         setup_default_ldap_mock(&mut mock);
@@ -306,6 +308,7 @@ pub mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_admin_bind() {
         let mut mock = MockTestBackendHandler::new();
         setup_default_ldap_mock(&mut mock);
@@ -340,6 +343,7 @@ pub mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_bind_invalid_dn() {
         let mut mock = MockTestBackendHandler::new();
         setup_default_ldap_mock(&mut mock);
@@ -415,6 +419,7 @@ pub mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_password_modify_extended_matrix() {
         let success = || make_extended_response(LdapResultCode::Success, "".to_string());
         let cases = [

@@ -453,6 +453,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_modify_password_of_regular_as_admin() {
         let mut mock = MockTestBackendHandler::new();
         setup_default_ldap_mock(&mut mock);
@@ -467,6 +468,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_modify_password_of_regular_as_regular() {
         let mut mock = MockTestBackendHandler::new();
         setup_default_ldap_mock(&mut mock);
@@ -481,6 +483,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_modify_password_of_regular_as_password_manager() {
         let mut mock = MockTestBackendHandler::new();
         setup_default_ldap_mock(&mut mock);
@@ -530,6 +533,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_modify_password_of_admin_as_admin() {
         let mut mock = MockTestBackendHandler::new();
         setup_default_ldap_mock(&mut mock);

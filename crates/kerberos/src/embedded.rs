@@ -579,6 +579,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_disable_and_enable_keep_the_password_expiry() {
         let temp = TempRealm::new();
         let (embedded, store) = temp.embedded();

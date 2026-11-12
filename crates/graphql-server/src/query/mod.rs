@@ -394,6 +394,7 @@ mod tests {
     use lldap_test_utils::{MockTestBackendHandler, setup_default_schema};
     use mockall::predicate::eq;
     use pretty_assertions::assert_eq;
+    use serial_test::serial;
     use std::collections::HashSet;
 
     fn schema<C, Q>(query_root: Q) -> RootNode<Q, EmptyMutation<C>, EmptySubscription<C>>
@@ -1247,6 +1248,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn keycloak_suggested_config_uses_the_context_base_dn() {
         const QUERY: &str = r#"{
             keycloakSuggestedConfig { url realm }

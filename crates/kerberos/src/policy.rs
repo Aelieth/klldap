@@ -75,6 +75,7 @@ mod tests {
     use lldap_domain::types::UserId;
     use lldap_domain_handlers::kerberos::KerberosSync;
     use pretty_assertions::assert_eq;
+    use serial_test::serial;
 
     fn ticket(realm: &str, user: &str) -> EncTicketPart {
         let now = KerberosTime::from_unix_seconds(1_700_000_000);
@@ -126,6 +127,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_a_ticket_outlives_its_user_only_until_the_next_request() {
         let temp = TempRealm::new();
         let (embedded, store) = temp.embedded();

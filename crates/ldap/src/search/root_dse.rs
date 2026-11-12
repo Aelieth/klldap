@@ -127,8 +127,10 @@ pub fn is_subschema_entry_request(request: &LdapSearchRequest) -> bool {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+    use serial_test::serial;
 
     #[test]
+    #[serial]
     fn test_root_dse_always_emits_subschema_and_realm() {
         let LdapOp::SearchResultEntry(entry) = root_dse_response("dc=example,dc=com") else {
             panic!("expected SearchResultEntry");

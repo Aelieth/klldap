@@ -14,10 +14,6 @@ CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=x86-64" cargo bui
 cargo install cross
 
 # Build for 32-bit ARMv7 (hard-float) using glibc instead of musl.
-# MIT Kerberos (via the kerberos crate + pkg-config/bindgen) requires glibc.
-# The cross target is now gnueabihf. Ensure your Cross.toml / Docker setup
-# provides the necessary cross-compiler and libkrb5-dev for armhf if the
-# kerberos build step runs during cross-compilation.
 cross build --target=armv7-unknown-linux-gnueabihf -p lldap --release
 
 # Build the frontend (unchanged).

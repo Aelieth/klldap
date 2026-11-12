@@ -123,19 +123,19 @@ pub struct KerberosOptions {
     pub supported_enctypes: Vec<String>,
     #[builder(default = "IpAddr::from([0, 0, 0, 0])")]
     pub kdc_bind: IpAddr,
-    #[builder(default = "88")]
+    #[builder(default = "1088")]
     pub kdc_port: u16,
-    #[builder(default = "SocketAddr::from(([127, 0, 0, 1], 749))")]
+    #[builder(default = "SocketAddr::from(([127, 0, 0, 1], 1749))")]
     pub kadmin_bind: SocketAddr,
     #[builder(default)]
     pub kadmin_acl_file: Option<PathBuf>,
-    #[builder(default = r#"PathBuf::from("/var/kerberos/krb5kdc")"#)]
+    #[builder(default = r#"PathBuf::from("krb5kdc")"#)]
     pub data_dir: PathBuf,
-    #[builder(default = r#"PathBuf::from("/data/kadm5.keytab")"#)]
+    #[builder(default = r#"PathBuf::from("kadm5.keytab")"#)]
     pub admin_keytab: PathBuf,
-    #[builder(default = r#"PathBuf::from("/data/keytab/keycloak-http.keytab")"#)]
+    #[builder(default = r#"PathBuf::from("keytab/keycloak-http.keytab")"#)]
     pub keycloak_keytab: PathBuf,
-    #[builder(default = r#"PathBuf::from("/data/krb5.conf")"#)]
+    #[builder(default = r#"PathBuf::from("krb5.conf")"#)]
     pub client_config: PathBuf,
 }
 
@@ -148,7 +148,7 @@ impl std::default::Default for KerberosOptions {
 #[derive(Clone, Debug, Deserialize, Serialize, derive_builder::Builder)]
 #[builder(pattern = "owned")]
 pub struct KeycloakOptions {
-    #[builder(default = r#"PathBuf::from("/data/keycloak_config.toml")"#)]
+    #[builder(default = r#"PathBuf::from("keycloak_config.toml")"#)]
     pub config_file: PathBuf,
     #[builder(default)]
     pub admin_pass: Option<SecUtf8>,
@@ -1299,7 +1299,7 @@ mod tests {
         type Env = &'static [(&'static str, &'static str)];
         type Row = (Env, &'static str, Option<&'static str>);
         let rows: [Row; 3] = [
-            (&[], "/data/keycloak_config.toml", None),
+            (&[], "keycloak_config.toml", None),
             (
                 &[("LLDAP_KEYCLOAK_OPTIONS__CONFIG_FILE", "/data/realm.toml")],
                 "/data/realm.toml",
@@ -1307,7 +1307,7 @@ mod tests {
             ),
             (
                 &[("LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS", "s3cret")],
-                "/data/keycloak_config.toml",
+                "keycloak_config.toml",
                 Some("s3cret"),
             ),
         ];
@@ -1416,7 +1416,7 @@ mod tests {
             assert_eq!(config.ldap_base_dn, "dc=example,dc=com");
             assert_eq!(
                 config.keycloak_options.config_file,
-                std::path::PathBuf::from("/data/keycloak_config.toml")
+                std::path::PathBuf::from("keycloak_config.toml")
             );
             assert!(config.keycloak_options.admin_pass.is_none());
         }

@@ -36,7 +36,7 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v6.0.1
       - name: Install build dependencies
-        run: sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y libkrb5-dev clang pkg-config krb5-kdc krb5-admin-server krb5-user
+        run: sudo apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y pkg-config krb5-user
       - name: Install Rust
         run: rustup show
       - uses: Swatinem/rust-cache@v2
@@ -71,7 +71,7 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v6.0.1
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev clang pkg-config
+        run: sudo apt-get update && sudo apt-get install -y pkg-config
       - name: Install Rust
         run: rustup show
       - uses: Swatinem/rust-cache@v2
@@ -115,6 +115,6 @@ jobs:
       - name: Shellcheck boot, release and gate scripts
         run: >
           shellcheck --severity=error
-          entrypoint.sh start-lldap.sh generate_secrets.sh export_schema.sh
+          docker-entrypoint.sh docker-entrypoint-rootless.sh generate_secrets.sh export_schema.sh
           prepare-release.sh app/build.sh scripts/*.sh
           gate/run-gate.sh gate/embed-cell.sh gate/lib/*.sh gate/phases.d/*.sh

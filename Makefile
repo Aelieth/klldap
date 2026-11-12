@@ -18,7 +18,6 @@ prepare-release:
 
 # Fully Dockerized release build (AlmaLinux 10 base).
 # Builds a reproducible AlmaLinux container with:
-#   - krb5-devel (consistent with runtime image)
 #   - cross (Docker socket mounted so it can spawn the armv7 build container)
 #   - wasm-pack
 # Then runs prepare-release.sh inside it.
@@ -72,6 +71,15 @@ test:
 		--build-arg VERSION=$(VERSION)-test \
 		--build-arg CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=native" \
 		--build-arg CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=native" \
+		--target rootless \
+		--tag klldap-test-rootless \
+		.
+	docker build \
+		--file Dockerfile \
+		--build-arg VERSION=$(VERSION)-test \
+		--build-arg CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=native" \
+		--build-arg CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=native" \
+		--target default \
 		--tag klldap-test \
 		.
 
@@ -87,7 +95,7 @@ test-run:
 	-docker rm -f klldap-test >/dev/null 2>&1
 	docker run -d --name klldap-test \
 		-p 3890:3890 -p 17170:17170 \
-		-p 88:88/tcp -p 88:88/udp -p 749:749/tcp \
+		-p 88:1088/tcp -p 88:1088/udp \
 		-e LLDAP_JWT_SECRET="$(LLDAP_JWT_SECRET)" \
 		-e LLDAP_KEY_SEED="$(LLDAP_KEY_SEED)" \
 		-e LLDAP_LDAP_BASE_DN="$(LLDAP_LDAP_BASE_DN)" \
@@ -104,8 +112,9 @@ test-run:
 # - gate          → build the test image and run the full container gate
 # - gate-fast     → run the gate against the existing klldap-test image
 # - gate-postgres → gate with a gate-managed postgres:16 backend
+# - gate-rootless → gate (SQLite) on the -rootless image
 # - gate-phase    → run selected phases, e.g. make gate-phase PHASE=kerberos
-.PHONY: safety gate gate-fast gate-postgres gate-phase
+.PHONY: safety gate gate-fast gate-postgres gate-rootless gate-phase
 
 safety:
 	cargo fmt --all
@@ -124,6 +133,9 @@ gate-fast:
 
 gate-postgres:
 	GATE_DB=postgres gate/run-gate.sh
+
+gate-rootless: test
+	GATE_IMAGE=klldap-test-rootless GATE_ROOTLESS=1 gate/run-gate.sh
 
 gate-phase:
 	GATE_PHASES="$(PHASE)" gate/run-gate.sh

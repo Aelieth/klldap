@@ -1,8 +1,7 @@
 # Dockerfile.release
 # AlmaLinux 10-based reproducible builder for KLLDAP release tarballs.
-# Matches the AlmaLinux runtime image (quay.io/almalinuxorg/10-minimal)
-# so Kerberos (krb5) headers, libraries, and behavior are consistent
-# between the release build environment and the final containers.
+# Matches the AlmaLinux runtime image (quay.io/almalinuxorg/10-minimal),
+# so the release build links against the same glibc as the containers.
 #
 # Produces both x86_64 (baseline CPU) and armv7 glibc tarballs.
 #
@@ -12,7 +11,6 @@
 FROM quay.io/almalinuxorg/10-minimal
 
 # Install build dependencies with microdnf (AlmaLinux/Fedora)
-# krb5-devel is critical for bindgen + Kerberos consistency
 RUN microdnf install -y --assumeyes \
     shadow-utils \
     pkgconf \
@@ -23,9 +21,6 @@ RUN microdnf install -y --assumeyes \
     curl \
     git \
     gzip \
-    krb5-devel \
-    clang \
-    llvm \
     ca-certificates \
     wget \
     docker \

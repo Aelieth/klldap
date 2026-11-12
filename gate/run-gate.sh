@@ -83,14 +83,16 @@ postgres)
         -e POSTGRES_USER=klldap -e POSTGRES_PASSWORD=klldap -e POSTGRES_DB=klldap \
         -p "127.0.0.1::5432" \
         postgres:16 >/dev/null || exit 1
+    # Over TCP: the image's first start runs a temporary server on the Unix socket only.
     for _ in $(seq 1 60); do
-        if docker exec "$PG_CONTAINER" pg_isready -U klldap -q 2>/dev/null; then
+        if docker exec "$PG_CONTAINER" pg_isready -h 127.0.0.1 -U klldap -q 2>/dev/null; then
             break
         fi
         sleep 1
     done
-    docker exec "$PG_CONTAINER" pg_isready -U klldap -q || {
-        note "postgres did not become ready"
+    docker exec "$PG_CONTAINER" pg_isready -h 127.0.0.1 -U klldap -q || {
+        docker logs "$PG_CONTAINER" >"$RESULTS_DIR/postgres.log" 2>&1
+        note "postgres did not become ready (see postgres.log)"
         exit 1
     }
     GATE_DATABASE_URL="${GATE_DATABASE_URL:-postgres://klldap:klldap@$PG_CONTAINER:5432/klldap}"

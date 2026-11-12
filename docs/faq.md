@@ -38,7 +38,7 @@ set isn't working, try the following:
   principal is created on the password sync. This shows what exists:
 
   ```sh
-  docker exec -e KRB5_CONFIG=/data/krb5.conf klldap \
+  docker exec klldap \
     kadmin -k -t /data/kadm5.keytab -p admin/admin -q listprincs
   ```
 - A user in `lldap_disabled` cannot get tickets by design.
@@ -53,7 +53,7 @@ MySQL/MariaDB, check out the [DB migration docs](database_migration.md).
 
 ## How does KLLDAP compare with LLDAP?
 
-KLLDAP is LLDAP plus an MIT Kerberos KDC, POSIX accounts and groups, admin-managed
+KLLDAP is LLDAP plus a Kerberos KDC and kadmin inside the `lldap` process, POSIX accounts and groups, admin-managed
 OUs, LDAP writes and Keycloak federation, in one container. The web UI, the GraphQL
 API and the LDAP layout are LLDAP's, and `lldap-cli` works. If you do not need
 Kerberos or POSIX, [LLDAP](https://github.com/lldap/lldap) is the maintained,
@@ -80,7 +80,7 @@ DNS, certificate management or policy engines.
 [Kanidm](https://kanidm.com) is a modern identity platform with OAuth, WebAuthn and a
 read-only LDAPS server.
 
-KLLDAP keeps read-write LDAP and adds an MIT Kerberos KDC; it is an evolution of the
+KLLDAP keeps read-write LDAP and runs a Kerberos KDC and kadmin inside the `lldap` process; it is an evolution of the
 LLDAP code rather than a rewrite.
 
 ## Does KLLDAP support vhosts?

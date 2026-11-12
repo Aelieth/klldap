@@ -1,8 +1,8 @@
 # Architecture
 
 The server is entirely written in Rust, using [actix](https://actix.rs) for the
-backend and [yew](https://yew.rs) for the frontend. An MIT Kerberos KDC runs beside
-it in the same container.
+backend and [yew](https://yew.rs) for the frontend. The KDC and kadmin run inside
+the `lldap` process.
 
 Backend:
 * Listens on a port for LDAP protocol.
@@ -17,8 +17,8 @@ Backend:
   * The static frontend files are served by this port too.
 * Keeps the KDC in step: principals are created, updated, disabled and deleted as
   users are created, get a password, join or leave `lldap_disabled`, or are deleted.
-  The KDC's own database lives in `/var/kerberos/krb5kdc`; the admin keytab in
-  `/data/kadm5.keytab`.
+  In the image, the KDC's own database lives in `/var/kerberos/krb5kdc` and the
+  admin keytab in `/data/kadm5.keytab`.
 
 Note that HTTPS is currently not supported. This can be worked around by using
 a reverse proxy in front of the server (for the HTTP API) that wraps/unwraps

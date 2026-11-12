@@ -20,7 +20,7 @@
 ## About
 
 KLLDAP is a hard fork of [LLDAP](https://github.com/lldap/lldap), the lightweight
-LDAP authentication server, with an MIT Kerberos KDC running in the same container.
+LDAP authentication server, with a Kerberos KDC and kadmin running inside the `lldap` process.
 Users, groups and passwords are managed once, through the web UI, LDAP or
 GraphQL; the KDC follows.
 
@@ -118,15 +118,19 @@ read from a file instead by appending `_FILE` to the variable name
 | `LLDAP_HEALTHCHECK_OPTIONS__HTTP_HOST` / `__LDAP_HOST` | `localhost` | What `lldap healthcheck` probes |
 | `LLDAP_LOG_OPTIONS__PERSIST` / `__RETENTION_DAYS` / `__MAX_ENTRIES` / `__BIND_COALESCE_SECONDS` | `true` / `30` / `50000` / `300` | Persistent event log (logins, binds, directory changes, denials) in the `logs` table, see [docs/logging.md](docs/logging.md); `0` removes an age or size limit; the trim also runs with `PERSIST=false`; repeated successful binds are stored once per coalescing window (`0` stores all) |
 | `LLDAP_KERBEROS_OPTIONS__ENABLED` / `__REALM` / `__TICKET_LIFETIME` / `__RENEW_LIFETIME` / `__MAX_RENEWABLE_LIFE` / `__FORWARDABLE` / `__SUPPORTED_ENCTYPES` | `false` (`true` in the image) / from the base DN / `24h` / `7d` / `7d` / `true` / `aes256-cts-hmac-sha1-96` | Kerberos inside the server: when enabled, directory writes wait for the KDC after boot and the healthcheck also requires it, see [docs/kerberos.md](docs/kerberos.md) |
-| `LLDAP_KERBEROS_OPTIONS__KDC_BIND` / `__KDC_PORT` / `__KADMIN_BIND` / `__DATA_DIR` / `__ADMIN_KEYTAB` / `__KEYCLOAK_KEYTAB` / `__CLIENT_CONFIG` / `__KADMIN_ACL_FILE` | `0.0.0.0` / `88` / `127.0.0.1:749` / `/var/kerberos/krb5kdc` / `/data/kadm5.keytab` / `/data/keytab/keycloak-http.keytab` / `/data/krb5.conf` / none | KDC and kadmin listeners, the database directory, the keytabs and the client config |
-| `LLDAP_KEYCLOAK_OPTIONS__CONFIG_FILE` | `/data/keycloak_config.toml` | Where the Federation tab stores URL, realm and admin user |
+| `LLDAP_KERBEROS_OPTIONS__KDC_BIND` / `__KDC_PORT` / `__KADMIN_BIND` / `__DATA_DIR` / `__ADMIN_KEYTAB` / `__KEYCLOAK_KEYTAB` / `__CLIENT_CONFIG` / `__KADMIN_ACL_FILE` | `0.0.0.0` / `1088` / `127.0.0.1:1749` / `krb5kdc` / `kadm5.keytab` / `keytab/keycloak-http.keytab` / `krb5.conf` / none | KDC and kadmin listeners, the database directory, the keytabs and the client config. The image sets the four paths to `/var/kerberos/krb5kdc`, `/data/kadm5.keytab`, `/data/keytab/keycloak-http.keytab` and `/data/krb5.conf` |
+| `LLDAP_KEYCLOAK_OPTIONS__CONFIG_FILE` | `keycloak_config.toml` | Where the Federation tab stores URL, realm and admin user. The image sets `/data/keycloak_config.toml` |
 | `LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS` | none | Keycloak admin password used by the Federation tab. `LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS_FILE` reads it from a file; if both are set, the plain value wins |
-| `LLDAP_UID` / `LLDAP_GID` | `1000` / `1000` | User the server runs as inside the container (`UID`/`GID` still honored) |
+| `UID` / `GID` | `1000` / `1000` | User the server runs as. `LLDAP_UID` / `LLDAP_GID` still work and win when set |
 | `LLDAP_CONFIG_FILE`, `LLDAP_SERVER_KEY_FILE`, `LLDAP_SERVER_KEY_SEED` | | Command-line equivalents of the config file / key settings |
 
-Ports: `3890` LDAP, `6360` LDAPS (optional), `17170` web UI and API, `88/tcp+udp`
-KDC. kadmin listens on loopback inside the container and is used with
-`docker exec` and `KRB5_CONFIG=/data/krb5.conf`. Volumes: `/data` (config,
+Ports: `3890` LDAP, `6360` LDAPS (optional), `17170` web UI and API. The KDC
+listens on 1088 and is published as `88:1088` (tcp and udp). kadmin listens
+on `127.0.0.1:1749` inside the container and is not published. Clients outside
+use port 88. The image sets `KRB5_CONFIG=/data/krb5.conf`, so `docker exec` does
+not pass it. A root start uses `gosu` to switch user. `--user` on that image
+fails, because `gosu` cannot switch user without root. `tini` is the init. The
+rootless image starts as user `lldap` and does not change ownership. Volumes: `/data` (config,
 database, keytabs) and `/var/kerberos/krb5kdc` (KDC database) — both must persist.
 
 ## Documentation

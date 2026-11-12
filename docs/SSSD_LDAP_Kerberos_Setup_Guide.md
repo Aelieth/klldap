@@ -437,7 +437,7 @@ curl -v --negotiate -u : http://keycloak.example.com:8080/realms/your-realm/acco
 | Encryption type error (`AES256`)            | Keytab missing strong encryption types    | Regenerate keytab with `aes256-cts-hmac-sha1-96` |
 | SPNEGO not working in browser               | Wrong hostname or Browser not configured  | Use matching hostname + configure Firefox `trusted-uris` |
 | `krb5_validate = true` breaks login         | No host keytab or incorrect permissions   | Create host keytab or set `krb5_validate = false` |
-| User lookup works but authentication fails  | Kerberos misconfiguration, or the user has no principal (`kerberosSync` off, or no password set since) | Verify `krb5.conf` and `krb5_server`; `docker exec -e KRB5_CONFIG=/data/krb5.conf klldap kadmin -k -t /data/kadm5.keytab -p admin/admin -q listprincs` |
+| User lookup works but authentication fails  | Kerberos misconfiguration, or the user has no principal (`kerberosSync` off, or no password set since) | Verify `krb5.conf` and `krb5_server`; `docker exec klldap kadmin -k -t /data/kadm5.keytab -p admin/admin -q listprincs` |
 | Keytab changes not picked up by Keycloak    | Keycloak cached old path / permissions    | Restart Keycloak after updating keytab |
 | `groups: cannot find name for group ID`     | Group not present in LDAP or caching      | Create matching group in LDAP + clear cache |
 

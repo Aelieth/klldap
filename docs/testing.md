@@ -44,7 +44,9 @@ the tests that install a process-global recorder.
 ## The container gate
 
 `make test` builds the local image `klldap-test` from the working tree; `make test-run`
-boots it with test secrets on the standard ports and two named volumes.
+boots it with test secrets and two named volumes, publishing `3890`, `17170`,
+`88:1088/tcp` and `88:1088/udp`. It does not publish `1749`. `make gate-rootless`
+runs the SQLite gate on the rootless image.
 
 `make gate` builds that image and runs `gate/run-gate.sh` against it: the real
 container, entrypoint and all, exercised as CLI invocations (`ldapsearch`, `ldapmodify`,
@@ -53,7 +55,7 @@ a custom `LLDAP_UID`/`LLDAP_GID` boot, GraphQL auth, OU lifecycle, Kerberos life
 (principal, kinit, disable, re-enable),
 bootstrap idempotence, LDAP read and write matrices, Keycloak keytab export, the event
 log queries (rows with peers, per-actor summary and activity, the tail cursor, admin-only),
-restart persistence (directory data and the logs table), KDC death detection, and, when their
+restart persistence (directory data and the logs table), a realm that cannot open, and, when their
 inputs are given, migration boot and a real lldap-cli run. It needs docker, the OpenLDAP client tools
 (`openldap-clients` / `ldap-utils`) and python3; `kinit` runs inside the container.
 

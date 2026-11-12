@@ -16,17 +16,17 @@ gives realm `EXAMPLE.COM` and domain `example.com`. `kerberos_options.realm`
 There is no `kerberos_manager`, and no separate `krb5kdc` or `kadmind` process.
 When `kerberos_options.enabled` is true, the server opens the realm itself:
 
-1. creates `data_dir` (default `/var/kerberos/krb5kdc`) at mode 0700 and opens or
+1. creates `data_dir` (default `krb5kdc`) at mode 0700 and opens or
    creates the database (`principal`) and the stash (`.k5.<REALM>`). The master
    key is random and lives only in the stash. A directory that already exists
    with a looser mode is tightened to 0700 when this process owns it; otherwise
    the server warns and continues,
-2. writes `admin/admin@REALM` to `admin_keytab` (default `/data/kadm5.keytab`) at
+2. writes `admin/admin@REALM` to `admin_keytab` (default `kadm5.keytab`) at
    mode 0600, owned by the service user, on every boot,
-3. writes the client `krb5.conf` to `client_config` (default `/data/krb5.conf`),
-4. binds the KDC on UDP and TCP at `kdc_bind:kdc_port` (default `0.0.0.0:88`) and
-   kadmin at `kadmin_bind` (default `127.0.0.1:749`), then serves them on the
-   threads `krb5-kdc` and `krb5-kadmind`.
+3. writes the client `krb5.conf` to `client_config` (default `krb5.conf`),
+4. binds the KDC on UDP and TCP at `kdc_bind:kdc_port` (default `0.0.0.0:1088`) and
+   kadmin at `kadmin_bind` (default `127.0.0.1:1749`), then serves them on the threads
+   `krb5-kdc` and `krb5-kadmind`.
 
 `/data/kerberos_config.toml` is gone. The realm settings are `[kerberos_options]`.
 
@@ -37,7 +37,9 @@ credential for the realm.
 **If either Kerberos thread dies, the process exits non-zero. Without a restart
 policy, the container stays down.**
 
-**When the realm cannot open.** If Kerberos is enabled and the realm does not
+### When the realm cannot open
+
+If Kerberos is enabled and the realm does not
 open at startup (for example, the KDC port is taken, or the realm's database or
 directory cannot be read), the server starts in a degraded state instead of
 exiting:
@@ -87,13 +89,13 @@ ACL text, read at boot.
   from the `kerberosInfo` query for `syncKerberosPassword`; the server decrypts
   it and updates the embedded KDC.
 
-kadmin listens on the container's loopback. Run it with `docker exec` and
-`KRB5_CONFIG=/data/krb5.conf`:
+kadmin listens on the container's loopback. The image sets
+`KRB5_CONFIG=/data/krb5.conf`, so `docker exec` does not pass it:
 
 ```sh
-docker exec -e KRB5_CONFIG=/data/krb5.conf klldap \
+docker exec klldap \
   kadmin -k -t /data/kadm5.keytab -p admin/admin -q listprincs
-docker exec -e KRB5_CONFIG=/data/krb5.conf klldap \
+docker exec klldap \
   kadmin -k -t /data/kadm5.keytab -p admin/admin -q "getprinc bob"
 ```
 
@@ -101,15 +103,16 @@ docker exec -e KRB5_CONFIG=/data/krb5.conf klldap \
 
 ## Ports and clients
 
-The image publishes `88/tcp+udp` (the KDC). kadmin listens on the container's
-loopback (`kadmin_bind`, default `127.0.0.1:749`) and is used with `docker exec`
-and `KRB5_CONFIG=/data/krb5.conf`. kpasswd (`464`) is not published: passwords
+The KDC listens on 1088 and is published as `88:1088` (tcp and udp).
+kadmin listens on the container's loopback (`127.0.0.1:1749`). kadmin is not
+published, and it is used with `docker exec`. Clients outside use port 88.
+The image sets `KRB5_CONFIG=/data/krb5.conf`. kpasswd (`464`) is not published: passwords
 are changed through KLLDAP, which updates the KDC.
 
 The `krb5.conf` the server writes (`client_config`, default `/data/krb5.conf`)
-is for tools inside the container. With the default `kdc_bind` it names
-`127.0.0.1` as the KDC and `kadmin_bind` as the admin server. Remote clients
-write their own. The
+is for tools inside the container, and it carries the inner port. With the
+default `kdc_bind` it names `127.0.0.1` as the KDC and `kadmin_bind` as the
+admin server. Remote clients write their own and use port 88. The
 [SSSD guide](SSSD_LDAP_Kerberos_Setup_Guide.md) has complete client and browser
 configurations.
 
@@ -117,7 +120,7 @@ configurations.
 
 The Federation tab's **Export keytab** creates `HTTP/<hostname>@REALM` with a
 fresh random key and writes `keycloak_keytab` (default
-`/data/keytab/keycloak-http.keytab`, aes256 and aes128, the types Java accepts).
+`keytab/keycloak-http.keytab`, aes256 and aes128, the types Java accepts).
 Mount that directory read-only into Keycloak; **Push To Keycloak** creates a
 realm with KLLDAP as an LDAP + Kerberos user-federation provider. See
 [the SSSD guide, section 7](SSSD_LDAP_Kerberos_Setup_Guide.md#7-keycloak-integration--spnego-sso).
@@ -133,13 +136,19 @@ realm with KLLDAP as an LDAP + Kerberos user-federation provider. See
 | `ticket_lifetime` / `renew_lifetime` / `max_renewable_life` | `24h` / `7d` / `7d` |
 | `forwardable` | `true` |
 | `supported_enctypes` | `aes256-cts-hmac-sha1-96` |
-| `kdc_bind` / `kdc_port` | `0.0.0.0` / `88` |
-| `kadmin_bind` | `127.0.0.1:749` |
+| `kdc_bind` / `kdc_port` | `0.0.0.0` / `1088` |
+| `kadmin_bind` | `127.0.0.1:1749` |
 | `kadmin_acl_file` | none |
-| `data_dir` | `/var/kerberos/krb5kdc` (mode 0700) |
-| `admin_keytab` | `/data/kadm5.keytab` (mode 0600) |
-| `keycloak_keytab` | `/data/keytab/keycloak-http.keytab` |
-| `client_config` | `/data/krb5.conf` |
+| `data_dir` | `krb5kdc` (mode 0700) |
+| `admin_keytab` | `kadm5.keytab` (mode 0600) |
+| `keycloak_keytab` | `keytab/keycloak-http.keytab` |
+| `client_config` | `krb5.conf` |
+
+The image sets these four, and `keycloak_options.config_file` (default
+`keycloak_config.toml`), to `/var/kerberos/krb5kdc`, `/data/kadm5.keytab`,
+`/data/keytab/keycloak-http.keytab`, `/data/krb5.conf` and
+`/data/keycloak_config.toml`. Inside the image that environment overrides the
+same keys in the config file.
 
 `supported_enctypes` accepts `aes256-cts-hmac-sha1-96`,
 `aes128-cts-hmac-sha1-96`, `aes256-cts-hmac-sha384-192` and
@@ -162,7 +171,8 @@ ignored. Use the options above.
 ## Losing a volume
 
 - `data_dir` lost (database and stash go together; the default path is
-  `/var/kerberos/krb5kdc`): the next start creates a fresh database and rewrites
+  `krb5kdc`, and in the image `/var/kerberos/krb5kdc`): the next start creates a
+  fresh database and rewrites
   the admin keytab. Existing users have no principal until their password is
   next set (or an admin sets one for them); the Keycloak keytab has to be
   exported again.

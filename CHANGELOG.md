@@ -32,8 +32,9 @@ Next release. The KDC is kerber-rust inside the `lldap` process.
   directory writes wait for the KDC after boot, and adds the KDC to the healthcheck. A compose
   file that overrides the healthcheck with `--kerberos` must drop the flag.
 - `LLDAP_KERB_REALM_NAME` is removed; use `kerberos_options.realm`. It now warns as unknown.
-- `[keycloak_options]` holds `config_file` (default `/data/keycloak_config.toml`,
-  `LLDAP_KEYCLOAK_OPTIONS__CONFIG_FILE`) and `admin_pass` (no default,
+- `[keycloak_options]` holds `config_file` (default `keycloak_config.toml`,
+  `LLDAP_KEYCLOAK_OPTIONS__CONFIG_FILE`; the image sets
+  `/data/keycloak_config.toml`) and `admin_pass` (no default,
   `LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS`, or `LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS_FILE`
   for a file; if both are set, the plain value wins). `LLDAP_KEYCLOAK_CONFIG` and
   `LLDAP_KEYCLOAK_ADMIN_PASS` now warn as unknown and are ignored. An operator who
@@ -44,14 +45,16 @@ Next release. The KDC is kerber-rust inside the `lldap` process.
   missing `LLDAP_CONFIG_FILE` starts the server on defaults, the same as a missing
   `--config-file`.
 - `LLDAP_KERB_ADMIN_KEYTAB` is `kerberos_options.admin_keytab` (default
-  `/data/kadm5.keytab`). `LLDAP_KERB_KDC_DIR` is `data_dir` (default
-  `/var/kerberos/krb5kdc`). `LLDAP_KERB_KDC_PORT` is `kdc_port` (default `88`), with
-  `kdc_bind` (default `0.0.0.0`) and `kadmin_bind` (default `127.0.0.1:749`).
+  `kadm5.keytab`). `LLDAP_KERB_KDC_DIR` is `data_dir` (default `krb5kdc`).
+  `LLDAP_KERB_KDC_PORT` is `kdc_port` (default `1088`), with
+  `kdc_bind` (default `0.0.0.0`) and `kadmin_bind` (default `127.0.0.1:1749`).
   `LLDAP_KERB_KRB5_CONF` defaulted to `/etc/krb5.conf`. It and
-  `LLDAP_KERB_KRB5_TEMPLATE` are `client_config`, and that default moved to
-  `/data/krb5.conf`. `/etc/krb5.conf` is no longer written. Tools run inside the
-  container need `KRB5_CONFIG=/data/krb5.conf`. `LLDAP_KERB_KEYCLOAK_KEYTAB` is `keycloak_keytab` (default
-  `/data/keytab/keycloak-http.keytab`). `LLDAP_KERB_KADM5_ACL` and
+  `LLDAP_KERB_KRB5_TEMPLATE` are `client_config` (default `krb5.conf`).
+  `/etc/krb5.conf` is no longer written. The image sets these paths to
+  `/var/kerberos/krb5kdc`, `/data/kadm5.keytab`, `/data/keytab/keycloak-http.keytab`
+  and `/data/krb5.conf`, and tools inside the container need
+  `KRB5_CONFIG=/data/krb5.conf`. `LLDAP_KERB_KEYCLOAK_KEYTAB` is `keycloak_keytab`
+  (default `keytab/keycloak-http.keytab`). `LLDAP_KERB_KADM5_ACL` and
   `LLDAP_KERB_KADM5_ACL_TEMPLATE` are `kadmin_acl_file` (no default;
   `admin/admin@REALM *` is always granted). `LLDAP_KERB_CONFIG`,
   `LLDAP_KERB_CONFIG_TEMPLATE`, `LLDAP_KERB_KDC_CONF`, `LLDAP_KERB_KDC_TEMPLATE` and
@@ -66,9 +69,23 @@ Next release. The KDC is kerber-rust inside the `lldap` process.
   machine itself. `data_dir` is mode 0700.
 - A Kerberos thread that dies stops the server with a non-zero exit. Without a
   restart policy the container stays down.
-- kadmin is no longer reachable on port 749 from outside the container. It
-  listens on the container's loopback (`kadmin_bind`, default `127.0.0.1:749`)
-  and is used with `docker exec` and `KRB5_CONFIG=/data/krb5.conf`.
+- kadmin is no longer reachable from outside the container. It listens on
+  `127.0.0.1:1749` and is used with `docker exec`. The image sets
+  `KRB5_CONFIG=/data/krb5.conf`.
+- **The KDC listens on 1088. Publish it as `88:1088` (tcp and udp). A 0.7.2
+  compose file that publishes `88:88` must change, or the KDC is unreachable.**
+  kadmin is not published. Clients outside use port 88. Tools inside the
+  container use the `krb5.conf` the server writes, which carries 1088.
+- The image no longer installs `krb5-server` or ships `kerberos_manager`.
+  `krb5-libs` and `krb5-workstation` stay.
+- A root start repairs ownership and `gosu` runs the server as `UID`:`GID`
+  (default 1000). `LLDAP_UID` and `LLDAP_GID` still work and win when set.
+  No capability is passed to the server. `tini` is the init. `--user` on the
+  standard image fails, because `gosu` cannot switch user without root. The
+  rootless image starts as user `lldap` and does not change ownership.
+- The entrypoint no longer waits or prints "LLDAP is ready!". `tini` is the
+  container's first process and forwards `docker stop` to the server.
+- The image no longer declares `749` in `EXPOSE`. It declares `1088`.
 - `supported_enctypes` accepts `aes256-cts-hmac-sha1-96`, `aes128-cts-hmac-sha1-96`,
   `aes256-cts-hmac-sha384-192` and `aes128-cts-hmac-sha256-128`. `des3-cbc-sha1`, `arcfour-hmac` and
   their aliases are refused as deprecated (RFC 8429 section 7,

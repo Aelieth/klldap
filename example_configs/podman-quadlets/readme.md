@@ -1,10 +1,9 @@
 ## Installing the quadlet lldap user service
 
 These quadlets are upstream LLDAP's, adapted to the KLLDAP image (two volumes, the
-Kerberos ports and the healthcheck's Kerberos leg). KLLDAP under rootless Podman is
-**untested**: the container runs its KDC bootstrap as root inside its user namespace,
-which Podman provides, but nobody has confirmed the result yet — please report what you
-find.
+Kerberos ports and the healthcheck's Kerberos leg). The file publishes the KDC
+as `88:1088` (tcp and udp). The server listens on 1088, and kadmin on
+`127.0.0.1:1749` is not published. This file has not been run.
 
 The following assumes you have a working Podman installation and that you want to install lldap as a user service.
 

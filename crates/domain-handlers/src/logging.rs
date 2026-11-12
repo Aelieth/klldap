@@ -427,9 +427,7 @@ impl WarnLimiter {
 
 static WARN_LIMITER: WarnLimiter = WarnLimiter::new();
 
-/// Print the pending `suppressed N` summary once its window has elapsed, so a failure flood
-/// that stops does not leave the terminal quiet with the count unaccounted for. Called on the
-/// writer's idle tick; a no-op when nothing is pending.
+/// Called on the idle tick, so a flood that stops still prints its `suppressed N` line.
 pub fn flush_suppressed_warnings(now: u64) {
     if let Some(missed) = WARN_LIMITER.take_suppressed(now) {
         warn!(target: "logs", "suppressed {missed} failure lines");

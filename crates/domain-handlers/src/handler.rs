@@ -116,7 +116,6 @@ pub enum GroupRequestFilter {
     LessOrEqual(String, String),
     AttributeGreaterOrEqual(AttributeName, String),
     AttributeLessOrEqual(AttributeName, String),
-    // Same substring support for groups.
     AttributeSubString(AttributeName, SubStringFilter),
 }
 
@@ -201,16 +200,14 @@ pub trait LogBackendHandler: Send + Sync {
         limit: u32,
         cursor: LogCursor,
     ) -> Result<Vec<LogRecord>>;
-    /// One bucket per distinct combination of `group_by`, most frequent first (then newest);
-    /// no dimension gives one bucket of totals.
+    /// One bucket per distinct `group_by` combination, most frequent then newest; none: one total.
     async fn summarize_log_events(
         &self,
         filter: LogFilter,
         group_by: Vec<LogDimension>,
         limit: u32,
     ) -> Result<Vec<LogBucket>>;
-    /// The actor's last success and failure among `kinds` (`since` bounds both), and the
-    /// failures recorded after that last success.
+    /// Last success and failure among `kinds` (bounded by `since`), and the failures after it.
     async fn log_activity(
         &self,
         actor: &UserId,
@@ -221,8 +218,7 @@ pub trait LogBackendHandler: Send + Sync {
 
 #[async_trait]
 pub trait MfaBackendHandler: Send + Sync {
-    /// What a login must present under the current policy; the doors and the refresh
-    /// path ask this, a per-group policy plugs in here.
+    /// What a login must present under the current policy; a per-group policy plugs in here.
     async fn mfa_requirement(&self, user_id: &UserId) -> Result<MfaRequirement>;
     async fn start_totp_enrollment(
         &self,

@@ -28,9 +28,7 @@ pub fn realm_from(realm_override: Option<&str>, base_dn: &str) -> String {
 
 const RESERVED_PRINCIPALS: &[&str] = &["krbtgt", "kadmin", "kiprop", "wellknown"];
 
-/// Usernames that become `{user}@{realm}` must be a single principal component:
-/// no `/` `@` whitespace (those would parse as another principal or feed
-/// `kadmin.local -q`), and never the KDC's own reserved names.
+/// One principal component (`/` or `@` would start another), no whitespace, no KDC-reserved name.
 pub fn validate_kerberos_username(username: &str) -> Result<(), String> {
     if username.is_empty() || username.len() > 128 {
         return Err("Kerberos username is empty or longer than 128 characters".to_owned());
@@ -55,10 +53,8 @@ pub fn validate_kerberos_username(username: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Directory create rejects only names that would become another principal
-/// (`/`, `@`) or a reserved KDC identity. Quotes and non-ASCII stay allowed
-/// so existing IDs and the SQL-injection fixture still insert; sync uses
-/// `validate_kerberos_username`.
+/// Looser than `validate_kerberos_username`: refuses only `/`, `@` and reserved KDC names, so
+/// existing IDs with quotes or non-ASCII, and the SQL-injection fixture, still insert.
 pub fn validate_directory_username(username: &str) -> Result<(), String> {
     if username.is_empty() || username.len() > 128 {
         return Err("Username is empty or longer than 128 characters".to_owned());
@@ -84,9 +80,7 @@ pub fn validate_directory_username(username: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Hostnames interpolated into `HTTP/{host}@{realm}` and then into
-/// `kadmin.local -q` must be a DNS name or IPv4 address: no spaces, slashes
-/// or newlines that would split the query.
+/// Goes into `HTTP/{host}@{realm}`: a DNS name or IPv4 address, so no space, `/` or newline.
 pub fn validate_keytab_hostname(hostname: &str) -> Result<(), String> {
     if hostname.is_empty() || hostname.len() > 253 {
         return Err("Keytab hostname is empty or longer than 253 characters".to_owned());

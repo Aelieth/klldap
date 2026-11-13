@@ -1,13 +1,15 @@
 # shellcheck shell=bash
 # Phase: LDAPS on its own container. The certificate is made by the image's openssl
-# on a Docker volume, and the volume is removed even when a row fails.
-# The runner (gate/run-gate.sh) sets the variables this phase reads.
+# on a Docker volume. The phase removes that volume when it finishes, and the
+# runner removes it if the gate is interrupted. The runner sets the variables
+# this phase reads.
 
 # shellcheck disable=SC2154
 D="$(phase_dir)"
 LDAPS_C="$CONTAINER-ldaps"
 LDAPS_VOL="klldap-gate-ldaps-$RUNID"
 EXTRA_CONTAINERS+=("$LDAPS_C")
+EXTRA_VOLUMES+=("$LDAPS_VOL")
 
 ldaps_stop() {
     docker rm -f "$LDAPS_C" >/dev/null 2>&1 || true

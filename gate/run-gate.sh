@@ -40,6 +40,7 @@ VOL_DATA="klldap-gate-data-$RUNID"
 VOL_KDC="klldap-gate-kdc-$RUNID"
 PG_CONTAINER="klldap-gate-pg-$RUNID"
 EXTRA_CONTAINERS=()
+EXTRA_VOLUMES=()
 
 BASE_DN="dc=gate,dc=test"
 REALM="GATE.TEST"
@@ -62,6 +63,9 @@ cleanup() {
     docker rm -f "$PG_CONTAINER" >/dev/null 2>&1
     docker network rm "$NET" >/dev/null 2>&1
     docker volume rm "$VOL_DATA" "$VOL_KDC" >/dev/null 2>&1
+    for v in "${EXTRA_VOLUMES[@]:-}"; do
+        [ -n "$v" ] && docker volume rm "$v" >/dev/null 2>&1
+    done
 }
 trap cleanup EXIT
 

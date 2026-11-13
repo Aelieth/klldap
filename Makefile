@@ -109,12 +109,13 @@ test-run:
 
 # ---- Verification ----
 # - safety        → the pre-commit dance: fmt, build, test, clippy, cargo deny, schema drift
+# - advisories    → cargo deny check advisories, before a tag or release
 # - gate          → build the test image and run the full container gate
 # - gate-fast     → run the gate against the existing klldap-test image
 # - gate-postgres → gate with a gate-managed postgres:16 backend
 # - gate-rootless → gate (SQLite) on the -rootless image
 # - gate-phase    → run selected phases, e.g. make gate-phase PHASE=kerberos
-.PHONY: safety gate gate-fast gate-postgres gate-rootless gate-phase
+.PHONY: safety advisories gate gate-fast gate-postgres gate-rootless gate-phase
 
 safety:
 	cargo fmt --all
@@ -124,6 +125,9 @@ safety:
 	cargo deny check licenses sources
 	./export_schema.sh
 	git diff --exit-code schema.graphql
+
+advisories:
+	cargo deny check advisories
 
 gate: test
 	gate/run-gate.sh

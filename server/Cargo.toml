@@ -19,7 +19,7 @@ actix-rt = "2"
 actix-server = "2"
 actix-service = "2"
 actix-tls = { version = "3", features = ["default", "rustls-0_23"] }
-actix-web = { version = "4.12.1", features = ["rustls-0_23"] }
+actix-web = { version = "4.12.1", default-features = false, features = ["macros", "cookies", "unicode", "compat", "ws", "rustls-0_23"] }
 actix-web-httpauth = "0.8"
 anyhow = { workspace = true }
 async-trait = { workspace = true }

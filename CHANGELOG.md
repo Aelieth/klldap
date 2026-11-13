@@ -24,6 +24,11 @@ Next release. The KDC is kerber-rust inside the `lldap` process.
   a MySQL server's public key. The key is 3072 bits (rsa 0.10's default) and is made at start
   in the background; a password set through the web UI is bounded at 318 bytes by the
   envelope.
+- actix-web is built without its `http2` feature and without `compress-brotli`,
+  `compress-gzip` and `compress-zstd`. The web port was already HTTP/1.1 only, and
+  nothing of ours sends a compressed request, so clients see no change. `h2` leaves
+  the lock, and RUSTSEC-2026-0258 with it. A precompressed `.wasm.gz` response is
+  unchanged: the handler sets that header itself.
 
 ### Configuration
 

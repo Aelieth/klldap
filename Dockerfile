@@ -122,7 +122,7 @@ ENV UID=1000 GID=1000
 # The KDC listens on 1088 and kadmin on 127.0.0.1:1749 (the code's defaults): publish 88:1088.
 # The code's paths are relative to the working directory, as upstream's are; the image keeps them
 # where 0.7.2 had them, which a 0.7.2 config does not name.
-ENV LLDAP_KERBEROS_OPTIONS__ENABLED=true KRB5_CONFIG=/data/krb5.conf \
+ENV KRB5_CONFIG=/data/krb5.conf \
     LLDAP_KERBEROS_OPTIONS__DATA_DIR=/var/kerberos/krb5kdc \
     LLDAP_KERBEROS_OPTIONS__ADMIN_KEYTAB=/data/kadm5.keytab \
     LLDAP_KEYCLOAK_OPTIONS__KEYTAB=/data/keytab/keycloak-http.keytab \

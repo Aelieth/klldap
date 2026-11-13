@@ -196,8 +196,8 @@ key_seed = "RanD0m STR1ng"
 [kerberos_options]
 ## Run Kerberos with the directory: directory writes wait for the KDC after boot, users with
 ## kerberossync get principals, and the healthcheck also requires the KDC and the admin
-## keytab. The image sets this to true.
-#enabled = false
+## keytab. Set false to run without a realm.
+#enabled = true
 ## The realm. Defaults to the domain of ldap_base_dn, uppercased (dc=example,dc=com gives
 ## EXAMPLE.COM).
 #realm = "EXAMPLE.COM"
@@ -206,13 +206,12 @@ key_seed = "RanD0m STR1ng"
 #renew_lifetime = "7d"
 ## Issue forwardable tickets.
 #forwardable = true
-## How long a ticket may be renewed.
-#max_renewable_life = "7d"
 ## Session and long-term keys. Accepts aes256-cts-hmac-sha1-96,
 ## aes128-cts-hmac-sha1-96, aes256-cts-hmac-sha384-192 and
 ## aes128-cts-hmac-sha256-128. 3DES and RC4 are refused as deprecated
 ## (RFC 8429). Camellia is refused because the embedded KDC does not serve it.
-## The family name "default" is refused because it includes them.
+## One type name per item: family names such as "aes" or "default", +/- prefixes and two
+## names in one item are refused. A new first type rolls krbtgt's key at the next boot.
 #supported_enctypes = ["aes256-cts-hmac-sha1-96"]
 ## KDC listen address and port (UDP and TCP). Publish 1088 as 88.
 #kdc_host = "0.0.0.0"

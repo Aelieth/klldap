@@ -24,7 +24,7 @@ JWT, SEED = "gate-jwt-secret-not-for-production", "gate-key-seed-not-for-product
 KDC_DIR = "/var/kerberos/krb5kdc"
 SERVICE, WRITER, LOCKED, POLICY, MAX_FAIL = "HTTP/dur.gate.test", "durbob", "durlock", "durpol", 3
 SECOND = "HTTP/dur-second.gate.test"
-HEALTH_LIMIT, EXIT_LIMIT, STOPPED_FOR = 90, 30, 40
+HEALTH_LIMIT, EXIT_LIMIT, STOPPED_ALONE, WRITE_WITHIN = 90, 30, 25, 10
 REFUSED = "Password incorrect while getting initial credentials"
 GAP_TARGET_MS = 20
 POWER = ROW == "acc8"
@@ -615,7 +615,7 @@ def not_back(record, server, kind, head, n):
 
 def acc4(record, times):
     n = 0
-    for case in ENV.get("DUR_CASES", "i,ii,iii").split(","):
+    for case in ENV.get("DUR_CASES", "i,ii,iii,iv").split(","):
         for k in range(times):
             n += 1
             url, shared = db_url(True)
@@ -629,7 +629,7 @@ def acc4(record, times):
                 record.line(case, False, f"CASE n={n} db={DB} case={case} A did not become healthy")
                 continue
             a.create_user(WRITER, test_password(n))
-            ok, text = {"i": case_i, "ii": case_ii, "iii": case_iii}[case](a, b, n)
+            ok, text = {"i": case_i, "ii": case_ii, "iii": case_iii, "iv": case_iv}[case](a, b, n)
             if not ok:
                 a.keep_logs(f"case-{n}")
                 b.keep_logs(f"case-{n}")
@@ -672,25 +672,41 @@ def case_ii(a, b, n):
 def case_iii(a, b, n):
     if not a.signal("STOP"):
         return False, "could not stop A's lldap process"
-    stopped_at = time.monotonic()
     b.create()
-    time.sleep(max(0.0, STOPPED_FOR - (time.monotonic() - stopped_at)))
+    b_back = b.wait_healthy()
     a.signal("CONT")
+    if b_back is None:
+        return False, "B did not become healthy while A was stopped"
     password_a = test_password(n) + "a"
     a_answer = a.set_password(WRITER, password_a)
     a_gone = a.wait_exit(EXIT_LIMIT)
     a_code = a.state("ExitCode")
     a_cause = next((line for line in a.logs().splitlines() if line.startswith("Error:")), "")
-    b_back = b.wait_healthy()
-    serving = b_back is not None
-    directory_has_a = b.bind(WRITER, password_a) if serving else None
-    realm_has_a = b.kinit(WRITER, password_a)[0] if serving else None
-    write, _ = write_through(b, n, "b") if serving else (False, None)
-    one = serving and b.healthy() and not a.running()
-    ok = a_gone is not None and a_code not in ("", "0") and realm_has_a is False and write and one
-    return ok, (f"a_exit={a_code} realm_has_a_password={realm_has_a} write_via_b={write} "
-                f"one_healthy={one} recorded: a_answer={a_answer} "
-                f"directory_has_a_password={directory_has_a} a_cause={a_cause!r}")
+    moved = "the realm's generation moved" in a_cause
+    directory_has_a = b.bind(WRITER, password_a)
+    realm_has_a = b.kinit(WRITER, password_a)[0]
+    write, _ = write_through(b, n, "b")
+    one = b.healthy() and not a.running()
+    ok = (a_gone is not None and a_code not in ("", "0") and moved and realm_has_a is False
+          and write and one)
+    return ok, (f"b_back_s={b_back:.1f} a_exit={a_code} a_cause_moved={moved} "
+                f"realm_has_a_password={realm_has_a} write_via_b={write} one_healthy={one} "
+                f"recorded: a_answer={a_answer} directory_has_a_password={directory_has_a} "
+                f"a_cause={a_cause!r}")
+
+
+def case_iv(a, b, n):
+    if not a.signal("STOP"):
+        return False, "could not stop A's lldap process"
+    time.sleep(STOPPED_ALONE)
+    a.signal("CONT")
+    woke = time.monotonic()
+    write, _ = write_through(a, n, "a")
+    write_s = time.monotonic() - woke
+    warned = "the heartbeat still held it" in a.logs()
+    healthy = a.running() and a.healthy()
+    ok = write and write_s <= WRITE_WITHIN and warned and healthy
+    return ok, f"write_via_a={write} write_s={write_s:.1f} warn_line={warned} a_healthy={healthy}"
 
 
 def main():

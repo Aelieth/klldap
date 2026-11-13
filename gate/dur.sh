@@ -8,7 +8,7 @@ GATE_ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$GATE_ROOT/.." || exit 1
 usage() {
     echo "usage: gate/dur.sh acc3|acc4|acc8 --db sqlite|postgres [--image IMG] [--kills N] [--times N]" \
-        "[--kinds abcd] [--cases i,ii,iii]" \
+        "[--kinds abcd] [--cases i,ii,iii,iv]" \
         "[--kill power --cuts N --settle S --guest NAME --addr IP --lab-home DIR]" >&2
     exit 2
 }
@@ -21,7 +21,7 @@ GATE_IMAGE="klldap-test"
 KILLS=25
 TIMES=5
 KINDS="abc"
-CASES="i,ii,iii"
+CASES="i,ii,iii,iv"
 KILL="process"
 CUTS=3
 GUEST="kerber-klldap"

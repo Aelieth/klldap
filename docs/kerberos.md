@@ -201,25 +201,71 @@ ignored. So do `kdc_bind`, `kadmin_bind`, `kadmin_acl_file`,
 `max_renewable_life` and `kerberos_options.keycloak_keytab`. Use the options
 above. `keycloak_keytab` is `keycloak_options.keytab`.
 
+## The realm in the database
+
+The realm is rows in the directory database: `kerberos_realm`,
+`kerberos_principals` and `kerberos_policies`. The master key is the file
+`.k5.<REALM>` in `kerberos_options.data_dir` (default `krb5kdc`, and in the
+image `/var/kerberos/krb5kdc`). **Back up the database and that file
+together.** If the database holds the realm and the file is missing, the
+realm does not open. The server comes up in the degraded state, and the
+cause says to restore the stash from the backup taken with the database.
+See [When the realm cannot open](#when-the-realm-cannot-open).
+
+On MySQL and MariaDB the columns `kerberos_principals.record`,
+`kerberos_policies.record` and `kerberos_realm.state` are `LONGBLOB`.
+Upstream's own migrations use a plain blob.
+
+Failed sign-in counts are the file `lockout` in the same directory. A missing
+file means the realm does not open. The server comes up in the degraded
+state, and the cause says the lockout file is missing; restore it, or create
+an empty one to count failed logins from zero. A file that cannot be read or
+written, or that is not a kerber-rust lockout file, is the same case: restore
+it, or put an empty file in its place. An empty file counts from zero. See
+[When the realm cannot open](#when-the-realm-cannot-open). A count already
+written survives a kill of the server process. A power cut is not tested and
+can lose the most recent counts. After an admin unlock, a failure in that
+same second can leave the count at 1 for one extra failure, as MIT does.
+
+While the database is down, an administrative write is refused at once. The
+kadmin client reports "Unable to access Kerberos database". A kadmin read of
+an existing principal is still answered. The server exits after twenty seconds
+without the database. A step still in flight can make that twenty-five. A
+start that finds the realm left open waits out a thirty-second watch. A second
+server pointed at the same database starts, waits out the watch, then exits
+and names the cause.
+
 ## Upgrading from 0.7.2
 
-0.7.2 kept the realm in MIT's db2 format, which 0.8.0 cannot read. Before the first 0.8.0
-start, write a dump of it into the same directory with the 0.7.2 image, either in the running
-0.7.2 container or in a one-off container on the same KDC volume:
+0.7.2 kept the realm in MIT's db2 format, which 0.8.0 cannot read. 0.8.0 keeps
+the realm in the directory database. Before the first 0.8.0 start, write a dump
+of the 0.7.2 realm into the same directory with the 0.7.2 image, either in the
+running 0.7.2 container or in a one-off container on the same KDC volume:
 
     docker exec <your 0.7.2 container> kdb5_util -r <REALM> dump /var/kerberos/krb5kdc/principal.dump
     docker run --rm --entrypoint kdb5_util -v <kdc volume>:/var/kerberos/krb5kdc \
         aelieth/klldap:0.7.2 -r <REALM> dump /var/kerberos/krb5kdc/principal.dump
 
-On its first start, 0.8.0 finds `principal.dump` beside the stash, loads it, and moves the MIT
-files (`principal`, `principal.kadm5`, `principal.ok`, `principal.kadm5.lock`, `kadm5.acl`,
-`kdc.conf` and the dump) into `mit-db2.bak/` in the same directory, mode 0700. Nothing is
-deleted: remove that directory once the realm works. The dump holds every principal's key
-data, encrypted in the master key, so keep the backup as safe as the database.
+On its first start, 0.8.0 finds `principal.dump` beside the stash, loads it
+into the directory database, and moves the MIT files (`principal`,
+`principal.kadm5`, `principal.ok`, `principal.kadm5.lock`, `kadm5.acl`,
+`kdc.conf` and the dump) into `mit-db2.bak/` in the same directory, mode 0700.
+Nothing is deleted: remove that directory once the realm works. The dump holds
+every principal's key data, encrypted in the master key, so keep the backup as
+safe as the database.
 
-What carries over: the realm, the master key (the stash stays), every principal with its keys
-and attributes, and `admin/admin`, whose keytab is written again from its key. What does not:
-grants in `kadm5.acl` beyond the admin line (name them in `kadmin_acl`), and MIT's logs.
+What carries over: the realm, the master key (the stash stays), every principal
+with its keys and attributes, and `admin/admin`, whose keytab is written again
+from its key. The rows are sealed again when they are written, so the encrypted
+bytes in a later dump of the database differ from MIT's dump. A dump the master
+key cannot open is refused, and nothing is moved. What does not carry over:
+grants in `kadm5.acl` beyond the admin line (name them in `kadmin_acl`), and
+MIT's logs.
+
+A dump that names a principal which is only a user id, when that user does not
+exist, is refused. The cause names the principal, the database is not written,
+and the MIT files stay. Create the user it names, or remove the principal on
+0.7.2 and dump again.
 
 A configuration that does not set `kerberos_options.enabled` now starts a
 realm. Set `enabled = false` to stay without one.
@@ -234,15 +280,28 @@ first 0.8.0 start; otherwise the migration is refused and the cause names both r
 
 ## Losing a volume
 
-- `data_dir` lost (database and stash go together; the default path is
-  `krb5kdc`, and in the image `/var/kerberos/krb5kdc`): the next start creates a
-  fresh database and rewrites
-  the admin keytab. Existing users have no principal until their password is
-  next set (or an admin sets one for them); the Keycloak keytab has to be
-  exported again.
-- `data_dir` lost after a migration, with `mit-db2.bak/` still there: the realm does not
-  open, and the cause names the backup, so a lost database is not silently replaced by a
-  new realm. Restore the database, or move `mit-db2.bak/` away to start a fresh realm.
-- `/data` lost: the directory database and `server_key` are gone with it.
-  Restore them from backup. The admin keytab is rewritten from the surviving
-  KDC database on the next boot.
+- `data_dir` lost, directory database intact (the default path is `krb5kdc`,
+  and in the image `/var/kerberos/krb5kdc`): the stash `.k5.<REALM>` and the
+  `lockout` file are gone, and the realm rows are still in the database. The
+  realm does not open. The server comes up in the degraded state, and the
+  cause says the stash is missing. Restore that file from the backup taken
+  with the database. With the stash back, a missing `lockout` file is its own
+  cause: restore it, or create an empty one to count failed logins from zero.
+  A file that cannot be read or written, or that is not a kerber-rust lockout
+  file, is the same case. See
+  [When the realm cannot open](#when-the-realm-cannot-open).
+- The database has no realm, and `mit-db2.bak/` is still in `data_dir` without
+  the stash: the realm does not open. The server comes up in the degraded
+  state, and the cause names the backup, so a lost database is not silently
+  replaced by a new realm. Restore the database and the stash, or move
+  `mit-db2.bak/` away to start a fresh realm.
+- `/data` lost: the directory database and `server_key` are gone, and with them
+  the realm rows. If the stash is still in `data_dir`, the realm does not
+  open. The server comes up in the degraded state, and the cause says that
+  stash belongs to a realm the database does not hold. Restore the database,
+  or put the 0.7.2 dump back beside the stash to run the import again. With
+  nothing to restore and no 0.7.2 dump, moving the stash and the `lockout`
+  file away is the last resort: the next start creates a new realm. Existing
+  users then have no principal until their password is next set, or an admin
+  sets one for them, with `kerberosSync` on. The Keycloak keytab is exported
+  again.

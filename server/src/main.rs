@@ -38,9 +38,11 @@ use tracing::{Instrument, Level, debug, error, info, instrument, span, warn};
 
 use lldap_domain::requests::{CreateGroupRequest, CreateUserRequest};
 use lldap_domain::types::{Attribute, BUILTIN_GROUPS};
-use lldap_domain_handlers::kerberos::{DegradedKerberos, NoopKerberos, set_kerberos_backend};
+use lldap_domain_handlers::kerberos::{
+    DegradedKerberos, NoopKerberos, kerberos_store, set_kerberos_backend,
+};
 use lldap_domain_handlers::logging::{LogKind, record};
-use lldap_kerberos::boot::client_address;
+use lldap_kerberos::boot::{RealmSettings, client_address};
 use lldap_kerberos::embedded::{EmbeddedKerberos, RealmThreads};
 
 use lldap_domain_handlers::handler::{
@@ -292,10 +294,15 @@ async fn set_up_server(
     let (realm_threads, embedded) = match config.kerberos_options.enabled {
         false => (None, None),
         true => {
-            warn_database_durability(&sql_pool)
+            let settings = config.kerberos_settings()?;
+            let durable = warn_database_durability(&sql_pool)
                 .await
-                .context("while reading database durability")?;
-            match EmbeddedKerberos::start(&config.kerberos_settings()?) {
+                .context("while reading database durability");
+            let started = match durable {
+                Ok(()) => start_realm(settings).await,
+                Err(e) => Err(e),
+            };
+            match started {
                 Ok((embedded, threads)) => {
                     set_kerberos_backend(embedded.clone());
                     reconcile_principals(&backend_handler, &embedded).await?;
@@ -331,6 +338,24 @@ async fn set_up_server(
     Ok((server_builder, realm_threads))
 }
 
+async fn start_realm(settings: RealmSettings) -> Result<(Arc<EmbeddedKerberos>, RealmThreads)> {
+    tokio::task::spawn_blocking(move || EmbeddedKerberos::start(&settings, kerberos_store()))
+        .await
+        .context("while starting the Kerberos realm")?
+}
+
+async fn stop_realm(realm: RealmThreads) -> Result<()> {
+    tokio::task::spawn_blocking(move || realm.stop())
+        .await
+        .context("while stopping the Kerberos realm")
+}
+
+enum Ended {
+    Served(Result<()>),
+    Died(String),
+    Lost,
+}
+
 fn loopback(host: &str) -> String {
     match host.parse::<IpAddr>() {
         Ok(IpAddr::V6(_)) => "::1".to_owned(),
@@ -364,8 +389,11 @@ async fn serve(
     realm: Option<RealmThreads>,
     lost: Option<tokio::sync::watch::Receiver<Option<KerberosLost>>>,
 ) -> Result<()> {
-    if lost.as_ref().is_some_and(|lost| lost.borrow().is_some()) {
-        return realm_lost(lost.as_ref().unwrap());
+    if let Some(lost) = lost.as_ref().filter(|lost| lost.borrow().is_some()) {
+        if let Some(realm) = realm {
+            stop_realm(realm).await?;
+        }
+        return realm_lost(lost);
     }
     let server = server.workers(1).run();
     match (realm, lost) {
@@ -390,21 +418,27 @@ async fn serve(
         }
         (Some(mut realm), Some(mut lost)) => {
             let handle = server.handle();
-            let served = tokio::select! {
-                served = server => served.context("while starting the server"),
-                cause = realm.died() => {
-                    handle.stop(true).await;
-                    Err(anyhow!("the Kerberos realm stopped: {cause}"))
-                }
-                _ = lost.changed() => {
+            let ended = tokio::select! {
+                served = server => Ended::Served(served.context("while starting the server")),
+                cause = realm.died() => Ended::Died(cause),
+                _ = lost.changed() => Ended::Lost,
+            };
+            match ended {
+                Ended::Lost => {
+                    stop_realm(realm).await?;
                     handle.stop(true).await;
                     realm_lost(&lost)
                 }
-            };
-            tokio::task::spawn_blocking(move || realm.stop())
-                .await
-                .context("while stopping the Kerberos realm")?;
-            served
+                Ended::Died(cause) => {
+                    handle.stop(true).await;
+                    stop_realm(realm).await?;
+                    Err(anyhow!("the Kerberos realm stopped: {cause}"))
+                }
+                Ended::Served(served) => {
+                    stop_realm(realm).await?;
+                    served
+                }
+            }
         }
     }
 }

@@ -1,7 +1,7 @@
 use crate::common::{
     auth::{get_token, get_token_for},
     env,
-    fixture::{LLDAPFixture, free_port},
+    fixture::{LLDAPFixture, free_port, query_i64},
 };
 use ldap3::LdapConn;
 use reqwest::StatusCode;
@@ -659,21 +659,41 @@ fn kerberos_degraded() {
     drop(fresh_holder);
 }
 
+fn seed_0_7_2_realm(data_dir: &Path) {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/krb5kdc");
+    std::fs::create_dir_all(data_dir).expect("data dir");
+    for name in [".k5.LIVEBOB.TEST", "principal.dump"] {
+        std::fs::copy(fixture.join(name), data_dir.join(name)).expect(name);
+    }
+}
+
 #[test]
 fn kerberos_migrates_a_dump() {
-    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/krb5kdc");
+    // As on an upgrade, the directory has the user before the realm comes over: a first start
+    // without Kerberos creates livebob, and the restart imports the dump.
     let mut realm = start_realm_seeded(
         true,
         false,
         free_port(),
-        &[("LLDAP_KERBEROS_OPTIONS__REALM", "LIVEBOB.TEST")],
-        |data_dir| {
-            std::fs::create_dir_all(data_dir).expect("data dir");
-            for name in [".k5.LIVEBOB.TEST", "principal.dump"] {
-                std::fs::copy(fixture.join(name), data_dir.join(name)).expect(name);
-            }
-        },
+        &[
+            ("LLDAP_KERBEROS_OPTIONS__REALM", "LIVEBOB.TEST"),
+            ("LLDAP_KERBEROS_OPTIONS__ENABLED", "false"),
+        ],
+        seed_0_7_2_realm,
     );
+    let http = client();
+    let base = realm.fixture.http_url();
+    let created = gql(
+        &http,
+        &base,
+        &get_token(&http, &base),
+        "mutation($u: CreateUserInput!) { createUser(user: $u) { id } }",
+        json!({"u": {"id": USER, "email": "livebob@example.com"}}),
+    );
+    assert_eq!(created["data"]["createUser"]["id"], USER, "{created}");
+    realm
+        .fixture
+        .restart_with_env("LLDAP_KERBEROS_OPTIONS__ENABLED", "true");
     expect_ok(
         &kinit(&realm.krb, FIRST),
         "kinit livebob on the migrated realm",
@@ -795,4 +815,33 @@ fn kerberos_rolls_krbtgt_when_the_first_type_changes() {
         ["aes128-cts-hmac-sha1-96", "aes256-cts-hmac-sha1-96"],
         "{listed}"
     );
+}
+
+#[test]
+fn kerberos_refuses_a_dump_whose_user_is_missing() {
+    let realm = start_realm_seeded(
+        false,
+        true,
+        free_port(),
+        &[("LLDAP_KERBEROS_OPTIONS__REALM", "LIVEBOB.TEST")],
+        seed_0_7_2_realm,
+    );
+    let (status, body) = health(&client(), &realm.fixture.http_url());
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    for cause in [
+        "the Kerberos realm LIVEBOB.TEST did not open",
+        "principal livebob names user livebob, and there is no such user",
+        "create the user it names, or remove the principal on 0.7.2 and dump again",
+    ] {
+        assert!(body.contains(cause), "{cause}: {body}");
+    }
+    for table in ["kerberos_realm", "kerberos_principals"] {
+        let rows = query_i64(
+            realm.fixture.db_url(),
+            &format!("SELECT COUNT(*) FROM {table}"),
+        );
+        assert_eq!(rows, 0, "{table}");
+    }
+    assert!(realm.data_dir.join("principal.dump").is_file());
+    assert!(!realm.data_dir.join("mit-db2.bak").exists());
 }

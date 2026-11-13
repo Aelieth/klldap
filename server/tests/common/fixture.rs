@@ -129,6 +129,10 @@ impl LLDAPFixture {
         }
     }
 
+    pub fn db_url(&self) -> &str {
+        &self.db_url
+    }
+
     pub fn server_log(&self) -> String {
         let path = self
             .server_log

@@ -32,6 +32,10 @@ Next release. The KDC is kerber-rust inside the `lldap` process.
 
 ### Configuration
 
+- `smtp_options.tls_root_cert_file` (`LLDAP_SMTP_OPTIONS__TLS_ROOT_CERT_FILE`) is an
+  optional PEM of extra SMTP roots, added to the roots compiled into the server.
+  Unset, nothing changes. A missing, unreadable, or empty file refuses the start
+  and names the setting. The `_FILE` form is refused: the key is the path itself.
 - New `[kerberos_options]` section (`LLDAP_KERBEROS_OPTIONS__*`): `enabled`, `realm`,
   `ticket_lifetime`, `renew_lifetime`, `forwardable`,
   `supported_enctypes`, `kdc_host`, `kdc_port`, `kadmin_host`, `kadmin_port`,

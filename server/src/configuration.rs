@@ -56,6 +56,8 @@ pub struct MailOptions {
     pub password: SecUtf8,
     #[builder(default = "SmtpEncryption::Tls")]
     pub smtp_encryption: SmtpEncryption,
+    #[builder(default)]
+    pub tls_root_cert_file: Option<String>,
     /// Deprecated.
     #[debug(skip)]
     #[serde(skip)]
@@ -707,6 +709,10 @@ impl ConfigOverrider for SmtpOpts {
             .inspect(|&enable_password_reset| {
                 config.smtp_options.enable_password_reset = enable_password_reset;
             });
+
+        self.smtp_tls_root_cert_file
+            .as_ref()
+            .inspect(|path| config.smtp_options.tls_root_cert_file = Some((*path).clone()));
     }
 }
 
@@ -739,15 +745,17 @@ impl ConfigOverrider for LogOpts {
 }
 
 // Keys whose value is itself a path; the file provider leaves them alone.
-const FILE_PROVIDER_EXEMPT: [&str; 3] = ["key_file", "cert_file", "config_file"];
+const FILE_PROVIDER_EXEMPT: [&str; 4] =
+    ["key_file", "cert_file", "config_file", "tls_root_cert_file"];
 
-const PATH_KEYS: [(&str, &str); 6] = [
+const PATH_KEYS: [(&str, &str); 7] = [
     ("kerberos_options", "data_dir"),
     ("kerberos_options", "admin_keytab"),
     ("kerberos_options", "client_config"),
     ("kerberos_options", "kadmin_acl"),
     ("keycloak_options", "keytab"),
     ("keycloak_options", "config_file"),
+    ("smtp_options", "tls_root_cert_file"),
 ];
 
 const CHECKED_FILE_SECTIONS: [&str; 2] = ["kerberos_options", "keycloak_options"];
@@ -972,6 +980,10 @@ where
         println!(
             "DEPRECATED: smtp_options.tls_required field is deprecated, it never did anything. You can replace it with smtp_options.smtp_encryption."
         );
+    }
+    if let Some(path) = &config.smtp_options.tls_root_cert_file {
+        crate::tls::load_certificates(path)
+            .with_context(|| format!("smtp_options.tls_root_cert_file = {path:?} is refused"))?;
     }
     if config.smtp_options.enable_password_reset {
         println!(
@@ -1719,6 +1731,33 @@ mod tests {
                 Ok(())
             });
         }
+    }
+
+    #[test]
+    fn test_smtp_root_file_refuses_start() {
+        Jail::expect_with(|jail| {
+            jail.clear_env();
+            jail.set_env("LLDAP_JWT_SECRET", "secret");
+            jail.set_env(
+                "LLDAP_SMTP_OPTIONS__TLS_ROOT_CERT_FILE",
+                "no-such-smtp-root.pem",
+            );
+            let missing = format!("{:#}", init(default_run_opts()).unwrap_err());
+            assert!(
+                missing.contains("smtp_options.tls_root_cert_file"),
+                "{missing}"
+            );
+            assert!(missing.contains("no-such-smtp-root.pem"), "{missing}");
+            jail.create_file("empty-smtp-root.pem", "")?;
+            jail.set_env(
+                "LLDAP_SMTP_OPTIONS__TLS_ROOT_CERT_FILE",
+                "empty-smtp-root.pem",
+            );
+            let empty = format!("{:#}", init(default_run_opts()).unwrap_err());
+            assert!(empty.contains("smtp_options.tls_root_cert_file"), "{empty}");
+            assert!(empty.contains("empty-smtp-root.pem"), "{empty}");
+            Ok(())
+        });
     }
 
     #[test]

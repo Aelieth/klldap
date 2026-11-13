@@ -1,8 +1,12 @@
 use crate::{cli::SmtpEncryption, configuration::MailOptions};
-use anyhow::{Ok, Result, anyhow};
+use anyhow::{Context, Ok, Result, anyhow};
 use lettre::{
-    AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor, message::Mailbox,
-    transport::smtp::authentication::Credentials,
+    AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
+    message::Mailbox,
+    transport::smtp::{
+        authentication::Credentials,
+        client::{Certificate, Tls, TlsParameters},
+    },
 };
 use std::time::Duration;
 use tokio::time::sleep;
@@ -51,6 +55,17 @@ async fn send_email(
             AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(&options.server)?
         }
     };
+    if options.tls_root_cert_file.is_some() {
+        match options.smtp_encryption {
+            SmtpEncryption::None => {}
+            SmtpEncryption::Tls => {
+                mailer = mailer.tls(Tls::Wrapper(smtp_tls_parameters(options)?));
+            }
+            SmtpEncryption::StartTls => {
+                mailer = mailer.tls(Tls::Required(smtp_tls_parameters(options)?));
+            }
+        }
+    }
     if options.user.as_str() != "" {
         let creds = Credentials::new(
             options.user.clone(),
@@ -77,6 +92,21 @@ async fn send_email(
     } else {
         Ok(())
     }
+}
+
+fn smtp_tls_parameters(options: &MailOptions) -> Result<TlsParameters> {
+    let path = options
+        .tls_root_cert_file
+        .as_deref()
+        .ok_or_else(|| anyhow!("smtp_options.tls_root_cert_file is unset"))?;
+    let pem = std::fs::read(path)
+        .with_context(|| format!("smtp_options.tls_root_cert_file = {path:?} is refused"))?;
+    let cert = Certificate::from_pem(&pem)
+        .map_err(|e| anyhow!("smtp_options.tls_root_cert_file = {path:?} is refused: {e}"))?;
+    TlsParameters::builder(options.server.clone())
+        .add_root_certificate(cert)
+        .build()
+        .map_err(|e| anyhow!("smtp_options.tls_root_cert_file = {path:?} is refused: {e}"))
 }
 
 fn build_reset_url(server_url: &url::Url, token: &str) -> url::Url {

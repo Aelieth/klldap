@@ -316,6 +316,13 @@ pub struct SmtpOpts {
 
     #[clap(long, env = "LLDAP_SMTP_OPTIONS__SMTP_ENCRYPTION", value_parser = EnumValueParser::<SmtpEncryption>::new(), ignore_case = true)]
     pub smtp_encryption: Option<SmtpEncryption>,
+
+    #[clap(
+        long,
+        env = "LLDAP_SMTP_OPTIONS__TLS_ROOT_CERT_FILE",
+        help = "PEM file of extra SMTP roots, added to the roots in the binary"
+    )]
+    pub smtp_tls_root_cert_file: Option<String>,
 }
 
 #[derive(Debug, Parser, Clone)]

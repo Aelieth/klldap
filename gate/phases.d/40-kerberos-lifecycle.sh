@@ -118,3 +118,59 @@ else
 fi
 graphql 'mutation($id: String!) { deleteUser(userId: $id) { ok } }' \
     '{"id": "'"$NOSYNC_USER"'"}' >"$D/delete-nosync.json" 2>&1 || p_bad "deleteUser $NOSYNC_USER failed"
+
+# The browser's password envelope, sealed by OpenSSL instead of the app: RSA-OAEP with SHA-256
+# and MGF1-SHA-256 under the published PKCS#1 key. The password travels on stdin only.
+ENV_USER="gateenvelope"
+ENV_PASS="GateEnvelopePass2026!"
+SYNC_MUTATION='mutation($u: String!, $e: String!) { syncKerberosPassword(userId: $u, encryptedPassword: $e) }'
+if ! gexec sh -c 'command -v openssl' >/dev/null 2>&1; then
+    p_skip "envelope rows: no openssl in the image"
+else
+    graphql 'mutation($u: CreateUserInput!) { createUser(user: $u) { id } }' \
+        '{"u": {"id": "'"$ENV_USER"'", "email": "'"$ENV_USER"'@gate.test",
+                "attributes": [{"name": "kerberossync", "value": ["1"]}]}}' \
+        >"$D/create-envelope.json" 2>&1 || p_bad "createUser $ENV_USER failed"
+    graphql '{ kerberosInfo { publicKeyDerBase64 } }' >"$D/envelope-key.json" 2>&1 \
+        || p_bad "kerberosInfo for the envelope failed"
+    pubkey="$(json_get kerberosInfo.publicKeyDerBase64 <"$D/envelope-key.json" 2>/dev/null)"
+    printf '%s' "$ENV_PASS" | t docker exec -i -e KEY="$pubkey" "$CONTAINER" sh -c '
+        printf %s "$KEY" | base64 -d >/tmp/gate_envelope.der &&
+            openssl rsa -RSAPublicKey_in -inform DER -in /tmp/gate_envelope.der \
+                -pubout -out /tmp/gate_envelope.pem 2>/dev/null &&
+            openssl pkeyutl -encrypt -pubin -inkey /tmp/gate_envelope.pem \
+                -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 \
+                -pkeyopt rsa_mgf1_md:sha256 | base64 -w0
+        rc=$?; rm -f /tmp/gate_envelope.der /tmp/gate_envelope.pem; exit $rc' \
+        >"$D/envelope.b64" 2>"$D/envelope.err"
+    sealed="$(cat "$D/envelope.b64")"
+    if [ -n "$sealed" ] && graphql "$SYNC_MUTATION" '{"u": "'"$ENV_USER"'", "e": "'"$sealed"'"}' \
+        >"$D/envelope-sync.json" 2>"$D/envelope-sync.err" \
+        && [ "$(json_get syncKerberosPassword <"$D/envelope-sync.json")" = "True" ]; then
+        p_ok "syncKerberosPassword takes an OpenSSL OAEP-SHA256 envelope"
+    else
+        p_bad "syncKerberosPassword refused the OpenSSL envelope (see envelope.err, envelope-sync.err)"
+    fi
+    if printf '%s\n' "$ENV_PASS" | t docker exec -i "$CONTAINER" \
+        sh -c 'KRB5CCNAME=/tmp/gate_cc_envelope kinit "$0"; rc=$?; kdestroy -q 2>/dev/null; exit $rc' \
+        "$ENV_USER@$REALM" >"$D/kinit-envelope.log" 2>&1; then
+        p_ok "kinit with the enveloped password succeeds"
+    else
+        p_bad "kinit with the enveloped password failed"
+    fi
+    flipped="$(printf '%s' "$sealed" | python3 -c '
+import base64, sys
+sealed = bytearray(base64.b64decode(sys.stdin.read()))
+sealed[-1] ^= 1
+print(base64.b64encode(sealed).decode())' 2>/dev/null)"
+    if graphql "$SYNC_MUTATION" '{"u": "'"$ENV_USER"'", "e": "'"$flipped"'"}' \
+        >"$D/envelope-flipped.json" 2>"$D/envelope-flipped.err"; then
+        p_bad "syncKerberosPassword took an envelope with one byte flipped"
+    elif grep -q "Kerberos password decryption failed" "$D/envelope-flipped.err"; then
+        p_ok "an envelope with one byte flipped is refused"
+    else
+        p_bad "flipped envelope: unexpected answer (see envelope-flipped.err)"
+    fi
+    graphql 'mutation($id: String!) { deleteUser(userId: $id) { ok } }' \
+        '{"id": "'"$ENV_USER"'"}' >"$D/delete-envelope.json" 2>&1 || p_bad "deleteUser $ENV_USER failed"
+fi

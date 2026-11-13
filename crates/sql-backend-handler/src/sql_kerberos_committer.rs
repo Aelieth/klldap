@@ -12,6 +12,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, watch};
+use tracing::warn;
 
 const HEARTBEAT: Duration = Duration::from_secs(10);
 const LOST_AFTER: Duration = Duration::from_secs(20);
@@ -516,12 +517,20 @@ async fn on_wake(
             Err(_) => lose(lost_tx, KerberosLost::DatabaseUnreachable),
         },
         Phase::Held(held) if held.row => {
-            if held.last_ok.elapsed() >= timings.lost_after {
-                return lose(lost_tx, KerberosLost::DatabaseUnreachable);
-            }
+            let silent = held.last_ok.elapsed();
+            let overdue = silent >= timings.lost_after;
             match beat(pool, held.generation, timings.step).await {
-                Ok(next) => Phase::Held(fresh(next, true, timings)),
+                Ok(next) => {
+                    if overdue {
+                        warn!(
+                            "Woke {} s after the last write to the Kerberos realm; the heartbeat still held it",
+                            silent.as_secs()
+                        );
+                    }
+                    Phase::Held(fresh(next, true, timings))
+                }
                 Err(Step::Replaced) => lose(lost_tx, KerberosLost::Replaced),
+                Err(Step::Database) if overdue => lose(lost_tx, KerberosLost::DatabaseUnreachable),
                 Err(Step::Database) => Phase::Held(retry(held, timings)),
             }
         }
@@ -1284,5 +1293,60 @@ mod tests {
             KerberosLost::DatabaseUnreachable
         );
         handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_woken_owner_beats_once_before_it_gives_up() {
+        let timings = Timings {
+            heartbeat: HEARTBEAT,
+            lost_after: LOST_AFTER,
+            watch: WATCH,
+            step: Duration::from_millis(500),
+        };
+        let rows = [
+            ("generation still ours", Some(6), None),
+            ("taken meanwhile", None, Some(KerberosLost::Replaced)),
+            (
+                "database gone",
+                None,
+                Some(KerberosLost::DatabaseUnreachable),
+            ),
+            ("a newcomer's take loses the race", Some(6), None),
+        ];
+        for (row, held_after, cause) in rows {
+            let db = db().await;
+            insert_realm(&db.pool, 5, true).await;
+            match row {
+                "taken meanwhile" => {
+                    let take = take_owned(&db.other, 5, timings.step).await;
+                    assert!(matches!(take, Ok(6)), "{row}");
+                }
+                "database gone" => db.pool.clone().close().await.unwrap(),
+                _ => {}
+            }
+            let (lost_tx, lost) = watch::channel(None);
+            let woken = Held {
+                generation: 5,
+                row: true,
+                last_ok: Instant::now() - Duration::from_secs(25),
+                next: Instant::now(),
+            };
+            let phase = on_wake(&db.pool, Phase::Held(woken), &timings, &lost_tx).await;
+            let generation = match phase {
+                Phase::Held(held) => Some(held.generation),
+                _ => None,
+            };
+            assert_eq!(
+                (generation, lost.borrow().clone()),
+                (held_after, cause),
+                "{row}"
+            );
+            if row == "a newcomer's take loses the race" {
+                let take = take_owned(&db.other, 5, timings.step).await;
+                assert!(matches!(take, Err(Step::Replaced)), "{row}");
+                assert_eq!(hold(&db.other).await.0, 6, "{row}");
+            }
+        }
     }
 }

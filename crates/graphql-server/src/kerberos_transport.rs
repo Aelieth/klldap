@@ -4,18 +4,30 @@
 use anyhow::{Context, Result};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use getrandom::SysRng;
 use rsa::pkcs1::EncodeRsaPublicKey;
 use rsa::sha2::Sha256;
-use rsa::{PrivateKey, PublicKey};
+use rsa::{Generate, PrivateKey, PublicKey};
 use std::sync::LazyLock;
+use std::time::Instant;
+use tracing::info;
 
 static KEYPAIR: LazyLock<(PrivateKey, PublicKey)> = LazyLock::new(|| {
-    let private_key = PrivateKey::new(&mut SysRng, 2048)
+    let started = Instant::now();
+    let private_key = PrivateKey::try_generate()
         .expect("Failed to generate the RSA keypair for Kerberos password transport");
+    info!(
+        "Made the {}-bit RSA key in {} ms",
+        PrivateKey::DEFAULT_BITS,
+        started.elapsed().as_millis()
+    );
     let public_key = private_key.to_public_key();
     (private_key, public_key)
 });
+
+/// Makes the key now; a request that comes first waits for the same one.
+pub fn warm_transport_key() {
+    LazyLock::force(&KEYPAIR);
+}
 
 pub fn public_key_der_base64() -> String {
     let der = KEYPAIR

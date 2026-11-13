@@ -21,7 +21,9 @@ Next release. The KDC is kerber-rust inside the `lldap` process.
 - The browser's Kerberos password envelope (RSA-OAEP, SHA-256) moves to `rsa` 0.10 in the server
   and the app, whose constant-time code fixes RUSTSEC-2023-0071 (the Marvin timing attack).
   The wire format is unchanged. `sqlx-mysql` keeps its own `rsa` 0.9, which only encrypts to
-  a MySQL server's public key.
+  a MySQL server's public key. The key is 3072 bits (rsa 0.10's default) and is made at start
+  in the background; a password set through the web UI is bounded at 318 bytes by the
+  envelope.
 
 ### Configuration
 

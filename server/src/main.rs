@@ -178,6 +178,7 @@ async fn set_up_server(
 ) -> Result<(ServerBuilder, Option<RealmThreads>)> {
     let realm = config.kerberos_realm();
     set_kerberos_backend(Arc::new(NoopKerberos::new(realm.clone())));
+    tokio::task::spawn_blocking(lldap_graphql_server::warm_transport_key);
     let private_key_info = config.get_private_key_info();
     let force_update_private_key = config.force_update_private_key;
     let key_rotated = match (

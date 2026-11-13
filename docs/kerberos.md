@@ -87,7 +87,12 @@ ACL text, read at boot.
   recorded for the user.
 - The web UI never sends a plaintext password: it encrypts it with the RSA key
   from the `kerberosInfo` query for `syncKerberosPassword`; the server decrypts
-  it and updates the embedded KDC.
+  it and updates the embedded KDC. The key is 3072 bits, made anew at every
+  start in the background; the log line "Made the 3072-bit RSA key in <ms> ms"
+  gives the time, and a form opened before it is ready waits for it.
+  RSA-OAEP with SHA-256 seals at most 318 bytes, so the web UI refuses a
+  longer password with "Failed to encrypt password for Kerberos sync" and
+  changes nothing; LDAP and `setUserPassword` have no such bound.
 
 kadmin listens on the container's loopback. The image sets
 `KRB5_CONFIG=/data/krb5.conf`, so `docker exec` does not pass it:

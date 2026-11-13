@@ -3556,7 +3556,6 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "chrono",
- "getrandom 0.4.2",
  "juniper",
  "lldap_access_control",
  "lldap_auth",

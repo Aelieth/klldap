@@ -216,16 +216,27 @@ On MySQL and MariaDB the columns `kerberos_principals.record`,
 `kerberos_policies.record` and `kerberos_realm.state` are `LONGBLOB`.
 Upstream's own migrations use a plain blob.
 
+A change the server has acknowledged, such as a password set or a kadmin
+write, is in the database before the answer goes out, and it survives a power
+loss. On SQLite the server runs `synchronous = EXTRA`, and the realm does not
+open with any other setting. On PostgreSQL this holds when the start-up log
+has no `database durability` warning (the warning names `fsync`,
+`full_page_writes` or `synchronous_commit`). On MySQL and MariaDB the server
+logs the same warning when `innodb_flush_log_at_trx_commit` or `sync_binlog`
+is unsafe; a power cut has not been tested on them.
+
 Failed sign-in counts are the file `lockout` in the same directory. A missing
 file means the realm does not open. The server comes up in the degraded
 state, and the cause says the lockout file is missing; restore it, or create
-an empty one to count failed logins from zero. A file that cannot be read or
-written, or that is not a kerber-rust lockout file, is the same case: restore
-it, or put an empty file in its place. An empty file counts from zero. See
+an empty one and sync it (`sync <file>`) to count failed logins from zero. A
+file that cannot be read or written, or that is not a kerber-rust lockout
+file, is the same case: restore it, or put an empty file in its place and
+sync it. An empty file counts from zero. See
 [When the realm cannot open](#when-the-realm-cannot-open). A count already
-written survives a kill of the server process. A power cut is not tested and
-can lose the most recent counts. After an admin unlock, a failure in that
-same second can leave the count at 1 for one extra failure, as MIT does.
+written survives a kill of the server process. A power cut can lose the
+failed-login counts of about the last half minute, never the `lockout` file
+once it is on disk. After an admin unlock, a failure in that same second can
+leave the count at 1 for one extra failure, as MIT does.
 
 While the database is down, an administrative write is refused at once. The
 kadmin client reports "Unable to access Kerberos database". A kadmin read of
@@ -286,7 +297,8 @@ first 0.8.0 start; otherwise the migration is refused and the cause names both r
   realm does not open. The server comes up in the degraded state, and the
   cause says the stash is missing. Restore that file from the backup taken
   with the database. With the stash back, a missing `lockout` file is its own
-  cause: restore it, or create an empty one to count failed logins from zero.
+  cause: restore it, or create an empty one and sync it (`sync <file>`) to
+  count failed logins from zero.
   A file that cannot be read or written, or that is not a kerber-rust lockout
   file, is the same case. See
   [When the realm cannot open](#when-the-realm-cannot-open).

@@ -176,6 +176,11 @@ Next release. The KDC is kerber-rust inside the `lldap` process.
   acknowledged survives a power loss: in SQLite's rollback-journal mode, FULL can roll the
   last transaction back at the next start
   (https://www.sqlite.org/pragma.html#pragma_synchronous).
+- With the realm enabled, the server reads PostgreSQL's `fsync`, `full_page_writes` and
+  `synchronous_commit`, and MySQL's and MariaDB's `innodb_flush_log_at_trx_commit` and
+  `sync_binlog`, at start, and logs a `database durability` warning for an unsafe one. On
+  PostgreSQL with no warning, an acknowledged change survives a power loss too; MySQL and
+  MariaDB are not power-cut tested.
 
 ### Fixed
 

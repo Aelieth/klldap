@@ -18,11 +18,30 @@ EXTRA_CONTAINERS+=("$MIG_A")
 A="$D/branch-a"
 mkdir -p "$A/data" "$A/krb5kdc"
 cp server/tests/fixtures/krb5kdc/principal.dump server/tests/fixtures/krb5kdc/.k5.LIVEBOB.TEST "$A/krb5kdc/"
-docker run -d --name "$MIG_A" --network "$NET" \
-    -v "$A/data:/data" -v "$A/krb5kdc:$KDC" \
-    -e LLDAP_JWT_SECRET="$JWT_SECRET" -e LLDAP_KEY_SEED="$KEY_SEED" \
-    -e LLDAP_LDAP_BASE_DN="dc=livebob,dc=test" -e LLDAP_LDAP_USER_PASS="$ADMIN_PASS" \
-    "$GATE_IMAGE" >/dev/null || p_bad "could not start branch A's container"
+# As on an upgrade, the directory has livebob before the realm comes over: a first start without
+# Kerberos creates the user, and the second start imports the dump.
+mig_a_run() {
+    docker run -d --name "$MIG_A" --network "$NET" -p 127.0.0.1::17170 \
+        -v "$A/data:/data" -v "$A/krb5kdc:$KDC" \
+        -e LLDAP_JWT_SECRET="$JWT_SECRET" -e LLDAP_KEY_SEED="$KEY_SEED" \
+        -e LLDAP_LDAP_BASE_DN="dc=livebob,dc=test" -e LLDAP_LDAP_USER_PASS="$ADMIN_PASS" \
+        "$@" "$GATE_IMAGE" >/dev/null || p_bad "could not start branch A's container"
+}
+mig_a_run -e LLDAP_KERBEROS_OPTIONS__ENABLED=false
+for _ in $(seq 1 60); do
+    docker exec "$MIG_A" /app/lldap healthcheck --config-file /data/lldap_config.toml >/dev/null 2>&1 && break
+    sleep 1
+done
+a_http="$(docker port "$MIG_A" 17170/tcp | head -1 | sed 's/.*://')"
+if a_token="$(HTTP_PORT="$a_http" gate_login)" && HTTP_PORT="$a_http" TOKEN="$a_token" graphql \
+    'mutation($u: CreateUserInput!) { createUser(user: $u) { id } }' \
+    '{"u": {"id": "livebob", "email": "livebob@livebob.test"}}' >"$D/branch-a-user.json" 2>&1; then
+    p_ok "livebob is created in the directory before the import"
+else
+    p_bad "could not create livebob before the import (see branch-a-user.json)"
+fi
+docker rm -f "$MIG_A" >/dev/null 2>&1
+mig_a_run
 a_healthy=""
 for _ in $(seq 1 120); do
     if docker exec "$MIG_A" /app/lldap healthcheck --config-file /data/lldap_config.toml >/dev/null 2>&1; then
@@ -52,6 +71,11 @@ if [ -n "$a_healthy" ] && grep -q "Kerberos realm LIVEBOB.TEST serving" "$D/bran
         p_ok "mit-db2.bak/ holds the dump, mode 0700"
     else
         p_bad "mit-db2.bak/ is missing, not 0700, or without the dump"
+    fi
+    if docker exec "$MIG_A" sh -c "[ ! -e $KDC/principal ] && [ ! -e $KDC/principal.dump ] && [ -e $KDC/lockout ]"; then
+        p_ok "the realm went to the database: the realm directory keeps the stash and the lockout file"
+    else
+        p_bad "the realm directory still has a principal file or the dump, or no lockout file"
     fi
 else
     p_bad "the dump did not boot to a serving realm (see branch-a-docker.log)"

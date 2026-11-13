@@ -59,8 +59,9 @@ for _ in $(seq 1 90); do
 done
 docker logs "$ENV_CONTAINER" >"$D/oldcfg.log" 2>&1
 if [ -n "$healthy" ] && docker exec "$ENV_CONTAINER" sh -c \
-    '[ -s /var/kerberos/krb5kdc/principal ] && [ -s /data/kadm5.keytab ] && [ ! -e /app/krb5kdc ]'; then
-    p_ok "a config naming none of the paths: the realm is in /var/kerberos/krb5kdc, the keytab in /data"
+    '[ -n "$(ls -A /var/kerberos/krb5kdc/.k5.* 2>/dev/null)" ] && [ -e /var/kerberos/krb5kdc/lockout ] \
+        && [ ! -e /var/kerberos/krb5kdc/principal ] && [ -s /data/kadm5.keytab ] && [ ! -e /app/krb5kdc ]'; then
+    p_ok "a config naming none of the paths: the stash and the lockout file are in /var/kerberos/krb5kdc, the keytab in /data"
 else
     p_bad "a config naming none of the paths did not keep them (see oldcfg.log)"
 fi

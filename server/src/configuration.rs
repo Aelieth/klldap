@@ -27,7 +27,6 @@ use lldap_sql_backend_handler::sql_tables::{
 use secstr::SecUtf8;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use url::Url;
 
@@ -121,20 +120,20 @@ pub struct KerberosOptions {
     pub forwardable: bool,
     #[builder(default = r#"vec![String::from("aes256-cts-hmac-sha1-96")]"#)]
     pub supported_enctypes: Vec<String>,
-    #[builder(default = "IpAddr::from([0, 0, 0, 0])")]
-    pub kdc_bind: IpAddr,
+    #[builder(default = r#"String::from("0.0.0.0")"#)]
+    pub kdc_host: String,
     #[builder(default = "1088")]
     pub kdc_port: u16,
-    #[builder(default = "SocketAddr::from(([127, 0, 0, 1], 1749))")]
-    pub kadmin_bind: SocketAddr,
+    #[builder(default = r#"String::from("127.0.0.1")"#)]
+    pub kadmin_host: String,
+    #[builder(default = "1749")]
+    pub kadmin_port: u16,
     #[builder(default)]
-    pub kadmin_acl_file: Option<PathBuf>,
+    pub kadmin_acl: Option<PathBuf>,
     #[builder(default = r#"PathBuf::from("krb5kdc")"#)]
     pub data_dir: PathBuf,
     #[builder(default = r#"PathBuf::from("kadm5.keytab")"#)]
     pub admin_keytab: PathBuf,
-    #[builder(default = r#"PathBuf::from("keytab/keycloak-http.keytab")"#)]
-    pub keycloak_keytab: PathBuf,
     #[builder(default = r#"PathBuf::from("krb5.conf")"#)]
     pub client_config: PathBuf,
 }
@@ -150,6 +149,8 @@ impl std::default::Default for KerberosOptions {
 pub struct KeycloakOptions {
     #[builder(default = r#"PathBuf::from("keycloak_config.toml")"#)]
     pub config_file: PathBuf,
+    #[builder(default = r#"PathBuf::from("keytab/keycloak-http.keytab")"#)]
+    pub keytab: PathBuf,
     #[builder(default)]
     pub admin_pass: Option<SecUtf8>,
 }
@@ -161,7 +162,12 @@ impl std::default::Default for KeycloakOptions {
 }
 
 impl KerberosOptions {
-    fn realm_settings(&self, realm: String, domain: String) -> Result<RealmSettings> {
+    fn realm_settings(
+        &self,
+        realm: String,
+        domain: String,
+        keycloak_keytab: PathBuf,
+    ) -> Result<RealmSettings> {
         Ok(RealmSettings {
             realm,
             domain,
@@ -171,13 +177,14 @@ impl KerberosOptions {
             forwardable: self.forwardable,
             supported_enctypes: parse_enctypes(&self.supported_enctypes)
                 .context("while reading kerberos_options.supported_enctypes")?,
-            kdc_bind: self.kdc_bind,
+            kdc_host: self.kdc_host.clone(),
             kdc_port: self.kdc_port,
-            kadmin_bind: self.kadmin_bind,
-            kadmin_acl_file: self.kadmin_acl_file.clone(),
+            kadmin_host: self.kadmin_host.clone(),
+            kadmin_port: self.kadmin_port,
+            kadmin_acl: self.kadmin_acl.clone(),
             data_dir: self.data_dir.clone(),
             admin_keytab: self.admin_keytab.clone(),
-            keycloak_keytab: self.keycloak_keytab.clone(),
+            keycloak_keytab,
             client_config: self.client_config.clone(),
         })
     }
@@ -327,6 +334,7 @@ impl Configuration {
         self.kerberos_options.realm_settings(
             self.kerberos_realm(),
             domain_from_base_dn(&self.ldap_base_dn),
+            self.keycloak_options.keytab.clone(),
         )
     }
 
@@ -847,7 +855,7 @@ where
         overrides.general_config().config_file
     );
 
-    let ignore_keys = ["key_file", "cert_file", "config_file", "kadmin_acl_file"];
+    let ignore_keys = ["key_file", "cert_file", "config_file"];
     let env_variable_provider =
         || FileAdapter::wrap(Env::prefixed("LLDAP_").split("__")).ignore(&ignore_keys);
     let figment_config = Figment::from(Serialized::defaults(
@@ -988,7 +996,7 @@ mod tests {
             jail.clear_env();
             jail.set_env("LLDAP_KEY_SEED", "a123");
             jail.set_env("LLDAP_JWT_SECRET", "secret");
-            let ignore_keys = ["key_file", "cert_file", "config_file", "kadmin_acl_file"];
+            let ignore_keys = ["key_file", "cert_file", "config_file"];
             let figment_config = Figment::from(Serialized::defaults(
                 ConfigurationBuilder::default()
                     .key_seed(Some(SecUtf8::from(FIGMENT_DUMMY_KEY_SEED)))
@@ -1174,7 +1182,7 @@ mod tests {
             ),
             (
                 &[(
-                    "LLDAP_KERBEROS_OPTIONS__KADMIN_ACL_FILE",
+                    "LLDAP_KERBEROS_OPTIONS__KADMIN_ACL",
                     "/etc/klldap/kadm5.acl",
                 )],
                 Ok((false, "EXAMPLE.COM", "24h", Some("/etc/klldap/kadm5.acl"))),
@@ -1229,7 +1237,7 @@ mod tests {
                         options.enabled,
                         config.kerberos_realm(),
                         options.ticket_lifetime.clone(),
-                        options.kadmin_acl_file.clone(),
+                        options.kadmin_acl.clone(),
                     )
                 });
                 match (loaded, expected) {
@@ -1407,6 +1415,88 @@ mod tests {
             );
             Ok(())
         });
+    }
+
+    #[test]
+    fn test_renamed_kerberos_settings() {
+        type Read = fn(&Configuration) -> String;
+        let rows: [(&str, &str, &str, &str, &str, Read); 5] = [
+            (
+                "kerberos_options",
+                "kdc_host",
+                "0.0.0.0",
+                "kdc.example",
+                "LLDAP_KERBEROS_OPTIONS__KDC_HOST",
+                |c| c.kerberos_options.kdc_host.clone(),
+            ),
+            (
+                "kerberos_options",
+                "kadmin_host",
+                "127.0.0.1",
+                "10.0.0.1",
+                "LLDAP_KERBEROS_OPTIONS__KADMIN_HOST",
+                |c| c.kerberos_options.kadmin_host.clone(),
+            ),
+            (
+                "kerberos_options",
+                "kadmin_port",
+                "1749",
+                "1750",
+                "LLDAP_KERBEROS_OPTIONS__KADMIN_PORT",
+                |c| c.kerberos_options.kadmin_port.to_string(),
+            ),
+            (
+                "kerberos_options",
+                "kadmin_acl",
+                "",
+                "/etc/klldap/kadm5.acl",
+                "LLDAP_KERBEROS_OPTIONS__KADMIN_ACL",
+                |c| {
+                    c.kerberos_options
+                        .kadmin_acl
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                },
+            ),
+            (
+                "keycloak_options",
+                "keytab",
+                "keytab/keycloak-http.keytab",
+                "/data/kc.keytab",
+                "LLDAP_KEYCLOAK_OPTIONS__KEYTAB",
+                |c| c.keycloak_options.keytab.display().to_string(),
+            ),
+        ];
+        for (section, key, default, value, env, read) in rows {
+            let toml = if key == "kadmin_port" {
+                value.to_owned()
+            } else {
+                format!("\"{value}\"")
+            };
+            Jail::expect_with(|jail| {
+                jail.clear_env();
+                jail.set_env("LLDAP_JWT_SECRET", "secret");
+                assert_eq!(
+                    read(&init(default_run_opts()).unwrap()),
+                    default,
+                    "{key} default"
+                );
+                jail.create_file(
+                    "lldap_config.toml",
+                    &format!("[{section}]\n{key} = {toml}\n"),
+                )?;
+                assert_eq!(
+                    read(&init(default_run_opts()).unwrap()),
+                    value,
+                    "{key} in TOML"
+                );
+                jail.create_file("lldap_config.toml", "")?;
+                jail.set_env(env, value);
+                assert_eq!(read(&init(default_run_opts()).unwrap()), value, "{env}");
+                Ok(())
+            });
+        }
     }
 
     #[test]

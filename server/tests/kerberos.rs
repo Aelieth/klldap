@@ -168,25 +168,26 @@ fn start_realm_seeded(
     let client_config = realm_dir.path().join("krb5.conf");
     let ccache = realm_dir.path().join("cc");
     let kdc_port_s = kdc_port.to_string();
-    let kadmin_bind = format!("127.0.0.1:{kadmin_port}");
+    let kadmin_port_s = kadmin_port.to_string();
     let data_dir_s = data_dir.display().to_string();
     let admin_keytab_s = admin_keytab.display().to_string();
     let keycloak_keytab_s = keycloak_keytab.display().to_string();
     let client_config_s = client_config.display().to_string();
     let mut env = vec![
         ("LLDAP_KERBEROS_OPTIONS__ENABLED", "true"),
-        ("LLDAP_KERBEROS_OPTIONS__KDC_BIND", "127.0.0.1"),
+        ("LLDAP_KERBEROS_OPTIONS__KDC_HOST", "127.0.0.1"),
         ("LLDAP_KERBEROS_OPTIONS__KDC_PORT", kdc_port_s.as_str()),
-        ("LLDAP_KERBEROS_OPTIONS__KADMIN_BIND", kadmin_bind.as_str()),
+        ("LLDAP_KERBEROS_OPTIONS__KADMIN_HOST", "127.0.0.1"),
+        (
+            "LLDAP_KERBEROS_OPTIONS__KADMIN_PORT",
+            kadmin_port_s.as_str(),
+        ),
         ("LLDAP_KERBEROS_OPTIONS__DATA_DIR", data_dir_s.as_str()),
         (
             "LLDAP_KERBEROS_OPTIONS__ADMIN_KEYTAB",
             admin_keytab_s.as_str(),
         ),
-        (
-            "LLDAP_KERBEROS_OPTIONS__KEYCLOAK_KEYTAB",
-            keycloak_keytab_s.as_str(),
-        ),
+        ("LLDAP_KEYCLOAK_OPTIONS__KEYTAB", keycloak_keytab_s.as_str()),
         (
             "LLDAP_KERBEROS_OPTIONS__CLIENT_CONFIG",
             client_config_s.as_str(),

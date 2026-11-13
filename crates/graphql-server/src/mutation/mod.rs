@@ -159,6 +159,16 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             .await
         {
             warn!("Kerberos sync failed after password set: {e}");
+            if sync_enabled
+                && groups
+                    .iter()
+                    .any(|g| g.display_name == "lldap_disabled".into())
+            {
+                kerberos_backend().reassert_disabled(&target_user_id).await;
+            }
+            return Err(
+                anyhow!("Kerberos sync failed after the directory password was set: {e}").into(),
+            );
         } else if sync_enabled {
             info!("Kerberos principal synced for user {target_user_id}");
         }
@@ -824,6 +834,7 @@ mod tests {
         AttributeValue as DomainAttributeValue, Cardinality, Group, GroupDetails, GroupId,
         GroupName, User, UserAndGroups, Uuid,
     };
+    use lldap_domain_handlers::kerberos::{NoopKerberos, set_kerberos_backend};
     use lldap_domain_handlers::mfa::MfaPolicy;
     use lldap_schema::{AttributeList, PublicSchema, Schema, schema::PosixSettings};
     use lldap_test_utils::MockTestBackendHandler;
@@ -1671,6 +1682,74 @@ mod tests {
                 password: "s3cret".into(),
             }]
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_set_user_password_reports_a_failed_kerberos_sync() {
+        use lldap_auth::{opaque, registration};
+        set_kerberos_backend(Arc::new(NoopKerberos::default()));
+        let mut rng = rand::rngs::OsRng;
+        let registration_start_request =
+            opaque::client::registration::start_registration(b"s3cret", &mut rng).unwrap();
+        let request = registration::ClientRegistrationStartRequest {
+            username: "alice".into(),
+            registration_start_request: registration_start_request.message,
+        };
+        let start_response = opaque::server::registration::start_registration(
+            &opaque::server::ServerSetup::new(&mut rng),
+            request.registration_start_request,
+            &request.username,
+        )
+        .unwrap();
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_registration_start()
+            .times(1)
+            .return_once(move |_| {
+                Ok(registration::ServerRegistrationStartResponse {
+                    server_data: String::new(),
+                    registration_response: start_response.message,
+                })
+            });
+        mock.expect_registration_finish()
+            .times(1)
+            .return_once(|_| Ok(UserId::new("alice")));
+        mock.expect_get_user_details()
+            .with(eq(UserId::new("alice")))
+            .returning(|uid| {
+                Ok(sample_user(
+                    uid.as_str(),
+                    vec![DomainAttr {
+                        name: "kerberossync".into(),
+                        value: 1i64.into(),
+                    }],
+                ))
+            });
+        mock.expect_get_user_groups()
+            .with(eq(UserId::new("alice")))
+            .returning(|_| Ok(std::collections::HashSet::new()));
+        let context = admin_context(mock);
+        let variables = Variables::from([
+            ("id".to_string(), InputValue::scalar("Alice")),
+            ("password".to_string(), InputValue::scalar("s3cret")),
+        ]);
+        let (value, errors) = execute(
+            r#"mutation($id: String!, $password: String!) { setUserPassword(userId: $id, password: $password) { ok } }"#,
+            None,
+            &root_schema(),
+            &variables,
+            &context,
+        )
+        .await
+        .unwrap();
+        assert!(
+            errors.iter().any(|e| {
+                e.error().message()
+                    == "Kerberos sync failed after the directory password was set: Kerberos backend not registered"
+            }),
+            "{value:?} {errors:?}"
+        );
+        assert_ne!(value, graphql_value!({"setUserPassword": {"ok": true}}));
     }
 
     #[tokio::test]

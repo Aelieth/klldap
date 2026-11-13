@@ -29,7 +29,11 @@ pub enum KerberosLost {
 impl std::fmt::Display for KerberosLost {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Replaced => write!(f, "replaced by another server"),
+            Self::Replaced => write!(
+                f,
+                "the realm's generation moved: another server took the realm, or this server's \
+                 last commit was answered too late"
+            ),
             Self::DatabaseUnreachable => {
                 write!(f, "the database unreachable for twenty seconds")
             }
@@ -77,6 +81,7 @@ pub struct KerberosCommitterHandle {
     tx: mpsc::Sender<Job>,
     task: tokio::task::JoinHandle<()>,
     lost: watch::Receiver<Option<KerberosLost>>,
+    registered: bool,
 }
 
 impl KerberosCommitterHandle {
@@ -84,8 +89,16 @@ impl KerberosCommitterHandle {
         self.lost.clone()
     }
 
+    pub fn store(&self) -> Arc<dyn KerberosStore> {
+        Arc::new(CommitterStore {
+            tx: self.tx.clone(),
+        })
+    }
+
     pub async fn shutdown(self) {
-        set_kerberos_store(Arc::new(NoopKerberosStore));
+        if self.registered {
+            set_kerberos_store(Arc::new(NoopKerberosStore));
+        }
         let (tx, rx) = oneshot::channel();
         let _ = self.tx.send(Job::Shutdown(tx)).await;
         let _ = rx.await;
@@ -104,6 +117,19 @@ pub fn start_kerberos_committer(pool: DbConnection) -> KerberosCommitterHandle {
     start_kerberos_committer_for(pool, HEARTBEAT, LOST_AFTER, WATCH, STEP)
 }
 
+/// A committer whose store is not the process's, for kerber-rust's conformance suite.
+pub fn start_unregistered_committer(pool: DbConnection) -> KerberosCommitterHandle {
+    spawn_committer(
+        pool,
+        Timings {
+            heartbeat: HEARTBEAT,
+            lost_after: LOST_AFTER,
+            watch: WATCH,
+            step: STEP,
+        },
+    )
+}
+
 pub(crate) fn start_kerberos_committer_for(
     pool: DbConnection,
     heartbeat: Duration,
@@ -111,21 +137,30 @@ pub(crate) fn start_kerberos_committer_for(
     watch: Duration,
     step: Duration,
 ) -> KerberosCommitterHandle {
-    let (tx, rx) = mpsc::channel(QUEUE);
-    let (lost_tx, lost) = watch::channel(None);
-    let task = tokio::spawn(run(
-        rx,
+    let mut handle = spawn_committer(
         pool,
-        lost_tx,
         Timings {
             heartbeat,
             lost_after,
             watch,
             step,
         },
-    ));
-    set_kerberos_store(Arc::new(CommitterStore { tx: tx.clone() }));
-    KerberosCommitterHandle { tx, task, lost }
+    );
+    set_kerberos_store(handle.store());
+    handle.registered = true;
+    handle
+}
+
+fn spawn_committer(pool: DbConnection, timings: Timings) -> KerberosCommitterHandle {
+    let (tx, rx) = mpsc::channel(QUEUE);
+    let (lost_tx, lost) = watch::channel(None);
+    let task = tokio::spawn(run(rx, pool, lost_tx, timings));
+    KerberosCommitterHandle {
+        tx,
+        task,
+        lost,
+        registered: false,
+    }
 }
 
 struct Held {
@@ -1101,7 +1136,7 @@ mod tests {
         assert_eq!(heartbeat(&txn, 5).await.unwrap(), 6);
         txn.commit().await.unwrap();
         let err = wait_thread(rx).await.unwrap().unwrap_err();
-        assert!(err.contains("replaced"), "{err}");
+        assert!(err.contains("generation moved"), "{err}");
         assert_eq!(hold(&db.other).await, (6, true));
         handle.shutdown().await;
     }

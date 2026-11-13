@@ -3,7 +3,7 @@ use lldap_domain_handlers::kerberos::{
     LoadedPrincipal, LoadedRealm, PolicyRow, PrincipalRow, RealmBatch, RealmState,
     user_id_for_principal_name,
 };
-use sea_orm::sea_query::{Alias, Expr, OnConflict, Order, Query, Value};
+use sea_orm::sea_query::{Alias, Expr, OnConflict, Query, Value};
 use sea_orm::{ConnectionTrait, DatabaseTransaction, DbErr, FromQueryResult};
 
 #[derive(Debug)]
@@ -50,14 +50,14 @@ struct StoredPolicy {
     record: Vec<u8>,
 }
 
+/// Rows come sorted by the bytes of their names, the same on every database.
 pub async fn load_realm(db: &impl ConnectionTrait) -> Result<(LoadedRealm, i64), KerberosSqlError> {
     let backend = db.get_database_backend();
     let principals = StoredPrincipal::find_by_statement(
         backend.build(
             Query::select()
                 .columns([KerberosPrincipals::Name, KerberosPrincipals::Record])
-                .from(KerberosPrincipals::Table)
-                .order_by(KerberosPrincipals::Name, Order::Asc),
+                .from(KerberosPrincipals::Table),
         ),
     )
     .all(db)
@@ -67,8 +67,7 @@ pub async fn load_realm(db: &impl ConnectionTrait) -> Result<(LoadedRealm, i64),
         backend.build(
             Query::select()
                 .columns([KerberosPolicies::Name, KerberosPolicies::Record])
-                .from(KerberosPolicies::Table)
-                .order_by(KerberosPolicies::Name, Order::Asc),
+                .from(KerberosPolicies::Table),
         ),
     )
     .all(db)
@@ -90,22 +89,26 @@ pub async fn load_realm(db: &impl ConnectionTrait) -> Result<(LoadedRealm, i64),
     .await
     .map_err(failed)?;
     let generation = realm.as_ref().map(|row| row.generation).unwrap_or(0);
+    let mut principals: Vec<LoadedPrincipal> = principals
+        .into_iter()
+        .map(|row| LoadedPrincipal {
+            name: row.name,
+            record: row.record,
+        })
+        .collect();
+    principals.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut policies: Vec<PolicyRow> = policies
+        .into_iter()
+        .map(|row| PolicyRow {
+            name: row.name,
+            record: row.record,
+        })
+        .collect();
+    policies.sort_by(|a, b| a.name.cmp(&b.name));
     Ok((
         LoadedRealm {
-            principals: principals
-                .into_iter()
-                .map(|row| LoadedPrincipal {
-                    name: row.name,
-                    record: row.record,
-                })
-                .collect(),
-            policies: policies
-                .into_iter()
-                .map(|row| PolicyRow {
-                    name: row.name,
-                    record: row.record,
-                })
-                .collect(),
+            principals,
+            policies,
             realm: realm.map(|row| RealmState {
                 realm: row.realm,
                 state: row.state,

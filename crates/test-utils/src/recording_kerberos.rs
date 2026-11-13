@@ -17,12 +17,22 @@ pub enum KerberosOp {
 
 pub struct RecordingKerberos {
     ops: Mutex<Vec<KerberosOp>>,
+    sync_error: Option<String>,
 }
 
 impl RecordingKerberos {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
             ops: Mutex::new(Vec::new()),
+            sync_error: None,
+        })
+    }
+
+    // Records each sync and refuses it with `cause`, as a KDC refusal would.
+    pub fn failing(cause: &str) -> Arc<Self> {
+        Arc::new(Self {
+            ops: Mutex::new(Vec::new()),
+            sync_error: Some(cause.to_owned()),
         })
     }
 
@@ -44,7 +54,7 @@ impl KerberosSync for RecordingKerberos {
                 username: user.as_str().to_owned(),
                 password: password.to_owned(),
             });
-        Ok(())
+        self.sync_error.clone().map_or(Ok(()), Err)
     }
     async fn delete_principal(&self, user: &UserId) -> Result<(), String> {
         self.ops
@@ -80,6 +90,12 @@ pub struct RecordingGuard {
 impl RecordingGuard {
     pub fn install() -> Self {
         let rec = RecordingKerberos::new();
+        set_kerberos_backend(rec.clone());
+        Self { rec }
+    }
+
+    pub fn install_failing(cause: &str) -> Self {
+        let rec = RecordingKerberos::failing(cause);
         set_kerberos_backend(rec.clone());
         Self { rec }
     }

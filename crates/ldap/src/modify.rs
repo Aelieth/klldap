@@ -411,7 +411,7 @@ mod tests {
         setup_bound_admin_handler, setup_bound_handler_with_group,
         setup_bound_password_manager_handler,
     };
-    use crate::password::tests::expect_password_change;
+    use crate::password::tests::{expect_password_change, expect_password_registration};
     use ldap3_proto::proto::LdapResult as LdapResultOp;
     use lldap_domain::types::{GroupDetails, GroupId, User, UserId};
     use lldap_domain_model::error::DomainError;
@@ -1097,13 +1097,24 @@ mod tests {
     #[serial]
     async fn test_modify_password_kerberos_matrix() {
         use mockall::predicate::eq;
-        let guard = RecordingGuard::install();
         let cases = [
-            ("sync enabled", true, false),
-            ("sync disabled", false, false),
-            ("born disabled reasserts and succeeds", true, true),
+            ("sync enabled", true, false, false),
+            ("sync disabled", false, false, false),
+            ("born disabled reasserts and succeeds", true, true, false),
+            ("sync fails: success, no record", true, false, true),
+            (
+                "born disabled, sync fails: reasserts, no record",
+                true,
+                true,
+                true,
+            ),
         ];
-        for (label, synced, disabled) in cases {
+        for (label, synced, disabled, fails) in cases {
+            let guard = if fails {
+                RecordingGuard::install_failing("password policy: min_length 40")
+            } else {
+                RecordingGuard::install()
+            };
             let mut mock = MockTestBackendHandler::new();
             if synced {
                 mock.expect_get_user_details()
@@ -1116,7 +1127,12 @@ mod tests {
                     .returning(|_| Ok(lldap_disabled_membership()));
             }
             setup_default_ldap_mock(&mut mock);
-            expect_password_change(&mut mock, "bob");
+            if fails {
+                expect_password_registration(&mut mock, "bob");
+                mock.expect_ensure_kerberos_principal_consistency().times(0);
+            } else {
+                expect_password_change(&mut mock, "bob");
+            }
             let ldap_handler = setup_bound_admin_handler(mock).await;
             assert_eq!(
                 ldap_handler

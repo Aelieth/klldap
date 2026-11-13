@@ -490,47 +490,72 @@ pub mod tests {
     #[serial]
     async fn test_password_modify_keeps_success_when_kerberos_sync_fails() {
         use lldap_domain::types::{Attribute, User};
-        use lldap_domain_handlers::kerberos::{NoopKerberos, set_kerberos_backend};
-        use std::sync::Arc;
+        use lldap_test_utils::recording_kerberos::{KerberosOp, RecordingGuard};
 
-        set_kerberos_backend(Arc::new(NoopKerberos::default()));
-        let mut mock = MockTestBackendHandler::new();
-        mock.expect_get_user_details().returning(|uid| {
-            Ok(User {
-                user_id: uid.clone(),
-                email: format!("{}@example.com", uid.as_str()).into(),
-                display_name: None,
-                creation_date: chrono::Utc::now().naive_utc(),
-                modified_date: chrono::Utc::now().naive_utc(),
-                password_modified_date: chrono::Utc::now().naive_utc(),
-                uuid: Uuid::from_name_and_date(uid.as_str(), &chrono::Utc::now().naive_utc()),
-                attributes: vec![Attribute {
-                    name: "kerberossync".into(),
-                    value: 1i64.into(),
-                }],
-                krb_principal_name: None,
-                mfa_type: None,
-            })
-        });
-        setup_default_ldap_mock(&mut mock);
-        expect_password_registration(&mut mock, "bob");
-        mock.expect_ensure_kerberos_principal_consistency().times(0);
-        let mut ldap_handler = setup_bound_admin_handler(mock).await;
-        let request = LdapOp::ExtendedRequest(
-            LdapPasswordModifyRequest {
-                user_identity: Some("uid=bob,ou=people,dc=example,dc=com".to_string()),
-                old_password: None,
-                new_password: Some("newpassword".to_string()),
-            }
-            .into(),
-        );
-        assert_eq!(
-            ldap_handler.handle_ldap_message(request).await,
-            Some(vec![make_extended_response(
-                LdapResultCode::Success,
-                "".to_string(),
-            )])
-        );
+        let disabled = HashSet::from([GroupDetails {
+            group_id: GroupId(2),
+            display_name: "lldap_disabled".into(),
+            creation_date: chrono::Utc::now().naive_utc(),
+            modified_date: chrono::Utc::now().naive_utc(),
+            uuid: Uuid::from_name_and_date("lldap_disabled", &chrono::Utc::now().naive_utc()),
+            attributes: vec![],
+        }]);
+        let sync = KerberosOp::SyncPrincipal {
+            username: "bob".into(),
+            password: "newpassword".into(),
+        };
+        let disable = KerberosOp::SetEnabled {
+            username: "bob".into(),
+            enabled: false,
+        };
+        let rows = [
+            ("in no group", HashSet::new(), vec![sync.clone()]),
+            ("in lldap_disabled", disabled, vec![sync, disable]),
+        ];
+        for (label, groups, expected_ops) in rows {
+            let guard = RecordingGuard::install_failing("password policy: min_length 40");
+            let mut mock = MockTestBackendHandler::new();
+            mock.expect_get_user_details().returning(|uid| {
+                Ok(User {
+                    user_id: uid.clone(),
+                    email: format!("{}@example.com", uid.as_str()).into(),
+                    display_name: None,
+                    creation_date: chrono::Utc::now().naive_utc(),
+                    modified_date: chrono::Utc::now().naive_utc(),
+                    password_modified_date: chrono::Utc::now().naive_utc(),
+                    uuid: Uuid::from_name_and_date(uid.as_str(), &chrono::Utc::now().naive_utc()),
+                    attributes: vec![Attribute {
+                        name: "kerberossync".into(),
+                        value: 1i64.into(),
+                    }],
+                    krb_principal_name: None,
+                    mfa_type: None,
+                })
+            });
+            mock.expect_get_user_groups()
+                .returning(move |_| Ok(groups.clone()));
+            setup_default_ldap_mock(&mut mock);
+            expect_password_registration(&mut mock, "bob");
+            mock.expect_ensure_kerberos_principal_consistency().times(0);
+            let mut ldap_handler = setup_bound_admin_handler(mock).await;
+            let request = LdapOp::ExtendedRequest(
+                LdapPasswordModifyRequest {
+                    user_identity: Some("uid=bob,ou=people,dc=example,dc=com".to_string()),
+                    old_password: None,
+                    new_password: Some("newpassword".to_string()),
+                }
+                .into(),
+            );
+            assert_eq!(
+                ldap_handler.handle_ldap_message(request).await,
+                Some(vec![make_extended_response(
+                    LdapResultCode::Success,
+                    "".to_string(),
+                )]),
+                "{label}"
+            );
+            assert_eq!(guard.recorder().take_ops(), expected_ops, "{label}");
+        }
     }
 
     #[tokio::test]

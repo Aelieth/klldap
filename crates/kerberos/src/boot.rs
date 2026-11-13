@@ -1,7 +1,8 @@
 use crate::policy::LiveClients;
-use anyhow::{Context, Result, bail};
+use crate::rotate;
+use anyhow::{Context, Result, anyhow, bail};
 use krb5_config::{KdcConf, KdcPaths, Krb5Conf, ProfileSet, listen::ListenAddr};
-use krb5_crypto::{EncryptionType, parse_enctype_list};
+use krb5_crypto::EncryptionType;
 use krb5_kdc::{Acl, AdminSpec, PrincipalStore, SharedDump};
 use krb5_types::PrincipalName;
 use minijinja::{Environment, context};
@@ -22,7 +23,6 @@ pub struct RealmSettings {
     pub domain: String,
     pub ticket_lifetime: u64,
     pub renew_lifetime: u64,
-    pub max_renewable_life: u64,
     pub forwardable: bool,
     pub supported_enctypes: Vec<EncryptionType>,
     pub kdc_host: String,
@@ -37,27 +37,32 @@ pub struct RealmSettings {
 }
 
 const DEPRECATED: [EncryptionType; 2] = [EncryptionType::Des3CbcSha1, EncryptionType::Rc4Hmac];
-const ENCTYPE_FAMILIES: [&str; 5] = ["default", "aes", "camellia", "des3", "rc4"];
 
-/// MIT's enctype list syntax. Refuses unknown names, 3DES and RC4 (RFC 8429), and Camellia.
+/// One MIT type name per item. Refuses anything else, 3DES and RC4 (RFC 8429), and Camellia.
 pub fn parse_enctypes(names: &[String]) -> Result<Vec<EncryptionType>> {
-    let list = names.join(" ");
-    for token in list.split(|c: char| c.is_ascii_whitespace() || c == ',') {
-        let name = token.trim_start_matches(['+', '-']);
-        let known = name.is_empty()
-            || ENCTYPE_FAMILIES.contains(&name.to_ascii_lowercase().as_str())
-            || EncryptionType::from_mit_name(name).is_ok();
-        if !known {
-            bail!("{token:?} is not an encryption type this realm supports");
+    let mut etypes = Vec::new();
+    for name in names {
+        let etype = EncryptionType::from_mit_name(name).map_err(|_| {
+            anyhow!(
+                "{name:?} is not an encryption type name; list one name per item, \
+                 such as \"aes256-cts-hmac-sha1-96\""
+            )
+        })?;
+        if DEPRECATED.contains(&etype) {
+            bail!(
+                "{} is deprecated (RFC 8429) and refused",
+                etype.to_mit_name()
+            );
+        }
+        if etype.is_weak() {
+            bail!("{} is not served by this KDC", etype.to_mit_name());
+        }
+        if !etypes.contains(&etype) {
+            etypes.push(etype);
         }
     }
-    let etypes = parse_enctype_list(&list, false)
-        .with_context(|| format!("no supported encryption type in {names:?}"))?;
-    if let Some(old) = etypes.iter().find(|etype| DEPRECATED.contains(etype)) {
-        bail!("{} is deprecated (RFC 8429) and refused", old.to_mit_name());
-    }
-    if let Some(weak) = etypes.iter().find(|etype| etype.is_weak()) {
-        bail!("{} is not served by this KDC", weak.to_mit_name());
+    if etypes.is_empty() {
+        bail!("no encryption type is listed");
     }
     Ok(etypes)
 }
@@ -77,6 +82,7 @@ pub(crate) fn open(settings: &RealmSettings) -> Result<OpenRealm> {
     }
     let profile = profile(settings);
     let mut store = open_store(settings, &profile)?;
+    rotate_keys(&mut store, settings)?;
     store
         .policy
         .plugins
@@ -122,6 +128,29 @@ pub fn with_port_hint(e: io::Error, port: u16) -> anyhow::Error {
     } else {
         e
     }
+}
+
+// A new first type rolls the service keys; the old keys go once no ticket can need them.
+pub(crate) fn rotate_keys(store: &mut PrincipalStore, settings: &RealmSettings) -> Result<()> {
+    let (realm, etypes) = (&settings.realm, &settings.supported_enctypes);
+    let actor = format!("admin/admin@{realm}");
+    let grace = settings.ticket_lifetime + settings.renew_lifetime;
+    let due = rotate::roll_due(store, realm, etypes)
+        .map_err(|e| anyhow!("while reading krbtgt/{realm}: {e}"))?;
+    if due {
+        rotate::roll(store, realm, etypes, &actor)
+            .map_err(|e| anyhow!("while rolling the keys of krbtgt/{realm}: {e}"))?;
+        let names: Vec<&str> = etypes.iter().map(|etype| etype.to_mit_name()).collect();
+        info!(
+            "🎟️ Rolled the keys of krbtgt/{realm}, kadmin/admin and kadmin/changepw to {}; \
+             the old keys stay for {grace} s",
+            names.join(" ")
+        );
+    }
+    if let Err(e) = rotate::purge_old_keys(store, realm, grace, rotate::unix_now(), &actor) {
+        warn!("Old Kerberos keys were not purged, the next hour tries again: {e}");
+    }
+    Ok(())
 }
 
 /// Opens the realm's database, creating it on first boot, and writes the admin keytab.
@@ -175,8 +204,8 @@ pub(crate) fn profile(settings: &RealmSettings) -> ProfileSet {
         kdc_listen: settings.kdc_port.to_string(),
         kdc_tcp_listen: Some(settings.kdc_port.to_string()),
         max_life: settings.ticket_lifetime,
-        max_renewable_life: settings.max_renewable_life,
-        realm_max_renewable_life: settings.max_renewable_life,
+        max_renewable_life: settings.renew_lifetime,
+        realm_max_renewable_life: settings.renew_lifetime,
         supported_enctypes: enctypes.iter().map(|e| format!("{e}:normal")).collect(),
         permitted_enctypes: Some(enctypes),
         master_key_type: Some(MASTER_KEY_TYPE.to_owned()),
@@ -198,6 +227,11 @@ fn acl(realm: &str, extra: Option<&Path>) -> Result<Acl> {
 }
 
 fn write_client_config(settings: &RealmSettings) -> Result<()> {
+    let enctypes: Vec<&str> = settings
+        .supported_enctypes
+        .iter()
+        .map(|etype| etype.to_mit_name())
+        .collect();
     let rendered = Environment::new()
         .template_from_str(CLIENT_CONFIG_TEMPLATE)
         .and_then(|template| {
@@ -207,6 +241,7 @@ fn write_client_config(settings: &RealmSettings) -> Result<()> {
                 TICKET_LIFETIME => format!("{}s", settings.ticket_lifetime),
                 RENEW_LIFETIME => format!("{}s", settings.renew_lifetime),
                 FORWARDABLE => settings.forwardable,
+                ENCTYPES => enctypes.join(" "),
                 RDNS => false,
                 KDC => client_address(&settings.kdc_host, settings.kdc_port),
                 ADMIN_SERVER => client_address(&settings.kadmin_host, settings.kadmin_port),
@@ -250,7 +285,7 @@ fn secure_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn client_address(host: &str, port: u16) -> String {
+pub fn client_address(host: &str, port: u16) -> String {
     match host.parse::<IpAddr>() {
         Ok(ip) => SocketAddr::new(loopback_for(ip), port).to_string(),
         Err(_) => format!("{host}:{port}"),
@@ -282,58 +317,52 @@ mod tests {
 
     #[test]
     fn test_parse_enctypes() {
-        let rows = [
+        type Row<'a> = (&'a [&'a str], Result<Vec<EncryptionType>, &'a str>);
+        let rows: [Row; 15] = [
             (
-                "aes256-cts-hmac-sha1-96",
+                &["aes256-cts-hmac-sha1-96"],
                 Ok(vec![EncryptionType::Aes256CtsHmacSha196]),
             ),
             (
-                "aes256-cts aes128-sha1",
+                &["aes256-cts", "aes128-sha1", "aes256-cts-hmac-sha1-96"],
                 Ok(vec![
                     EncryptionType::Aes256CtsHmacSha196,
                     EncryptionType::Aes128CtsHmacSha196,
                 ]),
             ),
-            ("aes256-cts no-such-type", Err("not an encryption type")),
-            ("des-cbc-crc", Err("not an encryption type")),
-            ("des3-cbc-sha1", Err("des3-cbc-sha1 is deprecated")),
-            ("des3-cbc-sha1-kd", Err("des3-cbc-sha1 is deprecated")),
-            ("des3-hmac-sha1", Err("des3-cbc-sha1 is deprecated")),
-            ("des3", Err("des3-cbc-sha1 is deprecated")),
-            ("arcfour-hmac", Err("arcfour-hmac is deprecated")),
-            ("rc4-hmac", Err("arcfour-hmac is deprecated")),
-            ("arcfour-hmac-md5", Err("arcfour-hmac is deprecated")),
-            ("rc4", Err("arcfour-hmac is deprecated")),
+            (&[], Err("no encryption type is listed")),
             (
-                "camellia256-cts-cmac",
+                &["aes256-cts aes128-sha1"],
+                Err("not an encryption type name"),
+            ),
+            (
+                &["aes256-cts,aes128-sha1"],
+                Err("not an encryption type name"),
+            ),
+            (&["aes"], Err("not an encryption type name")),
+            (&["default"], Err("not an encryption type name")),
+            (&["+aes256-cts"], Err("not an encryption type name")),
+            (&["-des3"], Err("not an encryption type name")),
+            (&["no-such-type"], Err("not an encryption type name")),
+            (&["des-cbc-crc"], Err("not an encryption type name")),
+            (&["des3-cbc-sha1"], Err("des3-cbc-sha1 is deprecated")),
+            (&["rc4-hmac"], Err("arcfour-hmac is deprecated")),
+            (
+                &["aes256-cts", "camellia256-cts-cmac"],
                 Err("camellia256-cts-cmac is not served"),
             ),
             (
-                "camellia128-cts-cmac",
+                &["camellia128-cts-cmac"],
                 Err("camellia128-cts-cmac is not served"),
-            ),
-            (
-                "aes256-cts camellia",
-                Err("camellia256-cts-cmac is not served"),
-            ),
-            ("default", Err("des3-cbc-sha1 is deprecated")),
-            ("default -des3 -rc4", Err("is not served")),
-            (
-                "default -des3 -rc4 -camellia",
-                Ok(vec![
-                    EncryptionType::Aes256CtsHmacSha196,
-                    EncryptionType::Aes128CtsHmacSha196,
-                    EncryptionType::Aes256CtsHmacSha384192,
-                    EncryptionType::Aes128CtsHmacSha256128,
-                ]),
             ),
         ];
         for (names, expected) in rows {
-            let parsed = parse_enctypes(&[names.to_owned()]).map_err(|e| e.to_string());
+            let items: Vec<String> = names.iter().map(|&name| name.to_owned()).collect();
+            let parsed = parse_enctypes(&items).map_err(|e| e.to_string());
             match (parsed, expected) {
-                (Ok(got), Ok(want)) => assert_eq!(got, want, "{names}"),
-                (Err(e), Err(want)) => assert!(e.contains(want), "{names}: {e}"),
-                (got, _) => panic!("{names}: unexpected {got:?}"),
+                (Ok(got), Ok(want)) => assert_eq!(got, want, "{names:?}"),
+                (Err(e), Err(want)) => assert!(e.contains(want), "{names:?}: {e}"),
+                (got, _) => panic!("{names:?}: unexpected {got:?}"),
             }
         }
     }

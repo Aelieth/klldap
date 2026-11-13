@@ -1,11 +1,12 @@
 use crate::boot::{self, OpenRealm, RealmSettings};
+use crate::rotate;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use krb5_admin::{
     Kadmind, KadmindConfig, Listeners, Programs, ServeLimits, Services, TracingAdmin,
 };
 use krb5_config::KadmindListen;
-use krb5_crypto::{EncryptionType, KeySalt};
+use krb5_crypto::KeySalt;
 use krb5_kdc::{
     AdminEnt, AdminFields, Error as StoreError, KDB_REQUIRES_PRE_AUTH, KdcLog, ListenLimits,
     PrincipalRead, PrincipalStore, SharedDump, SharedStore, Shutdown, kadm5_mask,
@@ -26,10 +27,6 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::{Span, error, info};
 use zeroize::Zeroizing;
 
-const KEYCLOAK_ETYPES: [EncryptionType; 2] = [
-    EncryptionType::Aes256CtsHmacSha196,
-    EncryptionType::Aes128CtsHmacSha196,
-];
 const KADMIND_START: Duration = Duration::from_secs(10);
 
 pub struct EmbeddedKerberos {
@@ -38,7 +35,9 @@ pub struct EmbeddedKerberos {
     actor: String,
     store: SharedDump,
     enctypes: Vec<KeySalt>,
+    max_life: u32,
     max_renewable_life: u32,
+    key_grace: u64,
     keycloak_keytab: PathBuf,
     ready: Arc<AtomicBool>,
     writes: Arc<Mutex<()>>,
@@ -174,49 +173,92 @@ impl EmbeddedKerberos {
                 .iter()
                 .map(|&e| e.into())
                 .collect(),
-            max_renewable_life: u32::try_from(settings.max_renewable_life).unwrap_or(u32::MAX),
+            max_life: u32::try_from(settings.ticket_lifetime).unwrap_or(u32::MAX),
+            max_renewable_life: u32::try_from(settings.renew_lifetime).unwrap_or(u32::MAX),
+            key_grace: settings.ticket_lifetime + settings.renew_lifetime,
             keycloak_keytab: settings.keycloak_keytab.clone(),
             ready,
             writes: Arc::new(Mutex::new(())),
         }
     }
 
-    /// Brings every listed principal up to the realm's settings: pre-authentication required
-    /// and the configured renewable life. Returns how many were updated and how many are missing.
+    /// Brings krbtgt and every listed principal up to the realm's lifetimes, and the users to
+    /// required pre-authentication. Returns how many were written and how many users have no
+    /// principal; one that already matches is not written.
     pub async fn reconcile(&self, users: Vec<UserId>) -> Result<(usize, usize)> {
         let (store, realm, actor) = (self.store.clone(), self.realm.clone(), self.actor.clone());
+        let max_life = u64::from(self.max_life);
         let max_renewable_life = u64::from(self.max_renewable_life);
         let serial = self.writes.clone().lock_owned().await;
         tokio::task::spawn_blocking(move || {
             let _serial = serial;
-            in_change(&store, |s| {
-                let (mut updated, mut missing) = (0, 0);
-                for user in &users {
-                    let name = user_principal(user);
-                    let Some(principal) = s.fetch_name(&name)? else {
-                        missing += 1;
-                        continue;
-                    };
+            let tgs = (PrincipalName::krbtgt(&realm), false);
+            let names = std::iter::once(tgs).chain(users.iter().map(|u| (user_principal(u), true)));
+            let (mut stale, mut missing) = (Vec::new(), 0);
+            let mut store = store
+                .write()
+                .map_err(|_| anyhow!("the principal store was poisoned"))?;
+            for (name, user) in names {
+                let Some(principal) = store
+                    .fetch_name(&name)
+                    .map_err(|e| anyhow!("while reading principals: {e}"))?
+                else {
+                    missing += usize::from(user);
+                    continue;
+                };
+                let preauth = principal.attributes | KDB_REQUIRES_PRE_AUTH;
+                if (user && preauth != principal.attributes)
+                    || principal.max_life != max_life
+                    || principal.max_renewable_life != max_renewable_life
+                {
                     let fields = AdminFields {
-                        attributes: Some(principal.attributes | KDB_REQUIRES_PRE_AUTH),
+                        attributes: user.then_some(preauth),
+                        max_life: Some(max_life),
                         max_renewable_life: Some(max_renewable_life),
                         ..Default::default()
                     };
-                    s.apply_admin_fields_in(&name, &realm, fields, &actor)?;
-                    updated += 1;
+                    stale.push((name, fields));
                 }
-                Ok((updated, missing))
-            })
-            .map_err(|e| anyhow!("while reconciling principals: {e}"))
+            }
+            if !stale.is_empty() {
+                store
+                    .change(|s| {
+                        for (name, fields) in &stale {
+                            s.apply_admin_fields_in(name, &realm, fields.clone(), &actor)?;
+                        }
+                        Ok::<_, StoreError>(())
+                    })
+                    .and_then(|changed| changed)
+                    .map_err(|e| anyhow!("while reconciling principals: {e}"))?;
+            }
+            Ok((stale.len(), missing))
         })
         .await
         .context("the reconcile did not complete")?
     }
 
+    /// The hourly purge of key versions no ticket can still need.
+    pub async fn purge_old_keys(&self) -> Result<usize> {
+        let (store, realm, actor) = (self.store.clone(), self.realm.clone(), self.actor.clone());
+        let grace = self.key_grace;
+        let serial = self.writes.clone().lock_owned().await;
+        tokio::task::spawn_blocking(move || {
+            let _serial = serial;
+            let mut store = store
+                .write()
+                .map_err(|_| anyhow!("the principal store was poisoned"))?;
+            rotate::purge_old_keys(&mut store, &realm, grace, rotate::unix_now(), &actor)
+                .map_err(|e| anyhow!("while purging old Kerberos keys: {e}"))
+        })
+        .await
+        .context("the purge did not complete")?
+    }
+
     fn new_principal(&self) -> AdminEnt {
         AdminEnt {
-            mask: kadm5_mask::ATTRIBUTES | kadm5_mask::MAX_RLIFE,
+            mask: kadm5_mask::ATTRIBUTES | kadm5_mask::MAX_LIFE | kadm5_mask::MAX_RLIFE,
             attributes: KDB_REQUIRES_PRE_AUTH,
+            max_life: self.max_life,
             max_renewable_life: self.max_renewable_life,
             ..Default::default()
         }
@@ -291,7 +333,7 @@ impl KerberosSync for EmbeddedKerberos {
         };
         validate_keytab_hostname(&host)?;
         let (store, realm, actor) = (self.store.clone(), self.realm.clone(), self.actor.clone());
-        let path = self.keycloak_keytab.clone();
+        let (path, etypes) = (self.keycloak_keytab.clone(), self.enctypes.clone());
         let name = PrincipalName::new(PrincipalName::NT_SRV_HST, ["HTTP", host.as_str()]);
         logged(
             &self.writes,
@@ -299,7 +341,6 @@ impl KerberosSync for EmbeddedKerberos {
             &host,
             "keycloak",
             move || {
-                let etypes = KEYCLOAK_ETYPES.map(KeySalt::from);
                 let keytab = in_change(&store, |s| {
                     if s.fetch_name(&name)?.is_none() {
                         s.insert_new_randkey(&name, &realm, &etypes, &actor)?;
@@ -486,11 +527,14 @@ async fn logged<T: Send + 'static>(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use krb5_crypto::EncryptionType;
     use krb5_kdc::KDB_DISALLOW_ALL_TIX;
     use lldap_domain_handlers::logging::{RequestMeta, with_request};
     use lldap_test_utils::recording_log::LogGuard;
     use pretty_assertions::assert_eq;
     use serial_test::serial;
+    use std::collections::BTreeMap;
+    use std::path::Path;
     use std::sync::atomic::AtomicUsize;
 
     pub(crate) struct TempRealm {
@@ -511,7 +555,6 @@ pub(crate) mod tests {
                     domain: "example.com".to_owned(),
                     ticket_lifetime: 86_400,
                     renew_lifetime: 604_800,
-                    max_renewable_life: 604_800,
                     forwardable: true,
                     supported_enctypes: vec![EncryptionType::Aes256CtsHmacSha196],
                     kdc_host: "127.0.0.1".to_owned(),
@@ -650,6 +693,39 @@ pub(crate) mod tests {
             vec![(Some("bob".to_owned()), Some("alice".to_owned()))],
             "the dropped call's row keeps its request's actor"
         );
+    }
+
+    fn files(dir: &Path) -> BTreeMap<PathBuf, (Vec<u8>, std::time::SystemTime)> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+                (path.clone(), (std::fs::read(&path).unwrap(), modified))
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_boot_with_nothing_to_change_writes_nothing() {
+        let temp = TempRealm::new();
+        let (embedded, store) = temp.embedded();
+        let bob = UserId::new("bob");
+        embedded
+            .sync_principal(&bob, "Bob-Password-1")
+            .await
+            .unwrap();
+        let users = vec![bob, UserId::new("nobody")];
+        embedded.reconcile(users.clone()).await.unwrap();
+        let before = files(&temp.settings.data_dir);
+        let again = embedded.reconcile(users).await.unwrap();
+        let mut reopened =
+            boot::open_store(&temp.settings, &boot::profile(&temp.settings)).unwrap();
+        boot::rotate_keys(&mut reopened, &temp.settings).unwrap();
+        boot::rotate_keys(&mut store.write().unwrap(), &temp.settings).unwrap();
+        assert_eq!(again, (0, 1));
+        assert_eq!(files(&temp.settings.data_dir), before);
     }
 
     #[test]

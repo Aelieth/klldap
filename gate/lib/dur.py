@@ -21,6 +21,8 @@ JWT, SEED = "gate-jwt-secret-not-for-production", "gate-key-seed-not-for-product
 KDC_DIR = "/var/kerberos/krb5kdc"
 SERVICE, WRITER, LOCKED, POLICY, MAX_FAIL = "HTTP/dur.gate.test", "durbob", "durlock", "durpol", 3
 HEALTH_LIMIT, EXIT_LIMIT, STOPPED_FOR = 90, 30, 40
+REFUSED = "Password incorrect while getting initial credentials"
+GAP_TARGET_MS = 20
 FIND_LLDAP = ('p=; for q in /proc/[0-9]*; do read -r c <"$q/comm" 2>/dev/null || continue; '
               '[ "$c" = lldap ] && { p=${q#/proc/}; break; }; done; [ -n "$p" ] || exit 3')
 
@@ -51,6 +53,8 @@ class Record:
         self.log = open(os.path.join(RUN_DIR, "dur.log"), "a", encoding="utf-8")
         self.acks = open(os.path.join(RUN_DIR, "acks.jsonl"), "a", encoding="utf-8")
         self.counts = {}
+        self.gaps = {}
+        self.aborted = 0
 
     @staticmethod
     def _sync(handle, text):
@@ -59,7 +63,16 @@ class Record:
         os.fsync(handle.fileno())
 
     def ack(self, entry):
-        self._sync(self.acks, json.dumps(entry, sort_keys=True))
+        try:
+            self._sync(self.acks, json.dumps(entry, sort_keys=True))
+        except OSError as e:
+            self.note(f"ACK-WRITE-FAILED n={entry.get('n')} {e}")
+            return False
+        return True
+
+    def abort(self, text):
+        self.aborted += 1
+        self.note(f"{text} ABORTED")
 
     def line(self, key, ok, text):
         passed, failed = self.counts.get(key, (0, 0))
@@ -198,24 +211,29 @@ class Server:
     def has_keytab(self):
         return run("docker", "cp", f"{self.name}:/data/kadm5.keytab", "-").returncode == 0
 
-    def write_then_kill(self, *command):
+    def client_then_kill(self, *command):
+        """The client's result streams to the host; the shell then waits for k to kill lldap."""
         script = (f"rm -f /data/dur-*; {FIND_LLDAP}; "
-                  '"$@" >/data/dur-out 2>&1; rc=$?; t1=$(date +%s%N); echo "$rc" >/data/dur-rc; '
-                  't2=$(date +%s%N); echo "$t1 $t2" >/data/dur-ret; kill -9 "$p"')
-        run("docker", "exec", self.name, "sh", "-c", script, "sh", *command, timeout=90)
-
-    def kill_result(self):
-        read = run("docker", "exec", self.name, "sh", "-c",
-                   "cat /data/dur-rc /data/dur-ret; echo; cat /data/dur-out").stdout
-        lines = read.splitlines()
-        if len(lines) < 2 or not lines[0].strip().isdigit():
-            return None, None, read
-        t1, t2 = (int(x) for x in lines[1].split())
-        return int(lines[0]), (t2 - t1) / 1e6, "\n".join(lines[2:])
+                  '"$@" >/data/dur-out 2>&1; rc=$?; t=$(date +%s%N); '
+                  'echo "RESULT $rc $t"; cat /data/dur-out; echo END-OF-OUTPUT; read -r x; '
+                  'k=$(date +%s%N); echo "$t $k" >/data/dur-kill; [ "$x" = k ] && kill -9 "$p"')
+        shell = subprocess.Popen(
+            ["docker", "exec", "-i", self.name, "sh", "-c", script, "sh", *command],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        head = shell.stdout.readline().split()
+        if len(head) != 3 or head[0] != "RESULT" or not head[1].isdigit():
+            release(shell, False)
+            return None, None, ""
+        out = []
+        for line in shell.stdout:
+            if line.rstrip("\n") == "END-OF-OUTPUT":
+                break
+            out.append(line)
+        return shell, int(head[1]), "".join(out)
 
     def arm_killer(self):
         script = (f"rm -f /data/dur-*; {FIND_LLDAP}; echo ready; read -r x; "
-                  't=$(date +%s%N); echo "$t" >/data/dur-kill; [ "$x" = k ] && kill -9 "$p"')
+                  't=$(date +%s%N); echo "- $t" >/data/dur-kill; [ "$x" = k ] && kill -9 "$p"')
         killer = subprocess.Popen(["docker", "exec", "-i", self.name, "sh", "-c", script],
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         if killer.stdout.readline().strip() != "ready":
@@ -224,14 +242,33 @@ class Server:
         return killer
 
     def killed_at(self):
-        read = run("docker", "exec", self.name, "cat", "/data/dur-kill").stdout.strip()
-        return int(read) if read.isdigit() else None
+        read = run("docker", "exec", self.name, "cat", "/data/dur-kill").stdout.split()
+        if len(read) != 2 or not read[1].isdigit():
+            return None, None
+        return (int(read[0]) if read[0].isdigit() else None), int(read[1])
 
     def signal(self, name):
         find = f'{FIND_LLDAP}; echo "$p"'
         pid = run("docker", "exec", self.name, "sh", "-c", find).stdout.strip()
         send = run("docker", "exec", self.name, "sh", "-c", 'kill -"$0" "$1"', name, pid)
         return bool(pid) and send.returncode == 0
+
+
+def release(killer, go):
+    try:
+        killer.stdin.write("k\n" if go else "n\n")
+        killer.stdin.flush()
+    except OSError:
+        pass
+    try:
+        killer.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        killer.kill()
+
+
+def refused(result):
+    signed, text = result
+    return not signed and REFUSED in text
 
 
 def volume(label):
@@ -282,35 +319,46 @@ def acc3(record, kills):
 
 def one_kill(record, server, n, kind, i, lock_password):
     head = f"KILL n={n} db={DB} kind={kind}"
-    if kind == "a":
-        target, before = SERVICE, server.kvno(SERVICE)
-        expect = before + 1 if before is not None else None
-        server.write_then_kill("kadmin", "-k", "-t", "/data/kadm5.keytab", "-p",
-                               f"admin/admin@{REALM}", "-q", f"cpw -randkey {SERVICE}")
-    elif kind == "b":
+    if kind == "b":
         target, password = WRITER, test_password(n)
         expect = tag(password)
         killer = server.arm_killer()
         acked = killer is not None and server.set_password(WRITER, password)
-        replied = time.time_ns()
-        if killer is not None:
-            killer.stdin.write("k\n" if acked else "n\n")
-            killer.stdin.flush()
-            try:
-                killer.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                killer.kill()
-        if not acked:
-            record.line(kind, False, f"{head} target={target} the write was not acknowledged")
-            return server.healthy()
+        read_at, returned = time.perf_counter_ns(), time.time_ns()
     else:
-        target, count = LOCKED, i % MAX_FAIL + 1
-        expect = f"{count},locked={count == MAX_FAIL}"
-        # A failure in the same whole second as the last unlock resets the count (MIT's audit).
-        time.sleep(2)
-        refused = all(not server.kinit(LOCKED, test_password(n))[0] for _ in range(count - 1))
-        server.write_then_kill("sh", "-c", 'printf "%s\\n" "$0" | KRB5CCNAME=/tmp/dur_cc kinit "$1"',
-                               test_password(n), LOCKED)
+        if kind == "a":
+            target, before = SERVICE, server.kvno(SERVICE)
+            expect = before + 1 if before is not None else None
+            command = ("kadmin", "-k", "-t", "/data/kadm5.keytab", "-p", f"admin/admin@{REALM}",
+                       "-q", f"cpw -randkey {SERVICE}")
+        else:
+            target, count = LOCKED, i % MAX_FAIL + 1
+            expect = f"{count},locked={count == MAX_FAIL}"
+            # A failure in the same whole second as the last unlock resets the count (MIT's audit).
+            time.sleep(2)
+            refused_before = all(refused(server.kinit(LOCKED, test_password(n)))
+                                 for _ in range(count - 1))
+            command = ("sh", "-c", 'printf "%s\\n" "$0" | KRB5CCNAME=/tmp/dur_cc kinit "$1"',
+                       test_password(n), LOCKED)
+        killer, rc, out = server.client_then_kill(*command)
+        read_at, returned = time.perf_counter_ns(), None
+        if kind == "a":
+            acked = killer is not None and rc == 0 and " while " not in out
+        else:
+            acked = killer is not None and refused_before and rc != 0 and REFUSED in out
+    if not acked:
+        if killer is not None:
+            release(killer, False)
+        if kind == "c":
+            server.kadmin(f"modprinc -unlock {LOCKED}")
+        record.line(kind, False, f"{head} target={target} the write was not acknowledged")
+        return server.healthy()
+    if not record.ack({"n": n, "db": DB, "kind": kind, "target": target, "expect": expect}):
+        release(killer, False)
+        record.abort(f"{head} target={target} the host's ack was not written; no kill")
+        return server.healthy()
+    ack_ms = (time.perf_counter_ns() - read_at) / 1e6
+    release(killer, True)
     server.wait_exit(EXIT_LIMIT)
     server.start()
     back = server.wait_healthy()
@@ -318,17 +366,12 @@ def one_kill(record, server, n, kind, i, lock_password):
         server.keep_logs(f"kill-{n}")
         record.line(kind, False, f"{head} target={target} not healthy after restart")
         return False
-    if kind == "b":
-        at = server.killed_at()
-        gap_ms = (at - replied) / 1e6 if at else None
-    else:
-        rc, gap_ms, out = server.kill_result()
-        acked = rc == 0 and " while " not in out if kind == "a" else refused and rc not in (None, 0)
-    if not acked:
-        record.line(kind, False, f"{head} target={target} the write was not acknowledged")
-        return True
+    client_return, kill_stamp = server.killed_at()
+    start_ns = returned if kind == "b" else client_return
+    gap_ms = (kill_stamp - start_ns) / 1e6 if kill_stamp and start_ns else None
+    if gap_ms is not None:
+        record.gaps.setdefault(kind, []).append(gap_ms)
     gap = f"{gap_ms:.1f}" if gap_ms is not None else "unknown"
-    record.ack({"n": n, "db": DB, "kind": kind, "target": target, "expect": expect, "gap_ms": gap})
     if kind == "a":
         got = server.kvno(SERVICE)
         ok = got == expect
@@ -344,8 +387,8 @@ def one_kill(record, server, n, kind, i, lock_password):
         server.kadmin(f"modprinc -unlock {LOCKED}")
     if not ok:
         server.keep_logs(f"kill-{n}")
-    record.line(kind, ok, f"{head} target={target} gap_ms={gap} back_s={back:.1f} "
-                          f"expect={expect} got={got}")
+    record.line(kind, ok, f"{head} target={target} gap_ms={gap} ack_written_ms={ack_ms:.1f} "
+                          f"back_s={back:.1f} expect={expect} got={got}")
     return True
 
 
@@ -443,15 +486,22 @@ def main():
     except Exception as e:
         error = str(e)
         record.note(f"ABORT {error}")
+    gaps = {k: {"min": round(min(v), 1), "median": round(sorted(v)[len(v) // 2], 1),
+                "max": round(max(v), 1), "over_target": sum(g > GAP_TARGET_MS for g in v)}
+            for k, v in record.gaps.items()}
+    for kind, g in sorted(gaps.items()):
+        record.note(f"GAPS kind={kind} min={g['min']} median={g['median']} max={g['max']} "
+                    f"over_{GAP_TARGET_MS}ms={g['over_target']}")
     summary = {"row": ROW, "db": DB, "image": IMAGE, "image_id": ENV.get("DUR_IMAGE_ID", ""),
                "driver": ENV.get("DUR_REV", ""), "seconds": round(time.time() - started),
                "counts": {k: {"pass": p, "fail": f} for k, (p, f) in record.counts.items()},
-               "aborted": error}
+               "gaps_ms": gaps, "aborted_iterations": record.aborted, "aborted": error}
     with open(os.path.join(RUN_DIR, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, sort_keys=True)
     failed = sum(f for _, f in record.counts.values())
-    record.note(f"END failed={failed} aborted={error is not None} seconds={summary['seconds']}")
-    return 0 if failed == 0 and error is None and record.counts else 1
+    record.note(f"END failed={failed} aborted={error is not None} aborted_iterations={record.aborted} "
+                f"seconds={summary['seconds']}")
+    return 0 if failed == 0 and error is None and record.aborted == 0 and record.counts else 1
 
 
 if __name__ == "__main__":

@@ -106,7 +106,7 @@ impl std::default::Default for HealthcheckOptions {
 #[derive(Clone, Debug, Deserialize, Serialize, derive_builder::Builder)]
 #[builder(pattern = "owned")]
 pub struct KerberosOptions {
-    #[builder(default = "false")]
+    #[builder(default = "true")]
     pub enabled: bool,
     #[builder(default)]
     pub realm: Option<String>,
@@ -114,8 +114,6 @@ pub struct KerberosOptions {
     pub ticket_lifetime: String,
     #[builder(default = r#"String::from("7d")"#)]
     pub renew_lifetime: String,
-    #[builder(default = r#"String::from("7d")"#)]
-    pub max_renewable_life: String,
     #[builder(default = "true")]
     pub forwardable: bool,
     #[builder(default = r#"vec![String::from("aes256-cts-hmac-sha1-96")]"#)]
@@ -173,7 +171,6 @@ impl KerberosOptions {
             domain,
             ticket_lifetime: seconds("ticket_lifetime", &self.ticket_lifetime)?,
             renew_lifetime: seconds("renew_lifetime", &self.renew_lifetime)?,
-            max_renewable_life: seconds("max_renewable_life", &self.max_renewable_life)?,
             forwardable: self.forwardable,
             supported_enctypes: parse_enctypes(&self.supported_enctypes)
                 .context("while reading kerberos_options.supported_enctypes")?,
@@ -192,6 +189,9 @@ impl KerberosOptions {
 
 fn seconds(name: &str, value: &str) -> Result<u64> {
     match krb5_types::deltat::parse(value).map(u64::try_from) {
+        Ok(Ok(0)) if name == "ticket_lifetime" => {
+            bail!("kerberos_options.{name} = {value:?} is refused: zero means no limit to the KDC")
+        }
         Ok(Ok(seconds)) if seconds > 0 => Ok(seconds),
         _ => bail!(
             "kerberos_options.{name} = {value:?} is not a positive Kerberos duration \
@@ -738,6 +738,86 @@ impl ConfigOverrider for LogOpts {
     }
 }
 
+// Keys whose value is itself a path; the file provider leaves them alone.
+const FILE_PROVIDER_EXEMPT: [&str; 3] = ["key_file", "cert_file", "config_file"];
+
+const PATH_KEYS: [(&str, &str); 6] = [
+    ("kerberos_options", "data_dir"),
+    ("kerberos_options", "admin_keytab"),
+    ("kerberos_options", "client_config"),
+    ("kerberos_options", "kadmin_acl"),
+    ("keycloak_options", "keytab"),
+    ("keycloak_options", "config_file"),
+];
+
+const CHECKED_FILE_SECTIONS: [&str; 2] = ["kerberos_options", "keycloak_options"];
+
+// The file provider would read the named file's contents into a path key.
+fn refuse_file_forms_of_paths(config_file: &str) -> Result<()> {
+    let env = Figment::from(Env::prefixed("LLDAP_").split("__"));
+    let file = Figment::from(Toml::file(config_file));
+    for (section, key) in PATH_KEYS {
+        let path = format!("{section}.{key}_file");
+        let named = if env.find_value(&path).is_ok() {
+            format!(
+                "LLDAP_{}__{}_FILE",
+                section.to_ascii_uppercase(),
+                key.to_ascii_uppercase()
+            )
+        } else if file.find_value(&path).is_ok() {
+            format!("{path} in {config_file}")
+        } else {
+            continue;
+        };
+        bail!("{named} is refused: {section}.{key} takes the path itself, not a file holding it");
+    }
+    Ok(())
+}
+
+fn default_values() -> figment::value::Dict {
+    Figment::from(Serialized::defaults(
+        ConfigurationBuilder::default()
+            .key_seed(Some(SecUtf8::from(FIGMENT_DUMMY_KEY_SEED)))
+            .build()
+            .unwrap(),
+    ))
+    .data()
+    .unwrap()
+    .remove(&figment::Profile::default())
+    .unwrap()
+}
+
+fn check_for_unexpected_file_keys<P: Provider>(file_provider: P) {
+    for name in unexpected_file_keys(file_provider) {
+        eprintln!("WARNING: Unknown key in the configuration file: {name}");
+    }
+}
+
+fn unexpected_file_keys<P: Provider>(file_provider: P) -> Vec<String> {
+    use figment::value::Value;
+    let defaults = default_values();
+    let Ok(mut data) = file_provider.data() else {
+        return Vec::new();
+    };
+    let Some(file) = data.remove(&figment::Profile::default()) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    for section in CHECKED_FILE_SECTIONS {
+        if let (Some(Value::Dict(_, keys)), Some(Value::Dict(_, known))) =
+            (file.get(section), defaults.get(section))
+        {
+            names.extend(
+                keys.keys()
+                    .filter(|key| !known.contains_key(*key))
+                    .map(|key| format!("{section}.{key}")),
+            );
+        }
+    }
+    names.sort();
+    names
+}
+
 fn extract_keys(dict: &figment::value::Dict) -> HashSet<String> {
     use figment::value::{Dict, Value};
     fn process_value(value: &Dict, keys: &mut HashSet<String>, path: &mut Vec<String>) {
@@ -772,6 +852,7 @@ fn expected_keys(dict: &figment::value::Dict) -> HashSet<String> {
     // Container knobs read by the entrypoint.
     keys.insert("LLDAP_UID".to_string());
     keys.insert("LLDAP_GID".to_string());
+    keys.insert("LLDAP_RAW_LOG".to_string());
     // Alternate spellings from clap.
     keys.insert("LLDAP_SERVER_KEY_FILE".to_string());
     keys.insert("LLDAP_SERVER_KEY_SEED".to_string());
@@ -789,16 +870,7 @@ fn check_for_unexpected_env_variables<P: Provider>(env_variable_provider: P) {
 
 fn unexpected_env_variables<P: Provider>(env_variable_provider: P) -> Vec<String> {
     use figment::Profile;
-    let expected_keys = expected_keys(
-        &Figment::from(Serialized::defaults(
-            ConfigurationBuilder::default()
-                .key_seed(Some(SecUtf8::from(FIGMENT_DUMMY_KEY_SEED)))
-                .build()
-                .unwrap(),
-        ))
-        .data()
-        .unwrap()[&Profile::default()],
-    );
+    let expected_keys = expected_keys(&default_values());
     let mut names: Vec<String> =
         extract_keys(&env_variable_provider.data().unwrap()[&Profile::default()])
             .into_iter()
@@ -855,7 +927,9 @@ where
         overrides.general_config().config_file
     );
 
-    let ignore_keys = ["key_file", "cert_file", "config_file"];
+    let config_file = &overrides.general_config().config_file;
+    refuse_file_forms_of_paths(config_file)?;
+    let ignore_keys = FILE_PROVIDER_EXEMPT;
     let env_variable_provider =
         || FileAdapter::wrap(Env::prefixed("LLDAP_").split("__")).ignore(&ignore_keys);
     let figment_config = Figment::from(Serialized::defaults(
@@ -864,9 +938,7 @@ where
             .build()
             .unwrap(),
     ))
-    .merge(
-        FileAdapter::wrap(Toml::file(&overrides.general_config().config_file)).ignore(&ignore_keys),
-    )
+    .merge(FileAdapter::wrap(Toml::file(config_file)).ignore(&ignore_keys))
     .merge(env_variable_provider());
     let mut config: Configuration = figment_config.extract()?;
 
@@ -882,6 +954,7 @@ where
         config.key_seed = None;
     }
     check_for_unexpected_env_variables(env_variable_provider());
+    check_for_unexpected_file_keys(FileAdapter::wrap(Toml::file(config_file)).ignore(&ignore_keys));
     config.server_setup = Some(get_server_setup(
         &config.key_file,
         config
@@ -996,7 +1069,7 @@ mod tests {
             jail.clear_env();
             jail.set_env("LLDAP_KEY_SEED", "a123");
             jail.set_env("LLDAP_JWT_SECRET", "secret");
-            let ignore_keys = ["key_file", "cert_file", "config_file"];
+            let ignore_keys = FILE_PROVIDER_EXEMPT;
             let figment_config = Figment::from(Serialized::defaults(
                 ConfigurationBuilder::default()
                     .key_seed(Some(SecUtf8::from(FIGMENT_DUMMY_KEY_SEED)))
@@ -1167,8 +1240,8 @@ mod tests {
     fn test_kerberos_options_from_env() {
         type Expected =
             Result<(bool, &'static str, &'static str, Option<&'static str>), &'static str>;
-        let rows: [(&[(&str, &str)], Expected); 10] = [
-            (&[], Ok((false, "EXAMPLE.COM", "24h", None))),
+        let rows: [(&[(&str, &str)], Expected); 12] = [
+            (&[], Ok((true, "EXAMPLE.COM", "24h", None))),
             (
                 &[
                     ("LLDAP_KERBEROS_OPTIONS__ENABLED", "true"),
@@ -1178,14 +1251,14 @@ mod tests {
             ),
             (
                 &[("LLDAP_KERBEROS_OPTIONS__TICKET_LIFETIME", "10h")],
-                Ok((false, "EXAMPLE.COM", "10h", None)),
+                Ok((true, "EXAMPLE.COM", "10h", None)),
             ),
             (
                 &[(
                     "LLDAP_KERBEROS_OPTIONS__KADMIN_ACL",
                     "/etc/klldap/kadm5.acl",
                 )],
-                Ok((false, "EXAMPLE.COM", "24h", Some("/etc/klldap/kadm5.acl"))),
+                Ok((true, "EXAMPLE.COM", "24h", Some("/etc/klldap/kadm5.acl"))),
             ),
             (
                 &[("LLDAP_KERBEROS_OPTIONS__TICKET_LIFETIME", "forever")],
@@ -1194,6 +1267,14 @@ mod tests {
             (
                 &[("LLDAP_KERBEROS_OPTIONS__RENEW_LIFETIME", "-1d")],
                 Err("renew_lifetime"),
+            ),
+            (
+                &[("LLDAP_KERBEROS_OPTIONS__TICKET_LIFETIME", "0s")],
+                Err("ticket_lifetime = \"0s\" is refused: zero means no limit to the KDC"),
+            ),
+            (
+                &[("LLDAP_KERBEROS_OPTIONS__RENEW_LIFETIME", "0s")],
+                Err("renew_lifetime = \"0s\" is not a positive Kerberos duration"),
             ),
             (
                 &[(
@@ -1395,10 +1476,10 @@ mod tests {
                     .map(secstr::SecUtf8::unsecure),
                 Some("new")
             );
-            let names =
-                super::unexpected_env_variables(figment_file_provider_adapter::FileAdapter::wrap(
-                    figment::providers::Env::prefixed("LLDAP_").split("__"),
-                ));
+            let names = super::unexpected_env_variables(
+                FileAdapter::wrap(figment::providers::Env::prefixed("LLDAP_").split("__"))
+                    .ignore(&FILE_PROVIDER_EXEMPT),
+            );
             assert!(
                 names.iter().any(|name| name == "LLDAP_KEYCLOAK_ADMIN_PASS"),
                 "{names:?}"
@@ -1497,6 +1578,171 @@ mod tests {
                 Ok(())
             });
         }
+    }
+
+    #[test]
+    fn test_kerberos_lifetimes_and_forwardable() {
+        type Read = fn(&Configuration) -> String;
+        let rows: [(&str, &str, &str, &str, Read); 3] = [
+            ("ticket_lifetime", "24h", "\"10h\"", "10h", |c| {
+                c.kerberos_options.ticket_lifetime.clone()
+            }),
+            ("renew_lifetime", "7d", "\"3d\"", "3d", |c| {
+                c.kerberos_options.renew_lifetime.clone()
+            }),
+            ("forwardable", "true", "false", "false", |c| {
+                c.kerberos_options.forwardable.to_string()
+            }),
+        ];
+        for (key, default, toml, value, read) in rows {
+            let env = format!("LLDAP_KERBEROS_OPTIONS__{}", key.to_ascii_uppercase());
+            Jail::expect_with(|jail| {
+                jail.clear_env();
+                jail.set_env("LLDAP_JWT_SECRET", "secret");
+                assert_eq!(
+                    read(&init(default_run_opts()).unwrap()),
+                    default,
+                    "{key} default"
+                );
+                jail.create_file(
+                    "lldap_config.toml",
+                    &format!("[kerberos_options]\n{key} = {toml}\n"),
+                )?;
+                assert_eq!(
+                    read(&init(default_run_opts()).unwrap()),
+                    value,
+                    "{key} in TOML"
+                );
+                jail.create_file("lldap_config.toml", "")?;
+                jail.set_env(&env, value);
+                assert_eq!(read(&init(default_run_opts()).unwrap()), value, "{env}");
+                Ok(())
+            });
+        }
+    }
+
+    #[test]
+    fn test_supported_enctypes_one_name_per_item() {
+        type Row<'a> = (&'a str, &'a str, Result<&'a [&'a str], &'a str>);
+        let aes = ["aes128-cts-hmac-sha1-96", "aes256-cts-hmac-sha1-96"];
+        let rows: [Row; 5] = [
+            (
+                "env",
+                "[aes128-cts-hmac-sha1-96, aes256-cts-hmac-sha1-96]",
+                Ok(&aes),
+            ),
+            (
+                "toml",
+                "[\"aes128-cts-hmac-sha1-96\", \"aes256-cts-hmac-sha1-96\"]",
+                Ok(&aes),
+            ),
+            (
+                "env",
+                "[aes]",
+                Err("\"aes\" is not an encryption type name"),
+            ),
+            (
+                "toml",
+                "[\"aes256-cts aes128-cts\"]",
+                Err("is not an encryption type name"),
+            ),
+            (
+                "toml",
+                "[\"-des3\"]",
+                Err("\"-des3\" is not an encryption type name"),
+            ),
+        ];
+        for (form, value, expected) in rows {
+            Jail::expect_with(|jail| {
+                jail.clear_env();
+                jail.set_env("LLDAP_JWT_SECRET", "secret");
+                if form == "env" {
+                    jail.set_env("LLDAP_KERBEROS_OPTIONS__SUPPORTED_ENCTYPES", value);
+                } else {
+                    jail.create_file(
+                        "lldap_config.toml",
+                        &format!("[kerberos_options]\nsupported_enctypes = {value}\n"),
+                    )?;
+                }
+                let loaded = init(default_run_opts()).and_then(|c| c.kerberos_settings());
+                let names = |settings: RealmSettings| -> Vec<String> {
+                    settings
+                        .supported_enctypes
+                        .iter()
+                        .map(|e| e.to_mit_name().to_owned())
+                        .collect()
+                };
+                match (loaded.map(names), expected) {
+                    (Ok(got), Ok(want)) => assert_eq!(got, want, "{form} {value}"),
+                    (Err(e), Err(want)) => {
+                        assert!(format!("{e:#}").contains(want), "{form} {value}: {e:#}")
+                    }
+                    (got, _) => panic!("{form} {value}: unexpected {got:?}"),
+                }
+                Ok(())
+            });
+        }
+    }
+
+    #[test]
+    fn test_path_keys_refuse_the_file_form() {
+        let mut rows: Vec<(String, bool)> = PATH_KEYS
+            .iter()
+            .map(|(section, key)| {
+                let env = format!(
+                    "LLDAP_{}__{}_FILE",
+                    section.to_ascii_uppercase(),
+                    key.to_ascii_uppercase()
+                );
+                (env, true)
+            })
+            .collect();
+        rows.push((
+            "[kerberos_options]\nkadmin_acl_file = \"acl\"\n".to_owned(),
+            false,
+        ));
+        for (name, env) in rows {
+            Jail::expect_with(|jail| {
+                jail.clear_env();
+                jail.set_env("LLDAP_JWT_SECRET", "secret");
+                jail.create_file("acl", "admin/admin@EXAMPLE.COM *\n")?;
+                if env {
+                    jail.set_env(&name, "acl");
+                } else {
+                    jail.create_file("lldap_config.toml", &name)?;
+                }
+                let e = init(default_run_opts()).unwrap_err().to_string();
+                assert!(
+                    e.contains("takes the path itself, not a file holding it"),
+                    "{name}: {e}"
+                );
+                Ok(())
+            });
+        }
+    }
+
+    #[test]
+    fn test_unknown_keys_in_the_kerberos_and_keycloak_sections() {
+        Jail::expect_with(|jail| {
+            jail.create_file("secret", "from-file")?;
+            jail.create_file(
+                "lldap_config.toml",
+                "[kerberos_options]\nkdc_bind = \"0.0.0.0\"\nkdc_host = \"0.0.0.0\"\n\
+                 [keycloak_options]\nkeycloak_keytab = \"k\"\nadmin_pass_file = \"secret\"\n\
+                 [ldaps_options]\nno_such_key = 1\n",
+            )?;
+            let names = unexpected_file_keys(
+                FileAdapter::wrap(Toml::file("lldap_config.toml")).ignore(&FILE_PROVIDER_EXEMPT),
+            );
+            assert_eq!(
+                names,
+                [
+                    "kerberos_options.kdc_bind",
+                    "keycloak_options.keycloak_keytab"
+                ]
+            );
+            Ok(())
+        });
     }
 
     #[test]

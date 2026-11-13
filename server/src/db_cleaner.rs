@@ -4,9 +4,10 @@ use cron::Schedule;
 use lldap_domain_model::model::{
     self, JwtRefreshStorageColumn, JwtStorageColumn, PasswordResetTokensColumn,
 };
+use lldap_kerberos::embedded::EmbeddedKerberos;
 use lldap_sql_backend_handler::{LogRetention, enforce_log_retention};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-use std::{str::FromStr, time::Duration};
+use std::{str::FromStr, sync::Arc, time::Duration};
 use tracing::{error, info, instrument};
 
 // Define actor
@@ -14,6 +15,7 @@ pub struct Scheduler {
     schedule: Schedule,
     sql_pool: DbConnection,
     log_retention: LogRetention,
+    realm: Option<Arc<EmbeddedKerberos>>,
 }
 
 // Provide Actor implementation for our actor
@@ -34,12 +36,18 @@ impl Actor for Scheduler {
 }
 
 impl Scheduler {
-    pub fn new(cron_expression: &str, sql_pool: DbConnection, log_retention: LogRetention) -> Self {
+    pub fn new(
+        cron_expression: &str,
+        sql_pool: DbConnection,
+        log_retention: LogRetention,
+        realm: Option<Arc<EmbeddedKerberos>>,
+    ) -> Self {
         let schedule = Schedule::from_str(cron_expression).unwrap();
         Self {
             schedule,
             sql_pool,
             log_retention,
+            realm,
         }
     }
 
@@ -47,6 +55,7 @@ impl Scheduler {
         let future = actix::fut::wrap_future::<_, Self>(Self::cleanup_db(
             self.sql_pool.clone(),
             self.log_retention,
+            self.realm.clone(),
         ));
         ctx.spawn(future);
 
@@ -56,7 +65,11 @@ impl Scheduler {
     }
 
     #[instrument(skip_all)]
-    async fn cleanup_db(sql_pool: DbConnection, log_retention: LogRetention) {
+    async fn cleanup_db(
+        sql_pool: DbConnection,
+        log_retention: LogRetention,
+        realm: Option<Arc<EmbeddedKerberos>>,
+    ) {
         if let Err(e) = model::JwtRefreshStorage::delete_many()
             .filter(JwtRefreshStorageColumn::ExpiryDate.lt(chrono::Utc::now().naive_utc()))
             .exec(&sql_pool)
@@ -80,6 +93,11 @@ impl Scheduler {
         };
         if let Err(e) = enforce_log_retention(&sql_pool, log_retention).await {
             error!("DB error while trimming the logs table: {}", e);
+        }
+        if let Some(realm) = realm
+            && let Err(e) = realm.purge_old_keys().await
+        {
+            error!("{e:#}");
         }
     }
 

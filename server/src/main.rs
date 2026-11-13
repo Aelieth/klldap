@@ -40,6 +40,7 @@ use lldap_domain::requests::{CreateGroupRequest, CreateUserRequest};
 use lldap_domain::types::{Attribute, BUILTIN_GROUPS};
 use lldap_domain_handlers::kerberos::{DegradedKerberos, NoopKerberos, set_kerberos_backend};
 use lldap_domain_handlers::logging::{LogKind, record};
+use lldap_kerberos::boot::client_address;
 use lldap_kerberos::embedded::{EmbeddedKerberos, RealmThreads};
 
 use lldap_domain_handlers::handler::{
@@ -284,13 +285,13 @@ async fn set_up_server(
             "Restart the server without --force-update-private-key or --force-ldap-user-pass-reset to continue."
         );
     }
-    let realm_threads = match config.kerberos_options.enabled {
-        false => None,
+    let (realm_threads, embedded) = match config.kerberos_options.enabled {
+        false => (None, None),
         true => match EmbeddedKerberos::start(&config.kerberos_settings()?) {
             Ok((embedded, threads)) => {
                 set_kerberos_backend(embedded.clone());
                 reconcile_principals(&backend_handler, &embedded).await?;
-                Some(threads)
+                (Some(threads), Some(embedded))
             }
             Err(e) => {
                 let cause = format!("the Kerberos realm {realm} did not open: {e:#}");
@@ -302,7 +303,7 @@ async fn set_up_server(
                     "Only admins may sign in, over LDAP on {} and HTTP on {}",
                     config.ldap_host, config.http_host
                 );
-                None
+                (None, None)
             }
         },
     };
@@ -316,7 +317,7 @@ async fn set_up_server(
         .await
         .context("while binding the TCP server")?;
     // Run every hour.
-    let scheduler = Scheduler::new("0 0 * * * * *", sql_pool, log_retention(&config));
+    let scheduler = Scheduler::new("0 0 * * * * *", sql_pool, log_retention(&config), embedded);
     scheduler.start();
     Ok((server_builder, realm_threads))
 }
@@ -423,8 +424,10 @@ async fn run_healthcheck(opts: RunOpts) -> Result<()> {
     let kerberos = async {
         if config.kerberos_options.enabled {
             healthcheck::check_kerberos(
-                &config.healthcheck_options.ldap_host,
-                config.kerberos_options.kdc_port,
+                &client_address(
+                    &config.kerberos_options.kdc_host,
+                    config.kerberos_options.kdc_port,
+                ),
                 &config.kerberos_options.admin_keytab,
             )
             .await

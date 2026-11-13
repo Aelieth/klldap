@@ -174,7 +174,6 @@ fn start_realm_seeded(
     let keycloak_keytab_s = keycloak_keytab.display().to_string();
     let client_config_s = client_config.display().to_string();
     let mut env = vec![
-        ("LLDAP_KERBEROS_OPTIONS__ENABLED", "true"),
         ("LLDAP_KERBEROS_OPTIONS__KDC_HOST", "127.0.0.1"),
         ("LLDAP_KERBEROS_OPTIONS__KDC_PORT", kdc_port_s.as_str()),
         ("LLDAP_KERBEROS_OPTIONS__KADMIN_HOST", "127.0.0.1"),
@@ -400,7 +399,7 @@ fn kerberos_lifecycle() {
         output_text(&listed_keytab)
             .matches(principal.as_str())
             .count(),
-        2,
+        1,
         "{}",
         output_text(&listed_keytab)
     );
@@ -687,4 +686,113 @@ fn kerberos_migrates_a_dump() {
     );
     let log = realm.fixture.server_log();
     assert_eq!(log.matches("Migrated the MIT realm").count(), 1, "{log}");
+}
+
+#[test]
+fn kerberos_rolls_krbtgt_when_the_first_type_changes() {
+    let mut realm = start_realm(true);
+    let http = client();
+    let base = realm.fixture.http_url();
+    let token = get_token(&http, &base);
+    let created = gql(
+        &http,
+        &base,
+        &token,
+        "mutation($u: CreateUserInput!) { createUser(user: $u) { id } }",
+        json!({"u": {
+            "id": USER,
+            "email": "livebob@example.com",
+            "attributes": [{"name": "kerberossync", "value": ["1"]}]
+        }}),
+    );
+    assert_eq!(created["data"]["createUser"]["id"], USER, "{created}");
+    let set = gql(
+        &http,
+        &base,
+        &token,
+        "mutation($id: String!, $password: String!) { setUserPassword(userId: $id, password: $password) { ok } }",
+        json!({"id": USER, "password": FIRST}),
+    );
+    assert_eq!(set["data"]["setUserPassword"]["ok"], true, "{set}");
+    let export = |token: &str| {
+        let exported = gql(
+            &http,
+            &base,
+            token,
+            "mutation($h: String!) { exportKeytabForKeycloak(hostname: $h) { ok path errorMsg } }",
+            json!({"h": HOST}),
+        );
+        assert_eq!(
+            exported["data"]["exportKeytabForKeycloak"]["ok"], true,
+            "{exported}"
+        );
+    };
+    export(&token);
+    expect_ok(&kinit(&realm.krb, FIRST), "kinit before the roll");
+
+    realm.fixture.restart_with_env(
+        "LLDAP_KERBEROS_OPTIONS__SUPPORTED_ENCTYPES",
+        "[aes128-cts-hmac-sha1-96, aes256-cts-hmac-sha1-96]",
+    );
+    let admin_keytab_s = realm.admin_keytab.display().to_string();
+    let getprinc = format!("getprinc krbtgt/{REALM}");
+    let tgs = realm.krb.run(
+        "kadmin",
+        &[
+            "-k",
+            "-t",
+            admin_keytab_s.as_str(),
+            "-p",
+            "admin/admin",
+            "-q",
+            getprinc.as_str(),
+        ],
+        None,
+    );
+    expect_ok(&tgs, "getprinc krbtgt");
+    let text = output_text(&tgs);
+    let keys: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("Key: "))
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            "Key: vno 2, aes128-cts-hmac-sha1-96",
+            "Key: vno 2, aes256-cts-hmac-sha1-96",
+            "Key: vno 1, aes256-cts-hmac-sha1-96",
+        ],
+        "{text}"
+    );
+    let service = format!("HTTP/{HOST}@{REALM}");
+    expect_ok(
+        &realm.krb.run("kvno", &[service.as_str()], None),
+        "kvno with the ticket from before the roll",
+    );
+    realm.fixture.restart();
+    let log = realm.fixture.server_log();
+    assert_eq!(
+        log.matches(&format!("Rolled the keys of krbtgt/{REALM}"))
+            .count(),
+        1,
+        "{log}"
+    );
+
+    export(&get_token(&http, &base));
+    let keytab = realm.keycloak_keytab.display().to_string();
+    let listed = realm.krb.run("klist", &["-kte", keytab.as_str()], None);
+    expect_ok(&listed, "klist -kte");
+    let listed = output_text(&listed);
+    let types: Vec<&str> = listed
+        .lines()
+        .filter(|line| line.contains(service.as_str()))
+        .filter_map(|line| line.rsplit('(').next())
+        .map(|etype| etype.trim().trim_end_matches(')'))
+        .collect();
+    assert_eq!(
+        types,
+        ["aes128-cts-hmac-sha1-96", "aes256-cts-hmac-sha1-96"],
+        "{listed}"
+    );
 }

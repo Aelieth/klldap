@@ -201,10 +201,10 @@ pub async fn check_api(host: &str, port: u16) -> Result<()> {
 /// every sync operation depends on must exist. Turns a dead KDC into an unhealthy
 /// container instead of a silently-degraded one.
 #[instrument(level = "info", err)]
-pub async fn check_kerberos(host: &str, port: u16, admin_keytab: &Path) -> Result<()> {
-    TcpStream::connect((host, port))
+pub async fn check_kerberos(address: &str, admin_keytab: &Path) -> Result<()> {
+    TcpStream::connect(address)
         .await
-        .with_context(|| format!("KDC not reachable on {host}:{port}"))?;
+        .with_context(|| format!("KDC not reachable on {address}"))?;
     ensure!(
         admin_keytab.exists(),
         "admin keytab {} is missing",

@@ -155,6 +155,12 @@ impl LLDAPFixture {
         self.token = get_token(&self.client, &self.http_url());
     }
 
+    pub fn restart_with_env(&mut self, key: &str, value: &str) {
+        self.extra_env.retain(|(name, _)| name != key);
+        self.extra_env.push((key.to_owned(), value.to_owned()));
+        self.restart();
+    }
+
     pub fn restart_after<T>(&mut self, between: impl FnOnce() -> T) -> T {
         stop_child(&mut self.child);
         let value = between();
@@ -318,6 +324,12 @@ fn server_command(
     extra_env: &[(String, String)],
 ) -> Command {
     let mut cmd = create_lldap_command(subcommand, db_url);
+    if extra_env
+        .iter()
+        .any(|(key, _)| key.starts_with("LLDAP_KERBEROS_OPTIONS__"))
+    {
+        cmd.env_remove(KERBEROS_ENABLED);
+    }
     cmd.env("LLDAP_LDAP_PORT", ldap_port.to_string())
         .env("LLDAP_HTTP_PORT", http_port.to_string())
         .envs(
@@ -456,6 +468,10 @@ pub fn free_port() -> u16 {
     }
 }
 
+// A test that sets no kerberos_options variable runs without a realm; one that does gets the
+// code's default unless it names `enabled` itself.
+const KERBEROS_ENABLED: &str = "LLDAP_KERBEROS_OPTIONS__ENABLED";
+
 pub fn create_lldap_command(subcommand: &str, db_url: &str) -> Command {
     let mut cmd = Command::new(cargo_bin!());
     let path = canonicalize("..").expect("canonical path to repo root");
@@ -463,6 +479,7 @@ pub fn create_lldap_command(subcommand: &str, db_url: &str) -> Command {
     cmd.env(env::DB_KEY, db_url);
     cmd.env(env::PRIVATE_KEY_SEED, "Random value for test");
     cmd.env(env::JWT_SECRET, "Random JWT secret for test");
+    cmd.env(KERBEROS_ENABLED, "false");
     cmd.env(env::LDAP_USER_PASSWORD, "password");
     cmd.arg(subcommand);
     cmd.arg("--config-file=/dev/null");
@@ -482,6 +499,7 @@ pub fn create_lldap_command_with_key_file(
     cmd.env(env::DB_KEY, db_url);
     cmd.env_remove(env::PRIVATE_KEY_SEED);
     cmd.env(env::JWT_SECRET, "Random JWT secret for test");
+    cmd.env(KERBEROS_ENABLED, "false");
     cmd.arg(subcommand);
     cmd.arg("--config-file=/dev/null");
     cmd.arg(format!("--server-key-file={key_file}"));

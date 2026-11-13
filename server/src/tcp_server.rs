@@ -128,15 +128,16 @@ async fn main_js_handler<Backend>(
 async fn wasm_handler<Backend>(
     data: web::Data<AppState<Backend>>,
 ) -> actix_web::Result<impl Responder> {
-    Ok(actix_files::NamedFile::open_async(data.assets_path.join("pkg/lldap_app_bg.wasm")).await?)
+    Ok(actix_files::NamedFile::open(
+        data.assets_path.join("pkg/lldap_app_bg.wasm"),
+    )?)
 }
 
 async fn wasm_handler_compressed<Backend>(
     data: web::Data<AppState<Backend>>,
 ) -> actix_web::Result<impl Responder> {
     Ok(
-        actix_files::NamedFile::open_async(data.assets_path.join("pkg/lldap_app_bg.wasm.gz"))
-            .await?
+        actix_files::NamedFile::open(data.assets_path.join("pkg/lldap_app_bg.wasm.gz"))?
             .customize()
             .insert_header(header::ContentEncoding::Gzip)
             .insert_header((header::CONTENT_TYPE, "application/wasm")),

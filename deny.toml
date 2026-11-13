@@ -36,7 +36,6 @@ unsound = "all"
 ignore = [
     { id = "RUSTSEC-2026-0459", reason = "bundled SQLite: needs a crafted database and -wal pair opened locally; the server opens only its own database; goes with the next sqlx move" },
     { id = "RUSTSEC-2026-0387", reason = "crypto-bigint through opaque-ke's elliptic-curve; moves when opaque-ke does, as upstream" },
-    { id = "RUSTSEC-2026-0443", reason = "actix-files: Windows 8.3 short names; KLLDAP ships for Linux only" },
     { id = "RUSTSEC-2024-0421", reason = "idna 0.2.3 is the browser app's validator only; not in the server" },
     { id = "RUSTSEC-2025-0141", reason = "bincode: unmaintained, no upgrade offered; as upstream" },
     { id = "RUSTSEC-2016-0007", reason = "jwt: unmaintained, no upgrade offered; as upstream" },

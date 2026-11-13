@@ -29,6 +29,8 @@ Next release. The KDC is kerber-rust inside the `lldap` process.
   nothing of ours sends a compressed request, so clients see no change. `h2` leaves
   the lock, and RUSTSEC-2026-0258 with it. A precompressed `.wasm.gz` response is
   unchanged: the handler sets that header itself.
+- `actix-files` 0.7.4 replaces 0.6.10. The wasm handlers call `NamedFile::open`.
+  RUSTSEC-2026-0443, the Windows short-name ignore, leaves with 0.6.
 
 ### Configuration
 

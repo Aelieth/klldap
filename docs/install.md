@@ -125,7 +125,13 @@ The binary is `target/release/lldap`.
 It runs `wasm-pack build --target web --release`.
 
 You can also install it as a systemd service, see
-[lldap.service](../example_configs/lldap.service).
+[lldap.service](../example_configs/lldap.service). The shipped unit is for
+SQLite. With PostgreSQL on the same host, add a drop-in and leave that unit
+as shipped:
+
+    Wants=postgresql.service
+    After=postgresql.service
+    Restart=on-failure
 
 ### Cross-compilation
 
@@ -151,4 +157,6 @@ Write a dump of the Kerberos realm with the 0.7.2 image before the first 0.8.0 s
 loads it and keeps the MIT files: [kerberos.md](kerberos.md#upgrading-from-072).
 
 **A 0.7.2 compose file that publishes `88:88` must publish `88:1088`, or the KDC is
-unreachable after the upgrade.**
+unreachable after the upgrade.** If `key_seed` is unset, keep the key file the
+first start writes: that write is not synced, and a lost key makes the next
+start refuse.

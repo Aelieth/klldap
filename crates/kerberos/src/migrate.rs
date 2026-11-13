@@ -1,17 +1,19 @@
 use crate::boot::RealmSettings;
 use anyhow::{Context, Result, anyhow, bail};
-use krb5_kdc::{PrincipalStore, load_dump_with_stash, parse_dump, save_store};
+use krb5_kdc::host::{HostPaths, KerberosStore, KerberosStoreError};
+use krb5_kdc::{create_lockout_file, load_dump_with_stash, parse_dump};
 use std::fs::{self, File};
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 
 const DB: &str = "principal";
 const DUMP: &str = "principal.dump";
 const BACKUP: &str = "mit-db2.bak";
-const STAGING: &str = ".migrating";
 const HEADER: &[u8] = b"kdb5_util load_dump version ";
+// The dump moves last, so a dump still here means the move is unfinished.
 const MIT_FILES: [&str; 7] = [
     DB,
     "principal.kadm5",
@@ -24,69 +26,70 @@ const MIT_FILES: [&str; 7] = [
 
 #[derive(Debug, PartialEq)]
 pub(crate) enum Found {
-    Ours,
-    Staged,
-    Lost,
     Dump,
     MitOnly,
     Empty,
 }
 
 pub(crate) fn detect(dir: &Path) -> Result<Found> {
+    if dir.join(DUMP).exists() {
+        return Ok(Found::Dump);
+    }
     let db = dir.join(DB);
-    if db.exists() {
+    let mit_db = if db.exists() {
         let mut head = Vec::new();
         File::open(&db)
             .and_then(|f| f.take(HEADER.len() as u64).read_to_end(&mut head))
             .with_context(|| format!("while reading {}", db.display()))?;
-        if head == HEADER {
-            return Ok(Found::Ours);
-        }
-    } else if dir.join(BACKUP).is_dir() {
-        return Ok(if dir.join(STAGING).join(DB).exists() {
-            Found::Staged
-        } else {
-            Found::Lost
-        });
-    }
-    Ok(if dir.join(DUMP).exists() {
-        Found::Dump
-    } else if db.exists() || dir.join("principal.kadm5").exists() {
-        Found::MitOnly
+        head != HEADER
     } else {
-        Found::Empty
-    })
+        dir.join("principal.kadm5").exists()
+    };
+    Ok(if mit_db { Found::MitOnly } else { Found::Empty })
 }
 
-/// Turns an MIT realm (0.7.2) into ours: loaded from its dump into a staging directory, then the
-/// MIT files move to `mit-db2.bak/` and the new database into place, last.
-pub(crate) fn migrate(settings: &RealmSettings) -> Result<()> {
+/// Turns an MIT realm (0.7.2) into ours: the dump goes into the database, then the MIT files
+/// move to `mit-db2.bak/`. A boot that finds the dump after the realm reached the database
+/// finishes the move.
+pub(crate) fn migrate(
+    settings: &RealmSettings,
+    paths: &HostPaths,
+    host: &dyn KerberosStore,
+) -> Result<()> {
     let dir = &settings.data_dir;
+    let backup = dir.join(BACKUP);
     match detect(dir)? {
-        Found::Ours | Found::Empty => return Ok(()),
-        Found::Lost => bail!(
-            "{} has no Kerberos database, but {} holds the MIT files of an earlier migration; \
-             restore the database instead of starting a new realm",
-            dir.display(),
-            dir.join(BACKUP).display()
+        Found::Empty if backup.is_dir() && !paths.stash.exists() && !realm_held(host)? => bail!(
+            "{} holds the MIT files of an earlier migration, but the database has no Kerberos \
+             realm and {} is missing; restore the database and the stash, or move {} away to \
+             start a new realm on purpose",
+            backup.display(),
+            paths.stash.display(),
+            backup.display()
         ),
+        Found::Empty => Ok(()),
         Found::MitOnly => bail!(
             "{} holds the MIT database of KLLDAP 0.7.2, which 0.8.0 cannot open; write its dump to \
              {} with the 0.7.2 image (docs/kerberos.md, Upgrading from 0.7.2) and start again",
             dir.display(),
             dir.join(DUMP).display()
         ),
-        Found::Dump => stage(settings)?,
-        Found::Staged => {}
+        Found::Dump if realm_held(host)? => finish(dir, false),
+        Found::Dump => {
+            import(settings, paths, host)?;
+            finish(dir, true)
+        }
     }
-    finish(dir)
 }
 
-pub(crate) fn import(dump: &str, stash: &[u8]) -> Result<PrincipalStore> {
-    load_dump_with_stash(dump, stash).map_err(|e| anyhow!("the dump does not load: {e}"))
+fn realm_held(host: &dyn KerberosStore) -> Result<bool> {
+    let loaded = host
+        .load()
+        .map_err(|e| anyhow!("while reading the realm from the database: {e}"))?;
+    Ok(loaded.realm.is_some() || !loaded.principals.is_empty())
 }
 
-fn stage(settings: &RealmSettings) -> Result<()> {
+fn import(settings: &RealmSettings, paths: &HostPaths, host: &dyn KerberosStore) -> Result<()> {
     let dir = &settings.data_dir;
     let text = fs::read_to_string(dir.join(DUMP))
         .with_context(|| format!("while reading {}", dir.join(DUMP).display()))?;
@@ -100,19 +103,27 @@ fn stage(settings: &RealmSettings) -> Result<()> {
             settings.realm
         );
     }
-    let stash_path = dir.join(format!(".k5.{}", settings.realm));
-    let stash = fs::read(&stash_path).with_context(|| {
+    let stash = fs::read(&paths.stash).with_context(|| {
         format!(
             "{} has a dump but no stash at {}",
             dir.display(),
-            stash_path.display()
+            paths.stash.display()
         )
     })?;
-    let store = import(&text, &stash)?;
-    let staging = dir.join(STAGING);
-    owner_only_dir(&staging)?;
-    save_store(&store, &staging.join(DB), &stash_path)
-        .map_err(|e| anyhow!("while writing the migrated database: {e}"))?;
+    let store =
+        load_dump_with_stash(&text, &stash).map_err(|e| anyhow!("the dump does not load: {e}"))?;
+    create_lockout_file(&paths.lockout)
+        .map_err(|e| anyhow!("while creating {}: {e}", paths.lockout.display()))?;
+    let batch = store
+        .host_full_batch()
+        .map_err(|e| anyhow!("while sealing the imported realm: {e}"))?;
+    host.commit(batch).map_err(|e| match e {
+        KerberosStoreError::Refused(why) => anyhow!(
+            "the database refused the imported realm: {why}; create the user it names, or \
+             remove the principal on 0.7.2 and dump again"
+        ),
+        e => anyhow!("while writing the imported realm to the database: {e}"),
+    })?;
     info!(
         "Loaded {} Kerberos principals from {}",
         dump.princs.len(),
@@ -121,30 +132,34 @@ fn stage(settings: &RealmSettings) -> Result<()> {
     Ok(())
 }
 
-fn finish(dir: &Path) -> Result<()> {
+fn finish(dir: &Path, imported: bool) -> Result<()> {
     let backup = dir.join(BACKUP);
     owner_only_dir(&backup)?;
     for name in MIT_FILES {
-        let (from, to) = (dir.join(name), backup.join(name));
-        if from.exists() && !to.exists() {
-            fs::rename(&from, &to).with_context(|| format!("while moving {}", from.display()))?;
+        let from = dir.join(name);
+        if !from.exists() {
+            continue;
         }
+        let mut to = backup.join(name);
+        if to.exists() {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs());
+            to = backup.join(format!("{name}.{now}"));
+        }
+        fs::rename(&from, &to).with_context(|| format!("while moving {}", from.display()))?;
     }
-    let staging = dir.join(STAGING);
-    let mut names = fs::read_dir(&staging)
-        .with_context(|| format!("while reading {}", staging.display()))?
-        .map(|entry| entry.map(|e| e.file_name()))
-        .collect::<std::io::Result<Vec<_>>>()?;
-    names.sort_by_key(|name| name.to_str() == Some(DB));
-    for name in names {
-        fs::rename(staging.join(&name), dir.join(&name))
-            .with_context(|| format!("while installing {name:?}"))?;
+    if imported {
+        info!(
+            "Migrated the MIT realm; its files are kept in {}",
+            backup.display()
+        );
+    } else {
+        info!(
+            "The realm was already in the database; put the MIT files left beside it in {}",
+            backup.display()
+        );
     }
-    fs::remove_dir(&staging).with_context(|| format!("while removing {}", staging.display()))?;
-    info!(
-        "Migrated the MIT realm; its files are kept in {}",
-        backup.display()
-    );
     Ok(())
 }
 
@@ -159,42 +174,79 @@ mod tests {
     use super::*;
     use crate::boot;
     use crate::embedded::tests::TempRealm;
+    use krb5_config::KdcPaths;
+    use krb5_kdc::host::{LoadedRealm, RealmBatch};
     use pretty_assertions::assert_eq;
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+    use std::sync::Arc;
 
     type Spoil = fn(&mut TempRealm);
 
     fn realm_as_mit(temp: &TempRealm) {
         let settings = &temp.settings;
-        boot::open_store(settings, &boot::profile(settings)).unwrap();
         let dir = &settings.data_dir;
+        fs::create_dir_all(dir).unwrap();
+        let profile = boot::profile(settings);
+        let paths = KdcPaths {
+            profile: PathBuf::new(),
+            conf: profile.kdc.clone(),
+            realm: Some(settings.realm.clone()),
+            database_name: dir.join(DB),
+            key_stash_file: dir.join(".k5.EXAMPLE.COM"),
+            acl_file: None,
+            master_key_type: Some("aes256-cts-hmac-sha1-96".to_owned()),
+        };
+        krb5_kdc::open_or_create(&paths, &profile, None).unwrap();
         fs::copy(dir.join(DB), dir.join(DUMP)).unwrap();
         fs::write(dir.join(DB), "\u{0}\u{6}\u{15}\u{61} db2").unwrap();
         fs::write(dir.join("principal.kadm5"), "").unwrap();
-        fs::remove_file(dir.join("principal.lockout")).unwrap();
+        let _ = fs::remove_file(dir.join("principal.lockout"));
+    }
+
+    fn dumped_names(dir: &Path) -> BTreeSet<String> {
+        let text = fs::read_to_string(dir.join(DUMP)).unwrap();
+        parse_dump(&text)
+            .unwrap()
+            .princs
+            .into_iter()
+            .map(|p| p.name.trim_end_matches("@EXAMPLE.COM").to_owned())
+            .collect()
+    }
+
+    fn held_names(temp: &TempRealm) -> BTreeSet<String> {
+        temp.host
+            .load()
+            .unwrap()
+            .principals
+            .into_iter()
+            .map(|p| p.name)
+            .collect()
+    }
+
+    fn kept(dir: &Path) -> Vec<String> {
+        let mut kept: Vec<_> = fs::read_dir(dir.join(BACKUP))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        kept.sort();
+        kept
     }
 
     #[test]
     fn test_detect() {
         let ours = "kdb5_util load_dump version 7\n";
         let db2 = "\u{0}\u{6}\u{15}\u{61}";
-        let rows: [(&[(&str, &str)], Found); 8] = [
+        let rows: [(&[(&str, &str)], Found); 6] = [
             (&[], Found::Empty),
-            (&[(DB, ours)], Found::Ours),
-            (&[(DB, ours), (DUMP, "stale")], Found::Ours),
+            (&[(DB, ours)], Found::Empty),
             (&[(DB, db2), ("principal.kadm5", "")], Found::MitOnly),
             (&[("principal.kadm5", "")], Found::MitOnly),
             (
                 &[(DB, db2), ("principal.kadm5", ""), (DUMP, "x")],
                 Found::Dump,
             ),
-            (
-                &[
-                    (".migrating/principal", "x"),
-                    ("mit-db2.bak/principal", db2),
-                ],
-                Found::Staged,
-            ),
-            (&[("mit-db2.bak/principal", db2)], Found::Lost),
+            (&[(DUMP, "x"), ("mit-db2.bak/principal", db2)], Found::Dump),
         ];
         for (files, expected) in rows {
             let temp = TempRealm::new();
@@ -215,21 +267,10 @@ mod tests {
         realm_as_mit(&temp);
         let settings = &temp.settings;
         let dir = &settings.data_dir;
-        let names = |text: &str| {
-            let mut names: Vec<_> = (parse_dump(text).unwrap().princs.into_iter())
-                .map(|p| p.name)
-                .collect();
-            names.sort();
-            names
-        };
-        let before = names(&fs::read_to_string(dir.join(DUMP)).unwrap());
-        migrate(settings).unwrap();
-        let backup = dir.join(BACKUP);
-        let mut kept: Vec<_> = fs::read_dir(&backup)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().into_string().unwrap())
-            .collect();
-        kept.sort();
+        let before = dumped_names(dir);
+        boot::open_store(settings, &boot::profile(settings), temp.host()).unwrap();
+        let held = held_names(&temp);
+        let commits = temp.commits();
         let mit = [
             DB,
             DUMP,
@@ -237,31 +278,112 @@ mod tests {
             "principal.kadm5.lock",
             "principal.ok",
         ];
-        let migrated = fs::read_to_string(dir.join(DB)).unwrap();
         assert_eq!(
             (
                 detect(dir).unwrap(),
-                kept,
-                names(&migrated),
-                dir.join(DUMP).exists() || dir.join(STAGING).exists(),
-                fs::metadata(&backup).unwrap().permissions().mode() & 0o777,
+                kept(dir),
+                before.is_subset(&held),
+                dir.join(boot::LOCKOUT_FILE).exists(),
+                fs::metadata(dir.join(BACKUP)).unwrap().permissions().mode() & 0o777,
             ),
             (
-                Found::Ours,
+                Found::Empty,
                 mit.map(String::from).to_vec(),
-                before,
-                false,
+                true,
+                true,
                 0o700
             )
         );
-        migrate(settings).unwrap();
-        assert_eq!(fs::read_to_string(dir.join(DB)).unwrap(), migrated);
-        boot::open_store(settings, &boot::profile(settings)).unwrap();
+        boot::open_store(settings, &boot::profile(settings), temp.host()).unwrap();
+        assert_eq!(temp.commits(), commits, "a second boot imports nothing");
+    }
+
+    #[test]
+    fn test_each_crash_point_of_the_import_recovers() {
+        type Crash = fn(&TempRealm, &HostPaths);
+        let rows: [(&str, Crash); 4] = [
+            ("after the lockout file", |_, paths| {
+                create_lockout_file(&paths.lockout).unwrap();
+            }),
+            ("after the commit", |temp, paths| {
+                import(&temp.settings, paths, temp.host.as_ref()).unwrap();
+            }),
+            ("during the move", |temp, paths| {
+                import(&temp.settings, paths, temp.host.as_ref()).unwrap();
+                let dir = &temp.settings.data_dir;
+                owner_only_dir(&dir.join(BACKUP)).unwrap();
+                for name in [DB, "principal.kadm5"] {
+                    fs::rename(dir.join(name), dir.join(BACKUP).join(name)).unwrap();
+                }
+            }),
+            ("a dump put back after the move", |temp, paths| {
+                import(&temp.settings, paths, temp.host.as_ref()).unwrap();
+                let dir = &temp.settings.data_dir;
+                finish(dir, true).unwrap();
+                fs::copy(dir.join(BACKUP).join(DUMP), dir.join(DUMP)).unwrap();
+            }),
+        ];
+        for (case, crash) in rows {
+            let temp = TempRealm::new();
+            realm_as_mit(&temp);
+            let settings = &temp.settings;
+            let dir = &settings.data_dir;
+            let before = dumped_names(dir);
+            crash(&temp, &boot::host_paths(settings));
+            boot::open_store(settings, &boot::profile(settings), temp.host()).unwrap();
+            let names = kept(dir);
+            assert_eq!(
+                (
+                    detect(dir).unwrap(),
+                    before.is_subset(&held_names(&temp)),
+                    names.iter().any(|n| n == DUMP),
+                    names.iter().any(|n| n == DB),
+                ),
+                (Found::Empty, true, true, true),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_lost_database_after_a_migration_is_refused() {
+        let temp = TempRealm::new();
+        realm_as_mit(&temp);
+        let settings = &temp.settings;
+        let profile = boot::profile(settings);
+        boot::open_store(settings, &profile, temp.host()).unwrap();
+        let stash = boot::host_paths(settings).stash;
+        fs::remove_file(&stash).unwrap();
+        let empty = Arc::new(crate::embedded::tests::Counting::default());
+        let error = format!(
+            "{:#}",
+            boot::open_store(settings, &profile, empty.clone()).unwrap_err()
+        );
+        assert!(
+            error.contains("holds the MIT files of an earlier migration"),
+            "{error}"
+        );
+        assert!(error.contains("move"), "{error}");
+        assert!(!stash.exists(), "no new realm was made");
+        assert!(empty.load().unwrap().realm.is_none(), "nothing was written");
+    }
+
+    struct Refusing;
+
+    impl KerberosStore for Refusing {
+        fn load(&self) -> Result<LoadedRealm, KerberosStoreError> {
+            Ok(LoadedRealm::default())
+        }
+        fn commit(&self, _: RealmBatch) -> Result<(), KerberosStoreError> {
+            Err(KerberosStoreError::Failed(
+                "the database is down".to_owned(),
+            ))
+        }
     }
 
     #[test]
     fn test_a_realm_that_cannot_migrate_is_refused_untouched() {
-        let rows: [(&str, Spoil, &str); 4] = [
+        let rows: [(&str, Spoil, &str); 3] = [
             (
                 "bad dump",
                 |t| fs::write(t.settings.data_dir.join(DUMP), "not a dump").unwrap(),
@@ -277,27 +399,29 @@ mod tests {
                 |t| t.settings.realm = "OTHER.TEST".to_owned(),
                 "is for realm EXAMPLE.COM, but this server serves OTHER.TEST",
             ),
-            (
-                "database lost after a migration",
-                |t| {
-                    let dir = &t.settings.data_dir;
-                    fs::create_dir(dir.join(BACKUP)).unwrap();
-                    for name in [DB, DUMP] {
-                        fs::rename(dir.join(name), dir.join(BACKUP).join(name)).unwrap();
-                    }
-                },
-                "holds the MIT files of an earlier migration",
-            ),
         ];
         for (case, spoil, cause) in rows {
             let mut temp = TempRealm::new();
             realm_as_mit(&temp);
             spoil(&mut temp);
             let dir = temp.settings.data_dir.clone();
-            let before = detect(&dir).unwrap();
-            let error = format!("{:#}", migrate(&temp.settings).unwrap_err());
+            let paths = boot::host_paths(&temp.settings);
+            let error = format!(
+                "{:#}",
+                migrate(&temp.settings, &paths, temp.host.as_ref()).unwrap_err()
+            );
             assert!(error.contains(cause), "{case}: {error}");
-            assert_eq!(detect(&dir).unwrap(), before, "{case}: nothing moved");
+            assert_eq!(detect(&dir).unwrap(), Found::Dump, "{case}: nothing moved");
+            assert!(held_names(&temp).is_empty(), "{case}: nothing written");
         }
+        let temp = TempRealm::new();
+        realm_as_mit(&temp);
+        let paths = boot::host_paths(&temp.settings);
+        let error = format!(
+            "{:#}",
+            migrate(&temp.settings, &paths, &Refusing).unwrap_err()
+        );
+        assert!(error.contains("the database is down"), "{error}");
+        assert_eq!(detect(&temp.settings.data_dir).unwrap(), Found::Dump);
     }
 }

@@ -1,5 +1,6 @@
 use crate::boot::{self, OpenRealm, RealmSettings};
 use crate::rotate;
+use crate::seam::SqlRealm;
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use krb5_admin::{
@@ -7,6 +8,7 @@ use krb5_admin::{
 };
 use krb5_config::KadmindListen;
 use krb5_crypto::KeySalt;
+use krb5_kdc::host::KerberosStore;
 use krb5_kdc::{
     AdminEnt, AdminFields, Error as StoreError, KDB_REQUIRES_PRE_AUTH, KdcLog, ListenLimits,
     PrincipalRead, PrincipalStore, SharedDump, SharedStore, Shutdown, kadm5_mask,
@@ -53,7 +55,19 @@ pub struct RealmThreads {
 }
 
 impl EmbeddedKerberos {
-    pub fn start(settings: &RealmSettings) -> Result<(Arc<Self>, RealmThreads)> {
+    /// Opens the realm in the directory's database and starts the KDC and kadmind. It blocks on
+    /// the database, so it runs off the async runtime's workers.
+    pub fn start(
+        settings: &RealmSettings,
+        store: Arc<dyn lldap_domain_handlers::kerberos::KerberosStore>,
+    ) -> Result<(Arc<Self>, RealmThreads)> {
+        Self::start_on(settings, Arc::new(SqlRealm(store)))
+    }
+
+    pub(crate) fn start_on(
+        settings: &RealmSettings,
+        host: Arc<dyn KerberosStore>,
+    ) -> Result<(Arc<Self>, RealmThreads)> {
         let OpenRealm {
             store,
             profile,
@@ -61,7 +75,7 @@ impl EmbeddedKerberos {
             kdc_udp,
             kdc_tcp,
             kadmin,
-        } = boot::open(settings)?;
+        } = boot::open(settings, host)?;
         let shutdown = Shutdown::new();
         let stopping = Arc::new(AtomicBool::new(false));
         let ready = Arc::new(AtomicBool::new(false));
@@ -529,6 +543,7 @@ pub(crate) mod tests {
     use super::*;
     use krb5_crypto::EncryptionType;
     use krb5_kdc::KDB_DISALLOW_ALL_TIX;
+    use krb5_kdc::host::{KerberosStoreError, LoadedRealm, MemoryRealm, RealmBatch};
     use lldap_domain_handlers::logging::{RequestMeta, with_request};
     use lldap_test_utils::recording_log::LogGuard;
     use pretty_assertions::assert_eq;
@@ -537,8 +552,26 @@ pub(crate) mod tests {
     use std::path::Path;
     use std::sync::atomic::AtomicUsize;
 
+    /// kerber-rust's in-memory host, counting the commits it takes.
+    #[derive(Default)]
+    pub(crate) struct Counting {
+        realm: MemoryRealm,
+        commits: AtomicUsize,
+    }
+
+    impl KerberosStore for Counting {
+        fn load(&self) -> Result<LoadedRealm, KerberosStoreError> {
+            self.realm.load()
+        }
+        fn commit(&self, batch: RealmBatch) -> Result<(), KerberosStoreError> {
+            self.commits.fetch_add(1, Ordering::Relaxed);
+            self.realm.commit(batch)
+        }
+    }
+
     pub(crate) struct TempRealm {
         pub settings: RealmSettings,
+        pub host: Arc<Counting>,
     }
 
     impl TempRealm {
@@ -550,6 +583,7 @@ pub(crate) mod tests {
                 SEQ.fetch_add(1, Ordering::Relaxed)
             ));
             Self {
+                host: Arc::default(),
                 settings: RealmSettings {
                     realm: "EXAMPLE.COM".to_owned(),
                     domain: "example.com".to_owned(),
@@ -570,9 +604,18 @@ pub(crate) mod tests {
             }
         }
 
+        pub(crate) fn host(&self) -> Arc<dyn KerberosStore> {
+            self.host.clone()
+        }
+
+        pub(crate) fn commits(&self) -> usize {
+            self.host.commits.load(Ordering::Relaxed)
+        }
+
         pub(crate) fn embedded(&self) -> (EmbeddedKerberos, SharedDump) {
             let profile = boot::profile(&self.settings);
-            let store = krb5_kdc::shared_dump(boot::open_store(&self.settings, &profile).unwrap());
+            let opened = boot::open_store(&self.settings, &profile, self.host()).unwrap();
+            let store = krb5_kdc::shared_dump(opened);
             let ready = Arc::new(AtomicBool::new(true));
             (
                 EmbeddedKerberos::new(store.clone(), &self.settings, ready),
@@ -718,13 +761,13 @@ pub(crate) mod tests {
             .unwrap();
         let users = vec![bob, UserId::new("nobody")];
         embedded.reconcile(users.clone()).await.unwrap();
-        let before = files(&temp.settings.data_dir);
+        let (before, commits) = (files(&temp.settings.data_dir), temp.commits());
         let again = embedded.reconcile(users).await.unwrap();
-        let mut reopened =
-            boot::open_store(&temp.settings, &boot::profile(&temp.settings)).unwrap();
+        let profile = boot::profile(&temp.settings);
+        let mut reopened = boot::open_store(&temp.settings, &profile, temp.host()).unwrap();
         boot::rotate_keys(&mut reopened, &temp.settings).unwrap();
         boot::rotate_keys(&mut store.write().unwrap(), &temp.settings).unwrap();
-        assert_eq!(again, (0, 1));
+        assert_eq!((again, temp.commits()), ((0, 1), commits));
         assert_eq!(files(&temp.settings.data_dir), before);
     }
 
@@ -741,7 +784,9 @@ pub(crate) mod tests {
             (&port_taken, "while binding the KDC on UDP"),
             (&dir_is_a_file, "while creating"),
         ] {
-            let error = EmbeddedKerberos::start(&temp.settings).err().unwrap();
+            let error = EmbeddedKerberos::start_on(&temp.settings, temp.host())
+                .err()
+                .unwrap();
             assert!(format!("{error:#}").contains(cause), "{error:#}");
         }
     }

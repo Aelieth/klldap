@@ -3,7 +3,8 @@ use crate::rotate;
 use anyhow::{Context, Result, anyhow, bail};
 use krb5_config::{KdcConf, KdcPaths, Krb5Conf, ProfileSet, listen::ListenAddr};
 use krb5_crypto::EncryptionType;
-use krb5_kdc::{Acl, AdminSpec, PrincipalStore, SharedDump};
+use krb5_kdc::host::{HostPaths, KerberosStore};
+use krb5_kdc::{Acl, AdminSpec, Error as StoreError, PrincipalStore, SharedDump};
 use krb5_types::PrincipalName;
 use minijinja::{Environment, context};
 use std::fs;
@@ -15,6 +16,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 const MASTER_KEY_TYPE: &str = "aes256-cts-hmac-sha1-96";
+pub(crate) const LOCKOUT_FILE: &str = "lockout";
 const CLIENT_CONFIG_TEMPLATE: &str = include_str!("../../../kerberos/krb5.template.conf");
 
 /// The realm as the server resolved it from `[kerberos_options]`.
@@ -76,12 +78,12 @@ pub(crate) struct OpenRealm {
     pub kadmin: TcpListener,
 }
 
-pub(crate) fn open(settings: &RealmSettings) -> Result<OpenRealm> {
+pub(crate) fn open(settings: &RealmSettings, host: Arc<dyn KerberosStore>) -> Result<OpenRealm> {
     if !krb5_types::pkinit::P384_ENABLED {
         bail!("this build lacks --cfg p384_backend=\"fiat\" (.cargo/config.toml), so P-384 is off");
     }
     let profile = profile(settings);
-    let mut store = open_store(settings, &profile)?;
+    let mut store = open_store(settings, &profile, host)?;
     rotate_keys(&mut store, settings)?;
     store
         .policy
@@ -153,23 +155,31 @@ pub(crate) fn rotate_keys(store: &mut PrincipalStore, settings: &RealmSettings) 
     Ok(())
 }
 
-/// Opens the realm's database, creating it on first boot, and writes the admin keytab.
-pub(crate) fn open_store(settings: &RealmSettings, profile: &ProfileSet) -> Result<PrincipalStore> {
+/// Opens the realm from the host's database, creating it on first boot or importing a 0.7.2
+/// dump, and writes the admin keytab.
+pub(crate) fn open_store(
+    settings: &RealmSettings,
+    profile: &ProfileSet,
+    host: Arc<dyn KerberosStore>,
+) -> Result<PrincipalStore> {
     let realm = &settings.realm;
     secure_dir(&settings.data_dir)?;
-    crate::migrate::migrate(settings)?;
+    let host_paths = host_paths(settings);
+    crate::migrate::migrate(settings, &host_paths, host.as_ref())?;
     let paths = KdcPaths {
         profile: PathBuf::new(),
         conf: profile.kdc.clone(),
         realm: Some(realm.clone()),
-        database_name: settings.data_dir.join("principal"),
-        key_stash_file: settings.data_dir.join(format!(".k5.{realm}")),
+        database_name: PathBuf::new(),
+        key_stash_file: PathBuf::new(),
         acl_file: settings.kadmin_acl.clone(),
         master_key_type: Some(MASTER_KEY_TYPE.to_owned()),
     };
     let admin = AdminSpec::new(admin_principal());
-    let (store, booted) = krb5_kdc::open_or_create(&paths, profile, Some(admin))
-        .with_context(|| format!("while opening the Kerberos realm {realm}"))?;
+    let (store, booted) =
+        krb5_kdc::open_or_create_host(&paths, profile, Some(admin), host, &host_paths)
+            .map_err(boot_error)
+            .with_context(|| format!("while opening the Kerberos realm {realm}"))?;
     let keytab = booted
         .admin_keytab
         .context("the realm returned no admin keytab")?;
@@ -178,6 +188,52 @@ pub(crate) fn open_store(settings: &RealmSettings, profile: &ProfileSet) -> Resu
         .write_file(&settings.admin_keytab)
         .with_context(|| format!("while writing {}", settings.admin_keytab.display()))?;
     Ok(store)
+}
+
+pub(crate) fn host_paths(settings: &RealmSettings) -> HostPaths {
+    HostPaths {
+        stash: settings.data_dir.join(format!(".k5.{}", settings.realm)),
+        lockout: settings.data_dir.join(LOCKOUT_FILE),
+    }
+}
+
+fn boot_error(e: StoreError) -> anyhow::Error {
+    let cause = match &e {
+        StoreError::StashWithoutHostRealm { stash } => Some(format!(
+            "the database holds no Kerberos realm, but the stash {} belongs to one; restore the \
+             database, or put the 0.7.2 dump back beside the stash to run the import again",
+            stash.display()
+        )),
+        StoreError::HostRecordsWithoutStash { stash, records } => Some(format!(
+            "the database holds the realm ({records} records) but its stash {} is missing; \
+             restore the stash from the backup taken with the database",
+            stash.display()
+        )),
+        StoreError::LockoutMissing { path } => Some(format!(
+            "the lockout file {} is missing; restore it, or create an empty one to count failed \
+             logins from zero",
+            path.display()
+        )),
+        StoreError::LockoutUnreadable { path, .. } => Some(format!(
+            "the lockout file {} cannot be read or written; restore it, or put an empty file in \
+             its place",
+            path.display()
+        )),
+        StoreError::LockoutForeign { path } => Some(format!(
+            "{} is not a kerber-rust lockout file; restore it, or put an empty file in its place",
+            path.display()
+        )),
+        StoreError::Record(_) => Some("a Kerberos record in the database does not open".to_owned()),
+        StoreError::Host(_) => Some(
+            "the database refused or did not answer the realm's first read or write".to_owned(),
+        ),
+        _ => None,
+    };
+    let e = anyhow::Error::new(e);
+    match cause {
+        Some(cause) => e.context(cause),
+        None => e,
+    }
 }
 
 pub(crate) fn admin_principal() -> PrincipalName {
@@ -353,6 +409,7 @@ fn create_parent(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::embedded::tests::TempRealm;
+    use krb5_kdc::host::{KerberosStoreError, LoadedRealm, PrincipalRow, RealmBatch};
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -463,10 +520,103 @@ mod tests {
                 fs::create_dir_all(dir).unwrap();
                 fs::set_permissions(dir, fs::Permissions::from_mode(mode)).unwrap();
             }
-            open_store(&temp.settings, &profile(&temp.settings)).unwrap();
+            open_store(&temp.settings, &profile(&temp.settings), temp.host()).unwrap();
             let mode = fs::metadata(dir).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700, "existing mode {looser:?}");
         }
+    }
+
+    struct Unanswered;
+
+    impl KerberosStore for Unanswered {
+        fn load(&self) -> Result<LoadedRealm, KerberosStoreError> {
+            Err(KerberosStoreError::NotReady("no answer".to_owned()))
+        }
+        fn commit(&self, _: RealmBatch) -> Result<(), KerberosStoreError> {
+            Err(KerberosStoreError::NotReady("no answer".to_owned()))
+        }
+    }
+
+    fn unopenable_row() -> RealmBatch {
+        RealmBatch {
+            upsert_principals: vec![PrincipalRow {
+                name: "broken@EXAMPLE.COM".to_owned(),
+                record: vec![0; 16],
+                has_keys: false,
+                disabled: false,
+                kvno: 1,
+                expiration: None,
+                password_expiration: None,
+                policy: None,
+                modified_date: 0,
+                attributes: 0,
+                alias_target: None,
+            }],
+            ..RealmBatch::default()
+        }
+    }
+
+    #[test]
+    fn test_each_boot_error_names_its_cause() {
+        type Spoil = fn(&TempRealm);
+        let rows: [(bool, Spoil, &str); 6] = [
+            (
+                false,
+                |t| {
+                    fs::create_dir_all(&t.settings.data_dir).unwrap();
+                    fs::write(t.settings.data_dir.join(".k5.EXAMPLE.COM"), b"key").unwrap();
+                },
+                "put the 0.7.2 dump back beside the stash",
+            ),
+            (
+                true,
+                |t| fs::remove_file(t.settings.data_dir.join(".k5.EXAMPLE.COM")).unwrap(),
+                "restore the stash from the backup",
+            ),
+            (
+                true,
+                |t| fs::remove_file(t.settings.data_dir.join(LOCKOUT_FILE)).unwrap(),
+                "create an empty one to count failed logins from zero",
+            ),
+            (
+                true,
+                |t| {
+                    let path = t.settings.data_dir.join(LOCKOUT_FILE);
+                    fs::remove_file(&path).unwrap();
+                    fs::create_dir(&path).unwrap();
+                },
+                "cannot be read or written",
+            ),
+            (
+                true,
+                |t| fs::write(t.settings.data_dir.join(LOCKOUT_FILE), "not ours").unwrap(),
+                "is not a kerber-rust lockout file",
+            ),
+            (
+                true,
+                |t| t.host.commit(unopenable_row()).unwrap(),
+                "a Kerberos record in the database does not open",
+            ),
+        ];
+        for (opened, spoil, cause) in rows {
+            let temp = TempRealm::new();
+            let profile = profile(&temp.settings);
+            if opened {
+                open_store(&temp.settings, &profile, temp.host()).unwrap();
+            }
+            spoil(&temp);
+            let error = open_store(&temp.settings, &profile, temp.host()).unwrap_err();
+            assert!(format!("{error:#}").contains(cause), "{cause}: {error:#}");
+        }
+        let temp = TempRealm::new();
+        let error = open_store(
+            &temp.settings,
+            &profile(&temp.settings),
+            Arc::new(Unanswered),
+        );
+        let error = format!("{:#}", error.unwrap_err());
+        let expected = "the database refused or did not answer the realm's first read or write";
+        assert!(error.contains(expected), "{error}");
     }
 
     #[test]

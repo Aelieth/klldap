@@ -13,6 +13,7 @@ rust-version.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+chrono = { workspace = true }
 krb5-admin = { workspace = true }
 krb5-config = { workspace = true }
 krb5-crypto = { workspace = true }
@@ -33,7 +34,11 @@ path = "../domain-handlers"
 
 [dev-dependencies]
 pretty_assertions = { workspace = true }
+sea-orm = { workspace = true }
 serial_test = { workspace = true }
+
+[dev-dependencies.lldap_sql_backend_handler]
+path = "../sql-backend-handler"
 
 [dev-dependencies.lldap_test_utils]
 path = "../test-utils"

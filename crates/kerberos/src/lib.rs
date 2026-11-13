@@ -5,3 +5,4 @@ pub mod embedded;
 mod migrate;
 mod policy;
 mod rotate;
+mod seam;

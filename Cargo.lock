@@ -2874,8 +2874,8 @@ dependencies = [
 
 [[package]]
 name = "krb5-admin"
-version = "1.2.1"
-source = "git+https://github.com/Aelieth/kerber-rust?tag=v1.2.1#43c8c9b39bc8c26895a4762ce209017536e9b60b"
+version = "1.2.2"
+source = "git+https://github.com/Aelieth/kerber-rust?tag=v1.2.2-rc.1#d28a8fb1ceddc85248c2de5313b3559bfd2adc27"
 dependencies = [
  "bytes",
  "chrono",
@@ -2899,8 +2899,8 @@ dependencies = [
 
 [[package]]
 name = "krb5-asn1"
-version = "1.2.1"
-source = "git+https://github.com/Aelieth/kerber-rust?tag=v1.2.1#43c8c9b39bc8c26895a4762ce209017536e9b60b"
+version = "1.2.2"
+source = "git+https://github.com/Aelieth/kerber-rust?tag=v1.2.2-rc.1#d28a8fb1ceddc85248c2de5313b3559bfd2adc27"
 dependencies = [
  "krb5-log",
  "krb5-types",
@@ -2910,8 +2910,8 @@ dependencies = [
 
 [[package]]
 name = "krb5-brainpool"
-version = "1.2.1"
-source = "git+https://github.com/Aelieth/kerber-rust?tag=v1.2.1#43c8c9b39bc8c26895a4762ce209017536e9b60b"
+version = "1.2.2"
+source = "git+https://github.com/Aelieth/kerber-rust?tag=v1.2.2-rc.1#d28a8fb1ceddc85248c2de5313b3559bfd2adc27"
 dependencies = [
  "ecdsa 0.17.0",
  "elliptic-curve 0.14.3",
@@ -2922,8 +2922,8 @@ dependencies = [
 
 [[package]]
 name = "krb5-cli"
-version = "1.2.1"
-source = "git+https://github.com/Aelieth/kerber-rust?tag=v1.2.1#43c8c9b39bc8c26895a4762ce209017536e9b60b"
+version = "1.2.2"
+source = "git+https://github.com/Aelieth/kerber-rust?tag=v1.2.2-rc.1#d28a8fb1ceddc85248c2de5313b3559bfd2adc27"
 dependencies = [
  "nix",
  "thiserror 2.0.18",
@@ -2932,8 +2932,8 @@ dependencies = [
 
 [[package]]
 name = "krb5-client"
-version = "1.2.1"
-source = "git+https://github.com/Aelieth/kerber-rust?tag=v1.2.1#43c8c9b39bc8c26895a4762ce209017536e9b60b"
+version = "1.2.2"
+source = "git+https://github.com/Aelieth/kerber-rust?tag=v1.2.2-rc.1#d28a8fb1ceddc85248c2de5313b3559bfd2adc27"
 dependencies = [
  "chrono",
  "krb5-asn1",
@@ -2950,8 +2950,8 @@ dependencies = [
 
 [[package]]
 name = "krb5-config"
-version = "1.2.1"
-source = "git+https://github.com/Aelieth/kerber-rust?tag=v1.2.1#43c8c9b39bc8c26895a4762ce209017536e9b60b"
+version = "1.2.2"
+source = "git+https://github.com/Aelieth/kerber-rust?tag=v1.2.2-rc.1#d28a8fb1ceddc85248c2de5313b3559bfd2adc27"
 dependencies = [
  "dns-lookup",
  "getrandom 0.2.17",
@@ -2962,8 +2962,8 @@ dependencies = [
 
 [[package]]
 name = "krb5-crypto"
-version = "1.2.1"
-source = "git+https://github.com/Aelieth/kerber-rust?tag=v1.2.1#43c8c9b39bc8c26895a4762ce209017536e9b60b"
+version = "1.2.2"
+source = "git+https://github.com/Aelieth/kerber-rust?tag=v1.2.2-rc.1#d28a8fb1ceddc85248c2de5313b3559bfd2adc27"
 dependencies = [
  "aes",
  "camellia",
@@ -2987,8 +2987,8 @@ dependencies = [
 
 [[package]]
 name = "krb5-gss"
-version = "1.2.1"
-source = "git+https://github.com/Aelieth/kerber-rust?tag=v1.2.1#43c8c9b39bc8c26895a4762ce209017536e9b60b"
+version = "1.2.2"
+source = "git+https://github.com/Aelieth/kerber-rust?tag=v1.2.2-rc.1#d28a8fb1ceddc85248c2de5313b3559bfd2adc27"
 dependencies = [
  "getrandom 0.2.17",
  "krb5-asn1",
@@ -3002,8 +3002,8 @@ dependencies = [
 
 [[package]]
 name = "krb5-kdc"
-version = "1.2.1"
-source = "git+https://github.com/Aelieth/kerber-rust?tag=v1.2.1#43c8c9b39bc8c26895a4762ce209017536e9b60b"
+version = "1.2.2"
+source = "git+https://github.com/Aelieth/kerber-rust?tag=v1.2.2-rc.1#d28a8fb1ceddc85248c2de5313b3559bfd2adc27"
 dependencies = [
  "getrandom 0.2.17",
  "krb5-asn1",
@@ -3024,8 +3024,8 @@ dependencies = [
 
 [[package]]
 name = "krb5-log"
-version = "1.2.1"
-source = "git+https://github.com/Aelieth/kerber-rust?tag=v1.2.1#43c8c9b39bc8c26895a4762ce209017536e9b60b"
+version = "1.2.2"
+source = "git+https://github.com/Aelieth/kerber-rust?tag=v1.2.2-rc.1#d28a8fb1ceddc85248c2de5313b3559bfd2adc27"
 dependencies = [
  "chrono",
  "getrandom 0.2.17",
@@ -3037,8 +3037,8 @@ dependencies = [
 
 [[package]]
 name = "krb5-protocol"
-version = "1.2.1"
-source = "git+https://github.com/Aelieth/kerber-rust?tag=v1.2.1#43c8c9b39bc8c26895a4762ce209017536e9b60b"
+version = "1.2.2"
+source = "git+https://github.com/Aelieth/kerber-rust?tag=v1.2.2-rc.1#d28a8fb1ceddc85248c2de5313b3559bfd2adc27"
 dependencies = [
  "bytes",
  "getrandom 0.2.17",
@@ -3057,8 +3057,8 @@ dependencies = [
 
 [[package]]
 name = "krb5-types"
-version = "1.2.1"
-source = "git+https://github.com/Aelieth/kerber-rust?tag=v1.2.1#43c8c9b39bc8c26895a4762ce209017536e9b60b"
+version = "1.2.2"
+source = "git+https://github.com/Aelieth/kerber-rust?tag=v1.2.2-rc.1#d28a8fb1ceddc85248c2de5313b3559bfd2adc27"
 dependencies = [
  "bp256",
  "bp384",
@@ -3336,6 +3336,7 @@ version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "krb5-admin",
  "krb5-config",
  "krb5-crypto",
@@ -3345,9 +3346,11 @@ dependencies = [
  "krb5-types",
  "lldap_domain",
  "lldap_domain_handlers",
+ "lldap_sql_backend_handler",
  "lldap_test_utils",
  "minijinja",
  "pretty_assertions",
+ "sea-orm",
  "serial_test",
  "tokio",
  "tracing",
@@ -4781,7 +4784,7 @@ checksum = "63b8176103e19a2643978565ca18b50549f6101881c443590420e4dc998a3c69"
 [[package]]
 name = "rasn"
 version = "0.28.14"
-source = "git+https://github.com/Aelieth/kerber-rust?tag=v1.2.1#43c8c9b39bc8c26895a4762ce209017536e9b60b"
+source = "git+https://github.com/Aelieth/kerber-rust?tag=v1.2.2-rc.1#d28a8fb1ceddc85248c2de5313b3559bfd2adc27"
 dependencies = [
  "bitvec",
  "bitvec-nom2",

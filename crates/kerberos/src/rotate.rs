@@ -142,7 +142,8 @@ mod tests {
     fn test_roll_keeps_the_old_keys_until_the_purge() {
         use EncryptionType::{Aes128CtsHmacSha196 as Aes128, Aes256CtsHmacSha196 as Aes256};
         let temp = TempRealm::new();
-        let mut store = boot::open_store(&temp.settings, &boot::profile(&temp.settings)).unwrap();
+        let mut store =
+            boot::open_store(&temp.settings, &boot::profile(&temp.settings), temp.host()).unwrap();
         let (realm, grace) = ("EXAMPLE.COM", 86_400 + 604_800);
         let tgs = PrincipalName::krbtgt(realm);
         let before = kvnos(&store, &tgs);

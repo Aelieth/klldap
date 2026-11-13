@@ -1,6 +1,6 @@
 use crate::sql_kerberos_handler::{
-    KerberosSqlError, clear_open, commit_batch_with_transaction, heartbeat, load_realm, read_hold,
-    take_realm,
+    KerberosSqlError, RealmHold, clear_open, commit_batch_with_transaction, heartbeat, load_realm,
+    read_hold, take_realm,
 };
 use crate::sql_tables::DbConnection;
 use lldap_domain_handlers::kerberos::{
@@ -8,6 +8,7 @@ use lldap_domain_handlers::kerberos::{
     set_kerberos_store,
 };
 use sea_orm::TransactionTrait;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -15,6 +16,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 const HEARTBEAT: Duration = Duration::from_secs(10);
 const LOST_AFTER: Duration = Duration::from_secs(20);
 const WATCH: Duration = Duration::from_secs(30);
+const STEP: Duration = Duration::from_secs(5);
 const RETRY: Duration = Duration::from_secs(1);
 const QUEUE: usize = 16;
 
@@ -95,10 +97,11 @@ struct Timings {
     heartbeat: Duration,
     lost_after: Duration,
     watch: Duration,
+    step: Duration,
 }
 
 pub fn start_kerberos_committer(pool: DbConnection) -> KerberosCommitterHandle {
-    start_kerberos_committer_for(pool, HEARTBEAT, LOST_AFTER, WATCH)
+    start_kerberos_committer_for(pool, HEARTBEAT, LOST_AFTER, WATCH, STEP)
 }
 
 pub(crate) fn start_kerberos_committer_for(
@@ -106,6 +109,7 @@ pub(crate) fn start_kerberos_committer_for(
     heartbeat: Duration,
     lost_after: Duration,
     watch: Duration,
+    step: Duration,
 ) -> KerberosCommitterHandle {
     let (tx, rx) = mpsc::channel(QUEUE);
     let (lost_tx, lost) = watch::channel(None);
@@ -117,6 +121,7 @@ pub(crate) fn start_kerberos_committer_for(
             heartbeat,
             lost_after,
             watch,
+            step,
         },
     ));
     set_kerberos_store(Arc::new(CommitterStore { tx: tx.clone() }));
@@ -163,24 +168,24 @@ async fn run(
         };
         match incoming {
             Incoming::Job(Job::Load(reply)) => {
-                answer_load(&pool, &phase, reply, &mut waiting, &lost_tx).await;
+                answer_load(&pool, &phase, reply, &mut waiting, &lost_tx, timings.step).await;
             }
             Incoming::Job(Job::Commit(batch, reply)) => {
                 phase = commit_job(&pool, phase, batch, reply, &lost_tx, &timings).await;
-                release_loads(&pool, &phase, &mut waiting, &lost_tx).await;
+                release_loads(&pool, &phase, &mut waiting, &lost_tx, timings.step).await;
             }
             Incoming::Job(Job::Shutdown(reply)) => {
-                clear_held(&pool, &phase).await;
+                clear_held(&pool, &phase, timings.step).await;
                 cancel_loads(&mut waiting);
                 let _ = reply.send(());
                 break;
             }
             Incoming::Timer => {
                 phase = on_wake(&pool, phase, &timings, &lost_tx).await;
-                release_loads(&pool, &phase, &mut waiting, &lost_tx).await;
+                release_loads(&pool, &phase, &mut waiting, &lost_tx, timings.step).await;
             }
             Incoming::Closed => {
-                clear_held(&pool, &phase).await;
+                clear_held(&pool, &phase, timings.step).await;
                 cancel_loads(&mut waiting);
                 break;
             }
@@ -193,9 +198,10 @@ async fn open_phase(
     timings: &Timings,
     lost_tx: &watch::Sender<Option<KerberosLost>>,
 ) -> Phase {
-    match read_hold(pool).await {
+    match hold_within(pool, timings.step).await {
         Ok(None) => Phase::Held(fresh(0, false, timings)),
-        Ok(Some(hold)) if !hold.open => match take_owned(pool, hold.generation).await {
+        Ok(Some(hold)) if !hold.open => match take_owned(pool, hold.generation, timings.step).await
+        {
             Ok(generation) => Phase::Held(fresh(generation, true, timings)),
             Err(Step::Replaced) => lose(lost_tx, KerberosLost::Replaced),
             Err(Step::Database) => starting(timings),
@@ -251,20 +257,97 @@ enum Step {
     Database,
 }
 
-async fn take_owned(pool: &DbConnection, generation: i64) -> Result<i64, Step> {
-    let txn = pool.begin().await.map_err(|_| Step::Database)?;
-    match take_realm(&txn, generation).await {
-        Ok(next) => {
-            txn.commit().await.map_err(|_| Step::Database)?;
-            Ok(next)
+// Bounded so an unreachable database fails the step instead of waiting out the pool's acquire.
+async fn within<T, E>(
+    step: Duration,
+    late: impl FnOnce() -> E,
+    work: impl Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    tokio::time::timeout(step, work)
+        .await
+        .unwrap_or_else(|_| Err(late()))
+}
+
+fn late(step: Duration) -> String {
+    format!("the database did not answer within {step:?}")
+}
+
+async fn hold_within(
+    pool: &DbConnection,
+    step: Duration,
+) -> Result<Option<RealmHold>, KerberosSqlError> {
+    within(
+        step,
+        || KerberosSqlError::Failed(late(step)),
+        read_hold(pool),
+    )
+    .await
+}
+
+async fn take_owned(pool: &DbConnection, generation: i64, step: Duration) -> Result<i64, Step> {
+    within(step, || Step::Database, async {
+        let txn = pool.begin().await.map_err(|_| Step::Database)?;
+        match take_realm(&txn, generation).await {
+            Ok(next) => {
+                txn.commit().await.map_err(|_| Step::Database)?;
+                Ok(next)
+            }
+            Err(KerberosSqlError::GenerationMoved { .. }) => {
+                let _ = txn.rollback().await;
+                Err(Step::Replaced)
+            }
+            Err(_) => {
+                let _ = txn.rollback().await;
+                Err(Step::Database)
+            }
         }
-        Err(KerberosSqlError::GenerationMoved { .. }) => {
-            let _ = txn.rollback().await;
-            Err(Step::Replaced)
+    })
+    .await
+}
+
+async fn beat(pool: &DbConnection, generation: i64, step: Duration) -> Result<i64, Step> {
+    within(step, || Step::Database, async {
+        let txn = pool.begin().await.map_err(|_| Step::Database)?;
+        match heartbeat(&txn, generation).await {
+            Ok(next) => {
+                txn.commit().await.map_err(|_| Step::Database)?;
+                Ok(next)
+            }
+            Err(KerberosSqlError::GenerationMoved { .. }) => {
+                let _ = txn.rollback().await;
+                Err(Step::Replaced)
+            }
+            Err(_) => {
+                let _ = txn.rollback().await;
+                Err(Step::Database)
+            }
         }
-        Err(_) => {
+    })
+    .await
+}
+
+enum WriteError {
+    Unreachable(String),
+    Batch(KerberosSqlError),
+}
+
+async fn write_batch(
+    pool: &DbConnection,
+    batch: &RealmBatch,
+    generation: i64,
+) -> Result<(), WriteError> {
+    let txn = pool
+        .begin()
+        .await
+        .map_err(|err| WriteError::Unreachable(err.to_string()))?;
+    match commit_batch_with_transaction(&txn, batch, generation).await {
+        Ok(()) => txn
+            .commit()
+            .await
+            .map_err(|err| WriteError::Unreachable(err.to_string())),
+        Err(err) => {
             let _ = txn.rollback().await;
-            Err(Step::Database)
+            Err(WriteError::Batch(err))
         }
     }
 }
@@ -281,34 +364,30 @@ async fn commit_job(
         let _ = reply.send(Err(not_held()));
         return phase;
     };
-    let txn = match pool.begin().await {
-        Ok(txn) => txn,
-        Err(err) => {
-            let _ = reply.send(Err(KerberosStoreError::Failed(err.to_string())));
-            return db_failed(held, timings, lost_tx);
+    let step = timings.step;
+    let written = within(
+        step,
+        || WriteError::Unreachable(late(step)),
+        write_batch(pool, &batch, held.generation),
+    )
+    .await;
+    match written {
+        Ok(()) => {
+            let _ = reply.send(Ok(()));
+            Phase::Held(fresh(held.generation + 1, true, timings))
         }
-    };
-    match commit_batch_with_transaction(&txn, &batch, held.generation).await {
-        Ok(()) => match txn.commit().await {
-            Ok(()) => {
-                let _ = reply.send(Ok(()));
-                Phase::Held(fresh(held.generation + 1, true, timings))
-            }
-            Err(err) => {
-                let _ = reply.send(Err(KerberosStoreError::Failed(err.to_string())));
-                db_failed(held, timings, lost_tx)
-            }
-        },
-        Err(KerberosSqlError::GenerationMoved { .. }) => {
-            let _ = txn.rollback().await;
+        Err(WriteError::Unreachable(reason)) => {
+            let _ = reply.send(Err(KerberosStoreError::Failed(reason)));
+            db_failed(held, timings, lost_tx)
+        }
+        Err(WriteError::Batch(KerberosSqlError::GenerationMoved { .. })) => {
             let _ = reply.send(Err(KerberosStoreError::Failed(
                 KerberosLost::Replaced.to_string(),
             )));
             lose(lost_tx, KerberosLost::Replaced)
         }
-        Err(err) => {
+        Err(WriteError::Batch(err)) => {
             let database = matches!(err, KerberosSqlError::Failed(_));
-            let _ = txn.rollback().await;
             let _ = reply.send(Err(store_err(err)));
             no_row_failure(pool, held, timings, lost_tx, database).await
         }
@@ -341,7 +420,7 @@ async fn no_row_failure(
             Phase::Held(held)
         };
     }
-    match read_hold(pool).await {
+    match hold_within(pool, timings.step).await {
         Ok(Some(_)) => lose(lost_tx, KerberosLost::Replaced),
         Ok(None) if database => db_failed(held, timings, lost_tx),
         Ok(None) => Phase::Held(held),
@@ -368,13 +447,15 @@ async fn on_wake(
             if since.elapsed() >= timings.lost_after {
                 return lose(lost_tx, KerberosLost::DatabaseUnreachable);
             }
-            match read_hold(pool).await {
+            match hold_within(pool, timings.step).await {
                 Ok(None) => Phase::Held(fresh(0, false, timings)),
-                Ok(Some(hold)) if !hold.open => match take_owned(pool, hold.generation).await {
-                    Ok(generation) => Phase::Held(fresh(generation, true, timings)),
-                    Err(Step::Replaced) => lose(lost_tx, KerberosLost::Replaced),
-                    Err(Step::Database) => starting_from(since, timings),
-                },
+                Ok(Some(hold)) if !hold.open => {
+                    match take_owned(pool, hold.generation, timings.step).await {
+                        Ok(generation) => Phase::Held(fresh(generation, true, timings)),
+                        Err(Step::Replaced) => lose(lost_tx, KerberosLost::Replaced),
+                        Err(Step::Database) => starting_from(since, timings),
+                    }
+                }
                 Ok(Some(hold)) => Phase::Watching {
                     generation: hold.generation,
                     until: Instant::now() + timings.watch,
@@ -382,9 +463,9 @@ async fn on_wake(
                 Err(_) => starting_from(since, timings),
             }
         }
-        Phase::Watching { generation, .. } => match read_hold(pool).await {
+        Phase::Watching { generation, .. } => match hold_within(pool, timings.step).await {
             Ok(Some(hold)) if hold.generation == generation => {
-                match take_owned(pool, generation).await {
+                match take_owned(pool, generation, timings.step).await {
                     Ok(next) => Phase::Held(fresh(next, true, timings)),
                     Err(Step::Replaced) => lose(lost_tx, KerberosLost::Replaced),
                     Err(Step::Database) => lose(lost_tx, KerberosLost::DatabaseUnreachable),
@@ -397,47 +478,31 @@ async fn on_wake(
             if held.last_ok.elapsed() >= timings.lost_after {
                 return lose(lost_tx, KerberosLost::DatabaseUnreachable);
             }
-            let txn = match pool.begin().await {
-                Ok(txn) => txn,
-                Err(_) => return Phase::Held(retry(held, timings)),
-            };
-            match heartbeat(&txn, held.generation).await {
-                Ok(next) => match txn.commit().await {
-                    Ok(()) => Phase::Held(fresh(next, true, timings)),
-                    Err(_) => Phase::Held(retry(held, timings)),
-                },
-                Err(KerberosSqlError::GenerationMoved { .. }) => {
-                    let _ = txn.rollback().await;
-                    lose(lost_tx, KerberosLost::Replaced)
-                }
-                Err(_) => {
-                    let _ = txn.rollback().await;
-                    Phase::Held(retry(held, timings))
-                }
+            match beat(pool, held.generation, timings.step).await {
+                Ok(next) => Phase::Held(fresh(next, true, timings)),
+                Err(Step::Replaced) => lose(lost_tx, KerberosLost::Replaced),
+                Err(Step::Database) => Phase::Held(retry(held, timings)),
             }
         }
         other => other,
     }
 }
 
-async fn clear_held(pool: &DbConnection, phase: &Phase) {
+async fn clear_held(pool: &DbConnection, phase: &Phase, step: Duration) {
     let Phase::Held(held) = phase else {
         return;
     };
     if !held.row {
         return;
     }
-    let Ok(txn) = pool.begin().await else {
-        return;
-    };
-    match clear_open(&txn, held.generation).await {
-        Ok(()) => {
-            let _ = txn.commit().await;
+    let _ = within(step, || (), async {
+        let txn = pool.begin().await.map_err(drop)?;
+        match clear_open(&txn, held.generation).await {
+            Ok(()) => txn.commit().await.map_err(drop),
+            Err(_) => txn.rollback().await.map_err(drop),
         }
-        Err(_) => {
-            let _ = txn.rollback().await;
-        }
-    }
+    })
+    .await;
 }
 
 fn lose(lost_tx: &watch::Sender<Option<KerberosLost>>, cause: KerberosLost) -> Phase {
@@ -445,11 +510,18 @@ fn lose(lost_tx: &watch::Sender<Option<KerberosLost>>, cause: KerberosLost) -> P
     Phase::Lost
 }
 
-async fn read_loaded(pool: &DbConnection) -> Result<LoadedRealm, KerberosStoreError> {
-    load_realm(pool)
-        .await
-        .map(|(realm, _)| realm)
-        .map_err(store_err)
+async fn read_loaded(
+    pool: &DbConnection,
+    step: Duration,
+) -> Result<LoadedRealm, KerberosStoreError> {
+    within(
+        step,
+        || KerberosSqlError::Failed(late(step)),
+        load_realm(pool),
+    )
+    .await
+    .map(|(realm, _)| realm)
+    .map_err(store_err)
 }
 
 fn lost_answer(lost_tx: &watch::Sender<Option<KerberosLost>>) -> KerberosStoreError {
@@ -465,10 +537,11 @@ async fn answer_load(
     reply: oneshot::Sender<Result<LoadedRealm, KerberosStoreError>>,
     waiting: &mut Vec<oneshot::Sender<Result<LoadedRealm, KerberosStoreError>>>,
     lost_tx: &watch::Sender<Option<KerberosLost>>,
+    step: Duration,
 ) {
     match phase {
         Phase::Held(_) => {
-            let _ = reply.send(read_loaded(pool).await);
+            let _ = reply.send(read_loaded(pool, step).await);
         }
         Phase::Lost => {
             let _ = reply.send(Err(lost_answer(lost_tx)));
@@ -482,13 +555,14 @@ async fn release_loads(
     phase: &Phase,
     waiting: &mut Vec<oneshot::Sender<Result<LoadedRealm, KerberosStoreError>>>,
     lost_tx: &watch::Sender<Option<KerberosLost>>,
+    step: Duration,
 ) {
     if waiting.is_empty() {
         return;
     }
     match phase {
         Phase::Held(_) => {
-            let loaded = read_loaded(pool).await;
+            let loaded = read_loaded(pool, step).await;
             for reply in waiting.drain(..) {
                 let _ = reply.send(loaded.clone());
             }
@@ -735,6 +809,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_secs(5),
             Duration::from_secs(5),
+            Duration::from_secs(5),
         );
         let loaded = commit_then_load(batch()).await.unwrap();
         assert_eq!(
@@ -758,6 +833,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_secs(5),
             Duration::from_secs(5),
+            Duration::from_secs(5),
         );
         handle.shutdown().await;
         let err = commit_in_thread(batch()).await.unwrap_err();
@@ -772,6 +848,7 @@ mod tests {
         insert_realm(&db.pool, 5, false).await;
         let handle = start_kerberos_committer_for(
             db.pool.clone(),
+            Duration::from_secs(5),
             Duration::from_secs(5),
             Duration::from_secs(5),
             Duration::from_secs(5),
@@ -801,6 +878,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_secs(5),
             Duration::from_millis(40),
+            Duration::from_secs(5),
         );
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -827,6 +905,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_secs(5),
             Duration::from_millis(200),
+            Duration::from_secs(5),
         );
         tokio::time::sleep(Duration::from_millis(40)).await;
         let txn = db.other.begin().await.unwrap();
@@ -847,6 +926,7 @@ mod tests {
         let handle = start_kerberos_committer_for(
             db.pool.clone(),
             Duration::from_millis(30),
+            Duration::from_secs(5),
             Duration::from_secs(5),
             Duration::from_secs(5),
         );
@@ -873,6 +953,7 @@ mod tests {
         let handle = start_kerberos_committer_for(
             db.pool.clone(),
             Duration::from_millis(40),
+            Duration::from_secs(5),
             Duration::from_secs(5),
             Duration::from_secs(5),
         );
@@ -906,6 +987,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_secs(5),
             Duration::from_secs(5),
+            Duration::from_secs(5),
         );
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
@@ -921,6 +1003,7 @@ mod tests {
         assert!(!hold(&db.other).await.1);
         let handle = start_kerberos_committer_for(
             db.pool.clone(),
+            Duration::from_secs(5),
             Duration::from_secs(5),
             Duration::from_secs(5),
             Duration::from_secs(5),
@@ -950,6 +1033,7 @@ mod tests {
             db.pool.clone(),
             Duration::from_millis(20),
             Duration::from_millis(60),
+            Duration::from_secs(5),
             Duration::from_secs(5),
         );
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -982,6 +1066,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_secs(5),
             Duration::from_millis(80),
+            Duration::from_secs(5),
         );
         tokio::time::sleep(Duration::from_millis(15)).await;
         let started = Instant::now();
@@ -1003,6 +1088,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_secs(5),
             Duration::from_millis(200),
+            Duration::from_secs(5),
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1031,6 +1117,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_secs(5),
             Duration::from_secs(5),
+            Duration::from_secs(5),
         );
         insert_realm(&db.other, 1, true).await;
         let err = commit_in_thread(batch()).await.unwrap_err();
@@ -1039,6 +1126,79 @@ mod tests {
         assert_eq!(wait_lost(&mut lost).await, KerberosLost::Replaced);
         assert_eq!(hold(&db.other).await, (1, true));
         handle.shutdown().await;
+    }
+
+    async fn unreachable_postgres() -> DbConnection {
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut opts =
+            sea_orm::ConnectOptions::new(format!("postgres://lldap:lldap@127.0.0.1:{port}/lldap"));
+        opts.connect_lazy(true)
+            .acquire_timeout(Duration::from_secs(30))
+            .sqlx_logging(false);
+        Database::connect(opts).await.unwrap()
+    }
+
+    fn short_timings() -> Timings {
+        Timings {
+            heartbeat: Duration::from_millis(20),
+            lost_after: Duration::from_millis(400),
+            watch: Duration::from_secs(5),
+            step: Duration::from_millis(100),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unreachable_postgres_fails_a_commit_within_one_step_not_the_acquire_timeout() {
+        let pool = unreachable_postgres().await;
+        let timings = short_timings();
+        let (lost_tx, lost) = watch::channel(None);
+        let (reply, answer) = oneshot::channel();
+        let started = Instant::now();
+        let held = Phase::Held(fresh(5, true, &timings));
+        let phase = commit_job(&pool, held, batch(), reply, &lost_tx, &timings).await;
+        let took = started.elapsed();
+        let err = answer.await.unwrap().unwrap_err().to_string();
+        assert!(
+            took >= timings.step && took < Duration::from_secs(2),
+            "{took:?}"
+        );
+        assert!(err.contains("did not answer within 100ms"), "{err}");
+        assert!(
+            matches!(phase, Phase::Held(_)),
+            "held just after the failed commit"
+        );
+        assert_eq!(*lost.borrow(), None);
+        tokio::time::sleep(timings.lost_after).await;
+        let (reply, _answer) = oneshot::channel();
+        let phase = commit_job(&pool, phase, batch(), reply, &lost_tx, &timings).await;
+        assert!(matches!(phase, Phase::Lost));
+        assert_eq!(*lost.borrow(), Some(KerberosLost::DatabaseUnreachable));
+    }
+
+    #[tokio::test]
+    async fn test_unreachable_postgres_heartbeat_gives_up_at_lost_after_not_the_acquire_timeout() {
+        let pool = unreachable_postgres().await;
+        let timings = short_timings();
+        let (lost_tx, lost) = watch::channel(None);
+        let started = Instant::now();
+        let mut phase = Phase::Held(fresh(5, true, &timings));
+        while !matches!(phase, Phase::Lost) {
+            sleep_until(wake_at(&phase)).await;
+            phase = on_wake(&pool, phase, &timings, &lost_tx).await;
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "{:?}",
+                started.elapsed()
+            );
+        }
+        let took = started.elapsed();
+        assert!(took >= timings.lost_after, "{took:?}");
+        assert!(took < timings.lost_after + timings.step * 3, "{took:?}");
+        assert_eq!(*lost.borrow(), Some(KerberosLost::DatabaseUnreachable));
     }
 
     #[tokio::test]
@@ -1051,6 +1211,7 @@ mod tests {
             db.pool.clone(),
             Duration::from_secs(5),
             Duration::from_millis(60),
+            Duration::from_secs(5),
             Duration::from_secs(5),
         );
         let deadline = Instant::now() + Duration::from_secs(2);

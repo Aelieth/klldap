@@ -861,6 +861,8 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_secs(5),
         );
+        let loaded = load_in_thread().await.expect("empty database held");
+        assert!(loaded.realm.is_none());
         let loaded = commit_then_load(batch()).await.unwrap();
         assert_eq!(
             loaded.principals,
@@ -954,10 +956,11 @@ mod tests {
             db.pool.clone(),
             Duration::from_secs(5),
             Duration::from_secs(5),
-            Duration::from_millis(200),
+            Duration::from_millis(1000),
             Duration::from_secs(5),
         );
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        let err = commit_in_thread(batch()).await.unwrap_err();
+        assert!(err.contains("the Kerberos realm is not held"), "{err}");
         let txn = db.other.begin().await.unwrap();
         assert_eq!(heartbeat(&txn, 5).await.unwrap(), 6);
         txn.commit().await.unwrap();
@@ -1144,16 +1147,16 @@ mod tests {
             db.pool.clone(),
             Duration::from_secs(5),
             Duration::from_secs(5),
-            Duration::from_millis(200),
+            Duration::from_millis(1000),
             Duration::from_secs(5),
         );
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        let err = commit_in_thread(batch()).await.unwrap_err();
+        assert!(err.contains("the Kerberos realm is not held"), "{err}");
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let result = kerberos_store().load().map_err(|err| err.to_string());
             let _ = tx.send(result);
         });
-        tokio::time::sleep(Duration::from_millis(20)).await;
         let txn = db.other.begin().await.unwrap();
         assert_eq!(heartbeat(&txn, 5).await.unwrap(), 6);
         txn.commit().await.unwrap();
@@ -1179,9 +1182,11 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_secs(5),
         );
+        let loaded = load_in_thread().await.expect("empty database held");
+        assert!(loaded.realm.is_none());
         insert_realm(&db.other, 1, true).await;
         let err = commit_in_thread(batch()).await.unwrap_err();
-        assert!(!err.is_empty(), "{err}");
+        assert!(err.contains("the realm's generation moved"), "{err}");
         let mut lost = handle.lost();
         assert_eq!(wait_lost(&mut lost).await, KerberosLost::Replaced);
         assert_eq!(hold(&db.other).await, (1, true));

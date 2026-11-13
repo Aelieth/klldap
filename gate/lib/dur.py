@@ -1,13 +1,16 @@
 """ACC-3: kill after an acknowledged write, recorded on the host first; ACC-4: two servers on
-one database (D127). One line per kill or case in dur.log."""
+one database (D127); ACC-8: the same writes, the lab guest cut by `virsh destroy` (D178).
+One line per kill, cut or case in dur.log."""
 
 import hashlib
 import json
 import os
 import secrets
+import shutil
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 
@@ -23,6 +26,16 @@ SERVICE, WRITER, LOCKED, POLICY, MAX_FAIL = "HTTP/dur.gate.test", "durbob", "dur
 HEALTH_LIMIT, EXIT_LIMIT, STOPPED_FOR = 90, 30, 40
 REFUSED = "Password incorrect while getting initial credentials"
 GAP_TARGET_MS = 20
+POWER = ROW == "acc8"
+ADDR = ENV.get("DUR_ADDR", "127.0.0.1")
+GUEST = ENV.get("DUR_GUEST", "")
+BOOT_LIMIT = 240
+SETTLE = int(ENV.get("DUR_SETTLE", "0"))
+LOCKOUT = f"{KDC_DIR}/lockout"
+NOISE, NOISE_POLICY = "durnoise", "durnoisepol"
+LOCKOUT_CAUSES = ("lockout file", "is not a kerber-rust lockout file")
+CACHE_NOTE = ("guest disk qcow2 with QEMU's default cache (writeback): a cut loses the guest's RAM "
+              "and page cache; a device's volatile cache is not tested (O, pwr-lab-readback.md 2)")
 FIND_LLDAP = ('p=; for q in /proc/[0-9]*; do read -r c <"$q/comm" 2>/dev/null || continue; '
               '[ "$c" = lldap ] && { p=${q#/proc/}; break; }; done; [ -n "$p" ] || exit 3')
 
@@ -55,6 +68,8 @@ class Record:
         self.counts = {}
         self.gaps = {}
         self.aborted = 0
+        self.losses = []
+        self.degraded = 0
 
     @staticmethod
     def _sync(handle, text):
@@ -89,13 +104,14 @@ class Record:
 class Server:
     def __init__(self, name, data, kdc, db_url, shared=None):
         self.name = f"{PREFIX}-{name}"
-        self.ldap, self.http = free_port(), free_port()
+        self.ldap, self.http = (3890, 17170) if POWER else (free_port(), free_port())
         mounts = ["-v", f"{data}:/data", "-v", f"{kdc}:{KDC_DIR}"]
         if shared:
             mounts += ["-v", f"{shared}:/shared"]
+        restart = ["--restart", "always"] if POWER else []
         self.args = [
-            "docker", "run", "-d", "--name", self.name, "--network", NET,
-            "-p", f"127.0.0.1:{self.ldap}:3890", "-p", f"127.0.0.1:{self.http}:17170",
+            "docker", "run", "-d", "--name", self.name, "--network", NET, *restart,
+            "-p", f"{ADDR}:{self.ldap}:3890", "-p", f"{ADDR}:{self.http}:17170",
             *mounts,
             "-e", f"LLDAP_JWT_SECRET={JWT}", "-e", f"LLDAP_KEY_SEED={SEED}",
             "-e", f"LLDAP_LDAP_BASE_DN={BASE_DN}", "-e", f"LLDAP_LDAP_USER_PASS={ADMIN_PASS}",
@@ -116,8 +132,8 @@ class Server:
     def remove(self):
         run("docker", "rm", "-f", self.name)
 
-    def logs(self):
-        result = run("docker", "logs", self.name)
+    def logs(self, since=None):
+        result = run("docker", "logs", *(["--since", since] if since else []), self.name)
         return result.stdout + result.stderr
 
     def keep_logs(self, label):
@@ -176,7 +192,7 @@ class Server:
         headers = {"Content-Type": "application/json"}
         if token:
             headers["Authorization"] = "Bearer " + token
-        request = urllib.request.Request(f"http://127.0.0.1:{self.http}{path}",
+        request = urllib.request.Request(f"http://{ADDR}:{self.http}{path}",
                                          data=json.dumps(body).encode(), headers=headers)
         with urllib.request.urlopen(request, timeout=15) as response:
             return json.load(response)
@@ -204,7 +220,7 @@ class Server:
             raise RuntimeError(f"could not create {user}: {body.get('errors')}")
 
     def bind(self, user, password):
-        result = run("ldapwhoami", "-x", "-H", f"ldap://127.0.0.1:{self.ldap}",
+        result = run("ldapwhoami", "-x", "-H", f"ldap://{ADDR}:{self.ldap}",
                      "-D", f"uid={user},ou=people,{BASE_DN}", "-w", password, timeout=15)
         return result.returncode == 0
 
@@ -271,6 +287,109 @@ def refused(result):
     return not signed and REFUSED in text
 
 
+def virsh(*args):
+    command = ["virsh", "-q", "-c", "qemu:///system", *args]
+    if shutil.which("virsh") is None:
+        command.insert(0, "distrobox-host-exec")
+    return run(*command, timeout=120)
+
+
+def cut_guest():
+    started = time.perf_counter_ns()
+    result = virsh("destroy", GUEST)
+    if result.returncode != 0:
+        raise RuntimeError(f"virsh destroy {GUEST}: {result.stderr.strip()}")
+    return (time.perf_counter_ns() - started) / 1e6
+
+
+def boot_guest():
+    started = time.monotonic()
+    result = virsh("start", GUEST)
+    if result.returncode != 0:
+        raise RuntimeError(f"virsh start {GUEST}: {result.stderr.strip()}")
+    while time.monotonic() - started < BOOT_LIMIT:
+        if run("docker", "info", timeout=10).returncode == 0:
+            return time.monotonic() - started
+        time.sleep(2)
+    raise RuntimeError(f"the guest's docker did not answer within {BOOT_LIMIT} s of virsh start")
+
+
+def lockout_state(server):
+    """The lockout file read in the container: guest clock, and size/birth/modify or missing."""
+    script = f'date +%s.%N; stat -c "%s %W %Y" {LOCKOUT} 2>/dev/null || echo missing'
+    lines = run("docker", "exec", "-u", "0", server.name, "sh", "-c", script, timeout=30).stdout.split()
+    if len(lines) < 2:
+        return None
+    if lines[1] == "missing":
+        return {"now": float(lines[0]), "exists": False}
+    size, birth, modify = (int(x) if x.lstrip("-").isdigit() else 0 for x in lines[1:4])
+    return {"now": float(lines[0]), "exists": True, "size": size, "birth": birth, "modify": modify}
+
+
+def lockout_text(state):
+    if state is None:
+        return "unread"
+    if not state["exists"]:
+        return "missing"
+    return f"size={state['size']},birth={state['birth']},modify={state['modify']}"
+
+
+def wait_up(server, since):
+    """Healthy, or the log since the boot names a lockout cause: (seconds, cause) or (None, None)."""
+    started = time.monotonic()
+    while time.monotonic() - started < BOOT_LIMIT:
+        if server.running():
+            if server.healthy():
+                return time.monotonic() - started, None
+            logs = server.logs(since)
+            if "did not open" in logs:
+                cause = next((c for c in LOCKOUT_CAUSES if c in logs), None)
+                if cause:
+                    return time.monotonic() - started, cause
+        time.sleep(1)
+    return None, None
+
+
+def save_evidence(server, n):
+    where = os.path.join(RUN_DIR, f"evidence-{n}")
+    os.makedirs(where, exist_ok=True)
+    stash = f"{KDC_DIR}/.k5.{REALM}"
+    listing = run("docker", "exec", "-u", "0", server.name, "sh", "-c",
+                  f"ls -la --full-time {KDC_DIR}; stat {KDC_DIR} {stash} {LOCKOUT}", timeout=30)
+    with open(os.path.join(where, "kdc.txt"), "w", encoding="utf-8") as f:
+        f.write(listing.stdout + listing.stderr)
+    with open(os.path.join(where, "docker-logs.txt"), "w", encoding="utf-8") as f:
+        f.write(server.logs())
+
+
+def recover(record, server, n):
+    """An empty lockout file with the KDC directory's owner, synced with its directory; then restart."""
+    script = (f'owner=$(stat -c %u:%g {KDC_DIR}) && : > {LOCKOUT} && chown "$owner" {LOCKOUT} '
+              f"&& chmod 600 {LOCKOUT} && sync {LOCKOUT} {KDC_DIR}")
+    made = run("docker", "exec", "-u", "0", server.name, "sh", "-c", script, timeout=30)
+    restart = run("docker", "restart", server.name, timeout=120)
+    back = server.wait_healthy(BOOT_LIMIT)
+    record.note(f"RECOVERY n={n} file_rc={made.returncode} {made.stderr.strip()!r} "
+                f"restart_rc={restart.returncode} {restart.stderr.strip()!r} healthy_after_s="
+                f"{'none' if back is None else f'{back:.1f}'}")
+    return back
+
+
+class Noise(threading.Thread):
+    """Failed logins for NOISE once a second, so the lockout file is being written at the cut."""
+
+    def __init__(self, server):
+        super().__init__(daemon=True)
+        self.server, self.stopped = server, threading.Event()
+        self.tries = self.refused = 0
+
+    def run(self):
+        while not self.stopped.is_set():
+            self.tries += 1
+            self.refused += refused(self.server.kinit(NOISE, test_password(0)))
+            self.stopped.wait(1)
+
+
 def volume(label):
     return f"{PREFIX}-{label}"
 
@@ -294,21 +413,31 @@ def reset_database(shared):
             "-c", "chown 1000:1000 /shared && chmod 700 /shared")
 
 
-def acc3(record, kills):
+def set_up(row):
     url, shared = db_url(False)
-    server = Server("acc3", volume("acc3-data"), volume("acc3-kdc"), url, shared)
+    server = Server(row, volume(f"{row}-data"), volume(f"{row}-kdc"), url, shared)
     server.create()
-    if server.wait_healthy() is None:
+    if server.wait_healthy(BOOT_LIMIT if POWER else HEALTH_LIMIT) is None:
         server.keep_logs("start")
         raise RuntimeError("the server did not become healthy")
     lock_password = test_password(0)
     server.create_user(WRITER, test_password(0))
     server.create_user(LOCKED, lock_password)
-    for query in (f"addprinc -randkey {SERVICE}",
-                  f"addpol -maxfailure {MAX_FAIL} -failurecountinterval 0 -lockoutduration 0 {POLICY}",
-                  f"modprinc -policy {POLICY} {LOCKED}"):
+    queries = [f"addprinc -randkey {SERVICE}",
+               f"addpol -maxfailure {MAX_FAIL} -failurecountinterval 0 -lockoutduration 0 {POLICY}",
+               f"modprinc -policy {POLICY} {LOCKED}"]
+    if POWER:
+        server.create_user(NOISE, test_password(0))
+        queries += [f"addpol -maxfailure 1000000 -failurecountinterval 0 {NOISE_POLICY}",
+                    f"modprinc -policy {NOISE_POLICY} {NOISE}"]
+    for query in queries:
         if not server.kadmin(query)[1]:
             raise RuntimeError(f"kadmin {query} failed")
+    return server, lock_password
+
+
+def acc3(record, kills):
+    server, lock_password = set_up("acc3")
     n = 0
     for kind in "abc":
         for i in range(kills):
@@ -317,8 +446,28 @@ def acc3(record, kills):
                 raise RuntimeError(f"the server did not come back after kill {n}")
 
 
+def acc8(record, cuts):
+    server, lock_password = set_up("acc8")
+    noise = Noise(server)
+    noise.start()
+    time.sleep(SETTLE)
+    try:
+        for n in range(1, cuts + 1):
+            kind, i = "abc"[(n - 1) % 3], (n - 1) // 3
+            if not one_kill(record, server, n, kind, i, lock_password):
+                raise RuntimeError(f"the server did not come back after cut {n}")
+    finally:
+        noise.stopped.set()
+        noise.join(timeout=90)
+        record.note(f"NOISE user={NOISE} tries={noise.tries} refused={noise.refused} (recorded, not judged)")
+
+
 def one_kill(record, server, n, kind, i, lock_password):
     head = f"KILL n={n} db={DB} kind={kind}"
+    if POWER:
+        with open(os.path.join(RUN_DIR, f"pre-cut-{n}.log"), "w", encoding="utf-8") as f:
+            f.write(server.logs())
+        lock_before, lock_before_at = lockout_state(server), time.perf_counter_ns()
     if kind == "b":
         target, password = WRITER, test_password(n)
         expect = tag(password)
@@ -358,17 +507,47 @@ def one_kill(record, server, n, kind, i, lock_password):
         record.abort(f"{head} target={target} the host's ack was not written; no kill")
         return server.healthy()
     ack_ms = (time.perf_counter_ns() - read_at) / 1e6
-    release(killer, True)
-    server.wait_exit(EXIT_LIMIT)
-    server.start()
-    back = server.wait_healthy()
+    timing, finding = "", None
+    if POWER:
+        destroy_ms = cut_guest()
+        cut_at = time.perf_counter_ns()
+        gap_ms = (cut_at - read_at) / 1e6
+        killer.kill()
+        try:
+            killer.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        boot_s = boot_guest()
+        back, finding = wait_up(server, since)
+        timing = f"destroy_ms={destroy_ms:.0f} boot_s={boot_s:.1f} "
+        age = (lock_before["now"] - lock_before["birth"] + (cut_at - lock_before_at) / 1e9
+               if lock_before and lock_before["exists"] and lock_before["birth"] > 0 else None)
+        record.note(f"LOCKOUT n={n} before_cut={lockout_text(lock_before)} age_at_cut_s="
+                    f"{'unknown' if age is None else f'{age:.1f}'} after_boot={lockout_text(lockout_state(server))}")
+        if back is not None and finding:
+            record.degraded += 1
+            save_evidence(server, n)
+            waited = back
+            recovered = recover(record, server, n)
+            if recovered is None:
+                record.line(kind, False, f"{head} target={target} {timing}FINDING degraded start "
+                                         f"({finding!r}) after {waited:.1f} s; the recovery did not bring it back")
+                return False
+            back = waited + recovered
+    else:
+        release(killer, True)
+        server.wait_exit(EXIT_LIMIT)
+        server.start()
+        back = server.wait_healthy()
     if back is None:
-        server.keep_logs(f"kill-{n}")
-        record.line(kind, False, f"{head} target={target} not healthy after restart")
-        return False
-    client_return, kill_stamp = server.killed_at()
-    start_ns = returned if kind == "b" else client_return
-    gap_ms = (kill_stamp - start_ns) / 1e6 if kill_stamp and start_ns else None
+        if POWER:
+            save_evidence(server, n)
+        return not_back(record, server, kind, f"{head} target={target} {timing}".rstrip(), n)
+    if not POWER:
+        client_return, kill_stamp = server.killed_at()
+        start_ns = returned if kind == "b" else client_return
+        gap_ms = (kill_stamp - start_ns) / 1e6 if kill_stamp and start_ns else None
     if gap_ms is not None:
         record.gaps.setdefault(kind, []).append(gap_ms)
     gap = f"{gap_ms:.1f}" if gap_ms is not None else "unknown"
@@ -384,12 +563,29 @@ def one_kill(record, server, n, kind, i, lock_password):
         locked = not signed and "revoked" in why
         got = f"{failures},locked={locked}"
         ok = got == expect
+        if POWER:
+            # A cut may forget recent counts (no fsync), never mix them: any value it had since the unlock.
+            had = int(failures) if failures and failures.isdigit() else None
+            ok = had is not None and had <= count and locked == (had >= MAX_FAIL)
+            got += f",lost={count - had if had is not None else 'unknown'}"
+            if had is not None and had < count:
+                record.losses.append(count - had)
         server.kadmin(f"modprinc -unlock {LOCKED}")
-    if not ok:
+    if not ok or finding:
         server.keep_logs(f"kill-{n}")
-    record.line(kind, ok, f"{head} target={target} gap_ms={gap} ack_written_ms={ack_ms:.1f} "
-                          f"back_s={back:.1f} expect={expect} got={got}")
+    found = f"FINDING degraded start ({finding!r}), evidence-{n}/, recovered; " if finding else ""
+    record.line(kind, ok and not finding,
+                f"{head} target={target} {found}gap_ms={gap} ack_written_ms={ack_ms:.1f} "
+                f"{timing}back_s={back:.1f} expect={expect} got={got}")
+    if finding and SETTLE:
+        time.sleep(SETTLE)
     return True
+
+
+def not_back(record, server, kind, head, n):
+    server.keep_logs(f"kill-{n}")
+    record.line(kind, False, f"{head} not healthy after restart")
+    return False
 
 
 def acc4(record, times):
@@ -477,10 +673,17 @@ def main():
     started = time.time()
     record.note(f"START row={ROW} db={DB} image={IMAGE} image_id={ENV.get('DUR_IMAGE_ID', '')} "
                 f"driver={ENV.get('DUR_REV', '')}")
+    if POWER:
+        record.note(f"START guest={GUEST} addr={ADDR} docker_host={ENV.get('DOCKER_HOST', '')} "
+                    f"lab_lock={ENV.get('DUR_LAB_LOCK', '')} ssh_config={ENV.get('DUR_SSH_CONFIG', '')}")
+        record.note(f"START cache: {CACHE_NOTE}")
+        record.note(f"START docker root: {ENV.get('DUR_DOCKER_ROOT', 'unknown')} settle_s={SETTLE}")
     error = None
     try:
         if ROW == "acc3":
             acc3(record, int(ENV["DUR_KILLS"]))
+        elif POWER:
+            acc8(record, int(ENV["DUR_CUTS"]))
         else:
             acc4(record, int(ENV["DUR_TIMES"]))
     except Exception as e:
@@ -495,12 +698,16 @@ def main():
     summary = {"row": ROW, "db": DB, "image": IMAGE, "image_id": ENV.get("DUR_IMAGE_ID", ""),
                "driver": ENV.get("DUR_REV", ""), "seconds": round(time.time() - started),
                "counts": {k: {"pass": p, "fail": f} for k, (p, f) in record.counts.items()},
-               "gaps_ms": gaps, "aborted_iterations": record.aborted, "aborted": error}
+               "gaps_ms": gaps, "aborted_iterations": record.aborted, "aborted": error,
+               "lockout_lost_cuts": len(record.losses), "lockout_lost_sum": sum(record.losses),
+               "degraded_starts": record.degraded, "findings": record.degraded}
     with open(os.path.join(RUN_DIR, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, sort_keys=True)
     failed = sum(f for _, f in record.counts.values())
+    power = (f" lockout_lost_cuts={len(record.losses)} lockout_lost_sum={sum(record.losses)} "
+             f"degraded_starts={record.degraded} findings={record.degraded}") if POWER else ""
     record.note(f"END failed={failed} aborted={error is not None} aborted_iterations={record.aborted} "
-                f"seconds={summary['seconds']}")
+                f"seconds={summary['seconds']}{power}")
     return 0 if failed == 0 and error is None and record.aborted == 0 and record.counts else 1
 
 

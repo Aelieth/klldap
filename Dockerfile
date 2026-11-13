@@ -125,7 +125,7 @@ ENV UID=1000 GID=1000
 ENV LLDAP_KERBEROS_OPTIONS__ENABLED=true KRB5_CONFIG=/data/krb5.conf \
     LLDAP_KERBEROS_OPTIONS__DATA_DIR=/var/kerberos/krb5kdc \
     LLDAP_KERBEROS_OPTIONS__ADMIN_KEYTAB=/data/kadm5.keytab \
-    LLDAP_KERBEROS_OPTIONS__KEYCLOAK_KEYTAB=/data/keytab/keycloak-http.keytab \
+    LLDAP_KEYCLOAK_OPTIONS__KEYTAB=/data/keytab/keycloak-http.keytab \
     LLDAP_KERBEROS_OPTIONS__CLIENT_CONFIG=/data/krb5.conf \
     LLDAP_KEYCLOAK_OPTIONS__CONFIG_FILE=/data/keycloak_config.toml
 

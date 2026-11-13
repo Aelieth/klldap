@@ -215,20 +215,19 @@ key_seed = "RanD0m STR1ng"
 ## The family name "default" is refused because it includes them.
 #supported_enctypes = ["aes256-cts-hmac-sha1-96"]
 ## KDC listen address and port (UDP and TCP). Publish 1088 as 88.
-#kdc_bind = "0.0.0.0"
+#kdc_host = "0.0.0.0"
 #kdc_port = 1088
-## kadmin listen address, on the container's loopback. Use it with docker exec.
-#kadmin_bind = "127.0.0.1:1749"
+## kadmin listen address and port, on the container's loopback. Use it with docker exec.
+#kadmin_host = "127.0.0.1"
+#kadmin_port = 1749
 ## Extra kadmin ACL lines. admin/admin@REALM * is always granted.
-#kadmin_acl_file = "/data/kadm5.acl"
+#kadmin_acl = "/data/kadm5.acl"
 ## The image sets these paths by ENV too; the code's defaults are relative to the working
 ## directory.
 ## Database and stash. The directory itself is mode 0700.
 data_dir = "/var/kerberos/krb5kdc"
 ## Admin keytab, rewritten every boot at mode 0600.
 admin_keytab = "/data/kadm5.keytab"
-## Keycloak HTTP keytab, written by Export keytab.
-keycloak_keytab = "/data/keytab/keycloak-http.keytab"
 ## Client krb5.conf written at every boot, for tools inside the container.
 client_config = "/data/krb5.conf"
 
@@ -255,5 +254,7 @@ client_config = "/data/krb5.conf"
 [keycloak_options]
 ## Where the Federation tab stores the URL, realm and admin user.
 config_file = "/data/keycloak_config.toml"
+## Keycloak HTTP keytab, written by Export keytab.
+keytab = "/data/keytab/keycloak-http.keytab"
 ## Keycloak admin password. No default. Not written into the file above.
 #admin_pass = "changeme"

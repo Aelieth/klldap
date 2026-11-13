@@ -61,6 +61,9 @@ inputs are given, migration boot and a real lldap-cli run. It needs docker, the 
 
 - `make gate-fast` runs the phases against the already built image.
 - `make gate-postgres` runs them against a gate-managed PostgreSQL.
+- `make lane-mysql` and `make lane-mariadb` start a scratch `mysql:9.7` or
+  `mariadb:12.3` on `127.0.0.1`, set `KLLDAP_TEST_DATABASE_URL`, and run the
+  ignored lane tests on one thread. The container is removed with its volume.
 - `make gate-phase PHASE=kerberos` runs the phases whose name contains the string.
 - Results land in `gate/results/<run id>/`, one directory per phase with the exact
   requests, responses and container logs. `GATE_KEEP=1` leaves the containers running.

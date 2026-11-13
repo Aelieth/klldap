@@ -251,5 +251,27 @@ mod tests {
             .map_sqlx_sqlite_opts(sqlite_extra_synchronous);
         let pool = Database::connect(opts).await.unwrap();
         warn_database_durability(&pool).await.unwrap();
+        if pool.get_database_backend() == DbBackend::MySql {
+            let row = mysql_settings(&pool).await.unwrap();
+            eprintln!(
+                "mysql durability: innodb_flush_log_at_trx_commit={} sync_binlog={} log_bin={}",
+                row.innodb_flush_log_at_trx_commit, row.sync_binlog, row.log_bin
+            );
+            assert!(
+                durability_warning(
+                    "innodb_flush_log_at_trx_commit",
+                    &row.innodb_flush_log_at_trx_commit,
+                )
+                .is_none(),
+                "innodb_flush_log_at_trx_commit={}",
+                row.innodb_flush_log_at_trx_commit
+            );
+            assert!(
+                sync_binlog_warning(&row.sync_binlog, &row.log_bin).is_none(),
+                "sync_binlog={} log_bin={}",
+                row.sync_binlog,
+                row.log_bin
+            );
+        }
     }
 }

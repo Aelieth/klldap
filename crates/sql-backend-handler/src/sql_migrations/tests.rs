@@ -1808,12 +1808,21 @@ async fn test_migration_from_v5_eav_with_legacy_names() {
     run_stepwise_migration_test(SchemaVersion(4)).await; // reach v5 state via the runner start
 }
 
-// The #[ignore] lane tests DROP SCHEMA public; the lock stops parallel clobber.
+// The #[ignore] lane tests reset one scratch database; the lock stops parallel clobber.
 static PG_LANE_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+static MYSQL_LANE_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 async fn connect_scratch_postgres() -> Option<DbConnection> {
-    let url = std::env::var("KLLDAP_TEST_DATABASE_URL").ok()?;
+    let Ok(url) = std::env::var("KLLDAP_TEST_DATABASE_URL") else {
+        eprintln!("KLLDAP_TEST_DATABASE_URL not set; skipping");
+        return None;
+    };
+    if !url.starts_with("postgres://") && !url.starts_with("postgresql://") {
+        eprintln!("KLLDAP_TEST_DATABASE_URL is not a postgres URL; skipping");
+        return None;
+    }
     let mut opts = sea_orm::ConnectOptions::new(url);
     opts.max_connections(2).sqlx_logging(false);
     let pool = Database::connect(opts)
@@ -1830,9 +1839,59 @@ async fn connect_scratch_postgres() -> Option<DbConnection> {
     Some(pool)
 }
 
-async fn pg_user_attribute(pool: &DbConnection, user: &str, name: &str) -> Vec<u8> {
+fn mysql_database_name(url: &str) -> String {
+    let path = url.split('?').next().unwrap_or(url);
+    let name = path.rsplit('/').next().unwrap_or("klldap");
+    assert!(
+        !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+        "mysql database name {name}"
+    );
+    name.to_owned()
+}
+
+async fn connect_scratch_mysql() -> Option<DbConnection> {
+    let Ok(url) = std::env::var("KLLDAP_TEST_DATABASE_URL") else {
+        eprintln!("KLLDAP_TEST_DATABASE_URL not set; skipping");
+        return None;
+    };
+    if !url.starts_with("mysql://") {
+        eprintln!("KLLDAP_TEST_DATABASE_URL is not a mysql URL; skipping");
+        return None;
+    }
+    let db = mysql_database_name(&url);
+    let admin = format!(
+        "{}/mysql",
+        url.split('?')
+            .next()
+            .unwrap_or(&url)
+            .rsplit_once('/')
+            .unwrap()
+            .0
+    );
+    let mut opts = sea_orm::ConnectOptions::new(admin);
+    opts.max_connections(1).sqlx_logging(false);
+    let admin_pool = Database::connect(opts).await.expect("connect mysql admin");
+    for sql in [
+        format!("DROP DATABASE IF EXISTS `{db}`"),
+        format!("CREATE DATABASE `{db}`"),
+    ] {
+        admin_pool
+            .execute(sea_orm::Statement::from_string(DbBackend::MySql, sql))
+            .await
+            .expect("reset scratch database");
+    }
+    let mut opts = sea_orm::ConnectOptions::new(url);
+    opts.max_connections(2).sqlx_logging(false);
+    Some(
+        Database::connect(opts)
+            .await
+            .expect("connect scratch mysql"),
+    )
+}
+
+async fn lane_user_attribute(pool: &DbConnection, user: &str, name: &str) -> Vec<u8> {
     pool.query_one(sea_orm::Statement::from_string(
-        DbBackend::Postgres,
+        pool.get_database_backend(),
         format!(
             "SELECT user_attribute_value FROM user_attributes \
              WHERE user_attribute_user_id = '{user}' AND user_attribute_name = '{name}'"
@@ -1845,18 +1904,11 @@ async fn pg_user_attribute(pool: &DbConnection, user: &str, name: &str) -> Vec<u
     .expect("value column")
 }
 
-#[tokio::test]
-#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
-async fn test_postgres_stepwise_migration() {
-    let _lane = PG_LANE_LOCK.lock().await;
-    let Some(pool) = connect_scratch_postgres().await else {
-        eprintln!("KLLDAP_TEST_DATABASE_URL not set; skipping");
-        return;
-    };
-    upgrade_to_v1(&pool).await.unwrap();
-    migrate_from_version(&pool, SchemaVersion(1), SchemaVersion(11))
+async fn stepwise_lane(pool: &DbConnection) {
+    upgrade_to_v1(pool).await.unwrap();
+    migrate_from_version(pool, SchemaVersion(1), SchemaVersion(11))
         .await
-        .expect("chain to v11 on postgres");
+        .expect("chain to v11");
 
     let now = chrono::Utc::now().naive_utc();
     let builder = pool.get_database_backend();
@@ -1925,34 +1977,34 @@ async fn test_postgres_stepwise_migration() {
         pool.execute(builder.build(&insert_value)).await.unwrap();
     }
 
-    migrate_from_version(&pool, SchemaVersion(11), LAST_SCHEMA_VERSION)
+    migrate_from_version(pool, SchemaVersion(11), LAST_SCHEMA_VERSION)
         .await
-        .expect("v12+v13 on postgres");
-    assert_eq!(get_schema_version(&pool).await, Some(LAST_SCHEMA_VERSION));
+        .expect("v12+v13");
+    assert_eq!(get_schema_version(pool).await, Some(LAST_SCHEMA_VERSION));
 
     assert_eq!(
-        pg_user_attribute(&pool, "pguser", "pgcustom").await,
+        lane_user_attribute(pool, "pguser", "pgcustom").await,
         b"PG Bob",
-        "v13 must re-encode bincode on postgres"
+        "v13 must re-encode bincode"
     );
     assert_eq!(
-        pg_user_attribute(&pool, "pguser", "kerberossync").await,
+        lane_user_attribute(pool, "pguser", "kerberossync").await,
         b"1",
         "v12 normalize must preserve truthy kerberossync"
     );
     assert_eq!(
-        pg_user_attribute(&pool, "pguser", "ou").await,
+        lane_user_attribute(pool, "pguser", "ou").await,
         b"people",
-        "v12 OU default must byte-bind into bytea"
+        "v12 OU default must be stored as bytes"
     );
     assert_eq!(
-        pg_user_attribute(&pool, "pguser", "avatar").await,
+        lane_user_attribute(pool, "pguser", "avatar").await,
         jpeg,
         "raw JPEG must pass through untouched"
     );
     let aliases_row = pool
         .query_one(sea_orm::Statement::from_string(
-            DbBackend::Postgres,
+            pool.get_database_backend(),
             "SELECT aliases FROM user_attribute_schema \
              WHERE user_attribute_schema_name = 'avatar'"
                 .to_owned(),
@@ -1966,19 +2018,37 @@ async fn test_postgres_stepwise_migration() {
             .unwrap_or_default()
             .to_lowercase()
             .contains("jpegphoto"),
-        "v12 upsert must reach the hardcoded avatar aliases on postgres"
+        "v12 upsert must reach the hardcoded avatar aliases"
     );
 
-    init_table(&pool).await.expect("re-init must be idempotent");
+    init_table(pool).await.expect("re-init must be idempotent");
     assert_eq!(
-        pg_user_attribute(&pool, "pguser", "pgcustom").await,
+        lane_user_attribute(pool, "pguser", "pgcustom").await,
         b"PG Bob"
     );
 }
 
 #[tokio::test]
 #[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
-async fn test_postgres_fresh_install_lookups_and_retention() {
+async fn test_postgres_stepwise_migration() {
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres().await else {
+        return;
+    };
+    stepwise_lane(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_stepwise_migration() {
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql().await else {
+        return;
+    };
+    stepwise_lane(&pool).await;
+}
+
+async fn fresh_install_lane(pool: &DbConnection) {
     use crate::sql_backend_handler::tests::{
         insert_group, insert_membership, insert_user_no_password,
     };
@@ -1990,15 +2060,10 @@ async fn test_postgres_fresh_install_lookups_and_retention() {
     use lldap_domain_model::model::{Logs, LogsColumn, logs};
     use sea_orm::{ActiveValue::Set, EntityTrait, QueryOrder};
 
-    let _lane = PG_LANE_LOCK.lock().await;
-    let Some(pool) = connect_scratch_postgres().await else {
-        eprintln!("KLLDAP_TEST_DATABASE_URL not set; skipping");
-        return;
-    };
-    init_table(&pool).await.expect("fresh init on postgres");
-    assert_eq!(get_schema_version(&pool).await, Some(LAST_SCHEMA_VERSION));
-    init_table(&pool).await.expect("re-init must be idempotent");
-    assert_eq!(get_schema_version(&pool).await, Some(LAST_SCHEMA_VERSION));
+    init_table(pool).await.expect("fresh init");
+    assert_eq!(get_schema_version(pool).await, Some(LAST_SCHEMA_VERSION));
+    init_table(pool).await.expect("re-init must be idempotent");
+    assert_eq!(get_schema_version(pool).await, Some(LAST_SCHEMA_VERSION));
 
     let handler = SqlBackendHandler::new(generate_random_private_key(), pool.clone());
     insert_user_no_password(&handler, "bob").await;
@@ -2027,7 +2092,7 @@ async fn test_postgres_fresh_install_lookups_and_retention() {
         row("bob", "login", false, at(2, 12)),
         row("carol", "bind", false, at(2, 13)),
     ])
-    .exec(&pool)
+    .exec(pool)
     .await
     .expect("insert rows");
 
@@ -2097,13 +2162,21 @@ async fn test_postgres_fresh_install_lookups_and_retention() {
     struct IndexRow {
         indexname: String,
     }
+    let index_sql = match pool.get_database_backend() {
+        DbBackend::Postgres => "SELECT indexname FROM pg_indexes WHERE tablename = 'logs'",
+        DbBackend::MySql => {
+            "SELECT index_name AS indexname FROM information_schema.statistics \
+             WHERE table_schema = DATABASE() AND table_name = 'logs'"
+        }
+        other => panic!("no logs index query for {other:?}"),
+    };
     let indexes: Vec<String> = IndexRow::find_by_statement(sea_orm::Statement::from_string(
-        DbBackend::Postgres,
-        "SELECT indexname FROM pg_indexes WHERE tablename = 'logs'".to_owned(),
+        pool.get_database_backend(),
+        index_sql.to_owned(),
     ))
-    .all(&pool)
+    .all(pool)
     .await
-    .expect("pg_indexes")
+    .expect("logs indexes")
     .into_iter()
     .map(|r| r.indexname)
     .collect();
@@ -2111,7 +2184,7 @@ async fn test_postgres_fresh_install_lookups_and_retention() {
         assert!(indexes.iter().any(|n| n == index), "{index}: {indexes:?}");
     }
 
-    Logs::delete_many().exec(&pool).await.expect("clear rows");
+    Logs::delete_many().exec(pool).await.expect("clear rows");
     let aged = |actor: &str, days_ago: i64| logs::ActiveModel {
         timestamp: Set(chrono::Utc::now().naive_utc() - chrono::Duration::days(days_ago)),
         kind: Set("bind".to_owned()),
@@ -2123,27 +2196,47 @@ async fn test_postgres_fresh_install_lookups_and_retention() {
     Logs::insert_many(
         std::iter::once(aged("old", 40)).chain((0..5).map(|i| aged(&format!("new{i}"), 0))),
     )
-    .exec(&pool)
+    .exec(pool)
     .await
     .expect("insert rows");
     enforce_log_retention(
-        &pool,
+        pool,
         LogRetention {
             retention_days: 30,
             max_entries: 3,
         },
     )
     .await
-    .expect("retention on postgres");
+    .expect("retention");
     let actors: Vec<_> = Logs::find()
         .order_by_asc(LogsColumn::Id)
-        .all(&pool)
+        .all(pool)
         .await
         .expect("query")
         .into_iter()
         .filter_map(|r| r.actor)
         .collect();
     assert_eq!(actors, vec!["new2", "new3", "new4"]);
+}
+
+#[tokio::test]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_fresh_install_lookups_and_retention() {
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres().await else {
+        return;
+    };
+    fresh_install_lane(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_fresh_install_lookups_and_retention() {
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql().await else {
+        return;
+    };
+    fresh_install_lane(&pool).await;
 }
 
 fn kerberos_stamp() -> chrono::NaiveDateTime {
@@ -2492,7 +2585,6 @@ async fn test_ensure_kerberos_tables() {
 async fn test_postgres_ensure_kerberos_tables() {
     let _lane = PG_LANE_LOCK.lock().await;
     let Some(pool) = connect_scratch_postgres().await else {
-        eprintln!("KLLDAP_TEST_DATABASE_URL not set; skipping");
         return;
     };
     init_table(&pool).await.unwrap();
@@ -2519,17 +2611,14 @@ async fn test_postgres_kerberos_batch() {
     };
     let _lane = PG_LANE_LOCK.lock().await;
     let Some(pool) = connect_scratch_postgres().await else {
-        eprintln!("KLLDAP_TEST_DATABASE_URL not set; skipping");
         return;
     };
     scenario_batch_round_trip(&pool).await;
     let Some(pool) = connect_scratch_postgres().await else {
-        eprintln!("KLLDAP_TEST_DATABASE_URL not set; skipping");
         return;
     };
     scenario_stale_generation(&pool).await;
     let Some(pool) = connect_scratch_postgres().await else {
-        eprintln!("KLLDAP_TEST_DATABASE_URL not set; skipping");
         return;
     };
     scenario_failure_rolls_back(&pool).await;
@@ -2540,10 +2629,118 @@ async fn test_postgres_kerberos_batch() {
 async fn test_postgres_take_one_wins() {
     let _lane = PG_LANE_LOCK.lock().await;
     let Some(pool) = connect_scratch_postgres().await else {
-        eprintln!("KLLDAP_TEST_DATABASE_URL not set; skipping");
         return;
     };
     crate::sql_kerberos_handler::tests::scenario_take_one_wins(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_ensure_kerberos_tables() {
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql().await else {
+        return;
+    };
+    init_table(&pool).await.unwrap();
+    assert_principal_user_rules(&pool).await;
+    insert_principal(&pool, "HTTP/kept.example.com", None)
+        .await
+        .unwrap();
+    ensure_v13_additions(&pool).await.unwrap();
+    assert_eq!(
+        count_sql(
+            &pool,
+            "SELECT COUNT(*) as c FROM kerberos_principals WHERE name = 'HTTP/kept.example.com'",
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_kerberos_batch() {
+    use crate::sql_kerberos_handler::tests::{
+        scenario_batch_round_trip, scenario_failure_rolls_back, scenario_stale_generation,
+    };
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql().await else {
+        return;
+    };
+    scenario_batch_round_trip(&pool).await;
+    let Some(pool) = connect_scratch_mysql().await else {
+        return;
+    };
+    scenario_stale_generation(&pool).await;
+    let Some(pool) = connect_scratch_mysql().await else {
+        return;
+    };
+    scenario_failure_rolls_back(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_take_one_wins() {
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql().await else {
+        return;
+    };
+    crate::sql_kerberos_handler::tests::scenario_take_one_wins(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_kerberos_longblob() {
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql().await else {
+        return;
+    };
+    init_table(&pool).await.unwrap();
+    for (table, column) in [
+        ("kerberos_principals", "record"),
+        ("kerberos_policies", "record"),
+        ("kerberos_realm", "state"),
+    ] {
+        let row = pool
+            .query_one(sea_orm::Statement::from_string(
+                DbBackend::MySql,
+                format!(
+                    "SELECT column_type FROM information_schema.columns \
+                     WHERE table_schema = DATABASE() AND table_name = '{table}' \
+                     AND column_name = '{column}'"
+                ),
+            ))
+            .await
+            .expect("column type")
+            .unwrap_or_else(|| panic!("{table}.{column} missing"));
+        let column_type: String = row.try_get_by_index(0).expect("column_type");
+        assert!(
+            column_type.to_ascii_lowercase().contains("longblob"),
+            "{table}.{column}: {column_type}"
+        );
+    }
+    let blob = vec![0x5au8; 70 * 1024];
+    insert_principal(&pool, "long", None).await.unwrap();
+    pool.execute(
+        pool.get_database_backend().build(
+            Query::update()
+                .table(KerberosPrincipals::Table)
+                .value(KerberosPrincipals::Record, blob.clone().into())
+                .and_where(Expr::col(KerberosPrincipals::Name).eq("long")),
+        ),
+    )
+    .await
+    .expect("store a record larger than a MySQL BLOB");
+    let got = pool
+        .query_one(sea_orm::Statement::from_string(
+            DbBackend::MySql,
+            "SELECT record FROM kerberos_principals WHERE name = 'long'".to_owned(),
+        ))
+        .await
+        .expect("read record")
+        .expect("long row");
+    let stored: Vec<u8> = got.try_get_by_index(0).expect("record");
+    assert_eq!(stored, blob);
 }
 
 fn dump_script_names(text: &str, prefix: &str) -> Vec<String> {

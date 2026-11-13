@@ -113,9 +113,11 @@ test-run:
 # - gate          → build the test image and run the full container gate
 # - gate-fast     → run the gate against the existing klldap-test image
 # - gate-postgres → gate with a gate-managed postgres:16 backend
+# - lane-mysql    → ignored cargo lane on a scratch mysql:9.7
+# - lane-mariadb  → the same lane on a scratch mariadb:12.3
 # - gate-rootless → gate (SQLite) on the -rootless image
 # - gate-phase    → run selected phases, e.g. make gate-phase PHASE=kerberos
-.PHONY: safety advisories gate gate-fast gate-postgres gate-rootless gate-phase
+.PHONY: safety advisories gate gate-fast gate-postgres lane-mysql lane-mariadb gate-rootless gate-phase
 
 safety:
 	cargo fmt --all
@@ -137,6 +139,12 @@ gate-fast:
 
 gate-postgres:
 	GATE_DB=postgres gate/run-gate.sh
+
+lane-mysql:
+	GATE_MYSQL_FLAVOR=mysql gate/mysql-lane.sh
+
+lane-mariadb:
+	GATE_MYSQL_FLAVOR=mariadb gate/mysql-lane.sh
 
 gate-rootless: test
 	GATE_IMAGE=klldap-test-rootless GATE_ROOTLESS=1 gate/run-gate.sh

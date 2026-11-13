@@ -164,6 +164,10 @@ mod tests {
             eprintln!("KLLDAP_TEST_DATABASE_URL not set; skipping");
             return;
         };
+        if !url.starts_with("postgres://") && !url.starts_with("postgresql://") {
+            eprintln!("KLLDAP_TEST_DATABASE_URL is not a postgres URL; skipping");
+            return;
+        }
         conformance_on(&move |n, runtime| {
             let schema = format!("klldap_conformance_{}_{n}", std::process::id());
             runtime.block_on(async {
@@ -178,6 +182,52 @@ mod tests {
                 opts.set_schema_search_path(schema)
                     .max_connections(2)
                     .sqlx_logging(false);
+                Database::connect(opts).await.unwrap()
+            })
+        });
+    }
+
+    #[test]
+    #[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+    fn test_kerber_rust_conformance_on_mysql() {
+        let Ok(url) = std::env::var("KLLDAP_TEST_DATABASE_URL") else {
+            eprintln!("KLLDAP_TEST_DATABASE_URL not set; skipping");
+            return;
+        };
+        if !url.starts_with("mysql://") {
+            eprintln!("KLLDAP_TEST_DATABASE_URL is not a mysql URL; skipping");
+            return;
+        }
+        conformance_on(&move |n, runtime| {
+            let db = format!("klldap_conf_{}_{n}", std::process::id());
+            runtime.block_on(async {
+                let admin_url = format!(
+                    "{}/mysql",
+                    url.split('?')
+                        .next()
+                        .unwrap_or(&url)
+                        .rsplit_once('/')
+                        .unwrap()
+                        .0
+                );
+                let admin = Database::connect(admin_url.as_str()).await.unwrap();
+                for sql in [
+                    format!("DROP DATABASE IF EXISTS `{db}`"),
+                    format!("CREATE DATABASE `{db}`"),
+                ] {
+                    admin.execute_unprepared(&sql).await.unwrap();
+                }
+                let db_url = format!(
+                    "{}/{db}",
+                    url.split('?')
+                        .next()
+                        .unwrap_or(&url)
+                        .rsplit_once('/')
+                        .unwrap()
+                        .0
+                );
+                let mut opts = ConnectOptions::new(db_url);
+                opts.max_connections(2).sqlx_logging(false);
                 Database::connect(opts).await.unwrap()
             })
         });

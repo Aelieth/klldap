@@ -94,11 +94,11 @@ async fn handle_password_modify<Handler: BackendHandler + OpaqueHandler>(
             message: format!("Error while changing the password: {e:#?}"),
         })?;
 
-    let sync_enabled =
-        password::sync_kerberos_after_password_change(readable_handler, &user_id, plain_pass).await;
-    if let Err(e) = backend_handler
-        .ensure_kerberos_principal_consistency(&user_id, sync_enabled)
-        .await
+    if let Some(sync_enabled) =
+        password::sync_kerberos_after_password_change(readable_handler, &user_id, plain_pass).await
+        && let Err(e) = backend_handler
+            .ensure_kerberos_principal_consistency(&user_id, sync_enabled)
+            .await
     {
         warn!("Failed to record Kerberos principal name for {user_id}: {e}");
     }

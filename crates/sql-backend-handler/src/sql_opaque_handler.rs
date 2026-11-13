@@ -674,7 +674,7 @@ mod tests {
                 // the loop hits that reserved step: wait out a near boundary first.
                 let remaining =
                     TOTP_STEP_SECS - (chrono::Utc::now().timestamp() as u64 % TOTP_STEP_SECS);
-                if remaining < 5 {
+                if remaining < u64::from(TOTP_MAX_ATTEMPTS_PER_STEP) * 3 {
                     tokio::time::sleep(std::time::Duration::from_secs(remaining)).await;
                 }
                 let uuid = model::User::find_by_id(UserId::new("bob"))

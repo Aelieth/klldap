@@ -2545,3 +2545,109 @@ async fn test_postgres_take_one_wins() {
     };
     crate::sql_kerberos_handler::tests::scenario_take_one_wins(&pool).await;
 }
+
+fn dump_script_names(text: &str, prefix: &str) -> Vec<String> {
+    text.lines()
+        .find_map(|line| line.strip_prefix(prefix))
+        .unwrap_or_else(|| panic!("the dump script has no {prefix} line"))
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
+#[tokio::test]
+async fn test_sqlite_dump_script_matches_migrated_tables() {
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/sqlite_dump_commands.sh");
+    let text = std::fs::read_to_string(&script).unwrap();
+    let left_out = dump_script_names(&text, "# left out:");
+    let server_tables = dump_script_names(&text, "# server tables:");
+    assert_eq!(left_out, ["metadata", "sqlite_sequence"].map(str::to_owned));
+    let output = std::process::Command::new("bash")
+        .arg(&script)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let listed: Vec<String> = stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix(".mode insert "))
+        .map(str::to_owned)
+        .collect();
+    assert!(listed.iter().all(|name| !left_out.contains(name)));
+    for name in &server_tables {
+        assert!(listed.iter().any(|item| item == name), "{name}");
+    }
+    let users = listed.iter().position(|name| name == "users").unwrap();
+    let after_users: Vec<&str> = listed[users + 1..users + 6]
+        .iter()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        after_users,
+        [
+            "policies",
+            "ou_policies",
+            "kerberos_policies",
+            "kerberos_realm",
+            "kerberos_principals",
+        ]
+    );
+
+    let pool = get_in_memory_db().await;
+    init_table(&pool).await.unwrap();
+    #[derive(FromQueryResult)]
+    struct NameRow {
+        name: String,
+    }
+    let created: Vec<String> = NameRow::find_by_statement(raw_statement(
+        "SELECT name FROM sqlite_master WHERE type = 'table'",
+    ))
+    .all(&pool)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|row| row.name)
+    .collect();
+    let mut dumped: Vec<String> = listed
+        .iter()
+        .filter(|name| !server_tables.iter().any(|extra| extra == *name))
+        .cloned()
+        .collect();
+    dumped.sort();
+    let mut migrated: Vec<String> = created
+        .iter()
+        .filter(|name| !left_out.iter().any(|skip| skip == *name))
+        .cloned()
+        .collect();
+    migrated.sort();
+    assert_eq!(dumped, migrated);
+
+    #[derive(FromQueryResult)]
+    struct FkDest {
+        dest: String,
+    }
+    for (index, table) in listed.iter().enumerate() {
+        if !created.iter().any(|name| name == table) {
+            continue;
+        }
+        assert!(
+            table.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "{table}"
+        );
+        let dests = FkDest::find_by_statement(raw_statement(&format!(
+            "SELECT \"table\" as dest FROM pragma_foreign_key_list('{table}')"
+        )))
+        .all(&pool)
+        .await
+        .unwrap();
+        for dest in dests {
+            let earlier = listed.iter().position(|name| name == &dest.dest).unwrap();
+            assert!(earlier < index, "{table} follows {}", dest.dest);
+        }
+    }
+}

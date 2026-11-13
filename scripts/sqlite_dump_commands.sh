@@ -1,6 +1,9 @@
 #! /bin/bash
 
-tables=("users" "groups" "memberships" "jwt_refresh_storage" "jwt_storage" "password_reset_tokens" "group_attribute_schema" "group_attributes" "user_object_classes" "group_object_classes" "system_config" "logs")
+# left out: metadata sqlite_sequence
+# server tables: jwt_refresh_storage jwt_storage password_reset_tokens
+
+tables=("users" "policies" "ou_policies" "kerberos_policies" "kerberos_realm" "kerberos_principals" "groups" "memberships" "jwt_refresh_storage" "jwt_storage" "password_reset_tokens" "group_attribute_schema" "group_attributes" "user_object_classes" "group_object_classes" "system_config" "logs")
 echo ".header on"
 
 for table in "${tables[@]}"; do

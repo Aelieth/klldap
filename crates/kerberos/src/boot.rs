@@ -25,10 +25,11 @@ pub struct RealmSettings {
     pub max_renewable_life: u64,
     pub forwardable: bool,
     pub supported_enctypes: Vec<EncryptionType>,
-    pub kdc_bind: IpAddr,
+    pub kdc_host: String,
     pub kdc_port: u16,
-    pub kadmin_bind: SocketAddr,
-    pub kadmin_acl_file: Option<PathBuf>,
+    pub kadmin_host: String,
+    pub kadmin_port: u16,
+    pub kadmin_acl: Option<PathBuf>,
     pub data_dir: PathBuf,
     pub admin_keytab: PathBuf,
     pub keycloak_keytab: PathBuf,
@@ -83,7 +84,7 @@ pub(crate) fn open(settings: &RealmSettings) -> Result<OpenRealm> {
     write_client_config(settings)?;
 
     let kdc_addr = ListenAddr {
-        host: Some(settings.kdc_bind.to_string()),
+        host: Some(settings.kdc_host.clone()),
         port: settings.kdc_port,
     };
     let kdc_udp = krb5_kdc::bind_udp_listeners(std::slice::from_ref(&kdc_addr))
@@ -92,12 +93,17 @@ pub(crate) fn open(settings: &RealmSettings) -> Result<OpenRealm> {
     let kdc_tcp = krb5_kdc::bind_tcp_listeners(std::slice::from_ref(&kdc_addr))
         .map_err(|e| with_port_hint(e, settings.kdc_port))
         .with_context(|| format!("while binding the KDC on TCP {kdc_addr:?}"))?;
-    let kadmin = TcpListener::bind(settings.kadmin_bind)
-        .map_err(|e| with_port_hint(e, settings.kadmin_bind.port()))
-        .with_context(|| format!("while binding kadmin on {}", settings.kadmin_bind))?;
+    let kadmin = TcpListener::bind((settings.kadmin_host.as_str(), settings.kadmin_port))
+        .map_err(|e| with_port_hint(e, settings.kadmin_port))
+        .with_context(|| {
+            format!(
+                "while binding kadmin on {}:{}",
+                settings.kadmin_host, settings.kadmin_port
+            )
+        })?;
     Ok(OpenRealm {
         store: krb5_kdc::shared_dump(store),
-        acl: acl(&settings.realm, settings.kadmin_acl_file.as_deref())?,
+        acl: acl(&settings.realm, settings.kadmin_acl.as_deref())?,
         profile,
         kdc_udp,
         kdc_tcp,
@@ -129,7 +135,7 @@ pub(crate) fn open_store(settings: &RealmSettings, profile: &ProfileSet) -> Resu
         realm: Some(realm.clone()),
         database_name: settings.data_dir.join("principal"),
         key_stash_file: settings.data_dir.join(format!(".k5.{realm}")),
-        acl_file: settings.kadmin_acl_file.clone(),
+        acl_file: settings.kadmin_acl.clone(),
         master_key_type: Some(MASTER_KEY_TYPE.to_owned()),
     };
     let admin = AdminSpec::new(admin_principal());
@@ -202,8 +208,8 @@ fn write_client_config(settings: &RealmSettings) -> Result<()> {
                 RENEW_LIFETIME => format!("{}s", settings.renew_lifetime),
                 FORWARDABLE => settings.forwardable,
                 RDNS => false,
-                KDC => SocketAddr::new(loopback_for(settings.kdc_bind), settings.kdc_port),
-                ADMIN_SERVER => settings.kadmin_bind,
+                KDC => client_address(&settings.kdc_host, settings.kdc_port),
+                ADMIN_SERVER => client_address(&settings.kadmin_host, settings.kadmin_port),
             })
         })
         .context("while rendering krb5.conf")?;
@@ -242,6 +248,13 @@ fn secure_dir(dir: &Path) -> Result<()> {
         ),
     }
     Ok(())
+}
+
+fn client_address(host: &str, port: u16) -> String {
+    match host.parse::<IpAddr>() {
+        Ok(ip) => SocketAddr::new(loopback_for(ip), port).to_string(),
+        Err(_) => format!("{host}:{port}"),
+    }
 }
 
 fn loopback_for(bind: IpAddr) -> IpAddr {

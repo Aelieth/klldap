@@ -153,8 +153,12 @@ impl EmbeddedKerberos {
         }
         ready.store(true, Ordering::Relaxed);
         info!(
-            "🎟️ Kerberos realm {} serving: kdc {}:{}, kadmin {}",
-            settings.realm, settings.kdc_bind, settings.kdc_port, settings.kadmin_bind
+            "🎟️ Kerberos realm {} serving: kdc {}:{}, kadmin {}:{}",
+            settings.realm,
+            settings.kdc_host,
+            settings.kdc_port,
+            settings.kadmin_host,
+            settings.kadmin_port
         );
         Ok((Arc::new(Self::new(store, settings, ready)), threads))
     }
@@ -510,10 +514,11 @@ pub(crate) mod tests {
                     max_renewable_life: 604_800,
                     forwardable: true,
                     supported_enctypes: vec![EncryptionType::Aes256CtsHmacSha196],
-                    kdc_bind: [127, 0, 0, 1].into(),
+                    kdc_host: "127.0.0.1".to_owned(),
                     kdc_port: 0,
-                    kadmin_bind: ([127, 0, 0, 1], 0).into(),
-                    kadmin_acl_file: None,
+                    kadmin_host: "127.0.0.1".to_owned(),
+                    kadmin_port: 0,
+                    kadmin_acl: None,
                     data_dir: dir.join("kdc"),
                     admin_keytab: dir.join("kadm5.keytab"),
                     keycloak_keytab: dir.join("keycloak.keytab"),

@@ -23,6 +23,7 @@ ADMIN_PASS = "GateAdminPass2026!"
 JWT, SEED = "gate-jwt-secret-not-for-production", "gate-key-seed-not-for-production"
 KDC_DIR = "/var/kerberos/krb5kdc"
 SERVICE, WRITER, LOCKED, POLICY, MAX_FAIL = "HTTP/dur.gate.test", "durbob", "durlock", "durpol", 3
+SECOND = "HTTP/dur-second.gate.test"
 HEALTH_LIMIT, EXIT_LIMIT, STOPPED_FOR = 90, 30, 40
 REFUSED = "Password incorrect while getting initial credentials"
 GAP_TARGET_MS = 20
@@ -31,6 +32,7 @@ ADDR = ENV.get("DUR_ADDR", "127.0.0.1")
 GUEST = ENV.get("DUR_GUEST", "")
 BOOT_LIMIT = 240
 SETTLE = int(ENV.get("DUR_SETTLE", "0"))
+KINDS = ENV.get("DUR_KINDS", "abc")
 LOCKOUT = f"{KDC_DIR}/lockout"
 NOISE, NOISE_POLICY = "durnoise", "durnoisepol"
 LOCKOUT_CAUSES = ("lockout file", "is not a kerber-rust lockout file")
@@ -67,6 +69,7 @@ class Record:
         self.acks = open(os.path.join(RUN_DIR, "acks.jsonl"), "a", encoding="utf-8")
         self.counts = {}
         self.gaps = {}
+        self.writes = {}
         self.aborted = 0
         self.losses = []
         self.degraded = 0
@@ -230,22 +233,22 @@ class Server:
     def client_then_kill(self, *command):
         """The client's result streams to the host; the shell then waits for k to kill lldap."""
         script = (f"rm -f /data/dur-*; {FIND_LLDAP}; "
-                  '"$@" >/data/dur-out 2>&1; rc=$?; t=$(date +%s%N); '
-                  'echo "RESULT $rc $t"; cat /data/dur-out; echo END-OF-OUTPUT; read -r x; '
+                  's=$(date +%s%N); "$@" >/data/dur-out 2>&1; rc=$?; t=$(date +%s%N); '
+                  'echo "RESULT $rc $s $t"; cat /data/dur-out; echo END-OF-OUTPUT; read -r x; '
                   'k=$(date +%s%N); echo "$t $k" >/data/dur-kill; [ "$x" = k ] && kill -9 "$p"')
         shell = subprocess.Popen(
             ["docker", "exec", "-i", self.name, "sh", "-c", script, "sh", *command],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         head = shell.stdout.readline().split()
-        if len(head) != 3 or head[0] != "RESULT" or not head[1].isdigit():
+        if len(head) != 4 or head[0] != "RESULT" or not all(x.isdigit() for x in head[1:]):
             release(shell, False)
-            return None, None, ""
+            return None, None, "", None
         out = []
         for line in shell.stdout:
             if line.rstrip("\n") == "END-OF-OUTPUT":
                 break
             out.append(line)
-        return shell, int(head[1]), "".join(out)
+        return shell, int(head[1]), "".join(out), (int(head[3]) - int(head[2])) / 1e6
 
     def arm_killer(self):
         script = (f"rm -f /data/dur-*; {FIND_LLDAP}; echo ready; read -r x; "
@@ -430,6 +433,8 @@ def set_up(row):
         server.create_user(NOISE, test_password(0))
         queries += [f"addpol -maxfailure 1000000 -failurecountinterval 0 {NOISE_POLICY}",
                     f"modprinc -policy {NOISE_POLICY} {NOISE}"]
+    if "d" in KINDS:
+        queries.append(f"addprinc -randkey {SECOND}")
     for query in queries:
         if not server.kadmin(query)[1]:
             raise RuntimeError(f"kadmin {query} failed")
@@ -439,7 +444,7 @@ def set_up(row):
 def acc3(record, kills):
     server, lock_password = set_up("acc3")
     n = 0
-    for kind in "abc":
+    for kind in KINDS:
         for i in range(kills):
             n += 1
             if not one_kill(record, server, n, kind, i, lock_password):
@@ -453,7 +458,7 @@ def acc8(record, cuts):
     time.sleep(SETTLE)
     try:
         for n in range(1, cuts + 1):
-            kind, i = "abc"[(n - 1) % 3], (n - 1) // 3
+            kind, i = KINDS[(n - 1) % len(KINDS)], (n - 1) // len(KINDS)
             if not one_kill(record, server, n, kind, i, lock_password):
                 raise RuntimeError(f"the server did not come back after cut {n}")
     finally:
@@ -472,14 +477,23 @@ def one_kill(record, server, n, kind, i, lock_password):
         target, password = WRITER, test_password(n)
         expect = tag(password)
         killer = server.arm_killer()
+        sent = time.perf_counter_ns()
         acked = killer is not None and server.set_password(WRITER, password)
         read_at, returned = time.perf_counter_ns(), time.time_ns()
+        write_ms = (read_at - sent) / 1e6
     else:
-        if kind == "a":
+        if kind in ("a", "d"):
             target, before = SERVICE, server.kvno(SERVICE)
             expect = before + 1 if before is not None else None
             command = ("kadmin", "-k", "-t", "/data/kadm5.keytab", "-p", f"admin/admin@{REALM}",
                        "-q", f"cpw -randkey {SERVICE}")
+            if kind == "d":
+                # A second acknowledged write follows, so the first is no longer the last commit.
+                second = server.kvno(SECOND)
+                second = second + 1 if second is not None else None
+                command = ("sh", "-c", 'kadmin -k -t /data/kadm5.keytab -p "$0" -q "$1" && '
+                           'kadmin -k -t /data/kadm5.keytab -p "$0" -q "$2"',
+                           f"admin/admin@{REALM}", f"cpw -randkey {SERVICE}", f"cpw -randkey {SECOND}")
         else:
             target, count = LOCKED, i % MAX_FAIL + 1
             expect = f"{count},locked={count == MAX_FAIL}"
@@ -489,10 +503,12 @@ def one_kill(record, server, n, kind, i, lock_password):
                                  for _ in range(count - 1))
             command = ("sh", "-c", 'printf "%s\\n" "$0" | KRB5CCNAME=/tmp/dur_cc kinit "$1"',
                        test_password(n), LOCKED)
-        killer, rc, out = server.client_then_kill(*command)
+        killer, rc, out, write_ms = server.client_then_kill(*command)
         read_at, returned = time.perf_counter_ns(), None
-        if kind == "a":
+        if kind in ("a", "d"):
             acked = killer is not None and rc == 0 and " while " not in out
+            if kind == "d":
+                acked = acked and all(f'"{p}@{REALM}" randomized' in out for p in (SERVICE, SECOND))
         else:
             acked = killer is not None and refused_before and rc != 0 and REFUSED in out
     if not acked:
@@ -502,7 +518,10 @@ def one_kill(record, server, n, kind, i, lock_password):
             server.kadmin(f"modprinc -unlock {LOCKED}")
         record.line(kind, False, f"{head} target={target} the write was not acknowledged")
         return server.healthy()
-    if not record.ack({"n": n, "db": DB, "kind": kind, "target": target, "expect": expect}):
+    entry = {"n": n, "db": DB, "kind": kind, "target": target, "expect": expect}
+    if kind == "d":
+        entry.update(second=SECOND, second_expect=second)
+    if not record.ack(entry):
         release(killer, False)
         record.abort(f"{head} target={target} the host's ack was not written; no kill")
         return server.healthy()
@@ -551,9 +570,15 @@ def one_kill(record, server, n, kind, i, lock_password):
     if gap_ms is not None:
         record.gaps.setdefault(kind, []).append(gap_ms)
     gap = f"{gap_ms:.1f}" if gap_ms is not None else "unknown"
-    if kind == "a":
+    if write_ms is not None:
+        record.writes.setdefault(kind, []).append(write_ms)
+    write = f"{write_ms:.1f}" if write_ms is not None else "unknown"
+    if kind in ("a", "d"):
         got = server.kvno(SERVICE)
         ok = got == expect
+        if kind == "d":
+            got = (f"{got} second_expect={second} second_got={server.kvno(SECOND)} "
+                   "(second: recorded, not judged)")
     elif kind == "b":
         bound, (signed, _) = server.bind(WRITER, password), server.kinit(WRITER, password)
         got, ok = f"bind={bound},kinit={signed}", bound and signed
@@ -575,7 +600,7 @@ def one_kill(record, server, n, kind, i, lock_password):
         server.keep_logs(f"kill-{n}")
     found = f"FINDING degraded start ({finding!r}), evidence-{n}/, recovered; " if finding else ""
     record.line(kind, ok and not finding,
-                f"{head} target={target} {found}gap_ms={gap} ack_written_ms={ack_ms:.1f} "
+                f"{head} target={target} {found}gap_ms={gap} write_ms={write} ack_written_ms={ack_ms:.1f} "
                 f"{timing}back_s={back:.1f} expect={expect} got={got}")
     if finding and SETTLE:
         time.sleep(SETTLE)
@@ -677,7 +702,8 @@ def main():
         record.note(f"START guest={GUEST} addr={ADDR} docker_host={ENV.get('DOCKER_HOST', '')} "
                     f"lab_lock={ENV.get('DUR_LAB_LOCK', '')} ssh_config={ENV.get('DUR_SSH_CONFIG', '')}")
         record.note(f"START cache: {CACHE_NOTE}")
-        record.note(f"START docker root: {ENV.get('DUR_DOCKER_ROOT', 'unknown')} settle_s={SETTLE}")
+        record.note(f"START docker root: {ENV.get('DUR_DOCKER_ROOT', 'unknown')} settle_s={SETTLE} "
+                    f"kinds={KINDS}")
     error = None
     try:
         if ROW == "acc3":
@@ -695,10 +721,15 @@ def main():
     for kind, g in sorted(gaps.items()):
         record.note(f"GAPS kind={kind} min={g['min']} median={g['median']} max={g['max']} "
                     f"over_{GAP_TARGET_MS}ms={g['over_target']}")
+    writes = {k: {"min": round(min(v), 1), "median": round(sorted(v)[len(v) // 2], 1),
+                  "max": round(max(v), 1)} for k, v in record.writes.items()}
+    if POWER:
+        for kind, w in sorted(writes.items()):
+            record.note(f"WRITES kind={kind} min={w['min']} median={w['median']} max={w['max']}")
     summary = {"row": ROW, "db": DB, "image": IMAGE, "image_id": ENV.get("DUR_IMAGE_ID", ""),
                "driver": ENV.get("DUR_REV", ""), "seconds": round(time.time() - started),
-               "counts": {k: {"pass": p, "fail": f} for k, (p, f) in record.counts.items()},
-               "gaps_ms": gaps, "aborted_iterations": record.aborted, "aborted": error,
+               "kinds": KINDS, "counts": {k: {"pass": p, "fail": f} for k, (p, f) in record.counts.items()},
+               "gaps_ms": gaps, "writes_ms": writes, "aborted_iterations": record.aborted, "aborted": error,
                "lockout_lost_cuts": len(record.losses), "lockout_lost_sum": sum(record.losses),
                "degraded_starts": record.degraded, "findings": record.degraded}
     with open(os.path.join(RUN_DIR, "summary.json"), "w", encoding="utf-8") as f:

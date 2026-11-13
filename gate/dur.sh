@@ -8,7 +8,8 @@ GATE_ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$GATE_ROOT/.." || exit 1
 usage() {
     echo "usage: gate/dur.sh acc3|acc4|acc8 --db sqlite|postgres [--image IMG] [--kills N] [--times N]" \
-        "[--cases i,ii,iii] [--kill power --cuts N --settle S --guest NAME --addr IP --lab-home DIR]" >&2
+        "[--kinds abcd] [--cases i,ii,iii]" \
+        "[--kill power --cuts N --settle S --guest NAME --addr IP --lab-home DIR]" >&2
     exit 2
 }
 case "${1:-}" in
@@ -19,6 +20,7 @@ DB="sqlite"
 GATE_IMAGE="klldap-test"
 KILLS=25
 TIMES=5
+KINDS="abc"
 CASES="i,ii,iii"
 KILL="process"
 CUTS=3
@@ -33,6 +35,7 @@ while [ $# -gt 0 ]; do
     --image) GATE_IMAGE="$2" ;;
     --kills) KILLS="$2" ;;
     --times) TIMES="$2" ;;
+    --kinds) KINDS="$2" ;;
     --cases) CASES="$2" ;;
     --kill) KILL="$2" ;;
     --cuts) CUTS="$2" ;;
@@ -52,6 +55,10 @@ case "$ROW:$KILL" in
 acc8:power | acc3:process | acc4:process) ;;
 *) usage ;;
 esac
+case "$KINDS" in
+"" | *[!abcd]*) usage ;;
+esac
+[ "$ROW" != acc4 ] || [ "$KINDS" = abc ] || usage
 RUNID="$(date +%Y%m%d-%H%M%S)-$$"
 RESULTS_DIR="${GATE_RESULTS_DIR:-gate/results}/dur-$RUNID"
 mkdir -p "$RESULTS_DIR" || exit 1
@@ -189,7 +196,7 @@ DUR_ROW="$ROW" DUR_DB="$DB" DUR_IMAGE="$GATE_IMAGE" DUR_PREFIX="$PREFIX" DUR_NET
     DUR_PG="$PG_CONTAINER" DUR_KILLS="$KILLS" DUR_TIMES="$TIMES" DUR_CASES="$CASES" DUR_REV="$driver_rev" \
     DUR_IMAGE_ID="$IMAGE_ID" DUR_CUTS="$CUTS" DUR_GUEST="$GUEST" DUR_LAB_LOCK="$LAB_LOCK" \
     DUR_SSH_CONFIG="$SSH_CONFIG" DUR_ADDR="$([ "$ROW" = acc8 ] && echo "$ADDR" || echo 127.0.0.1)" \
-    DUR_SETTLE="$SETTLE" DUR_DOCKER_ROOT="${DOCKER_ROOT:-}" \
+    DUR_SETTLE="$SETTLE" DUR_DOCKER_ROOT="${DOCKER_ROOT:-}" DUR_KINDS="$KINDS" \
     python3 -I "$GATE_ROOT/lib/dur.py" "$RESULTS_DIR"
 DUR_RC=$?
 exit "$DUR_RC"

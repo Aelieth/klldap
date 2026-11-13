@@ -23,10 +23,9 @@ graphql_client = { workspace = true }
 jwt = { workspace = true }
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 rand = { workspace = true }
-rsa = "0.9.6"
+rsa = "0.10.0"
 serde = { workspace = true }
 serde_json = { workspace = true }
-sha2 = "0.10"
 strum = { workspace = true }
 url-escape = "0.1.1"
 validator = "0.14"
@@ -35,6 +34,11 @@ wasm-bindgen = "0.2.100"
 wasm-bindgen-futures = "0"
 yew = "0.19.3"
 yew-router = "0.16"
+
+# rsa 0.10 draws randomness from getrandom 0.4, which needs wasm_js in the browser.
+[target.'cfg(target_arch = "wasm32")'.dependencies.getrandom]
+version = "0.4"
+features = ["wasm_js"]
 
 # opaque_server stays enabled (default): the shared login/registration wire types
 # in lldap_auth reference opaque::server types even on the client side.
@@ -93,3 +97,7 @@ wasm-opt = ['--enable-bulk-memory']
 wasm-opt = ['--enable-bulk-memory']
 [package.metadata.wasm-pack.profile.release]
 wasm-opt = ['--enable-bulk-memory']
+
+[dev-dependencies.getrandom]
+version = "0.4"
+features = ["sys_rng"]

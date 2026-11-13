@@ -18,6 +18,10 @@ Next release. The KDC is kerber-rust inside the `lldap` process.
 - `lldap_mfa` moves to hmac 0.13 and sha1 0.11, kerber-rust's RustCrypto generation. sha2
   0.10, hmac 0.12 and digest 0.10 remain, pinned by `opaque-ke` 4, `rsa` 0.9, `jwt` 0.16 and
   `sqlx` 0.8; `sqlx` also keeps sha1 0.10 and md-5 0.10.
+- The browser's Kerberos password envelope (RSA-OAEP, SHA-256) moves to `rsa` 0.10 in the server
+  and the app, whose constant-time code fixes RUSTSEC-2023-0071 (the Marvin timing attack).
+  The wire format is unchanged. `sqlx-mysql` keeps its own `rsa` 0.9, which only encrypts to
+  a MySQL server's public key.
 
 ### Configuration
 

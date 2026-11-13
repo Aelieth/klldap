@@ -1,20 +1,19 @@
 use anyhow::{Context, Result};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use rsa::PublicKey;
 use rsa::pkcs1::DecodeRsaPublicKey;
-use rsa::{Oaep, RsaPublicKey};
-use sha2::Sha256;
+use rsa::sha2::Sha256;
 
 pub(crate) fn encrypt_password(pub_key_der_base64: &str, plain: &str) -> Result<String> {
     let der_bytes = STANDARD
         .decode(pub_key_der_base64)
         .context("Base64 decode of public key failed")?;
     let pub_key =
-        RsaPublicKey::from_pkcs1_der(&der_bytes).context("Failed to load public key from DER")?;
+        PublicKey::from_pkcs1_der(&der_bytes).context("Failed to load public key from DER")?;
 
-    let padding = Oaep::new::<Sha256>();
     let encrypted_data = pub_key
-        .encrypt(&mut rand::thread_rng(), padding, plain.as_bytes())
+        .oaep_encrypt::<Sha256>(plain.as_bytes())
         .context("Encryption failed")?;
 
     Ok(STANDARD.encode(encrypted_data))
@@ -33,22 +32,22 @@ pub fn encrypt_kerberos_password(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use getrandom::SysRng;
+    use rsa::PrivateKey;
     use rsa::pkcs1::EncodeRsaPublicKey;
-    use rsa::{Oaep, RsaPrivateKey, RsaPublicKey};
 
     #[test]
     fn encrypt_round_trips_with_backend_padding() {
         // Mirrors the backend: OAEP + SHA-256, PKCS1 DER public key, base64 wire form.
-        let mut rng = rand::thread_rng();
-        let private = RsaPrivateKey::new(&mut rng, 2048).unwrap();
-        let public = RsaPublicKey::from(&private);
+        let private = PrivateKey::new(&mut SysRng, 2048).unwrap();
+        let public = private.to_public_key();
         let pub_der_b64 = STANDARD.encode(public.to_pkcs1_der().unwrap().as_bytes());
 
         let plaintext = "correct horse battery staple";
         let wire = encrypt_password(&pub_der_b64, plaintext).unwrap();
 
         let ciphertext = STANDARD.decode(&wire).unwrap();
-        let decrypted = private.decrypt(Oaep::new::<Sha256>(), &ciphertext).unwrap();
+        let decrypted = private.oaep_decrypt::<Sha256>(&ciphertext).unwrap();
         assert_eq!(decrypted, plaintext.as_bytes());
     }
 }

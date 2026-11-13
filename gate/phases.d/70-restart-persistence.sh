@@ -106,6 +106,10 @@ if t docker stop "$CONTAINER" >/dev/null 2>&1; then
     stop_code="$(docker inspect -f '{{.State.ExitCode}}' "$CONTAINER")"
     if [ "$stop_code" != "137" ] && [ "$stop_secs" -lt 5 ]; then
         p_ok "docker stop ends the server cleanly (exit $stop_code in ${stop_secs}s)"
+    elif [ "$stop_secs" -ge 5 ]; then
+        finished_at="$(docker inspect -f '{{.State.FinishedAt}}' "$CONTAINER")"
+        last_log="$(docker logs --timestamps "$CONTAINER" 2>&1 | tail -n 1)"
+        p_bad "docker stop: exit $stop_code after ${stop_secs}s (SIGTERM not handled); FinishedAt ${finished_at}; last log: ${last_log}"
     else
         p_bad "docker stop: exit $stop_code after ${stop_secs}s (SIGTERM not handled)"
     fi

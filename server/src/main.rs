@@ -30,7 +30,7 @@ use futures_util::TryFutureExt;
 use lldap_sql_backend_handler::{
     KerberosLost, LogRetention, SqlBackendHandler, register_password,
     sql_tables::{self, get_private_key_info, set_private_key_info},
-    sqlite_full_synchronous, start_kerberos_committer, start_log_writer, warn_database_durability,
+    sqlite_extra_synchronous, start_kerberos_committer, start_log_writer, warn_database_durability,
 };
 use sea_orm::{Database, DatabaseConnection};
 use std::{net::IpAddr, sync::Arc, time::Duration};
@@ -156,7 +156,7 @@ async fn setup_sql_tables(database_url: &DatabaseUrl) -> Result<DatabaseConnecti
             .sqlx_logging(true)
             .sqlx_logging_level(log::LevelFilter::Debug);
         if database_url.db_type() == "sqlite" {
-            sql_opt.map_sqlx_sqlite_opts(sqlite_full_synchronous);
+            sql_opt.map_sqlx_sqlite_opts(sqlite_extra_synchronous);
         }
         Database::connect(sql_opt).await?
     };

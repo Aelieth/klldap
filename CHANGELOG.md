@@ -170,6 +170,13 @@ Next release. The KDC is kerber-rust inside the `lldap` process.
   longest ticket life and `renew_lifetime` as their longest renewable life. A principal that
   already matches is not written.
 
+### Database
+
+- SQLite now runs with `synchronous = EXTRA` (it was FULL), so a change the server has
+  acknowledged survives a power loss: in SQLite's rollback-journal mode, FULL can roll the
+  last transaction back at the next start
+  (https://www.sqlite.org/pragma.html#pragma_synchronous).
+
 ### Fixed
 
 - LDAP Modify and ADD refuse a `userPassword` that is not valid UTF-8, with

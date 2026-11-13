@@ -6,9 +6,10 @@ pub const POSTGRESQL_RUNTIME_CONFIG_WAL: &str =
     "https://www.postgresql.org/docs/current/runtime-config-wal.html";
 pub const MYSQL_INNODB_FLUSH_LOG_AT_TRX_COMMIT: &str = "https://dev.mysql.com/doc/refman/8.4/en/innodb-parameters.html#sysvar_innodb_flush_log_at_trx_commit";
 pub const MYSQL_SYNC_BINLOG: &str = "https://dev.mysql.com/doc/refman/8.4/en/replication-options-binary-log.html#sysvar_sync_binlog";
+pub const SQLITE_PRAGMA_SYNCHRONOUS: &str = "https://www.sqlite.org/pragma.html#pragma_synchronous";
 
-pub fn sqlite_full_synchronous(options: SqliteConnectOptions) -> SqliteConnectOptions {
-    options.synchronous(SqliteSynchronous::Full)
+pub fn sqlite_extra_synchronous(options: SqliteConnectOptions) -> SqliteConnectOptions {
+    options.synchronous(SqliteSynchronous::Extra)
 }
 
 pub fn durability_warning(setting: &str, value: &str) -> Option<String> {
@@ -46,9 +47,9 @@ pub async fn warn_database_durability(pool: &DbConnection) -> Result<(), DbErr> 
     match pool.get_database_backend() {
         DbBackend::Sqlite => {
             let name = sqlite_synchronous_name(pool).await?;
-            if name != "FULL" {
+            if name != "EXTRA" {
                 return Err(DbErr::Custom(format!(
-                    "SQLite synchronous is {name}, not FULL"
+                    "SQLite synchronous is {name}, not EXTRA ({SQLITE_PRAGMA_SYNCHRONOUS})"
                 )));
             }
         }
@@ -208,7 +209,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_sqlite_synchronous_is_full() {
+    async fn test_sqlite_synchronous_is_extra() {
         let path = std::env::temp_dir().join(format!(
             "klldap-sql-b5-{}-{}.db",
             std::process::id(),
@@ -218,12 +219,22 @@ mod tests {
                 .as_nanos()
         ));
         let url = format!("sqlite://{}?mode=rwc", path.display());
-        let mut opts = sea_orm::ConnectOptions::new(url);
+        let mut opts = sea_orm::ConnectOptions::new(url.clone());
         opts.max_connections(1)
             .sqlx_logging(false)
-            .map_sqlx_sqlite_opts(sqlite_full_synchronous);
+            .map_sqlx_sqlite_opts(sqlite_extra_synchronous);
         let pool = Database::connect(opts).await.unwrap();
         warn_database_durability(&pool).await.unwrap();
+        let mut full = sea_orm::ConnectOptions::new(url);
+        full.max_connections(1)
+            .sqlx_logging(false)
+            .map_sqlx_sqlite_opts(|o| o.synchronous(SqliteSynchronous::Full));
+        let full = Database::connect(full).await.unwrap();
+        let refused = warn_database_durability(&full).await.unwrap_err();
+        assert!(
+            refused.to_string().contains("is FULL, not EXTRA"),
+            "{refused}"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -235,7 +246,9 @@ mod tests {
             return;
         };
         let mut opts = sea_orm::ConnectOptions::new(url);
-        opts.max_connections(1).sqlx_logging(false);
+        opts.max_connections(1)
+            .sqlx_logging(false)
+            .map_sqlx_sqlite_opts(sqlite_extra_synchronous);
         let pool = Database::connect(opts).await.unwrap();
         warn_database_durability(&pool).await.unwrap();
     }

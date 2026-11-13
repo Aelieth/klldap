@@ -39,7 +39,7 @@ use std::{
     task::{Context, Poll},
 };
 use time::ext::NumericalDuration;
-use tracing::{debug, info, instrument, warn};
+use tracing::{debug, instrument, warn};
 use uuid::Uuid;
 
 type Token<S> = jwt::Token<jwt::Header, JWTClaims, S>;
@@ -264,7 +264,7 @@ where
     .await
     {
         warn!("Error sending email: {:#?}", e);
-        info!("Reset token: {}", token);
+        debug!("Reset token: {}", token);
         logging::record_as(
             None,
             LogKind::PasswordResetRequest,

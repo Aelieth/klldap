@@ -165,6 +165,8 @@ Next release. The KDC is kerber-rust inside the `lldap` process.
 
 ### Security
 
+- A failed password-reset email logs the reset token at debug, not info. The
+  warning that the send failed, and the failed `password_reset_request` row, stay.
 - GraphQL refuses a mutation sent by GET. Queries by GET still answer, so send
   mutations by POST.
 - A password manager may call `setUserPassword` for a non-admin, the same rule as

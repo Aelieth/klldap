@@ -203,8 +203,9 @@ key_seed = "RanD0m STR1ng"
 ## The realm. Defaults to the domain of ldap_base_dn, uppercased (dc=example,dc=com gives
 ## EXAMPLE.COM).
 #realm = "EXAMPLE.COM"
-## Ticket lifetimes, as Kerberos durations ("24h", "7d", "36000s"). A bare
-## number is refused, and zero is refused.
+## Ticket lifetimes take a Kerberos duration ("24h", "7d", "36000s") or a
+## bare number of seconds ("36000"), quoted or not, in the file or the
+## environment. Zero and a negative are refused.
 #ticket_lifetime = "24h"
 #renew_lifetime = "7d"
 ## Issue forwardable tickets.

@@ -36,6 +36,9 @@ Next release. The KDC is kerber-rust inside the `lldap` process.
   optional PEM of extra SMTP roots, added to the roots compiled into the server.
   Unset, nothing changes. A missing, unreadable, or empty file refuses the start
   and names the setting. The `_FILE` form is refused: the key is the path itself.
+- `ticket_lifetime` and `renew_lifetime` take a Kerberos duration (`24h`, `7d`,
+  `36000s`) or a bare number of seconds (`36000`), quoted or not, in the file
+  or the environment. Zero and a negative stay refused.
 - New `[kerberos_options]` section (`LLDAP_KERBEROS_OPTIONS__*`): `enabled`, `realm`,
   `ticket_lifetime`, `renew_lifetime`, `forwardable`,
   `supported_enctypes`, `kdc_host`, `kdc_port`, `kadmin_host`, `kadmin_port`,

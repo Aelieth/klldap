@@ -113,8 +113,10 @@ pub struct KerberosOptions {
     #[builder(default)]
     pub realm: Option<String>,
     #[builder(default = r#"String::from("24h")"#)]
+    #[serde(deserialize_with = "deserialize_lifetime")]
     pub ticket_lifetime: String,
     #[builder(default = r#"String::from("7d")"#)]
+    #[serde(deserialize_with = "deserialize_lifetime")]
     pub renew_lifetime: String,
     #[builder(default = "true")]
     pub forwardable: bool,
@@ -187,6 +189,35 @@ impl KerberosOptions {
             client_config: self.client_config.clone(),
         })
     }
+}
+
+fn deserialize_lifetime<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Visitor;
+
+    impl serde::de::Visitor<'_> for Visitor {
+        type Value = String;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a Kerberos duration or a whole number of seconds")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+            Ok(value.to_owned())
+        }
+
+        fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+            Ok(value.to_string())
+        }
+
+        fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+            Ok(value.to_string())
+        }
+    }
+
+    deserializer.deserialize_any(Visitor)
 }
 
 fn seconds(name: &str, value: &str) -> Result<u64> {
@@ -1065,6 +1096,27 @@ mod tests {
         RunOpts::parse_from::<_, std::ffi::OsString>([])
     }
 
+    fn put_lifetime(
+        jail: &mut Jail,
+        key: &str,
+        source: &str,
+        raw: &str,
+    ) -> figment::error::Result<()> {
+        jail.clear_env();
+        jail.set_env("LLDAP_JWT_SECRET", "secret");
+        if source == "env" {
+            let env_name = format!("LLDAP_KERBEROS_OPTIONS__{}", key.to_ascii_uppercase());
+            jail.set_env(env_name, raw);
+            Ok(())
+        } else {
+            jail.create_file(
+                "lldap_config.toml",
+                &format!("[kerberos_options]\n{key} = {raw}\n"),
+            )?;
+            Ok(())
+        }
+    }
+
     fn write_random_key(jail: &Jail, file: &str) {
         use std::io::Write;
         let file = std::fs::File::create(jail.directory().join(file)).unwrap();
@@ -1630,6 +1682,98 @@ mod tests {
                 assert_eq!(read(&init(default_run_opts()).unwrap()), value, "{env}");
                 Ok(())
             });
+        }
+        let fields = ["ticket_lifetime", "renew_lifetime"];
+        let accepted: [(&str, &str, &str); 4] = [
+            ("env", "36000", "36000"),
+            ("toml", "36000", "36000"),
+            ("toml", "\"36000\"", "36000"),
+            ("env", "36000s", "36000s"),
+        ];
+        for key in fields {
+            for (source, raw, stored) in accepted {
+                Jail::expect_with(|jail| {
+                    put_lifetime(jail, key, source, raw)?;
+                    let config = init(default_run_opts()).unwrap();
+                    let got = if key == "ticket_lifetime" {
+                        config.kerberos_options.ticket_lifetime.as_str()
+                    } else {
+                        config.kerberos_options.renew_lifetime.as_str()
+                    };
+                    assert_eq!(got, stored, "{source} {key} = {raw}");
+                    let settings = config.kerberos_settings().unwrap();
+                    let parsed = if key == "ticket_lifetime" {
+                        settings.ticket_lifetime
+                    } else {
+                        settings.renew_lifetime
+                    };
+                    assert_eq!(parsed, 36000, "{source} {key} = {raw}");
+                    Ok(())
+                });
+            }
+        }
+        let refused: [(&str, &str, &str, &str); 6] = [
+            (
+                "env",
+                "0",
+                "ticket_lifetime",
+                "ticket_lifetime = \"0\" is refused: zero means no limit to the KDC",
+            ),
+            (
+                "toml",
+                "0",
+                "ticket_lifetime",
+                "ticket_lifetime = \"0\" is refused: zero means no limit to the KDC",
+            ),
+            (
+                "env",
+                "0",
+                "renew_lifetime",
+                "renew_lifetime = \"0\" is not a positive Kerberos duration",
+            ),
+            (
+                "toml",
+                "0",
+                "renew_lifetime",
+                "renew_lifetime = \"0\" is not a positive Kerberos duration",
+            ),
+            (
+                "toml",
+                "-1",
+                "ticket_lifetime",
+                "ticket_lifetime = \"-1\" is not a positive Kerberos duration",
+            ),
+            (
+                "toml",
+                "-1",
+                "renew_lifetime",
+                "renew_lifetime = \"-1\" is not a positive Kerberos duration",
+            ),
+        ];
+        for (source, raw, key, expect) in refused {
+            Jail::expect_with(|jail| {
+                put_lifetime(jail, key, source, raw)?;
+                let err = init(default_run_opts()).unwrap_err().to_string();
+                assert!(err.contains(expect), "{source} {key} = {raw}: {err}");
+                Ok(())
+            });
+        }
+        for key in fields {
+            for source in ["env", "toml"] {
+                Jail::expect_with(|jail| {
+                    put_lifetime(jail, key, source, "36000.5")?;
+                    let err = init(default_run_opts()).unwrap_err().to_string();
+                    assert!(
+                        err.contains("invalid type") && err.contains("36000.5"),
+                        "{source} {key}: {err}"
+                    );
+                    assert!(
+                        !err.contains("is not a positive") && !err.contains("is refused"),
+                        "{source} {key}: {err}"
+                    );
+                    Ok(())
+                });
+            }
         }
     }
 

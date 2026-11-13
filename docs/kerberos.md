@@ -157,14 +157,15 @@ realm with KLLDAP as an LDAP + Kerberos user-federation provider. See
 itself. Their `_FILE` forms, in the environment or the file, stop the start
 and name the key.
 
-`ticket_lifetime` and `renew_lifetime` are written with a unit (`24h`, `7d`,
-`36000s`). A bare number in the environment is refused, and zero is refused:
-to the KDC a zero ticket life means no limit. `renew_lifetime` is also the
-KDC's longest renewable life. A principal keeps the ticket life it was created
-with. At every start the server brings krbtgt and the users to the configured
-lives. The Keycloak HTTP principal, `admin/admin` and the kadmin services keep
-theirs, so a raised `ticket_lifetime` does not reach them. A lowered one still
-caps them through the realm's value.
+`ticket_lifetime` and `renew_lifetime` take a Kerberos duration (`24h`, `7d`,
+`36000s`) or a bare number of seconds (`36000`), quoted or not, in the file or
+the environment. Zero and a negative are refused: to the KDC a zero ticket life
+means no limit. `renew_lifetime` is also the KDC's longest renewable life. A
+principal keeps the ticket life it was created with. At every start the server
+brings krbtgt and the users to the configured lives. The Keycloak HTTP
+principal, `admin/admin` and the kadmin services keep theirs, so a raised
+`ticket_lifetime` does not reach them. A lowered one still caps them through
+the realm's value.
 
 The image sets `data_dir`, `admin_keytab` and `client_config`, and
 `keycloak_options.keytab` (default `keytab/keycloak-http.keytab`) and

@@ -154,7 +154,10 @@ key_seed = "RanD0m STR1ng"
 #port=587
 ## How the connection is encrypted, either "NONE" (no encryption), "TLS" or "STARTTLS".
 #smtp_encryption = "TLS"
-## PEM file of extra SMTP roots, trusted in addition to the roots in the binary.
+## PEM of the CA certificate(s) that signed the SMTP server's certificate, trusted
+## in addition to the roots in the binary. A self-signed server certificate that is
+## itself marked as a CA (what `openssl req -x509` makes by default) is refused as a
+## server certificate, so sign the server's certificate with that CA.
 #tls_root_cert_file = "/data/smtp-root.pem"
 ## The SMTP user, usually your email address.
 #user="sender@gmail.com"

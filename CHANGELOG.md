@@ -35,9 +35,12 @@ Next release. The KDC is kerber-rust inside the `lldap` process.
 ### Configuration
 
 - `smtp_options.tls_root_cert_file` (`LLDAP_SMTP_OPTIONS__TLS_ROOT_CERT_FILE`) is an
-  optional PEM of extra SMTP roots, added to the roots compiled into the server.
-  Unset, nothing changes. A missing, unreadable, or empty file refuses the start
-  and names the setting. The `_FILE` form is refused: the key is the path itself.
+  optional PEM of the CA certificate(s) that signed the SMTP server's certificate,
+  added to the roots compiled into the server. A self-signed server certificate that
+  is itself marked as a CA (what `openssl req -x509` makes by default) is refused as
+  a server certificate, so sign the server's certificate with that CA. Unset, nothing
+  changes. A missing, unreadable, or empty file refuses the start and names the
+  setting. The `_FILE` form is refused: the key is the path itself.
 - `ticket_lifetime` and `renew_lifetime` take a Kerberos duration (`24h`, `7d`,
   `36000s`) or a bare number of seconds (`36000`), quoted or not, in the file
   or the environment. Zero and a negative stay refused.

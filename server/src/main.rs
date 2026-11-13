@@ -445,6 +445,7 @@ async fn serve(
 
 fn realm_lost(lost: &tokio::sync::watch::Receiver<Option<KerberosLost>>) -> Result<()> {
     match lost.borrow().clone() {
+        Some(cause @ KerberosLost::Occupied) => Err(anyhow!("{cause}")),
         Some(cause) => Err(anyhow!("the Kerberos realm was lost: {cause}")),
         None => Err(anyhow!("the Kerberos realm was lost")),
     }

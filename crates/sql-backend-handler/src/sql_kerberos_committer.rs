@@ -23,6 +23,7 @@ const QUEUE: usize = 16;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KerberosLost {
     Replaced,
+    Occupied,
     DatabaseUnreachable,
 }
 
@@ -34,8 +35,13 @@ impl std::fmt::Display for KerberosLost {
                 "the realm's generation moved: another server took the realm, or this server's \
                  last commit was answered too late"
             ),
+            Self::Occupied => write!(
+                f,
+                "another server holds the Kerberos realm in this database; this one wrote \
+                 nothing and stops"
+            ),
             Self::DatabaseUnreachable => {
-                write!(f, "the database unreachable for twenty seconds")
+                write!(f, "no write reached the database for twenty seconds")
             }
         }
     }
@@ -238,7 +244,7 @@ async fn open_phase(
         Ok(Some(hold)) if !hold.open => match take_owned(pool, hold.generation, timings.step).await
         {
             Ok(generation) => Phase::Held(fresh(generation, true, timings)),
-            Err(Step::Replaced) => lose(lost_tx, KerberosLost::Replaced),
+            Err(Step::Replaced) => lose(lost_tx, KerberosLost::Occupied),
             Err(Step::Database) => starting(timings),
         },
         Ok(Some(hold)) => Phase::Watching {
@@ -487,7 +493,7 @@ async fn on_wake(
                 Ok(Some(hold)) if !hold.open => {
                     match take_owned(pool, hold.generation, timings.step).await {
                         Ok(generation) => Phase::Held(fresh(generation, true, timings)),
-                        Err(Step::Replaced) => lose(lost_tx, KerberosLost::Replaced),
+                        Err(Step::Replaced) => lose(lost_tx, KerberosLost::Occupied),
                         Err(Step::Database) => starting_from(since, timings),
                     }
                 }
@@ -502,11 +508,11 @@ async fn on_wake(
             Ok(Some(hold)) if hold.generation == generation => {
                 match take_owned(pool, generation, timings.step).await {
                     Ok(next) => Phase::Held(fresh(next, true, timings)),
-                    Err(Step::Replaced) => lose(lost_tx, KerberosLost::Replaced),
+                    Err(Step::Replaced) => lose(lost_tx, KerberosLost::Occupied),
                     Err(Step::Database) => lose(lost_tx, KerberosLost::DatabaseUnreachable),
                 }
             }
-            Ok(_) => lose(lost_tx, KerberosLost::Replaced),
+            Ok(_) => lose(lost_tx, KerberosLost::Occupied),
             Err(_) => lose(lost_tx, KerberosLost::DatabaseUnreachable),
         },
         Phase::Held(held) if held.row => {
@@ -947,7 +953,12 @@ mod tests {
         assert_eq!(heartbeat(&txn, 5).await.unwrap(), 6);
         txn.commit().await.unwrap();
         let mut lost = handle.lost();
-        assert_eq!(wait_lost(&mut lost).await, KerberosLost::Replaced);
+        let cause = wait_lost(&mut lost).await;
+        assert_eq!(cause, KerberosLost::Occupied);
+        assert!(
+            cause.to_string().contains("this one wrote nothing"),
+            "{cause}"
+        );
         assert_eq!(hold(&db.other).await, (6, true));
         handle.shutdown().await;
     }
@@ -1083,9 +1094,11 @@ mod tests {
         }
         db.pool.clone().close().await.unwrap();
         let mut lost = handle.lost();
+        let cause = wait_lost(&mut lost).await;
+        assert_eq!(cause, KerberosLost::DatabaseUnreachable);
         assert_eq!(
-            wait_lost(&mut lost).await,
-            KerberosLost::DatabaseUnreachable
+            cause.to_string(),
+            "no write reached the database for twenty seconds"
         );
         handle.shutdown().await;
     }
@@ -1136,7 +1149,10 @@ mod tests {
         assert_eq!(heartbeat(&txn, 5).await.unwrap(), 6);
         txn.commit().await.unwrap();
         let err = wait_thread(rx).await.unwrap().unwrap_err();
-        assert!(err.contains("generation moved"), "{err}");
+        assert!(
+            err.contains("another server holds the Kerberos realm"),
+            "{err}"
+        );
         assert_eq!(hold(&db.other).await, (6, true));
         handle.shutdown().await;
     }

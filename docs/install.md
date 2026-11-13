@@ -147,7 +147,8 @@ Moving between database backends is in [database_migration.md](database_migratio
 
 ### Upgrading from KLLDAP 0.7.2
 
-<!-- BLANK (MIG): the realm-dump section joins here when it lands. -->
+Write a dump of the Kerberos realm with the 0.7.2 image before the first 0.8.0 start; 0.8.0
+loads it and keeps the MIT files: [kerberos.md](kerberos.md#upgrading-from-072).
 
 **A 0.7.2 compose file that publishes `88:88` must publish `88:1088`, or the KDC is
 unreachable after the upgrade.**

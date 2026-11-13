@@ -12,7 +12,7 @@ EXTRA_CONTAINERS+=("$LDAPS_C")
 EXTRA_VOLUMES+=("$LDAPS_VOL")
 
 ldaps_stop() {
-    docker rm -f "$LDAPS_C" >/dev/null 2>&1 || true
+    docker rm -fv "$LDAPS_C" >/dev/null 2>&1 || true
     docker volume rm "$LDAPS_VOL" >/dev/null 2>&1 || true
 }
 

@@ -56,11 +56,11 @@ cleanup() {
         note "GATE_KEEP set — leaving $CONTAINER (and helpers) running"
         return
     fi
-    docker rm -f "$CONTAINER" >/dev/null 2>&1
+    docker rm -fv "$CONTAINER" >/dev/null 2>&1
     for c in "${EXTRA_CONTAINERS[@]:-}"; do
-        [ -n "$c" ] && docker rm -f "$c" >/dev/null 2>&1
+        [ -n "$c" ] && docker rm -fv "$c" >/dev/null 2>&1
     done
-    docker rm -f "$PG_CONTAINER" >/dev/null 2>&1
+    docker rm -fv "$PG_CONTAINER" >/dev/null 2>&1
     docker network rm "$NET" >/dev/null 2>&1
     docker volume rm "$VOL_DATA" "$VOL_KDC" >/dev/null 2>&1
     for v in "${EXTRA_VOLUMES[@]:-}"; do

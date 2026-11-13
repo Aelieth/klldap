@@ -97,7 +97,7 @@ KLLDAP's image publishes the KDC (88) and not kpasswd (464): passwords are chang
 through KLLDAP (web UI, GraphQL, or LDAP), which updates the KDC. Leave
 `kpasswd_server` out. kadmin listens on loopback inside the container, so these
 client files set no `admin_server`. An `admin_server` line applies only if the
-operator has changed `kadmin_bind`.
+operator has changed `kadmin_host` or `kadmin_port`.
 
 Test it:
 

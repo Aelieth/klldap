@@ -24,8 +24,8 @@ When `kerberos_options.enabled` is true, the server opens the realm itself:
 2. writes `admin/admin@REALM` to `admin_keytab` (default `kadm5.keytab`) at
    mode 0600, owned by the service user, on every boot,
 3. writes the client `krb5.conf` to `client_config` (default `krb5.conf`),
-4. binds the KDC on UDP and TCP at `kdc_bind:kdc_port` (default `0.0.0.0:1088`) and
-   kadmin at `kadmin_bind` (default `127.0.0.1:1749`), then serves them on the threads
+4. binds the KDC on UDP and TCP at `kdc_host`:`kdc_port` (default `0.0.0.0:1088`) and
+   kadmin at `kadmin_host`:`kadmin_port` (default `127.0.0.1:1749`), then serves them on the threads
    `krb5-kdc` and `krb5-kadmind`.
 
 `/data/kerberos_config.toml` is gone. The realm settings are `[kerberos_options]`.
@@ -60,15 +60,15 @@ it opens, serves normally. Nothing in the product repairs the realm. In a
 container, loopback is the container's own, so reach the server with `docker
 exec klldap /app/lldap healthcheck --config-file /data/lldap_config.toml`.
 
-The image sets `LLDAP_KERBEROS_OPTIONS__ENABLED=true`. The container's
+`enabled` defaults to true, and the image no longer sets it. The container's
 healthcheck (`lldap healthcheck`) then also requires the KDC port to accept
 connections and the admin keytab to exist, otherwise the container reports
 unhealthy, and **directory writes (users, groups, passwords, attributes,
 settings) are refused with "Kerberos KDC unavailable" until the KDC has
-answered once after boot**. Logins and reads are never gated. Outside the
-image, leave `enabled` unset: writes never wait and no principals are synced.
+answered once after boot**. Logins and reads are never gated. Set `enabled`
+to false to run without a realm: writes never wait and no principals are synced.
 
-`admin/admin@REALM *` is always granted. `kadmin_acl_file` is optional extra
+`admin/admin@REALM *` is always granted. `kadmin_acl` is optional extra
 ACL text, read at boot.
 
 ## Principals
@@ -114,7 +114,7 @@ are changed through KLLDAP, which updates the KDC.
 
 The `krb5.conf` the server writes (`client_config`, default `/data/krb5.conf`)
 is for tools inside the container, and it carries the inner port. With the
-default `kdc_bind` it names `127.0.0.1` as the KDC and `kadmin_bind` as the
+default `kdc_host` it names `127.0.0.1` as the KDC and `kadmin_host` as the
 admin server. Remote clients write their own and use port 88. The
 [SSSD guide](SSSD_LDAP_Kerberos_Setup_Guide.md) has complete client and browser
 configurations.
@@ -122,8 +122,8 @@ configurations.
 ## Keycloak
 
 The Federation tab's **Export keytab** creates `HTTP/<hostname>@REALM` with a
-fresh random key and writes `keycloak_keytab` (default
-`keytab/keycloak-http.keytab`, aes256 and aes128, the types Java accepts).
+fresh random key and writes `keycloak_options.keytab` (default
+`keytab/keycloak-http.keytab`, the types in `supported_enctypes`).
 Mount that directory read-only into Keycloak; **Push To Keycloak** creates a
 realm with KLLDAP as an LDAP + Kerberos user-federation provider. See
 [the SSSD guide, section 7](SSSD_LDAP_Kerberos_Setup_Guide.md#7-keycloak-integration--spnego-sso).
@@ -134,42 +134,66 @@ realm with KLLDAP as an LDAP + Kerberos user-federation provider. See
 
 | Option | Default |
 |---|---|
-| `enabled` | `false` (`true` in the image) |
+| `enabled` | `true` |
 | `realm` | derived from the base DN |
-| `ticket_lifetime` / `renew_lifetime` / `max_renewable_life` | `24h` / `7d` / `7d` |
+| `ticket_lifetime` | `24h` |
+| `renew_lifetime` | `7d` |
 | `forwardable` | `true` |
 | `supported_enctypes` | `aes256-cts-hmac-sha1-96` |
-| `kdc_bind` / `kdc_port` | `0.0.0.0` / `1088` |
-| `kadmin_bind` | `127.0.0.1:1749` |
-| `kadmin_acl_file` | none |
+| `kdc_host` / `kdc_port` | `0.0.0.0` / `1088` |
+| `kadmin_host` / `kadmin_port` | `127.0.0.1` / `1749` |
+| `kadmin_acl` | none |
 | `data_dir` | `krb5kdc` (mode 0700) |
 | `admin_keytab` | `kadm5.keytab` (mode 0600) |
-| `keycloak_keytab` | `keytab/keycloak-http.keytab` |
 | `client_config` | `krb5.conf` |
 
-The image sets these four, and `keycloak_options.config_file` (default
-`keycloak_config.toml`), to `/var/kerberos/krb5kdc`, `/data/kadm5.keytab`,
-`/data/keytab/keycloak-http.keytab`, `/data/krb5.conf` and
-`/data/keycloak_config.toml`. Inside the image that environment overrides the
-same keys in the config file.
+`data_dir`, `admin_keytab`, `client_config`, `kadmin_acl`,
+`keycloak_options.keytab` and `keycloak_options.config_file` take the path
+itself. Their `_FILE` forms, in the environment or the file, stop the start
+and name the key.
 
-`supported_enctypes` accepts `aes256-cts-hmac-sha1-96`,
-`aes128-cts-hmac-sha1-96`, `aes256-cts-hmac-sha384-192` and
-`aes128-cts-hmac-sha256-128`. `des3-cbc-sha1`, `arcfour-hmac`
-and their aliases are refused at startup as deprecated
+`ticket_lifetime` and `renew_lifetime` are written with a unit (`24h`, `7d`,
+`36000s`). A bare number in the environment is refused, and zero is refused:
+to the KDC a zero ticket life means no limit. `renew_lifetime` is also the
+KDC's longest renewable life. A principal keeps the ticket life it was created
+with. At every start the server brings krbtgt and the users to the configured
+lives. The Keycloak HTTP principal, `admin/admin` and the kadmin services keep
+theirs, so a raised `ticket_lifetime` does not reach them. A lowered one still
+caps them through the realm's value.
+
+The image sets `data_dir`, `admin_keytab` and `client_config`, and
+`keycloak_options.keytab` (default `keytab/keycloak-http.keytab`) and
+`keycloak_options.config_file` (default `keycloak_config.toml`), to
+`/var/kerberos/krb5kdc`, `/data/kadm5.keytab`, `/data/krb5.conf`,
+`/data/keytab/keycloak-http.keytab` and `/data/keycloak_config.toml`. Inside
+the image that environment overrides the same keys in the config file.
+
+`supported_enctypes` takes one type name per item. It accepts
+`aes256-cts-hmac-sha1-96`, `aes128-cts-hmac-sha1-96`,
+`aes256-cts-hmac-sha384-192` and `aes128-cts-hmac-sha256-128`. A family name
+such as `aes` or `default`, a `+` or `-` prefix, or two names in one item is
+refused at startup, naming the item. `des3-cbc-sha1`, `arcfour-hmac` and
+their aliases are refused as deprecated
 ([RFC 8429 section 7](https://www.rfc-editor.org/rfc/rfc8429)). `camellia128-cts-cmac`,
 `camellia256-cts-cmac` and the `camellia` family are refused because the
-embedded KDC does not serve them; that is not a deprecation. `des-cbc-crc` and
-`des-cbc-md5` are not encryption types this KDC knows. The name `default` is
-refused too, because it expands to AES plus 3DES, RC4 and Camellia;
-`default -des3 -rc4 -camellia` is the four AES types. `allow_rc4` and
-`allow_des3` stay off, which is MIT's default. See
+embedded KDC does not serve them. `des-cbc-crc` and `des-cbc-md5` are not
+encryption types this KDC knows. `allow_rc4` and `allow_des3` stay off. See
 [MIT's encryption types](https://web.mit.edu/kerberos/krb5-latest/doc/admin/enctypes.html)
 and
 [krb5.conf](https://web.mit.edu/kerberos/krb5-latest/doc/admin/conf_files/krb5_conf.html).
 
+When the first listed type changes, the next start gives `krbtgt/REALM`,
+`kadmin/admin` and `kadmin/changepw` new keys in the listed types and keeps
+the old ones, so tickets issued before the change still work. The old key
+versions are removed once `ticket_lifetime` plus `renew_lifetime` has passed,
+at a start or by the hourly cleanup. A roll that fails leaves the realm closed
+with the cause, as any realm that does not open. A user's own keys take the
+new types at that user's next password change.
+
 The old `LLDAP_KERB_*` variables are unknown. They warn at startup and are
-ignored. Use the options above.
+ignored. So do `kdc_bind`, `kadmin_bind`, `kadmin_acl_file`,
+`max_renewable_life` and `kerberos_options.keycloak_keytab`. Use the options
+above. `keycloak_keytab` is `keycloak_options.keytab`.
 
 ## Upgrading from 0.7.2
 
@@ -189,7 +213,10 @@ data, encrypted in the master key, so keep the backup as safe as the database.
 
 What carries over: the realm, the master key (the stash stays), every principal with its keys
 and attributes, and `admin/admin`, whose keytab is written again from its key. What does not:
-grants in `kadm5.acl` beyond the admin line (name them in `kadmin_acl_file`), and MIT's logs.
+grants in `kadm5.acl` beyond the admin line (name them in `kadmin_acl`), and MIT's logs.
+
+A configuration that does not set `kerberos_options.enabled` now starts a
+realm. Set `enabled = false` to stay without one.
 
 Without a dump the realm does not open: the server comes up in the degraded state and the
 cause names the file to write. A dump for a realm other than `kerberos_options.realm`, or a

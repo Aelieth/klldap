@@ -264,25 +264,65 @@ fn write_client_config(settings: &RealmSettings) -> Result<()> {
 // The database and stash are owner-only; the directory follows. One we cannot change is the
 // operator's arrangement, so it only warns.
 fn secure_dir(dir: &Path) -> Result<()> {
-    let existed = dir.exists();
+    let created = created_chain(dir);
+    let existed = created.is_empty();
     fs::create_dir_all(dir).with_context(|| format!("while creating {}", dir.display()))?;
     let mode = fs::metadata(dir)
         .with_context(|| format!("while reading {}", dir.display()))?
         .permissions()
         .mode()
         & 0o777;
-    if mode == 0o700 {
-        return Ok(());
+    if mode != 0o700 {
+        match fs::set_permissions(dir, fs::Permissions::from_mode(0o700)) {
+            Ok(()) if existed => info!("Tightened {} from {mode:o} to 700", dir.display()),
+            Ok(()) => {}
+            Err(e) => warn!(
+                "{} is {mode:o}, not 700, and was left so: {e}",
+                dir.display()
+            ),
+        }
     }
-    match fs::set_permissions(dir, fs::Permissions::from_mode(0o700)) {
-        Ok(()) if existed => info!("Tightened {} from {mode:o} to 700", dir.display()),
-        Ok(()) => {}
-        Err(e) => warn!(
-            "{} is {mode:o}, not 700, and was left so: {e}",
-            dir.display()
-        ),
+    if !existed {
+        sync_created(&created);
     }
     Ok(())
+}
+
+fn created_chain(dir: &Path) -> Vec<PathBuf> {
+    let mut chain = Vec::new();
+    let mut cur = dir;
+    loop {
+        if cur.as_os_str().is_empty() || cur.exists() {
+            break;
+        }
+        chain.push(cur.to_path_buf());
+        match cur.parent() {
+            Some(parent) => cur = parent,
+            None => break,
+        }
+    }
+    chain.reverse();
+    chain
+}
+
+fn sync_created(chain: &[PathBuf]) {
+    if let Some(first) = chain.first() {
+        let parent = match first.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        sync_one(parent);
+    }
+    for path in chain {
+        sync_one(path);
+    }
+}
+
+fn sync_one(dir: &Path) {
+    match fs::File::open(dir).and_then(|file| file.sync_all()) {
+        Ok(()) => {}
+        Err(err) => warn!("could not sync {}: {err}", dir.display()),
+    }
 }
 
 pub fn client_address(host: &str, port: u16) -> String {
@@ -391,6 +431,27 @@ mod tests {
                 "the io error stays in the chain: {message}"
             );
         }
+    }
+
+    #[test]
+    fn test_a_new_data_dir_is_created_owner_only() {
+        let root = std::env::temp_dir().join(format!("klldap-own-dir-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir(&root).unwrap();
+        let leaf = root.join("opt").join("data");
+        secure_dir(&leaf).unwrap();
+        assert!(leaf.is_dir());
+        assert!(root.join("opt").is_dir());
+        assert_eq!(
+            fs::metadata(&leaf).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        secure_dir(&leaf).unwrap();
+        assert_eq!(
+            fs::metadata(&leaf).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

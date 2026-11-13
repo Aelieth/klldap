@@ -2,7 +2,10 @@ use anyhow::{Context, Result};
 use lldap_domain_handlers::kerberos::domain_from_base_dn;
 use secstr::SecUtf8;
 use serde::{Deserialize, Serialize};
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use tracing::warn;
 
 pub const SUGGESTED_HOSTNAME: &str = "keycloak";
 
@@ -51,10 +54,59 @@ impl KeycloakConfig {
                       # The admin password is not stored here. Set keycloak_options.admin_pass\n\
                       # (LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS).\n\n";
         let body = toml::to_string_pretty(self).context("while serializing the Keycloak config")?;
-        std::fs::write(path, format!("{header}{body}"))
+        write_synced(path, format!("{header}{body}").as_bytes())
             .with_context(|| format!("while writing {}", path.display()))?;
         Ok(path.to_path_buf())
     }
+}
+
+fn write_synced(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no file name")
+    })?;
+    let tmp = parent.join(format!(
+        ".{}.{}.{}.tmp",
+        name.to_string_lossy(),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let mut created = false;
+    let result = (|| {
+        let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        created = true;
+        file.write_all(bytes)?;
+        if let Ok(meta) = fs::metadata(path) {
+            fs::set_permissions(&tmp, meta.permissions())?;
+        }
+        file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(err) = result {
+        if created {
+            let _ = fs::remove_file(&tmp);
+        }
+        return Err(err);
+    }
+    if let Err(err) = fs::rename(&tmp, path) {
+        let _ = fs::remove_file(&tmp);
+        return Err(err);
+    }
+    match File::open(parent) {
+        Ok(dir) => {
+            if let Err(err) = dir.sync_all() {
+                warn!("could not sync {}: {err}", parent.display());
+            }
+        }
+        Err(err) => warn!("could not sync {}: {err}", parent.display()),
+    }
+    Ok(())
 }
 
 pub fn admin_password(value: Option<&str>) -> Result<String> {
@@ -68,6 +120,7 @@ pub fn admin_password(value: Option<&str>) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn test_admin_password_has_no_default() {
@@ -93,6 +146,99 @@ mod tests {
         let loaded = KeycloakConfig::load("dc=other,dc=com", "OTHER.COM", &path).unwrap();
         let _ = std::fs::remove_file(&path);
         assert_eq!(loaded, cfg);
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("klldap-kco-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn sample() -> KeycloakConfig {
+        KeycloakConfig {
+            url: "http://keycloak.gate.test".into(),
+            realm: "gate.test".into(),
+            admin_user: "admin".into(),
+        }
+    }
+
+    fn no_temp_left(dir: &Path) -> bool {
+        fs::read_dir(dir).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp")
+        })
+    }
+
+    #[test]
+    fn save_replaces_the_file_and_leaves_no_temp() {
+        let dir = scratch("save");
+        let path = dir.join("keycloak_config.toml");
+        let cfg = sample();
+        cfg.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            text.starts_with("# KLLDAP Keycloak federation settings"),
+            "{text}"
+        );
+        assert_eq!(
+            KeycloakConfig::load("dc=other,dc=com", "OTHER.COM", &path).unwrap(),
+            cfg
+        );
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        let next = KeycloakConfig {
+            admin_user: "kcadmin".into(),
+            ..cfg
+        };
+        next.save(&path).unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.contains("kcadmin"), "{text}");
+        assert_eq!(
+            KeycloakConfig::load("dc=other,dc=com", "OTHER.COM", &path).unwrap(),
+            next
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert!(no_temp_left(&dir));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_save_leaves_the_previous_file() {
+        let dir = scratch("fail");
+        let path = dir.join("keycloak_config.toml");
+        sample().save(&path).unwrap();
+        let before = fs::read(&path).unwrap();
+        let mode = fs::metadata(&dir).unwrap().permissions().mode();
+        struct Restore(PathBuf, u32);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(self.1));
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _restore = Restore(dir.clone(), mode);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+        if File::create(dir.join(".probe")).is_ok() {
+            let _ = fs::remove_file(dir.join(".probe"));
+            eprintln!("a_failed_save_leaves_the_previous_file: directory stayed writable");
+            return;
+        }
+        let err = KeycloakConfig {
+            admin_user: "other".into(),
+            ..sample()
+        }
+        .save(&path)
+        .unwrap_err();
+        assert!(err.to_string().contains("while writing"), "{err}");
+        assert_eq!(fs::read(&path).unwrap(), before);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(mode)).unwrap();
+        assert!(no_temp_left(&dir));
     }
 
     #[test]

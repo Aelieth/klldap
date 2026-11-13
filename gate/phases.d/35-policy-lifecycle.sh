@@ -44,11 +44,19 @@ else
     p_ok "deleteOu dropped policy state for $OU_NAME"
 fi
 
-ROWS="$(log_rows "kind='policy_change'")"
-if [ "${ROWS:-0}" -gt 0 ]; then
+# The log writer lingers 250 ms, so the fourth policy_change row may still be queued.
+ROWS=0
+for _ in $(seq 1 8); do
+    ROWS="$(log_rows "kind='policy_change'")"
+    if [ "${ROWS:-0}" -eq 4 ]; then
+        break
+    fi
+    sleep 0.3
+done
+if [ "${ROWS:-0}" -eq 4 ]; then
     p_ok "policy_change rows recorded ($ROWS)"
 else
-    p_bad "no policy_change rows"
+    p_bad "policy_change rows recorded (${ROWS:-0}), want 4"
 fi
 
 graphql 'mutation($p: Int!) { deletePolicy(policyId: $p) { ok } }' '{"p": '"$PID"'}' \

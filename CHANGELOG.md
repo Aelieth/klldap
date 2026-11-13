@@ -23,8 +23,8 @@ Next release. The KDC is kerber-rust inside the `lldap` process.
 
 - New `[kerberos_options]` section (`LLDAP_KERBEROS_OPTIONS__*`): `enabled`, `realm`,
   `ticket_lifetime`, `renew_lifetime`, `max_renewable_life`, `forwardable`,
-  `supported_enctypes`, `kdc_bind`, `kdc_port`, `kadmin_bind`, `kadmin_acl_file`,
-  `data_dir`, `admin_keytab`, `keycloak_keytab`, `client_config`. Durations are
+  `supported_enctypes`, `kdc_host`, `kdc_port`, `kadmin_host`, `kadmin_port`,
+  `kadmin_acl`, `data_dir`, `admin_keytab`, `client_config`. Durations are
   checked at startup.
 - `kerberos_options.enabled` replaces `healthcheck_options.kerberos`
   (`LLDAP_HEALTHCHECK_OPTIONS__KERBEROS`) and the `healthcheck --kerberos` flag
@@ -32,30 +32,42 @@ Next release. The KDC is kerber-rust inside the `lldap` process.
   directory writes wait for the KDC after boot, and adds the KDC to the healthcheck. A compose
   file that overrides the healthcheck with `--kerberos` must drop the flag.
 - `LLDAP_KERB_REALM_NAME` is removed; use `kerberos_options.realm`. It now warns as unknown.
+- Renamed during 0.8.0's development, to follow LLDAP's shape (`ldap_host`, `ldap_port`):
+
+  | Old name | New name |
+  |---|---|
+  | `kerberos_options.kdc_bind` (`LLDAP_KERBEROS_OPTIONS__KDC_BIND`) | `kerberos_options.kdc_host` (`LLDAP_KERBEROS_OPTIONS__KDC_HOST`) |
+  | `kerberos_options.kadmin_bind` (`LLDAP_KERBEROS_OPTIONS__KADMIN_BIND`) | `kerberos_options.kadmin_host` and `kerberos_options.kadmin_port` (`LLDAP_KERBEROS_OPTIONS__KADMIN_HOST`, `LLDAP_KERBEROS_OPTIONS__KADMIN_PORT`) |
+  | `kerberos_options.kadmin_acl_file` (`LLDAP_KERBEROS_OPTIONS__KADMIN_ACL_FILE`) | `kerberos_options.kadmin_acl` (`LLDAP_KERBEROS_OPTIONS__KADMIN_ACL`) |
+  | `kerberos_options.keycloak_keytab` (`LLDAP_KERBEROS_OPTIONS__KEYCLOAK_KEYTAB`) | `keycloak_options.keytab` (`LLDAP_KEYCLOAK_OPTIONS__KEYTAB`) |
+
 - `[keycloak_options]` holds `config_file` (default `keycloak_config.toml`,
   `LLDAP_KEYCLOAK_OPTIONS__CONFIG_FILE`; the image sets
-  `/data/keycloak_config.toml`) and `admin_pass` (no default,
+  `/data/keycloak_config.toml`), `keytab` (default `keytab/keycloak-http.keytab`,
+  `LLDAP_KEYCLOAK_OPTIONS__KEYTAB`; the image sets `/data/keytab/keycloak-http.keytab`)
+  and `admin_pass` (no default,
   `LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS`, or `LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS_FILE`
   for a file; if both are set, the plain value wins). `LLDAP_KEYCLOAK_CONFIG` and
   `LLDAP_KEYCLOAK_ADMIN_PASS` now warn as unknown and are ignored. An operator who
   keeps the old admin password gets a realm push that fails with "admin password is
   not set".
-- `config_file` and `kadmin_acl_file` stay exempt from the file provider, with
-  `key_file` and `cert_file`. The exemption matches that name at any depth, so a
+- `config_file` stays exempt from the file provider, with `key_file` and
+  `cert_file`. The exemption matches that name at any depth, so a
   missing `LLDAP_CONFIG_FILE` starts the server on defaults, the same as a missing
   `--config-file`.
 - `LLDAP_KERB_ADMIN_KEYTAB` is `kerberos_options.admin_keytab` (default
   `kadm5.keytab`). `LLDAP_KERB_KDC_DIR` is `data_dir` (default `krb5kdc`).
   `LLDAP_KERB_KDC_PORT` is `kdc_port` (default `1088`), with
-  `kdc_bind` (default `0.0.0.0`) and `kadmin_bind` (default `127.0.0.1:1749`).
+  `kdc_host` (default `0.0.0.0`), `kadmin_host` (default `127.0.0.1`) and
+  `kadmin_port` (default `1749`).
   `LLDAP_KERB_KRB5_CONF` defaulted to `/etc/krb5.conf`. It and
   `LLDAP_KERB_KRB5_TEMPLATE` are `client_config` (default `krb5.conf`).
   `/etc/krb5.conf` is no longer written. The image sets these paths to
   `/var/kerberos/krb5kdc`, `/data/kadm5.keytab`, `/data/keytab/keycloak-http.keytab`
   and `/data/krb5.conf`, and tools inside the container need
-  `KRB5_CONFIG=/data/krb5.conf`. `LLDAP_KERB_KEYCLOAK_KEYTAB` is `keycloak_keytab`
+  `KRB5_CONFIG=/data/krb5.conf`. `LLDAP_KERB_KEYCLOAK_KEYTAB` is `keycloak_options.keytab`
   (default `keytab/keycloak-http.keytab`). `LLDAP_KERB_KADM5_ACL` and
-  `LLDAP_KERB_KADM5_ACL_TEMPLATE` are `kadmin_acl_file` (no default;
+  `LLDAP_KERB_KADM5_ACL_TEMPLATE` are `kadmin_acl` (no default;
   `admin/admin@REALM *` is always granted). `LLDAP_KERB_CONFIG`,
   `LLDAP_KERB_CONFIG_TEMPLATE`, `LLDAP_KERB_KDC_CONF`, `LLDAP_KERB_KDC_TEMPLATE` and
   `/data/kerberos_config.toml` are gone. Every one of those old names warns as unknown

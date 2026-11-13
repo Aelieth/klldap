@@ -22,10 +22,14 @@ Next release. The KDC is kerber-rust inside the `lldap` process.
 ### Configuration
 
 - New `[kerberos_options]` section (`LLDAP_KERBEROS_OPTIONS__*`): `enabled`, `realm`,
-  `ticket_lifetime`, `renew_lifetime`, `max_renewable_life`, `forwardable`,
+  `ticket_lifetime`, `renew_lifetime`, `forwardable`,
   `supported_enctypes`, `kdc_host`, `kdc_port`, `kadmin_host`, `kadmin_port`,
   `kadmin_acl`, `data_dir`, `admin_keytab`, `client_config`. Durations are
-  checked at startup.
+  checked at startup and must be positive: to the KDC a zero `ticket_lifetime` means no
+  limit, and a zero `renew_lifetime` means no renewal.
+  `renew_lifetime` is also the KDC's longest renewable life.
+- `kerberos_options.enabled` defaults to `true`: `lldap run` starts the realm unless it is
+  set to `false`. The image no longer sets it.
 - `kerberos_options.enabled` replaces `healthcheck_options.kerberos`
   (`LLDAP_HEALTHCHECK_OPTIONS__KERBEROS`) and the `healthcheck --kerberos` flag
   (`LLDAP_KERBEROS_HEALTHCHECK`), which are removed: it gates the Kerberos sync, makes
@@ -41,6 +45,18 @@ Next release. The KDC is kerber-rust inside the `lldap` process.
   | `kerberos_options.kadmin_acl_file` (`LLDAP_KERBEROS_OPTIONS__KADMIN_ACL_FILE`) | `kerberos_options.kadmin_acl` (`LLDAP_KERBEROS_OPTIONS__KADMIN_ACL`) |
   | `kerberos_options.keycloak_keytab` (`LLDAP_KERBEROS_OPTIONS__KEYCLOAK_KEYTAB`) | `keycloak_options.keytab` (`LLDAP_KEYCLOAK_OPTIONS__KEYTAB`) |
 
+  `kerberos_options.max_renewable_life` is removed; `renew_lifetime` takes its place. The old
+  names warn and are ignored: an environment variable as "Unknown environment variable", a
+  key in the configuration file's `[kerberos_options]` or `[keycloak_options]` as "Unknown
+  key in the configuration file".
+- `supported_enctypes` takes one type name per item: `["aes256-cts-hmac-sha1-96",
+  "aes128-cts-hmac-sha1-96"]` in the file, `[aes256-cts-hmac-sha1-96, aes128-cts-hmac-sha1-96]`
+  in the environment. A family name such as `aes` or `default`, a `+` or `-` prefix, or two
+  names in one item is refused at startup, naming the item.
+- The path keys take the path itself, never a file holding it:
+  `LLDAP_KERBEROS_OPTIONS__{DATA_DIR,ADMIN_KEYTAB,CLIENT_CONFIG,KADMIN_ACL}_FILE`,
+  `LLDAP_KEYCLOAK_OPTIONS__{KEYTAB,CONFIG_FILE}_FILE` and the same `_file` keys in the
+  configuration file stop the start, naming the variable or key.
 - `[keycloak_options]` holds `config_file` (default `keycloak_config.toml`,
   `LLDAP_KEYCLOAK_OPTIONS__CONFIG_FILE`; the image sets
   `/data/keycloak_config.toml`), `keytab` (default `keytab/keycloak-http.keytab`,
@@ -110,17 +126,29 @@ Next release. The KDC is kerber-rust inside the `lldap` process.
   `camellia256-cts-cmac` and the `camellia` family are refused because the embedded
   KDC does not serve them; MIT does not mark Camellia deprecated
   (https://web.mit.edu/kerberos/krb5-latest/doc/admin/enctypes.html). `des-cbc-crc`
-  and `des-cbc-md5` are not encryption types this KDC knows. The name `default` is
-  refused too, because it expands to AES plus 3DES, RC4 and Camellia. The shipped
+  and `des-cbc-md5` are not encryption types this KDC knows. The shipped
   default remains `aes256-cts-hmac-sha1-96`, and `allow_rc4` / `allow_des3` stay
   off (MIT's default,
   https://web.mit.edu/kerberos/krb5-latest/doc/admin/conf_files/krb5_conf.html).
+- The `krb5.conf` the server writes and the Keycloak keytab follow `supported_enctypes`;
+  the keytab holds one key per listed type.
+- When the first type of `supported_enctypes` changes, the next start rolls the keys of
+  `krbtgt/REALM`, `kadmin/admin` and `kadmin/changepw` to the listed types and keeps the old
+  ones, so tickets issued before the change still work. The old key versions are purged once
+  `ticket_lifetime` plus `renew_lifetime` has passed, at a start or by the hourly cleanup. A
+  roll that fails leaves the realm closed with the cause, as for any realm that does not open.
+- At every start, `krbtgt/REALM` and every synced principal take `ticket_lifetime` as their
+  longest ticket life and `renew_lifetime` as their longest renewable life. A principal that
+  already matches is not written.
 
 ### Fixed
 
 - LDAP Modify and ADD refuse a `userPassword` that is not valid UTF-8, with
   `constraintViolation`. A refused ADD creates no user.
 - GraphQL gives Kerberos the directory's user id, so `Alice` and `alice` name the same principal.
+- The healthcheck reaches the KDC at `kdc_host` (loopback when it is `0.0.0.0` or `::`), not at
+  `healthcheck_options.ldap_host`.
+- `LLDAP_RAW_LOG` no longer warns as an unknown environment variable.
 - The Keycloak realm push and the suggested Keycloak URL use the configured
   base DN, also when it is set only in the configuration file.
 

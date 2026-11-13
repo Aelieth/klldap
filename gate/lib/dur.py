@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import secrets
+import shlex
 import shutil
 import socket
 import subprocess
@@ -21,7 +22,11 @@ PREFIX, NET, PG = ENV["DUR_PREFIX"], ENV["DUR_NET"], ENV["DUR_PG"]
 REALM, BASE_DN = "GATE.TEST", "dc=gate,dc=test"
 ADMIN_PASS = "GateAdminPass2026!"
 JWT, SEED = "gate-jwt-secret-not-for-production", "gate-key-seed-not-for-production"
-KDC_DIR = "/var/kerberos/krb5kdc"
+HOST = ENV.get("DUR_INSTALL", "container") == "host"
+OPT, STAGE = "/opt/nitnelave", "/home/lab/klldap-stage"
+DATA = OPT if HOST else "/data"
+KDC_DIR = f"{OPT}/krb5kdc" if HOST else "/var/kerberos/krb5kdc"
+KEYTAB = f"{DATA}/kadm5.keytab"
 SERVICE, WRITER, LOCKED, POLICY, MAX_FAIL = "HTTP/dur.gate.test", "durbob", "durlock", "durpol", 3
 SECOND = "HTTP/dur-second.gate.test"
 HEALTH_LIMIT, EXIT_LIMIT, STOPPED_ALONE, WRITE_WITHIN = 90, 30, 25, 10
@@ -105,6 +110,8 @@ class Record:
 
 
 class Server:
+    HEALTH = ("/app/lldap", "healthcheck", "--config-file", "/data/lldap_config.toml")
+
     def __init__(self, name, data, kdc, db_url, shared=None):
         self.name = f"{PREFIX}-{name}"
         self.ldap, self.http = (3890, 17170) if POWER else (free_port(), free_port())
@@ -126,8 +133,15 @@ class Server:
         if result.returncode != 0:
             raise RuntimeError(f"docker run {self.name}: {result.stderr.strip()}")
 
+    def exec_argv(self, *cmd, root=False, interactive=False):
+        return ["docker", "exec", *(["-i"] if interactive else []), *(["-u", "0"] if root else []),
+                self.name, *cmd]
+
     def start(self):
         run("docker", "start", self.name)
+
+    def restart(self):
+        return run("docker", "restart", self.name, timeout=120)
 
     def kill(self):
         run("docker", "kill", "--signal", "KILL", self.name)
@@ -150,8 +164,7 @@ class Server:
         return self.state("Running") == "true"
 
     def healthy(self):
-        check = ["/app/lldap", "healthcheck", "--config-file", "/data/lldap_config.toml"]
-        return run("docker", "exec", self.name, *check, timeout=30).returncode == 0
+        return run(*self.exec_argv(*self.HEALTH), timeout=30).returncode == 0
 
     def wait(self, until, limit):
         start = time.monotonic()
@@ -169,14 +182,13 @@ class Server:
 
     def kadmin(self, query):
         principal = f"admin/admin@{REALM}"
-        result = run("docker", "exec", self.name, "kadmin", "-k", "-t", "/data/kadm5.keytab",
-                     "-p", principal, "-q", query)
+        result = run(*self.exec_argv("kadmin", "-k", "-t", KEYTAB, "-p", principal, "-q", query))
         refused = result.returncode != 0 or " while " in result.stderr
         return result.stdout, not refused
 
     def kinit(self, principal, password):
         script = 'KRB5CCNAME="/tmp/dur_cc_$$" kinit "$0"'
-        result = run("docker", "exec", "-i", self.name, "sh", "-c", script, principal,
+        result = run(*self.exec_argv("sh", "-c", script, principal, interactive=True),
                      stdin=password + "\n")
         return result.returncode == 0, result.stderr
 
@@ -232,12 +244,12 @@ class Server:
 
     def client_then_kill(self, *command):
         """The client's result streams to the host; the shell then waits for k to kill lldap."""
-        script = (f"rm -f /data/dur-*; {FIND_LLDAP}; "
-                  's=$(date +%s%N); "$@" >/data/dur-out 2>&1; rc=$?; t=$(date +%s%N); '
-                  'echo "RESULT $rc $s $t"; cat /data/dur-out; echo END-OF-OUTPUT; read -r x; '
-                  'k=$(date +%s%N); echo "$t $k" >/data/dur-kill; [ "$x" = k ] && kill -9 "$p"')
+        script = (f"rm -f {DATA}/dur-*; {FIND_LLDAP}; "
+                  f's=$(date +%s%N); "$@" >{DATA}/dur-out 2>&1; rc=$?; t=$(date +%s%N); '
+                  f'echo "RESULT $rc $s $t"; cat {DATA}/dur-out; echo END-OF-OUTPUT; read -r x; '
+                  f'k=$(date +%s%N); echo "$t $k" >{DATA}/dur-kill; [ "$x" = k ] && kill -9 "$p"')
         shell = subprocess.Popen(
-            ["docker", "exec", "-i", self.name, "sh", "-c", script, "sh", *command],
+            self.exec_argv("sh", "-c", script, "sh", *command, interactive=True),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         head = shell.stdout.readline().split()
         if len(head) != 4 or head[0] != "RESULT" or not all(x.isdigit() for x in head[1:]):
@@ -251,9 +263,9 @@ class Server:
         return shell, int(head[1]), "".join(out), (int(head[3]) - int(head[2])) / 1e6
 
     def arm_killer(self):
-        script = (f"rm -f /data/dur-*; {FIND_LLDAP}; echo ready; read -r x; "
-                  't=$(date +%s%N); echo "- $t" >/data/dur-kill; [ "$x" = k ] && kill -9 "$p"')
-        killer = subprocess.Popen(["docker", "exec", "-i", self.name, "sh", "-c", script],
+        script = (f"rm -f {DATA}/dur-*; {FIND_LLDAP}; echo ready; read -r x; "
+                  f't=$(date +%s%N); echo "- $t" >{DATA}/dur-kill; [ "$x" = k ] && kill -9 "$p"')
+        killer = subprocess.Popen(self.exec_argv("sh", "-c", script, interactive=True),
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
         if killer.stdout.readline().strip() != "ready":
             killer.kill()
@@ -261,16 +273,71 @@ class Server:
         return killer
 
     def killed_at(self):
-        read = run("docker", "exec", self.name, "cat", "/data/dur-kill").stdout.split()
+        read = run(*self.exec_argv("cat", f"{DATA}/dur-kill")).stdout.split()
         if len(read) != 2 or not read[1].isdigit():
             return None, None
         return (int(read[0]) if read[0].isdigit() else None), int(read[1])
 
     def signal(self, name):
         find = f'{FIND_LLDAP}; echo "$p"'
-        pid = run("docker", "exec", self.name, "sh", "-c", find).stdout.strip()
-        send = run("docker", "exec", self.name, "sh", "-c", 'kill -"$0" "$1"', name, pid)
+        pid = run(*self.exec_argv("sh", "-c", find)).stdout.strip()
+        send = run(*self.exec_argv("sh", "-c", 'kill -"$0" "$1"', name, pid))
         return bool(pid) and send.returncode == 0
+
+
+class HostServer(Server):
+    """The server under klldap.service in the guest (ACC-8's host leg, D182), reached over ssh."""
+
+    HEALTH = ("sh", "-c", f"set -a; . {OPT}/secret/env; cd {OPT} && exec ./lldap healthcheck")
+
+    def __init__(self, db_url):
+        self.name = "klldap.service"
+        self.ldap, self.http = 3890, 17170
+        self.db_url = db_url
+
+    def exec_argv(self, *cmd, root=False, interactive=False):
+        user = [] if root else ["-u", "klldap"]
+        return ["ssh", ADDR, "sudo", "-n", *user, "env", f"KRB5_CONFIG={OPT}/krb5.conf",
+                *(shlex.quote(c) for c in cmd)]
+
+    def systemctl(self, *args, timeout=60):
+        return run("ssh", ADDR, "sudo", "-n", "systemctl", *args, "klldap", timeout=timeout)
+
+    def create(self):
+        result = run("ssh", ADDR, "sudo", "-n", "bash", f"{STAGE}/dur-host.sh",
+                     *(shlex.quote(a) for a in (self.db_url, JWT, SEED, ADMIN_PASS, BASE_DN, REALM)),
+                     timeout=180)
+        with open(os.path.join(RUN_DIR, "host-install.txt"), "w", encoding="utf-8") as f:
+            f.write(result.stdout + result.stderr)
+        if result.returncode != 0:
+            raise RuntimeError(f"the host install failed (host-install.txt): {result.stderr.strip()}")
+
+    def start(self):
+        self.systemctl("start")
+
+    def restart(self):
+        return self.systemctl("restart", timeout=120)
+
+    def kill(self):
+        self.systemctl("kill", "--signal=KILL")
+
+    def remove(self):
+        pass
+
+    def logs(self, since=None):
+        window = ["--since", since.replace("T", " ").rstrip("Z") + " UTC"] if since else []
+        result = run("ssh", ADDR, "sudo", "-n", "journalctl", "-u", "klldap", "--no-pager",
+                     "-o", "short-iso", *(shlex.quote(a) for a in window))
+        return result.stdout + result.stderr
+
+    def state(self, field):
+        return self.systemctl("show", f"--property={field}", "--value").stdout.strip()
+
+    def running(self):
+        return self.systemctl("is-active").stdout.strip() == "active"
+
+    def healthy(self):
+        return run(*self.exec_argv(*self.HEALTH, root=True), timeout=30).returncode == 0
 
 
 def release(killer, go):
@@ -318,15 +385,17 @@ def boot_guest():
 
 
 def lockout_state(server):
-    """The lockout file read in the container: guest clock, and size/birth/modify or missing."""
-    script = f'date +%s.%N; stat -c "%s %W %Y" {LOCKOUT} 2>/dev/null || echo missing'
-    lines = run("docker", "exec", "-u", "0", server.name, "sh", "-c", script, timeout=30).stdout.split()
-    if len(lines) < 2:
+    """The lockout file read in the guest: clock, uptime, and size/birth/modify or missing."""
+    script = (f'date +%s.%N; cut -d" " -f1 /proc/uptime; '
+              f'stat -c "%s %W %Y" {LOCKOUT} 2>/dev/null || echo missing')
+    lines = run(*server.exec_argv("sh", "-c", script, root=True), timeout=30).stdout.split()
+    if len(lines) < 3:
         return None
-    if lines[1] == "missing":
-        return {"now": float(lines[0]), "exists": False}
-    size, birth, modify = (int(x) if x.lstrip("-").isdigit() else 0 for x in lines[1:4])
-    return {"now": float(lines[0]), "exists": True, "size": size, "birth": birth, "modify": modify}
+    clock = {"now": float(lines[0]), "uptime": float(lines[1])}
+    if lines[2] == "missing":
+        return {**clock, "exists": False}
+    size, birth, modify = (int(x) if x.lstrip("-").isdigit() else 0 for x in lines[2:5])
+    return {**clock, "exists": True, "size": size, "birth": birth, "modify": modify}
 
 
 def lockout_text(state):
@@ -357,8 +426,9 @@ def save_evidence(server, n):
     where = os.path.join(RUN_DIR, f"evidence-{n}")
     os.makedirs(where, exist_ok=True)
     stash = f"{KDC_DIR}/.k5.{REALM}"
-    listing = run("docker", "exec", "-u", "0", server.name, "sh", "-c",
-                  f"ls -la --full-time {KDC_DIR}; stat {KDC_DIR} {stash} {LOCKOUT}", timeout=30)
+    listing = run(*server.exec_argv(
+        "sh", "-c", f"ls -la --full-time {KDC_DIR}; stat {KDC_DIR} {stash} {LOCKOUT}", root=True),
+        timeout=30)
     with open(os.path.join(where, "kdc.txt"), "w", encoding="utf-8") as f:
         f.write(listing.stdout + listing.stderr)
     with open(os.path.join(where, "docker-logs.txt"), "w", encoding="utf-8") as f:
@@ -369,8 +439,8 @@ def recover(record, server, n):
     """An empty lockout file with the KDC directory's owner, synced with its directory; then restart."""
     script = (f'owner=$(stat -c %u:%g {KDC_DIR}) && : > {LOCKOUT} && chown "$owner" {LOCKOUT} '
               f"&& chmod 600 {LOCKOUT} && sync {LOCKOUT} {KDC_DIR}")
-    made = run("docker", "exec", "-u", "0", server.name, "sh", "-c", script, timeout=30)
-    restart = run("docker", "restart", server.name, timeout=120)
+    made = run(*server.exec_argv("sh", "-c", script, root=True), timeout=30)
+    restart = server.restart()
     back = server.wait_healthy(BOOT_LIMIT)
     record.note(f"RECOVERY n={n} file_rc={made.returncode} {made.stderr.strip()!r} "
                 f"restart_rc={restart.returncode} {restart.stderr.strip()!r} healthy_after_s="
@@ -399,7 +469,9 @@ def volume(label):
 
 def db_url(shared):
     if DB == "postgres":
-        return f"postgres://klldap:klldap@{PG}:5432/klldap", None
+        return f"postgres://klldap:klldap@{'127.0.0.1' if HOST else PG}:5432/klldap", None
+    if HOST:
+        return f"sqlite:///{OPT}/users.db?mode=rwc", None
     if not shared:
         return "sqlite:////data/users.db?mode=rwc", None
     return "sqlite:////shared/users.db?mode=rwc", volume("shared")
@@ -418,7 +490,10 @@ def reset_database(shared):
 
 def set_up(row):
     url, shared = db_url(False)
-    server = Server(row, volume(f"{row}-data"), volume(f"{row}-kdc"), url, shared)
+    if HOST:
+        server = HostServer(url)
+    else:
+        server = Server(row, volume(f"{row}-data"), volume(f"{row}-kdc"), url, shared)
     server.create()
     if server.wait_healthy(BOOT_LIMIT if POWER else HEALTH_LIMIT) is None:
         server.keep_logs("start")
@@ -485,14 +560,14 @@ def one_kill(record, server, n, kind, i, lock_password):
         if kind in ("a", "d"):
             target, before = SERVICE, server.kvno(SERVICE)
             expect = before + 1 if before is not None else None
-            command = ("kadmin", "-k", "-t", "/data/kadm5.keytab", "-p", f"admin/admin@{REALM}",
+            command = ("kadmin", "-k", "-t", KEYTAB, "-p", f"admin/admin@{REALM}",
                        "-q", f"cpw -randkey {SERVICE}")
             if kind == "d":
                 # A second acknowledged write follows, so the first is no longer the last commit.
                 second = server.kvno(SECOND)
                 second = second + 1 if second is not None else None
-                command = ("sh", "-c", 'kadmin -k -t /data/kadm5.keytab -p "$0" -q "$1" && '
-                           'kadmin -k -t /data/kadm5.keytab -p "$0" -q "$2"',
+                command = ("sh", "-c", f'kadmin -k -t {KEYTAB} -p "$0" -q "$1" && '
+                           f'kadmin -k -t {KEYTAB} -p "$0" -q "$2"',
                            f"admin/admin@{REALM}", f"cpw -randkey {SERVICE}", f"cpw -randkey {SECOND}")
         else:
             target, count = LOCKED, i % MAX_FAIL + 1
@@ -540,10 +615,23 @@ def one_kill(record, server, n, kind, i, lock_password):
         boot_s = boot_guest()
         back, finding = wait_up(server, since)
         timing = f"destroy_ms={destroy_ms:.0f} boot_s={boot_s:.1f} "
-        age = (lock_before["now"] - lock_before["birth"] + (cut_at - lock_before_at) / 1e9
+        since_read = (cut_at - lock_before_at) / 1e9
+        age = (lock_before["now"] - lock_before["birth"] + since_read
                if lock_before and lock_before["exists"] and lock_before["birth"] > 0 else None)
+        uptime = lock_before["uptime"] + since_read if lock_before else None
+        lock_after = lockout_state(server)
         record.note(f"LOCKOUT n={n} before_cut={lockout_text(lock_before)} age_at_cut_s="
-                    f"{'unknown' if age is None else f'{age:.1f}'} after_boot={lockout_text(lockout_state(server))}")
+                    f"{'unknown' if age is None else f'{age:.1f}'} uptime_at_cut_s="
+                    f"{'unknown' if uptime is None else f'{uptime:.1f}'} "
+                    f"after_boot={lockout_text(lock_after)}")
+        if (lock_before and lock_after and lock_before["exists"] and lock_after["exists"]
+                and lock_after["modify"] < lock_before["modify"]):
+            save_evidence(server, n)
+            with open(os.path.join(RUN_DIR, "keep"), "w", encoding="utf-8") as f:
+                f.write(f"cut {n}: the lockout file's after-boot mtime went back\n")
+            record.note(f"BACKWARD n={n} the lockout file's mtime after the boot ({lock_after['modify']}) "
+                        f"is earlier than before the cut ({lock_before['modify']}); evidence-{n}/ saved, "
+                        "the run's volumes are kept")
         if back is not None and finding:
             record.degraded += 1
             save_evidence(server, n)
@@ -720,6 +808,10 @@ def main():
         record.note(f"START cache: {CACHE_NOTE}")
         record.note(f"START docker root: {ENV.get('DUR_DOCKER_ROOT', 'unknown')} settle_s={SETTLE} "
                     f"kinds={KINDS}")
+        if HOST:
+            record.note(f"START install=host unit=klldap.service "
+                        f"binary_sha256={ENV.get('DUR_BINARY_SHA', '')} "
+                        f"unit_sha256={ENV.get('DUR_UNIT_SHA', '')} firewall: {ENV.get('DUR_FIREWALL', '')}")
     error = None
     try:
         if ROW == "acc3":

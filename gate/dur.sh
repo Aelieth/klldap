@@ -9,7 +9,8 @@ cd "$GATE_ROOT/.." || exit 1
 usage() {
     echo "usage: gate/dur.sh acc3|acc4|acc8 --db sqlite|postgres [--image IMG] [--kills N] [--times N]" \
         "[--kinds abcd] [--cases i,ii,iii,iv]" \
-        "[--kill power --cuts N --settle S --guest NAME --addr IP --lab-home DIR]" >&2
+        "[--kill power --cuts N --settle S --guest NAME --addr IP --lab-home DIR" \
+        "[--install container|host --binary PATH]]" >&2
     exit 2
 }
 case "${1:-}" in
@@ -28,6 +29,8 @@ GUEST="kerber-klldap"
 ADDR="192.168.177.30"
 LAB_HOME="$HOME/kerber-lab"
 SETTLE=0
+INSTALL="container"
+BINARY=""
 while [ $# -gt 0 ]; do
     [ $# -ge 2 ] || usage
     case "$1" in
@@ -43,6 +46,8 @@ while [ $# -gt 0 ]; do
     --addr) ADDR="$2" ;;
     --lab-home) LAB_HOME="$2" ;;
     --settle) SETTLE="$2" ;;
+    --install) INSTALL="$2" ;;
+    --binary) BINARY="$2" ;;
     *) usage ;;
     esac
     shift 2
@@ -59,6 +64,12 @@ case "$KINDS" in
 "" | *[!abcd]*) usage ;;
 esac
 [ "$ROW" != acc4 ] || [ "$KINDS" = abc ] || usage
+case "$INSTALL" in
+container) ;;
+host) [ "$ROW" = acc8 ] && [ -f "$BINARY" ] || usage ;;
+*) usage ;;
+esac
+[ "$INSTALL" = container ] || GATE_IMAGE="none (host install)"
 RUNID="$(date +%Y%m%d-%H%M%S)-$$"
 RESULTS_DIR="${GATE_RESULTS_DIR:-gate/results}/dur-$RUNID"
 mkdir -p "$RESULTS_DIR" || exit 1
@@ -86,6 +97,11 @@ cleanup() {
                 "a FINDING or an error (rc=${DUR_RC:-none})" | tee -a "$RESULTS_DIR/dur.log"
             return
         fi
+        if [ -e "$RESULTS_DIR/keep" ]; then
+            echo "KEPT the run's containers and volumes in the guest ($PREFIX-*):" \
+                "$(head -1 "$RESULTS_DIR/keep")" | tee -a "$RESULTS_DIR/dur.log"
+            return
+        fi
     fi
     if [ -n "${GATE_KEEP:-}" ]; then
         note "GATE_KEEP set: leaving $PREFIX-*"
@@ -96,11 +112,17 @@ cleanup() {
     docker network rm "$NET" >/dev/null 2>&1
 }
 trap cleanup EXIT
-docker image inspect "$GATE_IMAGE" >/dev/null 2>&1 || {
-    note "Image $GATE_IMAGE not found"
-    exit 1
-}
-IMAGE_ID="$(docker image inspect -f '{{.Id}}' "$GATE_IMAGE")"
+if [ "$INSTALL" = host ]; then
+    IMAGE_ID="none"
+    BINARY_SHA="$(sha256sum "$BINARY" | cut -c1-64)"
+    UNIT_SHA="$(sha256sum example_configs/lldap.service | cut -c1-64)"
+else
+    docker image inspect "$GATE_IMAGE" >/dev/null 2>&1 || {
+        note "Image $GATE_IMAGE not found"
+        exit 1
+    }
+    IMAGE_ID="$(docker image inspect -f '{{.Id}}' "$GATE_IMAGE")"
+fi
 LAB_LOCK=""
 SSH_CONFIG=""
 if [ "$ROW" = acc8 ]; then
@@ -157,20 +179,44 @@ EOF
     }
     DOCKER_ROOT="$(ssh "$ADDR" findmnt -no SOURCE,FSTYPE,OPTIONS --target /var/lib/docker 2>&1)"
     export DOCKER_HOST="ssh://lab@$ADDR"
-    env -u DOCKER_HOST docker save "$GATE_IMAGE" | docker load >/dev/null || {
-        note "could not load $GATE_IMAGE into the guest"
-        exit 1
-    }
-    guest_id="$(docker image inspect -f '{{.Id}}' "$GATE_IMAGE")"
-    [ "$guest_id" = "$IMAGE_ID" ] || {
-        note "the guest's $GATE_IMAGE is $guest_id, not $IMAGE_ID"
-        exit 1
-    }
+    if [ "$INSTALL" = host ]; then
+        stage=/home/lab/klldap-stage
+        if ! { ssh "$ADDR" mkdir -p "$stage" &&
+            scp -q -F "$SSH_CONFIG" "$BINARY" "$ADDR:$stage/lldap" &&
+            scp -q -F "$SSH_CONFIG" example_configs/lldap.service gate/lib/dur-host.sh \
+                "$ADDR:$stage/"; }; then
+            note "could not stage the host install in the guest"
+            exit 1
+        fi
+        { ssh "$ADDR" systemctl is-active firewalld; ssh "$ADDR" sudo -n firewall-cmd --list-all; } \
+            >"$RESULTS_DIR/firewall-before.txt" 2>&1
+        FIREWALL="firewalld not active"
+        if [ "$(head -1 "$RESULTS_DIR/firewall-before.txt")" = active ]; then
+            if ! { ssh "$ADDR" sudo -n firewall-cmd --permanent --add-port=3890/tcp \
+                --add-port=17170/tcp >/dev/null &&
+                ssh "$ADDR" sudo -n firewall-cmd --reload >/dev/null; }; then
+                note "could not open 3890/tcp and 17170/tcp in the guest's firewalld"
+                exit 1
+            fi
+            FIREWALL="3890/tcp and 17170/tcp opened permanently (the next reset removes them)"
+        fi
+    else
+        env -u DOCKER_HOST docker save "$GATE_IMAGE" | docker load >/dev/null || {
+            note "could not load $GATE_IMAGE into the guest"
+            exit 1
+        }
+        guest_id="$(docker image inspect -f '{{.Id}}' "$GATE_IMAGE")"
+        [ "$guest_id" = "$IMAGE_ID" ] || {
+            note "the guest's $GATE_IMAGE is $guest_id, not $IMAGE_ID"
+            exit 1
+        }
+    fi
 fi
 docker network create "$NET" >/dev/null || exit 1
 if [ "$DB" = postgres ]; then
     pg_keep=()
     [ "$ROW" = acc8 ] && pg_keep=(--restart always -v "$PREFIX-pgdata:/var/lib/postgresql/data")
+    [ "$INSTALL" = host ] && pg_keep+=(-p 127.0.0.1:5432:5432)
     docker run -d --name "$PG_CONTAINER" --network "$NET" "${pg_keep[@]}" \
         -e POSTGRES_USER=klldap -e POSTGRES_PASSWORD=klldap -e POSTGRES_DB=klldap \
         postgres:16 >/dev/null || exit 1
@@ -196,7 +242,8 @@ DUR_ROW="$ROW" DUR_DB="$DB" DUR_IMAGE="$GATE_IMAGE" DUR_PREFIX="$PREFIX" DUR_NET
     DUR_PG="$PG_CONTAINER" DUR_KILLS="$KILLS" DUR_TIMES="$TIMES" DUR_CASES="$CASES" DUR_REV="$driver_rev" \
     DUR_IMAGE_ID="$IMAGE_ID" DUR_CUTS="$CUTS" DUR_GUEST="$GUEST" DUR_LAB_LOCK="$LAB_LOCK" \
     DUR_SSH_CONFIG="$SSH_CONFIG" DUR_ADDR="$([ "$ROW" = acc8 ] && echo "$ADDR" || echo 127.0.0.1)" \
-    DUR_SETTLE="$SETTLE" DUR_DOCKER_ROOT="${DOCKER_ROOT:-}" DUR_KINDS="$KINDS" \
+    DUR_SETTLE="$SETTLE" DUR_DOCKER_ROOT="${DOCKER_ROOT:-}" DUR_KINDS="$KINDS" DUR_INSTALL="$INSTALL" \
+    DUR_BINARY_SHA="${BINARY_SHA:-}" DUR_UNIT_SHA="${UNIT_SHA:-}" DUR_FIREWALL="${FIREWALL:-}" \
     python3 -I "$GATE_ROOT/lib/dur.py" "$RESULTS_DIR"
 DUR_RC=$?
 exit "$DUR_RC"

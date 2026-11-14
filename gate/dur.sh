@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # shellcheck source-path=SCRIPTDIR
 # Durability cells ACC-3, ACC-4 and ACC-8 (D127, D178), run by gate/lib/dur.py; usage below.
+# mysql and mariadb (acc3, acc4) start the scratch server gate/mysql-lane.sh starts, on the run's network.
 # Results in gate/results/dur-<run>/ (GATE_RESULTS_DIR overrides); GATE_KEEP=1 keeps the containers.
 # acc8 runs the server in the lab guest and cuts it with virsh destroy, holding lab.lock throughout.
 set -uo pipefail
 GATE_ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$GATE_ROOT/.." || exit 1
 usage() {
-    echo "usage: gate/dur.sh acc3|acc4|acc8 --db sqlite|postgres [--image IMG] [--kills N] [--times N]" \
+    echo "usage: gate/dur.sh acc3|acc4|acc8 --db sqlite|postgres|mysql|mariadb [--image IMG] [--kills N] [--times N]" \
         "[--kinds abcd] [--cases i,ii,iii,iv]" \
         "[--kill power --cuts N --settle S --guest NAME --addr IP --lab-home DIR" \
         "[--install container|host --binary PATH]]" >&2
@@ -53,8 +54,15 @@ while [ $# -gt 0 ]; do
     shift 2
 done
 case "$DB" in
-sqlite | postgres) ;;
+sqlite | postgres | mysql | mariadb) ;;
 *) usage ;;
+esac
+case "$ROW:$DB" in
+acc8:mysql | acc8:mariadb)
+    echo "gate/dur.sh: acc8 does not take --db $DB: 0.8.0 has no power leg for an external MySQL or" \
+        "MariaDB server (acc3 and acc4 cover them)" >&2
+    exit 2
+    ;;
 esac
 case "$ROW:$KILL" in
 acc8:power | acc3:process | acc4:process) ;;
@@ -79,12 +87,20 @@ RESULTS_DIR="$(cd "$RESULTS_DIR" && pwd)"
 PREFIX="klldap-dur-$RUNID"
 NET="$PREFIX-net"
 PG_CONTAINER="$PREFIX-pg"
+MY_CONTAINER="$PREFIX-db"
+MY_ENV="${DB^^}"
 vsh() {
     if command -v virsh >/dev/null 2>&1; then
         virsh -q -c qemu:///system "$@"
     else
         distrobox-host-exec virsh -q -c qemu:///system "$@"
     fi
+}
+my_sql() {
+    local tool="$1" user="$2" pass="${MY_ENV}_PASSWORD"
+    [ "$user" = root ] && pass="${MY_ENV}_ROOT_PASSWORD"
+    shift 2
+    docker exec "$MY_CONTAINER" sh -c "exec \"\$0\" -h 127.0.0.1 -u$user -p\"\$$pass\" \"\$@\"" "$tool" "$@"
 }
 DUR_RC=""
 OWNER_SAVED=""
@@ -107,7 +123,7 @@ cleanup() {
         note "GATE_KEEP set: leaving $PREFIX-*"
         return
     fi
-    docker ps -aq -f "name=^$PREFIX-" | xargs -r docker rm -f >/dev/null 2>&1
+    docker ps -aq -f "name=^$PREFIX-" | xargs -r docker rm -fv >/dev/null 2>&1
     docker volume ls -q -f "name=^$PREFIX-" | xargs -r docker volume rm >/dev/null 2>&1
     docker network rm "$NET" >/dev/null 2>&1
 }
@@ -235,6 +251,44 @@ if [ "$DB" = postgres ]; then
         printf '%s=%s\n' "$setting" "$(docker exec "$PG_CONTAINER" psql -U klldap -d klldap -Atc "SHOW $setting")"
     done >"$RESULTS_DIR/postgres-settings.txt"
 fi
+if [ "$DB" = mysql ] || [ "$DB" = mariadb ]; then
+    if [ "$DB" = mysql ]; then
+        my_image="mysql:9.7@sha256:df90258da46f6e7ff8574ff84f17618aba0765cac749928299c69fd4e7cb8ad8"
+        my_admin=mysqladmin
+    else
+        my_image="mariadb:12.3@sha256:4ebbcf100a3ba320766dfa0e1af008df12261301db6ef72798c7650f70794aed"
+        my_admin=mariadb-admin
+    fi
+    grep -qF "$my_image" gate/mysql-lane.sh || {
+        note "$my_image is not the image gate/mysql-lane.sh starts for $DB"
+        exit 1
+    }
+    docker run -d --name "$MY_CONTAINER" --network "$NET" \
+        -e "${MY_ENV}_ROOT_PASSWORD=klldap-root" -e "${MY_ENV}_DATABASE=klldap" \
+        -e "${MY_ENV}_USER=klldap" -e "${MY_ENV}_PASSWORD=klldap" "$my_image" >/dev/null || exit 1
+    ready=""
+    for _ in $(seq 1 90); do
+        if my_sql "$my_admin" klldap ping --silent >/dev/null 2>&1; then
+            ready=1
+            break
+        fi
+        sleep 1
+    done
+    [ -n "$ready" ] || {
+        docker logs "$MY_CONTAINER" >"$RESULTS_DIR/$DB.log" 2>&1
+        note "$DB did not become ready (see $DB.log)"
+        exit 1
+    }
+    read -r my_version my_flush my_sync my_log_bin < <(my_sql "$DB" root --batch --skip-column-names \
+        -e "SELECT VERSION(), @@innodb_flush_log_at_trx_commit, @@sync_binlog, @@log_bin")
+    [ -n "${my_log_bin:-}" ] || {
+        note "could not read $DB's version and flush settings"
+        exit 1
+    }
+    DB_SETTINGS="server=$DB version=$my_version innodb_flush_log_at_trx_commit=$my_flush"
+    DB_SETTINGS+=" sync_binlog=$my_sync log_bin=$my_log_bin image=$my_image"
+    echo "$DB_SETTINGS" >"$RESULTS_DIR/db-settings.txt"
+fi
 note "Durability $ROW: image=$GATE_IMAGE db=$DB run=$RUNID results=$RESULTS_DIR"
 driver_rev="$(git rev-parse --short HEAD 2>/dev/null)"
 git diff --quiet HEAD -- gate 2>/dev/null || driver_rev="$driver_rev+dirty"
@@ -244,6 +298,7 @@ DUR_ROW="$ROW" DUR_DB="$DB" DUR_IMAGE="$GATE_IMAGE" DUR_PREFIX="$PREFIX" DUR_NET
     DUR_SSH_CONFIG="$SSH_CONFIG" DUR_ADDR="$([ "$ROW" = acc8 ] && echo "$ADDR" || echo 127.0.0.1)" \
     DUR_SETTLE="$SETTLE" DUR_DOCKER_ROOT="${DOCKER_ROOT:-}" DUR_KINDS="$KINDS" DUR_INSTALL="$INSTALL" \
     DUR_BINARY_SHA="${BINARY_SHA:-}" DUR_UNIT_SHA="${UNIT_SHA:-}" DUR_FIREWALL="${FIREWALL:-}" \
+    DUR_MY="$MY_CONTAINER" DUR_DB_SETTINGS="${DB_SETTINGS:-}" \
     python3 -I "$GATE_ROOT/lib/dur.py" "$RESULTS_DIR"
 DUR_RC=$?
 exit "$DUR_RC"

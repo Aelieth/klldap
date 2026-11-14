@@ -19,6 +19,7 @@ ENV = os.environ
 RUN_DIR = sys.argv[1]
 ROW, DB, IMAGE = ENV["DUR_ROW"], ENV["DUR_DB"], ENV["DUR_IMAGE"]
 PREFIX, NET, PG = ENV["DUR_PREFIX"], ENV["DUR_NET"], ENV["DUR_PG"]
+MY, MYSQL = ENV.get("DUR_MY", ""), DB in ("mysql", "mariadb")
 REALM, BASE_DN = "GATE.TEST", "dc=gate,dc=test"
 ADMIN_PASS = "GateAdminPass2026!"
 JWT, SEED = "gate-jwt-secret-not-for-production", "gate-key-seed-not-for-production"
@@ -474,6 +475,8 @@ def volume(label):
 def db_url(shared):
     if DB == "postgres":
         return f"postgres://klldap:klldap@{'127.0.0.1' if HOST else PG}:5432/klldap", None
+    if MYSQL:
+        return f"mysql://klldap:klldap@{MY}:3306/klldap", None
     if HOST:
         return f"sqlite:///{OPT}/users.db?mode=rwc", None
     if not shared:
@@ -485,6 +488,12 @@ def reset_database(shared):
     if DB == "postgres":
         sql = "DROP SCHEMA public CASCADE; CREATE SCHEMA public;"
         run("docker", "exec", PG, "psql", "-U", "klldap", "-d", "klldap", "-q", "-c", sql)
+    elif MYSQL:
+        sql = "DROP DATABASE klldap; CREATE DATABASE klldap;"
+        done = run("docker", "exec", MY, "sh", "-c",
+                   f'exec {DB} -h 127.0.0.1 -uroot -p"${DB.upper()}_ROOT_PASSWORD" -e "$0"', sql)
+        if done.returncode != 0:
+            raise RuntimeError(f"{DB}: {sql} failed: {done.stderr.strip()}")
     elif shared:
         # The entrypoint owns /data and the KDC directory for the server's user, not /shared.
         run("docker", "volume", "rm", "-f", shared)
@@ -813,6 +822,8 @@ def main():
     started = time.time()
     record.note(f"START row={ROW} db={DB} image={IMAGE} image_id={ENV.get('DUR_IMAGE_ID', '')} "
                 f"driver={ENV.get('DUR_REV', '')}")
+    if MYSQL:
+        record.note(f"START db_settings: {ENV.get('DUR_DB_SETTINGS', '')} (printed, not tested)")
     if POWER:
         record.note(f"START guest={GUEST} addr={ADDR} docker_host={ENV.get('DOCKER_HOST', '')} "
                     f"lab_lock={ENV.get('DUR_LAB_LOCK', '')} ssh_config={ENV.get('DUR_SSH_CONFIG', '')}")

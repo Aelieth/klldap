@@ -213,6 +213,12 @@ key_seed = "RanD0m STR1ng"
 #renew_lifetime = "7d"
 ## Issue forwardable tickets.
 #forwardable = true
+## Match a client principal without regard to case
+## (LLDAP_KERBEROS_OPTIONS__CLIENT_CASE_FOLD). kinit Livebob finds livebob, and
+## the ticket carries the name as typed unless the client asks for the canonical
+## name. At start the server warns once for each set of principals that differ
+## only in case. Set false to match names exactly.
+#client_case_fold = true
 ## Session and long-term keys. Accepts aes256-cts-hmac-sha1-96,
 ## aes128-cts-hmac-sha1-96, aes256-cts-hmac-sha384-192 and
 ## aes128-cts-hmac-sha256-128. 3DES and RC4 are refused as deprecated

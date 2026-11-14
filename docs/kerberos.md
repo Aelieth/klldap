@@ -144,6 +144,7 @@ realm with KLLDAP as an LDAP + Kerberos user-federation provider. See
 | `ticket_lifetime` | `24h` |
 | `renew_lifetime` | `7d` |
 | `forwardable` | `true` |
+| `client_case_fold` | `true` |
 | `supported_enctypes` | `aes256-cts-hmac-sha1-96` |
 | `kdc_host` / `kdc_port` | `0.0.0.0` / `1088` |
 | `kadmin_host` / `kadmin_port` | `127.0.0.1` / `1749` |
@@ -151,6 +152,12 @@ realm with KLLDAP as an LDAP + Kerberos user-federation provider. See
 | `data_dir` | `krb5kdc` (mode 0700) |
 | `admin_keytab` | `kadm5.keytab` (mode 0600) |
 | `client_config` | `krb5.conf` |
+
+`client_case_fold` (default `true`) matches a client principal without regard
+to case, so `kinit Livebob` finds `livebob`, and the ticket carries the name
+as typed unless the client asks for the canonical name. At start the server
+warns once for each set of principals that differ only in case. With the
+option off, names match exactly.
 
 `data_dir`, `admin_keytab`, `client_config`, `kadmin_acl`,
 `keycloak_options.keytab` and `keycloak_options.config_file` take the path

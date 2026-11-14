@@ -4,6 +4,7 @@
 
 Next release. The KDC is kerber-rust inside the `lldap` process.
 0.7.4, 0.7.5 and 0.7.6 were never released, and their work is in 0.8.0.
+KLLDAP 0.8.0 is 64-bit only (x86_64 and arm64); there is no 32-bit or ARMv7 build. The release tarball is x86_64 only; earlier releases' recipe also built ARMv7.
 
 ### License
 

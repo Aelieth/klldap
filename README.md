@@ -59,6 +59,8 @@ container. See [docs/install.md](docs/install.md). A 0.7.2 install follows
 
 Images are amd64 and arm64, `aelieth/klldap:0.8.0`. The arm64 image is built under emulation and is not tested by us.
 
+KLLDAP 0.8.0 is 64-bit only (x86_64 and arm64); there is no 32-bit or ARMv7 build.
+
 ## Usage
 
 The web UI creates users and groups, sets passwords, assigns OUs and POSIX numbers,

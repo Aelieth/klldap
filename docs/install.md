@@ -4,6 +4,8 @@ The Kerberos KDC runs inside the `lldap` process. The image is how you run the s
 
 Images are amd64 and arm64, `aelieth/klldap:0.8.0`. The arm64 image is built under emulation and is not tested by us.
 
+KLLDAP 0.8.0 is 64-bit only (x86_64 and arm64); there is no 32-bit or ARMv7 build.
+
 **Set a restart policy. If a Kerberos thread dies, the process exits non-zero,
 and without a restart policy the container stays down.**
 

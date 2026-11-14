@@ -12,28 +12,23 @@
 # Single-sourced from [workspace.package] in Cargo.toml (first version line in the file).
 VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 
-# Native prepare-release (run directly — needs Rust, cross and Docker)
+# Native prepare-release (run directly — needs Rust, wasm-pack and gzip)
 prepare-release:
 	./prepare-release.sh
 
 # Fully Dockerized release build (AlmaLinux 10 base).
-# Builds a reproducible AlmaLinux container with:
-#   - cross (Docker socket mounted so it can spawn the armv7 build container)
-#   - wasm-pack
-# Then runs prepare-release.sh inside it.
+# Builds a reproducible AlmaLinux container with Rust and wasm-pack,
+# then runs prepare-release.sh inside it.
 #
-# Output: lldap-x86_64-glibc-*.tar.gz and lldap-armv7-glibc-*.tar.gz
+# Output: lldap-x86_64-glibc-*.tar.gz (KLLDAP 0.8.0 is 64-bit only).
 #
-# Note: Uses --privileged + Docker socket (standard for cross-in-cross).
-# Only run on trusted builders / CI.
+# Note: no --privileged and no Docker socket; the build needs neither.
 prepare-release-docker:
 	docker buildx build \
 		--file Dockerfile.release \
 		--tag klldap/release-builder:latest \
 		--load .
 	docker run --rm \
-		--privileged \
-		-v /var/run/docker.sock:/var/run/docker.sock \
 		-v "$(PWD)":/work \
 		-w /work \
 		klldap/release-builder:latest \

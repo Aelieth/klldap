@@ -137,18 +137,6 @@ as shipped:
     After=postgresql.service
     Restart=on-failure
 
-### Cross-compilation
-
-`prepare-release.sh` installs `cross` and builds the 32-bit ARMv7 server against glibc:
-
-```sh
-cargo install cross
-cross build --target=armv7-unknown-linux-gnueabihf -p lldap --release
-./app/build.sh
-```
-
-The server binary is `target/armv7-unknown-linux-gnueabihf/release/lldap`.
-
 ### Migrating from LLDAP
 
 Stock LLDAP 0.6.x databases (schema 11 or older) can move to KLLDAP with their

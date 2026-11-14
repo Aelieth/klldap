@@ -11,27 +11,16 @@ set -x
 # on a modern CPU or implicit optimization).
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=x86-64" cargo build --release -p lldap
 
-cargo install cross
-
-# Build for 32-bit ARMv7 (hard-float) using glibc instead of musl.
-cross build --target=armv7-unknown-linux-gnueabihf -p lldap --release
-
 # Build the frontend (unchanged).
 ./app/build.sh
 
 VERSION=$(git describe --tags)
 
-# Package x86_64 (glibc) release
+# Package the x86_64 (glibc) release. KLLDAP 0.8.0 is 64-bit only: there is no armv7 tarball.
 mkdir -p /tmp/release/x86_64
 cp target/release/lldap /tmp/release/x86_64
 cp -R app/index.html app/static app/pkg lldap_config.docker_template.toml README.md LICENSE /tmp/release/x86_64
 tar -czvf lldap-x86_64-glibc-${VERSION}.tar.gz -C /tmp/release x86_64
 
-# Package armv7 (glibc) release
-mkdir -p /tmp/release/armv7
-cp target/armv7-unknown-linux-gnueabihf/release/lldap /tmp/release/armv7
-cp -R app/index.html app/static app/pkg lldap_config.docker_template.toml README.md LICENSE /tmp/release/armv7
-tar -czvf lldap-armv7-glibc-${VERSION}.tar.gz -C /tmp/release armv7
-
-echo "Release archives created:"
+echo "Release archive created:"
 ls -l *.tar.gz

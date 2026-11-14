@@ -3,7 +3,7 @@
 # Matches the AlmaLinux runtime image (quay.io/almalinuxorg/10-minimal),
 # so the release build links against the same glibc as the containers.
 #
-# Produces both x86_64 (baseline CPU) and armv7 glibc tarballs.
+# Produces the x86_64 (baseline CPU) glibc tarball. KLLDAP 0.8.0 is 64-bit only.
 #
 # Usage:
 #   make prepare-release-docker
@@ -21,23 +21,10 @@ RUN microdnf install -y --assumeyes \
     curl \
     git \
     gzip \
+    tar \
     ca-certificates \
     wget \
-    gnupg2 \
     && microdnf clean all
-
-# cross reaches the host's Docker daemon through the mounted socket, so the image has Docker's CLI only.
-RUN curl -fsSLo /tmp/docker.gpg https://download.docker.com/linux/rhel/gpg \
-    && export GNUPGHOME="$(mktemp -d)" \
-    && fpr="$(gpg --batch --show-keys --with-colons /tmp/docker.gpg | awk -F: '$1 == "fpr" {print $10; exit}')" \
-    && { [ "$fpr" = 060A61C51B558A7F742B77AAC52FEB6B621E9F35 ] || { echo "Docker's key is $fpr, not the documented one"; exit 1; }; } \
-    && rpm --import /tmp/docker.gpg \
-    && curl -fsSLo /etc/yum.repos.d/docker-ce.repo https://download.docker.com/linux/rhel/docker-ce.repo \
-    && microdnf install -y --assumeyes --setopt=install_weak_deps=0 docker-ce-cli-29.9.3-1.el10 \
-    && sig="$(rpm -q --qf '%{RSAHEADER:pgpsig}' docker-ce-cli)" \
-    && { case "$sig" in *"Key ID c52feb6b621e9f35") ;; *) echo "docker-ce-cli is signed by '$sig', not Docker's documented key"; exit 1 ;; esac; } \
-    && microdnf clean all \
-    && rm -rf /tmp/docker.gpg "$GNUPGHOME"
 
 # Create lldap user (consistent with main Dockerfile)
 RUN mkdir -p /app && \
@@ -52,11 +39,11 @@ WORKDIR /app
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
 ENV PATH="/app/.cargo/bin:${PATH}"
 
-# Install cross (for armv7 cross-compilation) and wasm-pack (frontend)
-RUN cargo install cross wasm-pack
+# Install wasm-pack (frontend)
+RUN cargo install --locked wasm-pack --version 0.15.1
 
 # Pre-add targets
-RUN rustup target add x86_64-unknown-linux-gnu armv7-unknown-linux-gnueabihf
+RUN rustup target add x86_64-unknown-linux-gnu
 
 # Default command (overridden by Makefile)
 CMD ["bash"]

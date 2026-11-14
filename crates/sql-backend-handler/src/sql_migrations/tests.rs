@@ -2095,17 +2095,20 @@ async fn expect_logs_and_policy_index(pool: &DbConnection) {
         }
         other => panic!("repair lane has no index query for {other:?}"),
     };
-    let indexes = IndexRow::find_by_statement(sea_orm::Statement::from_string(
+    let indexes: Vec<String> = IndexRow::find_by_statement(sea_orm::Statement::from_string(
         backend,
         index_sql.to_owned(),
     ))
     .all(pool)
     .await
-    .expect("index lookup");
+    .expect("index lookup")
+    .into_iter()
+    .map(|row| row.indexname)
+    .collect();
     assert!(
         indexes
             .iter()
-            .any(|row| row.indexname == "unique-policy-lower-name"),
+            .any(|name| name == "unique-policy-lower-name"),
         "unique-policy-lower-name restored: {indexes:?}"
     );
 }

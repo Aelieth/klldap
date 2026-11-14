@@ -240,10 +240,11 @@ file that cannot be read or written, or that is not a kerber-rust lockout
 file, is the same case: restore it, or put an empty file in its place and
 sync it. An empty file counts from zero. See
 [When the realm cannot open](#when-the-realm-cannot-open). A count already
-written survives a kill of the server process. A power cut can lose the
-failed-login counts of about the last half minute, never the `lockout` file
-once it is on disk. After an admin unlock, a failure in that same second can
-leave the count at 1 for one extra failure, as MIT does.
+written survives a kill of the server process. A power cut may forget
+lockout changes from the last few minutes, as MIT's does. The realm still
+opens. The `lockout` file itself, once on disk, is not lost. After an admin
+unlock, a failure in that same second can leave the count at 1 for one extra
+failure, as MIT does.
 
 While the database is down, an administrative write is refused at once. The
 kadmin client reports "Unable to access Kerberos database". A kadmin read of

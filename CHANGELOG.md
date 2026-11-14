@@ -184,6 +184,8 @@ Next release. The KDC is kerber-rust inside the `lldap` process.
 - On MySQL and MariaDB schema changes are not transactional (the server commits at each DDL
   statement), so take a backup before the first 0.8.0 start; if a start is interrupted
   mid-migration the next start completes it.
+- MySQL and MariaDB support is newly tested in 0.8.0. The lane runs the migrations, the
+  Kerberos tables, and kerber-rust's conformance suite on MySQL 9.7 and MariaDB 12.3.
 
 ### Fixed
 

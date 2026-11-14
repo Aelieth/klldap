@@ -2725,7 +2725,7 @@ async fn test_mysql_kerberos_longblob() {
         pool.get_database_backend().build(
             Query::update()
                 .table(KerberosPrincipals::Table)
-                .value(KerberosPrincipals::Record, blob.clone().into())
+                .value(KerberosPrincipals::Record, blob.clone())
                 .and_where(Expr::col(KerberosPrincipals::Name).eq("long")),
         ),
     )

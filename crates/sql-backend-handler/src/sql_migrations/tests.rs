@@ -2048,6 +2048,312 @@ async fn test_mysql_stepwise_migration() {
     stepwise_lane(&pool).await;
 }
 
+async fn lane_insert_user(pool: &DbConnection, user_id: &str, uuid: &str) {
+    let now = chrono::Utc::now().naive_utc();
+    let mut insert_user = Query::insert();
+    insert_user
+        .into_table(Users::Table)
+        .columns([
+            Users::UserId,
+            Users::Email,
+            Users::LowercaseEmail,
+            Users::CreationDate,
+            Users::Uuid,
+            Users::ModifiedDate,
+            Users::PasswordModifiedDate,
+        ])
+        .values_panic([
+            user_id.into(),
+            format!("{user_id}@ex.com").into(),
+            format!("{user_id}@ex.com").into(),
+            now.into(),
+            uuid.into(),
+            now.into(),
+            now.into(),
+        ]);
+    pool.execute(pool.get_database_backend().build(&insert_user))
+        .await
+        .unwrap();
+}
+
+async fn lane_insert_group(pool: &DbConnection, group_id: i32, name: &str, uuid: &str) {
+    let now = chrono::Utc::now().naive_utc();
+    let mut insert_group = Query::insert();
+    insert_group
+        .into_table(Groups::Table)
+        .columns([
+            Groups::GroupId,
+            Groups::DisplayName,
+            Groups::LowercaseDisplayName,
+            Groups::CreationDate,
+            Groups::Uuid,
+            Groups::ModifiedDate,
+        ])
+        .values_panic([
+            group_id.into(),
+            name.into(),
+            name.into(),
+            now.into(),
+            uuid.into(),
+            now.into(),
+        ]);
+    pool.execute(pool.get_database_backend().build(&insert_group))
+        .await
+        .unwrap();
+}
+
+async fn lane_user_schema(pool: &DbConnection, name: &str, hardcoded: bool) {
+    let mut insert_schema = Query::insert();
+    insert_schema
+        .into_table(UserAttributeSchema::Table)
+        .columns([
+            UserAttributeSchema::UserAttributeSchemaName,
+            UserAttributeSchema::UserAttributeSchemaType,
+            UserAttributeSchema::UserAttributeSchemaIsList,
+            UserAttributeSchema::UserAttributeSchemaIsUserVisible,
+            UserAttributeSchema::UserAttributeSchemaIsUserEditable,
+            UserAttributeSchema::UserAttributeSchemaIsHardcoded,
+        ])
+        .values_panic([
+            name.into(),
+            "Integer".into(),
+            false.into(),
+            true.into(),
+            false.into(),
+            hardcoded.into(),
+        ]);
+    pool.execute(pool.get_database_backend().build(&insert_schema))
+        .await
+        .unwrap();
+}
+
+async fn lane_group_schema(pool: &DbConnection, name: &str, hardcoded: bool) {
+    let mut insert_schema = Query::insert();
+    insert_schema
+        .into_table(GroupAttributeSchema::Table)
+        .columns([
+            GroupAttributeSchema::GroupAttributeSchemaName,
+            GroupAttributeSchema::GroupAttributeSchemaType,
+            GroupAttributeSchema::GroupAttributeSchemaIsList,
+            GroupAttributeSchema::GroupAttributeSchemaIsGroupVisible,
+            GroupAttributeSchema::GroupAttributeSchemaIsGroupEditable,
+            GroupAttributeSchema::GroupAttributeSchemaIsHardcoded,
+        ])
+        .values_panic([
+            name.into(),
+            "Integer".into(),
+            false.into(),
+            true.into(),
+            false.into(),
+            hardcoded.into(),
+        ]);
+    pool.execute(pool.get_database_backend().build(&insert_schema))
+        .await
+        .unwrap();
+}
+
+async fn lane_user_value(pool: &DbConnection, user_id: &str, name: &str, value: &[u8]) {
+    let mut insert_value = Query::insert();
+    insert_value
+        .into_table(UserAttributes::Table)
+        .columns([
+            UserAttributes::UserAttributeUserId,
+            UserAttributes::UserAttributeName,
+            UserAttributes::UserAttributeValue,
+        ])
+        .values_panic([user_id.into(), name.into(), value.to_vec().into()]);
+    pool.execute(pool.get_database_backend().build(&insert_value))
+        .await
+        .unwrap();
+}
+
+async fn lane_group_value(pool: &DbConnection, group_id: i32, name: &str, value: &[u8]) {
+    let mut insert_value = Query::insert();
+    insert_value
+        .into_table(GroupAttributes::Table)
+        .columns([
+            GroupAttributes::GroupAttributeGroupId,
+            GroupAttributes::GroupAttributeName,
+            GroupAttributes::GroupAttributeValue,
+        ])
+        .values_panic([group_id.into(), name.into(), value.to_vec().into()]);
+    pool.execute(pool.get_database_backend().build(&insert_value))
+        .await
+        .unwrap();
+}
+
+async fn lane_one_spelling(pool: &DbConnection, sql: String, canonical: &str, value: &[u8]) {
+    #[derive(Debug, FromQueryResult)]
+    struct NameValue {
+        name: String,
+        value: Vec<u8>,
+    }
+    let rows = NameValue::find_by_statement(sea_orm::Statement::from_string(
+        pool.get_database_backend(),
+        sql,
+    ))
+    .all(pool)
+    .await
+    .expect("attribute names");
+    let matched: Vec<_> = rows
+        .iter()
+        .filter(|row| row.name.eq_ignore_ascii_case(canonical))
+        .collect();
+    assert_eq!(matched.len(), 1, "{canonical} rows: {rows:?}");
+    assert_eq!(matched[0].name, canonical, "stored spelling");
+    assert_eq!(matched[0].value, value);
+}
+
+async fn lane_hardcoded_schema(pool: &DbConnection, sql: &str, canonical: &str) {
+    #[derive(Debug, FromQueryResult)]
+    struct NameFlag {
+        name: String,
+        flag: bool,
+    }
+    let rows = NameFlag::find_by_statement(sea_orm::Statement::from_string(
+        pool.get_database_backend(),
+        sql.to_owned(),
+    ))
+    .all(pool)
+    .await
+    .expect("schema names");
+    let matched: Vec<_> = rows
+        .iter()
+        .filter(|row| row.name.eq_ignore_ascii_case(canonical))
+        .collect();
+    assert_eq!(matched.len(), 1, "{canonical} schema rows: {rows:?}");
+    assert_eq!(matched[0].name, canonical, "schema spelling");
+    assert!(matched[0].flag, "{canonical} schema row must be hardcoded");
+}
+
+// Seeds the case-only alias before v12. PostgreSQL can hold both spellings for one
+// entity; MySQL cannot, so that third entity is Postgres-only.
+async fn alias_case_lane(pool: &DbConnection) {
+    upgrade_to_v1(pool).await.unwrap();
+    migrate_from_version(pool, SchemaVersion(1), SchemaVersion(11))
+        .await
+        .expect("chain to v11");
+
+    lane_insert_user(pool, "aliasonly", "11111111-1111-1111-1111-111111111101").await;
+    lane_insert_user(pool, "canononly", "11111111-1111-1111-1111-111111111102").await;
+    lane_insert_group(pool, 41, "aliasg", "22222222-2222-2222-2222-222222222201").await;
+    lane_insert_group(pool, 42, "canong", "22222222-2222-2222-2222-222222222202").await;
+    lane_user_schema(pool, "uidnumber", false).await;
+    lane_group_schema(pool, "gidnumber", false).await;
+    let postgres = pool.get_database_backend() == DbBackend::Postgres;
+    if postgres {
+        lane_insert_user(pool, "bothspell", "11111111-1111-1111-1111-111111111103").await;
+        lane_insert_group(pool, 43, "bothg", "22222222-2222-2222-2222-222222222203").await;
+        lane_user_schema(pool, "uidNumber", true).await;
+        lane_group_schema(pool, "gidNumber", true).await;
+    }
+    lane_user_value(pool, "aliasonly", "uidNumber", b"3001").await;
+    lane_user_value(pool, "canononly", "uidnumber", b"3002").await;
+    lane_group_value(pool, 41, "gidNumber", b"4001").await;
+    lane_group_value(pool, 42, "gidnumber", b"4002").await;
+    if postgres {
+        lane_user_value(pool, "bothspell", "uidnumber", b"3002").await;
+        lane_user_value(pool, "bothspell", "uidNumber", b"3001").await;
+        lane_group_value(pool, 43, "gidnumber", b"4002").await;
+        lane_group_value(pool, 43, "gidNumber", b"4001").await;
+    }
+
+    migrate_from_version(pool, SchemaVersion(11), LAST_SCHEMA_VERSION)
+        .await
+        .expect("v12+v13");
+
+    lane_one_spelling(
+        pool,
+        "SELECT user_attribute_name AS name, user_attribute_value AS value \
+         FROM user_attributes WHERE user_attribute_user_id = 'aliasonly'"
+            .to_owned(),
+        "uidnumber",
+        b"3001",
+    )
+    .await;
+    lane_one_spelling(
+        pool,
+        "SELECT user_attribute_name AS name, user_attribute_value AS value \
+         FROM user_attributes WHERE user_attribute_user_id = 'canononly'"
+            .to_owned(),
+        "uidnumber",
+        b"3002",
+    )
+    .await;
+    lane_one_spelling(
+        pool,
+        "SELECT group_attribute_name AS name, group_attribute_value AS value \
+         FROM group_attributes WHERE group_attribute_group_id = 41"
+            .to_owned(),
+        "gidnumber",
+        b"4001",
+    )
+    .await;
+    lane_one_spelling(
+        pool,
+        "SELECT group_attribute_name AS name, group_attribute_value AS value \
+         FROM group_attributes WHERE group_attribute_group_id = 42"
+            .to_owned(),
+        "gidnumber",
+        b"4002",
+    )
+    .await;
+    if postgres {
+        lane_one_spelling(
+            pool,
+            "SELECT user_attribute_name AS name, user_attribute_value AS value \
+             FROM user_attributes WHERE user_attribute_user_id = 'bothspell'"
+                .to_owned(),
+            "uidnumber",
+            b"3002",
+        )
+        .await;
+        lane_one_spelling(
+            pool,
+            "SELECT group_attribute_name AS name, group_attribute_value AS value \
+             FROM group_attributes WHERE group_attribute_group_id = 43"
+                .to_owned(),
+            "gidnumber",
+            b"4002",
+        )
+        .await;
+    }
+    lane_hardcoded_schema(
+        pool,
+        "SELECT user_attribute_schema_name AS name, \
+         user_attribute_schema_is_hardcoded AS flag FROM user_attribute_schema",
+        "uidnumber",
+    )
+    .await;
+    lane_hardcoded_schema(
+        pool,
+        "SELECT group_attribute_schema_name AS name, \
+         group_attribute_schema_is_hardcoded AS flag FROM group_attribute_schema",
+        "gidnumber",
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_alias_case() {
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres().await else {
+        return;
+    };
+    alias_case_lane(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_alias_case() {
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql().await else {
+        return;
+    };
+    alias_case_lane(&pool).await;
+}
+
 fn drop_policy_index_sql(backend: DbBackend) -> &'static str {
     match backend {
         DbBackend::MySql => "DROP INDEX `unique-policy-lower-name` ON `policies`",
@@ -2194,7 +2500,7 @@ async fn fresh_install_lane(pool: &DbConnection) {
         LOGIN_KINDS, LogCursor, LogDimension, LogFilter, LogKind,
     };
     use lldap_domain_model::model::{Logs, LogsColumn, logs};
-    use sea_orm::{ActiveValue::Set, EntityTrait, QueryOrder};
+    use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
 
     init_table(pool).await.expect("fresh init");
     assert_eq!(get_schema_version(pool).await, Some(LAST_SCHEMA_VERSION));
@@ -2269,6 +2575,21 @@ async fn fresh_install_lane(pool: &DbConnection) {
         "equal counts: newest first"
     );
     assert_eq!(by_hour[0].first, at(2, 13));
+    let sharp = NaiveDate::from_ymd_opt(2024, 5, 2)
+        .unwrap()
+        .and_hms_micro_opt(14, 0, 40, 600_000)
+        .unwrap();
+    Logs::insert_many([row("dave", "bind", true, sharp)])
+        .exec(pool)
+        .await
+        .expect("fractional insert");
+    let stored = Logs::find()
+        .filter(LogsColumn::Actor.eq("dave"))
+        .one(pool)
+        .await
+        .expect("dave row")
+        .expect("dave row");
+    assert_eq!(stored.timestamp, sharp, "a .600000 fraction must not round");
 
     let members = handler
         .list_log_events(

@@ -1395,6 +1395,12 @@ async fn ensure_system_config(
     Ok(())
 }
 
+// MySQL equates these spellings, so the duplicate delete matches the canonical row.
+// PostgreSQL and SQLite still send that delete: the spellings are different keys there.
+fn mysql_case_alias(backend: sea_orm::DbBackend, canonical: &str, alias: &str) -> bool {
+    backend == sea_orm::DbBackend::MySql && alias.eq_ignore_ascii_case(canonical)
+}
+
 async fn ghost_and_alias_cleanup(
     transaction: &DatabaseTransaction,
     backend: sea_orm::DbBackend,
@@ -1403,13 +1409,15 @@ async fn ghost_and_alias_cleanup(
     for attr in &schema.user_attributes.attributes {
         let canonical = attr.name.as_str();
         for alias in &attr.aliases {
-            transaction
-                .execute(backend.build(&alias_duplicate_delete(
-                    &user_attribute_tables(),
-                    canonical,
-                    alias,
-                )))
-                .await?;
+            if !mysql_case_alias(backend, canonical, alias) {
+                transaction
+                    .execute(backend.build(&alias_duplicate_delete(
+                        &user_attribute_tables(),
+                        canonical,
+                        alias,
+                    )))
+                    .await?;
+            }
             transaction
                 .execute(backend.build(&alias_rename_update(
                     &user_attribute_tables(),
@@ -1423,13 +1431,15 @@ async fn ghost_and_alias_cleanup(
     for attr in &schema.group_attributes.attributes {
         let canonical = attr.name.as_str();
         for alias in &attr.aliases {
-            transaction
-                .execute(backend.build(&alias_duplicate_delete(
-                    &group_attribute_tables(),
-                    canonical,
-                    alias,
-                )))
-                .await?;
+            if !mysql_case_alias(backend, canonical, alias) {
+                transaction
+                    .execute(backend.build(&alias_duplicate_delete(
+                        &group_attribute_tables(),
+                        canonical,
+                        alias,
+                    )))
+                    .await?;
+            }
             transaction
                 .execute(backend.build(&alias_rename_update(
                     &group_attribute_tables(),
@@ -1448,7 +1458,12 @@ async fn ghost_and_alias_cleanup(
         .attributes
         .iter()
         .filter(|a| a.is_hardcoded)
-        .flat_map(|a| a.aliases.iter().cloned())
+        .flat_map(|a| {
+            a.aliases
+                .iter()
+                .filter(|alias| !mysql_case_alias(backend, a.name.as_str(), alias))
+                .cloned()
+        })
         .collect();
     if !user_alias_names.is_empty() {
         transaction
@@ -1472,7 +1487,12 @@ async fn ghost_and_alias_cleanup(
         .attributes
         .iter()
         .filter(|a| a.is_hardcoded)
-        .flat_map(|a| a.aliases.iter().cloned())
+        .flat_map(|a| {
+            a.aliases
+                .iter()
+                .filter(|alias| !mysql_case_alias(backend, a.name.as_str(), alias))
+                .cloned()
+        })
         .collect();
     if !group_alias_names.is_empty() {
         transaction
@@ -1611,7 +1631,7 @@ async fn ensure_logs(
                                 .not_null()
                                 .primary_key(),
                         )
-                        .col(ColumnDef::new(Logs::Timestamp).date_time().not_null())
+                        .col(fractional_time(ColumnDef::new(Logs::Timestamp), backend).not_null())
                         .col(ColumnDef::new(Logs::Kind).string_len(32).not_null())
                         .col(ColumnDef::new(Logs::Success).boolean().not_null())
                         .col(ColumnDef::new(Logs::Protocol).string_len(8).not_null())
@@ -1786,6 +1806,20 @@ async fn relation_missing(
     probe_absent(backend, probed)
 }
 
+// MySQL datetime has no fractional digits unless the precision is written on the type.
+// PostgreSQL timestamp and SQLite datetime_text already keep microseconds.
+fn fractional_time(mut column: ColumnDef, backend: sea_orm::DbBackend) -> ColumnDef {
+    match backend {
+        sea_orm::DbBackend::MySql => {
+            column.custom(Alias::new("datetime(6)"));
+        }
+        sea_orm::DbBackend::Postgres | sea_orm::DbBackend::Sqlite => {
+            column.date_time();
+        }
+    }
+    column
+}
+
 fn kerberos_bytes(mut column: ColumnDef, backend: sea_orm::DbBackend) -> ColumnDef {
     match backend {
         sea_orm::DbBackend::MySql => {
@@ -1840,14 +1874,18 @@ async fn ensure_kerberos(
                                 .not_null(),
                         )
                         .col(
-                            ColumnDef::new(KerberosPrincipals::Expiration)
-                                .date_time()
-                                .null(),
+                            fractional_time(
+                                ColumnDef::new(KerberosPrincipals::Expiration),
+                                backend,
+                            )
+                            .null(),
                         )
                         .col(
-                            ColumnDef::new(KerberosPrincipals::PasswordExpiration)
-                                .date_time()
-                                .null(),
+                            fractional_time(
+                                ColumnDef::new(KerberosPrincipals::PasswordExpiration),
+                                backend,
+                            )
+                            .null(),
                         )
                         .col(
                             ColumnDef::new(KerberosPrincipals::Policy)
@@ -1855,9 +1893,11 @@ async fn ensure_kerberos(
                                 .null(),
                         )
                         .col(
-                            ColumnDef::new(KerberosPrincipals::ModifiedDate)
-                                .date_time()
-                                .not_null(),
+                            fractional_time(
+                                ColumnDef::new(KerberosPrincipals::ModifiedDate),
+                                backend,
+                            )
+                            .not_null(),
                         )
                         .foreign_key(
                             ForeignKey::create()

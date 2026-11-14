@@ -45,7 +45,9 @@ kinit_ok() {
     local principal="$1" password="$2" log="$3" start deadline
     start=$SECONDS
     deadline=$((SECONDS + ${GATE_TIMEOUT:-30}))
+    KINIT_ATTEMPTS=0
     while [ "$SECONDS" -le "$deadline" ]; do
+        KINIT_ATTEMPTS=$((KINIT_ATTEMPTS + 1))
         if kinit_pw "$principal" "$password" >"$log" 2>&1; then
             KINIT_WAITED=$((SECONDS - start))
             return 0
@@ -124,14 +126,14 @@ else
         p_bad "kinit with the old password is refused: not reached"
         p_bad "kinit with the new password succeeds: not reached"
     elif ! kinit_ok "${BROWSER_USER}@${REALM}" "$FIRST_PASS" "$D/kinit-first.log"; then
-        note "first kinit waited ${KINIT_WAITED}s"
+        note "first kinit waited ${KINIT_WAITED}s attempts ${KINIT_ATTEMPTS}"
         p_bad "kinit with the first password failed"
         p_bad "the user logs in through the app: not reached"
         p_bad "changes the password: not reached"
         p_bad "kinit with the old password is refused: not reached"
         p_bad "kinit with the new password succeeds: not reached"
     else
-        note "first kinit waited ${KINIT_WAITED}s"
+        note "first kinit waited ${KINIT_WAITED}s attempts ${KINIT_ATTEMPTS}"
         p_ok "kinit with the first password gets a ticket"
         run_mode change || true
         note_marks "$D/change.out"

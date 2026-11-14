@@ -38,6 +38,7 @@ GUEST = ENV.get("DUR_GUEST", "")
 BOOT_LIMIT = 240
 SETTLE = int(ENV.get("DUR_SETTLE", "0"))
 KINDS = ENV.get("DUR_KINDS", "abc")
+YOUNG_S = 30
 LOCKOUT = f"{KDC_DIR}/lockout"
 NOISE, NOISE_POLICY = "durnoise", "durnoisepol"
 LOCKOUT_CAUSES = ("lockout file", "is not a kerber-rust lockout file")
@@ -78,6 +79,8 @@ class Record:
         self.aborted = 0
         self.losses = []
         self.degraded = 0
+        self.acknowledged = {}
+        self.young = []
 
     @staticmethod
     def _sync(handle, text):
@@ -91,6 +94,7 @@ class Record:
         except OSError as e:
             self.note(f"ACK-WRITE-FAILED n={entry.get('n')} {e}")
             return False
+        self.acknowledged[entry["kind"]] = self.acknowledged.get(entry["kind"], 0) + 1
         return True
 
     def abort(self, text):
@@ -619,11 +623,18 @@ def one_kill(record, server, n, kind, i, lock_password):
         age = (lock_before["now"] - lock_before["birth"] + since_read
                if lock_before and lock_before["exists"] and lock_before["birth"] > 0 else None)
         uptime = lock_before["uptime"] + since_read if lock_before else None
+        since_write = (lock_before["now"] - lock_before["modify"] + since_read
+                       if lock_before and lock_before["exists"] else None)
+        young = since_write is not None and since_write < YOUNG_S
         lock_after = lockout_state(server)
         record.note(f"LOCKOUT n={n} before_cut={lockout_text(lock_before)} age_at_cut_s="
                     f"{'unknown' if age is None else f'{age:.1f}'} uptime_at_cut_s="
-                    f"{'unknown' if uptime is None else f'{uptime:.1f}'} "
-                    f"after_boot={lockout_text(lock_after)}")
+                    f"{'unknown' if uptime is None else f'{uptime:.1f}'} since_write_s="
+                    f"{'unknown' if since_write is None else f'{since_write:.1f}'} "
+                    f"young={'yes' if young else 'no'} after_boot={lockout_text(lock_after)}")
+        if young:
+            record.young.append(back is not None and not finding
+                                and bool(lock_after and lock_after["exists"]))
         if (lock_before and lock_after and lock_before["exists"] and lock_after["exists"]
                 and lock_after["modify"] < lock_before["modify"]):
             save_evidence(server, n)
@@ -831,15 +842,25 @@ def main():
                     f"over_{GAP_TARGET_MS}ms={g['over_target']}")
     writes = {k: {"min": round(min(v), 1), "median": round(sorted(v)[len(v) // 2], 1),
                   "max": round(max(v), 1)} for k, v in record.writes.items()}
+    install = ENV.get("DUR_INSTALL", "container")
     if POWER:
         for kind, w in sorted(writes.items()):
             record.note(f"WRITES kind={kind} min={w['min']} median={w['median']} max={w['max']}")
+        for kind, count in sorted(record.acknowledged.items()):
+            passed, fails = record.counts.get(kind, (0, 0))
+            record.note(f"ROW install={install} db={DB} kind={kind} acknowledged={count} "
+                        f"pass={passed} fail={fails}")
+        record.note(f"ROW install={install} db={DB} lockout_young cuts={len(record.young)} "
+                    f"kept_and_opened={sum(record.young)} (a cut under {YOUNG_S} s after the "
+                    "file's last write)")
     summary = {"row": ROW, "db": DB, "image": IMAGE, "image_id": ENV.get("DUR_IMAGE_ID", ""),
                "driver": ENV.get("DUR_REV", ""), "seconds": round(time.time() - started),
                "kinds": KINDS, "counts": {k: {"pass": p, "fail": f} for k, (p, f) in record.counts.items()},
                "gaps_ms": gaps, "writes_ms": writes, "aborted_iterations": record.aborted, "aborted": error,
                "lockout_lost_cuts": len(record.losses), "lockout_lost_sum": sum(record.losses),
-               "degraded_starts": record.degraded, "findings": record.degraded}
+               "degraded_starts": record.degraded, "findings": record.degraded,
+               "install": install, "acknowledged": record.acknowledged,
+               "lockout_young": {"cuts": len(record.young), "kept_and_opened": sum(record.young)}}
     with open(os.path.join(RUN_DIR, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, sort_keys=True)
     failed = sum(f for _, f in record.counts.values())

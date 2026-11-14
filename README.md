@@ -57,6 +57,8 @@ KLLDAP ships as a Docker image, `aelieth/klldap`, because the KDC lives in the
 container. See [docs/install.md](docs/install.md). A 0.7.2 install follows
 [Upgrading from 0.7.2](docs/kerberos.md#upgrading-from-072) before it pulls.
 
+Images are amd64 and arm64, `aelieth/klldap:0.8.0`. The arm64 image is built under emulation and is not tested by us.
+
 ## Usage
 
 The web UI creates users and groups, sets passwords, assigns OUs and POSIX numbers,

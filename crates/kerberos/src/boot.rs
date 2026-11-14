@@ -620,6 +620,35 @@ mod tests {
     }
 
     #[test]
+    fn test_a_good_lockout_file_opens_the_realm() {
+        type Prepare = fn(&TempRealm);
+        let rows: [(&str, bool, Prepare); 2] = [
+            ("a first start leaves the file", false, |_| {}),
+            (
+                "an empty file an operator made opens the realm",
+                true,
+                |t| fs::write(t.settings.data_dir.join(LOCKOUT_FILE), b"").unwrap(),
+            ),
+        ];
+        for (row, opened, prepare) in rows {
+            let temp = TempRealm::new();
+            let profile = profile(&temp.settings);
+            if opened {
+                open_store(&temp.settings, &profile, temp.host()).unwrap();
+            }
+            prepare(&temp);
+            if let Err(error) = open_store(&temp.settings, &profile, temp.host()) {
+                panic!("{row}: {error:#}");
+            }
+            let file = fs::metadata(temp.settings.data_dir.join(LOCKOUT_FILE));
+            assert!(
+                matches!(&file, Ok(meta) if meta.is_file()),
+                "{row}: {file:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_profile_from_settings() {
         let mut temp = TempRealm::new();
         temp.settings.kdc_port = 8888;

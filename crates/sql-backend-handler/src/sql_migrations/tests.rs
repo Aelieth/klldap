@@ -2048,6 +2048,139 @@ async fn test_mysql_stepwise_migration() {
     stepwise_lane(&pool).await;
 }
 
+fn drop_policy_index_sql(backend: DbBackend) -> &'static str {
+    match backend {
+        DbBackend::MySql => "DROP INDEX `unique-policy-lower-name` ON `policies`",
+        DbBackend::Postgres => "DROP INDEX \"unique-policy-lower-name\"",
+        other => panic!("repair lane has no drop-index for {other:?}"),
+    }
+}
+
+async fn drop_logs_and_policy_index(pool: &DbConnection) {
+    let backend = pool.get_database_backend();
+    pool.execute(sea_orm::Statement::from_string(
+        backend,
+        "DROP TABLE logs".to_owned(),
+    ))
+    .await
+    .expect("drop logs");
+    pool.execute(sea_orm::Statement::from_string(
+        backend,
+        drop_policy_index_sql(backend).to_owned(),
+    ))
+    .await
+    .expect("drop index");
+}
+
+async fn expect_logs_and_policy_index(pool: &DbConnection) {
+    let backend = pool.get_database_backend();
+    pool.execute(sea_orm::Statement::from_string(
+        backend,
+        "SELECT 1 FROM logs LIMIT 1".to_owned(),
+    ))
+    .await
+    .expect("logs restored");
+
+    #[derive(FromQueryResult)]
+    struct IndexRow {
+        indexname: String,
+    }
+    let index_sql = match backend {
+        DbBackend::Postgres => {
+            "SELECT indexname FROM pg_indexes WHERE indexname = 'unique-policy-lower-name'"
+        }
+        DbBackend::MySql => {
+            "SELECT index_name AS indexname FROM information_schema.statistics \
+             WHERE table_schema = DATABASE() AND index_name = 'unique-policy-lower-name'"
+        }
+        other => panic!("repair lane has no index query for {other:?}"),
+    };
+    let indexes = IndexRow::find_by_statement(sea_orm::Statement::from_string(
+        backend,
+        index_sql.to_owned(),
+    ))
+    .all(pool)
+    .await
+    .expect("index lookup");
+    assert!(
+        indexes
+            .iter()
+            .any(|row| row.indexname == "unique-policy-lower-name"),
+        "unique-policy-lower-name restored: {indexes:?}"
+    );
+}
+
+async fn expect_kept_user(pool: &DbConnection) {
+    let backend = pool.get_database_backend();
+    let kept = pool
+        .query_one(sea_orm::Statement::from_string(
+            backend,
+            "SELECT email FROM users WHERE user_id = 'kept'".to_owned(),
+        ))
+        .await
+        .expect("kept user query")
+        .expect("kept user row");
+    let email: String = kept.try_get_by_index(0).expect("email");
+    assert_eq!(email, "kept@ex.com");
+}
+
+async fn repair_lane(pool: &DbConnection) {
+    init_table(pool).await.expect("init");
+    insert_directory_user(pool, "kept", "22222222-2222-2222-2222-222222222222").await;
+    let backend = pool.get_database_backend();
+
+    pool.execute(sea_orm::Statement::from_string(
+        backend,
+        "UPDATE metadata SET version = 12".to_owned(),
+    ))
+    .await
+    .expect("stamp version 12");
+    pool.execute(sea_orm::Statement::from_string(
+        backend,
+        "ALTER TABLE users DROP COLUMN krb_principal_name".to_owned(),
+    ))
+    .await
+    .expect("drop v13 column");
+    drop_logs_and_policy_index(pool).await;
+    migrate_from_version(pool, SchemaVersion(12), LAST_SCHEMA_VERSION)
+        .await
+        .expect("v13 from version 12");
+    pool.execute(sea_orm::Statement::from_string(
+        backend,
+        "SELECT krb_principal_name FROM users LIMIT 1".to_owned(),
+    ))
+    .await
+    .expect("krb_principal_name restored");
+    expect_logs_and_policy_index(pool).await;
+    assert_eq!(get_schema_version(pool).await, Some(LAST_SCHEMA_VERSION));
+    expect_kept_user(pool).await;
+
+    drop_logs_and_policy_index(pool).await;
+    ensure_v13_additions(pool).await.expect("v13 additions");
+    expect_logs_and_policy_index(pool).await;
+    expect_kept_user(pool).await;
+}
+
+#[tokio::test]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_repair_v13_additions() {
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres().await else {
+        return;
+    };
+    repair_lane(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_repair_v13_additions() {
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql().await else {
+        return;
+    };
+    repair_lane(&pool).await;
+}
+
 async fn fresh_install_lane(pool: &DbConnection) {
     use crate::sql_backend_handler::tests::{
         insert_group, insert_membership, insert_user_no_password,

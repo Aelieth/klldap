@@ -156,6 +156,10 @@ Moving between database backends is in [database_migration.md](database_migratio
 Write a dump of the Kerberos realm with the 0.7.2 image before the first 0.8.0 start; 0.8.0
 loads it and keeps the MIT files: [kerberos.md](kerberos.md#upgrading-from-072).
 
+On MySQL and MariaDB schema changes are not transactional (the server commits at each DDL
+statement), so take a backup before the first 0.8.0 start; if a start is interrupted
+mid-migration the next start completes it.
+
 **A 0.7.2 compose file that publishes `88:88` must publish `88:1088`, or the KDC is
 unreachable after the upgrade.** If `key_seed` is unset, keep the key file the
 first start writes: that write is not synced, and a lost key makes the next

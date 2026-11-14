@@ -24,7 +24,7 @@ mysql)
         -e MYSQL_USER=klldap
         -e MYSQL_PASSWORD=klldap
     )
-    ROOT=(mysql -h 127.0.0.1 -uroot -pklldap-root --batch)
+    ROOT_SQL=(mysql -h 127.0.0.1 -uroot -pklldap-root --batch)
     ;;
 mariadb)
     IMAGE="mariadb:12.3@sha256:4ebbcf100a3ba320766dfa0e1af008df12261301db6ef72798c7650f70794aed"
@@ -36,7 +36,7 @@ mariadb)
         -e MARIADB_USER=klldap
         -e MARIADB_PASSWORD=klldap
     )
-    ROOT=(mariadb -h 127.0.0.1 -uroot -pklldap-root --batch)
+    ROOT_SQL=(mariadb -h 127.0.0.1 -uroot -pklldap-root --batch)
     ;;
 *)
     echo "GATE_MYSQL_FLAVOR must be mysql or mariadb" >&2
@@ -70,7 +70,7 @@ if [ "$ready" != 1 ]; then
     echo "mysql lane: $FLAVOR did not become ready" >&2
     exit 1
 fi
-docker exec "$NAME" "${ROOT[@]}" \
+docker exec "$NAME" "${ROOT_SQL[@]}" \
     -e "GRANT ALL PRIVILEGES ON *.* TO 'klldap'@'%'; FLUSH PRIVILEGES;"
 
 PORT="$(docker port "$NAME" 3306/tcp | head -1 | sed 's/.*://')"
@@ -80,5 +80,13 @@ docker exec "$NAME" "${SQL[@]}" klldap \
 
 export KLLDAP_TEST_DATABASE_URL="mysql://klldap:klldap@127.0.0.1:${PORT}/klldap"
 
-cargo test --locked -p lldap_sql_backend_handler -- --ignored --test-threads=1
-cargo test --locked -p lldap-kerberos -- --ignored --test-threads=1
+sql_rc=0
+cargo test --locked -p lldap_sql_backend_handler -- --ignored --test-threads=1 || sql_rc=$?
+kerberos_rc=0
+cargo test --locked -p lldap-kerberos -- --ignored --test-threads=1 || kerberos_rc=$?
+if [ "$sql_rc" -ne 0 ]; then
+    exit "$sql_rc"
+fi
+if [ "$kerberos_rc" -ne 0 ]; then
+    exit "$kerberos_rc"
+fi

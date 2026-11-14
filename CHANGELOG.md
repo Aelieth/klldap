@@ -181,6 +181,9 @@ Next release. The KDC is kerber-rust inside the `lldap` process.
   `sync_binlog`, at start, and logs a `database durability` warning for an unsafe one. On
   PostgreSQL with no warning, an acknowledged change survives a power loss too; MySQL and
   MariaDB are not power-cut tested.
+- On MySQL and MariaDB schema changes are not transactional (the server commits at each DDL
+  statement), so take a backup before the first 0.8.0 start; if a start is interrupted
+  mid-migration the next start completes it.
 
 ### Fixed
 

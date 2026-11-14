@@ -5,7 +5,7 @@ use lldap_domain::types::{AttributeType, Avatar, GroupId, Serialized, UserId, Uu
 use lldap_schema::PublicSchema;
 use sea_orm::{
     ConnectionTrait, DatabaseTransaction, DbErr, DeriveIden, FromQueryResult, Iden, Order,
-    Statement, TransactionTrait,
+    RuntimeErr, Statement, TransactionTrait,
     sea_query::{
         Alias, BinOper, ColumnDef, DynIden, Expr, ForeignKey, ForeignKeyAction, Func, Index,
         IntoIden, OnConflict, Query, SimpleExpr, Table, Value, all,
@@ -1495,8 +1495,75 @@ async fn ghost_and_alias_cleanup(
     Ok(())
 }
 
-// Probes inside a savepoint so a missing column cannot poison the outer transaction on
-// Postgres; the add runs only where an interrupted or MySQL-skipped v12 left a gap.
+// Postgres and SQLite probe inside a savepoint, so a missing column cannot abort the
+// migration. MySQL (and MariaDB, the same backend) has committed at the previous DDL,
+// and a savepoint there is rejected, so the probe stays on the outer transaction.
+enum Probe<'a> {
+    Outer(&'a DatabaseTransaction),
+    Savepoint(DatabaseTransaction),
+}
+
+impl Probe<'_> {
+    fn transaction(&self) -> &DatabaseTransaction {
+        match self {
+            Probe::Outer(transaction) => transaction,
+            Probe::Savepoint(transaction) => transaction,
+        }
+    }
+
+    async fn close(self, release: bool) -> Result<(), DbErr> {
+        match self {
+            Probe::Outer(_) => Ok(()),
+            Probe::Savepoint(savepoint) => {
+                if release {
+                    savepoint.commit().await
+                } else {
+                    savepoint.rollback().await
+                }
+            }
+        }
+    }
+}
+
+async fn open_probe(
+    transaction: &DatabaseTransaction,
+    backend: sea_orm::DbBackend,
+) -> Result<Probe<'_>, DbErr> {
+    match backend {
+        sea_orm::DbBackend::MySql => Ok(Probe::Outer(transaction)),
+        sea_orm::DbBackend::Postgres | sea_orm::DbBackend::Sqlite => {
+            Ok(Probe::Savepoint(transaction.begin().await?))
+        }
+    }
+}
+
+fn mysql_errno(err: &DbErr) -> Option<u16> {
+    let (DbErr::Exec(RuntimeErr::SqlxError(sqlx_err))
+    | DbErr::Query(RuntimeErr::SqlxError(sqlx_err))) = err
+    else {
+        return None;
+    };
+    sqlx_err
+        .as_database_error()?
+        .try_downcast_ref::<sea_orm::sqlx::mysql::MySqlDatabaseError>()
+        .map(|mysql| mysql.number())
+}
+
+// 1054 is an unknown column and 1146 is an unknown table. Any other MySQL error is real.
+fn probe_absent<T>(backend: sea_orm::DbBackend, probed: Result<T, DbErr>) -> Result<bool, DbErr> {
+    match probed {
+        Ok(_) => Ok(false),
+        Err(err) => match backend {
+            sea_orm::DbBackend::MySql => match mysql_errno(&err) {
+                Some(1054 | 1146) => Ok(true),
+                _ => Err(err),
+            },
+            sea_orm::DbBackend::Postgres | sea_orm::DbBackend::Sqlite => Ok(true),
+        },
+    }
+}
+
+// The add runs only where an interrupted or MySQL-skipped v12 left a gap.
 async fn ensure_column(
     transaction: &DatabaseTransaction,
     backend: sea_orm::DbBackend,
@@ -1504,12 +1571,13 @@ async fn ensure_column(
     column: DynIden,
     definition: ColumnDef,
 ) -> Result<(), DbErr> {
-    let savepoint = transaction.begin().await?;
-    let probe = savepoint
+    let scope = open_probe(transaction, backend).await?;
+    let probed = scope
+        .transaction()
         .execute(backend.build(Query::select().column(column).from(table.clone()).limit(1)))
         .await;
-    savepoint.rollback().await?;
-    if probe.is_err() {
+    scope.close(false).await?;
+    if probe_absent(backend, probed)? {
         transaction
             .execute(backend.build(Table::alter().table(table).add_column(definition)))
             .await?;
@@ -1517,19 +1585,19 @@ async fn ensure_column(
     Ok(())
 }
 
-// Table via the same probe as ensure_column. Indexes are always try-created in a
-// savepoint: MySQL's builder drops IF NOT EXISTS on indexes, so a missing-table-only
-// path would leave a crashed half-create without them forever.
+// Table via the same probe as ensure_column. Indexes are try-created: MySQL's builder
+// drops IF NOT EXISTS, so a duplicate name is success and a later start can still add one.
 async fn ensure_logs(
     transaction: &DatabaseTransaction,
     backend: sea_orm::DbBackend,
 ) -> Result<(), DbErr> {
-    let savepoint = transaction.begin().await?;
-    let probe = savepoint
+    let scope = open_probe(transaction, backend).await?;
+    let probed = scope
+        .transaction()
         .execute(backend.build(Query::select().expr(1).from(Logs::Table).limit(1)))
         .await;
-    savepoint.rollback().await?;
-    if probe.is_err() {
+    scope.close(false).await?;
+    if probe_absent(backend, probed)? {
         transaction
             .execute(
                 backend.build(
@@ -1593,12 +1661,13 @@ async fn ensure_policies(
     transaction: &DatabaseTransaction,
     backend: sea_orm::DbBackend,
 ) -> Result<(), DbErr> {
-    let savepoint = transaction.begin().await?;
-    let probe = savepoint
+    let scope = open_probe(transaction, backend).await?;
+    let probed = scope
+        .transaction()
         .execute(backend.build(Query::select().expr(1).from(Policies::Table).limit(1)))
         .await;
-    savepoint.rollback().await?;
-    if probe.is_err() {
+    scope.close(false).await?;
+    if probe_absent(backend, probed)? {
         transaction
             .execute(
                 backend.build(
@@ -1624,12 +1693,13 @@ async fn ensure_policies(
             )
             .await?;
     }
-    let savepoint = transaction.begin().await?;
-    let probe = savepoint
+    let scope = open_probe(transaction, backend).await?;
+    let probed = scope
+        .transaction()
         .execute(backend.build(Query::select().expr(1).from(OuPolicies::Table).limit(1)))
         .await;
-    savepoint.rollback().await?;
-    if probe.is_err() {
+    scope.close(false).await?;
+    if probe_absent(backend, probed)? {
         transaction
             .execute(
                 backend.build(
@@ -1682,12 +1752,22 @@ async fn ensure_index(
     backend: sea_orm::DbBackend,
     index: sea_orm::sea_query::IndexCreateStatement,
 ) -> Result<(), DbErr> {
-    let savepoint = transaction.begin().await?;
-    match savepoint.execute(backend.build(&index)).await {
-        Ok(_) => savepoint.commit().await,
-        Err(e) => {
-            debug!("Index left as is: {e}");
-            savepoint.rollback().await
+    let scope = open_probe(transaction, backend).await?;
+    let created = scope.transaction().execute(backend.build(&index)).await;
+    match created {
+        Ok(_) => scope.close(true).await,
+        // 1061 is duplicate key name. Postgres and SQLite still treat any error as "left as is".
+        Err(err) if backend == sea_orm::DbBackend::MySql && mysql_errno(&err) == Some(1061) => {
+            debug!("Index left as is: {err}");
+            scope.close(false).await
+        }
+        Err(err) if backend == sea_orm::DbBackend::MySql => {
+            scope.close(false).await?;
+            Err(err)
+        }
+        Err(err) => {
+            debug!("Index left as is: {err}");
+            scope.close(false).await
         }
     }
 }
@@ -1697,13 +1777,13 @@ async fn relation_missing(
     backend: sea_orm::DbBackend,
     table: DynIden,
 ) -> Result<bool, DbErr> {
-    let savepoint = transaction.begin().await?;
-    let missing = savepoint
+    let scope = open_probe(transaction, backend).await?;
+    let probed = scope
+        .transaction()
         .execute(backend.build(Query::select().expr(1).from(table).limit(1)))
-        .await
-        .is_err();
-    savepoint.rollback().await?;
-    Ok(missing)
+        .await;
+    scope.close(false).await?;
+    probe_absent(backend, probed)
 }
 
 fn kerberos_bytes(mut column: ColumnDef, backend: sea_orm::DbBackend) -> ColumnDef {

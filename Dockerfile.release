@@ -23,8 +23,21 @@ RUN microdnf install -y --assumeyes \
     gzip \
     ca-certificates \
     wget \
-    docker \
+    gnupg2 \
     && microdnf clean all
+
+# cross reaches the host's Docker daemon through the mounted socket, so the image has Docker's CLI only.
+RUN curl -fsSLo /tmp/docker.gpg https://download.docker.com/linux/rhel/gpg \
+    && export GNUPGHOME="$(mktemp -d)" \
+    && fpr="$(gpg --batch --show-keys --with-colons /tmp/docker.gpg | awk -F: '$1 == "fpr" {print $10; exit}')" \
+    && { [ "$fpr" = 060A61C51B558A7F742B77AAC52FEB6B621E9F35 ] || { echo "Docker's key is $fpr, not the documented one"; exit 1; }; } \
+    && rpm --import /tmp/docker.gpg \
+    && curl -fsSLo /etc/yum.repos.d/docker-ce.repo https://download.docker.com/linux/rhel/docker-ce.repo \
+    && microdnf install -y --assumeyes --setopt=install_weak_deps=0 docker-ce-cli-29.9.3-1.el10 \
+    && sig="$(rpm -q --qf '%{RSAHEADER:pgpsig}' docker-ce-cli)" \
+    && { case "$sig" in *"Key ID c52feb6b621e9f35") ;; *) echo "docker-ce-cli is signed by '$sig', not Docker's documented key"; exit 1 ;; esac; } \
+    && microdnf clean all \
+    && rm -rf /tmp/docker.gpg "$GNUPGHOME"
 
 # Create lldap user (consistent with main Dockerfile)
 RUN mkdir -p /app && \

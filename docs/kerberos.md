@@ -261,6 +261,15 @@ and names the cause.
 0.7.2 kept the realm in MIT's db2 format, which 0.8.0 cannot read. 0.8.0 keeps
 the realm in the directory database.
 
+Docker only, any tag: the script decides from the image itself.
+`scripts/upgrade-0.7.2-to-0.8.0.sh <container>` prints the plan
+and changes nothing. `scripts/upgrade-0.7.2-to-0.8.0.sh --yes <container>`
+stops 0.7.2, backs up both volumes, writes the dump with the image that
+container runs, and prints the edits in the steps below. It does not pull,
+and it does not start 0.8.0. Start 0.8.0, then
+`scripts/upgrade-0.7.2-to-0.8.0.sh --verify <container> <backup-dir>`.
+Podman follows the steps below. Those steps are what the script does.
+
 1. Stop 0.7.2. Copy both volumes, the data directory and the KDC directory,
    before the first 0.8.0 start. On MySQL or MariaDB, back up the database as
    well: schema changes are not transactional.

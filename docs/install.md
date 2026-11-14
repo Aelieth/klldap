@@ -52,7 +52,7 @@ volumes:
 
 services:
   klldap:
-    image: aelieth/klldap:latest
+    image: aelieth/klldap:0.8.0
     container_name: klldap
     restart: unless-stopped
     ports:

@@ -14,7 +14,7 @@ Restart=on-failure
 [Container]
 AutoUpdate=registry
 ContainerName=lldap
-Image=docker.io/aelieth/klldap:latest
+Image=docker.io/aelieth/klldap:0.8.0
 
 # /data holds the config, keytabs and (for sqlite) the database; the KDC database has
 # its own volume. Both must persist.

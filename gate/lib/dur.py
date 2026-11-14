@@ -45,8 +45,9 @@ NOISE, NOISE_POLICY = "durnoise", "durnoisepol"
 LOCKOUT_CAUSES = ("lockout file", "is not a kerber-rust lockout file")
 CACHE_NOTE = ("guest disk qcow2 with QEMU's default cache (writeback): a cut loses the guest's RAM "
               "and page cache; a device's volatile cache is not tested (O, pwr-lab-readback.md 2)")
-FIND_LLDAP = ('p=; for q in /proc/[0-9]*; do read -r c <"$q/comm" 2>/dev/null || continue; '
-              '[ "$c" = lldap ] && { p=${q#/proc/}; break; }; done; [ -n "$p" ] || exit 3')
+FIND_LLDAP = ('p=; m=0; for q in /proc/[0-9]*; do read -r c <"$q/comm" 2>/dev/null || continue; '
+              '[ "$c" = lldap ] || continue; a=$(tr "\\0" " " <"$q/cmdline" 2>/dev/null | cut -d" " -f2); '
+              '[ "$a" = run ] && { p=${q#/proc/}; m=$((m + 1)); }; done; [ "$m" = 1 ] || exit 3')
 
 
 def run(*args, stdin=None, timeout=60):
@@ -664,7 +665,12 @@ def one_kill(record, server, n, kind, i, lock_password):
             back = waited + recovered
     else:
         release(killer, True)
-        server.wait_exit(EXIT_LIMIT)
+        exited = server.wait_exit(EXIT_LIMIT)
+        if exited is None:
+            server.keep_logs(f"kill-{n}")
+            record.line(kind, False, f"{head} target={target} the kill did not stop the server")
+            return server.healthy()
+        timing = f"exited={server.state('ExitCode')} exit_s={exited:.1f} "
         server.start()
         back = server.wait_healthy()
     if back is None:
@@ -782,7 +788,8 @@ def case_iii(a, b, n):
         return False, "could not stop A's lldap process"
     b.create()
     b_back = b.wait_healthy()
-    a.signal("CONT")
+    if not a.signal("CONT"):
+        return False, "could not continue A's lldap process"
     if b_back is None:
         return False, "B did not become healthy while A was stopped"
     password_a = test_password(n) + "a"
@@ -807,7 +814,8 @@ def case_iv(a, b, n):
     if not a.signal("STOP"):
         return False, "could not stop A's lldap process"
     time.sleep(STOPPED_ALONE)
-    a.signal("CONT")
+    if not a.signal("CONT"):
+        return False, "could not continue A's lldap process"
     woke = time.monotonic()
     write, _ = write_through(a, n, "a")
     write_s = time.monotonic() - woke

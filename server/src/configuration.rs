@@ -138,6 +138,8 @@ pub struct KerberosOptions {
     pub admin_keytab: PathBuf,
     #[builder(default = r#"PathBuf::from("krb5.conf")"#)]
     pub client_config: PathBuf,
+    #[builder(default = "true")]
+    pub client_case_fold: bool,
 }
 
 impl std::default::Default for KerberosOptions {
@@ -187,6 +189,7 @@ impl KerberosOptions {
             admin_keytab: self.admin_keytab.clone(),
             keycloak_keytab,
             client_config: self.client_config.clone(),
+            client_case_fold: self.client_case_fold,
         })
     }
 }
@@ -1645,9 +1648,9 @@ mod tests {
     }
 
     #[test]
-    fn test_kerberos_lifetimes_and_forwardable() {
+    fn test_kerberos_lifetimes_and_flags() {
         type Read = fn(&Configuration) -> String;
-        let rows: [(&str, &str, &str, &str, Read); 3] = [
+        let rows: [(&str, &str, &str, &str, Read); 4] = [
             ("ticket_lifetime", "24h", "\"10h\"", "10h", |c| {
                 c.kerberos_options.ticket_lifetime.clone()
             }),
@@ -1656,6 +1659,9 @@ mod tests {
             }),
             ("forwardable", "true", "false", "false", |c| {
                 c.kerberos_options.forwardable.to_string()
+            }),
+            ("client_case_fold", "true", "false", "false", |c| {
+                c.kerberos_options.client_case_fold.to_string()
             }),
         ];
         for (key, default, toml, value, read) in rows {

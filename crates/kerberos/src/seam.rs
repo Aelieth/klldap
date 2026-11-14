@@ -133,6 +133,12 @@ mod tests {
             Arc::new(SqlRealm(store))
         };
         let rows = conformance::run(&new_store);
+        for row in &rows {
+            match &row.outcome {
+                Ok(()) => println!("ROW {} PASS", row.name),
+                Err(e) => println!("ROW {} FAIL {e}", row.name),
+            }
+        }
         let failed: Vec<_> = rows
             .iter()
             .filter_map(|row| row.outcome.as_ref().err().map(|e| (row.name, e)))

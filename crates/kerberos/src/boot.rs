@@ -36,6 +36,7 @@ pub struct RealmSettings {
     pub admin_keytab: PathBuf,
     pub keycloak_keytab: PathBuf,
     pub client_config: PathBuf,
+    pub client_case_fold: bool,
 }
 
 const DEPRECATED: [EncryptionType; 2] = [EncryptionType::Des3CbcSha1, EncryptionType::Rc4Hmac];
@@ -89,6 +90,15 @@ pub(crate) fn open(settings: &RealmSettings, host: Arc<dyn KerberosStore>) -> Re
         .policy
         .plugins
         .register_kdcpolicy(Arc::new(LiveClients));
+    store.set_client_case_fold(settings.client_case_fold);
+    if settings.client_case_fold {
+        for twins in store.client_case_twins() {
+            warn!(
+                "Kerberos principals {} differ only in case: none of them signs in under another spelling",
+                twins.join(", ")
+            );
+        }
+    }
     write_client_config(settings)?;
 
     let kdc_addr = ListenAddr {

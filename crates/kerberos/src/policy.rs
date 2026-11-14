@@ -46,7 +46,7 @@ impl KdcPolicy for LiveClients {
         if ticket.crealm.as_bytes() != store.realm().as_bytes() {
             return Ok(PolicyAdjustment::default());
         }
-        let (word, reason) = match store.fetch_name(&ticket.cname)? {
+        let (word, reason) = match store.fetch_client(&ticket.cname)? {
             Some(client) if client.attributes & KDB_DISALLOW_ALL_TIX == 0 => {
                 return Ok(PolicyAdjustment::default());
             }
@@ -156,6 +156,27 @@ mod tests {
                 check(&*guard, &ticket("OTHER.ORG", "bob")),
             );
             assert_eq!(got, (expected, Ok(())), "{step}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_folded_client_keeps_its_service_tickets() {
+        let temp = TempRealm::new();
+        let (embedded, store) = temp.embedded();
+        embedded
+            .sync_principal(&UserId::new("bob"), "Bob-Password-1")
+            .await
+            .unwrap();
+        let not_found = Err((err::CLIENT_REVOKED, NOT_FOUND.to_owned()));
+        for (fold, expected) in [(false, not_found), (true, Ok(()))] {
+            store.write().unwrap().set_client_case_fold(fold);
+            let guard = store.read().unwrap();
+            let got = (
+                check(&*guard, &ticket("EXAMPLE.COM", "Bob")),
+                check(&*guard, &ticket("EXAMPLE.COM", "bob")),
+            );
+            assert_eq!(got, (expected, Ok(())), "fold {fold}");
         }
     }
 }

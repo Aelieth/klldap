@@ -845,3 +845,68 @@ fn kerberos_refuses_a_dump_whose_user_is_missing() {
     assert!(realm.data_dir.join("principal.dump").is_file());
     assert!(!realm.data_dir.join("mit-db2.bak").exists());
 }
+
+#[test]
+fn kerberos_client_case_fold() {
+    let mut realm = start_realm(false);
+    let http = client();
+    let base = realm.fixture.http_url();
+    let token = get_token(&http, &base);
+    let created = gql(
+        &http,
+        &base,
+        &token,
+        "mutation($u: CreateUserInput!) { createUser(user: $u) { id } }",
+        json!({"u": {
+            "id": USER,
+            "email": "livebob@example.com",
+            "attributes": [{"name": "kerberossync", "value": ["1"]}]
+        }}),
+    );
+    assert_eq!(created["data"]["createUser"]["id"], USER, "{created}");
+    let set = gql(
+        &http,
+        &base,
+        &token,
+        "mutation($id: String!, $password: String!) { setUserPassword(userId: $id, password: $password) { ok } }",
+        json!({"id": USER, "password": FIRST}),
+    );
+    assert_eq!(set["data"]["setUserPassword"]["ok"], true, "{set}");
+    let exported = gql(
+        &http,
+        &base,
+        &token,
+        "mutation($h: String!) { exportKeytabForKeycloak(hostname: $h) { ok path errorMsg } }",
+        json!({"h": HOST}),
+    );
+    assert_eq!(
+        exported["data"]["exportKeytabForKeycloak"]["ok"], true,
+        "{exported}"
+    );
+    let service = format!("HTTP/{HOST}@{REALM}");
+
+    expect_ok(
+        &kinit_user(&realm.krb, "Livebob", FIRST),
+        "kinit Livebob, fold on by default",
+    );
+    let listed = realm.krb.run("klist", &[], None);
+    expect_ok(&listed, "klist");
+    let listed = output_text(&listed);
+    assert!(
+        listed.contains(&format!("Default principal: Livebob@{REALM}")),
+        "{listed}"
+    );
+    expect_ok(
+        &realm.krb.run("kvno", &[service.as_str()], None),
+        "kvno with Livebob's ticket",
+    );
+
+    realm
+        .fixture
+        .restart_with_env("LLDAP_KERBEROS_OPTIONS__CLIENT_CASE_FOLD", "false");
+    let refused = kinit_user(&realm.krb, "Livebob", FIRST);
+    expect_fail(&refused, "kinit Livebob, fold off");
+    let refused = output_text(&refused);
+    assert!(refused.contains("not found"), "{refused}");
+    expect_ok(&kinit(&realm.krb, FIRST), "kinit livebob, fold off");
+}

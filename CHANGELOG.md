@@ -45,7 +45,7 @@ Next release. The KDC is kerber-rust inside the `lldap` process.
   `36000s`) or a bare number of seconds (`36000`), quoted or not, in the file
   or the environment. Zero and a negative stay refused.
 - New `[kerberos_options]` section (`LLDAP_KERBEROS_OPTIONS__*`): `enabled`, `realm`,
-  `ticket_lifetime`, `renew_lifetime`, `forwardable`,
+  `ticket_lifetime`, `renew_lifetime`, `forwardable`, `client_case_fold`,
   `supported_enctypes`, `kdc_host`, `kdc_port`, `kadmin_host`, `kadmin_port`,
   `kadmin_acl`, `data_dir`, `admin_keytab`, `client_config`. Durations are
   checked at startup and must be positive: to the KDC a zero `ticket_lifetime` means no
@@ -192,6 +192,9 @@ Next release. The KDC is kerber-rust inside the `lldap` process.
 - LDAP Modify and ADD refuse a `userPassword` that is not valid UTF-8, with
   `constraintViolation`. A refused ADD creates no user.
 - GraphQL gives Kerberos the directory's user id, so `Alice` and `alice` name the same principal.
+- `kerberos_options.client_case_fold` (default true) lets `kinit Alice` sign in as `alice`, as an
+  LDAP bind does; service tickets for that client follow the same lookup. `false` keeps MIT's
+  exact names.
 - The healthcheck reaches the KDC at `kdc_host` (loopback when it is `0.0.0.0` or `::`), not at
   `healthcheck_options.ldap_host`.
 - `LLDAP_RAW_LOG` no longer warns as an unknown environment variable.

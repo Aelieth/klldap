@@ -600,6 +600,7 @@ pub(crate) mod tests {
                     admin_keytab: dir.join("kadm5.keytab"),
                     keycloak_keytab: dir.join("keycloak.keytab"),
                     client_config: dir.join("krb5.conf"),
+                    client_case_fold: false,
                 },
             }
         }

@@ -90,6 +90,10 @@ Next release. The KDC is kerber-rust inside the `lldap` process.
   `LLDAP_KEYCLOAK_ADMIN_PASS` now warn as unknown and are ignored. An operator who
   keeps the old admin password gets a realm push that fails with "admin password is
   not set".
+- `keycloak_config.toml` is saved through a temp file, synced, and renamed
+  over the target, so a power cut during a save cannot leave it empty or
+  short. The save needs write permission on its directory and cannot
+  replace a single-file bind mount.
 - `config_file` stays exempt from the file provider, with `key_file` and
   `cert_file`. The exemption matches that name at any depth, so a
   missing `LLDAP_CONFIG_FILE` starts the server on defaults, the same as a missing
@@ -118,6 +122,8 @@ Next release. The KDC is kerber-rust inside the `lldap` process.
   are not started. The admin keytab is rewritten at every boot at mode 0600; keep
   `/data/kadm5.keytab` out of any backup that is not secured as tightly as the
   machine itself. `data_dir` is mode 0700.
+- A data directory created at first start is synced, so a power cut right after
+  cannot lose it.
 - A 0.7.2 realm moves over on the first start from a `principal.dump` written with the
   0.7.2 image (`kdb5_util dump`, see docs/kerberos.md); its MIT files are kept in
   `mit-db2.bak/`. Without a dump, or with a dump for another realm or without its

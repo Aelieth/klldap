@@ -267,11 +267,11 @@ safe as the database.
 
 What carries over: the realm, the master key (the stash stays), every principal
 with its keys and attributes, and `admin/admin`, whose keytab is written again
-from its key. The rows are sealed again when they are written, so the encrypted
-bytes in a later dump of the database differ from MIT's dump. A dump the master
-key cannot open is refused, and nothing is moved. What does not carry over:
-grants in `kadm5.acl` beyond the admin line (name them in `kadmin_acl`), and
-MIT's logs.
+from its key. Each key keeps the bytes it had in MIT's dump, still encrypted in
+the master key, so a later dump of the database carries the same key bytes as
+MIT's. A dump the master key cannot open is refused, and nothing is moved. What
+does not carry over: grants in `kadm5.acl` beyond the admin line (name them in
+`kadmin_acl`), and MIT's logs.
 
 A dump that names a principal which is only a user id, when that user does not
 exist, is refused. The cause names the principal, the database is not written,

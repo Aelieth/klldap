@@ -73,33 +73,33 @@ features = ["chrono", "schema-language", "url", "uuid"]
 
 [workspace.dependencies.krb5-admin]
 git = "https://github.com/Aelieth/kerber-rust"
-tag = "v1.2.2-rc.1"
+tag = "v1.2.2-rc.3"
 default-features = false
 
 [workspace.dependencies.krb5-config]
 git = "https://github.com/Aelieth/kerber-rust"
-tag = "v1.2.2-rc.1"
+tag = "v1.2.2-rc.3"
 
 [workspace.dependencies.krb5-crypto]
 git = "https://github.com/Aelieth/kerber-rust"
-tag = "v1.2.2-rc.1"
+tag = "v1.2.2-rc.3"
 
 [workspace.dependencies.krb5-kdc]
 git = "https://github.com/Aelieth/kerber-rust"
-tag = "v1.2.2-rc.1"
+tag = "v1.2.2-rc.3"
 default-features = false
 
 [workspace.dependencies.krb5-log]
 git = "https://github.com/Aelieth/kerber-rust"
-tag = "v1.2.2-rc.1"
+tag = "v1.2.2-rc.3"
 
 [workspace.dependencies.krb5-protocol]
 git = "https://github.com/Aelieth/kerber-rust"
-tag = "v1.2.2-rc.1"
+tag = "v1.2.2-rc.3"
 
 [workspace.dependencies.krb5-types]
 git = "https://github.com/Aelieth/kerber-rust"
-tag = "v1.2.2-rc.1"
+tag = "v1.2.2-rc.3"
 
 [workspace.dependencies.ldap3]
 version = "0"
@@ -193,4 +193,4 @@ path = "crates/kerberos"
 path = "crates/schema"
 
 [patch.crates-io]
-rasn = { git = "https://github.com/Aelieth/kerber-rust", tag = "v1.2.2-rc.1" }
+rasn = { git = "https://github.com/Aelieth/kerber-rust", tag = "v1.2.2-rc.3" }

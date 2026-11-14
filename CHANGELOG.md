@@ -1,9 +1,9 @@
 # Changelog
 
-## [0.8.0] unreleased
+## [0.8.0] - RELEASE-DATE
 
 Next release. The KDC is kerber-rust inside the `lldap` process.
-0.7.4, 0.7.5 and 0.7.6 stay unreleased on their own branches.
+0.7.4, 0.7.5 and 0.7.6 were never released, and their work is in 0.8.0.
 
 ### License
 
@@ -11,7 +11,7 @@ Next release. The KDC is kerber-rust inside the `lldap` process.
 
 ### Dependencies
 
-- kerber-rust v1.2.1 (`krb5-kdc`, `krb5-admin`, `krb5-config`, `krb5-types`, `krb5-crypto`,
+- kerber-rust v1.2.2 (`krb5-kdc`, `krb5-admin`, `krb5-config`, `krb5-types`, `krb5-crypto`,
   `krb5-log`, `krb5-protocol`) is a git dependency at its tag and is the KDC inside the
   server. Its `rasn` patch is carried in `[patch.crates-io]`, and `.cargo/config.toml` sets
   `--cfg p384_backend="fiat"` so P-384 uses p384's constant-time field.
@@ -169,6 +169,8 @@ Next release. The KDC is kerber-rust inside the `lldap` process.
 - At every start, `krbtgt/REALM` and every synced principal take `ticket_lifetime` as their
   longest ticket life and `renew_lifetime` as their longest renewable life. A principal that
   already matches is not written.
+- A ticket issued before a user was disabled or deleted stops at the next
+  ticket-granting request.
 
 ### Database
 
@@ -186,14 +188,19 @@ Next release. The KDC is kerber-rust inside the `lldap` process.
 - On MySQL and MariaDB schema changes are not transactional (the server commits at each DDL
   statement), so take a backup before the first 0.8.0 start; if a start is interrupted
   mid-migration the next start completes it.
-- MySQL and MariaDB support is newly tested in 0.8.0. The lane runs the migrations, the
-  Kerberos tables, and kerber-rust's conformance suite on MySQL 9.7 and MariaDB 12.3.
+- MySQL and MariaDB support is newly tested in 0.8.0: the migrations, the
+  Kerberos tables, kerber-rust's conformance suite, a kill of the server after
+  an acknowledged write, and two servers on one database, on MySQL 9.7 and
+  MariaDB 12.3.
+- On MySQL and MariaDB the new time columns are `datetime(6)`. A MySQL name
+  equal to its canonical name ignoring case is kept.
 
 ### Fixed
 
 - LDAP Modify and ADD refuse a `userPassword` that is not valid UTF-8, with
   `constraintViolation`. A refused ADD creates no user.
 - GraphQL gives Kerberos the directory's user id, so `Alice` and `alice` name the same principal.
+- A failed Kerberos password sync is an error. A disabled user is put back after that failure.
 - `kerberos_options.client_case_fold` (default true) lets `kinit Alice` sign in as `alice`, as an
   LDAP bind does; service tickets for that client follow the same lookup. `false` keeps MIT's
   exact names.

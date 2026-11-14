@@ -33,8 +33,11 @@ Frontend:
 Data storage:
 * The data (users, groups, memberships, OUs, POSIX settings, active JWTs, ...) is
   stored in SQL.
-* SQLite by default; PostgreSQL is tested in CI; MySQL/MariaDB is best-effort (see
-  [DB Migration](database_migration.md) for how to migrate off of SQLite).
+* SQLite by default. PostgreSQL, MySQL and MariaDB are tested: the migrations,
+  the Kerberos tables, the conformance suite, a kill of the server after an
+  acknowledged write, and two servers on one database. A power cut is not
+  tested on MySQL or MariaDB, and schema changes there are not transactional,
+  so back up first. See [DB Migration](database_migration.md).
 * The attribute schema (names, aliases, types, flags) is compiled in:
   `crates/schema/src/public_schema.rs`. Custom attributes live in the database.
 

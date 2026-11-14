@@ -224,8 +224,10 @@ On MySQL and MariaDB the columns `kerberos_principals.record`,
 Upstream's own migrations use a plain blob.
 
 A change the server has acknowledged, such as a password set or a kadmin
-write, is in the database before the answer goes out, and it survives a power
-loss. On SQLite the server runs `synchronous = EXTRA`, and the realm does not
+write, is in the database before the answer goes out. An acknowledged change
+survives a kill of the server on SQLite, PostgreSQL, MySQL and MariaDB, and a
+power cut on SQLite and PostgreSQL. On SQLite the server runs
+`synchronous = EXTRA`, and the realm does not
 open with any other setting. On PostgreSQL this holds when the start-up log
 has no `database durability` warning (the warning names `fsync`,
 `full_page_writes` or `synchronous_commit`). On MySQL and MariaDB the server
@@ -257,45 +259,65 @@ and names the cause.
 ## Upgrading from 0.7.2
 
 0.7.2 kept the realm in MIT's db2 format, which 0.8.0 cannot read. 0.8.0 keeps
-the realm in the directory database. Before the first 0.8.0 start, write a dump
-of the 0.7.2 realm into the same directory with the 0.7.2 image, either in the
-running 0.7.2 container or in a one-off container on the same KDC volume:
+the realm in the directory database.
 
-    docker exec <your 0.7.2 container> kdb5_util -r <REALM> dump /var/kerberos/krb5kdc/principal.dump
+1. Stop 0.7.2. Copy both volumes, the data directory and the KDC directory,
+   before the first 0.8.0 start. On MySQL or MariaDB, back up the database as
+   well: schema changes are not transactional.
+
+2. Write a dump of the 0.7.2 realm into the KDC directory with the 0.7.2 image
+   the install runs, in a one-off container on the stopped install's volume:
+
     docker run --rm --entrypoint kdb5_util -v <kdc volume>:/var/kerberos/krb5kdc \
         aelieth/klldap:0.7.2 -r <REALM> dump /var/kerberos/krb5kdc/principal.dump
 
-On its first start, 0.8.0 finds `principal.dump` beside the stash, loads it
-into the directory database, and moves the MIT files (`principal`,
-`principal.kadm5`, `principal.ok`, `principal.kadm5.lock`, `kadm5.acl`,
-`kdc.conf` and the dump) into `mit-db2.bak/` in the same directory, mode 0700.
-Nothing is deleted: remove that directory once the realm works. The dump holds
-every principal's key data, encrypted in the master key, so keep the backup as
-safe as the database.
+   An install set up from 0.7.2's example uses its own image name there
+   (`aelieth/lldap-with-kerberos:<its tag>`).
+   `docker exec <your 0.7.2 container> kdb5_util -r <REALM> dump
+   /var/kerberos/krb5kdc/principal.dump` works only while the 0.7.2 container
+   is running; a change made after the dump is not carried over.
 
-What carries over: the realm, the master key (the stash stays), every principal
-with its keys and attributes, and `admin/admin`, whose keytab is written again
-from its key. Each key keeps the bytes it had in MIT's dump, still encrypted in
-the master key, so a later dump of the database carries the same key bytes as
-MIT's. A dump the master key cannot open is refused, and nothing is moved. What
-does not carry over: grants in `kadm5.acl` beyond the admin line (name them in
-`kadmin_acl`), and MIT's logs.
+3. In the 0.7.2 compose file, publish `88:1088` for tcp and udp instead of
+   `88:88`, or the KDC is unreachable. Remove `749:749`: kadmin listens on
+   `127.0.0.1:1749` inside the container and is not published.
+   `LLDAP_KERB_REALM_NAME` is ignored; set `LLDAP_KERBEROS_OPTIONS__REALM` to
+   that realm, including when 0.7.2's `realm_name` in `kerberos_config.toml`
+   was not the name the base DN gives. `LLDAP_KEYCLOAK_ADMIN_PASS` is ignored;
+   set `LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS`. Change the image to `aelieth/klldap`.
+   A configuration that does not set `kerberos_options.enabled` now starts a
+   realm; set `enabled = false` to stay without one. Pull 0.8.0 and start it.
 
-A dump that names a principal which is only a user id, when that user does not
-exist, is refused. The cause names the principal, the database is not written,
-and the MIT files stay. Create the user it names, or remove the principal on
-0.7.2 and dump again.
+4. The start logs `Loaded N Kerberos principals from …` and `Migrated the MIT
+   realm; its files are kept in …`. Then list the principals and take a ticket
+   with the admin keytab:
 
-A configuration that does not set `kerberos_options.enabled` now starts a
-realm. Set `enabled = false` to stay without one.
+    docker exec <container> \
+      kadmin -k -t /data/kadm5.keytab -p admin/admin@<REALM> -q listprincs
+    docker exec <container> \
+      kinit -kt /data/kadm5.keytab admin/admin@<REALM>
 
-Without a dump the realm does not open: the server comes up in the degraded state and the
-cause names the file to write. A dump for a realm other than `kerberos_options.realm`, or a
-dump without its stash, is refused the same way, and nothing is moved.
+   What carries over: the realm, the master key (the stash stays), every
+   principal with its keys and attributes, and `admin/admin`, whose keytab is
+   written again from its key. Each key keeps the bytes it had in MIT's dump,
+   still encrypted in the master key, so a later dump of the database carries
+   the same key bytes as MIT's. A dump the master key cannot open is refused,
+   and nothing is moved. What does not carry over: grants in `kadm5.acl` beyond
+   the admin line (name them in `kadmin_acl`), and MIT's logs.
 
-0.7.2 took the realm's name from `realm_name` in `kerberos_config.toml`. Where that was set to
-something other than the name the base DN gives, set `kerberos_options.realm` to it before the
-first 0.8.0 start; otherwise the migration is refused and the cause names both realms.
+5. Without a dump the realm does not open. The server comes up in the degraded
+   state, the cause names the file to write, and nothing is moved. Write the
+   dump (step 2) and start again. A dump for a realm other than
+   `kerberos_options.realm`, or a dump without its stash, is refused the same
+   way. A dump that names a principal which is only a user id, when that user
+   does not exist, is refused. The cause names the principal, the database is
+   not written, and the MIT files stay. Create the user it names, or remove
+   the principal on 0.7.2 and dump again.
+
+6. When the realm works, remove `mit-db2.bak/`. Until then it holds the MIT
+   files (`principal`, `principal.kadm5`, `principal.ok`,
+   `principal.kadm5.lock`, `kadm5.acl`, `kdc.conf` and the dump), mode 0700.
+   Nothing is deleted before that. The dump holds every principal's key data,
+   encrypted in the master key, so keep the backup as safe as the database.
 
 ## Losing a volume
 

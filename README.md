@@ -20,7 +20,8 @@
 ## About
 
 KLLDAP is a hard fork of [LLDAP](https://github.com/lldap/lldap), the lightweight
-LDAP authentication server, with a Kerberos KDC and kadmin running inside the `lldap` process.
+LDAP authentication server. In 0.8.0 the KDC and kadmin are kerber-rust (v1.2.2)
+inside the `lldap` process, and MIT's KDC is no longer in the image's running system.
 Users, groups and passwords are managed once, through the web UI, LDAP or
 GraphQL; the KDC follows.
 
@@ -45,7 +46,7 @@ On top of LLDAP it adds:
   (`lldap_disabled`).
 
 This is a personal project, developed for a home lab and shared as-is under the
-GPL-3.0. It is not supported by the LLDAP team; if you do not need Kerberos or
+GPL-3.0-only. It is not supported by the LLDAP team; if you do not need Kerberos or
 POSIX, use [LLDAP](https://github.com/lldap/lldap). Stock LLDAP 0.6.x databases can
 move to KLLDAP with their data (users set a new password), see the
 [migration guide](docs/migration_guides/v0.7-from-lldap.md).
@@ -53,7 +54,8 @@ move to KLLDAP with their data (users set a new password), see the
 ## Installation
 
 KLLDAP ships as a Docker image, `aelieth/klldap`, because the KDC lives in the
-container. See [docs/install.md](docs/install.md).
+container. See [docs/install.md](docs/install.md). A 0.7.2 install follows
+[Upgrading from 0.7.2](docs/kerberos.md#upgrading-from-072) before it pulls.
 
 ## Usage
 
@@ -114,10 +116,10 @@ read from a file instead by appending `_FILE` to the variable name
 | `LLDAP_FORCE_UPDATE_PRIVATE_KEY` | `false` | Accept a changed private key (invalidates every password) |
 | `LLDAP_ENABLE_MFA` | `false` | TOTP second factor: `true` for users who enroll, `always` for everyone (`lldap_mfa_disabled` members exempt), see [docs/mfa.md](docs/mfa.md) |
 | `LLDAP_LDAPS_OPTIONS__ENABLED` / `__PORT` / `__CERT_FILE` / `__KEY_FILE` | `false` / `6360` | LDAPS |
-| `LLDAP_SMTP_OPTIONS__ENABLE_PASSWORD_RESET`, `__SERVER`, `__PORT`, `__SMTP_ENCRYPTION`, `__USER`, `__PASSWORD`, `__FROM`, `__REPLY_TO` | off | Password-reset mail |
+| `LLDAP_SMTP_OPTIONS__ENABLE_PASSWORD_RESET`, `__SERVER`, `__PORT`, `__SMTP_ENCRYPTION`, `__USER`, `__PASSWORD`, `__FROM`, `__REPLY_TO`, `__TLS_ROOT_CERT_FILE` | off | Password-reset mail. `__TLS_ROOT_CERT_FILE` is an optional PEM of the CA that signed the SMTP server |
 | `LLDAP_HEALTHCHECK_OPTIONS__HTTP_HOST` / `__LDAP_HOST` | `localhost` | What `lldap healthcheck` probes |
 | `LLDAP_LOG_OPTIONS__PERSIST` / `__RETENTION_DAYS` / `__MAX_ENTRIES` / `__BIND_COALESCE_SECONDS` | `true` / `30` / `50000` / `300` | Persistent event log (logins, binds, directory changes, denials) in the `logs` table, see [docs/logging.md](docs/logging.md); `0` removes an age or size limit; the trim also runs with `PERSIST=false`; repeated successful binds are stored once per coalescing window (`0` stores all) |
-| `LLDAP_KERBEROS_OPTIONS__ENABLED` / `__REALM` / `__TICKET_LIFETIME` / `__RENEW_LIFETIME` / `__FORWARDABLE` / `__SUPPORTED_ENCTYPES` | `true` / from the base DN / `24h` / `7d` / `true` / `aes256-cts-hmac-sha1-96` | Kerberos inside the server. `enabled` defaults to true; set it to `false` to run without a realm. Lifetimes take a Kerberos duration (`24h`, `7d`, `36000s`) or a bare number of seconds (`36000`), quoted or not. When enabled, directory writes wait for the KDC after boot and the healthcheck also requires it, see [docs/kerberos.md](docs/kerberos.md) |
+| `LLDAP_KERBEROS_OPTIONS__ENABLED` / `__REALM` / `__TICKET_LIFETIME` / `__RENEW_LIFETIME` / `__FORWARDABLE` / `__CLIENT_CASE_FOLD` / `__SUPPORTED_ENCTYPES` | `true` / from the base DN / `24h` / `7d` / `true` / `true` / `aes256-cts-hmac-sha1-96` | Kerberos inside the server. `enabled` defaults to true; set it to `false` to run without a realm. Lifetimes take a Kerberos duration (`24h`, `7d`, `36000s`) or a bare number of seconds (`36000`), quoted or not. When enabled, directory writes wait for the KDC after boot and the healthcheck also requires it, `client_case_fold` defaults to true. See [docs/kerberos.md](docs/kerberos.md) |
 | `LLDAP_KERBEROS_OPTIONS__KDC_HOST` / `__KDC_PORT` / `__KADMIN_HOST` / `__KADMIN_PORT` / `__DATA_DIR` / `__ADMIN_KEYTAB` / `__CLIENT_CONFIG` / `__KADMIN_ACL` | `0.0.0.0` / `1088` / `127.0.0.1` / `1749` / `krb5kdc` / `kadm5.keytab` / `krb5.conf` / none | KDC and kadmin listeners, the database directory, the admin keytab and the client config. The image sets the three paths to `/var/kerberos/krb5kdc`, `/data/kadm5.keytab` and `/data/krb5.conf` |
 | `LLDAP_KEYCLOAK_OPTIONS__CONFIG_FILE` / `__KEYTAB` | `keycloak_config.toml` / `keytab/keycloak-http.keytab` | Where the Federation tab stores URL, realm and admin user, and the Keycloak HTTP keytab. The image sets `/data/keycloak_config.toml` and `/data/keytab/keycloak-http.keytab` |
 | `LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS` | none | Keycloak admin password used by the Federation tab. `LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS_FILE` reads it from a file; if both are set, the plain value wins |

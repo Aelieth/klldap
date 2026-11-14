@@ -3,12 +3,14 @@
 # Matches the AlmaLinux runtime image (quay.io/almalinuxorg/10-minimal),
 # so the release build links against the same glibc as the containers.
 #
-# Produces the x86_64 (baseline CPU) glibc tarball. KLLDAP 0.8.0 is 64-bit only.
+# One builder per platform: linux/amd64 builds the x86_64 (x86-64-v2) tarball and the web app,
+# linux/arm64 (emulated where the host is x86_64) the aarch64 tarball. KLLDAP 0.8.0 is 64-bit only.
 #
 # Usage:
 #   make prepare-release-docker
 
 FROM quay.io/almalinuxorg/10-minimal
+ARG TARGETARCH
 
 # Install build dependencies with microdnf (AlmaLinux/Fedora)
 RUN microdnf install -y --assumeyes \
@@ -39,11 +41,8 @@ WORKDIR /app
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
 ENV PATH="/app/.cargo/bin:${PATH}"
 
-# Install wasm-pack (frontend)
-RUN cargo install --locked wasm-pack --version 0.15.1
-
-# Pre-add targets
-RUN rustup target add x86_64-unknown-linux-gnu
+# Install wasm-pack (frontend), on amd64 only: the arm64 run reuses the web files the amd64 run built.
+RUN if [ "$TARGETARCH" = amd64 ]; then cargo install --locked wasm-pack --version 0.15.1; fi
 
 # Default command (overridden by Makefile)
 CMD ["bash"]

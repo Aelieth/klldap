@@ -16,22 +16,33 @@ VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 prepare-release:
 	./prepare-release.sh
 
-# Fully Dockerized release build (AlmaLinux 10 base).
-# Builds a reproducible AlmaLinux container with Rust and wasm-pack,
-# then runs prepare-release.sh inside it.
+# Fully Dockerized release build (AlmaLinux 10 base), one builder per platform.
+# linux/amd64 builds the x86_64 tarball (x86-64-v2) and the web app; linux/arm64 then
+# builds the aarch64 tarball (under qemu emulation on an x86_64 host), reusing the same
+# tree's web files (SKIP_FRONTEND=1 refuses if they are missing).
 #
-# Output: lldap-x86_64-glibc-*.tar.gz (KLLDAP 0.8.0 is 64-bit only).
+# Output: lldap-x86_64-glibc-*.tar.gz and lldap-aarch64-glibc-*.tar.gz (64-bit only).
 #
 # Note: no --privileged and no Docker socket; the build needs neither.
 prepare-release-docker:
-	docker buildx build \
+	docker buildx build --platform linux/amd64 \
 		--file Dockerfile.release \
-		--tag klldap/release-builder:latest \
+		--tag klldap/release-builder:amd64 \
 		--load .
-	docker run --rm \
+	docker run --rm --platform linux/amd64 \
 		-v "$(PWD)":/work \
 		-w /work \
-		klldap/release-builder:latest \
+		klldap/release-builder:amd64 \
+		./prepare-release.sh
+	docker buildx build --platform linux/arm64 \
+		--file Dockerfile.release \
+		--tag klldap/release-builder:arm64 \
+		--load .
+	docker run --rm --platform linux/arm64 \
+		-e SKIP_FRONTEND=1 \
+		-v "$(PWD)":/work \
+		-w /work \
+		klldap/release-builder:arm64 \
 		./prepare-release.sh
 
 # Build the main multi-stage KLLDAP Docker image for multiple architectures.

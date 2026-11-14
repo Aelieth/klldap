@@ -24,8 +24,9 @@ ENV PATH="/app/.cargo/bin:${PATH}"
 # Verify Rust/Cargo
 RUN rustc --version && cargo --version
 
-# Portable x86-64 baseline for release images. `make test` overrides with native.
-ARG CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=x86-64"
+# x86-64-v2 for release images. `make test` overrides with native.
+# Set the flag only through this variable: RUSTFLAGS would replace .cargo/config.toml's p384 cfg.
+ARG CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=x86-64-v2"
 ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS=$CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS
 ARG CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS
 ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS=$CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS

@@ -115,10 +115,11 @@ covers LLDAP's chart, TrueNAS app, packages and FreeBSD port.
 
 #### Backend
 
-`prepare-release.sh` builds the server for the baseline x86-64 instruction set:
+`prepare-release.sh` builds the server for the machine it runs on: on x86_64 for the x86-64-v2
+instruction set, on aarch64 with no CPU flag. On x86_64:
 
 ```sh
-CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=x86-64" cargo build --release -p lldap
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=x86-64-v2" cargo build --release -p lldap
 ```
 
 The binary is `target/release/lldap`.

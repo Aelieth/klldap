@@ -17,7 +17,9 @@ prepare-release:
 	./prepare-release.sh
 
 # Fully Dockerized release build (AlmaLinux 10 base), one builder per platform.
-# linux/amd64 builds the x86_64 tarball (x86-64-v2) and the web app; linux/arm64 then
+# linux/amd64/v2 builds the x86_64 tarball and the web app: x86-64-v2 for rustc and gcc, by
+# the v2 base's compiler and prepare-release.sh's own flags, which it then checks in the binary;
+# linux/arm64 then
 # builds the aarch64 tarball (under qemu emulation on an x86_64 host), reusing the same
 # tree's web files (SKIP_FRONTEND=1 refuses if they are missing).
 #
@@ -25,11 +27,11 @@ prepare-release:
 #
 # Note: no --privileged and no Docker socket; the build needs neither.
 prepare-release-docker:
-	docker buildx build --platform linux/amd64 \
+	docker buildx build --platform linux/amd64/v2 \
 		--file Dockerfile.release \
 		--tag klldap/release-builder:amd64 \
 		--load .
-	docker run --rm --platform linux/amd64 \
+	docker run --rm --platform linux/amd64/v2 \
 		-v "$(PWD)":/work \
 		-w /work \
 		klldap/release-builder:amd64 \

@@ -12,6 +12,7 @@ and without a restart policy the container stays down.**
 - [With Docker](#with-docker)
 - [With Podman](#with-podman)
 - [Kubernetes, TrueNAS SCALE and package repositories](#kubernetes-truenas-scale-and-package-repositories)
+- [Install from the release tarball](#install-from-the-release-tarball)
 - [From source](#from-source)
   - [Backend](#backend)
   - [Frontend](#frontend)
@@ -29,8 +30,8 @@ still work, and they win when both names are set. A root start repairs ownership
 `/data`, `/app` and the KDC directory, then `gosu` runs the server as that user.
 `tini` is the init. The rootless image starts as user `lldap` and does not change
 ownership; `/data` must already be writable by that user. `--user` on the standard
-image fails, because `gosu` cannot switch user without root. Use the `-rootless`
-tag, and the compose `user:` field in place of `UID` and `GID`.
+image fails, because `gosu` cannot switch user without root. Use `aelieth/klldap:0.8.0-rootless`,
+and the compose `user:` field in place of `UID` and `GID`.
 
 The KDC listens on 1088 and kadmin on `127.0.0.1:1749`. Publish the KDC as `88:1088`
 (tcp and udp). kadmin is not published. Those ports need no capability. A port below
@@ -110,6 +111,58 @@ comes up degraded, as it does under rootless Podman and unlike Docker.
 
 Nothing here installs KLLDAP. The image is how you run it. Upstream's install page
 covers LLDAP's chart, TrueNAS app, packages and FreeBSD port.
+
+### Install from the release tarball
+
+A release has two tarballs, `lldap-x86_64-glibc-v<version>.tar.gz` and
+`lldap-aarch64-glibc-v<version>.tar.gz`. There is no 32-bit or ARMv7 tarball.
+The aarch64 tarball is built under emulation and is not tested by us.
+
+The x86_64 tarball needs an x86-64-v2 processor or newer, glibc 2.34 or newer,
+and libgcc_s, libm and libc. It runs on AlmaLinux 10 and Debian 12.
+
+The tarball contains one directory, named `x86_64` or `aarch64`, with `lldap`,
+`index.html`, `static/`, `pkg/`, `lldap_config.docker_template.toml`, `README.md`
+and `LICENSE`.
+
+The unit is [lldap.service](../example_configs/lldap.service). It runs
+`/opt/nitnelave/lldap run` as user and group `klldap`, with working directory
+`/opt/nitnelave`. That directory must be readable and writable by `klldap`.
+
+Unpack that directory's contents into `/opt/nitnelave`, so the binary is
+`/opt/nitnelave/lldap`. Copy `lldap_config.docker_template.toml` to
+`/opt/nitnelave/lldap_config.toml` and edit it. The unit passes no
+`--config-file`, so the server reads `lldap_config.toml` from its working
+directory. Keep that file owned by `klldap` and not readable by others.
+
+Set these keys. The template points them at the image's paths:
+
+- `database_url`. The template uses `sqlite:////data/users.db?mode=rwc`. Point
+  it under `/opt/nitnelave`, for example
+  `sqlite:////opt/nitnelave/users.db?mode=rwc`.
+- `assets_path` to `/opt/nitnelave`, the directory that holds `index.html`,
+  `static/` and `pkg/`. Left unset it is `./app`, and the web app answers 404.
+- `ldap_base_dn`. The realm is the base DN's `dc` components, joined and
+  uppercased (`dc=example,dc=com` gives `EXAMPLE.COM`), unless
+  `kerberos_options.realm` is set.
+- `kerberos_options.data_dir`, `admin_keytab` and `client_config`. The template
+  sets `/var/kerberos/krb5kdc`, `/data/kadm5.keytab` and `/data/krb5.conf`. Use
+  `/opt/nitnelave/krb5kdc`, `/opt/nitnelave/kadm5.keytab` and
+  `/opt/nitnelave/krb5.conf`.
+- If you use the Federation tab, `keycloak_options.config_file` and
+  `keycloak_options.keytab`. The template sets them under `/data`. Point them
+  under `/opt/nitnelave`.
+
+`jwt_secret`, `key_seed` and `ldap_user_pass` go in that file. Replace the
+template's `key_seed`. Or set `LLDAP_JWT_SECRET`, `LLDAP_KEY_SEED` and
+`LLDAP_LDAP_USER_PASS` in a systemd drop-in of your own, the same kind of file
+as the PostgreSQL drop-in under [From source](#from-source).
+
+The KDC listens on 1088, which on a host install needs no capability. For a port
+below 1024, see [With Docker](#with-docker). `data_dir` is created at mode 0700
+and the admin keytab is written at mode 0600: [Bootstrap](kerberos.md#bootstrap).
+
+From `/opt/nitnelave`, run `/opt/nitnelave/lldap healthcheck`, then log in.
 
 ### From source
 

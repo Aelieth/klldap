@@ -1,5 +1,8 @@
 <h1 align="center">KLLDAP - Light LDAP with an integrated Kerberos KDC</h1>
 
+0.8.0 is a pre-release. The new policies and the front end have not yet had thorough testing. Further testing, verification and code review come before it is promoted.
+
+
 <p align="center">
   <a href="https://github.com/Aelieth/klldap/actions/workflows/rust.yml?query=branch%3A0.8.0">
     <img src="https://github.com/Aelieth/klldap/actions/workflows/rust.yml/badge.svg?branch=0.8.0" alt="Build"/>
@@ -58,6 +61,8 @@ container. See [docs/install.md](docs/install.md). A 0.7.2 install follows
 [Upgrading from 0.7.2](docs/kerberos.md#upgrading-from-072) before it pulls.
 
 Images are amd64 and arm64, `aelieth/klldap:0.8.0`. The arm64 image is built under emulation and is not tested by us.
+
+The rootless image is published under `aelieth/klldap:0.8.0-rootless`, for the same platforms as the default image.
 
 KLLDAP 0.8.0 is 64-bit only (x86_64 and arm64); there is no 32-bit or ARMv7 build.
 

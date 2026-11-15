@@ -2,9 +2,11 @@
 
 ## [0.8.0] - RELEASE-DATE
 
+0.8.0 is a pre-release. The new policies and the front end have not yet had thorough testing. Further testing, verification and code review come before it is promoted.
+
 Next release. The KDC is kerber-rust inside the `lldap` process.
 0.7.4, 0.7.5 and 0.7.6 were never released, and their work is in 0.8.0.
-KLLDAP 0.8.0 is 64-bit only (x86_64 and arm64); there is no 32-bit or ARMv7 build. The release tarball is x86_64 only; earlier releases' recipe also built ARMv7.
+KLLDAP 0.8.0 is 64-bit only (x86_64 and arm64); there is no 32-bit or ARMv7 build. Release tarballs are x86_64 and aarch64; earlier releases' recipe also built ARMv7.
 
 ### License
 
@@ -146,6 +148,7 @@ KLLDAP 0.8.0 is 64-bit only (x86_64 and arm64); there is no 32-bit or ARMv7 buil
   No capability is passed to the server. `tini` is the init. `--user` on the
   standard image fails, because `gosu` cannot switch user without root. The
   rootless image starts as user `lldap` and does not change ownership.
+- The rootless image is published under `aelieth/klldap:0.8.0-rootless`, for the same platforms as the default image.
 - The entrypoint no longer waits or prints "LLDAP is ready!". `tini` is the
   container's first process and forwards `docker stop` to the server.
 - The image no longer declares `749` in `EXPOSE`. It declares `1088`.

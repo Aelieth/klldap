@@ -293,9 +293,10 @@ Podman follows the steps below. Those steps are what the script does.
    `LLDAP_KERB_REALM_NAME` is ignored; set `LLDAP_KERBEROS_OPTIONS__REALM` to
    that realm, including when 0.7.2's `realm_name` in `kerberos_config.toml`
    was not the name the base DN gives. `LLDAP_KEYCLOAK_ADMIN_PASS` is ignored;
-   set `LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS`. Change the image to `aelieth/klldap`.
+   set `LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS`. Name the image `aelieth/klldap:0.8.0`
+   to get 0.8.0. `aelieth/klldap:latest` is still 0.7.2.
    A configuration that does not set `kerberos_options.enabled` now starts a
-   realm; set `enabled = false` to stay without one. Pull 0.8.0 and start it.
+   realm; set `enabled = false` to stay without one. Pull that tag and start it.
 
 4. The start logs `Loaded N Kerberos principals from …` and `Migrated the MIT
    realm; its files are kept in …`. Then list the principals and take a ticket

@@ -88,7 +88,7 @@ ACL text, read at boot.
 - The web UI never sends a plaintext password: it encrypts it with the RSA key
   from the `kerberosInfo` query for `syncKerberosPassword`; the server decrypts
   it and updates the embedded KDC. The key is 3072 bits, made anew at every
-  start in the background; the log line "Made the 3072-bit RSA key in <ms> ms"
+  start in the background; the log line "Made the 3072-bit RSA key in `<ms>` ms"
   gives the time, and a form opened before it is ready waits for it.
   RSA-OAEP with SHA-256 seals at most 318 bytes, so the web UI refuses a
   longer password with "Failed to encrypt password for Kerberos sync" and
@@ -278,8 +278,10 @@ Podman follows the steps below. Those steps are what the script does.
 2. Write a dump of the 0.7.2 realm into the KDC directory with the 0.7.2 image
    the install runs, in a one-off container on the stopped install's volume:
 
-    docker run --rm --entrypoint kdb5_util -v <kdc volume>:/var/kerberos/krb5kdc \
-        aelieth/klldap:0.7.2 -r <REALM> dump /var/kerberos/krb5kdc/principal.dump
+   ```
+   docker run --rm --entrypoint kdb5_util -v <kdc volume>:/var/kerberos/krb5kdc \
+       aelieth/klldap:0.7.2 -r <REALM> dump /var/kerberos/krb5kdc/principal.dump
+   ```
 
    An install set up from 0.7.2's example uses its own image name there
    (`aelieth/lldap-with-kerberos:<its tag>`).
@@ -302,10 +304,12 @@ Podman follows the steps below. Those steps are what the script does.
    realm; its files are kept in …`. Then list the principals and take a ticket
    with the admin keytab:
 
-    docker exec <container> \
-      kadmin -k -t /data/kadm5.keytab -p admin/admin@<REALM> -q listprincs
-    docker exec <container> \
-      kinit -kt /data/kadm5.keytab admin/admin@<REALM>
+   ```
+   docker exec <container> \
+     kadmin -k -t /data/kadm5.keytab -p admin/admin@<REALM> -q listprincs
+   docker exec <container> \
+     kinit -kt /data/kadm5.keytab admin/admin@<REALM>
+   ```
 
    What carries over: the realm, the master key (the stash stays), every
    principal with its keys and attributes, and `admin/admin`, whose keytab is

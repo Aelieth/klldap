@@ -266,7 +266,8 @@ Docker only, any tag: the script decides from the image itself.
 and changes nothing. `scripts/upgrade-0.7.2-to-0.8.0.sh --yes <container>`
 stops 0.7.2, backs up both volumes, writes the dump with the image that
 container runs, and prints the edits in the steps below. It does not pull,
-and it does not start 0.8.0. Start 0.8.0, then
+and it does not start 0.8.0. The script prints the edits for a compose file
+and for a `docker run` command. Start 0.8.0, then
 `scripts/upgrade-0.7.2-to-0.8.0.sh --verify <container> <backup-dir>`.
 Podman follows the steps below. Those steps are what the script does.
 

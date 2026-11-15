@@ -228,23 +228,222 @@ start_080() {
     return 0
 }
 
-print_edits() {
-    echo "0.7.2 is stopped. Edit the compose file or the run command, then start 0.8.0 yourself."
-    echo "image aelieth/klldap:0.8.0"
-    echo "publish 88:1088/tcp and 88:1088/udp"
-    echo "remove 749:749"
-    if [ -n "$realm" ]; then
-        echo "set LLDAP_KERBEROS_OPTIONS__REALM=${realm}"
+compose_of() {
+    local value
+    value="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.project"}}' "$name" 2>/dev/null || true)"
+    case "$value" in
+        "" | "<no value>") compose_project="" ;;
+        *) compose_project=$value ;;
+    esac
+    value="$(docker inspect -f '{{index .Config.Labels "com.docker.compose.service"}}' "$name" 2>/dev/null || true)"
+    case "$value" in
+        "" | "<no value>") compose_service="" ;;
+        *) compose_service=$value ;;
+    esac
+}
+
+binding_text() {
+    local ip="$1" hport="$2" cport="$3" proto="$4" force="$5"
+    if [ -n "$ip" ]; then
+        case "$ip" in
+            *:*) printf '[%s]:%s:%s/%s' "$ip" "$hport" "$cport" "$proto" ;;
+            *) printf '%s:%s:%s/%s' "$ip" "$hport" "$cport" "$proto" ;;
+        esac
+        return 0
     fi
-    echo "LLDAP_KERB_REALM_NAME is ignored"
-    if [ "$keycloak_set" = yes ]; then
-        echo "LLDAP_KEYCLOAK_ADMIN_PASS is set. Rename it to LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS. The value is not printed."
+    if [ -z "$hport" ]; then
+        if [ "$force" = yes ] || [ "$proto" != tcp ]; then
+            printf '%s/%s' "$cport" "$proto"
+        else
+            printf '%s' "$cport"
+        fi
+        return 0
+    fi
+    if [ "$force" = yes ] || [ "$proto" != tcp ]; then
+        printf '%s:%s/%s' "$hport" "$cport" "$proto"
     else
-        echo "LLDAP_KEYCLOAK_ADMIN_PASS was not set"
+        printf '%s:%s' "$hport" "$cport"
     fi
+}
+
+read_ports() {
+    local rec key rest ip hport cport proto force
+    port_kind=()
+    port_old=()
+    port_new=()
+    kerberos_ports=0
+    while IFS= read -r rec || [ -n "$rec" ]; do
+        [ -n "$rec" ] || continue
+        key=${rec%%|*}
+        rest=${rec#*|}
+        ip=${rest%%|*}
+        hport=${rest#*|}
+        case "$ip" in
+            "" | 0.0.0.0) ip="" ;;
+        esac
+        cport=${key%%/*}
+        proto=${key#*/}
+        force=no
+        case "$cport" in
+            88 | 749) force=yes ;;
+        esac
+        case "$cport" in
+            88)
+                kerberos_ports=$((kerberos_ports + 1))
+                port_kind+=(replace)
+                port_old+=("$(binding_text "$ip" "$hport" 88 "$proto" "$force")")
+                port_new+=("$(binding_text "$ip" "$hport" 1088 "$proto" "$force")")
+                ;;
+            749)
+                port_kind+=(delete)
+                port_old+=("$(binding_text "$ip" "$hport" 749 "$proto" "$force")")
+                port_new+=("")
+                ;;
+            *)
+                port_kind+=(leave)
+                port_old+=("$(binding_text "$ip" "$hport" "$cport" "$proto" "$force")")
+                port_new+=("")
+                ;;
+        esac
+    done < <(docker inspect -f '{{range $p, $conf := .HostConfig.PortBindings}}{{range $conf}}{{$p}}|{{.HostIp}}|{{.HostPort}}
+{{end}}{{end}}' "$name" 2>/dev/null || true)
+}
+
+print_port_actions() {
+    local style="$1" i=0 n lead bt='`'
+    n=${#port_kind[@]}
+    if [ "$n" -eq 0 ]; then
+        echo "ports:        this container publishes no Kerberos port"
+        echo "              the KDC's port in the container moved from 88 to 1088; clients that reach the container directly must use 1088"
+        return 0
+    fi
+    while [ "$i" -lt "$n" ]; do
+        if [ "$i" -eq 0 ]; then
+            lead="ports:        "
+        else
+            lead="              "
+        fi
+        case "${port_kind[$i]}" in
+            replace)
+                if [ "$style" = quote ]; then
+                    printf '%sreplace "%s" with "%s"\n' "$lead" "${port_old[$i]}" "${port_new[$i]}"
+                else
+                    printf '%sreplace %s-p %s%s with %s-p %s%s\n' "$lead" "$bt" "${port_old[$i]}" "$bt" "$bt" "${port_new[$i]}" "$bt"
+                fi
+                ;;
+            delete)
+                if [ "$style" = quote ]; then
+                    printf '%sdelete "%s"\n' "$lead" "${port_old[$i]}"
+                else
+                    printf '%sdelete %s-p %s%s\n' "$lead" "$bt" "${port_old[$i]}" "$bt"
+                fi
+                ;;
+            leave)
+                if [ "$style" = quote ]; then
+                    printf '%sleave "%s" unchanged\n' "$lead" "${port_old[$i]}"
+                else
+                    printf '%sleave %s-p %s%s unchanged\n' "$lead" "$bt" "${port_old[$i]}" "$bt"
+                fi
+                ;;
+        esac
+        i=$((i + 1))
+    done
+    if [ "$kerberos_ports" -eq 0 ]; then
+        echo "              this container publishes no Kerberos port"
+        echo "              the KDC's port in the container moved from 88 to 1088; clients that reach the container directly must use 1088"
+    fi
+}
+
+print_env_actions() {
+    local style="$1"
+    if [ -n "$realm" ]; then
+        if [ "$style" = run ]; then
+            printf 'environment:  add -e LLDAP_KERBEROS_OPTIONS__REALM=%s\n' "$realm"
+        else
+            printf 'environment:  add LLDAP_KERBEROS_OPTIONS__REALM=%s\n' "$realm"
+        fi
+        echo "              delete LLDAP_KERB_REALM_NAME (0.8.0 ignores it)"
+    else
+        echo "environment:  delete LLDAP_KERB_REALM_NAME (0.8.0 ignores it)"
+    fi
+    if [ "$keycloak_set" = yes ]; then
+        echo "              rename LLDAP_KEYCLOAK_ADMIN_PASS to LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS (keep its value)"
+    else
+        echo "              LLDAP_KEYCLOAK_ADMIN_PASS was not set"
+    fi
+}
+
+quote_arg() {
+    local spec="$1"
+    case "$spec" in
+        *[!A-Za-z0-9_./-]*)
+            printf '%q' "$spec"
+            ;;
+        *)
+            printf '%s' "$spec"
+            ;;
+    esac
+}
+
+mount_text() {
+    local spec="$1" dest="$2"
+    case "$spec" in
+        *[!A-Za-z0-9_./-]*)
+            printf -- '-v %q:%s' "$spec" "$dest"
+            ;;
+        *)
+            printf -- '-v %s:%s' "$spec" "$dest"
+            ;;
+    esac
+}
+
+print_compose_block() {
+    echo "edits_for_compose"
+    if [ -n "$compose_project" ]; then
+        echo "install looks like compose project ${compose_project} service ${compose_service}"
+    fi
+    if [ -n "$compose_service" ]; then
+        echo "In the compose file, service ${compose_service}:"
+    else
+        echo "In the compose file:"
+    fi
+    echo "image:        change to aelieth/klldap:0.8.0"
+    print_port_actions quote
+    print_env_actions compose
     echo "a configuration that does not set kerberos_options.enabled now starts a realm; set enabled = false to stay without one"
-    echo "backup directory ${backup_abs}"
-    echo "then: $self --verify <new-container> ${backup_abs}"
+    echo "then run:     docker compose up -d"
+    echo "the service name does not change, so the container name stays ${name}"
+    printf 'then run:     %s --verify %s %s\n' "$self" "$name" "$(quote_arg "$backup_abs")"
+    echo "edits_for_compose_end"
+}
+
+print_run_block() {
+    echo "edits_for_docker_run"
+    echo "For docker run:"
+    echo "the old container must be renamed or removed before a new one takes its name; this script never removes it"
+    echo "docker rename ${name} ${name}-0.7.2"
+    echo "image:        change to aelieth/klldap:0.8.0"
+    print_port_actions tick
+    print_env_actions run
+    echo "a configuration that does not set kerberos_options.enabled now starts a realm; set enabled = false to stay without one"
+    printf 'volumes:      %s\n' "$(mount_text "$data_spec" /data)"
+    printf '              %s\n' "$(mount_text "$kdc_spec" /var/kerberos/krb5kdc)"
+    echo "name:         --name ${name}"
+    printf 'then run:     %s --verify %s %s\n' "$self" "$name" "$(quote_arg "$backup_abs")"
+    echo "edits_for_docker_run_end"
+}
+
+print_edits() {
+    compose_of
+    read_ports
+    echo "0.7.2 is stopped. Apply one of the two blocks, then start 0.8.0 yourself."
+    if [ -n "$compose_project" ]; then
+        print_compose_block
+        print_run_block
+    else
+        print_run_block
+        print_compose_block
+    fi
 }
 
 write_copy() {

@@ -3305,3 +3305,150 @@ async fn test_sqlite_dump_script_matches_migrated_tables() {
         }
     }
 }
+
+async fn policy_store_lane(pool: &DbConnection) {
+    use lldap_domain_handlers::handler::PolicyBackendHandler;
+    use lldap_domain_handlers::policies::{CreatePolicyRequest, PolicyId, UpdatePolicyRequest};
+    use std::collections::BTreeMap;
+
+    fn items(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+    async fn state_of(handler: &SqlBackendHandler, ou: &str) -> Vec<(Option<PolicyId>, bool)> {
+        handler
+            .list_ou_policy_states()
+            .await
+            .expect("list states")
+            .into_iter()
+            .filter(|s| s.ou_key == ou)
+            .map(|s| (s.policy_id, s.block_inheritance))
+            .collect()
+    }
+
+    init_table(pool).await.expect("fresh init");
+    let handler = SqlBackendHandler::new(generate_random_private_key(), pool.clone());
+    let base = handler
+        .create_policy(CreatePolicyRequest {
+            name: "Lane Base".to_owned(),
+            description: "lane".to_owned(),
+            items: items(&[("require-mfa", "always"), ("lockout-threshold", "5")]),
+        })
+        .await
+        .expect("create base");
+    let other = handler
+        .create_policy(CreatePolicyRequest {
+            name: "Lane Other".to_owned(),
+            description: String::new(),
+            items: items(&[("lockout-threshold", "7")]),
+        })
+        .await
+        .expect("create other");
+    let mut names: Vec<String> = handler
+        .list_policies()
+        .await
+        .expect("list")
+        .into_iter()
+        .map(|p| p.name)
+        .collect();
+    names.sort();
+    assert_eq!(names, vec!["Lane Base".to_owned(), "Lane Other".to_owned()]);
+    assert_eq!(
+        handler.get_policy(base).await.expect("get").items,
+        items(&[("lockout-threshold", "5"), ("require-mfa", "always")])
+    );
+    assert!(
+        handler
+            .create_policy(CreatePolicyRequest {
+                name: "lane base".to_owned(),
+                description: String::new(),
+                items: BTreeMap::new(),
+            })
+            .await
+            .is_err(),
+        "the store must refuse a name that differs only in case"
+    );
+
+    handler
+        .update_policy(UpdatePolicyRequest {
+            id: base,
+            name: None,
+            description: None,
+            items: Some(items(&[("inactivity-days", "30")])),
+        })
+        .await
+        .expect("update");
+    assert_eq!(
+        handler.get_policy(base).await.expect("get").items,
+        items(&[("inactivity-days", "30")])
+    );
+
+    handler.set_ou_policy("lane-a", base).await.expect("set a");
+    handler
+        .set_ou_policy("lane-a", other)
+        .await
+        .expect("set a again");
+    assert_eq!(
+        state_of(&handler, "lane-a").await,
+        vec![(Some(other), false)]
+    );
+    handler.set_ou_policy("lane-b", other).await.expect("set b");
+    let mut linked = handler.get_policy(other).await.expect("get").linked_ous;
+    linked.sort();
+    assert_eq!(linked, vec!["lane-a".to_owned(), "lane-b".to_owned()]);
+
+    handler
+        .set_ou_policy_inheritance("lane-a\\lane-n", true)
+        .await
+        .expect("block nested");
+    let levels = handler
+        .get_policy_levels("lane-a\\lane-n")
+        .await
+        .expect("levels");
+    assert_eq!(
+        levels.iter().map(|l| l.ou_key.as_str()).collect::<Vec<_>>(),
+        vec!["", "lane-a", "lane-a\\lane-n"]
+    );
+    assert_eq!(levels[1].policy.as_ref().map(|p| p.id), Some(other));
+    assert!(levels[2].blocked && levels[2].policy.is_none());
+
+    handler.delete_policy(other).await.expect("delete other");
+    assert!(state_of(&handler, "lane-a").await.is_empty());
+    assert!(state_of(&handler, "lane-b").await.is_empty());
+    assert_eq!(
+        state_of(&handler, "lane-a\\lane-n").await,
+        vec![(None, true)]
+    );
+    assert!(handler.get_policy(other).await.is_err());
+    assert!(handler.clear_ou_policy("lane-a").await.is_err());
+
+    handler
+        .delete_ou_policy_state("lane-a\\lane-n")
+        .await
+        .expect("drop nested");
+    assert!(state_of(&handler, "lane-a\\lane-n").await.is_empty());
+    handler.delete_policy(base).await.expect("delete base");
+    assert!(handler.list_policies().await.expect("list").is_empty());
+}
+
+#[tokio::test]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_policy_store() {
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres().await else {
+        return;
+    };
+    policy_store_lane(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_policy_store() {
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql().await else {
+        return;
+    };
+    policy_store_lane(&pool).await;
+}

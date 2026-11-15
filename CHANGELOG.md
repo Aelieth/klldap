@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.8.0] - RELEASE-DATE
+## [0.8.0] - 2026-11-15
 
 0.8.0 is a pre-release. The new policies and the front end have not yet had thorough testing. Further testing, verification and code review come before it is promoted.
 

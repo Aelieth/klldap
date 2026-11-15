@@ -3,7 +3,7 @@
 # Clean release build targets.
 # - prepare-release          → Native tarball build
 # - prepare-release-docker   → Reproducible AlmaLinux tarball build (recommended)
-# - docker-build             → Build multi-arch Docker image (amd64 + arm64 by default)
+# - docker-build             → Build and push the multi-arch images, default and rootless (amd64 + arm64)
 # - test                     → Local test image (klldap-test) from this tree, native CPU
 # - test-run                 → Run klldap-test with local volumes and test secrets
 
@@ -48,21 +48,32 @@ prepare-release-docker:
 # Build the main multi-stage KLLDAP Docker image for multiple architectures.
 # Supports a wide variety of processors (x86_64 + arm64 by default).
 #
-# Default platforms: linux/amd64,linux/arm64
-# Override example: make docker-build PLATFORMS=linux/amd64
+# Default platforms: linux/amd64/v2,linux/arm64
+# Override example: make docker-build PLATFORMS=linux/amd64/v2
 #
-# Note: This builds the full runtime image with Kerberos support.
-# For maximum x86_64 compatibility inside the image, we can add
-# RUSTFLAGS later if needed (similar to the tarball build).
+# Note: This builds the full runtime image with Kerberos support, twice:
+# the default image and the rootless image (the Dockerfile's `rootless`
+# target), named with a `-rootless` suffix as upstream LLDAP names its own.
+#
+# It pushes :$(VERSION) and :$(VERSION)-rootless only. PROMOTE=1 on the make
+# command line (make docker-build PROMOTE=1) also pushes :latest and
+# :latest-rootless; PROMOTE from the environment does not count.
 PLATFORMS ?= linux/amd64/v2,linux/arm64
+PROMOTED = $(and $(filter 1,$(PROMOTE)),$(filter command line,$(origin PROMOTE)))
 
 docker-build:
 	docker buildx build \
 		--file Dockerfile \
 		--platform $(PLATFORMS) \
 		--build-arg VERSION=$(VERSION) \
-		--tag aelieth/klldap:latest \
-		--tag aelieth/klldap:$(VERSION) \
+		--tag aelieth/klldap:$(VERSION) $(if $(PROMOTED),--tag aelieth/klldap:latest) \
+		--push .
+	docker buildx build \
+		--file Dockerfile \
+		--target rootless \
+		--platform $(PLATFORMS) \
+		--build-arg VERSION=$(VERSION) \
+		--tag aelieth/klldap:$(VERSION)-rootless $(if $(PROMOTED),--tag aelieth/klldap:latest-rootless) \
 		--push .
 
 # Local test image from this tree. Tag is just klldap-test (no version).

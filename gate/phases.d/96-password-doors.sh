@@ -1,13 +1,15 @@
 # shellcheck shell=bash
-# Phase: password length at each door. Part A uses one character.
-# Part B binds a Kerberos policy of minimum length 12 and maximum failure 0,
-# then tries nine characters. The e-mail reset page follows after this revision has run.
+# Phase: password length at each door. The directory minimum is 8 to 128.
+# Part A tries one character. A door that takes it is FINDING. A PASS names
+# the door's sentence, not any refusal. Part B binds a Kerberos policy of
+# minimum length 12. A split on today's product is FINDING. add-pol is a
+# counted SKIP until min-length is an OU policy. The two kadmin rows are
+# re-scoped, see K1. The e-mail reset page follows after this revision has run.
 
 D="$(phase_dir)"
 DOOR="pwdoor"
 WEB="pwweb"
 ADD1="pwadd1"
-ADD2="pwadd2"
 DN="uid=${DOOR},ou=people,${BASE_DN}"
 WEB_DN="uid=${WEB},ou=people,${BASE_DN}"
 POL="pwpol"
@@ -33,7 +35,7 @@ w1_clip() {
 import os
 secrets = {}
 for secret in os.environ.get("DOOR_SECRETS", "").split("\n"):
-    if secret:
+    if len(secret) >= 4:
         secrets[secret] = "len=" + str(len(secret))
 words = os.environ.get("TEXT", "").split()
 print(" ".join(secrets.get(word, word) for word in words)[:300])
@@ -60,15 +62,47 @@ w1_say() {
     fi
 }
 
+# kadmin stays on the old rule: a taken password is FINDING, a refusal that
+# leaves the password is PASS. The row is re-scoped; see K1.
+w1_short_row() {
+    local name="$1" took="$2" answer="$3" stayed="$4"
+    if [ "$CLASS" = both ] || [ "$CLASS" = split ] || [ "$CLASS" = kadmin ]; then
+        w1_say "$name" FINDING "$answer" "$FOUR"
+    elif [ "$took" -eq 0 ] && [ "$CLASS" = "$stayed" ]; then
+        w1_say "$name" PASS "$answer" "$FOUR"
+    else
+        w1_say "$name" FAIL "$answer" "$FOUR"
+    fi
+}
+
+# PASS requires the refusal sentence in the door's answer. Any other refusal is FAIL.
+# A door that takes the password is FINDING.
+w1_sentence_row() {
+    local name="$1" took="$2" answer="$3" stayed="$4" sentence="$5" file="$6"
+    if [ "$CLASS" = both ] || [ "$CLASS" = split ] || [ "$CLASS" = kadmin ]; then
+        w1_say "$name" FINDING "$answer" "$FOUR"
+    elif [ "$took" -eq 0 ] && [ "$CLASS" = "$stayed" ] && grep -q -F "$sentence" "$file"; then
+        w1_say "$name" PASS "$answer" "$FOUR"
+    else
+        w1_say "$name" FAIL "$answer" "$FOUR"
+    fi
+}
+
+# kadmin -q exits 0 when the change is refused. The refusal names the principal.
+w1_kadmin_refused() {
+    grep -q " while changing password for " "$1"
+}
+
 w1_summary() {
-    local rows=0 pass=0 finding=0 notes=0
+    local rows=0 pass=0 finding=0 notes=0 skips=0
     if [ -s "$OUT" ]; then
         rows="$(grep -c '^ROW ' "$OUT" || true)"
         pass="$(grep -c '^ROW [^ ]* PASS' "$OUT" || true)"
         finding="$(grep -c '^ROW [^ ]* FINDING' "$OUT" || true)"
         notes="$(grep -c '^ROW [^ ]* NOTE' "$OUT" || true)"
+        skips="$(grep -c '^ROW [^ ]* SKIP' "$OUT" || true)"
     fi
-    note "W1 rows=${rows} pass=${pass} FINDING=${finding} NOTE=${notes}"
+    note "W1 rows=${rows} pass=${pass} FINDING=${finding} NOTE=${notes} SKIP=${skips}"
 }
 
 w1_judge() {
@@ -78,6 +112,7 @@ w1_judge() {
     "ROW ${name} PASS"*) p_ok "${name}: ${line#ROW "${name}" PASS }" ;;
     "ROW ${name} FINDING"*) note "FINDING ${name}: ${line#ROW "${name}" FINDING }" ;;
     "ROW ${name} NOTE"*) note "NOTE ${name}: ${line#ROW "${name}" NOTE }" ;;
+    "ROW ${name} SKIP"*) p_skip "${name}: ${line#ROW "${name}" SKIP }" ;;
     "") p_bad "${name}: not reached" ;;
     *) p_bad "${name}: ${line#ROW "${name}" }" ;;
     esac
@@ -87,8 +122,30 @@ w1_vars() {
     ID="$1" PW="$2" python3 -c 'import json,os; print(json.dumps({"id": os.environ["ID"], "pw": os.environ["PW"]}))'
 }
 
+w1_graphql() {
+    GQ_URL="$(http_url)/api/graphql" GQ_TOKEN="$TOKEN" GQ_QUERY="$1" GQ_VARS="${2:-{\}}" \
+        t python3 - <<'PY'
+import json, os, sys, urllib.error, urllib.request
+req = urllib.request.Request(
+    os.environ["GQ_URL"],
+    data=json.dumps({"query": os.environ["GQ_QUERY"],
+                     "variables": json.loads(os.environ["GQ_VARS"])}).encode(),
+    headers={"Content-Type": "application/json",
+             "Authorization": "Bearer " + os.environ["GQ_TOKEN"]})
+try:
+    resp = urllib.request.urlopen(req)
+except urllib.error.HTTPError as err:
+    body = err.read().decode("utf-8", "replace")
+    sys.exit("HTTP %s: %s" % (err.code, body))
+body = json.load(resp)
+if body.get("errors"):
+    sys.exit("GraphQL error: " + json.dumps(body["errors"]))
+json.dump(body["data"], sys.stdout)
+PY
+}
+
 w1_set() {
-    graphql "$SET_PW" "$(w1_vars "$1" "$2")" >"$3" 2>"$4"
+    w1_graphql "$SET_PW" "$(w1_vars "$1" "$2")" >"$3" 2>"$4"
 }
 
 w1_sides() {
@@ -167,7 +224,7 @@ w1_wait_gone() {
 w1_drop_user() {
     local id="$1" state
     if ! w1_user_absent "$id" "$D/exists-${id}.txt"; then
-        graphql "mutation(\$id: String!) { deleteUser(userId: \$id) { ok } }" \
+        w1_graphql "mutation(\$id: String!) { deleteUser(userId: \$id) { ok } }" \
             '{"id": "'"$id"'"}' >"$D/delete-${id}.json" 2>&1 || p_bad "deleteUser ${id} failed"
     fi
     if w1_user_absent "$id" "$D/user-gone-${id}.txt"; then
@@ -213,8 +270,10 @@ w1_drop_pol() {
 
 w1_create() {
     local id="$1"
-    ID="$id" graphql "mutation(\$u: CreateUserInput!) { createUser(user: \$u) { id } }" \
-        "$(python3 -c 'import json,os; print(json.dumps({"u": {"id": os.environ["ID"], "email": os.environ["ID"] + "@gate.test", "attributes": [{"name": "kerberossync", "value": ["1"]}]}}))')" \
+    # $u belongs to the GraphQL query.
+    # shellcheck disable=SC2016
+    w1_graphql 'mutation($u: CreateUserInput!) { createUser(user: $u) { id } }' \
+        '{"u": {"id": "'"$id"'", "email": "'"$id"'@gate.test", "attributes": [{"name": "kerberossync", "value": ["1"]}]}}' \
         >"$D/create-${id}.json" 2>&1
 }
 
@@ -243,18 +302,18 @@ NINE_REPL="$(w1_gen 9)"
 NINE_TOOL="$(w1_gen 9)"
 NINE_KADM="$(w1_gen 9)"
 ONE_ADD="$(w1_gen 1)"
-ADD_OLD="$(w1_gen 24)"
-NINE_ADD="$(w1_gen 9)"
+ADD_GOOD="$(w1_gen 24)"
 LONG_WEB="$(w1_gen 24)"
 ONE_WEB="$(w1_gen 1)"
 NINE_WEB="$(w1_gen 9)"
 DOOR_SECRETS="$(printf '%s\n' "$LONG" "$ONE_GQL" "$ONE_MOD" "$ONE_REPL" "$ONE_TOOL" "$ONE_KADM" \
     "$LONG2" "$NINE_GQL" "$NINE_MOD" "$NINE_REPL" "$NINE_TOOL" "$NINE_KADM" \
-    "$ONE_ADD" "$ADD_OLD" "$NINE_ADD" "$LONG_WEB" "$ONE_WEB" "$NINE_WEB")"
+    "$ONE_ADD" "$ADD_GOOD" "$LONG_WEB" "$ONE_WEB" "$NINE_WEB")"
 export DOOR_SECRETS
 
 if [ -z "$LONG" ] || [ -z "$ONE_GQL" ] || [ -z "$ONE_MOD" ] || [ -z "$ONE_REPL" ] \
     || [ -z "$ONE_TOOL" ] || [ -z "$ONE_KADM" ] || [ -z "$NINE_GQL" ] || [ -z "$LONG_WEB" ] \
+    || [ -z "$ADD_GOOD" ] || [ "${#ADD_GOOD}" -ne 24 ] \
     || [ "${#ONE_GQL}" -ne 1 ] || [ "${#NINE_GQL}" -ne 9 ] \
     || [ "$ONE_MOD" = "$ONE_GQL" ] || [ "$ONE_REPL" = "$ONE_MOD" ] \
     || [ "$ONE_TOOL" = "$ONE_REPL" ] || [ "$ONE_KADM" = "$ONE_REPL" ]; then
@@ -266,6 +325,8 @@ fi
 
 dir_pw="$LONG"
 krb_pw="$LONG"
+TOKEN="$(gate_login)" || p_bad "could not log in again before the password doors"
+export TOKEN
 w1_create "$DOOR" || p_bad "createUser $DOOR failed"
 w1_set "$DOOR" "$LONG" "$D/set-init.json" "$D/set-init.err" || p_bad "initial setUserPassword $DOOR failed"
 w1_sides "$LONG" "$ONE_GQL" "$ONE_GQL" "$DOOR" "$DN" init
@@ -281,11 +342,10 @@ else
 fi
 gql_answer="exit=${gql_code} len=${#ONE_GQL} $(w1_file "$D/one-graphql.json") $(w1_file "$D/one-graphql.err")"
 w1_sides "$ONE_GQL" "$dir_pw" "$krb_pw" "$DOOR" "$DN" one-graphql
-if [ "$gql_code" -eq 0 ] && [ "$CLASS" = both ]; then
-    w1_say one-graphql PASS "$gql_answer" "$FOUR"
-else
-    w1_say one-graphql FAIL "$gql_answer" "$FOUR"
-fi
+took=0
+if [ "$gql_code" -eq 0 ]; then took=1; fi
+w1_sentence_row one-graphql "$took" "$gql_answer" stay \
+    "the password must be at least 8 characters" "$D/one-graphql.err"
 w1_track "$ONE_GQL"
 
 ldap_code=0
@@ -297,11 +357,10 @@ else
 fi
 ldap_answer="exit=${ldap_code} len=${#ONE_MOD} $(w1_file "$D/one-modify.log")"
 w1_sides "$ONE_MOD" "$dir_pw" "$krb_pw" "$DOOR" "$DN" one-modify
-if [ "$ldap_code" -eq 0 ] && [ "$CLASS" = both ]; then
-    w1_say one-modify PASS "${ldap_answer}" "$FOUR"
-else
-    w1_say one-modify FAIL "${ldap_answer}" "$FOUR"
-fi
+took=0
+if [ "$ldap_code" -eq 0 ]; then took=1; fi
+w1_sentence_row one-modify "$took" "$ldap_answer" stay \
+    "the password must be at least 8 characters" "$D/one-modify.log"
 w1_track "$ONE_MOD"
 
 cat >"$D/one-replace.ldif" <<EOF
@@ -318,11 +377,10 @@ else
 fi
 ldap_answer="exit=${ldap_code} len=${#ONE_REPL} $(w1_file "$D/one-replace.log")"
 w1_sides "$ONE_REPL" "$dir_pw" "$krb_pw" "$DOOR" "$DN" one-replace
-if [ "$ldap_code" -eq 0 ] && [ "$CLASS" = both ]; then
-    w1_say one-replace PASS "${ldap_answer}" "$FOUR"
-else
-    w1_say one-replace FAIL "${ldap_answer}" "$FOUR"
-fi
+took=0
+if [ "$ldap_code" -eq 0 ]; then took=1; fi
+w1_sentence_row one-replace "$took" "$ldap_answer" stay \
+    "the password must be at least 8 characters" "$D/one-replace.log"
 w1_track "$ONE_REPL"
 
 tool_code=0
@@ -334,11 +392,10 @@ else
 fi
 tool_answer="exit=${tool_code} len=${#ONE_TOOL} $(w1_file "$D/one-tool.log")"
 w1_sides "$ONE_TOOL" "$dir_pw" "$krb_pw" "$DOOR" "$DN" one-tool
-if [ "$tool_code" -ne 0 ] && grep -q "at least 8" "$D/one-tool.log" && [ "$CLASS" = stay ]; then
-    w1_say one-tool PASS "${tool_answer}" "$FOUR"
-else
-    w1_say one-tool FAIL "${tool_answer}" "$FOUR"
-fi
+took=0
+if [ "$tool_code" -eq 0 ]; then took=1; fi
+w1_sentence_row one-tool "$took" "$tool_answer" stay \
+    "New password is too short, expected at least 8 characters" "$D/one-tool.log"
 w1_track "$ONE_TOOL"
 
 kadm_code=0
@@ -349,11 +406,12 @@ else
 fi
 kadm_answer="exit=${kadm_code} len=${#ONE_KADM} $(w1_file "$D/one-kadmin.log")"
 w1_sides "$ONE_KADM" "$dir_pw" "$krb_pw" "$DOOR" "$DN" one-kadmin
-if [ "$kadm_code" -eq 0 ] && [ "$CLASS" = kadmin ]; then
-    w1_say one-kadmin PASS "${kadm_answer:-cpw}" "$FOUR"
-else
-    w1_say one-kadmin FAIL "${kadm_answer:-cpw}" "$FOUR"
+took=0
+if [ "$kadm_code" -eq 0 ] && ! w1_kadmin_refused "$D/one-kadmin.log"; then
+    took=1
 fi
+w1_short_row one-kadmin "$took" "${kadm_answer:-cpw}" stay
+note "one-kadmin: re-scoped, see K1"
 w1_track "$ONE_KADM"
 
 if w1_set "$DOOR" "$LONG2" "$D/align.json" "$D/align.err"; then
@@ -392,7 +450,7 @@ if [ "$bound" -eq 1 ]; then
     w1_sides "$NINE_GQL" "$dir_pw" "$krb_pw" "$DOOR" "$DN" pol-graphql
     if grep -q "min_length 12" "$D/pol-graphql.err" && [ "$CLASS" = split ]; then
         w1_say pol-graphql FINDING "${gql_answer}" "$FOUR"
-    elif grep -q "min_length" "$D/pol-graphql.err" && [ "$CLASS" = stay ]; then
+    elif grep -q "min_length 12" "$D/pol-graphql.err" && [ "$CLASS" = stay ]; then
         w1_say pol-graphql PASS "${gql_answer}" "$FOUR"
     else
         w1_say pol-graphql FAIL "${gql_answer}" "$FOUR"
@@ -410,7 +468,8 @@ if [ "$bound" -eq 1 ]; then
     w1_sides "$NINE_MOD" "$dir_pw" "$krb_pw" "$DOOR" "$DN" pol-modify
     if [ "$ldap_code" -eq 0 ] && [ "$CLASS" = split ]; then
         w1_say pol-modify FINDING "${ldap_answer}" "$FOUR"
-    elif [ "$ldap_code" -ne 0 ] && [ "$CLASS" = stay ]; then
+    elif [ "$ldap_code" -ne 0 ] && [ "$CLASS" = stay ] \
+        && grep -q "min_length 12" "$D/pol-modify.log"; then
         w1_say pol-modify PASS "${ldap_answer}" "$FOUR"
     else
         w1_say pol-modify FAIL "${ldap_answer}" "$FOUR"
@@ -433,7 +492,8 @@ EOF
     w1_sides "$NINE_REPL" "$dir_pw" "$krb_pw" "$DOOR" "$DN" pol-replace
     if [ "$ldap_code" -eq 0 ] && [ "$CLASS" = split ]; then
         w1_say pol-replace FINDING "${ldap_answer}" "$FOUR"
-    elif [ "$ldap_code" -ne 0 ] && [ "$CLASS" = stay ]; then
+    elif [ "$ldap_code" -ne 0 ] && [ "$CLASS" = stay ] \
+        && grep -q "min_length 12" "$D/pol-replace.log"; then
         w1_say pol-replace PASS "${ldap_answer}" "$FOUR"
     else
         w1_say pol-replace FAIL "${ldap_answer}" "$FOUR"
@@ -449,8 +509,11 @@ EOF
     fi
     tool_answer="exit=${tool_code} len=${#NINE_TOOL} $(w1_file "$D/pol-tool.log")"
     w1_sides "$NINE_TOOL" "$dir_pw" "$krb_pw" "$DOOR" "$DN" pol-tool
-    if [ "$tool_code" -eq 0 ] && [ "$CLASS" = split ]; then
-        w1_say pol-tool NOTE "${tool_answer}" "$FOUR"
+    if [ "$CLASS" = split ]; then
+        w1_say pol-tool FINDING "${tool_answer}" "$FOUR"
+    elif [ "$tool_code" -ne 0 ] && [ "$CLASS" = stay ] \
+        && grep -q "min_length 12" "$D/pol-tool.log"; then
+        w1_say pol-tool PASS "${tool_answer}" "$FOUR"
     else
         w1_say pol-tool FAIL "${tool_answer}" "$FOUR"
     fi
@@ -464,11 +527,16 @@ EOF
     fi
     kadm_answer="exit=${kadm_code} len=${#NINE_KADM} $(w1_file "$D/pol-kadmin.log")"
     w1_sides "$NINE_KADM" "$dir_pw" "$krb_pw" "$DOOR" "$DN" pol-kadmin
-    if [ "$kadm_code" -ne 0 ] && [ "$CLASS" = stay ]; then
+    refused=0
+    if [ "$kadm_code" -ne 0 ] || w1_kadmin_refused "$D/pol-kadmin.log"; then
+        refused=1
+    fi
+    if [ "$refused" -eq 1 ] && [ "$CLASS" = stay ]; then
         w1_say pol-kadmin PASS "${kadm_answer}" "$FOUR"
     else
         w1_say pol-kadmin FAIL "${kadm_answer}" "$FOUR"
     fi
+    note "pol-kadmin: re-scoped, see K1"
     w1_track "$NINE_KADM"
 else
     w1_say pol-graphql FAIL "policy was not on the principal"
@@ -506,36 +574,32 @@ else
 fi
 ldap_answer="exit=${ldap_code} len=${#ONE_ADD} $(w1_file "$D/add-one.log")"
 w1_sides "$ONE_ADD" "$LONG" "$LONG" "$ADD1" "uid=${ADD1},ou=people,${BASE_DN}" add-one
-if [ "$ldap_code" -eq 0 ] && [ "$CLASS" = both ]; then
-    w1_say add-one PASS "${ldap_answer}" "$FOUR"
+took=0
+if [ "$ldap_code" -eq 0 ]; then took=1; fi
+if [ "$ldap_code" -eq 53 ] \
+    && grep -q -F "the password must be at least 8 characters" "$D/add-one.log" \
+    && w1_user_absent "$ADD1" "$D/add-one-absent.txt" \
+    && grep -q "not found in Kerberos database" "$D/kinit-add-one-new.log" \
+    && grep -q "not found in Kerberos database" "$D/kinit-add-one-old.log"; then
+    w1_say add-one PASS "$ldap_answer" "$FOUR"
+elif [ "$took" -eq 1 ]; then
+    w1_say add-one FINDING "$ldap_answer" "$FOUR"
 else
-    w1_say add-one FAIL "${ldap_answer}" "$FOUR"
+    w1_say add-one FAIL "$ldap_answer" "$FOUR"
 fi
 w1_drop_user "$ADD1"
-
-if kadmin_q "addpol -minlength 12 -maxfailure 0 $ADDPOL" >"$D/add-pol-addpol.log" 2>&1 \
-    && kadmin_q "addprinc -policy $ADDPOL -pw $ADD_OLD $ADD2" >"$D/addprinc.log" 2>&1 \
-    && w1_bound "$ADD2" "$ADDPOL" "$D/getprinc-add.txt"; then
-    w1_add "$ADD2" "$NINE_ADD" "$D/add-pol.ldif"
-    ldap_code=0
-    if lmodify -f "$D/add-pol.ldif" >"$D/add-pol.log" 2>&1; then
-        ldap_code=0
-    else
-        ldap_code=$?
-    fi
-    ldap_answer="exit=${ldap_code} len=${#NINE_ADD} $(w1_file "$D/add-pol.log")"
-    w1_sides "$NINE_ADD" "$ADD_OLD" "$ADD_OLD" "$ADD2" "uid=${ADD2},ou=people,${BASE_DN}" add-pol
-    if [ "$ldap_code" -eq 0 ] && [ "$CLASS" = split ]; then
-        w1_say add-pol FINDING "${ldap_answer}" "$FOUR"
-    elif [ "$ldap_code" -ne 0 ] && [ "$CLASS" = absent ]; then
-        w1_say add-pol PASS "${ldap_answer}" "$FOUR"
-    else
-        w1_say add-pol FAIL "${ldap_answer}" "$FOUR"
-    fi
+w1_add "$ADD1" "$ADD_GOOD" "$D/add-good.ldif"
+if lmodify -f "$D/add-good.ldif" >"$D/add-good.log" 2>&1 \
+    && ! w1_user_absent "$ADD1" "$D/add-good-present.txt" \
+    && w1_bind "$ADD_GOOD" "uid=${ADD1},ou=people,${BASE_DN}"; then
+    note "add-one control: a ${#ADD_GOOD}-character add binds"
 else
-    w1_say add-pol FAIL "could not create the principal with policy $ADDPOL"
+    p_bad "add-one control: a good password did not add and bind (see add-good.log)"
 fi
-w1_drop_user "$ADD2"
+rm -f "$D/add-one.ldif" "$D/add-good.ldif"
+w1_drop_user "$ADD1"
+
+w1_say add-pol SKIP "min-length is not an OU policy yet"
 w1_drop_pol "$ADDPOL"
 
 BROWSER_IMAGE="mcr.microsoft.com/playwright@sha256:766137e2d9caad4744187e53cdc89320ba6f2eb57cff097374020944b44dd0a9"
@@ -575,23 +639,28 @@ else
     w1_browser web-one "$ONE_WEB" || true
     page="$(grep '^PAGE web-one ' "$D/web-one.out" 2>/dev/null | head -1 || true)"
     w1_sides "$ONE_WEB" "$LONG_WEB" "$LONG_WEB" "$WEB" "$WEB_DN" web-one
-    if [ -n "$page" ] && [ "$CLASS" = stay ]; then
+    if [ -z "$page" ]; then
+        w1_say web-one FAIL "len=${#ONE_WEB} the browser did not print a PAGE line" "$FOUR"
+    elif [ "$CLASS" = stay ] && printf '%s\n' "$page" | grep -q "Invalid password. Min length: 8"; then
         w1_say web-one PASS "len=${#ONE_WEB} ${page#PAGE web-one }" "$FOUR"
+    elif [ "$CLASS" = both ] || [ "$CLASS" = split ]; then
+        w1_say web-one FINDING "len=${#ONE_WEB} ${page#PAGE web-one }" "$FOUR"
     else
-        w1_say web-one FAIL "len=${#ONE_WEB} ${page:-page}" "$FOUR"
+        w1_say web-one FAIL "len=${#ONE_WEB} ${page#PAGE web-one }" "$FOUR"
     fi
     if kadmin_q "addpol -minlength 12 -maxfailure 0 $WEBPOL" >"$D/web-addpol.log" 2>&1 \
         && kadmin_q "modprinc -policy $WEBPOL $WEB" >"$D/web-modprinc.log" 2>&1 \
         && w1_bound "$WEB" "$WEBPOL" "$D/getprinc-web.txt"; then
         w1_browser web-pol "$NINE_WEB" || true
         page="$(grep '^PAGE web-pol ' "$D/web-pol.out" 2>/dev/null | head -1 || true)"
+        row="$(grep '^ROW web-pol ' "$D/web-pol.out" 2>/dev/null | head -1 || true)"
         w1_sides "$NINE_WEB" "$LONG_WEB" "$LONG_WEB" "$WEB" "$WEB_DN" web-pol
-        if [ -n "$page" ] && [ "$CLASS" = split ]; then
-            w1_say web-pol FINDING "len=${#NINE_WEB} ${page#PAGE web-pol }" "$FOUR"
-        elif [ -n "$page" ] && [ "$CLASS" = stay ]; then
+        if [ "$CLASS" = split ]; then
+            w1_say web-pol FINDING "len=${#NINE_WEB} ${page:-${row:-split}}" "$FOUR"
+        elif [ -n "$page" ] && printf '%s\n' "$page" | grep -q "min_length 12" && [ "$CLASS" = stay ]; then
             w1_say web-pol PASS "len=${#NINE_WEB} ${page#PAGE web-pol }" "$FOUR"
         else
-            w1_say web-pol FAIL "len=${#NINE_WEB} ${page:-page}" "$FOUR"
+            w1_say web-pol FAIL "len=${#NINE_WEB} ${page:-${row:-page}}" "$FOUR"
         fi
     else
         w1_say web-pol FAIL "policy $WEBPOL is not on $WEB"

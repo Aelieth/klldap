@@ -226,9 +226,10 @@ try {
     await waitFor(
       `(() => {
         const alert = document.querySelector(".alert-danger");
-        return !!alert && alert.textContent.includes("min_length");
+        return !!alert && alert.textContent.includes("Failed to set new password")
+          && alert.textContent.includes("min_length 12");
       })()`,
-      "min_length",
+      "min_length 12",
     );
     const text = await evalValue(`document.querySelector(".alert-danger").textContent.replace(/\\s+/g, " ").trim()`);
     const stayed = await evalValue(`location.pathname.endsWith("/password")`);

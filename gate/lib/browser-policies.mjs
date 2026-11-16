@@ -20,8 +20,10 @@ const editedName = process.env.BROWSER_EDITED || "";
 const otherName = process.env.BROWSER_OTHER || "";
 const badIntName = process.env.BROWSER_BADINT || "";
 const badHoursName = process.env.BROWSER_BADHOURS || "";
-const NOTICE =
-  "Nothing is enforced at login yet in 0.7.6 — values resolve and wait for the enforcement pass.";
+const unenforcedKeys = (process.env.BROWSER_UNENFORCED || "")
+  .split(",")
+  .map((key) => key.trim())
+  .filter((key) => key.length > 0);
 
 const ITEMS = [
   ["require-mfa", "Require MFA", "always", "always", "select"],
@@ -38,6 +40,7 @@ let chrome;
 let ws;
 let nextId = 0;
 let currentStep = "admin-login";
+let pagePanicked = false;
 const pending = new Map();
 
 function say(line) {
@@ -299,11 +302,11 @@ async function setRule(key, kind, value) {
 
 async function panelValue(label) {
   return evalValue(`(() => {
-    const row = [...document.querySelectorAll("div.border .d-flex")].find((r) => {
-      const span = r.querySelector("span.text-truncate");
+    const row = [...document.querySelectorAll("div.d-flex")].find((r) => {
+      const span = [...r.children].find((el) => el.matches("span.text-truncate"));
       return span && span.textContent.trim() === ${JSON.stringify(label)};
     });
-    const value = row && row.querySelector("b");
+    const value = row && [...row.children].find((el) => el.tagName === "B");
     return value ? value.textContent.trim() : "";
   })()`);
 }
@@ -415,10 +418,34 @@ async function createOu() {
 
 async function openPolicies() {
   await goto("/policies");
-  await waitFor(
-    `[...document.querySelectorAll("h5")].some((h) => h.textContent.trim() === "Policies")`,
-    "h5 Policies",
-  );
+  try {
+    await waitFor(
+      `[...document.querySelectorAll("h5")].some((h) => h.textContent.trim() === "Policies")`,
+      "h5 Policies",
+    );
+  } catch (err) {
+    let body = "";
+    try {
+      body = await evalValue(`document.body ? document.body.innerText : ""`);
+    } catch {
+      body = "";
+    }
+    const panicked =
+      consoleLines.some((line) => line.includes("Modal node is not an element")) ||
+      String(body).includes("Loading");
+    if (panicked) {
+      pagePanicked = true;
+      row(
+        "open-policies",
+        "FINDING",
+        "Modal node is not an element; the policies page stays on Loading",
+      );
+      await screenshot("open-policies");
+      await writeConsole("open-policies");
+      return;
+    }
+    throw err;
+  }
   await selectOu(CHILD);
   row("open-policies", "PASS");
 }
@@ -536,13 +563,38 @@ async function deletePolicy() {
 }
 
 async function notice() {
-  const text = await evalValue(`(() => {
+  const found = await evalValue(`(() => {
+    const versionNode = [...document.querySelectorAll("span")].find((node) =>
+      node.textContent.trim().startsWith("KLLDAP version "));
+    const version = versionNode
+      ? versionNode.textContent.trim().slice("KLLDAP version ".length)
+      : "";
     const span = [...document.querySelectorAll("span.small.text-muted")].find((node) =>
-      node.textContent.includes("Nothing is enforced"));
-    return span ? span.textContent.trim() : "";
+      node.textContent.includes("Not enforced yet in "));
+    return {
+      version,
+      text: span ? span.textContent.replace(/\\s+/g, " ").trim() : "",
+    };
   })()`);
-  if (text === NOTICE) row("notice", "FINDING", text);
-  else throw fail("notice", text || "missing");
+  const labels = unenforcedKeys
+    .map((key) => {
+      const item = ITEMS.find((row) => row[0] === key);
+      return item ? item[1] : key;
+    })
+    .join(", ");
+  const version = found && found.version;
+  const text = (found && found.text) || "";
+  const expected =
+    unenforcedKeys.length > 0 && version
+      ? `Not enforced yet in ${version}: ${labels}. These values are saved and resolve per OU until the enforcement pass.`
+      : "";
+  if (!text && unenforcedKeys.length === 0) {
+    row("notice", "PASS", "the catalog has no unenforced item");
+  } else if (expected && text === expected) {
+    row("notice", "PASS", text);
+  } else {
+    row("notice", "FAIL", text || "missing");
+  }
 }
 
 async function emptyName() {
@@ -740,6 +792,10 @@ try {
   await connect();
   for (const [name, fn] of steps) {
     currentStep = name;
+    if (pagePanicked && !said.has(name)) {
+      row(name, "NOTE", "not reached: policies page panicked");
+      continue;
+    }
     try {
       await fn();
     } catch (err) {

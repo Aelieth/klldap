@@ -223,6 +223,7 @@ p3_run() {
             -e BROWSER_OTHER="$OTHER" \
             -e BROWSER_BADINT="$BADINT" \
             -e BROWSER_BADHOURS="$BADHOURS" \
+            -e BROWSER_UNENFORCED="$UNENFORCED" \
             "$BROWSER_IMAGE" /work/browser-policies.mjs \
             >"$OUT" 2>"$D/policies.err"
     ) &
@@ -261,6 +262,20 @@ else
         else
             p_bad "lldap_strict_readonly group not found"
         fi
+        graphql '{ policyItemCatalog { key enforced } }' '{}' \
+            >"$D/catalog.json" 2>"$D/catalog.err" || p_bad "policyItemCatalog failed"
+        UNENFORCED="$(CATALOG="$D/catalog.json" python3 - <<'PY'
+import json, os
+try:
+    with open(os.environ["CATALOG"], encoding="utf-8") as handle:
+        items = json.load(handle).get("policyItemCatalog") or []
+except (OSError, json.JSONDecodeError, AttributeError):
+    items = []
+print(",".join(
+    item["key"] for item in items if item.get("enforced") is False and item.get("key")
+))
+PY
+)"
         p3_run
         ready_for=$((SECONDS + 280))
         while [ ! -f "$D/graphql-match.ready" ] && [ "$SECONDS" -lt "$ready_for" ]; do
@@ -276,6 +291,8 @@ else
             : >"$D/graphql-match.done"
         fi
         wait "$BROWSER_PID" || true
+        TOKEN="$(gate_login)" || p_bad "could not log in again after the browser"
+        export TOKEN
         p3_judge admin-login "admin logs in"
         p3_judge create-ou "creates a primary OU and a child"
         p3_judge open-policies "opens the policies page on the child"

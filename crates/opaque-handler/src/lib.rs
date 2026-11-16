@@ -49,6 +49,11 @@ pub trait OpaqueHandler: Send + Sync {
         &self,
         request: registration::ClientRegistrationFinishRequest,
     ) -> Result<UserId>;
+    /// The user a finish request registers for, read from its sealed server data; writes nothing.
+    async fn registration_user(
+        &self,
+        request: &registration::ClientRegistrationFinishRequest,
+    ) -> Result<UserId>;
 }
 
 /// Runs the OPAQUE registration ceremony in-process, playing the client against `handler`.

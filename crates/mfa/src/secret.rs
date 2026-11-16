@@ -6,6 +6,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{MfaError, Result};
+use crate::sealing::{decode_exact, derive_sealing_key};
 use crate::types::{
     ENROLLMENT_KEY_INFO, SEAL_SALT_LEN, SEAL_TAG_LEN, SEALED_BLOB_LEN, SEALED_PREFIX,
     STORAGE_KEY_INFO, TOTP_ENROLLMENT_TTL_SECS, TOTP_SEED_LEN, build_nonce_info,
@@ -82,9 +83,7 @@ pub fn open_totp_secret(ikm: &[u8], user_uuid: &str, sealed: &str) -> Result<Vec
 
 // Distinct info string: wire-state blobs must never share a key with column blobs.
 fn derive_enrollment_key(ikm: &[u8]) -> Result<aead::SecretKey> {
-    let mut key_bytes = [0u8; 32];
-    hkdf::sha256::derive_key(&[], ikm, Some(ENROLLMENT_KEY_INFO), &mut key_bytes)?;
-    Ok(aead::SecretKey::from_slice(&key_bytes)?)
+    derive_sealing_key(ikm, ENROLLMENT_KEY_INFO)
 }
 
 #[derive(Serialize, Deserialize)]
@@ -124,7 +123,7 @@ pub fn open_enrollment(ikm: &[u8], sealed: &str, now_unix: i64) -> Result<Enroll
     let blob = URL_SAFE_NO_PAD
         .decode(sealed.as_bytes())
         .map_err(|_| MfaError::InvalidSealedFormat)?;
-    let state: EnrollmentState = bincode::deserialize(&aead::open(&key, &blob)?)?;
+    let state: EnrollmentState = decode_exact(&aead::open(&key, &blob)?)?;
     if state.kind != STATE_KIND_ENROLLMENT {
         return Err(MfaError::InvalidSealedFormat);
     }
@@ -240,5 +239,23 @@ mod tests {
             open_enrollment(IKM, &sealed, 1000),
             Err(MfaError::InvalidSealedFormat)
         ));
+    }
+
+    #[test]
+    fn test_an_enrollment_state_with_trailing_bytes_is_refused() {
+        let state = EnrollmentState {
+            kind: STATE_KIND_ENROLLMENT,
+            user_id: "bob".to_owned(),
+            seed: generate_seed(),
+            replaces_existing: false,
+            expiry_unix: 2000,
+        };
+        let key = derive_enrollment_key(IKM).unwrap();
+        let mut bytes = bincode::serialize(&state).unwrap();
+        let exact = URL_SAFE_NO_PAD.encode(aead::seal(&key, &bytes).unwrap());
+        assert!(open_enrollment(IKM, &exact, 1000).is_ok());
+        bytes.push(0);
+        let longer = URL_SAFE_NO_PAD.encode(aead::seal(&key, &bytes).unwrap());
+        assert!(open_enrollment(IKM, &longer, 1000).is_err());
     }
 }

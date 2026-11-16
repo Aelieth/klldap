@@ -18,6 +18,7 @@ use lldap_domain_handlers::handler::{
     ReadSchemaBackendHandler, SchemaBackendHandler, SystemConfigBackendHandler, UserBackendHandler,
     UserListerBackendHandler, UserRequestFilter,
 };
+use lldap_domain_handlers::policies::{OuPolicyState, Policy, PolicyId, PolicyLevel};
 use lldap_domain_model::error::Result;
 use lldap_opaque_handler::OpaqueHandler;
 use lldap_schema::PublicSchema;
@@ -39,6 +40,16 @@ pub trait ReadonlyBackendHandler: UserReadableBackendHandler {
     ) -> Result<Vec<UserAndGroups>>;
     async fn list_groups(&self, filters: Option<GroupRequestFilter>) -> Result<Vec<Group>>;
     async fn get_group_details(&self, group_id: GroupId) -> Result<GroupDetails>;
+}
+
+/// Policy reads, open to a read-only admin (Q10); every policy write stays admin-only.
+#[async_trait]
+pub trait PolicyReadBackendHandler: Send + Sync {
+    async fn list_policies(&self) -> Result<Vec<Policy>>;
+    async fn get_policy(&self, policy_id: PolicyId) -> Result<Policy>;
+    async fn list_ou_policy_states(&self) -> Result<Vec<OuPolicyState>>;
+    async fn get_policy_levels(&self, ou: &str) -> Result<Vec<PolicyLevel>>;
+    async fn get_allowed_ous(&self) -> Result<Vec<String>>;
 }
 
 #[async_trait]
@@ -103,6 +114,25 @@ impl<Handler: BackendHandler> ReadonlyBackendHandler for Handler {
     }
     async fn get_group_details(&self, group_id: GroupId) -> Result<GroupDetails> {
         <Handler as GroupBackendHandler>::get_group_details(self, group_id).await
+    }
+}
+
+#[async_trait]
+impl<Handler: BackendHandler> PolicyReadBackendHandler for Handler {
+    async fn list_policies(&self) -> Result<Vec<Policy>> {
+        <Handler as PolicyBackendHandler>::list_policies(self).await
+    }
+    async fn get_policy(&self, policy_id: PolicyId) -> Result<Policy> {
+        <Handler as PolicyBackendHandler>::get_policy(self, policy_id).await
+    }
+    async fn list_ou_policy_states(&self) -> Result<Vec<OuPolicyState>> {
+        <Handler as PolicyBackendHandler>::list_ou_policy_states(self).await
+    }
+    async fn get_policy_levels(&self, ou: &str) -> Result<Vec<PolicyLevel>> {
+        <Handler as PolicyBackendHandler>::get_policy_levels(self, ou).await
+    }
+    async fn get_allowed_ous(&self) -> Result<Vec<String>> {
+        <Handler as SystemConfigBackendHandler>::get_allowed_ous(self).await
     }
 }
 
@@ -214,6 +244,14 @@ impl<Handler: BackendHandler + OpaqueHandler> AccessControlledBackendHandler<Han
         validation_result: &ValidationResults,
     ) -> Option<&'a (impl ReadonlyBackendHandler + 'a)> {
         validation_result.can_read_all().then_some(&self.handler)
+    }
+
+    pub fn get_policy_read_handler<'a>(
+        &'a self,
+        validation_result: &ValidationResults,
+    ) -> Option<&'a (impl PolicyReadBackendHandler + 'a)> {
+        (validation_result.is_admin() || validation_result.permission == Permission::Readonly)
+            .then_some(&self.handler)
     }
 
     pub fn get_writeable_handler<'a>(
@@ -418,6 +456,13 @@ impl<Inner: OpaqueHandler + Send + Sync> OpaqueHandler for AccessControlledBacke
         request: registration::ClientRegistrationFinishRequest,
     ) -> Result<UserId> {
         self.handler.registration_finish(request).await
+    }
+
+    async fn registration_user(
+        &self,
+        request: &registration::ClientRegistrationFinishRequest,
+    ) -> Result<UserId> {
+        self.handler.registration_user(request).await
     }
 }
 

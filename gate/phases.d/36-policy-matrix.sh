@@ -372,7 +372,7 @@ pm_move() {
 }
 
 pm_authz() {
-    local role="$1" tok="$2" op q vars a before after scratch kind label
+    local role="$1" tok="$2" op q vars a before after scratch kind
     scratch="$(pm_new_policy "${PM_RUN} authz-$role")"
     for op in policies policy policyItemCatalog effectivePolicyItems ouPolicyStates createPolicy updatePolicy deletePolicy setOuPolicy clearOuPolicy setOuPolicyInheritance; do
         case "$op" in
@@ -399,9 +399,14 @@ pm_authz() {
         a="$(pm_q "$tok" "$q" "${vars[@]}")"
         [ "$op" = createPolicy ] && pm_track "$a" >/dev/null
         after="$(pm_state)"
-        if pm_unauth "$a" "$role" && [ "$before" != "<error>" ] && [ "$before" = "$after" ]; then
-            label="$role is refused $op as unauthorized$([ "$kind" = write ] && echo ', and nothing changed')"
-            if [ "$role" = read-only-admin ] && [ "$kind" = read ]; then pm_note "$label (pinned as it is; put to the owner)"; else pm_pass "$label"; fi
+        if [ "$role" = read-only-admin ] && [ "$kind" = read ]; then
+            if pm_ok "$a" && [ "$before" != "<error>" ] && [ "$before" = "$after" ]; then
+                pm_pass "read-only-admin may read $op (Q10), and nothing changed"
+            else
+                pm_finding "read-only-admin is refused $op although Q10 allows it ($(pm_err "$a"))"
+            fi
+        elif pm_unauth "$a" "$role" && [ "$before" != "<error>" ] && [ "$before" = "$after" ]; then
+            pm_pass "$role is refused $op as unauthorized$([ "$kind" = write ] && echo ', and nothing changed')"
         elif pm_ok "$a" || [ "$before" != "$after" ]; then
             case "$role" in
             plain-user) pm_finding "PLAIN USER ALLOWED $op ($(pm_err "$a"))" ;;

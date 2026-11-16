@@ -13,7 +13,7 @@ use crate::{
         encrypt::encrypt_kerberos_password,
     },
 };
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use lldap_auth::password_reset::ServerPasswordResetResponse;
 use lldap_auth::{opaque, registration};
 use validator_derive::Validate;
@@ -116,7 +116,7 @@ impl CommonComponent<ResetPasswordStep2Form> for ResetPasswordStep2Form {
                 Ok(false)
             }
             Msg::RegistrationFinishResponse(response) => {
-                response.context("Failed to set new password")?;
+                response.map_err(|e| anyhow!("Failed to set new password: {e:#}"))?;
                 if let Some(enc_pw) = &self.encrypted_password {
                     let Some(user_id) = self.username.clone() else {
                         bail!("Username not available");

@@ -1,7 +1,8 @@
 use crate::api::{Context, FullHandler, field_error_callback};
+use crate::mutation::policy::require_registered_ou;
 use anyhow::anyhow;
 use juniper::{FieldResult, GraphQLObject};
-use lldap_domain_handlers::handler::PolicyBackendHandler;
+use lldap_access_control::PolicyReadBackendHandler;
 use lldap_domain_handlers::policies::{
     EffectiveItem, OuPolicyState, POLICY_ITEM_CATALOG, Policy, PolicyId, PolicyItemSpec,
     PolicyScope, canonical_ou_key, resolve_effective_items,
@@ -193,7 +194,7 @@ pub(super) async fn policies<Handler: FullHandler + OpaqueHandler>(
 ) -> FieldResult<Vec<GraphQLPolicy>> {
     let span = debug_span!("[GraphQL query] policies");
     let handler = context
-        .get_admin_handler()
+        .get_policy_read_handler()
         .ok_or_else(field_error_callback(&span, "Unauthorized to read policies"))?;
     Ok(handler
         .list_policies()
@@ -212,7 +213,7 @@ pub(super) async fn policy<Handler: FullHandler + OpaqueHandler>(
     let span = debug_span!("[GraphQL query] policy");
     span.in_scope(|| debug!(policy_id));
     let handler = context
-        .get_admin_handler()
+        .get_policy_read_handler()
         .ok_or_else(field_error_callback(&span, "Unauthorized to read policies"))?;
     Ok(handler
         .get_policy(PolicyId(policy_id))
@@ -227,7 +228,7 @@ pub(super) fn policy_item_catalog<Handler: FullHandler + OpaqueHandler>(
 ) -> FieldResult<Vec<GraphQLPolicyCatalogItem>> {
     let span = debug_span!("[GraphQL query] policy_item_catalog");
     context
-        .get_admin_handler()
+        .get_policy_read_handler()
         .ok_or_else(field_error_callback(&span, "Unauthorized to read policies"))?;
     Ok(POLICY_ITEM_CATALOG.iter().map(Into::into).collect())
 }
@@ -239,10 +240,12 @@ pub(super) async fn effective_policy_items<Handler: FullHandler + OpaqueHandler>
     let span = debug_span!("[GraphQL query] effective_policy_items");
     span.in_scope(|| debug!(?ou));
     let handler = context
-        .get_admin_handler()
+        .get_policy_read_handler()
         .ok_or_else(field_error_callback(&span, "Unauthorized to read policies"))?;
+    let ou_key = canonical_ou_key(&ou);
+    require_registered_ou(&ou_key, handler.get_allowed_ous()).await?;
     let levels = handler
-        .get_policy_levels(&canonical_ou_key(&ou))
+        .get_policy_levels(&ou_key)
         .instrument(span)
         .await
         .map_err(|e| anyhow!("Failed to load policy levels: {e}"))?;
@@ -257,7 +260,7 @@ pub(super) async fn ou_policy_states<Handler: FullHandler + OpaqueHandler>(
 ) -> FieldResult<Vec<GraphQLOuPolicyState>> {
     let span = debug_span!("[GraphQL query] ou_policy_states");
     let handler = context
-        .get_admin_handler()
+        .get_policy_read_handler()
         .ok_or_else(field_error_callback(&span, "Unauthorized to read policies"))?;
     Ok(handler
         .list_ou_policy_states()

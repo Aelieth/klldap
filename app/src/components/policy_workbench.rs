@@ -519,8 +519,8 @@ impl Component for PolicyWorkbench {
         page
     }
 
-    fn rendered(&mut self, _: &Context<Self>, first_render: bool) {
-        self.modal.init_on_first_render(first_render);
+    fn rendered(&mut self, _: &Context<Self>, _: bool) {
+        self.modal.init_once();
     }
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
@@ -1086,18 +1086,27 @@ impl PolicyWorkbench {
                 </div>
             },
         };
-        let unenforced = self.catalog_rows().iter().any(|row| !row.enforced);
+        let unenforced: Vec<String> = self
+            .catalog_rows()
+            .iter()
+            .filter(|row| !row.enforced)
+            .map(|row| self.item_label(&row.key))
+            .collect();
         html! {
             <div class="d-flex flex-column gap-2">
                 <div class="text-muted small text-uppercase">{"Current OU policy"}</div>
                 {body}
-                { if unenforced {
+                { if unenforced.is_empty() { html! {} } else {
                     html! {
                         <span class="small text-muted">
-                            {"Nothing is enforced at login yet in 0.7.6 — values resolve and wait for the enforcement pass."}
+                            {format!(
+                                "Not enforced yet in {}: {}. These values are saved and resolve per OU until the enforcement pass.",
+                                env!("CARGO_PKG_VERSION"),
+                                unenforced.join(", ")
+                            )}
                         </span>
                     }
-                } else { html! {} } }
+                } }
             </div>
         }
     }

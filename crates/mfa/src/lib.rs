@@ -6,6 +6,8 @@ mod error;
 #[cfg(feature = "seal")]
 mod failed_attempts;
 #[cfg(feature = "seal")]
+mod sealing;
+#[cfg(feature = "seal")]
 mod secret;
 mod totp;
 mod types;
@@ -16,6 +18,8 @@ pub use encoding::{otpauth_uri, seed_base32, seed_from_base32};
 pub use error::{MfaError, Result};
 #[cfg(feature = "seal")]
 pub use failed_attempts::FailedAttempts;
+#[cfg(feature = "seal")]
+pub use sealing::{decode_exact, derive_sealing_key};
 #[cfg(feature = "seal")]
 pub use secret::{
     EnrollmentState, generate_seed, open_enrollment, open_totp_secret, seal_enrollment,

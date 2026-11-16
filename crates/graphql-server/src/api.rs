@@ -1,8 +1,8 @@
 use crate::{mutation::Mutation, query::Query};
 use juniper::{EmptyMutation, EmptySubscription, FieldError, FieldResult, RootNode};
 use lldap_access_control::{
-    AccessControlledBackendHandler, AdminBackendHandler, ReadonlyBackendHandler,
-    UserReadableBackendHandler, UserWriteableBackendHandler,
+    AccessControlledBackendHandler, AdminBackendHandler, PolicyReadBackendHandler,
+    ReadonlyBackendHandler, UserReadableBackendHandler, UserWriteableBackendHandler,
 };
 use lldap_auth::{access_control::ValidationResults, types::UserId};
 use lldap_domain_handlers::handler::{BackendHandler, MfaBackendHandler};
@@ -76,6 +76,14 @@ impl<Handler: FullHandler> Context<Handler> {
             return None;
         }
         self.handler.get_readonly_handler(&self.validation_result)
+    }
+
+    pub fn get_policy_read_handler(&self) -> Option<&(impl PolicyReadBackendHandler + '_)> {
+        if self.mfa_enrollment_pending {
+            return None;
+        }
+        self.handler
+            .get_policy_read_handler(&self.validation_result)
     }
 
     pub fn get_writeable_handler(

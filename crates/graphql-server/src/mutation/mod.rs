@@ -4,7 +4,7 @@ mod kerberos;
 mod keycloak;
 mod mfa;
 mod ou;
-mod policy;
+pub(crate) mod policy;
 mod posix;
 
 pub use inputs::{

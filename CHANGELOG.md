@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.8.1] - Unreleased
+
+### Changed
+
+- The policies page's notice lists the rules that are not enforced yet, read from the
+  catalog, and names the build's version.
+- A read-only admin can read policies, the item catalog, effective items and OU policy
+  states. Every policy write stays admin-only.
+- `clearOuPolicy` and `effectivePolicyItems` refuse an OU that is not registered
+  (`Unknown OU`).
+- A password-reset finish registers only the reset token's own user.
+
+### Fixed
+
+- The policies page no longer fails on its first render while its data loads.
+- The password pages show the server's reason when setting a password fails.
+- The verbose HTTP log records the request path without its query string.
+
 ## [0.8.0] - 2026-11-15
 
 0.8.0 is a pre-release. The new policies and the front end have not yet had thorough testing. Further testing, verification and code review come before it is promoted.

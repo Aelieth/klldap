@@ -640,6 +640,21 @@ where
         .unwrap_or_else(error_to_api_response)
 }
 
+async fn finish_registration<Handler: OpaqueHandler>(
+    handler: &Handler,
+    reset_user: Option<&UserId>,
+    request: registration::ClientRegistrationFinishRequest,
+) -> TcpResult<UserId> {
+    if let Some(user_id) = reset_user
+        && handler.registration_user(&request).await? != *user_id
+    {
+        return Err(TcpError::UnauthorizedError(
+            "Password reset token does not match the registered user".to_string(),
+        ));
+    }
+    Ok(handler.registration_finish(request).await?)
+}
+
 #[instrument(skip_all, level = "debug")]
 async fn opaque_register_finish<Backend>(
     http_request: HttpRequest,
@@ -660,19 +675,17 @@ where
     let reset_user = claims
         .filter(|claims| claims.password_reset)
         .map(|claims| UserId::new(&claims.user));
-    let registered = with_actor(
+    with_actor(
         actor.clone(),
-        data.get_opaque_handler()
-            .registration_finish(request.into_inner()),
+        finish_registration(
+            data.get_opaque_handler(),
+            reset_user.as_ref(),
+            request.into_inner(),
+        ),
     )
     .await?;
     // A recovery clears the second factor only once the new password is committed.
     if let Some(user_id) = reset_user {
-        if user_id != registered {
-            return Err(TcpError::UnauthorizedError(
-                "Password reset token does not match the registered user".to_string(),
-            ));
-        }
         with_actor(
             actor,
             data.get_mfa_handler()
@@ -908,7 +921,165 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lldap_auth::opaque;
+    use lldap_domain_model::error::{DomainError, Result as DomainResult};
+    use lldap_test_utils::MockTestBackendHandler;
     use pretty_assertions::assert_eq;
+
+    fn finish_request() -> registration::ClientRegistrationFinishRequest {
+        let mut rng = rand::rngs::OsRng;
+        let start =
+            opaque::client::registration::start_registration(b"s3cret-pass", &mut rng).unwrap();
+        let response = opaque::server::registration::start_registration(
+            &opaque::server::ServerSetup::new(&mut rng),
+            start.message,
+            &UserId::new("alice"),
+        )
+        .unwrap()
+        .message;
+        let finish = opaque::client::registration::finish_registration(
+            start.state,
+            b"s3cret-pass",
+            response,
+            &mut rng,
+        )
+        .unwrap();
+        registration::ClientRegistrationFinishRequest {
+            server_data: "sealed".to_owned(),
+            registration_upload: finish.message,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_reset_for_another_user_is_refused_before_any_write() {
+        let alice = UserId::new("alice");
+        let rows = [
+            ("no reset token", None, None, Ok(())),
+            ("the token's user", Some("alice"), Some(Ok("alice")), Ok(())),
+            ("another user", Some("alice"), Some(Ok("bob")), Err(401)),
+            ("unsealable", Some("alice"), Some(Err(())), Err(500)),
+        ];
+        for (row, reset, target, expected) in rows {
+            let mut mock = MockTestBackendHandler::new();
+            mock.expect_registration_user()
+                .times(usize::from(target.is_some()))
+                .returning(move |_| match target.unwrap() {
+                    Ok(user) => Ok(UserId::new(user)),
+                    Err(()) => Err(DomainError::InternalError("not sealed".to_owned())),
+                });
+            mock.expect_registration_finish()
+                .times(usize::from(expected.is_ok()))
+                .returning(|_| Ok(UserId::new("alice")));
+            let reset = reset.map(UserId::new);
+            let got = finish_registration(&mock, reset.as_ref(), finish_request())
+                .await
+                .map_err(|e| error_to_http_response(e).status().as_u16());
+            assert_eq!(got, expected.map(|()| alice.clone()), "{row}");
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl TcpBackendHandler for MockTestBackendHandler {
+        async fn get_jwt_blacklist(&self) -> anyhow::Result<HashSet<u64>> {
+            unimplemented!()
+        }
+        async fn create_refresh_token(
+            &self,
+            _: &UserId,
+        ) -> DomainResult<(String, chrono::Duration)> {
+            unimplemented!()
+        }
+        async fn register_jwt(&self, _: &UserId, _: u64, _: NaiveDateTime) -> DomainResult<()> {
+            unimplemented!()
+        }
+        async fn check_token(&self, _: u64, _: &UserId) -> DomainResult<bool> {
+            unimplemented!()
+        }
+        async fn blacklist_jwts(&self, _: &UserId) -> DomainResult<HashSet<u64>> {
+            unimplemented!()
+        }
+        async fn delete_refresh_token(&self, _: u64) -> DomainResult<()> {
+            unimplemented!()
+        }
+        async fn start_password_reset(&self, _: &UserId) -> DomainResult<Option<String>> {
+            unimplemented!()
+        }
+        async fn get_user_id_for_password_reset_token(&self, _: &str) -> DomainResult<UserId> {
+            unimplemented!()
+        }
+        async fn delete_password_reset_token(&self, _: &str) -> DomainResult<()> {
+            unimplemented!()
+        }
+    }
+
+    fn app_state(mock: MockTestBackendHandler) -> web::Data<AppState<MockTestBackendHandler>> {
+        use hmac::Mac;
+        web::Data::new(AppState {
+            backend_handler: lldap_access_control::AccessControlledBackendHandler::new(mock),
+            jwt_key: Hmac::new_from_slice(b"a test secret").unwrap(),
+            jwt_blacklist: std::sync::RwLock::new(HashSet::new()),
+            server_url: url::Url::parse("http://localhost").unwrap(),
+            assets_path: std::path::PathBuf::new(),
+            mail_options: crate::configuration::MailOptionsBuilder::default()
+                .build()
+                .unwrap(),
+            mfa_policy: lldap_domain_handlers::mfa::MfaPolicy::Disabled,
+            domain: "example.com".to_owned(),
+            keycloak: std::sync::Arc::new(lldap_keycloak::KeycloakSettings {
+                base_dn: "dc=example,dc=com".to_owned(),
+                config_file: std::path::PathBuf::new(),
+                admin_pass: None,
+            }),
+        })
+    }
+
+    fn reset_token(key: &Hmac<Sha512>, user: &str) -> String {
+        let claims = JWTClaims {
+            exp: Utc::now() + chrono::Duration::hours(1),
+            iat: Utc::now(),
+            jti: Uuid::new_v4(),
+            user: user.to_owned(),
+            groups: HashSet::new(),
+            password_reset: true,
+        };
+        let header = jwt::Header {
+            algorithm: jwt::AlgorithmType::Hs512,
+            ..Default::default()
+        };
+        jwt::Token::new(header, claims)
+            .sign_with_key(key)
+            .unwrap()
+            .as_str()
+            .to_owned()
+    }
+
+    #[actix_web::test]
+    async fn test_the_finish_route_refuses_a_reset_for_another_user_before_any_write() {
+        for (sealed_for, status, writes) in [("alice", 200, 1), ("bob", 401, 0)] {
+            let mut mock = MockTestBackendHandler::new();
+            mock.expect_registration_user()
+                .times(1)
+                .returning(move |_| Ok(UserId::new(sealed_for)));
+            mock.expect_registration_finish()
+                .times(writes)
+                .returning(|_| Ok(UserId::new("alice")));
+            mock.expect_reset_user_mfa()
+                .times(writes)
+                .returning(|_, _| Ok(()));
+            let state = app_state(mock);
+            let token = reset_token(&state.jwt_key, "alice");
+            let request = actix_web::test::TestRequest::post()
+                .insert_header(("Authorization", format!("Bearer {token}")))
+                .to_http_request();
+            let response =
+                opaque_register_finish_handler(request, state, web::Json(finish_request())).await;
+            assert_eq!(
+                response.status().as_u16(),
+                status,
+                "sealed for {sealed_for}"
+            );
+        }
+    }
 
     #[test]
     fn test_only_admins_keep_a_session_while_kerberos_is_unavailable() {

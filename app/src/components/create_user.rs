@@ -23,7 +23,7 @@ use crate::{
         form_utils::{EmailIsRequired, GraphQlAttributeSchema, IsAdmin, read_all_form_attributes},
     },
 };
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use graphql_client::GraphQLQuery;
 use lldap_auth::{opaque, registration};
 use validator_derive::Validate;
@@ -283,7 +283,7 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
                 Ok(false)
             }
             Msg::RegistrationFinishResponse(response) => {
-                response?;
+                response.map_err(|e| anyhow!("Failed to set new password: {e:#}"))?;
                 if self.kerberossync_enabled {
                     if let Some(enc_pw) = &self.encrypted_password {
                         let variables = sync_kerberos_password::Variables {

@@ -8,6 +8,7 @@ use lldap_domain_handlers::policies::{
     CreatePolicyRequest, PolicyId, ROOT_OU_KEY, UpdatePolicyRequest, canonical_ou_key,
     validate_items, validate_policy_name,
 };
+use lldap_domain_model::error::Result as DomainResult;
 use lldap_opaque_handler::OpaqueHandler;
 use std::collections::BTreeMap;
 use tracing::{Instrument, debug, debug_span};
@@ -29,15 +30,15 @@ fn fold_items(items: Option<Vec<PolicyItemInput>>) -> FieldResult<BTreeMap<Strin
     Ok(map)
 }
 
-async fn require_registered_ou(
-    handler: &impl SystemConfigBackendHandler,
+/// The root always passes and loads nothing; any other OU must be in `allowed_ous`.
+pub(crate) async fn require_registered_ou(
     ou_key: &str,
+    allowed_ous: impl std::future::Future<Output = DomainResult<Vec<String>>>,
 ) -> FieldResult<()> {
     if ou_key == ROOT_OU_KEY {
         return Ok(());
     }
-    let ous = handler
-        .get_allowed_ous()
+    let ous = allowed_ous
         .await
         .map_err(|e| anyhow!("Failed to load allowedous: {e}"))?;
     if ous
@@ -170,7 +171,7 @@ pub(super) async fn set_ou_policy<Handler: FullHandler + OpaqueHandler>(
             "Unauthorized to write policies",
         ))?;
     let ou_key = canonical_ou_key(&ou);
-    require_registered_ou(handler, &ou_key).await?;
+    require_registered_ou(&ou_key, handler.get_allowed_ous()).await?;
     handler
         .set_ou_policy(&ou_key, PolicyId(policy_id))
         .instrument(span)
@@ -191,8 +192,10 @@ pub(super) async fn clear_ou_policy<Handler: FullHandler + OpaqueHandler>(
             &span,
             "Unauthorized to write policies",
         ))?;
+    let ou_key = canonical_ou_key(&ou);
+    require_registered_ou(&ou_key, handler.get_allowed_ous()).await?;
     handler
-        .clear_ou_policy(&canonical_ou_key(&ou))
+        .clear_ou_policy(&ou_key)
         .instrument(span)
         .await
         .map_err(|e| anyhow!("Failed to clear OU policy: {e}"))?;
@@ -216,11 +219,44 @@ pub(super) async fn set_ou_policy_inheritance<Handler: FullHandler + OpaqueHandl
     if ou_key == ROOT_OU_KEY {
         return Err("The domain root cannot block inheritance".into());
     }
-    require_registered_ou(handler, &ou_key).await?;
+    require_registered_ou(&ou_key, handler.get_allowed_ous()).await?;
     handler
         .set_ou_policy_inheritance(&ou_key, blocked)
         .instrument(span)
         .await
         .map_err(|e| anyhow!("Failed to set OU inheritance: {e}"))?;
     Ok(Success::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn never() -> DomainResult<Vec<String>> {
+        panic!("the root must not load the OU list")
+    }
+
+    #[tokio::test]
+    async fn test_only_the_root_and_registered_ous_pass() {
+        let ous = vec!["People".to_owned(), "people\\Labs".to_owned()];
+        assert!(require_registered_ou("", never()).await.is_ok());
+        for (ou, registered) in [
+            ("people", true),
+            ("people\\labs", true),
+            ("people\\lab", false),
+            ("nowhere", false),
+        ] {
+            let got =
+                require_registered_ou(&canonical_ou_key(ou), std::future::ready(Ok(ous.clone())))
+                    .await;
+            assert_eq!(got.is_ok(), registered, "{ou:?}");
+            if let Err(e) = got {
+                assert!(
+                    e.message().contains("Unknown OU"),
+                    "{ou:?}: {}",
+                    e.message()
+                );
+            }
+        }
+    }
 }

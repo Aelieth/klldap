@@ -17,7 +17,7 @@ impl RootSpanBuilder for CustomRootSpanBuilder {
         tracing::debug_span!(
             "HTTP request",
             method = request.method().to_string(),
-            uri = request.uri().to_string()
+            uri = request.path()
         )
     }
 
@@ -52,4 +52,52 @@ pub fn init(config: &Configuration) -> anyhow::Result<()> {
         registry.init();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+    use tracing::field::{Field, Visit};
+    use tracing_subscriber::layer::{Context, Layer};
+
+    #[derive(Clone, Default)]
+    struct Uris(Arc<Mutex<Vec<String>>>);
+
+    impl Visit for Uris {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "uri" {
+                self.0.lock().unwrap().push(format!("{value:?}"));
+            }
+        }
+        fn record_str(&mut self, field: &Field, value: &str) {
+            if field.name() == "uri" {
+                self.0.lock().unwrap().push(value.to_owned());
+            }
+        }
+    }
+
+    impl<S: tracing::Subscriber> Layer<S> for Uris {
+        fn on_new_span(
+            &self,
+            attrs: &tracing::span::Attributes<'_>,
+            _: &tracing::span::Id,
+            _: Context<'_, S>,
+        ) {
+            attrs.record(&mut self.clone());
+        }
+    }
+
+    #[test]
+    fn test_the_request_span_records_the_path_without_the_query_string() {
+        let uris = Uris::default();
+        let subscriber = tracing_subscriber::registry().with(uris.clone());
+        let request = actix_web::test::TestRequest::post()
+            .uri("/api/graphql?query=mutation%7BsetPassword%28password%3A%22hunter22%22%29%7D")
+            .to_srv_request();
+        tracing::subscriber::with_default(subscriber, || {
+            let _span = CustomRootSpanBuilder::on_request_start(&request);
+        });
+        assert_eq!(*uris.0.lock().unwrap(), vec!["/api/graphql".to_owned()]);
+    }
 }

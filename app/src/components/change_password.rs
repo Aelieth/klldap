@@ -15,7 +15,7 @@ use crate::{
         encrypt::encrypt_kerberos_password,
     },
 };
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use lldap_auth::{login, opaque, registration};
 use lldap_mfa::split_totp_suffix;
 use validator_derive::Validate;
@@ -201,7 +201,7 @@ impl CommonComponent<ChangePasswordForm> for ChangePasswordForm {
                 Ok(false)
             }
             Msg::RegistrationFinishResponse(response) => {
-                response.context("Failed to set new password")?;
+                response.map_err(|e| anyhow!("Failed to set new password: {e:#}"))?;
                 if let Some(enc_pw) = &self.encrypted_password {
                     let variables = sync_kerberos_password::Variables {
                         user_id: ctx.props().username.clone(),

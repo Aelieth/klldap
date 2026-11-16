@@ -19,7 +19,8 @@ inheritance, root's other items no longer apply there.
 
 ## Using it
 
-Admin-only GraphQL. Item values are strings: bools `true`/`false`, ints base-10 in range,
+GraphQL: admins and read-only admins read, admins write. `clearOuPolicy` and
+`effectivePolicyItems` answer `Unknown OU` for an OU that is not registered. Item values are strings: bools `true`/`false`, ints base-10 in range,
 enums exact tokens, lists comma-separated. `login-hours` is empty (always) or
 `;`-separated `DAY[-DAY] HH:MM-HH:MM` (`mon-fri 08:00-18:00`). `allowed-networks` is
 comma-separated CIDR with an explicit prefix.
@@ -72,7 +73,8 @@ no-op inheritance toggle is not logged.
 
 ## Configuration
 
-None. The surface is always on, admin-only, and inert until an enforcement pass.
+None. The surface is always on (reads for admins and read-only admins, writes for admins)
+and inert until an enforcement pass.
 
 ## Limitations
 

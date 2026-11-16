@@ -46,6 +46,15 @@ impl ModalHandle {
         }
     }
 
+    /// For a page whose modal is not rendered until its data has loaded.
+    pub fn init_once(&mut self) {
+        if self.modal.is_none()
+            && let Some(node) = self.node_ref.cast::<web_sys::Element>()
+        {
+            self.modal = Some(Modal::new(node));
+        }
+    }
+
     pub fn show(&self) {
         if let Some(modal) = &self.modal {
             modal.show();

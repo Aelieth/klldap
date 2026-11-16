@@ -813,37 +813,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_policy_queries_require_admin() {
-        const QUERIES: [&str; 5] = [
-            r#"{ policies { id } }"#,
-            r#"{ policy(policyId: 1) { id } }"#,
-            r#"{ policyItemCatalog { key } }"#,
-            r#"{ effectivePolicyItems(ou: "") { key } }"#,
-            r#"{ ouPolicyStates { ou } }"#,
+    async fn test_policy_reads_are_for_admin_and_read_only_admin() {
+        const QUERIES: [(&str, &str); 5] = [
+            (r#"{ policies { id } }"#, "list_policies"),
+            (r#"{ policy(policyId: 1) { id } }"#, "get_policy"),
+            (r#"{ policyItemCatalog { key } }"#, ""),
+            (
+                r#"{ effectivePolicyItems(ou: "") { key } }"#,
+                "get_policy_levels",
+            ),
+            (r#"{ ouPolicyStates { ou } }"#, "list_ou_policy_states"),
         ];
-        for query in QUERIES {
-            let mut mock = MockTestBackendHandler::new();
-            mock.expect_list_policies().times(0);
-            mock.expect_get_policy().times(0);
-            mock.expect_get_policy_levels().times(0);
-            mock.expect_list_ou_policy_states().times(0);
-            let context = Context::<MockTestBackendHandler>::new_for_tests(
-                mock,
-                ValidationResults {
-                    user: UserId::new("bob"),
-                    permission: Permission::Regular,
-                },
-            );
-            let schema = schema(Query::<MockTestBackendHandler>::new());
-            let (_, errors) = execute(query, None, &schema, &Variables::new(), &context)
-                .await
-                .unwrap();
-            assert!(
-                errors
-                    .iter()
-                    .any(|e| e.error().message().contains("Unauthorized")),
-                "{query}: {errors:?}"
-            );
+        for (permission, allowed) in [
+            (Permission::Admin, true),
+            (Permission::Readonly, true),
+            (Permission::PasswordManager, false),
+            (Permission::Regular, false),
+        ] {
+            for (query, reads) in QUERIES {
+                let calls = |name: &str| usize::from(allowed && reads == name);
+                let mut mock = MockTestBackendHandler::new();
+                mock.expect_list_policies()
+                    .times(calls("list_policies"))
+                    .returning(|| Ok(vec![]));
+                mock.expect_get_policy()
+                    .times(calls("get_policy"))
+                    .returning(|id| {
+                        Ok(lldap_domain_handlers::policies::Policy {
+                            id,
+                            name: "p".to_owned(),
+                            description: String::new(),
+                            items: Default::default(),
+                            linked_ous: vec![],
+                        })
+                    });
+                mock.expect_get_policy_levels()
+                    .times(calls("get_policy_levels"))
+                    .returning(|_| Ok(vec![]));
+                mock.expect_list_ou_policy_states()
+                    .times(calls("list_ou_policy_states"))
+                    .returning(|| Ok(vec![]));
+                mock.expect_get_allowed_ous().times(0);
+                let context = Context::<MockTestBackendHandler>::new_for_tests(
+                    mock,
+                    ValidationResults {
+                        user: UserId::new("bob"),
+                        permission,
+                    },
+                );
+                let schema = schema(Query::<MockTestBackendHandler>::new());
+                let (_, errors) = execute(query, None, &schema, &Variables::new(), &context)
+                    .await
+                    .unwrap();
+                if allowed {
+                    assert!(errors.is_empty(), "{permission:?} {query}: {errors:?}");
+                } else {
+                    assert!(
+                        errors
+                            .iter()
+                            .any(|e| e.error().message().contains("Unauthorized")),
+                        "{permission:?} {query}: {errors:?}"
+                    );
+                }
+            }
         }
     }
 

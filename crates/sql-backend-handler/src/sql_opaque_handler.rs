@@ -404,6 +404,19 @@ impl OpaqueHandler for SqlOpaqueHandler {
         logging::record(LogKind::PasswordChange, Some(username.as_str()), None);
         Ok(username)
     }
+
+    #[instrument(skip_all, level = "debug", err)]
+    async fn registration_user(
+        &self,
+        request: &registration::ClientRegistrationFinishRequest,
+    ) -> Result<UserId> {
+        let secret_key = self.get_orion_secret_key(REGISTRATION_STATE_KEY_INFO)?;
+        let registration::ServerData { username } = decode_exact(&orion::aead::open(
+            &secret_key,
+            &base64::engine::general_purpose::STANDARD.decode(&request.server_data)?,
+        )?)?;
+        Ok(username)
+    }
 }
 
 #[cfg(test)]
@@ -854,6 +867,40 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn test_registration_user_opens_the_server_data_and_writes_nothing() {
+        let handler =
+            SqlOpaqueHandler::new(generate_random_private_key(), get_initialized_db().await);
+        insert_user(&handler, "bob", "bob00").await;
+        let bob = UserId::new("bob");
+        let before = handler
+            .get_password_file_for_user(bob.clone())
+            .await
+            .unwrap();
+        let request = client_registration(&handler, "bob", "bob-new-1").await;
+        assert_eq!(handler.registration_user(&request).await.unwrap(), bob);
+        assert_eq!(
+            handler
+                .get_password_file_for_user(bob.clone())
+                .await
+                .unwrap(),
+            before
+        );
+        attempt_login(&handler, "bob", "bob00", None).await.unwrap();
+
+        let other =
+            SqlOpaqueHandler::new(generate_random_private_key(), get_initialized_db().await);
+        let mut garbled = request.clone();
+        garbled.server_data = "bm90IHNlYWxlZA==".to_owned();
+        for (label, handler, request) in [
+            ("another server's key", &other, &request),
+            ("not sealed", &handler, &garbled),
+        ] {
+            assert!(handler.registration_user(request).await.is_err(), "{label}");
+        }
+    }
+
     async fn login_state(handler: &SqlOpaqueHandler, user: &str) -> String {
         let mut rng = rand::rngs::OsRng;
         let start = opaque::client::login::start_login("anything", &mut rng).unwrap();
@@ -963,6 +1010,77 @@ mod tests {
                     totp_code: None,
                 })
                 .await
+                .is_err()
+        );
+    }
+
+    fn server_key(handler: &SqlOpaqueHandler) -> Vec<u8> {
+        handler
+            .opaque_setup
+            .keypair()
+            .private()
+            .serialize()
+            .to_vec()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_registration_user_opens_only_its_own_kind() {
+        let handler =
+            SqlOpaqueHandler::new(generate_random_private_key(), get_initialized_db().await);
+        insert_user(&handler, "bob", "bob00").await;
+        let mixed = registration::ClientRegistrationFinishRequest {
+            server_data: login_state(&handler, "bob").await,
+            ..client_registration(&handler, "bob", "bob-other-1").await
+        };
+        assert!(handler.registration_user(&mixed).await.is_err());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_no_sealed_kind_opens_as_another() {
+        use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
+        let handler =
+            SqlOpaqueHandler::new(generate_random_private_key(), get_initialized_db().await);
+        insert_user(&handler, "bob", "bob00").await;
+        let key = server_key(&handler);
+        let now = chrono::Utc::now().timestamp();
+        let upload = client_registration(&handler, "bob", "bob-x-1")
+            .await
+            .registration_upload;
+        let finish_with = |server_data: String| registration::ClientRegistrationFinishRequest {
+            server_data,
+            registration_upload: upload.clone(),
+        };
+        let long_name = format!("{}bob", "\u{1}".repeat(600));
+        let login = login_state(&handler, &long_name).await;
+        assert!(
+            handler
+                .registration_user(&finish_with(login.clone()))
+                .await
+                .is_err()
+        );
+        let login_bytes = STANDARD.decode(&login).unwrap();
+        assert!(
+            lldap_mfa::open_enrollment(&key, &URL_SAFE_NO_PAD.encode(login_bytes), now).is_err()
+        );
+
+        let enrollment =
+            lldap_mfa::seal_enrollment(&key, "bob", &lldap_mfa::generate_seed(), false, now)
+                .unwrap();
+        let enrollment_bytes = URL_SAFE_NO_PAD.decode(&enrollment).unwrap();
+        assert!(
+            handler
+                .registration_user(&finish_with(STANDARD.encode(&enrollment_bytes)))
+                .await
+                .is_err()
+        );
+        let registration = client_registration(&handler, "bob", "bob-new-1")
+            .await
+            .server_data;
+        let registration_bytes = STANDARD.decode(&registration).unwrap();
+        assert!(
+            lldap_mfa::open_enrollment(&key, &URL_SAFE_NO_PAD.encode(registration_bytes), now)
                 .is_err()
         );
     }

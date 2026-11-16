@@ -176,7 +176,7 @@ print(base64.b64encode(sealed).decode())' 2>/dev/null)"
 fi
 
 # A password the directory takes and the KDC refuses: a kadm5 policy (min length 40) on an
-# existing principal, as MIT's kadm5_chpass_principal_3 applies it. The directory changes, the
+# existing principal, as MIT applies it. The directory changes, the
 # principal keeps its key, through GraphQL (an error) and through ldappasswd (Success).
 POL_USER="gatepolicy"
 POL_FIRST="GatePolicyFirstPassword2026!"

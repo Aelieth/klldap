@@ -191,6 +191,13 @@ impl LoginHandler for SqlBackendHandler {
             }
             (MfaRequirement::Totp, None) => {
                 debug!(r#"Bind for "{}" carries no TOTP code"#, &name);
+                logging::record_as(
+                    Some(&name),
+                    LogKind::Bind,
+                    None,
+                    false,
+                    Some("totp code required"),
+                );
                 Err(DomainError::AuthenticationError(format!(
                     r#"{TOTP_CODE_REQUIRED} for user "{name}""#
                 )))
@@ -329,9 +336,16 @@ impl OpaqueHandler for SqlOpaqueHandler {
             MfaRequirement::None => Ok(authenticated(None, false)),
             MfaRequirement::Enrollment => Ok(authenticated(Some("mfa enrollment pending"), true)),
             MfaRequirement::Totp => match totp_code.as_deref() {
-                // The challenge is a protocol step, not an outcome: no row.
+                // A right password with no code is its own failure row, then the code step.
                 None => {
                     debug!(r#"OPAQUE login for "{}" awaits the TOTP code"#, &username);
+                    logging::record_as(
+                        Some(&username),
+                        LogKind::Login,
+                        None,
+                        false,
+                        Some("totp code required"),
+                    );
                     Ok(LoginOutcome::TotpRequired)
                 }
                 Some(code) => match self.verify_user_totp(&username, code).await? {
@@ -672,7 +686,7 @@ mod tests {
         with_request(
             RequestMeta::ldap(None, Some(peer.parse().unwrap())),
             async {
-                // The challenge: a verified password without a code is an error, not a row.
+                // A verified password without a code is its own failure row.
                 let err = handler
                     .bind(bind_request("bob", "bob00"))
                     .await
@@ -741,6 +755,7 @@ mod tests {
         let row =
             |success, detail: Option<&str>| (LogKind::Bind, success, detail.map(str::to_owned));
         let mut expected = vec![
+            row(false, Some("totp code required")),
             row(false, Some("invalid totp")),
             row(false, Some("invalid credentials")),
             row(true, Some("totp")),
@@ -833,6 +848,7 @@ mod tests {
             auth_rows(&guard, peer),
             vec![
                 row(true, Some("mfa enrollment pending")),
+                row(false, Some("totp code required")),
                 row(false, Some("invalid totp")),
                 row(true, Some("totp")),
             ]

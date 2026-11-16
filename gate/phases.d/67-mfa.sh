@@ -130,10 +130,16 @@ else
 fi
 if log_query_has_row '{ logs(filter: {kinds: [BIND], actor: "'"$MFA_USER"'", success: false}) { kind detail } }' bindfail; then
     detail="$(json_get logs.0.detail <"$D/bindfail.json")"
-    if [ "$detail" = "totp replayed" ]; then
-        p_ok "the replay is a bind row with detail 'totp replayed'"
+    replayed="$(BINDFAIL="$D/bindfail.json" python3 - <<'PY'
+import json, os
+rows = json.load(open(os.environ["BINDFAIL"], encoding="utf-8")).get("logs") or []
+print(sum(1 for row in rows if row.get("detail") == "totp replayed"))
+PY
+)"
+    if [ "$replayed" -eq 1 ] && [ "$detail" = "totp code required" ]; then
+        p_ok "one failed bind detail is 'totp replayed', and the newest is 'totp code required'"
     else
-        p_bad "unexpected newest failed-bind detail '$detail'"
+        p_bad "failed binds: newest '${detail:-empty}', totp replayed count ${replayed}"
     fi
 else
     p_bad "no failed bind row for $MFA_USER"

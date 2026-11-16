@@ -11,7 +11,7 @@ case $- in *x*) LK_XT=1 ;; esac
 LK_PASS="$(python3 -c 'import secrets; print("Lk" + secrets.token_hex(10) + "!")')"
 [ "$LK_XT" = 1 ] && set -x
 LK_TWO="${CONTAINER}-two" LK_TWO_VOL="${CONTAINER}-two-data"
-LK_SECRET=""
+LK_SECRET="" LK_MADE=0
 EXTRA_CONTAINERS+=("$LK_TWO")
 EXTRA_VOLUMES+=("$LK_TWO_VOL")
 
@@ -91,13 +91,18 @@ PY
 }
 lk_step() { echo $(($(date +%s) / 30)); }
 lk_step_start() { sleep $((30 - $(date +%s) % 30 + 1)); }
+# Prints "<answered Invalid TOTP code> <answered Too many TOTP attempts>" for five wrong codes.
 lk_five_wrong() {
-    local i out n=0
+    local i out n=0 many=0
     for i in 1 2 3 4 5; do
         out="$(lk_simple_at "$1" "$LK_MFA" pass:wrongcode)"
-        [ "${out%% *}" = 401 ] && n=$((n + 1))
+        if [ "${out%% *}" = 401 ] && grep -q 'Invalid TOTP code' <<<"$out"; then
+            n=$((n + 1))
+        elif grep -q 'Too many TOTP attempts' <<<"$out"; then
+            many=$((many + 1))
+        fi
     done
-    printf '%s\n' "$n"
+    printf '%s %s\n' "$n" "$many"
 }
 # shellcheck disable=SC2034
 lk_back_up() { wait_healthy 120 && discover_ports && TOKEN="$(gate_login)"; }
@@ -161,7 +166,7 @@ lk_fifty() {
 }
 
 lk_two_server() {
-    local two_port i healthy=0 out n
+    local two_port i healthy=0 out ctl n many step
     docker rm -fv "$LK_TWO" >/dev/null 2>&1
     LLDAP_JWT_SECRET="$JWT_SECRET" LLDAP_KEY_SEED="$KEY_SEED" LLDAP_LDAP_USER_PASS="$ADMIN_PASS" \
         LLDAP_DATABASE_URL="$GATE_DATABASE_URL" t docker run -d --name "$LK_TWO" --network "$NET" -p "127.0.0.1::17170" \
@@ -180,12 +185,18 @@ lk_two_server() {
         lk_note "[L1.totp-two-servers] the second server never became healthy; not run"
     else
         lk_step_start
-        n="$(lk_five_wrong "$HTTP_PORT")"
+        step="$(lk_step)"
+        read -r n many <<<"$(lk_five_wrong "$HTTP_PORT")"
         out="$(lk_simple_at "$two_port" "$LK_MFA" pass:code)"
+        ctl="$(lk_simple_at "$HTTP_PORT" "$LK_MFA" pass:code)"
         if [ "$n" != 5 ]; then
-            lk_note "[L1.totp-two-servers] only $n of 5 wrong codes were refused as wrong on server one; this run cannot tell"
+            lk_note "[L1.totp-two-servers] only $n of 5 wrong codes were answered 'Invalid TOTP code' on server one ($many 'Too many'); this run cannot tell"
+        elif [ "$(lk_step)" != "$step" ]; then
+            lk_note "[L1.totp-two-servers] the attempts did not fall in one 30 s step; this run cannot tell"
+        elif ! grep -q 'Too many TOTP attempts' <<<"$ctl"; then
+            lk_fail "[L1.totp-two-servers] control: server one did not refuse the right code for too many attempts in step $step ($ctl), so it was not at its limit"
         elif [ "$out" = "200 token" ]; then
-            lk_pass "[L1.totp-two-servers] 5 wrong codes on one server, then the right code on a second server on the same database in the same step: today allowed, nothing shared | when enforced: refused, the count shared"
+            lk_pass "[L1.totp-two-servers] 5 wrong codes on one server, then the right code on a second server on the same database in the same step ($step): today allowed, nothing shared; control: server one refused the same code for too many attempts | when enforced: refused, the count shared"
         elif grep -q 'Too many TOTP attempts' <<<"$out"; then
             lk_finding "[L1.totp-two-servers] the healthy second server refused the right code for too many attempts: the count is shared after all"
         else
@@ -198,17 +209,19 @@ lk_two_server() {
 }
 
 lk_totp() {
-    local out step n
+    local out step n many
     lk_step_start
     step="$(lk_step)"
-    n="$(lk_five_wrong "$HTTP_PORT")"
+    read -r n many <<<"$(lk_five_wrong "$HTTP_PORT")"
     out="$(lk_simple "$LK_MFA" pass:code)"
-    if [ "$n" != 5 ]; then
-        lk_note "[L1.totp-sixth] only $n of 5 wrong codes were refused as wrong; this run cannot tell"
-    elif [ "$(lk_step)" != "$step" ]; then
+    if [ "$(lk_step)" != "$step" ]; then
         lk_note "[L1.totp-sixth] the six attempts did not fall in one 30 s step; this run cannot tell"
+    elif [ "$many" != 0 ]; then
+        lk_finding "[L1.totp-sixth] 'Too many TOTP attempts' came after $n wrong codes in step $step, so the limit is below 5"
+    elif [ "$n" != 5 ]; then
+        lk_note "[L1.totp-sixth] only $n of 5 wrong codes were answered 'Invalid TOTP code'; this run cannot tell"
     elif grep -q 'Too many TOTP attempts' <<<"$out"; then
-        lk_pass "[L1.totp-sixth] after 5 wrong codes, the right code in the same 30 s step (step $step) is refused: today 'Too many TOTP attempts', 5 per step, kept in memory | when enforced: refused, and the failures also count toward lockout-threshold"
+        lk_pass "[L1.totp-sixth] 5 wrong codes each answered 'Invalid TOTP code', then the right code in the same 30 s step (step $step) is refused: today 'Too many TOTP attempts', 5 per step, kept in memory | when enforced: refused, and the failures also count toward lockout-threshold"
     else
         lk_finding "[L1.totp-sixth] after 5 wrong codes in step $step the right code was not refused for too many attempts ($out)"
     fi
@@ -220,13 +233,13 @@ lk_totp() {
     fi
     lk_step_start
     step="$(lk_step)"
-    n="$(lk_five_wrong "$HTTP_PORT")"
+    read -r n many <<<"$(lk_five_wrong "$HTTP_PORT")"
     t docker restart "$CONTAINER" >/dev/null 2>&1 && lk_back_up || {
         lk_fail "[L1.totp-restart-up] the container did not come back after the TOTP restart"
         return 1
     }
     if [ "$n" != 5 ]; then
-        lk_note "[L1.totp-restart] only $n of 5 wrong codes were refused as wrong before the restart; this run cannot tell"
+        lk_note "[L1.totp-restart] only $n of 5 wrong codes were answered 'Invalid TOTP code' before the restart ($many 'Too many'); this run cannot tell"
     elif [ "$(lk_step)" != "$step" ]; then
         lk_note "[L1.totp-restart] the restart took past the 30 s step, so this run cannot tell whether it forgot the count"
     elif [ "$(lk_simple "$LK_MFA" pass:code)" = "200 token" ]; then
@@ -242,20 +255,18 @@ lk_totp() {
     return 0
 }
 
+# kadmin -q exits 0 when its query fails, so absence needs getpol's own answer.
 lk_policy_gone() {
     kadmin_q "modprinc -unlock $LK_USER@$REALM" >/dev/null 2>&1
     kadmin_q "modprinc -clearpolicy $LK_USER@$REALM" >/dev/null 2>&1
     kadmin_q "delpol -force $LK_POL" >/dev/null 2>&1
-    local pols
-    if pols="$(kadmin_q "listpols" 2>/dev/null)"; then
-        ! grep -qw "$LK_POL" <<<"$pols"
-    else
-        kadmin_q "getpol $LK_POL" 2>&1 | grep -q "Policy does not exist"
-    fi
+    kadmin_q "listpols" >"$LK_D/listpols.txt" 2>&1
+    kadmin_q "getpol $LK_POL" >"$LK_D/getpol.txt" 2>&1
+    grep -q "Policy does not exist" "$LK_D/getpol.txt" && ! grep -qw "$LK_POL" "$LK_D/listpols.txt"
 }
 
 lk_kerberos() {
-    local i wrong=0 got code
+    local i wrong=0 got code wrongp=""
     for i in $(seq 1 20); do [ "$(lk_kinit "wrong-$i-$LK_RUN")" = incorrect ] || wrong=$((wrong + 1)); done
     [ "$wrong" = 0 ] || lk_finding "[L1.kinit-wrong] $wrong of 20 wrong passwords were not refused as 'Password incorrect'"
     if [ "$(lk_kinit pass)" = ok ]; then
@@ -268,12 +279,12 @@ lk_kerberos() {
         lk_note "[L1.kinit-policy] a Kerberos policy could not be made or bound through kadmin on loopback: $(tail -n 1 -q "$LK_D/addpol.log" "$LK_D/modprinc.log" | tr '\n' ' ' | cut -c1-200)"
         return 0
     }
-    for i in 1 2 3; do lk_kinit "wrong-p$i-$LK_RUN" >/dev/null; done
+    for i in 1 2 3; do wrongp+="$(lk_kinit "wrong-p$i-$LK_RUN") "; done
     got="$(lk_kinit pass)"
-    if [ "$got" = revoked ]; then
-        lk_pass "[L1.kinit-policy] a Kerberos policy with maxfailure 3 (kadmin on loopback), 3 wrong, then the right password: today refused, 'Client's credentials have been revoked' | when enforced: the same, and the OU policy also applies"
+    if [ "$wrongp" = "incorrect incorrect incorrect " ] && [ "$got" = revoked ]; then
+        lk_pass "[L1.kinit-policy] a Kerberos policy with maxfailure 3 (kadmin on loopback): 3 wrong, each 'Password incorrect', then the right password: today refused, 'Client's credentials have been revoked' | when enforced: the same, and the OU policy also applies"
     else
-        lk_finding "[L1.kinit-policy] with maxfailure 3 bound through kadmin, the right password after 3 failures gave '$got', not the lockout refusal"
+        lk_finding "[L1.kinit-policy] with maxfailure 3 bound through kadmin, the 3 wrong passwords gave '${wrongp% }' and the right password then gave '$got', not 3 x incorrect then the lockout refusal"
     fi
     t docker restart "$CONTAINER" >/dev/null 2>&1 && lk_back_up || {
         lk_fail "[L1.kinit-restart-up] the container did not come back after the Kerberos restart"
@@ -312,14 +323,25 @@ lk_kerberos() {
 }
 
 lk_cleanup() {
+    local u out gone=0 deleted=0
     docker rm -fv "$LK_TWO" >/dev/null 2>&1
     docker volume rm "$LK_TWO_VOL" >/dev/null 2>&1
-    lk_policy_gone || lk_fail "[L1.cleanup-policy] the Kerberos policy $LK_POL is still there after delpol"
-    for u in "$LK_USER" "$LK_MFA"; do lk_gql 'mutation($u: String!) { deleteUser(userId: $u) { ok } }' '{"u": "'"$u"'"}' >/dev/null; done
+    lk_policy_gone && gone=1
+    for u in "$LK_USER" "$LK_MFA"; do
+        out="$(lk_gql 'mutation($u: String!) { deleteUser(userId: $u) { ok } }' '{"u": "'"$u"'"}')" &&
+            [ "$(json_get deleteUser.ok <<<"$out" 2>/dev/null)" = True ] && deleted=$((deleted + 1))
+    done
     LK_SECRET=""
+    [ "$LK_MADE" = 1 ] || return 0
+    if [ "$gone" = 1 ] && [ "$deleted" = 2 ]; then
+        lk_pass "[L1.cleanup] the Kerberos policy $LK_POL is gone (getpol: 'Policy does not exist'; listpols does not name it) and both users are deleted"
+    else
+        lk_fail "[L1.cleanup] policy gone: $gone (getpol: $(tail -n 1 "$LK_D/getpol.txt" | cut -c1-120)); users deleted: $deleted of 2"
+    fi
 }
 
 if lk_setup; then
+    LK_MADE=1
     lk_fifty ldap-bind
     lk_fifty simple-login
     lk_totp && lk_kerberos

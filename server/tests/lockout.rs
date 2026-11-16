@@ -174,6 +174,14 @@ fn test_lockout_facts_at_web_login() {
     let path = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("l1-web-login.txt");
     std::fs::write(&path, report.join("\n") + "\n").expect("write the L1 report");
     println!("L1 rows: {}", path.display());
+    assert_eq!(
+        app_rows, 0,
+        "today a wrong password typed in the web app never reaches the server"
+    );
+    assert_eq!(
+        forged_rows, 10,
+        "today each failed finish writes one failure row"
+    );
     assert!(
         allowed,
         "today the right password still logs in after 60 failures: {status} {body}"

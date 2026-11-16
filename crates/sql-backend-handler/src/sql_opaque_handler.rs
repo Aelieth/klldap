@@ -55,11 +55,29 @@ async fn passwords_match(
     .map_err(|_| DomainError::InternalError(STRETCH_FAILED.to_string()))?
 }
 
+const LOGIN_STATE_KEY_INFO: &[u8] = b"lldap-opaque-login-state-v1";
+const REGISTRATION_STATE_KEY_INFO: &[u8] = b"lldap-opaque-registration-state-v1";
+
+/// bincode as `bincode::serialize` writes it, refusing trailing bytes.
+fn decode_exact<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> bincode::Result<T> {
+    use bincode::Options;
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .deserialize(bytes)
+}
+
 impl SqlBackendHandler {
-    fn get_orion_secret_key(&self) -> Result<orion::aead::SecretKey> {
-        Ok(orion::aead::SecretKey::from_slice(
+    /// One key per kind of sealed state, derived from the server key.
+    fn get_orion_secret_key(&self, purpose: &[u8]) -> Result<orion::aead::SecretKey> {
+        let mut key = [0u8; 32];
+        orion::hazardous::kdf::hkdf::sha256::derive_key(
+            &[],
             self.opaque_setup.keypair().private().serialize().as_ref(),
-        )?)
+            Some(purpose),
+            &mut key,
+        )?;
+        Ok(orion::aead::SecretKey::from_slice(&key)?)
     }
 
     #[instrument(skip(self), level = "debug", err)]
@@ -243,7 +261,7 @@ impl OpaqueHandler for SqlOpaqueHandler {
             request.login_start_request,
             &user_id,
         )?;
-        let secret_key = self.get_orion_secret_key()?;
+        let secret_key = self.get_orion_secret_key(LOGIN_STATE_KEY_INFO)?;
         let server_data = login::ServerData {
             username: user_id,
             server_login: start_response.state,
@@ -263,11 +281,11 @@ impl OpaqueHandler for SqlOpaqueHandler {
             credential_finalization,
             totp_code,
         } = request;
-        let secret_key = self.get_orion_secret_key()?;
+        let secret_key = self.get_orion_secret_key(LOGIN_STATE_KEY_INFO)?;
         let login::ServerData {
             username,
             server_login,
-        } = bincode::deserialize(&orion::aead::open(
+        } = decode_exact(&orion::aead::open(
             &secret_key,
             &base64::engine::general_purpose::STANDARD.decode(&server_data)?,
         )?)?;
@@ -348,7 +366,7 @@ impl OpaqueHandler for SqlOpaqueHandler {
             request.registration_start_request,
             &request.username,
         )?;
-        let secret_key = self.get_orion_secret_key()?;
+        let secret_key = self.get_orion_secret_key(REGISTRATION_STATE_KEY_INFO)?;
         let server_data = registration::ServerData {
             username: request.username,
         };
@@ -365,8 +383,8 @@ impl OpaqueHandler for SqlOpaqueHandler {
         request: registration::ClientRegistrationFinishRequest,
     ) -> Result<UserId> {
         require_kdc_ready()?;
-        let secret_key = self.get_orion_secret_key()?;
-        let registration::ServerData { username } = bincode::deserialize(&orion::aead::open(
+        let secret_key = self.get_orion_secret_key(REGISTRATION_STATE_KEY_INFO)?;
+        let registration::ServerData { username } = decode_exact(&orion::aead::open(
             &secret_key,
             &base64::engine::general_purpose::STANDARD.decode(&request.server_data)?,
         )?)?;
@@ -805,6 +823,147 @@ mod tests {
                 row(false, Some("invalid totp")),
                 row(true, Some("totp")),
             ]
+        );
+    }
+
+    async fn client_registration(
+        handler: &SqlOpaqueHandler,
+        user: &str,
+        password: &str,
+    ) -> registration::ClientRegistrationFinishRequest {
+        let mut rng = rand::rngs::OsRng;
+        let start = opaque::client::registration::start_registration(password.as_bytes(), &mut rng)
+            .unwrap();
+        let response = handler
+            .registration_start(registration::ClientRegistrationStartRequest {
+                username: UserId::new(user),
+                registration_start_request: start.message,
+            })
+            .await
+            .unwrap();
+        let finish = opaque::client::registration::finish_registration(
+            start.state,
+            password.as_bytes(),
+            response.registration_response,
+            &mut rng,
+        )
+        .unwrap();
+        registration::ClientRegistrationFinishRequest {
+            server_data: response.server_data,
+            registration_upload: finish.message,
+        }
+    }
+
+    async fn login_state(handler: &SqlOpaqueHandler, user: &str) -> String {
+        let mut rng = rand::rngs::OsRng;
+        let start = opaque::client::login::start_login("anything", &mut rng).unwrap();
+        handler
+            .login_start(login::ClientLoginStartRequest {
+                username: UserId::new(user),
+                login_start_request: start.message,
+            })
+            .await
+            .unwrap()
+            .server_data
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_each_kind_of_state_opens_only_as_its_own_kind_across_users() {
+        let handler =
+            SqlOpaqueHandler::new(generate_random_private_key(), get_initialized_db().await);
+        insert_user(&handler, "bob", "bob00").await;
+        insert_user(&handler, "carol", "carol00").await;
+        let bob = UserId::new("bob");
+        let mixed = registration::ClientRegistrationFinishRequest {
+            server_data: login_state(&handler, "bob").await,
+            ..client_registration(&handler, "carol", "carol-new-1").await
+        };
+        let before = handler
+            .get_password_file_for_user(bob.clone())
+            .await
+            .unwrap();
+        assert!(handler.registration_finish(mixed).await.is_err());
+        assert_eq!(
+            handler
+                .get_password_file_for_user(bob.clone())
+                .await
+                .unwrap(),
+            before
+        );
+        attempt_login(&handler, "bob", "bob00", None).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_each_kind_of_state_opens_only_as_its_own_kind_for_one_user() {
+        let handler =
+            SqlOpaqueHandler::new(generate_random_private_key(), get_initialized_db().await);
+        insert_user(&handler, "bob", "bob00").await;
+        let bob = UserId::new("bob");
+        let before = handler
+            .get_password_file_for_user(bob.clone())
+            .await
+            .unwrap();
+        let mixed = registration::ClientRegistrationFinishRequest {
+            server_data: login_state(&handler, "bob").await,
+            ..client_registration(&handler, "bob", "bob-other-1").await
+        };
+        assert!(handler.registration_finish(mixed).await.is_err());
+        assert_eq!(
+            handler.get_password_file_for_user(bob).await.unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_each_kind_of_state_opens_only_as_its_own_kind_for_a_long_name() {
+        let handler =
+            SqlOpaqueHandler::new(generate_random_private_key(), get_initialized_db().await);
+        insert_user(&handler, "bob", "bob00").await;
+        let long_name = format!("{}bob", "\u{1}".repeat(600));
+        let mixed = registration::ClientRegistrationFinishRequest {
+            server_data: login_state(&handler, &long_name).await,
+            ..client_registration(&handler, "bob", "bob-other-1").await
+        };
+        assert!(handler.registration_finish(mixed).await.is_err());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_each_kind_of_state_opens_only_as_its_own_kind_at_login() {
+        let handler =
+            SqlOpaqueHandler::new(generate_random_private_key(), get_initialized_db().await);
+        insert_user(&handler, "bob", "bob00").await;
+        let mut rng = rand::rngs::OsRng;
+        let start = opaque::client::login::start_login("bob00", &mut rng).unwrap();
+        let answer = handler
+            .login_start(login::ClientLoginStartRequest {
+                username: UserId::new("bob"),
+                login_start_request: start.message,
+            })
+            .await
+            .unwrap();
+        let finish = opaque::client::login::finish_login(
+            start.state,
+            b"bob00",
+            answer.credential_response,
+            &mut rng,
+        )
+        .unwrap();
+        let registration_state = client_registration(&handler, "bob", "bob-new-1")
+            .await
+            .server_data;
+        assert!(
+            handler
+                .login_finish(login::ClientLoginFinishRequest {
+                    server_data: registration_state,
+                    credential_finalization: finish.message,
+                    totp_code: None,
+                })
+                .await
+                .is_err()
         );
     }
 }

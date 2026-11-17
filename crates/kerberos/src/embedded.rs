@@ -721,20 +721,7 @@ where
     };
     let mut next = after_change(change());
     if next == Next::Create {
-        let created = krb5_kdc::create_password_shared_committing_then(
-            &own.store,
-            &name,
-            &own.realm,
-            password,
-            enctypes,
-            ent,
-            &own.actor,
-            commit(),
-            |s| {
-                follow_directory(s, &name, locked, &own.actor)?;
-                s.set_host_owned_in(&name, &own.realm, true)
-            },
-        );
+        let created = create_owned(own, user, password, enctypes, ent, locked, commit());
         next = after_create(created);
     }
     if next == Next::ChangeAgain {
@@ -745,6 +732,34 @@ where
         Next::Fail(e) => Err(e),
         Next::Create | Next::ChangeAgain => Err(StoreError::NotFound),
     }
+}
+
+// kerber-rust runs `checks` again under the write lock, right before the create.
+fn create_owned(
+    own: &Own,
+    user: &UserId,
+    password: &[u8],
+    enctypes: &[KeySalt],
+    ent: &AdminEnt,
+    locked: Option<bool>,
+    commit: impl FnOnce(HostChange) -> Result<(), KerberosStoreError>,
+) -> Result<(), StoreError> {
+    let name = user_principal(user);
+    krb5_kdc::create_password_shared_committing_then(
+        &own.store,
+        &name,
+        &own.realm,
+        password,
+        enctypes,
+        ent,
+        &own.actor,
+        |s| not_an_alias(s, &own.realm, user),
+        commit,
+        |s| {
+            follow_directory(s, &name, locked, &own.actor)?;
+            s.set_host_owned_in(&name, &own.realm, true)
+        },
+    )
 }
 
 // `set_status` also writes `pw_expire`: the one the keys or the create left goes through.
@@ -2022,6 +2037,7 @@ pub(crate) mod tests {
             &[KeySalt],
             &AdminEnt,
             &str,
+            Checks,
             Commit,
             Edit,
         ) -> Result<(), StoreError>;
@@ -2199,6 +2215,62 @@ pub(crate) mod tests {
                 .is_err()
         );
         assert_eq!(temp.commits(), commits, "the check commits nothing");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_the_create_refuses_a_name_that_became_an_alias() {
+        let temp = TempRealm::new();
+        let (embedded, store) = temp.embedded();
+        unmarked(&embedded, "svc", false);
+        let (own, svc) = (embedded.own(), user_principal(&UserId::new("svc")));
+        in_change(&own, |s| {
+            s.create_alias_in(
+                &user_principal(&bob()),
+                "EXAMPLE.COM",
+                &svc,
+                "EXAMPLE.COM",
+                "test",
+            )?;
+            s.remove_in(&svc, "EXAMPLE.COM")
+        })
+        .unwrap();
+        let alias = || {
+            let store = store.read().unwrap();
+            let bob = store.get_raw("bob@EXAMPLE.COM");
+            (
+                bob.and_then(|p| p.alias_target()),
+                bob.is_some_and(|p| p.keys.is_empty()),
+            )
+        };
+        let (before, writes, called) = (alias(), temp.own_writes(), std::cell::Cell::new(false));
+        let created = create_owned(
+            &own,
+            &bob(),
+            b"Bob-Password-1",
+            &embedded.enctypes,
+            &embedded.new_principal(),
+            Some(false),
+            |_| {
+                called.set(true);
+                Ok(())
+            },
+        );
+        let why = "the principal name of user bob is an alias of svc@EXAMPLE.COM";
+        assert!(
+            matches!(&created, Err(StoreError::InvalidArgument(text)) if text == why),
+            "{created:?}"
+        );
+        assert_eq!(
+            (
+                before.clone(),
+                alias(),
+                temp.own_writes() - writes,
+                called.get()
+            ),
+            ((Some("svc@EXAMPLE.COM".to_owned()), true), before, 0, false),
+            "the dangling alias stays as it was and nothing reaches the host"
+        );
     }
 
     #[tokio::test]

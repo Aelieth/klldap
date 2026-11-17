@@ -1,7 +1,7 @@
 use crate::boot::RealmSettings;
 use anyhow::{Context, Result, anyhow, bail};
 use krb5_kdc::host::{HostPaths, KerberosStore, KerberosStoreError};
-use krb5_kdc::{create_lockout_file, load_dump_with_stash, parse_dump};
+use krb5_kdc::{create_lockout_file, load_dump_with_stash_path, parse_dump};
 use std::fs::{self, File};
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
@@ -103,15 +103,15 @@ fn import(settings: &RealmSettings, paths: &HostPaths, host: &dyn KerberosStore)
             settings.realm
         );
     }
-    let stash = fs::read(&paths.stash).with_context(|| {
-        format!(
+    if !paths.stash.exists() {
+        bail!(
             "{} has a dump but no stash at {}",
             dir.display(),
             paths.stash.display()
-        )
-    })?;
-    let store =
-        load_dump_with_stash(&text, &stash).map_err(|e| anyhow!("the dump does not load: {e}"))?;
+        );
+    }
+    let store = load_dump_with_stash_path(&text, &paths.stash)
+        .map_err(|e| anyhow!("the dump does not load: {e}"))?;
     create_lockout_file(&paths.lockout)
         .map_err(|e| anyhow!("while creating {}: {e}", paths.lockout.display()))?;
     let change = store

@@ -3136,6 +3136,8 @@ mod tests {
             concat!("host_seal", "_key"),
             concat!("open_", "principal"),
             concat!("Seal", "Key"),
+            concat!("load_dump_with", "_stash("),
+            concat!("read_stash", "_file"),
         ];
         let found: Vec<(&str, &str)> = sources
             .iter()
@@ -3149,7 +3151,7 @@ mod tests {
         assert_eq!(
             (on_disk, found),
             (scanned, Vec::new()),
-            "every source file is scanned, and none takes the realm's key or opens a record"
+            "every source file is scanned, and none takes the realm's key, opens a record or reads the stash"
         );
     }
 

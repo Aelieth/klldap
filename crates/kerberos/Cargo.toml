@@ -33,6 +33,7 @@ path = "../domain"
 path = "../domain-handlers"
 
 [dev-dependencies]
+krb5-asn1 = { workspace = true }
 pretty_assertions = { workspace = true }
 sea-orm = { workspace = true }
 serial_test = { workspace = true }

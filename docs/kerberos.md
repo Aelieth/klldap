@@ -319,6 +319,13 @@ Podman follows the steps below. Those steps are what the script does.
    and nothing is moved. What does not carry over: grants in `kadm5.acl` beyond
    the admin line (name them in `kadmin_acl`), and MIT's logs.
 
+   At that start, KLLDAP takes the principal of each user with `kerberosSync`
+   as its own, and only KLLDAP changes it from then on. A principal of a
+   directory user without `kerberosSync` is disabled, not deleted, and a
+   `kerberos_sync` log row names it. To use it again, turn `kerberosSync` on
+   for the user and set the password once, or remove it with kadmin. A
+   principal that names no directory user is left as it is.
+
 5. Without a dump the realm does not open. The server comes up in the degraded
    state, the cause names the file to write, and nothing is moved. Write the
    dump (step 2) and start again. A dump for a realm other than

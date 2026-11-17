@@ -1,3 +1,4 @@
+use crate::seam::{Host, committing};
 use krb5_crypto::{EncryptionType, KeySalt};
 use krb5_kdc::{Error as StoreError, PrincipalRead, PrincipalStore, TL_LAST_PWD_CHANGE, TlData};
 use krb5_types::PrincipalName;
@@ -29,9 +30,10 @@ pub(crate) fn roll(
     realm: &str,
     etypes: &[EncryptionType],
     actor: &str,
+    host: &dyn Host,
 ) -> Result<(), StoreError> {
     let keysalts: Vec<KeySalt> = etypes.iter().map(|&etype| etype.into()).collect();
-    store.change(|s| {
+    store.change_committing(committing(host), |s| {
         for name in services(realm) {
             if s.fetch_name(&name)?.is_some() {
                 s.chrand_etypes_keepold_in(&name, realm, &keysalts, 1, actor)?;
@@ -49,6 +51,7 @@ pub(crate) fn purge_old_keys(
     grace: u64,
     now: u64,
     actor: &str,
+    host: &dyn Host,
 ) -> Result<usize, StoreError> {
     let mut due = Vec::new();
     for name in services(realm) {
@@ -68,7 +71,7 @@ pub(crate) fn purge_old_keys(
     if due.is_empty() {
         return Ok(0);
     }
-    store.change(|s| {
+    store.change_committing(committing(host), |s| {
         for (name, top) in &due {
             s.purgekeys_in(name, realm, i32::try_from(*top).unwrap_or(i32::MAX), actor)?;
         }
@@ -144,6 +147,7 @@ mod tests {
         let temp = TempRealm::new();
         let mut store =
             boot::open_store(&temp.settings, &boot::profile(&temp.settings), temp.host()).unwrap();
+        let (own, changes) = (temp.own(), temp.changes());
         let (realm, grace) = ("EXAMPLE.COM", 86_400 + 604_800);
         let tgs = PrincipalName::krbtgt(realm);
         let before = kvnos(&store, &tgs);
@@ -151,7 +155,7 @@ mod tests {
         assert!(!roll_due(&store, realm, &[Aes256, Aes128]).unwrap());
         assert!(roll_due(&store, realm, &[Aes128, Aes256]).unwrap());
 
-        roll(&mut store, realm, &[Aes128, Aes256], "test").unwrap();
+        roll(&mut store, realm, &[Aes128, Aes256], "test", own.as_ref()).unwrap();
         let mut rolled = vec![(first + 1, Aes128), (first + 1, Aes256)];
         rolled.extend(before.iter().copied());
         assert_eq!(kvnos(&store, &tgs), rolled);
@@ -164,9 +168,14 @@ mod tests {
             (now + grace + 10, 3),
             (now + grace + 10, 0),
         ] {
-            let count = purge_old_keys(&mut store, realm, grace, at, "test").unwrap();
+            let count = purge_old_keys(&mut store, realm, grace, at, "test", own.as_ref()).unwrap();
             assert_eq!(count, purged, "{at}");
         }
         assert_eq!(kvnos(&store, &tgs), rolled[..2].to_vec());
+        assert_eq!(
+            (temp.changes(), temp.own_writes()),
+            (changes, 2),
+            "the roll and the purge commit through the closure"
+        );
     }
 }

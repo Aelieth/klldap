@@ -1,5 +1,6 @@
-use crate::policy::LiveClients;
+use crate::policy::{AllowAll, LiveClients};
 use crate::rotate;
+use crate::seam::Host;
 use anyhow::{Context, Result, anyhow, bail};
 use krb5_config::{KdcConf, KdcPaths, Krb5Conf, ProfileSet, listen::ListenAddr};
 use krb5_crypto::EncryptionType;
@@ -79,17 +80,23 @@ pub(crate) struct OpenRealm {
     pub kadmin: TcpListener,
 }
 
-pub(crate) fn open(settings: &RealmSettings, host: Arc<dyn KerberosStore>) -> Result<OpenRealm> {
-    if !krb5_types::pkinit::P384_ENABLED {
-        bail!("this build lacks --cfg p384_backend=\"fiat\" (.cargo/config.toml), so P-384 is off");
-    }
-    let profile = profile(settings);
-    let mut store = open_store(settings, &profile, host)?;
-    rotate_keys(&mut store, settings)?;
+/// A marked client with no admission module is refused, so it goes in before the KDC serves.
+pub(crate) fn install_plugins(store: &mut PrincipalStore) {
     store
         .policy
         .plugins
         .register_kdcpolicy(Arc::new(LiveClients));
+    store.policy.plugins.set_host_admission(Arc::new(AllowAll));
+}
+
+pub(crate) fn open(settings: &RealmSettings, host: Arc<dyn Host>) -> Result<OpenRealm> {
+    if !krb5_types::pkinit::P384_ENABLED {
+        bail!("this build lacks --cfg p384_backend=\"fiat\" (.cargo/config.toml), so P-384 is off");
+    }
+    let profile = profile(settings);
+    let mut store = open_store(settings, &profile, host.clone())?;
+    rotate_keys(&mut store, settings, host.as_ref())?;
+    install_plugins(&mut store);
     store.set_client_case_fold(settings.client_case_fold);
     if settings.client_case_fold {
         for twins in store.client_case_twins() {
@@ -143,14 +150,18 @@ pub fn with_port_hint(e: io::Error, port: u16) -> anyhow::Error {
 }
 
 // A new first type rolls the service keys; the old keys go once no ticket can need them.
-pub(crate) fn rotate_keys(store: &mut PrincipalStore, settings: &RealmSettings) -> Result<()> {
+pub(crate) fn rotate_keys(
+    store: &mut PrincipalStore,
+    settings: &RealmSettings,
+    host: &dyn Host,
+) -> Result<()> {
     let (realm, etypes) = (&settings.realm, &settings.supported_enctypes);
     let actor = format!("admin/admin@{realm}");
     let grace = settings.ticket_lifetime + settings.renew_lifetime;
     let due = rotate::roll_due(store, realm, etypes)
         .map_err(|e| anyhow!("while reading krbtgt/{realm}: {e}"))?;
     if due {
-        rotate::roll(store, realm, etypes, &actor)
+        rotate::roll(store, realm, etypes, &actor, host)
             .map_err(|e| anyhow!("while rolling the keys of krbtgt/{realm}: {e}"))?;
         let names: Vec<&str> = etypes.iter().map(|etype| etype.to_mit_name()).collect();
         info!(
@@ -159,7 +170,7 @@ pub(crate) fn rotate_keys(store: &mut PrincipalStore, settings: &RealmSettings) 
             names.join(" ")
         );
     }
-    if let Err(e) = rotate::purge_old_keys(store, realm, grace, rotate::unix_now(), &actor) {
+    if let Err(e) = rotate::purge_old_keys(store, realm, grace, rotate::unix_now(), &actor, host) {
         warn!("Old Kerberos keys were not purged, the next hour tries again: {e}");
     }
     Ok(())
@@ -419,7 +430,7 @@ fn create_parent(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::embedded::tests::TempRealm;
-    use krb5_kdc::host::{KerberosStoreError, LoadedRealm, PrincipalRow, RealmBatch};
+    use krb5_kdc::host::{HostChange, KerberosStoreError, LoadedRealm, PrincipalRow, RealmBatch};
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -542,7 +553,7 @@ mod tests {
         fn load(&self) -> Result<LoadedRealm, KerberosStoreError> {
             Err(KerberosStoreError::NotReady("no answer".to_owned()))
         }
-        fn commit(&self, _: RealmBatch) -> Result<(), KerberosStoreError> {
+        fn commit_change(&self, _: HostChange) -> Result<(), KerberosStoreError> {
             Err(KerberosStoreError::NotReady("no answer".to_owned()))
         }
     }
@@ -604,7 +615,7 @@ mod tests {
             ),
             (
                 true,
-                |t| t.host.commit(unopenable_row()).unwrap(),
+                |t| t.host.realm.commit(unopenable_row()).unwrap(),
                 "a Kerberos record in the database does not open",
             ),
         ];

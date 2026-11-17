@@ -37,7 +37,7 @@ use std::{net::IpAddr, sync::Arc, time::Duration};
 use tracing::{Instrument, Level, debug, error, info, instrument, span, warn};
 
 use lldap_domain::requests::{CreateGroupRequest, CreateUserRequest};
-use lldap_domain::types::{Attribute, BUILTIN_GROUPS};
+use lldap_domain::types::{Attribute, BUILTIN_GROUPS, kerberos_sync_enabled};
 use lldap_domain_handlers::kerberos::{
     DegradedKerberos, NoopKerberos, kerberos_store, set_kerberos_backend,
 };
@@ -306,6 +306,7 @@ async fn set_up_server(
                 Ok((embedded, threads)) => {
                     set_kerberos_backend(embedded.clone());
                     reconcile_principals(&backend_handler, &embedded).await?;
+                    start_pass(&backend_handler, &embedded).await?;
                     (Some(threads), Some(embedded))
                 }
                 Err(e) => {
@@ -381,6 +382,24 @@ async fn reconcile_principals(
         .collect();
     let (updated, missing) = embedded.reconcile(users).await?;
     info!("🎟️ Kerberos reconcile: {updated} principals updated, {missing} without a principal");
+    Ok(())
+}
+
+async fn start_pass(handler: &SqlBackendHandler, embedded: &EmbeddedKerberos) -> Result<()> {
+    let users = handler
+        .list_users(None, false)
+        .await?
+        .into_iter()
+        .map(|u| {
+            let sync = kerberos_sync_enabled(&u.user.attributes);
+            (u.user.user_id, sync)
+        })
+        .collect();
+    let pass = embedded.start_pass(users).await?;
+    info!(
+        "🎟️ Kerberos start pass: {} principals marked, {} removed, {} disabled",
+        pass.marked, pass.removed, pass.disabled
+    );
     Ok(())
 }
 

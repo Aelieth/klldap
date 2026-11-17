@@ -669,8 +669,53 @@ fn seed_0_7_2_realm(data_dir: &Path) {
 
 #[test]
 fn kerberos_migrates_a_dump() {
-    // As on an upgrade, the directory has the user before the realm comes over: a first start
-    // without Kerberos creates livebob, and the restart imports the dump.
+    // As on an upgrade, the directory has the user, with sync as 0.7.2 set it, before the realm
+    // comes over: a first start without Kerberos creates livebob, and the restart imports the dump.
+    let mut realm = start_realm_seeded(
+        true,
+        false,
+        free_port(),
+        &[
+            ("LLDAP_KERBEROS_OPTIONS__REALM", "LIVEBOB.TEST"),
+            ("LLDAP_KERBEROS_OPTIONS__ENABLED", "false"),
+        ],
+        seed_0_7_2_realm,
+    );
+    let http = client();
+    let base = realm.fixture.http_url();
+    let created = gql(
+        &http,
+        &base,
+        &get_token(&http, &base),
+        "mutation($u: CreateUserInput!) { createUser(user: $u) { id } }",
+        json!({"u": {
+            "id": USER,
+            "email": "livebob@example.com",
+            "attributes": [{"name": "kerberossync", "value": ["1"]}]
+        }}),
+    );
+    assert_eq!(created["data"]["createUser"]["id"], USER, "{created}");
+    realm
+        .fixture
+        .restart_with_env("LLDAP_KERBEROS_OPTIONS__ENABLED", "true");
+    expect_ok(
+        &kinit(&realm.krb, FIRST),
+        "kinit livebob on the migrated realm",
+    );
+    assert!(realm.data_dir.join("mit-db2.bak/principal.dump").is_file());
+    realm.fixture.restart();
+    expect_ok(
+        &kinit(&realm.krb, FIRST),
+        "kinit livebob after the second boot",
+    );
+    let log = realm.fixture.server_log();
+    assert_eq!(log.matches("Migrated the MIT realm").count(), 1, "{log}");
+}
+
+#[test]
+fn kerberos_migrates_a_dump_for_a_user_without_sync() {
+    // A 0.7.x operator could give a user without sync a principal with kadmin: the first start
+    // disables it, keeps it, and says why.
     let mut realm = start_realm_seeded(
         true,
         false,
@@ -694,18 +739,59 @@ fn kerberos_migrates_a_dump() {
     realm
         .fixture
         .restart_with_env("LLDAP_KERBEROS_OPTIONS__ENABLED", "true");
-    expect_ok(
-        &kinit(&realm.krb, FIRST),
-        "kinit livebob on the migrated realm",
+    let refused = kinit(&realm.krb, FIRST);
+    expect_fail(&refused, "kinit livebob without sync on the migrated realm");
+    assert!(
+        output_text(&refused).contains("revoked"),
+        "{}",
+        output_text(&refused)
     );
-    assert!(realm.data_dir.join("mit-db2.bak/principal.dump").is_file());
+    let admin_keytab = realm.admin_keytab.display().to_string();
+    let princ = realm.krb.run(
+        "kadmin",
+        &[
+            "-k",
+            "-t",
+            admin_keytab.as_str(),
+            "-p",
+            "admin/admin",
+            "-q",
+            "getprinc livebob",
+        ],
+        None,
+    );
+    expect_ok(&princ, "getprinc livebob");
+    assert!(
+        output_text(&princ).contains("DISALLOW_ALL_TIX"),
+        "{}",
+        output_text(&princ)
+    );
+    let db_url = realm.fixture.db_url().to_owned();
+    let disabled_rows = || {
+        query_i64(
+            &db_url,
+            "SELECT COUNT(*) FROM logs WHERE kind = 'kerberos_sync' AND target LIKE 'livebob%' \
+             AND detail LIKE 'disabled at start:%'",
+        )
+    };
+    assert_eq!(disabled_rows(), 1, "one row names the disabled principal");
     realm.fixture.restart();
-    expect_ok(
+    expect_fail(
         &kinit(&realm.krb, FIRST),
-        "kinit livebob after the second boot",
+        "kinit livebob without sync after the second boot",
     );
-    let log = realm.fixture.server_log();
-    assert_eq!(log.matches("Migrated the MIT realm").count(), 1, "{log}");
+    assert_eq!(disabled_rows(), 1, "a second start disables nothing again");
+    let base = realm.fixture.http_url();
+    let updated = gql(
+        &http,
+        &base,
+        &get_token(&http, &base),
+        "mutation($user: UpdateUserInput!) { updateUser(user: $user) { ok } }",
+        json!({"user": {"id": USER, "insertAttributes": [{"name": "kerberossync", "value": ["1"]}]}}),
+    );
+    assert_eq!(updated["data"]["updateUser"]["ok"], true, "{updated}");
+    // U1′ adopts the principal at sync on; its row `sync-on-adopts` then changes the password
+    // and expects kinit to work again.
 }
 
 #[test]

@@ -114,10 +114,10 @@ fn import(settings: &RealmSettings, paths: &HostPaths, host: &dyn KerberosStore)
         load_dump_with_stash(&text, &stash).map_err(|e| anyhow!("the dump does not load: {e}"))?;
     create_lockout_file(&paths.lockout)
         .map_err(|e| anyhow!("while creating {}: {e}", paths.lockout.display()))?;
-    let batch = store
-        .host_full_batch()
+    let change = store
+        .host_full_change()
         .map_err(|e| anyhow!("while sealing the imported realm: {e}"))?;
-    host.commit(batch).map_err(|e| match e {
+    host.commit_change(change).map_err(|e| match e {
         KerberosStoreError::Refused(why) => anyhow!(
             "the database refused the imported realm: {why}; create the user it names, or \
              remove the principal on 0.7.2 and dump again"
@@ -175,7 +175,7 @@ mod tests {
     use crate::boot;
     use crate::embedded::tests::TempRealm;
     use krb5_config::KdcPaths;
-    use krb5_kdc::host::{LoadedRealm, RealmBatch};
+    use krb5_kdc::host::{HostChange, LoadedRealm};
     use pretty_assertions::assert_eq;
     use std::collections::BTreeSet;
     use std::path::PathBuf;
@@ -374,7 +374,7 @@ mod tests {
         fn load(&self) -> Result<LoadedRealm, KerberosStoreError> {
             Ok(LoadedRealm::default())
         }
-        fn commit(&self, _: RealmBatch) -> Result<(), KerberosStoreError> {
+        fn commit_change(&self, _: HostChange) -> Result<(), KerberosStoreError> {
             Err(KerberosStoreError::Failed(
                 "the database is down".to_owned(),
             ))

@@ -1,3 +1,4 @@
+use krb5_kdc::admission::{AsNotice, AsQuestion, HostAdmission, KdcRefusal, TgsQuestion};
 use krb5_kdc::{
     Error, KDB_DISALLOW_ALL_TIX, KdcPolicy, PolicyAdjustment, Principal, PrincipalRead,
 };
@@ -62,6 +63,23 @@ impl KdcPolicy for LiveClients {
             e_data: None,
             detail: Some(format!("{principal}: {word}")),
         })
+    }
+}
+
+/// Until the enforcement passes: every marked client may sign in; the KDC's own entry checks run.
+pub(crate) struct AllowAll;
+
+impl HostAdmission for AllowAll {
+    fn check_as(&self, _: &AsQuestion<'_>) -> Result<(), KdcRefusal> {
+        Ok(())
+    }
+
+    fn as_notice(&self, notice: AsNotice) {
+        tracing::debug!(client = %notice.client, reason = ?notice.reason, "Kerberos AS outcome");
+    }
+
+    fn check_tgs(&self, _: &TgsQuestion<'_>) -> Result<(), KdcRefusal> {
+        Ok(())
     }
 }
 
@@ -178,5 +196,41 @@ mod tests {
             );
             assert_eq!(got, (expected, Ok(())), "fold {fold}");
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_marked_client_signs_in_only_with_the_admission_module() {
+        use krb5_asn1::{decode, encode};
+        let temp = TempRealm::new();
+        let (embedded, store) = temp.embedded();
+        embedded
+            .sync_principal(&UserId::new("bob"), "bob-pass-1")
+            .await
+            .unwrap();
+        let first_as = |store: &krb5_kdc::SharedDump| {
+            let request = krb5_protocol::as_req(
+                PrincipalName::new(PrincipalName::NT_PRINCIPAL, ["bob"]),
+                "EXAMPLE.COM",
+                1,
+                None,
+            )
+            .unwrap();
+            let reply =
+                krb5_kdc::handle_request(&*store.read().unwrap(), &encode(&request).unwrap())
+                    .unwrap();
+            decode::<krb5_types::KrbError>(&reply).map_or(0, |e| e.error_code)
+        };
+        assert_eq!(
+            first_as(&store),
+            krb5_types::err::CLIENT_REVOKED,
+            "no admission module"
+        );
+        crate::boot::install_plugins(&mut store.write().unwrap());
+        assert_ne!(
+            first_as(&store),
+            krb5_types::err::CLIENT_REVOKED,
+            "the module installed"
+        );
     }
 }

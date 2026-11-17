@@ -1,6 +1,6 @@
 use crate::boot::{self, OpenRealm, RealmSettings};
 use crate::rotate;
-use crate::seam::SqlRealm;
+use crate::seam::{Host, SqlRealm, committing};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use krb5_admin::{
@@ -8,17 +8,20 @@ use krb5_admin::{
 };
 use krb5_config::KadmindListen;
 use krb5_crypto::KeySalt;
-use krb5_kdc::host::KerberosStore;
 use krb5_kdc::{
-    AdminEnt, AdminFields, Error as StoreError, KDB_REQUIRES_PRE_AUTH, KdcLog, ListenLimits,
-    PrincipalRead, PrincipalStore, SharedDump, SharedStore, Shutdown, kadm5_mask,
+    AdminEnt, AdminFields, CreateKeys, CreatePlan, Error as StoreError, KDB_REQUIRES_PRE_AUTH,
+    KdcLog, ListenLimits, PrincipalRead, PrincipalStore, SharedDump, SharedStore, Shutdown,
+    kadm5_mask,
 };
 use krb5_types::PrincipalName;
 use lldap_domain::types::UserId;
 use lldap_domain_handlers::kerberos::{
     KerberosSync, validate_kerberos_username, validate_keytab_hostname,
 };
-use lldap_domain_handlers::logging::{LogKind, current_request, record_outcome, with_request_sync};
+use lldap_domain_handlers::logging::{
+    LogKind, current_request, record, record_outcome, with_request_sync,
+};
+use std::collections::HashMap;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -30,12 +33,17 @@ use tracing::{Span, error, info};
 use zeroize::Zeroizing;
 
 const KADMIND_START: Duration = Duration::from_secs(10);
+const USER_GONE: &str = "user gone";
+const NO_SYNC: &str = "no sync";
+const DISABLED_AT_START: &str =
+    "disabled at start: a directory user without Kerberos sync has a principal";
 
 pub struct EmbeddedKerberos {
     realm: String,
     domain: String,
     actor: String,
     store: SharedDump,
+    host: Arc<dyn Host>,
     enctypes: Vec<KeySalt>,
     max_life: u32,
     max_renewable_life: u32,
@@ -61,12 +69,12 @@ impl EmbeddedKerberos {
         settings: &RealmSettings,
         store: Arc<dyn lldap_domain_handlers::kerberos::KerberosStore>,
     ) -> Result<(Arc<Self>, RealmThreads)> {
-        Self::start_on(settings, Arc::new(SqlRealm(store)))
+        Self::start_on(settings, Arc::new(SqlRealm::new(store)))
     }
 
     pub(crate) fn start_on(
         settings: &RealmSettings,
-        host: Arc<dyn KerberosStore>,
+        host: Arc<dyn Host>,
     ) -> Result<(Arc<Self>, RealmThreads)> {
         let OpenRealm {
             store,
@@ -75,7 +83,7 @@ impl EmbeddedKerberos {
             kdc_udp,
             kdc_tcp,
             kadmin,
-        } = boot::open(settings, host)?;
+        } = boot::open(settings, host.clone())?;
         let shutdown = Shutdown::new();
         let stopping = Arc::new(AtomicBool::new(false));
         let ready = Arc::new(AtomicBool::new(false));
@@ -173,15 +181,21 @@ impl EmbeddedKerberos {
             settings.kadmin_host,
             settings.kadmin_port
         );
-        Ok((Arc::new(Self::new(store, settings, ready)), threads))
+        Ok((Arc::new(Self::new(store, settings, ready, host)), threads))
     }
 
-    pub(crate) fn new(store: SharedDump, settings: &RealmSettings, ready: Arc<AtomicBool>) -> Self {
+    pub(crate) fn new(
+        store: SharedDump,
+        settings: &RealmSettings,
+        ready: Arc<AtomicBool>,
+        host: Arc<dyn Host>,
+    ) -> Self {
         Self {
             realm: settings.realm.clone(),
             domain: settings.domain.clone(),
             actor: format!("admin/admin@{}", settings.realm),
             store,
+            host,
             enctypes: settings
                 .supported_enctypes
                 .iter()
@@ -200,16 +214,17 @@ impl EmbeddedKerberos {
     /// required pre-authentication. Returns how many were written and how many users have no
     /// principal; one that already matches is not written.
     pub async fn reconcile(&self, users: Vec<UserId>) -> Result<(usize, usize)> {
-        let (store, realm, actor) = (self.store.clone(), self.realm.clone(), self.actor.clone());
+        let own = self.own();
         let max_life = u64::from(self.max_life);
         let max_renewable_life = u64::from(self.max_renewable_life);
         let serial = self.writes.clone().lock_owned().await;
         tokio::task::spawn_blocking(move || {
             let _serial = serial;
-            let tgs = (PrincipalName::krbtgt(&realm), false);
+            let tgs = (PrincipalName::krbtgt(&own.realm), false);
             let names = std::iter::once(tgs).chain(users.iter().map(|u| (user_principal(u), true)));
             let (mut stale, mut missing) = (Vec::new(), 0);
-            let mut store = store
+            let mut store = own
+                .store
                 .write()
                 .map_err(|_| anyhow!("the principal store was poisoned"))?;
             for (name, user) in names {
@@ -236,9 +251,9 @@ impl EmbeddedKerberos {
             }
             if !stale.is_empty() {
                 store
-                    .change(|s| {
+                    .change_committing(committing(own.host.as_ref()), |s| {
                         for (name, fields) in &stale {
-                            s.apply_admin_fields_in(name, &realm, fields.clone(), &actor)?;
+                            s.apply_admin_fields_in(name, &own.realm, fields.clone(), &own.actor)?;
                         }
                         Ok::<_, StoreError>(())
                     })
@@ -253,19 +268,89 @@ impl EmbeddedKerberos {
 
     /// The hourly purge of key versions no ticket can still need.
     pub async fn purge_old_keys(&self) -> Result<usize> {
-        let (store, realm, actor) = (self.store.clone(), self.realm.clone(), self.actor.clone());
+        let own = self.own();
         let grace = self.key_grace;
         let serial = self.writes.clone().lock_owned().await;
         tokio::task::spawn_blocking(move || {
             let _serial = serial;
-            let mut store = store
+            let mut store = own
+                .store
                 .write()
                 .map_err(|_| anyhow!("the principal store was poisoned"))?;
-            rotate::purge_old_keys(&mut store, &realm, grace, rotate::unix_now(), &actor)
+            let now = rotate::unix_now();
+            rotate::purge_old_keys(&mut store, &own.realm, grace, now, &own.actor, &*own.host)
                 .map_err(|e| anyhow!("while purging old Kerberos keys: {e}"))
         })
         .await
         .context("the purge did not complete")?
+    }
+
+    /// Once at start, before the listeners, on users read beforehand with their sync: marks each
+    /// synced user's principal, removes a marked one no synced user has, and disables an
+    /// unmarked one of a user without sync. A second run writes nothing.
+    pub async fn start_pass(&self, users: Vec<(UserId, bool)>) -> Result<StartPass> {
+        let own = self.own();
+        let serial = self.writes.clone().lock_owned().await;
+        let swept = tokio::task::spawn_blocking(move || {
+            let _serial = serial;
+            let directory: HashMap<String, bool> = users
+                .into_iter()
+                .map(|(user, sync)| (user.into_string(), sync))
+                .collect();
+            let mut store = own
+                .store
+                .write()
+                .map_err(|_| anyhow!("the principal store was poisoned"))?;
+            store
+                .change_committing(committing(own.host.as_ref()), |s| {
+                    let swept = sweep_plan(s, &own.realm, &directory);
+                    for one in &swept {
+                        match one.sweep {
+                            Sweep::Mark => s.set_host_owned_in(&one.name, &own.realm, true)?,
+                            Sweep::Remove(_) => s.remove_in(&one.name, &own.realm)?,
+                            Sweep::Disable => {
+                                s.set_status(&one.name, true, one.pw_expire, &own.actor)?;
+                            }
+                        }
+                    }
+                    Ok::<_, StoreError>(swept)
+                })
+                .and_then(|swept| swept)
+                .map_err(|e| anyhow!("while sweeping the Kerberos principals at start: {e}"))
+                .inspect(|_| own.host.start_pass_committed())
+        })
+        .await
+        .context("the start pass did not complete")??;
+        let mut pass = StartPass::default();
+        for one in &swept {
+            let target = Some(one.target.as_str());
+            match one.sweep {
+                Sweep::Mark => pass.marked += 1,
+                Sweep::Remove(reason) => {
+                    pass.removed += 1;
+                    let detail = format!("removed at start: {reason}");
+                    record(LogKind::KerberosSync, target, Some(&detail));
+                }
+                Sweep::Disable => {
+                    pass.disabled += 1;
+                    record(LogKind::KerberosSync, target, Some(DISABLED_AT_START));
+                }
+            }
+        }
+        if pass.marked > 0 {
+            let detail = format!("marked at start: {} principals", pass.marked);
+            record(LogKind::KerberosSync, None, Some(&detail));
+        }
+        Ok(pass)
+    }
+
+    fn own(&self) -> Own {
+        Own {
+            store: self.store.clone(),
+            host: self.host.clone(),
+            realm: self.realm.clone(),
+            actor: self.actor.clone(),
+        }
     }
 
     fn new_principal(&self) -> AdminEnt {
@@ -289,7 +374,7 @@ impl KerberosSync for EmbeddedKerberos {
     }
     async fn sync_principal(&self, user: &UserId, password: &str) -> Result<(), String> {
         validate_kerberos_username(user.as_str())?;
-        let (store, realm, actor) = (self.store.clone(), self.realm.clone(), self.actor.clone());
+        let own = self.own();
         let (name, enctypes, ent) = (
             user_principal(user),
             self.enctypes.clone(),
@@ -302,20 +387,20 @@ impl KerberosSync for EmbeddedKerberos {
             user.as_str(),
             "sync",
             move || {
-                set_password(&store, &name, &realm, &password, &enctypes, &ent, &actor)
+                set_password(&own, &name, &password, &enctypes, &ent)
                     .map_err(|e| anyhow!("while setting the Kerberos password: {e}"))
             },
         )
         .await
     }
     async fn delete_principal(&self, user: &UserId) -> Result<(), String> {
-        let (store, realm, name) = (self.store.clone(), self.realm.clone(), user_principal(user));
+        let (own, name) = (self.own(), user_principal(user));
         logged(
             &self.writes,
             LogKind::KerberosSync,
             user.as_str(),
             "delete",
-            move || match in_change(&store, |s| s.remove_in(&name, &realm)) {
+            move || match in_change(&own, |s| s.remove_in(&name, &own.realm)) {
                 Ok(()) | Err(StoreError::NotFound) => Ok(()),
                 Err(e) => Err(anyhow!("while deleting the principal: {e}")),
             },
@@ -324,15 +409,17 @@ impl KerberosSync for EmbeddedKerberos {
     }
     async fn set_principal_enabled(&self, user: &UserId, enabled: bool) -> Result<(), String> {
         let op = if enabled { "enable" } else { "disable" };
-        let (store, actor, name) = (self.store.clone(), self.actor.clone(), user_principal(user));
+        let (own, name) = (self.own(), user_principal(user));
         logged(
             &self.writes,
             LogKind::KerberosSync,
             user.as_str(),
             op,
             move || {
-                in_change(&store, |s| match s.fetch_name(&name)? {
-                    Some(principal) => s.set_status(&name, !enabled, principal.pw_expire, &actor),
+                in_change(&own, |s| match s.fetch_name(&name)? {
+                    Some(principal) => {
+                        s.set_status(&name, !enabled, principal.pw_expire, &own.actor)
+                    }
                     None => Ok(()),
                 })
                 .map_err(|e| anyhow!("while setting the principal's status: {e}"))
@@ -346,7 +433,7 @@ impl KerberosSync for EmbeddedKerberos {
             host => host.to_owned(),
         };
         validate_keytab_hostname(&host)?;
-        let (store, realm, actor) = (self.store.clone(), self.realm.clone(), self.actor.clone());
+        let own = self.own();
         let (path, etypes) = (self.keycloak_keytab.clone(), self.enctypes.clone());
         let name = PrincipalName::new(PrincipalName::NT_SRV_HST, ["HTTP", host.as_str()]);
         logged(
@@ -355,11 +442,11 @@ impl KerberosSync for EmbeddedKerberos {
             &host,
             "keycloak",
             move || {
-                let keytab = in_change(&store, |s| {
+                let keytab = in_change(&own, |s| {
                     if s.fetch_name(&name)?.is_none() {
-                        s.insert_new_randkey(&name, &realm, &etypes, &actor)?;
+                        s.insert_new_randkey(&name, &own.realm, &etypes, &own.actor)?;
                     }
-                    s.chrand_etypes_keepold_in(&name, &realm, &etypes, 0, &actor)?;
+                    s.chrand_etypes_keepold_in(&name, &own.realm, &etypes, 0, &own.actor)?;
                     s.export_keytab_local(&name)
                 })
                 .map_err(|e| anyhow!("while rotating the Keycloak service key: {e}"))?;
@@ -467,25 +554,37 @@ fn after_create(result: Result<(), StoreError>) -> Next {
     }
 }
 
+// What a write of our own needs; kerber-rust hands its change to `committing`, as `Embedded`.
+struct Own {
+    store: SharedDump,
+    host: Arc<dyn Host>,
+    realm: String,
+    actor: String,
+}
+
 fn set_password(
-    store: &SharedDump,
+    own: &Own,
     name: &PrincipalName,
-    realm: &str,
     password: &[u8],
     enctypes: &[KeySalt],
     ent: &AdminEnt,
-    actor: &str,
 ) -> Result<(), StoreError> {
     let change = || {
-        krb5_kdc::change_password_shared(store, name, realm, password, 0, actor, enctypes, |_| {
-            Ok(())
-        })
+        krb5_kdc::change_password_shared_committing(
+            &own.store,
+            name,
+            &own.realm,
+            password,
+            0,
+            &own.actor,
+            enctypes,
+            |_| Ok(()),
+            committing(own.host.as_ref()),
+        )
     };
     let mut next = after_change(change());
     if next == Next::Create {
-        next = after_create(krb5_kdc::create_password_shared(
-            store, name, realm, password, enctypes, ent, actor,
-        ));
+        next = after_create(create_marked(own, name, password, enctypes, ent));
     }
     if next == Next::ChangeAgain {
         next = after_change(change());
@@ -497,14 +596,102 @@ fn set_password(
     }
 }
 
+fn create_marked(
+    own: &Own,
+    name: &PrincipalName,
+    password: &[u8],
+    enctypes: &[KeySalt],
+    ent: &AdminEnt,
+) -> Result<(), StoreError> {
+    let planned = {
+        let (g, read) = krb5_kdc::read_fresh(&own.store);
+        match read {
+            Err(_) => None,
+            Ok(()) => Some(g.plan_create_password(name, &own.realm, password, enctypes, ent)?),
+        }
+    };
+    let prepared = planned.map(CreatePlan::derive).transpose()?;
+    let mut store = own.store.write().map_err(|_| poisoned())?;
+    store.change_committing(committing(own.host.as_ref()), |s| {
+        let created = match prepared {
+            Some(p) => s.create_prepared(p, &own.actor)?,
+            None => false,
+        };
+        if !created {
+            let keys = CreateKeys::Password(password);
+            s.create_principal_3_in(name, &own.realm, keys, enctypes, ent, &own.actor)?;
+        }
+        s.set_host_owned_in(name, &own.realm, true)
+    })?
+}
+
 fn in_change<T>(
-    store: &SharedDump,
+    own: &Own,
     f: impl FnOnce(&mut PrincipalStore) -> Result<T, StoreError>,
 ) -> Result<T, StoreError> {
-    let mut store = store.write().map_err(|_| {
-        StoreError::InvalidArgument("the principal store was poisoned by a panic".to_owned())
-    })?;
-    store.change(f)?
+    let mut store = own.store.write().map_err(|_| poisoned())?;
+    store.change_committing(committing(own.host.as_ref()), f)?
+}
+
+fn poisoned() -> StoreError {
+    StoreError::InvalidArgument("the principal store was poisoned by a panic".to_owned())
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct StartPass {
+    pub marked: usize,
+    pub removed: usize,
+    pub disabled: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sweep {
+    Mark,
+    Remove(&'static str),
+    Disable,
+}
+
+struct Swept {
+    name: PrincipalName,
+    target: String,
+    pw_expire: u32,
+    sweep: Sweep,
+}
+
+// `user` is the sync of the directory user the one-part name matches, or None.
+fn sweep_of(owned: bool, locked: bool, user: Option<bool>) -> Option<Sweep> {
+    match (owned, user) {
+        (false, Some(true)) => Some(Sweep::Mark),
+        (true, None) => Some(Sweep::Remove(USER_GONE)),
+        (true, Some(false)) => Some(Sweep::Remove(NO_SYNC)),
+        (false, Some(false)) if !locked => Some(Sweep::Disable),
+        _ => None,
+    }
+}
+
+fn sweep_plan(
+    store: &PrincipalStore,
+    realm: &str,
+    directory: &HashMap<String, bool>,
+) -> Vec<Swept> {
+    store
+        .ids()
+        .iter()
+        .filter_map(|id| store.get_raw(id))
+        .filter(|p| p.realm == realm && p.alias_target().is_none())
+        .filter_map(|p| {
+            let user = (p.name.name_string.len() == 1)
+                .then(|| p.name.try_components_joined())
+                .flatten()
+                .and_then(|one| directory.get(&one).copied());
+            Some(Swept {
+                name: p.name.clone(),
+                target: p.name.unparse_no_realm_lossy(),
+                pw_expire: p.pw_expire,
+                sweep: sweep_of(p.host_owned(), p.locked(), user)?,
+            })
+        })
+        .collect()
 }
 
 fn user_principal(user: &UserId) -> PrincipalName {
@@ -541,9 +728,12 @@ async fn logged<T: Send + 'static>(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::seam::verdict;
     use krb5_crypto::EncryptionType;
     use krb5_kdc::KDB_DISALLOW_ALL_TIX;
-    use krb5_kdc::host::{KerberosStoreError, LoadedRealm, MemoryRealm, RealmBatch};
+    use krb5_kdc::host::{
+        HostChange, KerberosStore, KerberosStoreError, LoadedRealm, MemoryRealm, Operation,
+    };
     use lldap_domain_handlers::logging::{RequestMeta, with_request};
     use lldap_test_utils::recording_log::LogGuard;
     use pretty_assertions::assert_eq;
@@ -552,21 +742,32 @@ pub(crate) mod tests {
     use std::path::Path;
     use std::sync::atomic::AtomicUsize;
 
-    /// kerber-rust's in-memory host, counting the commits it takes.
+    /// kerber-rust's in-memory host with SqlRealm's verdict, keeping what reaches it.
     #[derive(Default)]
     pub(crate) struct Counting {
-        realm: MemoryRealm,
-        commits: AtomicUsize,
+        pub(crate) realm: MemoryRealm,
+        changes: std::sync::Mutex<Vec<Operation>>,
+        own: AtomicUsize,
     }
 
     impl KerberosStore for Counting {
         fn load(&self) -> Result<LoadedRealm, KerberosStoreError> {
             self.realm.load()
         }
-        fn commit(&self, batch: RealmBatch) -> Result<(), KerberosStoreError> {
-            self.commits.fetch_add(1, Ordering::Relaxed);
-            self.realm.commit(batch)
+        fn commit_change(&self, change: HostChange) -> Result<(), KerberosStoreError> {
+            self.changes.lock().unwrap().push(change.intent.operation);
+            verdict(&change)?;
+            self.realm.commit(change.batch)
         }
+    }
+
+    impl Host for Counting {
+        fn write_own(&self, change: HostChange) -> Result<(), KerberosStoreError> {
+            self.own.fetch_add(1, Ordering::Relaxed);
+            self.realm.commit(change.batch)
+        }
+
+        fn start_pass_committed(&self) {}
     }
 
     pub(crate) struct TempRealm {
@@ -609,8 +810,20 @@ pub(crate) mod tests {
             self.host.clone()
         }
 
+        pub(crate) fn own(&self) -> Arc<dyn Host> {
+            self.host.clone()
+        }
+
         pub(crate) fn commits(&self) -> usize {
-            self.host.commits.load(Ordering::Relaxed)
+            self.changes().len() + self.own_writes()
+        }
+
+        pub(crate) fn changes(&self) -> Vec<Operation> {
+            self.host.changes.lock().unwrap().clone()
+        }
+
+        pub(crate) fn own_writes(&self) -> usize {
+            self.host.own.load(Ordering::Relaxed)
         }
 
         pub(crate) fn embedded(&self) -> (EmbeddedKerberos, SharedDump) {
@@ -619,9 +832,13 @@ pub(crate) mod tests {
             let store = krb5_kdc::shared_dump(opened);
             let ready = Arc::new(AtomicBool::new(true));
             (
-                EmbeddedKerberos::new(store.clone(), &self.settings, ready),
+                EmbeddedKerberos::new(store.clone(), &self.settings, ready, self.own()),
                 store,
             )
+        }
+
+        pub(crate) fn reopened(&self) -> PrincipalStore {
+            boot::open_store(&self.settings, &boot::profile(&self.settings), self.host()).unwrap()
         }
     }
 
@@ -680,7 +897,7 @@ pub(crate) mod tests {
             .sync_principal(&bob, "Bob-Password-1")
             .await
             .unwrap();
-        in_change(&store, |s| {
+        in_change(&embedded.own(), |s| {
             s.set_status(&user_principal(&bob), false, 2_000_000_000, "test")
         })
         .unwrap();
@@ -766,8 +983,9 @@ pub(crate) mod tests {
         let again = embedded.reconcile(users).await.unwrap();
         let profile = boot::profile(&temp.settings);
         let mut reopened = boot::open_store(&temp.settings, &profile, temp.host()).unwrap();
-        boot::rotate_keys(&mut reopened, &temp.settings).unwrap();
-        boot::rotate_keys(&mut store.write().unwrap(), &temp.settings).unwrap();
+        let own = temp.own();
+        boot::rotate_keys(&mut reopened, &temp.settings, own.as_ref()).unwrap();
+        boot::rotate_keys(&mut store.write().unwrap(), &temp.settings, own.as_ref()).unwrap();
         assert_eq!((again, temp.commits()), ((0, 1), commits));
         assert_eq!(files(&temp.settings.data_dir), before);
     }
@@ -785,10 +1003,258 @@ pub(crate) mod tests {
             (&port_taken, "while binding the KDC on UDP"),
             (&dir_is_a_file, "while creating"),
         ] {
-            let error = EmbeddedKerberos::start_on(&temp.settings, temp.host())
+            let error = EmbeddedKerberos::start_on(&temp.settings, temp.own())
                 .err()
                 .unwrap();
             assert!(format!("{error:#}").contains(cause), "{error:#}");
         }
+    }
+
+    fn bob() -> UserId {
+        UserId::new("bob")
+    }
+
+    fn marked(store: &SharedDump, user: &str) -> Option<(bool, bool)> {
+        let name = user_principal(&UserId::new(user));
+        let guard = store.read().unwrap();
+        let principal = guard.get_name(&name)?;
+        Some((principal.host_owned(), principal.locked()))
+    }
+
+    pub(crate) fn unmarked(embedded: &EmbeddedKerberos, user: &str, locked: bool) {
+        let name = user_principal(&UserId::new(user));
+        in_change(&embedded.own(), |s| {
+            s.insert_new_randkey(&name, "EXAMPLE.COM", &[], "test")?;
+            s.set_status(&name, locked, 0, "test")
+        })
+        .unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_each_own_write_commits_through_the_closure() {
+        let temp = TempRealm::new();
+        let (embedded, _store) = temp.embedded();
+        unmarked(&embedded, "carol", false);
+        let carol = UserId::new("carol");
+        let mut seen = temp.own_writes();
+        let sites = [
+            "sync, create",
+            "sync, change",
+            "disable",
+            "enable",
+            "reconcile",
+            "keytab",
+            "start pass",
+            "delete",
+        ];
+        for site in sites {
+            match site {
+                "sync, create" | "sync, change" => {
+                    embedded
+                        .sync_principal(&bob(), "Bob-Password-1")
+                        .await
+                        .unwrap();
+                }
+                "disable" => embedded.set_principal_enabled(&bob(), false).await.unwrap(),
+                "enable" => embedded.set_principal_enabled(&bob(), true).await.unwrap(),
+                "reconcile" => {
+                    embedded.reconcile(vec![carol.clone()]).await.unwrap();
+                }
+                "keytab" => {
+                    embedded.export_keytab_for_keycloak("").await.unwrap();
+                }
+                "start pass" => {
+                    let users = vec![(bob(), true), (carol.clone(), true)];
+                    embedded.start_pass(users).await.unwrap();
+                }
+                "delete" => embedded.delete_principal(&bob()).await.unwrap(),
+                _ => unreachable!(),
+            }
+            let now = temp.own_writes();
+            assert_eq!(
+                (temp.changes(), now > seen),
+                (vec![Operation::Bootstrap], true),
+                "{site}"
+            );
+            seen = now;
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_synced_create_is_marked_in_its_own_change() {
+        let temp = TempRealm::new();
+        let (embedded, store) = temp.embedded();
+        let before = temp.own_writes();
+        embedded
+            .sync_principal(&bob(), "Bob-Password-1")
+            .await
+            .unwrap();
+        embedded
+            .sync_principal(&bob(), "Bob-Password-2")
+            .await
+            .unwrap();
+        let reopened = temp.reopened();
+        let kept = reopened
+            .get_name(&user_principal(&bob()))
+            .map(|p| p.host_owned());
+        assert_eq!(
+            (temp.own_writes() - before, marked(&store, "bob"), kept),
+            (2, Some((true, false)), Some(true))
+        );
+    }
+
+    #[test]
+    fn test_what_the_start_pass_does_with_each_principal() {
+        type Row = (&'static str, bool, bool, Option<bool>, Option<Sweep>);
+        let rows: [Row; 9] = [
+            (
+                "synced, unmarked",
+                false,
+                false,
+                Some(true),
+                Some(Sweep::Mark),
+            ),
+            (
+                "synced and disabled",
+                false,
+                true,
+                Some(true),
+                Some(Sweep::Mark),
+            ),
+            ("synced, marked", true, false, Some(true), None),
+            (
+                "marked, user gone",
+                true,
+                false,
+                None,
+                Some(Sweep::Remove(USER_GONE)),
+            ),
+            (
+                "marked, disabled, gone",
+                true,
+                true,
+                None,
+                Some(Sweep::Remove(USER_GONE)),
+            ),
+            (
+                "marked, no sync",
+                true,
+                false,
+                Some(false),
+                Some(Sweep::Remove(NO_SYNC)),
+            ),
+            (
+                "unmarked, no sync",
+                false,
+                false,
+                Some(false),
+                Some(Sweep::Disable),
+            ),
+            (
+                "unmarked, no sync, disabled",
+                false,
+                true,
+                Some(false),
+                None,
+            ),
+            ("unmarked, no user", false, false, None, None),
+        ];
+        for (row, owned, locked, user, expected) in rows {
+            assert_eq!(sweep_of(owned, locked, user), expected, "{row}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_the_start_pass_marks_removes_and_disables_once() {
+        let guard = LogGuard::install();
+        let temp = TempRealm::new();
+        let (embedded, store) = temp.embedded();
+        for user in ["alice", "gone", "nosync"] {
+            embedded
+                .sync_principal(&UserId::new(user), "A-Password-1")
+                .await
+                .unwrap();
+        }
+        unmarked(&embedded, "carol", false);
+        unmarked(&embedded, "dave", false);
+        unmarked(&embedded, "eve", true);
+        unmarked(&embedded, "foreign", false);
+        let users: Vec<(UserId, bool)> = [
+            ("alice", true),
+            ("carol", true),
+            ("nosync", false),
+            ("dave", false),
+            ("eve", false),
+            ("frank", true),
+        ]
+        .into_iter()
+        .map(|(user, sync)| (UserId::new(user), sync))
+        .collect();
+        guard.recorder().take_events();
+
+        let pass = embedded.start_pass(users.clone()).await.unwrap();
+        let after: Vec<_> = ["alice", "carol", "gone", "nosync", "dave", "eve", "foreign"]
+            .into_iter()
+            .map(|user| (user, marked(&store, user)))
+            .collect();
+        assert_eq!(
+            (pass, after),
+            (
+                StartPass {
+                    marked: 1,
+                    removed: 2,
+                    disabled: 1
+                },
+                vec![
+                    ("alice", Some((true, false))),
+                    ("carol", Some((true, false))),
+                    ("gone", None),
+                    ("nosync", None),
+                    ("dave", Some((false, true))),
+                    ("eve", Some((false, true))),
+                    ("foreign", Some((false, false))),
+                ]
+            )
+        );
+        let rows: Vec<_> = guard
+            .recorder()
+            .take_events()
+            .into_iter()
+            .map(|e| (e.target, e.detail))
+            .collect();
+        let row = |target: Option<&str>, detail: &str| {
+            (target.map(str::to_owned), Some(detail.to_owned()))
+        };
+        assert_eq!(
+            rows,
+            vec![
+                row(Some("dave"), DISABLED_AT_START),
+                row(Some("gone"), "removed at start: user gone"),
+                row(Some("nosync"), "removed at start: no sync"),
+                row(None, "marked at start: 1 principals"),
+            ]
+        );
+
+        let (writes, changes) = (temp.own_writes(), temp.changes());
+        let again = embedded.start_pass(users).await.unwrap();
+        assert_eq!(
+            (
+                again,
+                temp.own_writes(),
+                temp.changes(),
+                guard.recorder().take_events()
+            ),
+            (StartPass::default(), writes, changes, Vec::new())
+        );
+        let reopened = temp.reopened();
+        assert!(
+            reopened
+                .get_name(&user_principal(&UserId::new("carol")))
+                .is_some_and(|p| p.host_owned()),
+            "the upgrade's mark survives a reload"
+        );
     }
 }

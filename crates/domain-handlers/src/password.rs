@@ -1,7 +1,7 @@
 use crate::kerberos::{
-    CommitError, Committed, HostRow, PasswordCommit, kerberos_backend, require_kdc_ready,
+    CommitError, HostRow, KerberosSync, PasswordCommit, kerberos_backend, require_kdc_ready,
 };
-use crate::logging::{self, LogEvent, LogKind};
+use crate::logging::{self, LogKind};
 use lldap_domain::requests::CreateUserRequest;
 use lldap_domain::types::UserId;
 use lldap_domain_model::error::DomainError;
@@ -12,6 +12,12 @@ pub const PASSWORD_CHANGE_IN_PROGRESS: &str = "a password change is in progress,
 pub const RESULT_UNKNOWN: &str = "the result is unknown: try the new password";
 pub const ANSWER_LOST: &str = "the answer was lost; the change had committed";
 pub const UNKNOWN_ROW: &str = "result unknown: the database did not answer";
+pub const PASSWORD_MIN_LENGTH: usize = 8;
+
+/// The directory's floor, in characters (Unicode scalar values), at every door.
+pub fn long_enough(password: &str) -> bool {
+    password.chars().count() >= PASSWORD_MIN_LENGTH
+}
 
 #[cfg(feature = "kill-points")]
 pub fn kill_point(name: &str) {
@@ -75,11 +81,24 @@ fn commit_error(e: CommitError) -> PasswordChangeError {
         CommitError::Refused(reason) => PasswordChangeError::Refused(reason),
         CommitError::UserGone => PasswordChangeError::NoSuchUser,
         CommitError::Failed(cause) => PasswordChangeError::Failed(cause),
-        CommitError::Unknown(cause) => {
-            warn!("A password change's result is unknown: {cause}");
-            PasswordChangeError::Unknown
-        }
+        CommitError::Unknown(_) => PasswordChangeError::Unknown,
     }
+}
+
+/// Written by the task that did the work, so a dropped caller still has its row.
+pub fn record_commit_failure(kind: LogKind, user: &UserId, error: &CommitError) {
+    if let CommitError::Unknown(cause) = error {
+        warn!("A password change's result is unknown: {cause}");
+    }
+    record_failed(kind, user, &commit_error(error.clone()));
+}
+
+fn record_failed(kind: LogKind, user: &UserId, error: &PasswordChangeError) {
+    let detail = match error {
+        PasswordChangeError::Unknown => UNKNOWN_ROW.to_owned(),
+        e => e.to_string(),
+    };
+    logging::record_failure(kind, Some(user.as_str()), &detail);
 }
 
 /// With kerberossync on, the directory record and the KDC keys change in one transaction, or
@@ -95,8 +114,7 @@ pub async fn change_password_everywhere(
             .await
             .map_err(change_error);
     }
-    let changed = commit_synced(handler, user, password, None).await;
-    finish(LogKind::PasswordChange, user, changed)
+    commit_synced(handler, user, password, None).await
 }
 
 /// An LDAP Add with a password for a synced user: the user, its record and its principal in one
@@ -107,33 +125,7 @@ pub async fn create_synced_user(
     password: &str,
 ) -> Result<(), PasswordChangeError> {
     let user = request.user_id.clone();
-    let changed = commit_synced(handler, &user, password, Some(request)).await;
-    finish(LogKind::UserCreate, &user, changed)
-}
-
-// A committed change's rows are in its transaction; a failure gets its one row here.
-fn finish(
-    kind: LogKind,
-    user: &UserId,
-    changed: Result<(Committed, Vec<LogEvent>), PasswordChangeError>,
-) -> Result<(), PasswordChangeError> {
-    match changed {
-        Ok((committed, rows)) => {
-            rows.iter().for_each(logging::print);
-            if committed == Committed::AnswerLost {
-                warn!("{kind} {user}: {ANSWER_LOST}");
-            }
-            Ok(())
-        }
-        Err(e) => {
-            let detail = match e {
-                PasswordChangeError::Unknown => UNKNOWN_ROW.to_owned(),
-                _ => e.to_string(),
-            };
-            logging::record_failure(kind, Some(user.as_str()), &detail);
-            Err(e)
-        }
-    }
+    commit_synced(handler, &user, password, Some(request)).await
 }
 
 async fn commit_synced(
@@ -141,9 +133,44 @@ async fn commit_synced(
     user: &UserId,
     password: &str,
     create: Option<CreateUserRequest>,
-) -> Result<(Committed, Vec<LogEvent>), PasswordChangeError> {
-    require_kdc_ready().map_err(change_error)?;
+) -> Result<(), PasswordChangeError> {
+    let kind = match create {
+        Some(_) => LogKind::UserCreate,
+        None => LogKind::PasswordChange,
+    };
     let kerberos = kerberos_backend();
+    let answer = match prepare_change(handler, &*kerberos, user, password, create).await {
+        Ok(rows) => {
+            let change = PasswordCommit {
+                user: user.clone(),
+                rows,
+                kind,
+            };
+            kerberos.commit_password(change, password).await
+        }
+        Err(e) => {
+            record_failed(kind, user, &e);
+            return Err(e);
+        }
+    };
+    match answer {
+        Ok(()) => Ok(()),
+        Err(CommitError::Busy) => {
+            record_failed(kind, user, &PasswordChangeError::InProgress);
+            Err(PasswordChangeError::InProgress)
+        }
+        Err(e) => Err(commit_error(e)),
+    }
+}
+
+async fn prepare_change(
+    handler: &(impl OpaqueHandler + ?Sized),
+    kerberos: &dyn KerberosSync,
+    user: &UserId,
+    password: &str,
+    create: Option<CreateUserRequest>,
+) -> Result<Vec<HostRow>, PasswordChangeError> {
+    require_kdc_ready().map_err(change_error)?;
     kerberos
         .check_password(user, password)
         .await
@@ -152,24 +179,10 @@ async fn commit_synced(
         .await
         .map_err(change_error)?;
     kill_point("opaque-prepared");
-    let (rows, logged) = host_rows(user, &record, create);
-    let change = PasswordCommit {
-        user: user.clone(),
-        record,
-        rows,
-    };
-    let committed = kerberos
-        .commit_password(change, password)
-        .await
-        .map_err(commit_error)?;
-    Ok((committed, logged))
+    Ok(host_rows(user, &record, create))
 }
 
-fn host_rows(
-    user: &UserId,
-    record: &[u8],
-    create: Option<CreateUserRequest>,
-) -> (Vec<HostRow>, Vec<LogEvent>) {
+fn host_rows(user: &UserId, record: &[u8], create: Option<CreateUserRequest>) -> Vec<HostRow> {
     let target = Some(user.as_str());
     let mut rows = Vec::new();
     let mut logged = Vec::new();
@@ -183,8 +196,8 @@ fn host_rows(
         now: chrono::Utc::now().naive_utc(),
     });
     logged.push(logging::event(LogKind::PasswordChange, target, true, None));
-    rows.extend(logged.iter().cloned().map(HostRow::Log));
-    (rows, logged)
+    rows.extend(logged.into_iter().map(HostRow::Log));
+    rows
 }
 
 #[cfg(test)]
@@ -253,11 +266,32 @@ mod tests {
             ),
         ];
         for (create, expected) in rows {
-            let (rows, logged) = host_rows(&bob, b"record", create);
+            let rows = host_rows(&bob, b"record", create);
             let labels: Vec<_> = rows.iter().map(HostRow::label).collect();
             assert_eq!(labels, expected);
-            assert!(logged.iter().all(|row| row.success && row.detail.is_none()));
+            assert!(rows.iter().all(|row| match row {
+                HostRow::Log(event) => event.success && event.detail.is_none(),
+                _ => true,
+            }));
         }
+    }
+
+    #[test]
+    fn test_the_floor_counts_characters() {
+        let rows = [
+            ("", false),
+            ("Short-7", false),
+            ("pässwör", false),
+            ("Eight-88", true),
+            ("pässwörd", true),
+            ("ÄÖÜäöüßé", true),
+        ];
+        let got: Vec<_> = rows
+            .iter()
+            .map(|(text, _)| (*text, long_enough(text)))
+            .collect();
+        assert_eq!(got, rows.to_vec());
+        assert_eq!(("pässwör".len(), PASSWORD_MIN_LENGTH), (9, 8));
     }
 
     #[test]
@@ -283,21 +317,12 @@ mod tests {
         let rows = std::sync::Arc::new(Rows::default());
         logging::set_log_sink(rows.clone());
         let bob = UserId::new("bob");
-        let unknown = finish(
-            LogKind::PasswordChange,
-            &bob,
-            Err(PasswordChangeError::Unknown),
-        );
-        let failed = finish(
-            LogKind::PasswordChange,
-            &bob,
-            Err(PasswordChangeError::Failed(
-                "the generation moved".to_owned(),
-            )),
-        );
+        let unknown = CommitError::Unknown("the database did not answer".to_owned());
+        record_commit_failure(LogKind::PasswordChange, &bob, &unknown);
+        let failed = CommitError::Failed("the generation moved".to_owned());
+        record_commit_failure(LogKind::PasswordChange, &bob, &failed);
         logging::set_log_sink(std::sync::Arc::new(logging::NoopLogSink));
-        assert_eq!(unknown.unwrap_err().to_string(), RESULT_UNKNOWN);
-        assert!(failed.is_err());
+        assert_eq!(commit_error(unknown).to_string(), RESULT_UNKNOWN);
         let details: Vec<_> = rows
             .0
             .lock()

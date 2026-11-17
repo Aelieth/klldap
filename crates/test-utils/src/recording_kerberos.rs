@@ -1,9 +1,10 @@
 use async_trait::async_trait;
 use lldap_domain::types::UserId;
 use lldap_domain_handlers::kerberos::{
-    CommitError, Committed, DegradedKerberos, HostRow, KerberosSync, NoopKerberos, PasswordCommit,
+    CommitError, DegradedKerberos, HostRow, KerberosSync, NoopKerberos, PasswordCommit,
     set_kerberos_backend,
 };
+use lldap_domain_handlers::password::record_commit_failure;
 use std::sync::{Arc, Mutex};
 
 pub const RECORDER_REALM: &str = "RECORDER.TEST";
@@ -35,7 +36,7 @@ pub struct RecordingKerberos {
     ops: Mutex<Vec<KerberosOp>>,
     sync_error: Option<String>,
     check_error: Option<String>,
-    commit: Result<Committed, CommitError>,
+    commit: Result<(), CommitError>,
 }
 
 impl Default for RecordingKerberos {
@@ -44,7 +45,7 @@ impl Default for RecordingKerberos {
             ops: Mutex::new(Vec::new()),
             sync_error: None,
             check_error: None,
-            commit: Ok(Committed::Done),
+            commit: Ok(()),
         }
     }
 }
@@ -71,7 +72,7 @@ impl RecordingKerberos {
         })
     }
 
-    pub fn answering(commit: Result<Committed, CommitError>) -> Arc<Self> {
+    pub fn answering(commit: Result<(), CommitError>) -> Arc<Self> {
         Arc::new(Self {
             commit,
             ..Self::default()
@@ -105,7 +106,7 @@ impl KerberosSync for RecordingKerberos {
         &self,
         change: PasswordCommit,
         password: &str,
-    ) -> Result<Committed, CommitError> {
+    ) -> Result<(), CommitError> {
         self.ops
             .lock()
             .expect("ops")
@@ -114,6 +115,11 @@ impl KerberosSync for RecordingKerberos {
                 password: password.to_owned(),
                 rows: change.rows.iter().map(HostRow::label).collect(),
             });
+        if let Err(e) = &self.commit
+            && *e != CommitError::Busy
+        {
+            record_commit_failure(change.kind, &change.user, e);
+        }
         self.commit.clone()
     }
     async fn delete_principal(&self, user: &UserId) -> Result<(), String> {
@@ -162,7 +168,7 @@ impl RecordingGuard {
         Self::installed(RecordingKerberos::refusing(cause))
     }
 
-    pub fn install_answering(commit: Result<Committed, CommitError>) -> Self {
+    pub fn install_answering(commit: Result<(), CommitError>) -> Self {
         Self::installed(RecordingKerberos::answering(commit))
     }
 

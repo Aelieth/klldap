@@ -50,6 +50,7 @@ path = "../auth"
 
 [dev-dependencies.lldap_sql_backend_handler]
 path = "../sql-backend-handler"
+features = ["test-hooks"]
 
 [dev-dependencies.lldap_test_utils]
 path = "../test-utils"

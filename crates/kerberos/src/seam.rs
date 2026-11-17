@@ -3,13 +3,17 @@ use krb5_kdc::host::{
     LoadedRealm, Operation, PolicyRow, PrincipalRow, RealmBatch, RealmState, RowChange, TargetPeek,
     WriteIntent,
 };
-use krb5_kdc::kadm5_mask;
+use krb5_kdc::{MAX_ALIAS_DEPTH, PrincipalStore, kadm5_mask, lookup_principal_id};
 use lldap_domain::types::UserId;
-use lldap_domain_handlers::kerberos::{self as directory, DIRECTORY_USER, HostRow};
+use lldap_domain_handlers::kerberos::{
+    self as directory, DIRECTORY_TARGET, DIRECTORY_USER, HostRow,
+};
 use lldap_domain_handlers::logging::{self, LogKind};
+use lldap_domain_handlers::password::{PASSWORD_MIN_LENGTH, long_enough};
 use lldap_opaque_handler::{OpaqueHandler, prepare_registration};
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tracing::warn;
 use zeroize::Zeroizing;
@@ -18,7 +22,7 @@ use zeroize::Zeroizing;
 pub(crate) const KADM5_PROTECT_PRINCIPAL: u32 = 43_787_550;
 pub(crate) const KADM5_PASS_Q_TOOSHORT: u32 = 43_787_542;
 pub(crate) const KADM5_AUTH_ADD: u32 = 43_787_522;
-pub(crate) const PASSWORD_FLOOR: usize = 8;
+pub(crate) const KADM5_PASS_Q_GENERIC: u32 = 43_787_577;
 const DERIVE_WAIT: Duration = Duration::from_secs(30);
 
 /// What derives a kadmin `cpw`'s OPAQUE record: the server's handler, on the server's runtime.
@@ -54,6 +58,8 @@ pub(crate) struct SqlRealm {
     started: AtomicBool,
     realm: String,
     records: Option<Records>,
+    /// Each alias row's target, by row name: the stored rows keep it encrypted.
+    aliases: Mutex<HashMap<String, String>>,
 }
 
 impl SqlRealm {
@@ -63,6 +69,7 @@ impl SqlRealm {
             started: AtomicBool::new(false),
             realm: String::new(),
             records: None,
+            aliases: Mutex::default(),
         }
     }
 
@@ -78,10 +85,11 @@ impl SqlRealm {
 /// `change_committing` changes at `write_own`, with the directory rows that commit beside them.
 pub(crate) trait Host: KerberosStore {
     fn write_own(&self, change: HostChange, rows: Vec<HostRow>) -> Result<(), KerberosStoreError>;
-    fn password_record(&self, user: &UserId) -> Result<Option<Vec<u8>>, KerberosStoreError>;
     fn user_disabled(&self, user: &UserId) -> Result<bool, KerberosStoreError>;
     /// Until the start pass has committed, only the bootstrap may come from outside.
     fn start_pass_committed(&self);
+    /// The alias rows of the realm as opened; every committed batch keeps them after that.
+    fn seed_aliases(&self, _aliases: Vec<(String, String)>) {}
 }
 
 pub(crate) fn committing(
@@ -107,6 +115,8 @@ pub(crate) fn committing_with(
 pub(crate) struct Named {
     pub(crate) principal: String,
     pub(crate) user: Option<UserId>,
+    /// The name as sent, when the write reached `principal` through an alias.
+    pub(crate) sent: Option<String>,
 }
 
 impl Named {
@@ -114,8 +124,54 @@ impl Named {
         Self {
             principal: principal.to_owned(),
             user: directory_name(principal, realm),
+            sent: None,
         }
     }
+
+    fn sent_as(mut self, name: Option<&String>) -> Self {
+        self.sent = name.filter(|name| **name != self.principal).cloned();
+        self
+    }
+
+    fn requested_as(&self) -> String {
+        self.sent
+            .as_ref()
+            .map(|sent| format!(" (requested as {sent})"))
+            .unwrap_or_default()
+    }
+}
+
+fn row_of(name: &str, realm: &str) -> Option<String> {
+    let (parsed, in_realm) = krb5_types::principal_from_unparsed(name, realm).ok()?;
+    lookup_principal_id(&parsed, &in_realm).map(|id| row_name(id, realm))
+}
+
+fn row_name(id: String, realm: &str) -> String {
+    id.strip_suffix(&format!("@{realm}"))
+        .map_or_else(|| id.clone(), str::to_owned)
+}
+
+pub(crate) fn stored_aliases(store: &PrincipalStore, realm: &str) -> Vec<(String, String)> {
+    store
+        .ids()
+        .iter()
+        .filter_map(|id| store.get_raw(id))
+        .filter_map(|p| Some((row_name(p.id(), realm), p.alias_target()?)))
+        .collect()
+}
+
+fn asked<S: AsRef<str>>(names: impl IntoIterator<Item = S>, realm: &str) -> Vec<Named> {
+    names
+        .into_iter()
+        .map(|name| Named::of(name.as_ref(), realm))
+        .filter(|named| named.user.is_some())
+        .collect()
+}
+
+/// The name kadmind peeked at: an alias's target, else the first.
+fn peeked(intent: &WriteIntent) -> Option<&String> {
+    let at = usize::from(intent.operation == Operation::CreateAlias);
+    intent.requested.get(at)
 }
 
 /// One component in our realm, lowercased as the directory stores user ids.
@@ -131,9 +187,10 @@ pub(crate) fn directory_name(principal: &str, realm: &str) -> Option<UserId> {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Verdict {
-    /// MIT's write; none of `new` may be a directory user's name.
+    /// MIT's write, unless a name in `new`, or a target in `onto` or past it, is a user's.
     Write {
         new: Vec<Named>,
+        onto: Vec<String>,
     },
     Unlock(Named),
     Password(Named),
@@ -152,22 +209,32 @@ pub(crate) fn verdict(change: &HostChange, realm: &str) -> Result<Verdict, Kerbe
                 "an own write arrived as another's".to_owned(),
             ));
         }
-        Operation::Bootstrap => return Ok(Verdict::Write { new: Vec::new() }),
+        Operation::Bootstrap => {
+            return Ok(Verdict::Write {
+                new: Vec::new(),
+                onto: Vec::new(),
+            });
+        }
         _ => {}
     }
     let owned: Vec<&RowChange> = change.rows.iter().filter(|row| row.host_owned).collect();
     let existing = owned.iter().find(|row| row.before.is_some());
     let Some(row) = existing.or_else(|| owned.first()) else {
-        let new = change
-            .rows
+        let created: Vec<&RowChange> = change.rows.iter().filter(|r| r.before.is_none()).collect();
+        let new = asked(
+            created
+                .iter()
+                .filter(|row| row.after.is_some())
+                .map(|row| &row.id),
+            realm,
+        );
+        let onto = created
             .iter()
-            .filter(|row| row.before.is_none() && row.after.is_some())
-            .map(|row| Named::of(&row.id, realm))
-            .filter(|named| named.user.is_some())
+            .filter_map(|row| row.after.as_ref()?.alias_target())
             .collect();
-        return Ok(Verdict::Write { new });
+        return Ok(Verdict::Write { new, onto });
     };
-    let named = Named::of(&row.id, realm);
+    let named = Named::of(&row.id, realm).sent_as(peeked(intent));
     match intent.operation {
         Operation::Unspecified => Err(KerberosStoreError::Refused(format!(
             "an undeclared write to a directory user's principal: {}",
@@ -184,30 +251,28 @@ pub(crate) fn verdict(change: &HostChange, realm: &str) -> Result<Verdict, Kerbe
 
 /// `prepare`'s answer from the peek; `commit_change` gives it again from the rows.
 pub(crate) fn early(intent: &WriteIntent, target: Option<&TargetPeek>, realm: &str) -> Verdict {
-    let new = |at: Option<usize>| Verdict::Write {
-        new: at
-            .and_then(|at| intent.requested.get(at))
-            .map(|name| Named::of(name, realm))
-            .filter(|named| named.user.is_some())
-            .into_iter()
-            .collect(),
+    let at = |at: usize| intent.requested.get(at);
+    let ask = |new: Option<&String>, onto: Option<&String>| Verdict::Write {
+        new: asked(new, realm),
+        onto: onto.cloned().into_iter().collect(),
     };
     let owned = target
         .filter(|peek| peek.host_owned)
-        .map(|peek| Named::of(&peek.id, realm));
+        .map(|peek| Named::of(&peek.id, realm).sent_as(peeked(intent)));
     match (intent.operation, target, owned) {
         (Operation::Bootstrap | Operation::Embedded | Operation::Unspecified, _, _)
-        | (Operation::Create, Some(_), _) => new(None),
-        (Operation::Create, None, _) => new(Some(0)),
+        | (Operation::Create, Some(_), _) => ask(None, None),
+        (Operation::Create, None, _) => ask(at(0), None),
         (Operation::ChangePassword, _, Some(named)) => password_verdict(intent, named),
         (Operation::Modify, _, Some(named)) if unlock_only(intent) => Verdict::Unlock(named),
+        (Operation::Delete, _, Some(named)) if named.sent.is_some() => ask(None, None),
         (_, _, Some(named)) => Verdict::Deny {
             code: KADM5_PROTECT_PRINCIPAL,
             named,
         },
-        (Operation::Rename, Some(_), None) => new(Some(1)),
-        (Operation::CreateAlias, _, None) => new(Some(0)),
-        _ => new(None),
+        (Operation::Rename, Some(_), None) => ask(at(1), None),
+        (Operation::CreateAlias, _, None) => ask(at(0), at(1)),
+        _ => ask(None, None),
     }
 }
 
@@ -219,16 +284,14 @@ fn password_verdict(intent: &WriteIntent, named: Named) -> Verdict {
     let keepold = intent.keepold.is_some_and(|keepold| keepold != 0);
     let code = match &intent.password {
         _ if keepold || named.user.is_none() => KADM5_PROTECT_PRINCIPAL,
-        Some(password) if long_enough(password.as_slice()) => return Verdict::Password(named),
-        Some(_) => KADM5_PASS_Q_TOOSHORT,
+        Some(password) => match std::str::from_utf8(password.as_slice()) {
+            Ok(text) if long_enough(text) => return Verdict::Password(named),
+            Ok(_) => KADM5_PASS_Q_TOOSHORT,
+            Err(_) => KADM5_PASS_Q_GENERIC,
+        },
         None => KADM5_PROTECT_PRINCIPAL,
     };
     Verdict::Deny { code, named }
-}
-
-fn long_enough(password: &[u8]) -> bool {
-    let chars = std::str::from_utf8(password).map_or(password.len(), |text| text.chars().count());
-    chars >= PASSWORD_FLOOR
 }
 
 fn client(caller: &Caller) -> &str {
@@ -278,23 +341,26 @@ pub(crate) fn code_name(code: u32) -> &'static str {
         KADM5_PROTECT_PRINCIPAL => "PROTECT_PRINCIPAL",
         KADM5_AUTH_ADD => "AUTH_ADD",
         KADM5_PASS_Q_TOOSHORT => "PASS_Q_TOOSHORT",
+        KADM5_PASS_Q_GENERIC => "PASS_Q_GENERIC",
         _ => "another code",
     }
 }
 
 fn denied(intent: &WriteIntent, code: u32, named: &Named) -> KerberosStoreError {
     let detail = format!(
-        "kadmin {} on {} by {}: {}",
+        "kadmin {} on {} by {}: {}{}",
         operation_name(intent.operation),
         named.principal,
         client(&intent.caller),
-        code_name(code)
+        code_name(code),
+        named.requested_as()
     );
     logging::record_failure(LogKind::AccessDenied, Some(&named.principal), &detail);
     let text = match code {
         KADM5_PASS_Q_TOOSHORT => {
-            format!("the password is shorter than {PASSWORD_FLOOR} characters")
+            format!("the password is shorter than {PASSWORD_MIN_LENGTH} characters")
         }
+        KADM5_PASS_Q_GENERIC => "the password is not valid UTF-8".to_owned(),
         KADM5_AUTH_ADD => format!(
             "{} is a directory user's name; turn on Kerberos for the user in KLLDAP",
             named.principal
@@ -348,12 +414,13 @@ impl KerberosStore for SqlRealm {
             return Err(KerberosStoreError::Refused("starting".to_owned()));
         }
         match verdict(&change, &self.realm)? {
-            Verdict::Write { new } => self.write_new(change, &new),
+            Verdict::Write { new, onto } => self.write_new(change, &new, &self.targets(&onto)),
             Verdict::Unlock(named) => {
                 self.write(Vec::new(), change.batch)?;
                 let detail = format!(
-                    "kadmin unlock by {} (no lockout counter yet)",
-                    client(&change.intent.caller)
+                    "kadmin unlock by {} (no lockout counter yet){}",
+                    client(&change.intent.caller),
+                    named.requested_as()
                 );
                 logging::record(LogKind::KerberosSync, Some(&named.principal), Some(&detail));
                 Ok(())
@@ -372,7 +439,10 @@ impl KerberosStore for SqlRealm {
             return Ok(None);
         }
         match early(intent, target, &self.realm) {
-            Verdict::Write { new } => self.read_new(intent, &new).map(|()| None),
+            Verdict::Write { new, onto } => {
+                let onto = self.targets(&onto);
+                self.read_new(intent, &new, &onto).map(|()| None)
+            }
             Verdict::Unlock(_) => Ok(None),
             Verdict::Password(named) => self.prepared(intent, &named).map(Some),
             Verdict::Deny { code, named } => Err(denied(intent, code, &named)),
@@ -385,16 +455,16 @@ impl Host for SqlRealm {
         self.write(rows, change.batch)
     }
 
-    fn password_record(&self, user: &UserId) -> Result<Option<Vec<u8>>, KerberosStoreError> {
-        self.store.password_record(user).map_err(store_error)
-    }
-
     fn user_disabled(&self, user: &UserId) -> Result<bool, KerberosStoreError> {
         self.store.user_disabled(user).map_err(store_error)
     }
 
     fn start_pass_committed(&self) {
         self.started.store(true, Ordering::Release);
+    }
+
+    fn seed_aliases(&self, aliases: Vec<(String, String)>) {
+        self.keep_aliases(aliases.into_iter().map(|(row, target)| (row, Some(target))));
     }
 }
 
@@ -405,19 +475,27 @@ impl SqlRealm {
         })
     }
 
-    fn read_new(&self, intent: &WriteIntent, new: &[Named]) -> Result<(), KerberosStoreError> {
-        let users: Vec<UserId> = new.iter().filter_map(|named| named.user.clone()).collect();
+    fn read_new(
+        &self,
+        intent: &WriteIntent,
+        new: &[Named],
+        onto: &[Named],
+    ) -> Result<(), KerberosStoreError> {
+        let users = [users_of(onto), users_of(new)].concat();
         if users.is_empty() {
             return Ok(());
         }
         match self.store.directory_users(&users) {
-            Ok(found) => match new
-                .iter()
-                .find(|named| named.user.as_ref().is_some_and(|u| found.contains(u)))
-            {
-                Some(named) => Err(denied(intent, KADM5_AUTH_ADD, named)),
-                None => Ok(()),
-            },
+            Ok(found) => {
+                let held = |named: &Named| named.user.as_ref().is_some_and(|u| found.contains(u));
+                if let Some(named) = onto.iter().find(|&named| held(named)) {
+                    return Err(denied(intent, KADM5_PROTECT_PRINCIPAL, named));
+                }
+                match new.iter().find(|&named| held(named)) {
+                    Some(named) => Err(denied(intent, KADM5_AUTH_ADD, named)),
+                    None => Ok(()),
+                }
+            }
             Err(e) => {
                 warn!(
                     "The directory could not be read before a kadmin write; its commit decides: {e}"
@@ -442,27 +520,35 @@ impl SqlRealm {
         }))
     }
 
-    fn write_new(&self, change: HostChange, new: &[Named]) -> Result<(), KerberosStoreError> {
-        let users: Vec<UserId> = new.iter().filter_map(|named| named.user.clone()).collect();
-        let rows = if users.is_empty() {
-            Vec::new()
-        } else {
-            vec![HostRow::NoUser(users)]
-        };
+    fn write_new(
+        &self,
+        change: HostChange,
+        new: &[Named],
+        onto: &[Named],
+    ) -> Result<(), KerberosStoreError> {
+        let (onto_users, new_users) = (users_of(onto), users_of(new));
+        let mut rows = Vec::new();
+        if !onto_users.is_empty() {
+            rows.push(HostRow::NoAliasOnto(onto_users));
+        }
+        if !new_users.is_empty() {
+            rows.push(HostRow::NoUser(new_users));
+        }
         match self.write(rows, change.batch) {
+            Err(KerberosStoreError::Refused(why)) if why.starts_with(DIRECTORY_TARGET) => {
+                let found = why
+                    .strip_prefix(DIRECTORY_TARGET)
+                    .and_then(|rest| rest.strip_prefix(": "))
+                    .map(UserId::new);
+                let named = onto
+                    .iter()
+                    .find(|named| named.user == found)
+                    .cloned()
+                    .unwrap_or_else(|| one_of(onto));
+                Err(denied(&change.intent, KADM5_PROTECT_PRINCIPAL, &named))
+            }
             Err(KerberosStoreError::Refused(why)) if why == DIRECTORY_USER => {
-                let named = match new {
-                    [one] => one.clone(),
-                    _ => Named {
-                        principal: new
-                            .iter()
-                            .map(|named| named.principal.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                        user: None,
-                    },
-                };
-                Err(denied(&change.intent, KADM5_AUTH_ADD, &named))
+                Err(denied(&change.intent, KADM5_AUTH_ADD, &one_of(new)))
             }
             written => written,
         }
@@ -491,6 +577,7 @@ impl SqlRealm {
         if self_service(&intent.caller) {
             detail.push_str(" (self-service)");
         }
+        detail.push_str(&named.requested_as());
         let row = logging::event(
             LogKind::PasswordChange,
             Some(&named.principal),
@@ -510,7 +597,46 @@ impl SqlRealm {
         Ok(())
     }
 
+    /// Each target, then each alias it leads through, as kerber-rust resolves them.
+    fn targets(&self, onto: &[String]) -> Vec<Named> {
+        let aliases = self.aliases.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut named = Vec::new();
+        for target in onto {
+            let mut name = target.clone();
+            for _ in 0..=MAX_ALIAS_DEPTH {
+                named.push(Named::of(&name, &self.realm).sent_as(Some(target)));
+                match row_of(&name, &self.realm).and_then(|row| aliases.get(&row)) {
+                    Some(next) => name.clone_from(next),
+                    None => break,
+                }
+            }
+        }
+        named.retain(|named| named.user.is_some());
+        named
+    }
+
+    fn keep_aliases(&self, rows: impl IntoIterator<Item = (String, Option<String>)>) {
+        let mut aliases = self.aliases.lock().unwrap_or_else(PoisonError::into_inner);
+        for (row, target) in rows {
+            match target {
+                Some(target) => aliases.insert(row, target),
+                None => aliases.remove(&row),
+            };
+        }
+    }
+
     fn write(&self, rows: Vec<HostRow>, batch: RealmBatch) -> Result<(), KerberosStoreError> {
+        let kept: Vec<(String, Option<String>)> = batch
+            .delete_principals
+            .iter()
+            .map(|row| (row.clone(), None))
+            .chain(
+                batch
+                    .upsert_principals
+                    .iter()
+                    .map(|p| (p.name.clone(), p.alias_target.clone())),
+            )
+            .collect();
         let upsert_principals = batch
             .upsert_principals
             .into_iter()
@@ -537,7 +663,31 @@ impl SqlRealm {
                     }),
                 },
             )
-            .map_err(store_error)
+            .map_err(store_error)?;
+        self.keep_aliases(kept);
+        Ok(())
+    }
+}
+
+fn users_of(names: &[Named]) -> Vec<UserId> {
+    names
+        .iter()
+        .filter_map(|named| named.user.clone())
+        .collect()
+}
+
+fn one_of(names: &[Named]) -> Named {
+    match names {
+        [one] => one.clone(),
+        _ => Named {
+            principal: names
+                .iter()
+                .map(|named| named.principal.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            user: None,
+            sent: None,
+        },
     }
 }
 
@@ -976,25 +1126,37 @@ mod tests {
         row.try_get::<i64>("", "n").unwrap()
     }
 
-    fn change(user: &str, record: &[u8]) -> directory::PasswordCommit {
-        use lldap_domain_handlers::logging::{LogKind, event};
-        directory::PasswordCommit {
+    fn password_commit(
+        user: &str,
+        record: &[u8],
+    ) -> lldap_domain_handlers::kerberos::PasswordCommit {
+        lldap_domain_handlers::kerberos::PasswordCommit {
             user: UserId::new(user),
-            record: record.to_vec(),
+            kind: LogKind::PasswordChange,
             rows: vec![
                 HostRow::SetPassword {
                     user: UserId::new(user),
                     record: record.to_vec(),
                     now: chrono::Utc::now().naive_utc(),
                 },
-                HostRow::Log(event(LogKind::PasswordChange, Some(user), true, None)),
+                HostRow::Log(logging::event(
+                    LogKind::PasswordChange,
+                    Some(user),
+                    true,
+                    None,
+                )),
             ],
         }
     }
 
+    fn top_kvno(store: &krb5_kdc::PrincipalStore, user: &str) -> Option<u32> {
+        let name = PrincipalName::new(PrincipalName::NT_PRINCIPAL, [user]);
+        store.get_name(&name).and_then(|p| p.top_kvno())
+    }
+
     // X1: a synced user's change, its record and its row in one transaction, or none of them.
     fn one_transaction_on(connect: Reconnect) {
-        use lldap_domain_handlers::kerberos::{CommitError, Committed};
+        use lldap_domain_handlers::kerberos::CommitError;
         let runtime = runtime();
         let temp = TempRealm::new();
         let profile = boot::profile(&temp.settings);
@@ -1018,11 +1180,9 @@ mod tests {
         );
         let ready = Arc::new(AtomicBool::new(true));
         let embedded = EmbeddedKerberos::new(store.clone(), &temp.settings, ready, host.clone());
-        fn kvno(store: &krb5_kdc::PrincipalStore, user: &str) -> Option<u32> {
-            let name = PrincipalName::new(PrincipalName::NT_PRINCIPAL, [user]);
-            store.get_name(&name).and_then(|p| p.top_kvno())
-        }
-        let stored = |user: &str| host.password_record(&UserId::new(user)).unwrap();
+        let (change, kvno) = (password_commit, top_kvno);
+        let reads = committer.store();
+        let stored = |user: &str| reads.password_record(&UserId::new(user)).unwrap();
         let logs = || {
             count(
                 &pool,
@@ -1040,12 +1200,12 @@ mod tests {
                 logs(),
                 kvno(&reopened, "bob")
             ),
-            (Ok(Committed::Done), true, 1, Some(1)),
+            (Ok(()), true, 1, Some(1)),
             "committed: both new, with its row"
         );
 
         let carol = runtime.block_on(embedded.commit_password(change("carol", b"c1"), "Carol-1"));
-        assert_eq!(carol, Ok(Committed::Done));
+        assert_eq!(carol, Ok(()));
         sql(&pool, &runtime, "DELETE FROM users WHERE user_id = 'carol'");
         let gone = runtime.block_on(embedded.commit_password(change("carol", b"c2"), "Carol-2"));
         assert_eq!(
@@ -1072,6 +1232,149 @@ mod tests {
         );
         drop((embedded, store, host));
         runtime.block_on(committer.shutdown());
+    }
+
+    #[derive(Clone, Default)]
+    struct Warnings(Arc<Mutex<Vec<String>>>);
+
+    struct Message<'a>(&'a mut String);
+
+    impl tracing::field::Visit for Message<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0.push_str(&format!("{value:?}"));
+            }
+        }
+    }
+
+    impl tracing::Subscriber for Warnings {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                let mut text = String::new();
+                event.record(&mut Message(&mut text));
+                self.0.lock().unwrap().push(text);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    // X1 grade 4: the answer to COMMIT is lost after the database took it, on a real database.
+    fn lost_answer_on(connect: Reconnect) {
+        use lldap_domain_handlers::password::ANSWER_LOST;
+        use lldap_sql_backend_handler::start_committer_losing_an_answer;
+        let warnings = Warnings::default();
+        let seen = warnings.clone();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .on_thread_start(move || {
+                std::mem::forget(tracing::subscriber::set_default(seen.clone()));
+            })
+            .build()
+            .unwrap();
+        let temp = TempRealm::new();
+        let profile = boot::profile(&temp.settings);
+        let pool = connect(&runtime);
+        let committer = runtime.block_on(async {
+            init_table(&pool).await.unwrap();
+            start_committer_losing_an_answer(pool.clone())
+        });
+        add_user(&pool, &runtime, "bob");
+        let reads = committer.store();
+        let host = Arc::new(SqlRealm::new(committer.store()));
+        host.start_pass_committed();
+        let store = krb5_kdc::shared_dump(
+            boot::open_store(&temp.settings, &profile, host.clone()).unwrap(),
+        );
+        let ready = Arc::new(AtomicBool::new(true));
+        let embedded = EmbeddedKerberos::new(store.clone(), &temp.settings, ready, host.clone());
+        let stored = |record: &[u8]| {
+            reads.password_record(&UserId::new("bob")).unwrap() == Some(record.to_vec())
+        };
+        let logs = || {
+            count(
+                &pool,
+                &runtime,
+                "SELECT COUNT(*) AS n FROM logs WHERE kind = 'password_change'",
+            )
+        };
+
+        let lost =
+            runtime.block_on(embedded.commit_password(password_commit("bob", b"r1"), "Bob-Pass-1"));
+        let reopened = boot::open_store(&temp.settings, &profile, host.clone()).unwrap();
+        let first = (lost, stored(b"r1"), logs(), top_kvno(&reopened, "bob"));
+        let next =
+            runtime.block_on(embedded.commit_password(password_commit("bob", b"r2"), "Bob-Pass-2"));
+        let then = (next, stored(b"r2"), logs());
+        let lines: Vec<String> = warnings
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|line| line.contains(ANSWER_LOST))
+            .cloned()
+            .collect();
+        assert_eq!(
+            (first, then, lines),
+            (
+                (Ok(()), true, 1, Some(1)),
+                (Ok(()), true, 2),
+                vec![format!("The commit for user bob: {ANSWER_LOST}")]
+            ),
+            "the answer lost after COMMIT: success, one row, the new record, one WARNING"
+        );
+        drop((embedded, store, host));
+        runtime.block_on(committer.shutdown());
+    }
+
+    #[test]
+    #[serial]
+    fn test_a_lost_answer_on_sqlite() {
+        let dir = std::env::temp_dir().join(format!("klldap-lost-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.join("lost.db").display());
+        lost_answer_on(&|runtime| sqlite_one_connection(&url, runtime));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial]
+    #[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+    fn test_a_lost_answer_on_postgres() {
+        let Ok(url) = std::env::var("KLLDAP_TEST_DATABASE_URL") else {
+            eprintln!("KLLDAP_TEST_DATABASE_URL not set; skipping");
+            return;
+        };
+        if !url.starts_with("postgres://") && !url.starts_with("postgresql://") {
+            eprintln!("KLLDAP_TEST_DATABASE_URL is not a postgres URL; skipping");
+            return;
+        }
+        let schema = format!("klldap_lost_{}", std::process::id());
+        lost_answer_on(&|runtime| {
+            runtime.block_on(async {
+                let admin = Database::connect(url.as_str()).await.unwrap();
+                for sql in [
+                    format!("DROP SCHEMA IF EXISTS {schema} CASCADE"),
+                    format!("CREATE SCHEMA {schema}"),
+                ] {
+                    admin.execute_unprepared(&sql).await.unwrap();
+                }
+                let mut opts = ConnectOptions::new(url.clone());
+                opts.set_schema_search_path(schema.clone())
+                    .max_connections(2)
+                    .sqlx_logging(false);
+                Database::connect(opts).await.unwrap()
+            })
+        });
     }
 
     #[test]
@@ -1124,7 +1427,6 @@ mod tests {
 
     // The principal takes lldap_disabled as read once the change holds the write lock.
     fn status_rows_on(connect: Reconnect) {
-        use lldap_domain_handlers::kerberos::Committed;
         let runtime = runtime();
         let temp = TempRealm::new();
         let profile = boot::profile(&temp.settings);
@@ -1161,9 +1463,9 @@ mod tests {
         sql(&pool, &runtime, &disable("carol"));
         let before = (state(&store, "bob"), state(&store, "carol"));
         let enabled =
-            runtime.block_on(embedded.commit_password(change("bob", b"b2"), "Bob-Pass-2"));
-        let disabled =
-            runtime.block_on(embedded.commit_password(change("carol", b"c2"), "Carol-Pass-2"));
+            runtime.block_on(embedded.commit_password(password_commit("bob", b"b2"), "Bob-Pass-2"));
+        let disabled = runtime
+            .block_on(embedded.commit_password(password_commit("carol", b"c2"), "Carol-Pass-2"));
 
         let held = runtime.block_on(embedded.hold_writes());
         let meanwhile = {
@@ -1175,7 +1477,7 @@ mod tests {
         };
         let (late, ()) = runtime.block_on(async {
             tokio::join!(
-                embedded.commit_password(change("dora", b"d1"), "Dora-Pass-1"),
+                embedded.commit_password(password_commit("dora", b"d1"), "Dora-Pass-1"),
                 meanwhile
             )
         });
@@ -1190,7 +1492,7 @@ mod tests {
                 (user, state(&store, user), kept)
             })
             .collect();
-        let done = || Ok(Committed::Done);
+        let done = || Ok(());
         assert_eq!(
             (before, (enabled, disabled, late), after),
             (
@@ -1258,11 +1560,17 @@ mod tests {
     }
 
     fn with_password(text: &'static str, keepold: u32) -> Fill {
+        with_bytes(text.as_bytes(), keepold)
+    }
+
+    fn with_bytes(password: &'static [u8], keepold: u32) -> Fill {
         Box::new(move |intent: &mut WriteIntent| {
-            intent.password = Some(Zeroizing::new(text.as_bytes().to_vec()));
+            intent.password = Some(Zeroizing::new(password.to_vec()));
             intent.keepold = Some(keepold);
         })
     }
+
+    const NOT_UTF8: &[u8] = b"Bob-\xff\xfe-Password";
 
     fn intent_of(
         operation: Operation,
@@ -1328,7 +1636,11 @@ mod tests {
     type Rows = Vec<(LogKind, Option<String>, Option<String>)>;
 
     fn denial(principal: &str, operation: &str, code: &str) -> Rows {
-        let detail = format!("kadmin {operation} on {principal} by {ADMIN}: {code}");
+        denial_as(principal, operation, code, "")
+    }
+
+    fn denial_as(principal: &str, operation: &str, code: &str, sent: &str) -> Rows {
+        let detail = format!("kadmin {operation} on {principal} by {ADMIN}: {code}{sent}");
         vec![(
             LogKind::AccessDenied,
             Some(principal.to_owned()),
@@ -1349,7 +1661,7 @@ mod tests {
         let temp = TempRealm::new();
         let profile = boot::profile(&temp.settings);
         let (committer, pool) = committer_on(connect, &runtime);
-        for user in ["bob", "alice"] {
+        for user in ["bob", "alice", "carol"] {
             add_user(&pool, &runtime, user);
         }
         let handler = SqlBackendHandler::new(generate_random_private_key(), pool.clone());
@@ -1403,8 +1715,17 @@ mod tests {
             max_life: Some(3600),
             ..Default::default()
         };
-        let record = || host.password_record(&UserId::new("bob")).unwrap();
+        let reads = committer.store();
+        let record = || reads.password_record(&UserId::new("bob")).unwrap();
         let kvno = |n: &PrincipalName| store.read().unwrap().get_name(n).and_then(|p| p.top_kvno());
+        let key_bytes = |n: &PrincipalName| -> Vec<Vec<u8>> {
+            let guard = store.read().unwrap();
+            let keys = guard
+                .get_name(n)
+                .map(|p| p.keys.clone())
+                .unwrap_or_default();
+            keys.iter().map(|k| k.key.as_bytes().to_vec()).collect()
+        };
         let binds = |password: &str| {
             let request = BindRequest {
                 name: UserId::new("bob"),
@@ -1422,7 +1743,7 @@ mod tests {
         rows();
 
         let held = (host.load().unwrap(), record());
-        let on_bob: [Case; 11] = [
+        let on_bob: [Case; 12] = [
             (
                 "randkey",
                 Operation::Randkey,
@@ -1537,6 +1858,23 @@ mod tests {
                 "change_password: PASS_Q_TOOSHORT",
             ),
             (
+                "cpw not UTF-8",
+                Operation::ChangePassword,
+                &["bob"],
+                with_bytes(NOT_UTF8, 0),
+                Box::new(|s: &mut PrincipalStore| {
+                    s.set_password_etypes_keepold_n_in(
+                        &bob,
+                        "EXAMPLE.COM",
+                        NOT_UTF8,
+                        0,
+                        ADMIN,
+                        &etypes,
+                    )
+                }),
+                "change_password: PASS_Q_GENERIC",
+            ),
+            (
                 "alias onto bob",
                 Operation::CreateAlias,
                 &["robert", "bob"],
@@ -1551,10 +1889,6 @@ mod tests {
         for (label, operation, requested, fill, edit, row) in &on_bob {
             let (op, code) = row.split_once(": ").unwrap();
             for declared in [true, false] {
-                // The commit's rows carry the alias, not its target: only `prepare` sees the mark.
-                if !declared && *operation == Operation::CreateAlias {
-                    continue;
-                }
                 let intent = intent_of(*operation, kadmin(false), requested, fill);
                 let answer = kadmin_write(&store, declared, intent, &bob, &**edit);
                 let unchanged = (host.load().unwrap(), record()) == held;
@@ -1565,7 +1899,22 @@ mod tests {
         }
         assert_eq!(got, want, "refused on a directory user's principal");
 
-        let names: [(Case, &PrincipalName, &str); 6] = [
+        let (bobby, robby, carl, carol) =
+            (name("bobby"), name("robby"), name("carl"), name("carol"));
+        for alias in [&bobby, &robby] {
+            store
+                .write()
+                .unwrap()
+                .change_committing(committing(&*host), |s| {
+                    s.create_alias_in(alias, "EXAMPLE.COM", &bob, "EXAMPLE.COM", "test")
+                })
+                .unwrap()
+                .unwrap();
+        }
+        unmarked(&embedded, "carol", false);
+        let held = (host.load().unwrap(), record());
+        let through_bobby = " (requested as bobby@EXAMPLE.COM)";
+        let names: [(Case, &PrincipalName, &str, &str, &str); 10] = [
             (
                 (
                     "create",
@@ -1579,6 +1928,8 @@ mod tests {
                 ),
                 &alice,
                 "alice@EXAMPLE.COM",
+                "AUTH_ADD",
+                "",
             ),
             (
                 (
@@ -1593,6 +1944,8 @@ mod tests {
                 ),
                 &twin,
                 "Alice@EXAMPLE.COM",
+                "AUTH_ADD",
+                "",
             ),
             (
                 (
@@ -1607,6 +1960,8 @@ mod tests {
                 ),
                 &svc,
                 "alice@EXAMPLE.COM",
+                "AUTH_ADD",
+                "",
             ),
             (
                 (
@@ -1621,6 +1976,8 @@ mod tests {
                 ),
                 &svc,
                 "Alice@EXAMPLE.COM",
+                "AUTH_ADD",
+                "",
             ),
             (
                 (
@@ -1635,6 +1992,8 @@ mod tests {
                 ),
                 &svc,
                 "alice@EXAMPLE.COM",
+                "AUTH_ADD",
+                "",
             ),
             (
                 (
@@ -1649,20 +2008,89 @@ mod tests {
                 ),
                 &svc,
                 "Alice@EXAMPLE.COM",
+                "AUTH_ADD",
+                "",
+            ),
+            (
+                (
+                    "alias onto a user with no principal",
+                    Operation::CreateAlias,
+                    &["carl", "alice"],
+                    nothing(),
+                    Box::new(|s: &mut PrincipalStore| {
+                        s.create_alias_in(&carl, "EXAMPLE.COM", &alice, "EXAMPLE.COM", ADMIN)
+                    }),
+                    "create_alias",
+                ),
+                &alice,
+                "alice@EXAMPLE.COM",
+                "PROTECT_PRINCIPAL",
+                "",
+            ),
+            (
+                (
+                    "alias onto a case twin of a user",
+                    Operation::CreateAlias,
+                    &["carl", "Alice"],
+                    nothing(),
+                    Box::new(|s: &mut PrincipalStore| {
+                        s.create_alias_in(&carl, "EXAMPLE.COM", &twin, "EXAMPLE.COM", ADMIN)
+                    }),
+                    "create_alias",
+                ),
+                &twin,
+                "Alice@EXAMPLE.COM",
+                "PROTECT_PRINCIPAL",
+                "",
+            ),
+            (
+                (
+                    "alias onto a user's unmarked principal",
+                    Operation::CreateAlias,
+                    &["carl", "carol"],
+                    nothing(),
+                    Box::new(|s: &mut PrincipalStore| {
+                        s.create_alias_in(&carl, "EXAMPLE.COM", &carol, "EXAMPLE.COM", ADMIN)
+                    }),
+                    "create_alias",
+                ),
+                &carol,
+                "carol@EXAMPLE.COM",
+                "PROTECT_PRINCIPAL",
+                "",
+            ),
+            (
+                (
+                    "alias onto an alias of a user's principal",
+                    Operation::CreateAlias,
+                    &["carl", "bobby"],
+                    nothing(),
+                    Box::new(|s: &mut PrincipalStore| {
+                        s.create_alias_in(&carl, "EXAMPLE.COM", &bobby, "EXAMPLE.COM", ADMIN)
+                    }),
+                    "create_alias",
+                ),
+                &bobby,
+                "bob@EXAMPLE.COM",
+                "PROTECT_PRINCIPAL",
+                through_bobby,
             ),
         ];
         let (mut got, mut want) = (Vec::new(), Vec::new());
-        for ((label, operation, requested, fill, edit, op), peek, principal) in &names {
+        for ((label, operation, requested, fill, edit, op), peek, principal, code, sent) in &names {
             for declared in [true, false] {
                 let intent = intent_of(*operation, kadmin(false), requested, fill);
                 let answer = kadmin_write(&store, declared, intent, peek, &**edit);
                 let unchanged = (host.load().unwrap(), record()) == held;
                 got.push((*label, declared, answer, unchanged, rows()));
-                let logged = denial(principal, op, "AUTH_ADD");
-                want.push((*label, declared, "AUTH_ADD".to_owned(), true, logged));
+                let logged = denial_as(principal, op, code, sent);
+                want.push((*label, declared, (*code).to_owned(), true, logged));
             }
         }
-        assert_eq!(got, want, "a directory user's name, created");
+        assert_eq!(
+            got, want,
+            "a directory user's name, created or aliased onto"
+        );
 
         let dup = intent_of(Operation::Create, kadmin(false), &["bob"], &nothing());
         let peek = TargetPeek {
@@ -1721,6 +2149,70 @@ mod tests {
             "carried out: the keys, the record and one row"
         );
 
+        let cpw_through = |text: &'static str, keepold: u32, declared: bool| {
+            let fill = with_password(text, keepold);
+            let intent = intent_of(Operation::ChangePassword, kadmin(false), &["bobby"], &fill);
+            let edit = |s: &mut PrincipalStore| {
+                let password = text.as_bytes();
+                s.set_password_etypes_keepold_n_in(
+                    &bobby,
+                    "EXAMPLE.COM",
+                    password,
+                    keepold,
+                    ADMIN,
+                    &etypes,
+                )
+            };
+            kadmin_write(&store, declared, intent, &bobby, &edit)
+        };
+        let (before, stored) = (kvno(&bob), record());
+        let changed = cpw_through("Bob-Password-6", 0, true);
+        let both = (kvno(&bob) == before.map(|k| k + 1), record() != stored);
+        let carried = (changed, both, binds("Bob-Password-6"), rows());
+        let refused: Vec<_> = [true, false]
+            .into_iter()
+            .map(|declared| (cpw_through("Bob-Password-8", 1, declared), rows()))
+            .collect();
+        let keepold = denial_as(
+            "bob@EXAMPLE.COM",
+            "change_password",
+            "PROTECT_PRINCIPAL",
+            through_bobby,
+        );
+        let protect = ("PROTECT_PRINCIPAL".to_owned(), keepold);
+        assert_eq!(
+            (
+                carried,
+                refused,
+                details(&pool, &runtime, "password_change").last().cloned()
+            ),
+            (
+                ("written".to_owned(), (true, true), true, Vec::new()),
+                vec![protect.clone(), protect],
+                Some(format!("kadmin change_password by {ADMIN}{through_bobby}"))
+            ),
+            "a cpw through an alias, carried out and refused: both names"
+        );
+
+        let deleted: Vec<_> = [(&robby, "robby", true), (&bobby, "bobby", false)]
+            .into_iter()
+            .map(|(alias, text, declared)| {
+                let intent = intent_of(Operation::Delete, kadmin(false), &[text], &nothing());
+                let edit = |s: &mut PrincipalStore| s.remove_in(alias, "EXAMPLE.COM");
+                let (keys, stored) = (key_bytes(&bob), record());
+                let got = kadmin_write(&store, declared, intent, alias, &edit);
+                let raw = format!("{text}@EXAMPLE.COM");
+                let gone = store.read().unwrap().get_raw(&raw).is_none();
+                let kept = key_bytes(&bob) == keys && record() == stored;
+                (got, gone, kept, rows())
+            })
+            .collect();
+        assert_eq!(
+            deleted,
+            vec![("written".to_owned(), true, true, Vec::new()); 2],
+            "an alias of a directory user's principal is deleted, with and without prepare"
+        );
+
         let unlock = intent_of(
             Operation::Modify,
             kadmin(false),
@@ -1728,18 +2220,90 @@ mod tests {
             &mask(kadm5_mask::FAIL_AUTH_COUNT),
         );
         let edit = |s: &mut PrincipalStore| s.clear_fail_auth_count_in(&bob, "EXAMPLE.COM", ADMIN);
+        let (keys_unlocked, stored) = (key_bytes(&bob), record());
         let unlocked = kadmin_write(&store, true, unlock, &bob, &edit);
         let unlock_row = format!("kadmin unlock by {ADMIN} (no lockout counter yet)");
         assert_eq!(
-            (unlocked, rows()),
+            (
+                unlocked,
+                rows(),
+                key_bytes(&bob) == keys_unlocked,
+                record() == stored
+            ),
             (
                 "written".to_owned(),
                 vec![(
                     LogKind::KerberosSync,
                     Some("bob@EXAMPLE.COM".to_owned()),
                     Some(unlock_row)
-                )]
-            )
+                )],
+                true,
+                true
+            ),
+            "unlocked: the keys and the record unchanged"
+        );
+
+        let mark = |owned: bool| {
+            store
+                .write()
+                .unwrap()
+                .change_committing(committing(&*host), |s| {
+                    s.set_host_owned_in(&bob, "EXAMPLE.COM", owned)
+                })
+                .unwrap()
+                .unwrap();
+        };
+        let fill = with_password("Bob-Password-7", 0);
+        let intent = intent_of(Operation::ChangePassword, kadmin(false), &["bob"], &fill);
+        let (intent, prepared) =
+            krb5_kdc::declare_shared(&store, Some((&bob, "EXAMPLE.COM")), |_| intent).unwrap();
+        let was_prepared = prepared.is_some();
+        mark(false);
+        let (before, stored, logged) = (
+            kvno(&bob),
+            record(),
+            details(&pool, &runtime, "password_change"),
+        );
+        let cleared = answer(store.write().unwrap().change_as(intent, prepared, |s| {
+            let password = b"Bob-Password-7";
+            s.set_password_etypes_keepold_n_in(&bob, "EXAMPLE.COM", password, 0, ADMIN, &etypes)
+        }));
+        let after_cleared = (
+            was_prepared,
+            cleared,
+            kvno(&bob) == before.map(|k| k + 1),
+            record() == stored,
+            details(&pool, &runtime, "password_change") == logged,
+            rows(),
+        );
+        let intent = intent_of(Operation::Randkey, kadmin(false), &["bob"], &nothing());
+        let (intent, prepared) =
+            krb5_kdc::declare_shared(&store, Some((&bob, "EXAMPLE.COM")), |_| intent).unwrap();
+        let passed = prepared.is_none() && rows().is_empty();
+        mark(true);
+        let (keys_before, stored) = (key_bytes(&bob), record());
+        let set = answer(store.write().unwrap().change_as(intent, prepared, |s| {
+            s.chrand_etypes_keepold_in(&bob, "EXAMPLE.COM", &etypes, 0, ADMIN)
+                .map(drop)
+        }));
+        let after_set = (
+            passed,
+            set,
+            key_bytes(&bob) == keys_before && record() == stored,
+            rows(),
+        );
+        assert_eq!(
+            (after_cleared, after_set),
+            (
+                (true, "written", true, true, true, Vec::new()),
+                (
+                    true,
+                    "denied",
+                    true,
+                    denial("bob@EXAMPLE.COM", "randkey", "PROTECT_PRINCIPAL")
+                )
+            ),
+            "the mark changed between prepare and the commit: the commit's answer stands"
         );
 
         let stored = record();
@@ -1928,11 +2492,11 @@ mod tests {
                 lost == "written",
                 kvno(&bob) == before,
                 record() == stored,
-                binds("Bob-Password-4"),
+                binds("Bob-Password-6"),
                 details(&pool, &runtime, "password_change").len(),
                 rows()
             ),
-            (false, true, true, true, 3, Vec::new()),
+            (false, true, true, true, 4, Vec::new()),
             "the realm was lost before the commit: nothing written, {lost}"
         );
         drop((embedded, store, host));
@@ -1956,7 +2520,7 @@ mod tests {
             intent.password = Some(Zeroizing::new(text.as_bytes().to_vec()));
             intent.keepold = Some(keepold);
         }
-        let rows: [Row; 13] = [
+        let rows: [Row; 14] = [
             (Operation::Unspecified, false, |_| {}, "written"),
             (Operation::Modify, false, |_| {}, "written"),
             (Operation::Embedded, false, |_| {}, "refused"),
@@ -1995,6 +2559,15 @@ mod tests {
                 |i| password(i, "pässwör", 0),
                 "PASS_Q_TOOSHORT",
             ),
+            (
+                Operation::ChangePassword,
+                true,
+                |i| {
+                    i.password = Some(Zeroizing::new(NOT_UTF8.to_vec()));
+                    i.keepold = Some(0);
+                },
+                "PASS_Q_GENERIC",
+            ),
         ];
         for (operation, owned, fill, expected) in rows {
             let mut intent = WriteIntent::new(operation, Caller::Embedder);
@@ -2012,7 +2585,9 @@ mod tests {
                 batch: RealmBatch::default(),
             };
             let got = match verdict(&change, "EXAMPLE.COM") {
-                Ok(Verdict::Write { new }) if new.is_empty() => "written".to_owned(),
+                Ok(Verdict::Write { new, onto }) if new.is_empty() && onto.is_empty() => {
+                    "written".to_owned()
+                }
                 Ok(Verdict::Unlock(named)) => format!("unlock {}", named.principal),
                 Ok(Verdict::Password(named)) => format!("password {}", named.principal),
                 Ok(Verdict::Deny { code, .. }) => code_name(code).to_owned(),
@@ -2021,12 +2596,34 @@ mod tests {
             };
             assert_eq!(got, expected, "{operation:?}, owned {owned}");
         }
+        let mut alias = krb5_kdc::PrincipalBuilder::new(name("carl"), "EXAMPLE.COM").build();
+        alias.tl_data.push(krb5_kdc::TlData {
+            ty: krb5_kdc::TL_ALIAS_TARGET,
+            contents: b"bobby@EXAMPLE.COM\0".to_vec(),
+        });
+        let change = HostChange {
+            intent: WriteIntent::new(Operation::CreateAlias, Caller::Embedder),
+            rows: vec![RowChange {
+                id: "carl@EXAMPLE.COM".to_owned(),
+                before: None,
+                after: Some(alias),
+                mask: 0,
+                host_owned: false,
+            }],
+            prepared: None,
+            batch: RealmBatch::default(),
+        };
+        assert_eq!(
+            verdict(&change, "EXAMPLE.COM").map(shown),
+            Ok("ask carl@EXAMPLE.COM as carl, onto bobby@EXAMPLE.COM".to_owned()),
+            "an alias row: its target is asked of the directory, through the alias index"
+        );
     }
 
     fn shown(verdict: Verdict) -> String {
         match verdict {
-            Verdict::Write { new } if new.is_empty() => "pass".to_owned(),
-            Verdict::Write { new } => {
+            Verdict::Write { new, onto } if new.is_empty() && onto.is_empty() => "pass".to_owned(),
+            Verdict::Write { new, onto } => {
                 let names: Vec<_> = new
                     .iter()
                     .map(|n| {
@@ -2036,12 +2633,20 @@ mod tests {
                             n.user.as_ref().map_or("", UserId::as_str)
                         )
                     })
+                    .chain(onto.iter().map(|target| format!("onto {target}")))
                     .collect();
                 format!("ask {}", names.join(", "))
             }
-            Verdict::Unlock(named) => format!("unlock {}", named.principal),
-            Verdict::Password(named) => format!("password {}", named.principal),
-            Verdict::Deny { code, named } => format!("{} {}", code_name(code), named.principal),
+            Verdict::Unlock(named) => format!("unlock {}{}", named.principal, named.requested_as()),
+            Verdict::Password(named) => {
+                format!("password {}{}", named.principal, named.requested_as())
+            }
+            Verdict::Deny { code, named } => format!(
+                "{} {}{}",
+                code_name(code),
+                named.principal,
+                named.requested_as()
+            ),
         }
     }
 
@@ -2063,7 +2668,7 @@ mod tests {
             Some(("bob@EXAMPLE.COM", true)),
             Some(("svc@EXAMPLE.COM", false)),
         );
-        let rows: [Row; 24] = [
+        let rows: [Row; 29] = [
             (
                 "create, no record",
                 Operation::Create,
@@ -2137,12 +2742,28 @@ mod tests {
                 "PROTECT_PRINCIPAL bob@EXAMPLE.COM",
             ),
             (
+                "alias onto an owned record through an alias",
+                Operation::CreateAlias,
+                bob,
+                ["carl@EXAMPLE.COM", "bobby@EXAMPLE.COM"],
+                |_| {},
+                "PROTECT_PRINCIPAL bob@EXAMPLE.COM (requested as bobby@EXAMPLE.COM)",
+            ),
+            (
+                "alias onto a user's name, no record",
+                Operation::CreateAlias,
+                None,
+                ["carl@EXAMPLE.COM", "alice@EXAMPLE.COM"],
+                |_| {},
+                "ask carl@EXAMPLE.COM as carl, onto alice@EXAMPLE.COM",
+            ),
+            (
                 "alias named as a user",
                 Operation::CreateAlias,
                 svc,
                 ["alice@EXAMPLE.COM", "svc@EXAMPLE.COM"],
                 |_| {},
-                "ask alice@EXAMPLE.COM as alice",
+                "ask alice@EXAMPLE.COM as alice, onto svc@EXAMPLE.COM",
             ),
             (
                 "alias named as a case twin, no target",
@@ -2150,7 +2771,7 @@ mod tests {
                 None,
                 ["Alice@EXAMPLE.COM", "svc@EXAMPLE.COM"],
                 |_| {},
-                "ask Alice@EXAMPLE.COM as alice",
+                "ask Alice@EXAMPLE.COM as alice, onto svc@EXAMPLE.COM",
             ),
             (
                 "cpw",
@@ -2159,6 +2780,25 @@ mod tests {
                 ["bob@EXAMPLE.COM", ""],
                 |i| password(i, "Bob-Password-2", 0),
                 "password bob@EXAMPLE.COM",
+            ),
+            (
+                "cpw through an alias",
+                Operation::ChangePassword,
+                bob,
+                ["bobby@EXAMPLE.COM", ""],
+                |i| password(i, "Bob-Password-2", 0),
+                "password bob@EXAMPLE.COM (requested as bobby@EXAMPLE.COM)",
+            ),
+            (
+                "cpw not UTF-8",
+                Operation::ChangePassword,
+                bob,
+                ["bob@EXAMPLE.COM", ""],
+                |i| {
+                    i.password = Some(Zeroizing::new(NOT_UTF8.to_vec()));
+                    i.keepold = Some(0);
+                },
+                "PASS_Q_GENERIC bob@EXAMPLE.COM",
             ),
             (
                 "cpw of 7 characters in 9 bytes",
@@ -2247,6 +2887,14 @@ mod tests {
                 ["bob@EXAMPLE.COM", ""],
                 |_| {},
                 "PROTECT_PRINCIPAL bob@EXAMPLE.COM",
+            ),
+            (
+                "delete through an alias",
+                Operation::Delete,
+                bob,
+                ["bobby@EXAMPLE.COM", ""],
+                |_| {},
+                "pass",
             ),
             (
                 "randkey of an unowned record",

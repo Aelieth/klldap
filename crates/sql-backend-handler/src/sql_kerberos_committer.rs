@@ -8,10 +8,10 @@ use crate::sql_opaque_handler::user_disabled_in;
 use crate::sql_tables::DbConnection;
 use lldap_domain::types::UserId;
 use lldap_domain_handlers::kerberos::{
-    DIRECTORY_USER, HostRow, KerberosStore, KerberosStoreError, LoadedRealm, NoopKerberosStore,
-    RealmBatch, USER_GONE, set_kerberos_store,
+    DIRECTORY_TARGET, DIRECTORY_USER, HostRow, KerberosStore, KerberosStoreError, LoadedRealm,
+    NoopKerberosStore, RealmBatch, UNREAD_AFTER_COMMIT, USER_GONE, set_kerberos_store,
 };
-use lldap_domain_handlers::password::kill_point;
+use lldap_domain_handlers::password::{ANSWER_LOST, kill_point};
 use lldap_domain_model::model::{self, UserColumn};
 use sea_orm::sea_query::Expr;
 use sea_orm::{
@@ -20,6 +20,7 @@ use sea_orm::{
 };
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, watch};
 use tracing::warn;
@@ -169,23 +170,33 @@ struct Timings {
     lost_after: Duration,
     watch: Duration,
     step: Duration,
+    /// Tests only: the next password COMMIT that succeeds is answered as lost.
+    lose_an_answer: AtomicBool,
 }
 
 pub fn start_kerberos_committer(pool: DbConnection) -> KerberosCommitterHandle {
     start_kerberos_committer_for(pool, HEARTBEAT, LOST_AFTER, WATCH, STEP)
 }
 
+fn standard(lose_an_answer: bool) -> Timings {
+    Timings {
+        heartbeat: HEARTBEAT,
+        lost_after: LOST_AFTER,
+        watch: WATCH,
+        step: STEP,
+        lose_an_answer: AtomicBool::new(lose_an_answer),
+    }
+}
+
 /// A committer whose store is not the process's, for kerber-rust's conformance suite.
 pub fn start_unregistered_committer(pool: DbConnection) -> KerberosCommitterHandle {
-    spawn_committer(
-        pool,
-        Timings {
-            heartbeat: HEARTBEAT,
-            lost_after: LOST_AFTER,
-            watch: WATCH,
-            step: STEP,
-        },
-    )
+    spawn_committer(pool, standard(false))
+}
+
+/// For tests: the first password change that commits is answered as if its answer was lost.
+#[cfg(feature = "test-hooks")]
+pub fn start_committer_losing_an_answer(pool: DbConnection) -> KerberosCommitterHandle {
+    spawn_committer(pool, standard(true))
 }
 
 pub(crate) fn start_kerberos_committer_for(
@@ -202,6 +213,7 @@ pub(crate) fn start_kerberos_committer_for(
             lost_after,
             watch,
             step,
+            lose_an_answer: AtomicBool::new(false),
         },
     );
     set_kerberos_store(handle.store());
@@ -430,6 +442,8 @@ async fn beat(pool: &DbConnection, generation: i64, step: Duration) -> Result<i6
 
 enum WriteError {
     Unreachable(String),
+    /// COMMIT was sent, and its answer is an error or did not come within the step.
+    Unanswered(String),
     Batch(KerberosSqlError),
     Host(KerberosStoreError),
 }
@@ -450,6 +464,7 @@ async fn write_batch(
     host: &[HostRow],
     batch: &RealmBatch,
     generation: i64,
+    sent: &AtomicBool,
 ) -> Result<(), WriteError> {
     let password = changes_a_password(host);
     let txn = pool
@@ -464,9 +479,10 @@ async fn write_batch(
     match commit_batch_with_transaction(&txn, batch, generation).await {
         Ok(()) => {
             point(password, "batch-written");
+            sent.store(true, Ordering::Release);
             txn.commit()
                 .await
-                .map_err(|err| WriteError::Unreachable(err.to_string()))
+                .map_err(|err| WriteError::Unanswered(err.to_string()))
         }
         Err(err) => {
             let _ = txn.rollback().await;
@@ -498,17 +514,27 @@ async fn write_host_rows(
                     .map_err(row_failed)?;
             }
             HostRow::NoUser(users) => {
-                if !existing_users(txn, users)
-                    .await
-                    .map_err(row_failed)?
-                    .is_empty()
-                {
+                if first_user(txn, users).await?.is_some() {
                     return Err(KerberosStoreError::Refused(DIRECTORY_USER.to_owned()));
+                }
+            }
+            HostRow::NoAliasOnto(users) => {
+                if let Some(user) = first_user(txn, users).await? {
+                    let refusal = format!("{DIRECTORY_TARGET}: {user}");
+                    return Err(KerberosStoreError::Refused(refusal));
                 }
             }
         }
     }
     Ok(())
+}
+
+async fn first_user(
+    txn: &DatabaseTransaction,
+    users: &[UserId],
+) -> Result<Option<UserId>, KerberosStoreError> {
+    let found = existing_users(txn, users).await.map_err(row_failed)?;
+    Ok(users.iter().find(|user| found.contains(user)).cloned())
 }
 
 async fn existing_users(db: &impl ConnectionTrait, users: &[UserId]) -> Result<Vec<UserId>, DbErr> {
@@ -613,17 +639,36 @@ async fn commit_job(
         return phase;
     };
     let step = timings.step;
+    let sent = AtomicBool::new(false);
+    let ran_out = || {
+        if sent.load(Ordering::Acquire) {
+            WriteError::Unanswered(late(step))
+        } else {
+            WriteError::Unreachable(late(step))
+        }
+    };
     let written = within(
         step,
-        || WriteError::Unreachable(late(step)),
-        write_batch(pool, host, &batch, held.generation),
+        ran_out,
+        write_batch(pool, host, &batch, held.generation, &sent),
     )
     .await;
+    let written = match written {
+        Ok(()) if password && timings.lose_an_answer.swap(false, Ordering::AcqRel) => Err(
+            WriteError::Unanswered("the answer to COMMIT was lost".to_owned()),
+        ),
+        written => written,
+    };
     match written {
         Ok(()) => {
             point(password, "committed");
             let _ = reply.send(Ok(()));
             Phase::Held(fresh(held.generation + 1, true, timings))
+        }
+        Err(WriteError::Unanswered(reason)) => {
+            let (answer, phase) = read_back(pool, held, host, reason, lost_tx, timings).await;
+            let _ = reply.send(answer);
+            phase
         }
         Err(WriteError::Host(err)) => {
             let _ = reply.send(Err(err));
@@ -643,6 +688,43 @@ async fn commit_job(
             let database = matches!(err, KerberosSqlError::Failed(_));
             let _ = reply.send(Err(store_err(err)));
             no_row_failure(pool, held, timings, lost_tx, database).await
+        }
+    }
+}
+
+/// A password commit whose answer was lost: the user's record says whether it committed.
+async fn read_back(
+    pool: &DbConnection,
+    held: Held,
+    host: &[HostRow],
+    reason: String,
+    lost_tx: &watch::Sender<Option<KerberosLost>>,
+    timings: &Timings,
+) -> (Result<(), KerberosStoreError>, Phase) {
+    let written = host.iter().find_map(|row| match row {
+        HostRow::SetPassword { user, record, .. } => Some((user, record)),
+        _ => None,
+    });
+    let Some((user, record)) = written else {
+        let phase = db_failed(held, timings, lost_tx);
+        return (Err(KerberosStoreError::Failed(reason)), phase);
+    };
+    match read_record(pool, user, timings.step).await {
+        Ok(Some(stored)) if stored == *record => {
+            warn!("The commit for user {user}: {ANSWER_LOST}");
+            (
+                Ok(()),
+                Phase::Held(fresh(held.generation + 1, true, timings)),
+            )
+        }
+        Ok(_) => {
+            let phase = db_failed(held, timings, lost_tx);
+            (Err(KerberosStoreError::Failed(reason)), phase)
+        }
+        Err(err) => {
+            let phase = db_failed(held, timings, lost_tx);
+            let why = format!("{UNREAD_AFTER_COMMIT}: {reason}; {err}");
+            (Err(KerberosStoreError::Failed(why)), phase)
         }
     }
 }
@@ -1424,6 +1506,7 @@ mod tests {
             lost_after: Duration::from_millis(400),
             watch: Duration::from_secs(5),
             step: Duration::from_millis(100),
+            lose_an_answer: AtomicBool::new(false),
         }
     }
 
@@ -1515,10 +1598,8 @@ mod tests {
     #[serial]
     async fn test_a_woken_owner_beats_once_before_it_gives_up() {
         let timings = Timings {
-            heartbeat: HEARTBEAT,
-            lost_after: LOST_AFTER,
-            watch: WATCH,
             step: Duration::from_millis(500),
+            ..standard(false)
         };
         let rows = [
             ("generation still ours", Some(6), None),
@@ -1723,6 +1804,23 @@ mod tests {
                     ..nothing(6)
                 },
             ),
+            (
+                "an alias onto a directory user's name, in another case",
+                vec![HostRow::NoAliasOnto(vec![UserId::new("Alice")])],
+                Before::Nothing,
+                Err(DIRECTORY_TARGET),
+                nothing(5),
+            ),
+            (
+                "an alias onto a name no directory user holds",
+                vec![HostRow::NoAliasOnto(vec![UserId::new("bob")])],
+                Before::Nothing,
+                Ok(()),
+                After {
+                    principals: 1,
+                    ..nothing(6)
+                },
+            ),
         ];
         for (label, host, before, answer, expected) in rows {
             let db = db().await;
@@ -1861,5 +1959,131 @@ mod tests {
             ),
             ((false, false, true, false), true)
         );
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Lost {
+        Committed,
+        NotCommitted,
+        CommittedUnreadable,
+    }
+
+    // Q-E, in the committer: after a lost COMMIT answer, the user's record decides, once.
+    #[tokio::test]
+    #[serial]
+    async fn test_a_lost_answer_is_settled_by_the_record_read_back() {
+        use lldap_domain_handlers::logging::{LogKind, event};
+        const LOST: &str = "the answer to COMMIT was lost";
+        let mut kadmin = password_rows("alice", RECORD);
+        kadmin[1] = HostRow::Log(event(
+            LogKind::PasswordChange,
+            Some("alice@EXAMPLE.COM"),
+            true,
+            Some("kadmin change_password by admin/admin@EXAMPLE.COM"),
+        ));
+        let committed = || After {
+            alice_record: true,
+            carol: false,
+            logs: 1,
+            principals: 1,
+            generation: 6,
+        };
+        let untouched = || After {
+            alice_record: false,
+            carol: false,
+            logs: 0,
+            principals: 0,
+            generation: 5,
+        };
+        type Row = (
+            &'static str,
+            Vec<HostRow>,
+            Lost,
+            &'static str,
+            Option<i64>,
+            After,
+            (bool, Option<KerberosLost>),
+        );
+        let rows: Vec<Row> = vec![
+            (
+                "the record is the one written",
+                password_rows("alice", RECORD),
+                Lost::Committed,
+                "ok",
+                Some(6),
+                committed(),
+                (true, None),
+            ),
+            (
+                "the record is another",
+                password_rows("alice", RECORD),
+                Lost::NotCommitted,
+                "failed",
+                Some(5),
+                untouched(),
+                (true, None),
+            ),
+            (
+                "the record cannot be read",
+                password_rows("alice", RECORD),
+                Lost::CommittedUnreadable,
+                "unknown",
+                Some(5),
+                committed(),
+                (false, Some(KerberosLost::Replaced)),
+            ),
+            (
+                "a kadmin cpw, the record the one written",
+                kadmin,
+                Lost::Committed,
+                "ok",
+                Some(6),
+                committed(),
+                (true, None),
+            ),
+        ];
+        for (label, host, lost, answer, generation, expected, next) in rows {
+            let db = db().await;
+            insert_alice(&db.pool).await;
+            insert_realm(&db.pool, 5, true).await;
+            let timings = short_timings();
+            let (lost_tx, cause) = watch::channel(None);
+            if lost != Lost::NotCommitted {
+                let wrote =
+                    write_batch(&db.pool, &host, &batch(), 5, &AtomicBool::new(false)).await;
+                assert!(matches!(wrote, Ok(())), "{label}");
+            }
+            let holding = match lost {
+                Lost::CommittedUnreadable => Some(db.pool.begin().await.unwrap()),
+                _ => None,
+            };
+            let held = fresh(5, true, &timings);
+            let (got, phase) =
+                read_back(&db.pool, held, &host, LOST.to_owned(), &lost_tx, &timings).await;
+            if let Some(txn) = holding {
+                txn.rollback().await.unwrap();
+            }
+            let got = match got {
+                Ok(()) => "ok".to_owned(),
+                Err(KerberosStoreError::Failed(why)) if why == LOST => "failed".to_owned(),
+                Err(KerberosStoreError::Failed(why)) if why.starts_with(UNREAD_AFTER_COMMIT) => {
+                    "unknown".to_owned()
+                }
+                Err(e) => e.to_string(),
+            };
+            let at = match &phase {
+                Phase::Held(held) => Some(held.generation),
+                _ => None,
+            };
+            let stored = after(&db).await;
+            let (reply, answered) = oneshot::channel();
+            commit_job(&db.pool, phase, &[], batch(), reply, &lost_tx, &timings).await;
+            let then = (answered.await.unwrap().is_ok(), cause.borrow().clone());
+            assert_eq!(
+                (got.as_str(), at, stored, then),
+                (answer, generation, expected, next),
+                "{label}"
+            );
+        }
     }
 }

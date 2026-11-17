@@ -1,4 +1,4 @@
-use crate::logging::LogEvent;
+use crate::logging::{LogEvent, LogKind};
 use async_trait::async_trait;
 use lldap_domain::requests::CreateUserRequest;
 use lldap_domain::types::UserId;
@@ -134,7 +134,7 @@ pub trait KerberosSync: Send + Sync {
         &self,
         _change: PasswordCommit,
         _password: &str,
-    ) -> Result<Committed, CommitError> {
+    ) -> Result<(), CommitError> {
         Err(CommitError::Failed(NO_COMMIT.to_owned()))
     }
     async fn delete_principal(&self, user: &UserId) -> Result<(), String>;
@@ -154,6 +154,9 @@ const NO_HOST_ROWS: &str = "this Kerberos store writes no directory rows";
 pub const USER_GONE: &str = "the user is gone";
 /// A new principal name is a directory user's, or a case twin of one.
 pub const DIRECTORY_USER: &str = "the name belongs to a directory user";
+pub const DIRECTORY_TARGET: &str = "the alias's target belongs to a directory user";
+/// Starts the Failed answer of a commit whose record could not be read back.
+pub const UNREAD_AFTER_COMMIT: &str = "the result is unknown: the record could not be read back";
 
 /// A directory row that commits in the transaction of a Kerberos change.
 #[derive(Clone)]
@@ -168,6 +171,8 @@ pub enum HostRow {
     Log(LogEvent),
     /// None of these users may exist, or the transaction rolls back with `DIRECTORY_USER`.
     NoUser(Vec<UserId>),
+    /// None of these users may exist, or the transaction rolls back with `DIRECTORY_TARGET`.
+    NoAliasOnto(Vec<UserId>),
 }
 
 impl HostRow {
@@ -180,12 +185,15 @@ impl HostRow {
             Self::SetPassword { user, .. } => format!("password {user}"),
             Self::CreateUser(request) => format!("create {}", request.user_id),
             Self::Log(event) => format!("log {}", event.kind),
-            Self::NoUser(users) => {
-                let users: Vec<_> = users.iter().map(UserId::as_str).collect();
-                format!("no user {}", users.join(", "))
-            }
+            Self::NoUser(users) => format!("no user {}", names(users)),
+            Self::NoAliasOnto(users) => format!("no alias onto {}", names(users)),
         }
     }
+}
+
+fn names(users: &[UserId]) -> String {
+    let users: Vec<_> = users.iter().map(UserId::as_str).collect();
+    users.join(", ")
 }
 
 impl std::fmt::Debug for HostRow {
@@ -194,18 +202,11 @@ impl std::fmt::Debug for HostRow {
     }
 }
 
-/// The prepared OPAQUE record and the rows that carry it; the password goes beside it.
+/// The rows that carry the prepared OPAQUE record; the password goes beside them.
 pub struct PasswordCommit {
     pub user: UserId,
-    pub record: Vec<u8>,
     pub rows: Vec<HostRow>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Committed {
-    Done,
-    /// The commit was answered Failed, and the stored record is the one this change prepared.
-    AnswerLost,
+    pub kind: LogKind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -535,7 +536,7 @@ mod tests {
         use crate::logging::{LogKind, event};
         let now = chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc();
         let bob = UserId::new("bob");
-        let rows: [(HostRow, &str, bool); 4] = [
+        let rows: [(HostRow, &str, bool); 5] = [
             (
                 HostRow::SetPassword {
                     user: bob.clone(),
@@ -561,6 +562,11 @@ mod tests {
             (
                 HostRow::NoUser(vec![UserId::new("Alice"), UserId::new("carol")]),
                 "no user alice, carol",
+                false,
+            ),
+            (
+                HostRow::NoAliasOnto(vec![UserId::new("Bob")]),
+                "no alias onto bob",
                 false,
             ),
         ];

@@ -1710,7 +1710,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_set_user_password_answers_each_outcome_of_a_synced_change() {
-        use lldap_domain_handlers::kerberos::{CommitError, Committed};
+        use lldap_domain_handlers::kerberos::CommitError;
         use lldap_domain_handlers::password::{PASSWORD_CHANGE_IN_PROGRESS, RESULT_UNKNOWN};
         use lldap_test_utils::recording_kerberos::{DEGRADED_CAUSE, DegradedGuard};
         const REFUSAL: &str = "password policy: min_length 40";
@@ -1718,7 +1718,7 @@ mod tests {
         enum Kdc {
             Refusing,
             Offline,
-            Answering(Result<Committed, CommitError>),
+            Answering(Result<(), CommitError>),
         }
         let failed = |e| Kdc::Answering(Err(e));
         let rows: Vec<(Kdc, Option<String>)> = vec![
@@ -1742,7 +1742,7 @@ mod tests {
                 failed(CommitError::Unknown("late".to_owned())),
                 Some(RESULT_UNKNOWN.to_owned()),
             ),
-            (Kdc::Answering(Ok(Committed::AnswerLost)), None),
+            (Kdc::Answering(Ok(())), None),
         ];
         for (kdc, error) in rows {
             let reached = matches!(kdc, Kdc::Answering(_));

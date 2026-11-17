@@ -16,6 +16,8 @@ pub use lldap_domain_handlers::handler::PosixSettings;
 pub use lldap_opaque_handler::register_password;
 pub use sql_backend_handler::SqlBackendHandler;
 pub use sql_durability::{sqlite_extra_synchronous, warn_database_durability};
+#[cfg(feature = "test-hooks")]
+pub use sql_kerberos_committer::start_committer_losing_an_answer;
 pub use sql_kerberos_committer::{
     KerberosCommitterHandle, KerberosLost, start_kerberos_committer, start_unregistered_committer,
 };

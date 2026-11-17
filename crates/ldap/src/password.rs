@@ -231,7 +231,7 @@ pub mod tests {
     use chrono::TimeZone;
     use ldap3_proto::proto::{LdapBindCred, LdapBindResponse, LdapOp, LdapResult as LdapResultOp};
     use lldap_domain::types::{GroupDetails, GroupId, UserId, Uuid};
-    use lldap_domain_handlers::kerberos::{CommitError, Committed};
+    use lldap_domain_handlers::kerberos::CommitError;
     use lldap_domain_handlers::password::{PASSWORD_CHANGE_IN_PROGRESS, RESULT_UNKNOWN};
     use lldap_test_utils::recording_kerberos::{
         DEGRADED_CAUSE, DegradedGuard, KerberosOp, RecordingGuard,
@@ -585,7 +585,7 @@ pub mod tests {
     pub(crate) enum Kdc {
         Refusing,
         Offline,
-        Answering(Result<Committed, CommitError>),
+        Answering(Result<(), CommitError>),
     }
 
     pub(crate) const REFUSAL: &str = "password policy: min_length 40";
@@ -624,12 +624,7 @@ pub mod tests {
                 RESULT_UNKNOWN.to_owned(),
             ),
             (
-                Kdc::Answering(Ok(Committed::AnswerLost)),
-                LdapResultCode::Success,
-                String::new(),
-            ),
-            (
-                Kdc::Answering(Ok(Committed::Done)),
+                Kdc::Answering(Ok(())),
                 LdapResultCode::Success,
                 String::new(),
             ),

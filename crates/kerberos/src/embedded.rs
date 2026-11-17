@@ -1,7 +1,7 @@
 use crate::boot::{self, OpenRealm, RealmSettings};
 use crate::rotate;
 pub use crate::seam::Records;
-use crate::seam::{Host, SqlRealm, committing, committing_with};
+use crate::seam::{Host, SqlRealm, committing, committing_with, stored_aliases};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use krb5_admin::{
@@ -18,13 +18,13 @@ use krb5_kdc::{
 use krb5_types::PrincipalName;
 use lldap_domain::types::UserId;
 use lldap_domain_handlers::kerberos::{
-    CommitError, Committed, KerberosSync, PasswordCommit, USER_GONE as NO_USER_ROW,
-    validate_kerberos_username, validate_keytab_hostname,
+    CommitError, HostRow, KerberosSync, PasswordCommit, UNREAD_AFTER_COMMIT,
+    USER_GONE as NO_USER_ROW, validate_kerberos_username, validate_keytab_hostname,
 };
 use lldap_domain_handlers::logging::{
-    LogKind, current_request, record, record_outcome, with_request_sync,
+    self, LogKind, current_request, record, record_outcome, with_request_sync,
 };
-use lldap_domain_handlers::password::kill_point;
+use lldap_domain_handlers::password::{kill_point, record_commit_failure};
 use std::collections::HashMap;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
@@ -94,6 +94,10 @@ impl EmbeddedKerberos {
             kdc_tcp,
             kadmin,
         } = boot::open(settings, host.clone())?;
+        {
+            let (opened, _) = krb5_kdc::read_fresh(&store);
+            host.seed_aliases(stored_aliases(&opened, &settings.realm));
+        }
         let shutdown = Shutdown::new();
         let stopping = Arc::new(AtomicBool::new(false));
         let ready = Arc::new(AtomicBool::new(false));
@@ -463,23 +467,42 @@ impl KerberosSync for EmbeddedKerberos {
         &self,
         change: PasswordCommit,
         password: &str,
-    ) -> Result<Committed, CommitError> {
-        validate_kerberos_username(change.user.as_str()).map_err(CommitError::Refused)?;
+    ) -> Result<(), CommitError> {
+        let (kind, user) = (change.kind, change.user.clone());
+        if let Err(why) = validate_kerberos_username(user.as_str()) {
+            let refused = CommitError::Refused(why);
+            record_commit_failure(kind, &user, &refused);
+            return Err(refused);
+        }
         let (own, enctypes, ent) = (self.own(), self.enctypes.clone(), self.new_principal());
         let password = Zeroizing::new(password.as_bytes().to_vec());
         let serial = tokio::time::timeout(self.write_wait, self.writes.clone().lock_owned())
             .await
             .map_err(|_| CommitError::Busy)?;
-        let span = Span::current();
+        let (span, meta) = (Span::current(), current_request());
+        let worker = user.clone();
         tokio::task::spawn_blocking(move || {
             let _serial = serial;
-            span.in_scope(|| commit_owned(&own, &password, &enctypes, &ent, change))
+            span.in_scope(|| {
+                with_request_sync(meta, || {
+                    let printed = logged_rows(&change.rows);
+                    let done = panic::catch_unwind(AssertUnwindSafe(|| {
+                        commit_owned(&own, &password, &enctypes, &ent, change)
+                    }))
+                    .unwrap_or_else(|_| Err(CommitError::Unknown(PANICKED.to_owned())));
+                    match &done {
+                        Ok(()) => printed.iter().for_each(logging::print),
+                        Err(e) => record_commit_failure(kind, &worker, e),
+                    }
+                    done
+                })
+            })
         })
         .await
         .unwrap_or_else(|e| {
-            Err(CommitError::Unknown(format!(
-                "the password change did not complete: {e}"
-            )))
+            let unknown = CommitError::Unknown(format!("the password change did not run: {e}"));
+            record_commit_failure(kind, &user, &unknown);
+            Err(unknown)
         })
     }
     async fn delete_principal(&self, user: &UserId) -> Result<(), String> {
@@ -776,6 +799,17 @@ fn create_marked(
     })?
 }
 
+const PANICKED: &str = "the password change panicked";
+
+fn logged_rows(rows: &[HostRow]) -> Vec<logging::LogEvent> {
+    rows.iter()
+        .filter_map(|row| match row {
+            HostRow::Log(event) => Some(event.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 // A synced user's change from step 5 on, on the blocking task that owns the `writes` guard.
 fn commit_owned(
     own: &Own,
@@ -783,8 +817,8 @@ fn commit_owned(
     enctypes: &[KeySalt],
     ent: &AdminEnt,
     change: PasswordCommit,
-) -> Result<Committed, CommitError> {
-    let PasswordCommit { user, record, rows } = change;
+) -> Result<(), CommitError> {
+    let PasswordCommit { user, rows, .. } = change;
     let disabled = own
         .host
         .user_disabled(&user)
@@ -801,43 +835,28 @@ fn commit_owned(
     {
         return Err(CommitError::Refused(why.clone()));
     }
-    match made.map_err(unanswered) {
-        Ok(()) => {
-            kill_point("kerberos-changed");
-            Ok(Committed::Done)
-        }
-        Err(Ok(why)) => after_failed(own.host.password_record(&user), &record, why),
-        Err(Err(known)) => Err(known),
-    }
+    made.map_err(commit_error)?;
+    kill_point("kerberos-changed");
+    Ok(())
 }
 
-// Only Failed and NotReady can follow a commit that reached the database.
-fn unanswered(e: StoreError) -> Result<String, CommitError> {
+fn commit_error(e: StoreError) -> CommitError {
     match e {
+        StoreError::Host(KerberosStoreError::Failed(why))
+            if why.starts_with(UNREAD_AFTER_COMMIT) =>
+        {
+            CommitError::Unknown(why)
+        }
         StoreError::Host(KerberosStoreError::Failed(why) | KerberosStoreError::NotReady(why)) => {
-            Ok(why)
+            CommitError::Failed(why)
         }
         StoreError::Host(KerberosStoreError::Refused(why)) if why == NO_USER_ROW => {
-            Err(CommitError::UserGone)
+            CommitError::UserGone
         }
         e @ (StoreError::PasswordPolicy(_) | StoreError::PassTooSoon { .. }) => {
-            Err(CommitError::Refused(e.to_string()))
+            CommitError::Refused(e.to_string())
         }
-        e => Err(CommitError::Failed(e.to_string())),
-    }
-}
-
-fn after_failed(
-    stored: Result<Option<Vec<u8>>, KerberosStoreError>,
-    prepared: &[u8],
-    why: String,
-) -> Result<Committed, CommitError> {
-    match stored {
-        Ok(Some(record)) if record == prepared => Ok(Committed::AnswerLost),
-        Ok(_) => Err(CommitError::Failed(why)),
-        Err(e) => Err(CommitError::Unknown(format!(
-            "{why}; the stored record could not be read: {e}"
-        ))),
+        e => CommitError::Failed(e.to_string()),
     }
 }
 
@@ -1000,20 +1019,28 @@ pub(crate) mod tests {
         fault: std::sync::Mutex<Option<Fault>>,
         disabled: std::sync::Mutex<Vec<String>>,
         unread: AtomicBool,
+        delay: std::sync::Mutex<Duration>,
     }
 
+    /// What the committer answers after its own read-back; nothing is written.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub(crate) enum Fault {
-        /// Commits, then answers Failed.
-        AnswerLost,
         Failed,
-        Unreadable,
+        Unknown,
         UserGone,
     }
 
     impl Counting {
         pub(crate) fn set_fault(&self, fault: Option<Fault>) {
             *self.fault.lock().unwrap() = fault;
+        }
+
+        pub(crate) fn set_delay(&self, delay: Duration) {
+            *self.delay.lock().unwrap() = delay;
+        }
+
+        pub(crate) fn password_record(&self, user: &UserId) -> Option<Vec<u8>> {
+            self.records.lock().unwrap().get(user.as_str()).cloned()
         }
 
         pub(crate) fn rows(&self) -> Vec<String> {
@@ -1033,6 +1060,12 @@ pub(crate) mod tests {
 
     fn unanswered_db() -> KerberosStoreError {
         KerberosStoreError::Failed("the database did not answer".to_owned())
+    }
+
+    fn unread_db() -> KerberosStoreError {
+        KerberosStoreError::Failed(format!(
+            "{UNREAD_AFTER_COMMIT}: the database did not answer"
+        ))
     }
 
     impl KerberosStore for Counting {
@@ -1058,12 +1091,14 @@ pub(crate) mod tests {
             rows: Vec<HostRow>,
         ) -> Result<(), KerberosStoreError> {
             self.own.fetch_add(1, Ordering::Relaxed);
+            std::thread::sleep(*self.delay.lock().unwrap());
             match self.fault() {
-                Some(Fault::Failed | Fault::Unreadable) => return Err(unanswered_db()),
+                Some(Fault::Failed) => return Err(unanswered_db()),
+                Some(Fault::Unknown) => return Err(unread_db()),
                 Some(Fault::UserGone) => {
                     return Err(KerberosStoreError::Refused(NO_USER_ROW.to_owned()));
                 }
-                Some(Fault::AnswerLost) | None => {}
+                None => {}
             }
             self.realm.commit(change.batch)?;
             for row in &rows {
@@ -1076,17 +1111,7 @@ pub(crate) mod tests {
                 .lock()
                 .unwrap()
                 .extend(rows.iter().map(HostRow::label));
-            match self.fault() {
-                Some(Fault::AnswerLost) => Err(unanswered_db()),
-                _ => Ok(()),
-            }
-        }
-
-        fn password_record(&self, user: &UserId) -> Result<Option<Vec<u8>>, KerberosStoreError> {
-            if self.fault() == Some(Fault::Unreadable) {
-                return Err(unanswered_db());
-            }
-            Ok(self.records.lock().unwrap().get(user.as_str()).cloned())
+            Ok(())
         }
 
         fn user_disabled(&self, user: &UserId) -> Result<bool, KerberosStoreError> {
@@ -1741,10 +1766,10 @@ pub(crate) mod tests {
     }
 
     fn commit_of(user: &str, record: &[u8]) -> PasswordCommit {
-        use lldap_domain_handlers::logging::{LogKind, event};
+        use lldap_domain_handlers::logging::event;
         PasswordCommit {
             user: UserId::new(user),
-            record: record.to_vec(),
+            kind: LogKind::PasswordChange,
             rows: vec![
                 HostRow::SetPassword {
                     user: UserId::new(user),
@@ -1766,22 +1791,16 @@ pub(crate) mod tests {
     #[serial]
     async fn test_each_answer_of_the_commit_and_what_the_door_learns() {
         const RECORD: &[u8] = b"record-2";
-        type Row = (
-            &'static str,
-            Option<Fault>,
-            Result<Committed, CommitError>,
-            bool,
-        );
-        let rows: [Row; 5] = [
-            ("committed", None, Ok(Committed::Done), true),
+        type Row = (&'static str, Option<Fault>, Result<(), CommitError>, bool);
+        let rows: [Row; 4] = [
             (
-                "the answer was lost after the commit",
-                Some(Fault::AnswerLost),
-                Ok(Committed::AnswerLost),
+                "committed, or its lost answer read back as written",
+                None,
+                Ok(()),
                 true,
             ),
             (
-                "failed, and the stored record is not this one",
+                "failed: the record read back is not this one",
                 Some(Fault::Failed),
                 Err(CommitError::Failed(
                     "the database did not answer".to_owned(),
@@ -1789,13 +1808,11 @@ pub(crate) mod tests {
                 false,
             ),
             (
-                "failed, and the stored record cannot be read",
-                Some(Fault::Unreadable),
-                Err(CommitError::Unknown(
-                    "the database did not answer; the stored record could not be read: \
-                     Kerberos store failed: the database did not answer"
-                        .to_owned(),
-                )),
+                "unknown: the record could not be read back",
+                Some(Fault::Unknown),
+                Err(CommitError::Unknown(format!(
+                    "{UNREAD_AFTER_COMMIT}: the database did not answer"
+                ))),
                 false,
             ),
             (
@@ -1819,7 +1836,7 @@ pub(crate) mod tests {
                 .await;
             temp.host.set_fault(None);
             let kvno = old + u32::from(new);
-            let stored = temp.host.password_record(&bob()).unwrap();
+            let stored = temp.host.password_record(&bob());
             assert_eq!(
                 (
                     got,
@@ -1834,41 +1851,114 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_which_failures_may_follow_a_commit() {
-        type Row = (StoreError, Result<String, CommitError>);
-        let rows: [Row; 6] = [
+    fn test_each_store_failure_and_the_door_answer() {
+        let unread = format!("{UNREAD_AFTER_COMMIT}: late; the database did not answer");
+        type Row = (StoreError, CommitError);
+        let rows: [Row; 7] = [
             (
                 StoreError::Host(KerberosStoreError::Failed("late".to_owned())),
-                Ok("late".to_owned()),
+                CommitError::Failed("late".to_owned()),
+            ),
+            (
+                StoreError::Host(KerberosStoreError::Failed(unread.clone())),
+                CommitError::Unknown(unread),
             ),
             (
                 StoreError::Host(KerberosStoreError::NotReady("not held".to_owned())),
-                Ok("not held".to_owned()),
+                CommitError::Failed("not held".to_owned()),
             ),
             (
                 StoreError::Host(KerberosStoreError::Refused(NO_USER_ROW.to_owned())),
-                Err(CommitError::UserGone),
+                CommitError::UserGone,
             ),
             (
                 StoreError::Host(KerberosStoreError::Refused("a row".to_owned())),
-                Err(CommitError::Failed(
-                    "Kerberos store refused the change: a row".to_owned(),
-                )),
+                CommitError::Failed("Kerberos store refused the change: a row".to_owned()),
             ),
             (
                 StoreError::PasswordPolicy("too short".to_owned()),
-                Err(CommitError::Refused(
-                    "password policy: too short".to_owned(),
-                )),
+                CommitError::Refused("password policy: too short".to_owned()),
             ),
             (
                 StoreError::NotFound,
-                Err(CommitError::Failed("principal not found".to_owned())),
+                CommitError::Failed("principal not found".to_owned()),
             ),
         ];
         for (error, expected) in rows {
             let label = error.to_string();
-            assert_eq!(unanswered(error), expected, "{label}");
+            assert_eq!(commit_error(error), expected, "{label}");
+        }
+    }
+
+    // X1 grade 3: the row of a change whose caller went away is the blocking task's.
+    #[tokio::test]
+    #[serial]
+    async fn test_a_dropped_caller_of_a_password_change_still_gets_its_row() {
+        use lldap_domain_handlers::password::UNKNOWN_ROW;
+        let guard = LogGuard::install();
+        type Row = (
+            &'static str,
+            Option<Fault>,
+            Vec<(bool, String)>,
+            Vec<String>,
+        );
+        let rows: [Row; 3] = [
+            (
+                "committed: its row is in the transaction",
+                None,
+                Vec::new(),
+                vec!["password bob".to_owned(), "log password_change".to_owned()],
+            ),
+            (
+                "failed",
+                Some(Fault::Failed),
+                vec![(
+                    false,
+                    "password change failed: the database did not answer".to_owned(),
+                )],
+                Vec::new(),
+            ),
+            (
+                "unknown",
+                Some(Fault::Unknown),
+                vec![(false, UNKNOWN_ROW.to_owned())],
+                Vec::new(),
+            ),
+        ];
+        for (label, fault, logged, written) in rows {
+            let temp = TempRealm::new();
+            let (embedded, _store) = temp.embedded();
+            embedded
+                .sync_principal(&bob(), "Bob-Password-1")
+                .await
+                .unwrap();
+            guard.recorder().take_events();
+            temp.host.set_fault(fault);
+            temp.host.set_delay(Duration::from_millis(300));
+            let alice = RequestMeta::ldap(Some(UserId::new("alice")), None);
+            let call = embedded.commit_password(commit_of("bob", b"record"), "Bob-Pass-2");
+            let gave_up =
+                tokio::time::timeout(Duration::from_millis(50), with_request(alice, call))
+                    .await
+                    .is_err();
+            drop(embedded.writes.clone().lock_owned().await);
+            temp.host.set_delay(Duration::ZERO);
+            let events: Vec<_> = guard
+                .recorder()
+                .take_events()
+                .into_iter()
+                .filter(|e| e.kind == LogKind::PasswordChange)
+                .map(|e| (e.actor, (e.success, e.detail.unwrap_or_default())))
+                .collect();
+            let by_alice: Vec<_> = logged
+                .into_iter()
+                .map(|row| (Some("alice".to_owned()), row))
+                .collect();
+            assert_eq!(
+                (gave_up, events, temp.host.rows()),
+                (true, by_alice, written),
+                "{label}"
+            );
         }
     }
 
@@ -1891,10 +1981,7 @@ pub(crate) mod tests {
         let done = embedded
             .commit_password(commit_of("bob", b"record"), "Bob-Password-1")
             .await;
-        assert_eq!(
-            (done, marked(&store, "bob")),
-            (Ok(Committed::Done), Some((true, false)))
-        );
+        assert_eq!((done, marked(&store, "bob")), (Ok(()), Some((true, false))));
     }
 
     #[tokio::test]
@@ -1910,12 +1997,12 @@ pub(crate) mod tests {
         let unread = Err(CommitError::Failed(format!(
             "{STATE_UNREAD}: Kerberos store failed: the database did not answer"
         )));
-        let done = || Ok(Committed::Done);
+        let done = || Ok(());
         type Row = (
             &'static str,
             Before,
             Option<&'static [&'static str]>,
-            Result<Committed, CommitError>,
+            Result<(), CommitError>,
             (bool, bool),
         );
         let rows: [Row; 8] = [
@@ -2109,7 +2196,7 @@ pub(crate) mod tests {
                 fields(&store, "svc"),
                 temp.own_writes(),
                 temp.host.rows(),
-                temp.host.password_record(&bob()).unwrap(),
+                temp.host.password_record(&bob()),
                 raw
             ),
             (

@@ -206,32 +206,6 @@ mod tests {
 
     type Connect<'a> = &'a dyn Fn(usize, &Runtime) -> DatabaseConnection;
 
-    /// kerber-rust's suite plays the host and hands its own changes to `commit_change`; this
-    /// routes them to our own-write path and everything else to `SqlRealm`.
-    struct Conformance(SqlRealm);
-
-    impl Conformance {
-        fn new(store: Arc<dyn directory::KerberosStore>) -> Self {
-            let realm = SqlRealm::new(store);
-            realm.start_pass_committed();
-            Self(realm)
-        }
-    }
-
-    impl KerberosStore for Conformance {
-        fn load(&self) -> Result<LoadedRealm, KerberosStoreError> {
-            self.0.load()
-        }
-
-        fn commit_change(&self, change: HostChange) -> Result<(), KerberosStoreError> {
-            if change.intent.operation == Operation::Embedded {
-                committing(&self.0)(change)
-            } else {
-                self.0.commit_change(change)
-            }
-        }
-    }
-
     struct Nothing;
 
     impl directory::KerberosStore for Nothing {
@@ -293,7 +267,7 @@ mod tests {
             .unwrap();
         let committers: Mutex<Vec<KerberosCommitterHandle>> = Mutex::default();
         let made = AtomicUsize::new(0);
-        let new_store = || -> Arc<dyn KerberosStore> {
+        let new_host = || -> (Arc<dyn KerberosStore>, conformance::OwnCommit) {
             let pool = connect(made.fetch_add(1, Ordering::Relaxed), &runtime);
             let committer = runtime.block_on(async {
                 init_table(&pool).await.unwrap();
@@ -301,9 +275,13 @@ mod tests {
             });
             let store = committer.store();
             committers.lock().unwrap().push(committer);
-            Arc::new(Conformance::new(store))
+            let realm = Arc::new(SqlRealm::new(store));
+            realm.start_pass_committed();
+            let own = Arc::clone(&realm);
+            let commit: conformance::OwnCommit = Arc::new(move |change| own.write_own(change));
+            (realm as Arc<dyn KerberosStore>, commit)
         };
-        let rows = conformance::run(&new_store);
+        let rows = conformance::run_own(&new_host);
         for row in &rows {
             match &row.outcome {
                 Ok(()) => println!("ROW {} PASS", row.name),

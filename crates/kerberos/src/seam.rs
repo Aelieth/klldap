@@ -3,17 +3,19 @@ use krb5_kdc::host::{
     LoadedRealm, Operation, PolicyRow, PrincipalRow, RealmBatch, RealmState, RowChange, TargetPeek,
     WriteIntent,
 };
-use krb5_kdc::{MAX_ALIAS_DEPTH, PrincipalStore, kadm5_mask, lookup_principal_id};
+use krb5_kdc::{
+    MAX_ALIAS_DEPTH, Principal, TL_LAST_ADMIN_UNLOCK, TL_MOD_PRINC, TlData, kadm5_mask,
+    lookup_principal_id,
+};
 use lldap_domain::types::UserId;
 use lldap_domain_handlers::kerberos::{
-    self as directory, DIRECTORY_TARGET, DIRECTORY_USER, HostRow,
+    self as directory, AliasOnto, DIRECTORY_TARGET, DIRECTORY_USER, HostRow,
 };
 use lldap_domain_handlers::logging::{self, LogKind};
 use lldap_domain_handlers::password::{PASSWORD_MIN_LENGTH, long_enough};
 use lldap_opaque_handler::{OpaqueHandler, prepare_registration};
-use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 use tracing::warn;
 use zeroize::Zeroizing;
@@ -24,6 +26,7 @@ pub(crate) const KADM5_PASS_Q_TOOSHORT: u32 = 43_787_542;
 pub(crate) const KADM5_AUTH_ADD: u32 = 43_787_522;
 pub(crate) const KADM5_PASS_Q_GENERIC: u32 = 43_787_577;
 const DERIVE_WAIT: Duration = Duration::from_secs(30);
+const UNLOCK_ROW_BITS: u32 = kadm5_mask::TL_DATA | kadm5_mask::MOD_TIME | kadm5_mask::MOD_NAME;
 
 /// What derives a kadmin `cpw`'s OPAQUE record: the server's handler, on the server's runtime.
 #[derive(Clone)]
@@ -58,8 +61,6 @@ pub(crate) struct SqlRealm {
     started: AtomicBool,
     realm: String,
     records: Option<Records>,
-    /// Each alias row's target, by row name: the stored rows keep it encrypted.
-    aliases: Mutex<HashMap<String, String>>,
 }
 
 impl SqlRealm {
@@ -69,7 +70,6 @@ impl SqlRealm {
             started: AtomicBool::new(false),
             realm: String::new(),
             records: None,
-            aliases: Mutex::default(),
         }
     }
 
@@ -88,8 +88,7 @@ pub(crate) trait Host: KerberosStore {
     fn user_disabled(&self, user: &UserId) -> Result<bool, KerberosStoreError>;
     /// Until the start pass has committed, only the bootstrap may come from outside.
     fn start_pass_committed(&self);
-    /// The alias rows of the realm as opened; every committed batch keeps them after that.
-    fn seed_aliases(&self, _aliases: Vec<(String, String)>) {}
+    fn fill_alias_targets(&self, rows: &[(String, String)]) -> Result<u64, KerberosStoreError>;
 }
 
 pub(crate) fn committing(
@@ -146,18 +145,17 @@ fn row_of(name: &str, realm: &str) -> Option<String> {
     lookup_principal_id(&parsed, &in_realm).map(|id| row_name(id, realm))
 }
 
-fn row_name(id: String, realm: &str) -> String {
+pub(crate) fn row_name(id: String, realm: &str) -> String {
     id.strip_suffix(&format!("@{realm}"))
         .map_or_else(|| id.clone(), str::to_owned)
 }
 
-pub(crate) fn stored_aliases(store: &PrincipalStore, realm: &str) -> Vec<(String, String)> {
-    store
-        .ids()
-        .iter()
-        .filter_map(|id| store.get_raw(id))
-        .filter_map(|p| Some((row_name(p.id(), realm), p.alias_target()?)))
-        .collect()
+/// A row name as kerber-rust names its record: the realm's own rows get `@REALM` back.
+fn full_name(row: &str, realm: &str) -> String {
+    krb5_types::principal_from_unparsed(row, realm)
+        .ok()
+        .and_then(|(parsed, in_realm)| lookup_principal_id(&parsed, &in_realm))
+        .unwrap_or_else(|| row.to_owned())
 }
 
 fn asked<S: AsRef<str>>(names: impl IntoIterator<Item = S>, realm: &str) -> Vec<Named> {
@@ -240,7 +238,9 @@ pub(crate) fn verdict(change: &HostChange, realm: &str) -> Result<Verdict, Kerbe
             "an undeclared write to a directory user's principal: {}",
             row.id
         ))),
-        Operation::Modify if owned.len() == 1 && unlock_only(intent) => Ok(Verdict::Unlock(named)),
+        Operation::Modify if owned.len() == 1 && unlock_only(intent) && unlocked_only(change) => {
+            Ok(Verdict::Unlock(named))
+        }
         Operation::ChangePassword if owned.len() == 1 => Ok(password_verdict(intent, named)),
         _ => Ok(Verdict::Deny {
             code: KADM5_PROTECT_PRINCIPAL,
@@ -277,7 +277,65 @@ pub(crate) fn early(intent: &WriteIntent, target: Option<&TargetPeek>, realm: &s
 }
 
 fn unlock_only(intent: &WriteIntent) -> bool {
-    intent.client_mask == Some(kadm5_mask::FAIL_AUTH_COUNT)
+    let unlock = kadm5_mask::FAIL_AUTH_COUNT;
+    intent.client_mask == Some(unlock) || intent.client_mask == Some(unlock | kadm5_mask::TL_DATA)
+}
+
+/// One record, in which only the fail count, one `TL_LAST_ADMIN_UNLOCK` and the stamp moved.
+fn unlocked_only(change: &HostChange) -> bool {
+    let batch = &change.batch;
+    let [row] = change.rows.as_slice() else {
+        return false;
+    };
+    let (Some(before), Some(after)) = (&row.before, &row.after) else {
+        return false;
+    };
+    batch.put_policies.is_empty()
+        && batch.delete_policies.is_empty()
+        && batch.realm.is_none()
+        && row.mask & !UNLOCK_ROW_BITS == 0
+        && after.fail_auth_count == 0
+        && same_but_unlock(before, after)
+        && unlock_entries(before, after)
+}
+
+fn tl_of(p: &Principal, of: impl Fn(i32) -> bool) -> Vec<&TlData> {
+    p.tl_data.iter().filter(|tl| of(tl.ty)).collect()
+}
+
+fn same_but_unlock(a: &Principal, b: &Principal) -> bool {
+    let kept = |ty: i32| ty != TL_MOD_PRINC && ty != TL_LAST_ADMIN_UNLOCK;
+    a.name == b.name
+        && a.realm == b.realm
+        && a.keys.len() == b.keys.len()
+        && a.key_history.len() == b.key_history.len()
+        && a.top_kvno() == b.top_kvno()
+        && a.opaque_keys == b.opaque_keys
+        && a.salt == b.salt
+        && a.max_life == b.max_life
+        && a.pw_expire == b.pw_expire
+        && a.attributes == b.attributes
+        && a.max_renewable_life == b.max_renewable_life
+        && a.expiration == b.expiration
+        && a.last_success == b.last_success
+        && a.last_failed == b.last_failed
+        && a.mkvno == b.mkvno
+        && a.db_entry_len == b.db_entry_len
+        && tl_of(a, kept) == tl_of(b, kept)
+        && a.e_data == b.e_data
+        && a.rid == b.rid
+        && a.s4u_allowed_from == b.s4u_allowed_from
+        && a.s4u_allowed_to == b.s4u_allowed_to
+        && a.pw_policy == b.pw_policy
+        && a.kadm == b.kadm
+        && a.string_attrs == b.string_attrs
+}
+
+fn unlock_entries(before: &Principal, after: &Principal) -> bool {
+    let unlock = |ty: i32| ty == TL_LAST_ADMIN_UNLOCK;
+    let stamped = tl_of(after, |ty| ty == TL_MOD_PRINC).len() <= 1;
+    let entry = matches!(tl_of(after, unlock).as_slice(), [one] if one.contents.len() == 4);
+    stamped && (entry || tl_of(after, unlock) == tl_of(before, unlock))
 }
 
 fn password_verdict(intent: &WriteIntent, named: Named) -> Verdict {
@@ -355,7 +413,13 @@ fn denied(intent: &WriteIntent, code: u32, named: &Named) -> KerberosStoreError 
         code_name(code),
         named.requested_as()
     );
-    logging::record_failure(LogKind::AccessDenied, Some(&named.principal), &detail);
+    logging::record_kadmin(
+        client(&intent.caller),
+        LogKind::AccessDenied,
+        Some(&named.principal),
+        false,
+        Some(&detail),
+    );
     let text = match code {
         KADM5_PASS_Q_TOOSHORT => {
             format!("the password is shorter than {PASSWORD_MIN_LENGTH} characters")
@@ -414,7 +478,11 @@ impl KerberosStore for SqlRealm {
             return Err(KerberosStoreError::Refused("starting".to_owned()));
         }
         match verdict(&change, &self.realm)? {
-            Verdict::Write { new, onto } => self.write_new(change, &new, &self.targets(&onto)),
+            Verdict::Write { new, onto } => {
+                let onto: Vec<Named> = onto.iter().map(|t| Named::of(t, &self.realm)).collect();
+                let onto = self.onto(&change.intent, onto);
+                self.write_new(change, &new, &onto)
+            }
             Verdict::Unlock(named) => {
                 self.write(Vec::new(), change.batch)?;
                 let detail = format!(
@@ -422,7 +490,13 @@ impl KerberosStore for SqlRealm {
                     client(&change.intent.caller),
                     named.requested_as()
                 );
-                logging::record(LogKind::KerberosSync, Some(&named.principal), Some(&detail));
+                logging::record_kadmin(
+                    client(&change.intent.caller),
+                    LogKind::KerberosSync,
+                    Some(&named.principal),
+                    true,
+                    Some(&detail),
+                );
                 Ok(())
             }
             Verdict::Password(named) => self.commit_password(change, &named),
@@ -440,7 +514,8 @@ impl KerberosStore for SqlRealm {
         }
         match early(intent, target, &self.realm) {
             Verdict::Write { new, onto } => {
-                let onto = self.targets(&onto);
+                let onto = self.onto(intent, self.targets(&onto));
+                let onto = [onto, self.renamed_alias(intent)].concat();
                 self.read_new(intent, &new, &onto).map(|()| None)
             }
             Verdict::Unlock(_) => Ok(None),
@@ -463,8 +538,8 @@ impl Host for SqlRealm {
         self.started.store(true, Ordering::Release);
     }
 
-    fn seed_aliases(&self, aliases: Vec<(String, String)>) {
-        self.keep_aliases(aliases.into_iter().map(|(row, target)| (row, Some(target))));
+    fn fill_alias_targets(&self, rows: &[(String, String)]) -> Result<u64, KerberosStoreError> {
+        self.store.fill_alias_targets(rows).map_err(store_error)
     }
 }
 
@@ -526,10 +601,10 @@ impl SqlRealm {
         new: &[Named],
         onto: &[Named],
     ) -> Result<(), KerberosStoreError> {
-        let (onto_users, new_users) = (users_of(onto), users_of(new));
+        let new_users = users_of(new);
         let mut rows = Vec::new();
-        if !onto_users.is_empty() {
-            rows.push(HostRow::NoAliasOnto(onto_users));
+        if !onto.is_empty() {
+            rows.push(HostRow::NoAliasOnto(self.alias_onto(onto)));
         }
         if !new_users.is_empty() {
             rows.push(HostRow::NoUser(new_users));
@@ -538,13 +613,8 @@ impl SqlRealm {
             Err(KerberosStoreError::Refused(why)) if why.starts_with(DIRECTORY_TARGET) => {
                 let found = why
                     .strip_prefix(DIRECTORY_TARGET)
-                    .and_then(|rest| rest.strip_prefix(": "))
-                    .map(UserId::new);
-                let named = onto
-                    .iter()
-                    .find(|named| named.user == found)
-                    .cloned()
-                    .unwrap_or_else(|| one_of(onto));
+                    .and_then(|rest| rest.strip_prefix(": "));
+                let named = self.reached(onto, found);
                 Err(denied(&change.intent, KADM5_PROTECT_PRINCIPAL, &named))
             }
             Err(KerberosStoreError::Refused(why)) if why == DIRECTORY_USER => {
@@ -578,7 +648,8 @@ impl SqlRealm {
             detail.push_str(" (self-service)");
         }
         detail.push_str(&named.requested_as());
-        let row = logging::event(
+        let row = logging::kadmin_event(
+            client(&intent.caller),
             LogKind::PasswordChange,
             Some(&named.principal),
             true,
@@ -597,46 +668,85 @@ impl SqlRealm {
         Ok(())
     }
 
-    /// Each target, then each alias it leads through, as kerber-rust resolves them.
+    /// `row`, then each row name its alias rows lead to, as kerber-rust resolves them.
+    fn chain(&self, row: &str) -> Vec<String> {
+        let read = self.store.alias_chain(row, MAX_ALIAS_DEPTH);
+        read.unwrap_or_else(|e| {
+            warn!("The alias rows were not read before a kadmin write; its commit decides: {e}");
+            vec![row.to_owned()]
+        })
+    }
+
     fn targets(&self, onto: &[String]) -> Vec<Named> {
-        let aliases = self.aliases.lock().unwrap_or_else(PoisonError::into_inner);
         let mut named = Vec::new();
         for target in onto {
-            let mut name = target.clone();
-            for _ in 0..=MAX_ALIAS_DEPTH {
-                named.push(Named::of(&name, &self.realm).sent_as(Some(target)));
-                match row_of(&name, &self.realm).and_then(|row| aliases.get(&row)) {
-                    Some(next) => name.clone_from(next),
-                    None => break,
-                }
-            }
+            named.push(Named::of(target, &self.realm));
+            let chain = row_of(target, &self.realm).map(|row| self.chain(&row));
+            named.extend(chain.unwrap_or_default().iter().skip(1).map(|hop| {
+                Named::of(&full_name(hop, &self.realm), &self.realm).sent_as(Some(target))
+            }));
         }
         named.retain(|named| named.user.is_some());
         named
     }
 
-    fn keep_aliases(&self, rows: impl IntoIterator<Item = (String, Option<String>)>) {
-        let mut aliases = self.aliases.lock().unwrap_or_else(PoisonError::into_inner);
-        for (row, target) in rows {
-            match target {
-                Some(target) => aliases.insert(row, target),
-                None => aliases.remove(&row),
-            };
+    fn onto(&self, intent: &WriteIntent, named: Vec<Named>) -> Vec<Named> {
+        if intent.operation != Operation::Rename {
+            return named;
+        }
+        let sent = peeked(intent);
+        named.into_iter().map(|named| named.sent_as(sent)).collect()
+    }
+
+    /// A rename of an alias makes a new name for the alias's target, as `CreateAlias` does.
+    fn renamed_alias(&self, intent: &WriteIntent) -> Vec<Named> {
+        if intent.operation != Operation::Rename {
+            return Vec::new();
+        }
+        let Some(row) = peeked(intent).and_then(|source| row_of(source, &self.realm)) else {
+            return Vec::new();
+        };
+        let named: Vec<Named> = self
+            .chain(&row)
+            .iter()
+            .skip(1)
+            .map(|hop| Named::of(&full_name(hop, &self.realm), &self.realm))
+            .filter(|named| named.user.is_some())
+            .collect();
+        self.onto(intent, named)
+    }
+
+    fn alias_onto(&self, onto: &[Named]) -> AliasOnto {
+        let realm = self.realm.clone();
+        AliasOnto {
+            targets: onto
+                .iter()
+                .map(|named| {
+                    row_of(&named.principal, &self.realm).unwrap_or_else(|| named.principal.clone())
+                })
+                .collect(),
+            hops: MAX_ALIAS_DEPTH,
+            user_of: Arc::new(move |name: &str| directory_name(name, &realm)),
         }
     }
 
+    /// The name the commit found on a target's chain, named as `prepare` names it.
+    fn reached(&self, onto: &[Named], found: Option<&str>) -> Named {
+        let Some(found) = found else {
+            return one_of(onto);
+        };
+        let start =
+            |named: &&Named| row_of(&named.principal, &self.realm).as_deref() == Some(found);
+        if let Some(named) = onto.iter().find(start) {
+            return named.clone();
+        }
+        let through = onto
+            .first()
+            .map(|named| named.sent.as_ref().unwrap_or(&named.principal));
+        Named::of(&full_name(found, &self.realm), &self.realm).sent_as(through)
+    }
+
     fn write(&self, rows: Vec<HostRow>, batch: RealmBatch) -> Result<(), KerberosStoreError> {
-        let kept: Vec<(String, Option<String>)> = batch
-            .delete_principals
-            .iter()
-            .map(|row| (row.clone(), None))
-            .chain(
-                batch
-                    .upsert_principals
-                    .iter()
-                    .map(|p| (p.name.clone(), p.alias_target.clone())),
-            )
-            .collect();
         let upsert_principals = batch
             .upsert_principals
             .into_iter()
@@ -663,9 +773,7 @@ impl SqlRealm {
                     }),
                 },
             )
-            .map_err(store_error)?;
-        self.keep_aliases(kept);
-        Ok(())
+            .map_err(store_error)
     }
 }
 
@@ -733,6 +841,7 @@ mod tests {
     use crate::embedded::EmbeddedKerberos;
     use crate::embedded::tests::{TempRealm, unmarked};
     use krb5_kdc::Error as StoreError;
+    use krb5_kdc::ModifyPrincipal;
     use krb5_kdc::host::{Caller, RowChange, WriteIntent, conformance};
     use krb5_types::PrincipalName;
     use lldap_domain::types::UserId;
@@ -1126,6 +1235,13 @@ mod tests {
         row.try_get::<i64>("", "n").unwrap()
     }
 
+    fn record_of(pool: &DatabaseConnection, runtime: &Runtime, user: &str) -> Option<Vec<u8>> {
+        let query = format!("SELECT password_hash FROM users WHERE user_id = '{user}'");
+        let statement = sea_orm::Statement::from_string(pool.get_database_backend(), query);
+        let row = runtime.block_on(pool.query_one(statement)).unwrap()?;
+        row.try_get::<Option<Vec<u8>>>("", "password_hash").unwrap()
+    }
+
     fn password_commit(
         user: &str,
         record: &[u8],
@@ -1181,8 +1297,7 @@ mod tests {
         let ready = Arc::new(AtomicBool::new(true));
         let embedded = EmbeddedKerberos::new(store.clone(), &temp.settings, ready, host.clone());
         let (change, kvno) = (password_commit, top_kvno);
-        let reads = committer.store();
-        let stored = |user: &str| reads.password_record(&UserId::new(user)).unwrap();
+        let stored = |user: &str| record_of(&pool, &runtime, user);
         let logs = || {
             count(
                 &pool,
@@ -1289,7 +1404,6 @@ mod tests {
             start_committer_losing_an_answer(pool.clone())
         });
         add_user(&pool, &runtime, "bob");
-        let reads = committer.store();
         let host = Arc::new(SqlRealm::new(committer.store()));
         host.start_pass_committed();
         let store = krb5_kdc::shared_dump(
@@ -1297,9 +1411,7 @@ mod tests {
         );
         let ready = Arc::new(AtomicBool::new(true));
         let embedded = EmbeddedKerberos::new(store.clone(), &temp.settings, ready, host.clone());
-        let stored = |record: &[u8]| {
-            reads.password_record(&UserId::new("bob")).unwrap() == Some(record.to_vec())
-        };
+        let stored = |record: &[u8]| record_of(&pool, &runtime, "bob") == Some(record.to_vec());
         let logs = || {
             count(
                 &pool,
@@ -1521,6 +1633,34 @@ mod tests {
     }
 
     const ADMIN: &str = "admin/admin@EXAMPLE.COM";
+    const UNLOCKED: (i32, usize) = (krb5_kdc::TL_LAST_ADMIN_UNLOCK, 4);
+
+    type KadminRows = Vec<(
+        LogKind,
+        logging::Protocol,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )>;
+
+    fn modify_of(mask: u32, tl_data: &[(i32, usize)], attributes: Option<u32>) -> ModifyPrincipal {
+        ModifyPrincipal {
+            mask,
+            fields: krb5_kdc::AdminFields {
+                attributes,
+                ..Default::default()
+            },
+            tl_data: tl_data
+                .iter()
+                .map(|&(ty, len)| TlData {
+                    ty,
+                    contents: vec![7; len],
+                })
+                .collect(),
+            zero_fail_count: mask & kadm5_mask::FAIL_AUTH_COUNT != 0,
+            ..Default::default()
+        }
+    }
 
     type Fill = Box<dyn Fn(&mut WriteIntent)>;
     type Edit<'a> = Box<dyn Fn(&mut krb5_kdc::PrincipalStore) -> Result<(), StoreError> + 'a>;
@@ -1633,6 +1773,27 @@ mod tests {
             .collect()
     }
 
+    fn sources(
+        pool: &DatabaseConnection,
+        runtime: &Runtime,
+        kind: &str,
+    ) -> Vec<(String, Option<String>)> {
+        let query = format!("SELECT protocol, actor FROM logs WHERE kind = '{kind}' ORDER BY id");
+        let statement = sea_orm::Statement::from_string(pool.get_database_backend(), query);
+        runtime
+            .block_on(pool.query_all(statement))
+            .unwrap()
+            .iter()
+            .map(|row| {
+                let protocol = row.try_get::<String>("", "protocol").unwrap();
+                (
+                    protocol,
+                    row.try_get::<Option<String>>("", "actor").unwrap(),
+                )
+            })
+            .collect()
+    }
+
     type Rows = Vec<(LogKind, Option<String>, Option<String>)>;
 
     fn denial(principal: &str, operation: &str, code: &str) -> Rows {
@@ -1715,8 +1876,7 @@ mod tests {
             max_life: Some(3600),
             ..Default::default()
         };
-        let reads = committer.store();
-        let record = || reads.password_record(&UserId::new("bob")).unwrap();
+        let record = || record_of(&pool, &runtime, "bob");
         let kvno = |n: &PrincipalName| store.read().unwrap().get_name(n).and_then(|p| p.top_kvno());
         let key_bytes = |n: &PrincipalName| -> Vec<Vec<u8>> {
             let guard = store.read().unwrap();
@@ -1912,6 +2072,15 @@ mod tests {
                 .unwrap();
         }
         unmarked(&embedded, "carol", false);
+        let cary = name("cary");
+        store
+            .write()
+            .unwrap()
+            .change_committing(committing(&*host), |s| {
+                s.create_alias_in(&cary, "EXAMPLE.COM", &carol, "EXAMPLE.COM", "test")
+            })
+            .unwrap()
+            .unwrap();
         let held = (host.load().unwrap(), record());
         let through_bobby = " (requested as bobby@EXAMPLE.COM)";
         let names: [(Case, &PrincipalName, &str, &str, &str); 10] = [
@@ -2092,6 +2261,54 @@ mod tests {
             "a directory user's name, created or aliased onto"
         );
 
+        let (bobbie, caryn) = (name("bobbie"), name("caryn"));
+        let renames = [
+            (
+                ["bobby", "bobbie"],
+                &bobby,
+                &bobbie,
+                &bob,
+                "bob@EXAMPLE.COM",
+            ),
+            (
+                ["cary", "caryn"],
+                &cary,
+                &caryn,
+                &carol,
+                "carol@EXAMPLE.COM",
+            ),
+        ];
+        let unsupported = StoreError::AliasUnsupported.to_string();
+        let (mut got, mut want) = (Vec::new(), Vec::new());
+        for (requested, alias, renamed, target, principal) in renames {
+            let rename = |s: &mut PrincipalStore| {
+                s.rename_unchecked(alias, "EXAMPLE.COM", renamed, "EXAMPLE.COM", ADMIN)
+            };
+            let its_rows = |s: &mut PrincipalStore| -> Result<(), StoreError> {
+                s.remove_in(alias, "EXAMPLE.COM")?;
+                s.create_alias_in(renamed, "EXAMPLE.COM", target, "EXAMPLE.COM", ADMIN)
+            };
+            let sent = format!(" (requested as {}@EXAMPLE.COM)", requested[0]);
+            let protect = denial_as(principal, "rename", "PROTECT_PRINCIPAL", &sent);
+            type Write<'a> = &'a dyn Fn(&mut PrincipalStore) -> Result<(), StoreError>;
+            let runs: [(bool, Write, &str, Rows); 3] = [
+                (true, &rename, "PROTECT_PRINCIPAL", protect.clone()),
+                (false, &rename, &unsupported, Vec::new()),
+                (false, &its_rows, "PROTECT_PRINCIPAL", protect),
+            ];
+            for (declared, edit, answer, logged) in runs {
+                let intent = intent_of(Operation::Rename, kadmin(false), &requested, &nothing());
+                let answered = kadmin_write(&store, declared, intent, alias, edit);
+                let unchanged = (host.load().unwrap(), record()) == held;
+                got.push((requested[0], declared, answered, unchanged, rows()));
+                want.push((requested[0], declared, answer.to_owned(), true, logged));
+            }
+        }
+        assert_eq!(
+            got, want,
+            "renaming an alias of a directory user's principal: with prepare, without, and its rows"
+        );
+
         let dup = intent_of(Operation::Create, kadmin(false), &["bob"], &nothing());
         let peek = TargetPeek {
             id: "bob@EXAMPLE.COM".to_owned(),
@@ -2136,8 +2353,13 @@ mod tests {
         let by_admin = format!("kadmin change_password by {ADMIN}");
         let by_bob = "kadmin change_password by bob@EXAMPLE.COM (self-service)".to_owned();
         let done = |label| (label, "written".to_owned(), (true, true), true, Vec::new());
+        let kadmin_from = |client: &str| ("kadmin".to_owned(), Some(client.to_owned()));
         assert_eq!(
-            (got, details(&pool, &runtime, "password_change")),
+            (
+                got,
+                details(&pool, &runtime, "password_change"),
+                sources(&pool, &runtime, "password_change")
+            ),
             (
                 vec![
                     done("an admin's cpw"),
@@ -2145,6 +2367,11 @@ mod tests {
                     done("a cpw kadmind did not prepare"),
                 ],
                 vec![by_admin.clone(), by_bob, by_admin],
+                vec![
+                    kadmin_from(ADMIN),
+                    kadmin_from("bob@EXAMPLE.COM"),
+                    kadmin_from(ADMIN)
+                ],
             ),
             "carried out: the keys, the record and one row"
         );
@@ -2241,6 +2468,107 @@ mod tests {
                 true
             ),
             "unlocked: the keys and the record unchanged"
+        );
+
+        let one_bit = kadm5_mask::FAIL_AUTH_COUNT;
+        let mit = one_bit | kadm5_mask::TL_DATA;
+        let with_attribute = mit | kadm5_mask::ATTRIBUTES;
+        let flipped = store.read().unwrap().get_name(&bob).map(|p| p.attributes);
+        let flipped = flipped.map(|a| a ^ krb5_kdc::KDB_DISALLOW_POSTDATED);
+        let unlocks: [(&str, u32, ModifyPrincipal, bool); 6] = [
+            ("MIT's unlock", mit, modify_of(mit, &[UNLOCKED], None), true),
+            (
+                "the one-bit unlock",
+                one_bit,
+                modify_of(one_bit, &[], None),
+                true,
+            ),
+            (
+                "an unlock with a second TL entry",
+                mit,
+                modify_of(mit, &[UNLOCKED, (0x0701, 4)], None),
+                false,
+            ),
+            (
+                "an unlock with one TL entry of another type",
+                mit,
+                modify_of(mit, &[(0x0701, 4)], None),
+                false,
+            ),
+            (
+                "an unlock with an attribute",
+                with_attribute,
+                modify_of(with_attribute, &[UNLOCKED], flipped),
+                false,
+            ),
+            (
+                "an unlock whose mask hides an attribute",
+                mit,
+                modify_of(with_attribute, &[UNLOCKED], flipped),
+                false,
+            ),
+        ];
+        let in_memory = || {
+            let read = store.read().unwrap();
+            let p = read.get_name(&bob).unwrap();
+            (p.tl_data.clone(), p.attributes, p.fail_auth_count)
+        };
+        let kadmin_rows = || -> KadminRows {
+            let events = guard.recorder().take_events().into_iter();
+            events
+                .filter(|e| e.kind != LogKind::Bind)
+                .map(|e| (e.kind, e.protocol, e.actor, e.target, e.detail))
+                .collect()
+        };
+        let kadmin_row = |kind: LogKind, detail: &str| {
+            let target = Some("bob@EXAMPLE.COM".to_owned());
+            let admin = Some(ADMIN.to_owned());
+            let protocol = logging::Protocol::Kadmin;
+            (kind, protocol, admin, target, Some(detail.to_owned()))
+        };
+        let unlocked_row = format!("kadmin unlock by {ADMIN} (no lockout counter yet)");
+        let refused_row = format!("kadmin modify on bob@EXAMPLE.COM by {ADMIN}: PROTECT_PRINCIPAL");
+        let (mut got, mut want) = (Vec::new(), Vec::new());
+        for (label, client_mask, modify, carried) in &unlocks {
+            for declared in [true, false] {
+                let intent = intent_of(
+                    Operation::Modify,
+                    kadmin(false),
+                    &["bob"],
+                    &mask(*client_mask),
+                );
+                let edit = |s: &mut PrincipalStore| {
+                    s.modify_principal_in(&bob, "EXAMPLE.COM", modify.clone(), ADMIN)
+                };
+                let held = (host.load().unwrap(), record(), in_memory());
+                let (keys, stored) = (key_bytes(&bob), record());
+                let answer = kadmin_write(&store, declared, intent, &bob, &edit);
+                let (tl_data, _, fail_auth_count) = in_memory();
+                let entries: Vec<usize> = tl_data
+                    .iter()
+                    .filter(|tl| tl.ty == TL_LAST_ADMIN_UNLOCK)
+                    .map(|tl| tl.contents.len())
+                    .collect();
+                let kept = (key_bytes(&bob) == keys, record() == stored);
+                let unchanged = (host.load().unwrap(), record(), in_memory()) == held;
+                let unchanged = (!carried).then_some(unchanged);
+                let outcome = (kept, unchanged, fail_auth_count, entries);
+                got.push((*label, declared, answer, outcome, kadmin_rows()));
+                let (answer, row) = if *carried {
+                    ("written", kadmin_row(LogKind::KerberosSync, &unlocked_row))
+                } else {
+                    (
+                        "PROTECT_PRINCIPAL",
+                        kadmin_row(LogKind::AccessDenied, &refused_row),
+                    )
+                };
+                let outcome = ((true, true), (!carried).then_some(true), 0, vec![4]);
+                want.push((*label, declared, answer.to_owned(), outcome, vec![row]));
+            }
+        }
+        assert_eq!(
+            got, want,
+            "unlocks: MIT's and the one-bit form are carried out, any other change is refused"
         );
 
         let mark = |owned: bool| {
@@ -2513,6 +2841,318 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn alias_targets(pool: &DatabaseConnection, runtime: &Runtime) -> Vec<(String, String)> {
+        let query = "SELECT name, alias_target FROM kerberos_principals \
+                     WHERE alias_target IS NOT NULL";
+        let statement = sea_orm::Statement::from_string(pool.get_database_backend(), query);
+        let mut found: Vec<(String, String)> = runtime
+            .block_on(pool.query_all(statement))
+            .unwrap()
+            .iter()
+            .map(|row| {
+                let name = row.try_get::<String>("", "name").unwrap();
+                (name, row.try_get::<String>("", "alias_target").unwrap())
+            })
+            .collect();
+        found.sort();
+        found
+    }
+
+    fn alias_column_on(connect: Reconnect) {
+        use lldap_test_utils::recording_log::LogGuard;
+
+        let guard = LogGuard::install();
+        let runtime = runtime();
+        let temp = TempRealm::new();
+        let profile = boot::profile(&temp.settings);
+        let (committer, pool) = committer_on(connect, &runtime);
+        add_user(&pool, &runtime, "bob");
+        let host = Arc::new(SqlRealm::new(committer.store()).serving("EXAMPLE.COM", None));
+        host.start_pass_committed();
+        let store = krb5_kdc::shared_dump(
+            boot::open_store(&temp.settings, &profile, host.clone()).unwrap(),
+        );
+        let own = |edit: &dyn Fn(&mut krb5_kdc::PrincipalStore) -> Result<(), StoreError>| {
+            store
+                .write()
+                .unwrap()
+                .change_committing(committing(&*host), |s| edit(s))
+                .unwrap()
+                .unwrap();
+        };
+        let alias = |from: &str, onto: &str| {
+            let (from, onto) = (name(from), name(onto));
+            own(&|s: &mut krb5_kdc::PrincipalStore| {
+                s.create_alias_in(&from, "EXAMPLE.COM", &onto, "EXAMPLE.COM", "test")
+            });
+        };
+        let kadmin_alias = |from: &str, onto: &str, declared: bool| {
+            let intent = intent_of(
+                Operation::CreateAlias,
+                kadmin(false),
+                &[from, onto],
+                &nothing(),
+            );
+            let (from, onto) = (name(from), name(onto));
+            let edit = |s: &mut krb5_kdc::PrincipalStore| {
+                s.create_alias_in(&from, "EXAMPLE.COM", &onto, "EXAMPLE.COM", ADMIN)
+            };
+            kadmin_write(&store, declared, intent, &onto, &edit)
+        };
+        let rows = || -> Rows {
+            let events = guard.recorder().take_events().into_iter();
+            events
+                .filter(|e| e.kind != LogKind::Bind)
+                .map(|e| (e.kind, e.target, e.detail))
+                .collect()
+        };
+        let svc = name("HTTP/web.example.com");
+        own(&|s: &mut krb5_kdc::PrincipalStore| {
+            s.insert_new_randkey(&svc, "EXAMPLE.COM", &[], "test")
+        });
+        alias("y", "bob");
+        alias("x", "y");
+        rows();
+
+        let held = host.load().unwrap();
+        let through_x: Vec<_> = [false, true]
+            .into_iter()
+            .map(|declared| {
+                let answer = kadmin_alias("z", "x", declared);
+                (declared, answer, host.load().unwrap() == held, rows())
+            })
+            .collect();
+        let protect = |principal: &str, sent: &str| {
+            let sent = format!(" (requested as {sent}@EXAMPLE.COM)");
+            let logged = denial_as(principal, "create_alias", "PROTECT_PRINCIPAL", &sent);
+            ("PROTECT_PRINCIPAL".to_owned(), true, logged)
+        };
+        let (answer, unchanged, logged) = protect("bob@EXAMPLE.COM", "x");
+        assert_eq!(
+            through_x,
+            vec![
+                (false, answer.clone(), unchanged, logged.clone()),
+                (true, answer, unchanged, logged)
+            ],
+            "z onto x, x onto y, y onto bob: refused at the commit, and at prepare"
+        );
+
+        for hop in 0..=10 {
+            alias(&format!("a{hop}"), &format!("a{}", hop + 1));
+        }
+        let reach: Vec<String> = host
+            .targets(&["a0@EXAMPLE.COM".to_owned()])
+            .into_iter()
+            .map(|named| named.principal)
+            .collect();
+        add_user(&pool, &runtime, "a11");
+        let past = (kadmin_alias("d", "a0", false), rows());
+        add_user(&pool, &runtime, "a10");
+        let at = (kadmin_alias("e", "a0", false), rows());
+        let (answer, _, logged) = protect("a10@EXAMPLE.COM", "a0");
+        assert_eq!(
+            (reach, past, at),
+            (
+                (0..=10).map(|hop| format!("a{hop}@EXAMPLE.COM")).collect(),
+                ("written".to_owned(), Vec::new()),
+                (answer, logged)
+            ),
+            "a chain is followed 10 hops, as kerber-rust resolves it, and no further"
+        );
+
+        let web = kadmin_alias("web", "HTTP/web.example.com", true);
+        let mut written: Vec<(String, String)> = (0..=10)
+            .map(|hop| (format!("a{hop}"), format!("a{}", hop + 1)))
+            .collect();
+        written.extend(
+            [
+                ("d", "a0"),
+                ("web", "HTTP/web.example.com"),
+                ("x", "y"),
+                ("y", "bob"),
+            ]
+            .map(|(row, target)| (row.to_owned(), target.to_owned())),
+        );
+        written.sort();
+        let filled = alias_targets(&pool, &runtime);
+        let delete = intent_of(Operation::Delete, kadmin(false), &["web"], &nothing());
+        let edit = |s: &mut krb5_kdc::PrincipalStore| s.remove_in(&name("web"), "EXAMPLE.COM");
+        let deleted = kadmin_write(&store, true, delete, &name("web"), &edit);
+        let kept = alias_targets(&pool, &runtime);
+        let mut without_web = written.clone();
+        without_web.retain(|(row, _)| row != "web");
+        assert_eq!(
+            (web, filled, deleted, kept, rows()),
+            (
+                "written".to_owned(),
+                written,
+                "written".to_owned(),
+                without_web.clone(),
+                Vec::new()
+            ),
+            "each alias row carries its target's row name; a delete takes the row with it"
+        );
+
+        let held = host.load().unwrap();
+        sql(
+            &pool,
+            &runtime,
+            "UPDATE kerberos_principals SET alias_target = NULL",
+        );
+        let emptied = alias_targets(&pool, &runtime).len();
+        let ready = Arc::new(AtomicBool::new(true));
+        let embedded = EmbeddedKerberos::new(store.clone(), &temp.settings, ready, host.clone());
+        let pass = runtime.block_on(embedded.start_pass(Vec::new())).unwrap();
+        let refilled = alias_targets(&pool, &runtime);
+        let again = runtime.block_on(embedded.start_pass(Vec::new())).unwrap();
+        let after_again = alias_targets(&pool, &runtime);
+        let once_more = host.fill_alias_targets(&[("x".to_owned(), "y@EXAMPLE.COM".to_owned())]);
+        let refused = kadmin_alias("f", "x", false);
+        assert_eq!(
+            (
+                emptied,
+                (pass.marked, pass.removed, pass.disabled),
+                refilled,
+                host.load().unwrap() == held,
+                (again.marked, again.removed, again.disabled),
+                after_again,
+                once_more.map_err(|e| e.to_string()),
+                refused
+            ),
+            (
+                0,
+                (0, 0, 0),
+                without_web.clone(),
+                true,
+                (0, 0, 0),
+                without_web,
+                Ok(0),
+                "PROTECT_PRINCIPAL".to_owned()
+            ),
+            "alias rows written before the column: the start pass fills it, records unchanged"
+        );
+        drop((embedded, store, host));
+        runtime.block_on(committer.shutdown());
+    }
+
+    #[test]
+    #[serial]
+    fn test_the_alias_target_column_on_sqlite() {
+        let dir = std::env::temp_dir().join(format!("klldap-aliases-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.join("aliases.db").display());
+        alias_column_on(&|runtime| sqlite_one_connection(&url, runtime));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial]
+    #[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+    fn test_the_alias_target_column_on_postgres() {
+        let Ok(url) = std::env::var("KLLDAP_TEST_DATABASE_URL") else {
+            eprintln!("KLLDAP_TEST_DATABASE_URL not set; skipping");
+            return;
+        };
+        if !url.starts_with("postgres://") && !url.starts_with("postgresql://") {
+            eprintln!("KLLDAP_TEST_DATABASE_URL is not a postgres URL; skipping");
+            return;
+        }
+        let schema = format!("klldap_aliases_{}", std::process::id());
+        alias_column_on(&|runtime| {
+            runtime.block_on(async {
+                let admin = Database::connect(url.as_str()).await.unwrap();
+                for sql in [
+                    format!("DROP SCHEMA IF EXISTS {schema} CASCADE"),
+                    format!("CREATE SCHEMA {schema}"),
+                ] {
+                    admin.execute_unprepared(&sql).await.unwrap();
+                }
+                let mut opts = ConnectOptions::new(url.clone());
+                opts.set_schema_search_path(schema.clone())
+                    .max_connections(2)
+                    .sqlx_logging(false);
+                Database::connect(opts).await.unwrap()
+            })
+        });
+    }
+
+    #[test]
+    #[serial]
+    #[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+    fn test_the_alias_target_column_on_mysql() {
+        let Ok(url) = std::env::var("KLLDAP_TEST_DATABASE_URL") else {
+            eprintln!("KLLDAP_TEST_DATABASE_URL not set; skipping");
+            return;
+        };
+        if !url.starts_with("mysql://") {
+            eprintln!("KLLDAP_TEST_DATABASE_URL is not a mysql URL; skipping");
+            return;
+        }
+        let db = format!("klldap_aliases_{}", std::process::id());
+        let server = url
+            .split('?')
+            .next()
+            .unwrap_or(&url)
+            .rsplit_once('/')
+            .unwrap()
+            .0
+            .to_owned();
+        alias_column_on(&|runtime| {
+            runtime.block_on(async {
+                let admin = Database::connect(format!("{server}/mysql")).await.unwrap();
+                for sql in [
+                    format!("DROP DATABASE IF EXISTS `{db}`"),
+                    format!("CREATE DATABASE `{db}`"),
+                ] {
+                    admin.execute_unprepared(&sql).await.unwrap();
+                }
+                let mut opts = ConnectOptions::new(format!("{server}/{db}"));
+                opts.max_connections(2).sqlx_logging(false);
+                Database::connect(opts).await.unwrap()
+            })
+        });
+    }
+
+    #[test]
+    fn test_klldap_never_holds_the_realm_key() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
+        let sources = [
+            ("admission_test.rs", include_str!("admission_test.rs")),
+            ("boot.rs", include_str!("boot.rs")),
+            ("embedded.rs", include_str!("embedded.rs")),
+            ("lib.rs", include_str!("lib.rs")),
+            ("migrate.rs", include_str!("migrate.rs")),
+            ("policy.rs", include_str!("policy.rs")),
+            ("rotate.rs", include_str!("rotate.rs")),
+            ("seam.rs", include_str!("seam.rs")),
+        ];
+        let mut on_disk: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        on_disk.sort();
+        let scanned: Vec<String> = sources.iter().map(|(file, _)| (*file).to_owned()).collect();
+        let banned = [
+            concat!("host_seal", "_key"),
+            concat!("open_", "principal"),
+            concat!("Seal", "Key"),
+        ];
+        let found: Vec<(&str, &str)> = sources
+            .iter()
+            .flat_map(|(file, text)| {
+                banned
+                    .iter()
+                    .filter(|name| text.contains(**name))
+                    .map(move |name| (*file, *name))
+            })
+            .collect();
+        assert_eq!(
+            (on_disk, found),
+            (scanned, Vec::new()),
+            "every source file is scanned, and none takes the realm's key or opens a record"
+        );
+    }
+
     #[test]
     fn test_the_verdict_on_each_intent() {
         type Row = (Operation, bool, fn(&mut WriteIntent), &'static str);
@@ -2520,7 +3160,7 @@ mod tests {
             intent.password = Some(Zeroizing::new(text.as_bytes().to_vec()));
             intent.keepold = Some(keepold);
         }
-        let rows: [Row; 14] = [
+        let rows: [Row; 15] = [
             (Operation::Unspecified, false, |_| {}, "written"),
             (Operation::Modify, false, |_| {}, "written"),
             (Operation::Embedded, false, |_| {}, "refused"),
@@ -2533,6 +3173,12 @@ mod tests {
                 Operation::Modify,
                 true,
                 |i| i.client_mask = Some(kadm5_mask::FAIL_AUTH_COUNT),
+                "unlock bob@EXAMPLE.COM",
+            ),
+            (
+                Operation::Modify,
+                true,
+                |i| i.client_mask = Some(kadm5_mask::FAIL_AUTH_COUNT | kadm5_mask::TL_DATA),
                 "unlock bob@EXAMPLE.COM",
             ),
             (
@@ -2569,6 +3215,7 @@ mod tests {
                 "PASS_Q_GENERIC",
             ),
         ];
+        let bob = krb5_kdc::PrincipalBuilder::new(name("bob"), "EXAMPLE.COM").build();
         for (operation, owned, fill, expected) in rows {
             let mut intent = WriteIntent::new(operation, Caller::Embedder);
             fill(&mut intent);
@@ -2576,8 +3223,8 @@ mod tests {
                 intent,
                 rows: vec![RowChange {
                     id: "bob@EXAMPLE.COM".to_owned(),
-                    before: None,
-                    after: None,
+                    before: Some(bob.clone()),
+                    after: Some(bob.clone()),
                     mask: 0,
                     host_owned: owned,
                 }],
@@ -2616,8 +3263,215 @@ mod tests {
         assert_eq!(
             verdict(&change, "EXAMPLE.COM").map(shown),
             Ok("ask carl@EXAMPLE.COM as carl, onto bobby@EXAMPLE.COM".to_owned()),
-            "an alias row: its target is asked of the directory, through the alias index"
+            "an alias row: its target is asked of the directory, and followed in its rows"
         );
+    }
+
+    #[test]
+    fn test_an_unlock_is_judged_by_its_rows() {
+        type Case = (
+            &'static str,
+            u32,
+            u32,
+            fn(&mut Principal),
+            fn(&mut HostChange),
+            &'static str,
+        );
+        fn tl(ty: i32, contents: &[u8]) -> TlData {
+            TlData {
+                ty,
+                contents: contents.to_vec(),
+            }
+        }
+        fn unlocked(p: &mut Principal) {
+            p.fail_auth_count = 0;
+            p.tl_data.retain(|t| t.ty != TL_MOD_PRINC);
+            p.tl_data
+                .push(tl(TL_MOD_PRINC, b"\x02\0\0\0admin/admin@EXAMPLE.COM\0"));
+        }
+        fn mit_unlocked(p: &mut Principal) {
+            unlocked(p);
+            p.tl_data.push(tl(TL_LAST_ADMIN_UNLOCK, &[2, 0, 0, 0]));
+        }
+        let (unlock, tl_bit) = (kadm5_mask::FAIL_AUTH_COUNT, kadm5_mask::TL_DATA);
+        let stamp = kadm5_mask::MOD_TIME | kadm5_mask::MOD_NAME;
+        let (mit, rows) = (unlock | tl_bit, tl_bit | stamp);
+        let same: fn(&mut HostChange) = |_| {};
+        let pass = "unlock bob@EXAMPLE.COM";
+        let deny = "PROTECT_PRINCIPAL bob@EXAMPLE.COM";
+        let cases: [Case; 15] = [
+            ("MIT's unlock", mit, rows, mit_unlocked, same, pass),
+            ("the one-bit unlock", unlock, stamp, unlocked, same, pass),
+            (
+                "a second TL entry",
+                mit,
+                rows,
+                |p| {
+                    mit_unlocked(p);
+                    p.tl_data.push(tl(0x0701, &[1, 2, 3, 4]));
+                },
+                same,
+                deny,
+            ),
+            (
+                "one TL entry of another type",
+                mit,
+                rows,
+                |p| {
+                    unlocked(p);
+                    p.tl_data.push(tl(0x0701, &[1, 2, 3, 4]));
+                },
+                same,
+                deny,
+            ),
+            (
+                "an unlock entry of 8 bytes",
+                mit,
+                rows,
+                |p| {
+                    unlocked(p);
+                    p.tl_data.push(tl(TL_LAST_ADMIN_UNLOCK, &[0; 8]));
+                },
+                same,
+                deny,
+            ),
+            (
+                "two unlock entries",
+                mit,
+                rows,
+                |p| {
+                    mit_unlocked(p);
+                    p.tl_data.push(tl(TL_LAST_ADMIN_UNLOCK, &[3, 0, 0, 0]));
+                },
+                same,
+                deny,
+            ),
+            (
+                "two stamps",
+                mit,
+                rows,
+                |p| {
+                    mit_unlocked(p);
+                    p.tl_data.push(tl(TL_MOD_PRINC, b"x\0"));
+                },
+                same,
+                deny,
+            ),
+            (
+                "an attribute the mask does not show",
+                mit,
+                rows,
+                |p| {
+                    mit_unlocked(p);
+                    p.attributes ^= krb5_kdc::KDB_DISALLOW_POSTDATED;
+                },
+                same,
+                deny,
+            ),
+            (
+                "a string attribute",
+                mit,
+                rows,
+                |p| {
+                    mit_unlocked(p);
+                    p.string_attrs.push(("note".to_owned(), "x".to_owned()));
+                },
+                same,
+                deny,
+            ),
+            (
+                "keys, by the mask",
+                mit,
+                rows | kadm5_mask::KEY_DATA,
+                mit_unlocked,
+                same,
+                deny,
+            ),
+            (
+                "the fail count kept",
+                mit,
+                rows,
+                |p| {
+                    mit_unlocked(p);
+                    p.fail_auth_count = 5;
+                },
+                same,
+                deny,
+            ),
+            (
+                "the client asked for an attribute",
+                mit | kadm5_mask::ATTRIBUTES,
+                rows,
+                mit_unlocked,
+                same,
+                deny,
+            ),
+            (
+                "a second record",
+                mit,
+                rows,
+                mit_unlocked,
+                |c| {
+                    let other = RowChange {
+                        id: "carol@EXAMPLE.COM".to_owned(),
+                        host_owned: false,
+                        ..c.rows[0].clone()
+                    };
+                    c.rows.push(other);
+                },
+                deny,
+            ),
+            (
+                "the realm's state",
+                mit,
+                rows,
+                mit_unlocked,
+                |c| {
+                    c.batch.realm = Some(RealmState {
+                        realm: "EXAMPLE.COM".to_owned(),
+                        state: vec![1],
+                    });
+                },
+                deny,
+            ),
+            (
+                "no record before",
+                mit,
+                rows,
+                mit_unlocked,
+                |c| c.rows[0].before = None,
+                deny,
+            ),
+        ];
+        let mut before = krb5_kdc::PrincipalBuilder::new(name("bob"), "EXAMPLE.COM").build();
+        before.fail_auth_count = 5;
+        before
+            .tl_data
+            .push(tl(TL_MOD_PRINC, b"\x01\0\0\0db_creation@EXAMPLE.COM\0"));
+        let (mut got, mut want) = (Vec::new(), Vec::new());
+        for (label, client_mask, mask, edit, around, expected) in cases {
+            let mut after = before.clone();
+            edit(&mut after);
+            let mut intent = WriteIntent::new(Operation::Modify, Caller::Embedder);
+            intent.client_mask = Some(client_mask);
+            let mut change = HostChange {
+                intent,
+                rows: vec![RowChange {
+                    id: "bob@EXAMPLE.COM".to_owned(),
+                    before: Some(before.clone()),
+                    after: Some(after),
+                    mask,
+                    host_owned: true,
+                }],
+                prepared: None,
+                batch: RealmBatch::default(),
+            };
+            around(&mut change);
+            let answer = verdict(&change, "EXAMPLE.COM").map(shown);
+            got.push((label, answer));
+            want.push((label, Ok::<_, KerberosStoreError>(expected.to_owned())));
+        }
+        assert_eq!(got, want);
     }
 
     fn shown(verdict: Verdict) -> String {
@@ -2668,7 +3522,7 @@ mod tests {
             Some(("bob@EXAMPLE.COM", true)),
             Some(("svc@EXAMPLE.COM", false)),
         );
-        let rows: [Row; 29] = [
+        let rows: [Row; 31] = [
             (
                 "create, no record",
                 Operation::Create,
@@ -2724,6 +3578,14 @@ mod tests {
                 ["svc@EXAMPLE.COM", "Alice@EXAMPLE.COM"],
                 |_| {},
                 "ask Alice@EXAMPLE.COM as alice",
+            ),
+            (
+                "rename of an alias of an owned record",
+                Operation::Rename,
+                bob,
+                ["bobby@EXAMPLE.COM", "bobbie@EXAMPLE.COM"],
+                |_| {},
+                "PROTECT_PRINCIPAL bob@EXAMPLE.COM (requested as bobby@EXAMPLE.COM)",
             ),
             (
                 "rename of no record",
@@ -2838,6 +3700,14 @@ mod tests {
                 bob,
                 ["bob@EXAMPLE.COM", ""],
                 |i| i.client_mask = Some(kadm5_mask::FAIL_AUTH_COUNT),
+                "unlock bob@EXAMPLE.COM",
+            ),
+            (
+                "MIT's unlock: the count and one TL entry",
+                Operation::Modify,
+                bob,
+                ["bob@EXAMPLE.COM", ""],
+                |i| i.client_mask = Some(kadm5_mask::FAIL_AUTH_COUNT | kadm5_mask::TL_DATA),
                 "unlock bob@EXAMPLE.COM",
             ),
             (

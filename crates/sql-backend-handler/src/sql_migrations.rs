@@ -155,6 +155,7 @@ pub(crate) enum KerberosPrincipals {
     PasswordExpiration,
     Policy,
     ModifiedDate,
+    AliasTarget,
 }
 
 #[derive(DeriveIden, Clone, Copy)]
@@ -1592,9 +1593,17 @@ async fn ensure_column(
     definition: ColumnDef,
 ) -> Result<(), DbErr> {
     let scope = open_probe(transaction, backend).await?;
+    // Qualified: SQLite reads an unknown bare "name" as a string, so that probe always succeeds.
     let probed = scope
         .transaction()
-        .execute(backend.build(Query::select().column(column).from(table.clone()).limit(1)))
+        .execute(
+            backend.build(
+                Query::select()
+                    .column((table.clone(), column))
+                    .from(table.clone())
+                    .limit(1),
+            ),
+        )
         .await;
     scope.close(false).await?;
     if probe_absent(backend, probed)? {
@@ -1832,6 +1841,13 @@ fn kerberos_bytes(mut column: ColumnDef, backend: sea_orm::DbBackend) -> ColumnD
     column
 }
 
+fn alias_target() -> ColumnDef {
+    ColumnDef::new(KerberosPrincipals::AliasTarget)
+        .text()
+        .null()
+        .to_owned()
+}
+
 async fn ensure_kerberos(
     transaction: &DatabaseTransaction,
     backend: sea_orm::DbBackend,
@@ -1899,6 +1915,7 @@ async fn ensure_kerberos(
                             )
                             .not_null(),
                         )
+                        .col(alias_target())
                         .foreign_key(
                             ForeignKey::create()
                                 .name("KerberosPrincipalUserForeignKey")
@@ -1910,6 +1927,14 @@ async fn ensure_kerberos(
             )
             .await?;
     }
+    ensure_column(
+        transaction,
+        backend,
+        KerberosPrincipals::Table.into_iden(),
+        KerberosPrincipals::AliasTarget.into_iden(),
+        alias_target(),
+    )
+    .await?;
     ensure_index(
         transaction,
         backend,

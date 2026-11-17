@@ -78,6 +78,7 @@ pub enum GraphQLLogProtocol {
     Http,
     Graphql,
     System,
+    Kadmin,
 }
 
 #[derive(

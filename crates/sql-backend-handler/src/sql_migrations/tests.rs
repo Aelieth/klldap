@@ -2835,6 +2835,32 @@ async fn assert_principal_user_rules(pool: &DbConnection) {
     );
 }
 
+async fn assert_the_alias_target_column_is_ensured(pool: &DbConnection) {
+    pool.execute_unprepared("ALTER TABLE kerberos_principals DROP COLUMN alias_target")
+        .await
+        .unwrap();
+    insert_principal(pool, "HTTP/before.example.com", None)
+        .await
+        .unwrap();
+    ensure_v13_additions(pool).await.unwrap();
+    pool.execute_unprepared(
+        "UPDATE kerberos_principals SET alias_target = 'bob' \
+         WHERE name = 'HTTP/before.example.com'",
+    )
+    .await
+    .unwrap();
+    let filled = "SELECT COUNT(*) as c FROM kerberos_principals WHERE alias_target = 'bob'";
+    let empty = "SELECT COUNT(*) as c FROM kerberos_principals WHERE alias_target IS NULL";
+    assert_eq!(
+        (count_sql(pool, filled).await, count_sql(pool, empty).await),
+        (
+            1,
+            count_sql(pool, "SELECT COUNT(*) as c FROM kerberos_principals").await - 1
+        ),
+        "a table made before alias_target gets the column at the next start, empty"
+    );
+}
+
 #[test]
 fn test_kerberos_bytes_are_longblob_on_mysql() {
     for (backend, expect) in [
@@ -2914,6 +2940,7 @@ async fn test_ensure_kerberos_tables() {
         ("password_expiration", 0, "datetime_text"),
         ("policy", 0, "varchar(255)"),
         ("modified_date", 1, "datetime_text"),
+        ("alias_target", 0, "TEXT"),
     ];
     assert_eq!(principal_cols.len(), expect.len());
     for (col, (name, notnull, col_type)) in principal_cols.iter().zip(expect) {
@@ -3035,6 +3062,13 @@ async fn test_ensure_kerberos_tables() {
         .await,
         1
     );
+    assert_the_alias_target_column_is_ensured(&pool).await;
+    let ensured = columns("kerberos_principals").await;
+    let alias_target = ensured.iter().find(|c| c.name == "alias_target").unwrap();
+    assert_eq!(
+        (alias_target.nn, alias_target.col_type.as_str()),
+        (0, "TEXT")
+    );
 }
 
 #[tokio::test]
@@ -3058,6 +3092,7 @@ async fn test_postgres_ensure_kerberos_tables() {
         .await,
         1
     );
+    assert_the_alias_target_column_is_ensured(&pool).await;
 }
 
 #[tokio::test]
@@ -3112,6 +3147,7 @@ async fn test_mysql_ensure_kerberos_tables() {
         .await,
         1
     );
+    assert_the_alias_target_column_is_ensured(&pool).await;
 }
 
 #[tokio::test]

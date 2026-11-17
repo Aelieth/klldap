@@ -1,7 +1,7 @@
 use crate::boot::{self, OpenRealm, RealmSettings};
 use crate::rotate;
 pub use crate::seam::Records;
-use crate::seam::{Host, SqlRealm, committing, committing_with, stored_aliases};
+use crate::seam::{Host, SqlRealm, committing, committing_with, row_name};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use krb5_admin::{
@@ -94,10 +94,6 @@ impl EmbeddedKerberos {
             kdc_tcp,
             kadmin,
         } = boot::open(settings, host.clone())?;
-        {
-            let (opened, _) = krb5_kdc::read_fresh(&store);
-            host.seed_aliases(stored_aliases(&opened, &settings.realm));
-        }
         let shutdown = Shutdown::new();
         let stopping = Arc::new(AtomicBool::new(false));
         let ready = Arc::new(AtomicBool::new(false));
@@ -315,7 +311,7 @@ impl EmbeddedKerberos {
         let serial = self.writes.clone().lock_owned().await;
         let (swept, aliases) = tokio::task::spawn_blocking(move || {
             let _serial = serial;
-            let (swept, aliases) = {
+            let (swept, aliases, listed) = {
                 let store = own
                     .store
                     .read()
@@ -330,8 +326,19 @@ impl EmbeddedKerberos {
                     .into_iter()
                     .map(|(user, sync)| (user.into_string(), sync))
                     .collect();
-                (sweep_plan(&store, &own.realm, &directory), aliases)
+                let listed = alias_rows(&store, &own.realm);
+                (sweep_plan(&store, &own.realm, &directory), aliases, listed)
             };
+            let mut filled = 0;
+            for part in listed.chunks(chunk) {
+                filled += own
+                    .host
+                    .fill_alias_targets(part)
+                    .map_err(|e| anyhow!("while filling the alias targets at start: {e}"))?;
+            }
+            if filled > 0 {
+                info!("Filled the alias target of {filled} alias rows written before the column");
+            }
             for part in swept.chunks(chunk) {
                 let mut store = own
                     .store
@@ -934,6 +941,16 @@ fn user_principal(user: &UserId) -> PrincipalName {
     PrincipalName::new(PrincipalName::NT_PRINCIPAL, [user.as_str()])
 }
 
+/// Each alias record's row name and target, as the opened store holds them.
+fn alias_rows(store: &PrincipalStore, realm: &str) -> Vec<(String, String)> {
+    store
+        .ids()
+        .iter()
+        .filter_map(|id| store.get_raw(id))
+        .filter_map(|p| Some((row_name(p.id(), realm), p.alias_target()?)))
+        .collect()
+}
+
 /// The principal that `user`'s own name is an alias record of, read unresolved.
 pub(crate) fn alias_of(store: &PrincipalStore, realm: &str, user: &UserId) -> Option<String> {
     let id = lookup_principal_id(&user_principal(user), realm)?;
@@ -1133,6 +1150,10 @@ pub(crate) mod tests {
 
         fn start_pass_committed(&self) {
             *self.started_at.lock().unwrap() = Some(self.own.load(Ordering::Relaxed));
+        }
+
+        fn fill_alias_targets(&self, _: &[(String, String)]) -> Result<u64, KerberosStoreError> {
+            Ok(0)
         }
     }
 
@@ -1799,13 +1820,13 @@ pub(crate) mod tests {
         type Row = (&'static str, Option<Fault>, Result<(), CommitError>, bool);
         let rows: [Row; 4] = [
             (
-                "committed, or its lost answer read back as written",
+                "committed, or its lost answer settled by the realm's generation",
                 None,
                 Ok(()),
                 true,
             ),
             (
-                "failed: the record read back is not this one",
+                "failed: the realm's generation did not move",
                 Some(Fault::Failed),
                 Err(CommitError::Failed(
                     "the database did not answer".to_owned(),
@@ -1813,7 +1834,7 @@ pub(crate) mod tests {
                 false,
             ),
             (
-                "unknown: the record could not be read back",
+                "unknown: the realm's generation could not be read back",
                 Some(Fault::Unknown),
                 Err(CommitError::Unknown(format!(
                     "{UNREAD_AFTER_COMMIT}: the database did not answer"

@@ -247,8 +247,30 @@ impl FloodClass {
 struct FloodCoalescer {
     class: FloodClass,
     idle: chrono::Duration,
-    windows: HashMap<(Option<String>, Protocol), FloodWindow>,
+    windows: HashMap<FloodKey, FloodWindow>,
     ready: Vec<LogEvent>,
+}
+
+#[derive(PartialEq, Eq, Hash)]
+struct FloodKey {
+    peer: Option<String>,
+    actor: Option<String>,
+    protocol: Protocol,
+}
+
+impl FloodKey {
+    /// A kadmin refusal coalesces only on the caller's own principal, keyed by the caller.
+    fn of(event: &LogEvent) -> Option<Self> {
+        let kadmin = event.protocol == Protocol::Kadmin;
+        if kadmin && (event.actor.is_none() || event.actor != event.target) {
+            return None;
+        }
+        Some(Self {
+            peer: event.peer.clone(),
+            actor: event.actor.clone().filter(|_| kadmin),
+            protocol: event.protocol,
+        })
+    }
 }
 
 impl FloodCoalescer {
@@ -265,7 +287,9 @@ impl FloodCoalescer {
         if FloodClass::classify(event) != Some(self.class) {
             return true;
         }
-        let key = (event.peer.clone(), event.protocol);
+        let Some(key) = FloodKey::of(event) else {
+            return true;
+        };
         let Some(entry) = self.windows.get_mut(&key) else {
             if self.windows.len() >= COALESCE_CAP {
                 self.flush_into_ready(event.timestamp, true);
@@ -315,19 +339,15 @@ impl FloodCoalescer {
         });
     }
 
-    fn started_event(
-        &self,
-        key: &(Option<String>, Protocol),
-        timestamp: chrono::NaiveDateTime,
-    ) -> LogEvent {
+    fn started_event(&self, key: &FloodKey, timestamp: chrono::NaiveDateTime) -> LogEvent {
         let event = LogEvent {
             timestamp,
             kind: self.class.kind(),
             success: false,
-            protocol: key.1,
-            actor: None,
+            protocol: key.protocol,
+            actor: key.actor.clone(),
             target: None,
-            peer: key.0.clone(),
+            peer: key.peer.clone(),
             forwarded_for: None,
             detail: Some(self.class.started_detail().to_owned()),
         };
@@ -336,11 +356,7 @@ impl FloodCoalescer {
     }
 }
 
-fn resolved_event(
-    class: FloodClass,
-    key: &(Option<String>, Protocol),
-    window: &FloodWindow,
-) -> Option<LogEvent> {
+fn resolved_event(class: FloodClass, key: &FloodKey, window: &FloodWindow) -> Option<LogEvent> {
     if window.counted == 0 {
         return None;
     }
@@ -348,10 +364,10 @@ fn resolved_event(
         timestamp: window.last,
         kind: class.kind(),
         success: false,
-        protocol: key.1,
-        actor: None,
+        protocol: key.protocol,
+        actor: key.actor.clone(),
         target: None,
-        peer: key.0.clone(),
+        peer: key.peer.clone(),
         forwarded_for: None,
         detail: Some(class.resolved_detail(window)),
     };
@@ -1552,6 +1568,179 @@ mod tests {
                     && r.detail.as_deref().is_some_and(|d| d.contains("resolved")))
                 .count(),
             1
+        );
+    }
+
+    const ADMIN: &str = "admin/admin@EXAMPLE.COM";
+    const K1SYNC: &str = "k1sync@EXAMPLE.COM";
+
+    fn kadmin_denial(caller: &str, target: &str, timestamp: chrono::NaiveDateTime) -> LogEvent {
+        LogEvent {
+            timestamp,
+            kind: LogKind::AccessDenied,
+            success: false,
+            protocol: Protocol::Kadmin,
+            actor: Some(caller.to_owned()),
+            target: Some(target.to_owned()),
+            peer: None,
+            forwarded_for: None,
+            detail: Some(format!(
+                "kadmin purge_keys on {target} by {caller}: PROTECT_PRINCIPAL"
+            )),
+        }
+    }
+
+    type FloodRow<'a> = (
+        LogKind,
+        Protocol,
+        Option<&'a str>,
+        Option<&'a str>,
+        Option<&'a str>,
+    );
+
+    fn flood_rows(rows: &[LogEvent]) -> Vec<FloodRow<'_>> {
+        rows.iter()
+            .map(|r| {
+                let (actor, peer) = (r.actor.as_deref(), r.peer.as_deref());
+                (r.kind, r.protocol, actor, peer, r.detail.as_deref())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_kadmin_refusals_coalesce_only_on_the_callers_own_principal() {
+        let mut flood = FloodCoalescer::new(FloodClass::AccessDenied, FLOOD_IDLE_SECONDS);
+        let base = at(1, 9, 0);
+        let within = |i: i64| base + chrono::Duration::milliseconds(i * 40);
+        let admin: Vec<bool> = (0..20)
+            .map(|i| flood.keep(&kadmin_denial(ADMIN, "bob@EXAMPLE.COM", within(i))))
+            .collect();
+        let no_caller = LogEvent {
+            actor: None,
+            ..kadmin_denial(ADMIN, "bob@EXAMPLE.COM", base)
+        };
+        let no_caller_kept = (0..20).all(|_| flood.keep(&no_caller));
+        let flushed = flood.flush(base + chrono::Duration::hours(1), true);
+        assert_eq!(
+            (admin, no_caller_kept, flushed),
+            (vec![true; 20], true, Vec::new()),
+            "an admin's refusals on another principal: every row, no flood"
+        );
+
+        let own: Vec<bool> = (0..20)
+            .map(|i| flood.keep(&kadmin_denial(K1SYNC, K1SYNC, within(i))))
+            .collect();
+        let pass = usize::try_from(FLOOD_PASS).unwrap();
+        let rows = flood.flush(base + chrono::Duration::seconds(60), false);
+        assert_eq!(
+            (own, flood_rows(&rows)),
+            (
+                [vec![true; pass], vec![false; 20 - pass]].concat(),
+                vec![
+                    (
+                        LogKind::AccessDeniedFlood,
+                        Protocol::Kadmin,
+                        Some(K1SYNC),
+                        None,
+                        Some("access-denied flood started")
+                    ),
+                    (
+                        LogKind::AccessDeniedFlood,
+                        Protocol::Kadmin,
+                        Some(K1SYNC),
+                        None,
+                        Some("access-denied flood resolved: 12 denials, 1 actors, 0s")
+                    ),
+                ]
+            ),
+            "self-service refusals: keyed by the caller, the usual pass, then the bracket"
+        );
+
+        let spray: Vec<bool> = (0..20)
+            .map(|i| {
+                let own_name = LogEvent {
+                    protocol: Protocol::Http,
+                    target: Some("bob".to_owned()),
+                    ..denial(Some("bob"), "10.0.0.7", within(i))
+                };
+                flood.keep(&own_name)
+            })
+            .collect();
+        let rows = flood.flush(base + chrono::Duration::seconds(60), false);
+        assert_eq!(
+            (spray, flood_rows(&rows)),
+            (
+                [vec![true; pass], vec![false; 20 - pass]].concat(),
+                vec![
+                    (
+                        LogKind::AccessDeniedFlood,
+                        Protocol::Http,
+                        None,
+                        Some("10.0.0.7"),
+                        Some("access-denied flood started")
+                    ),
+                    (
+                        LogKind::AccessDeniedFlood,
+                        Protocol::Http,
+                        None,
+                        Some("10.0.0.7"),
+                        Some("access-denied flood resolved: 12 denials, 1 actors, 0s")
+                    ),
+                ]
+            ),
+            "an HTTP spray is keyed by its peer, as before"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_writer_stores_every_admin_kadmin_refusal() {
+        let pool = get_initialized_db().await;
+        let (sink, rx) = channel_sink(128);
+        let task = tokio::spawn(run_writer(
+            rx,
+            pool.clone(),
+            sink.dropped.clone(),
+            LogRetention::default(),
+            WriterCoalescers {
+                bind: BindCoalescer::new(0),
+                bind_flood: FloodCoalescer::new(FloodClass::UnknownBind, FLOOD_IDLE_SECONDS),
+                denied_flood: FloodCoalescer::new(FloodClass::AccessDenied, FLOOD_IDLE_SECONDS),
+            },
+            WRITER_TICK,
+        ));
+        let now = chrono::Utc::now().naive_utc();
+        for i in 0..20 {
+            let at = now + chrono::Duration::milliseconds(i * 40);
+            sink.record(kadmin_denial(ADMIN, "bob@EXAMPLE.COM", at));
+            sink.record(kadmin_denial(K1SYNC, K1SYNC, at));
+            sink.record(denial(Some("mallory"), "10.0.0.7", at));
+        }
+        drop(sink);
+        task.await.unwrap();
+
+        let mut stored: HashMap<(String, String, Option<String>), usize> = HashMap::new();
+        for row in rows(&pool).await {
+            *stored
+                .entry((row.kind, row.protocol, row.actor))
+                .or_default() += 1;
+        }
+        let key = |kind: &str, protocol: &str, actor: Option<&str>| {
+            (
+                kind.to_owned(),
+                protocol.to_owned(),
+                actor.map(str::to_owned),
+            )
+        };
+        let pass = usize::try_from(FLOOD_PASS).unwrap();
+        assert_eq!(
+            stored,
+            HashMap::from([
+                (key("access_denied", "kadmin", Some(ADMIN)), 20),
+                (key("access_denied", "kadmin", Some(K1SYNC)), pass),
+                (key("access_denied_flood", "kadmin", Some(K1SYNC)), 2),
+                (key("access_denied", "ldap", Some("mallory")), pass),
+                (key("access_denied_flood", "ldap", None), 2),
+            ])
         );
     }
 

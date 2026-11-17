@@ -300,6 +300,10 @@ async fn upsert_principal(
             principal.name
         )));
     }
+    let alias_target = principal
+        .alias_target
+        .as_deref()
+        .map(|target| target_row(target, realm_name));
     transaction
         .execute(
             transaction.get_database_backend().build(
@@ -316,6 +320,7 @@ async fn upsert_principal(
                         KerberosPrincipals::PasswordExpiration,
                         KerberosPrincipals::Policy,
                         KerberosPrincipals::ModifiedDate,
+                        KerberosPrincipals::AliasTarget,
                     ])
                     .values_panic([
                         Expr::value(principal.name.clone()),
@@ -328,6 +333,7 @@ async fn upsert_principal(
                         Expr::value(time_value(principal.password_expiration)),
                         Expr::value(string_value(principal.policy.clone())),
                         Expr::value(principal.modified_date),
+                        Expr::value(string_value(alias_target)),
                     ])
                     .on_conflict(
                         OnConflict::column(KerberosPrincipals::Name)
@@ -341,6 +347,7 @@ async fn upsert_principal(
                                 KerberosPrincipals::PasswordExpiration,
                                 KerberosPrincipals::Policy,
                                 KerberosPrincipals::ModifiedDate,
+                                KerberosPrincipals::AliasTarget,
                             ])
                             .to_owned(),
                     ),
@@ -353,6 +360,93 @@ async fn upsert_principal(
         set_principal_attribute(transaction, &user_id, Some(attribute)).await?;
     }
     Ok(())
+}
+
+/// An alias's target as the `name` column holds names: the realm's own drop `@REALM`.
+fn target_row(target: &str, realm: &str) -> String {
+    target
+        .strip_suffix(&format!("@{realm}"))
+        .unwrap_or(target)
+        .to_owned()
+}
+
+#[derive(Debug, FromQueryResult)]
+struct StoredTarget {
+    alias_target: Option<String>,
+}
+
+pub(crate) async fn alias_chain(
+    db: &impl ConnectionTrait,
+    start: &str,
+    hops: usize,
+) -> Result<Vec<String>, KerberosSqlError> {
+    let mut chain = vec![start.to_owned()];
+    let mut name = start.to_owned();
+    for _ in 0..hops {
+        let row = StoredTarget::find_by_statement(
+            db.get_database_backend().build(
+                Query::select()
+                    .column(KerberosPrincipals::AliasTarget)
+                    .from(KerberosPrincipals::Table)
+                    .and_where(Expr::col(KerberosPrincipals::Name).eq(name.as_str())),
+            ),
+        )
+        .one(db)
+        .await
+        .map_err(failed)?;
+        match row.and_then(|row| row.alias_target) {
+            Some(next) => {
+                chain.push(next.clone());
+                name = next;
+            }
+            None => break,
+        }
+    }
+    Ok(chain)
+}
+
+#[derive(Debug, FromQueryResult)]
+struct StoredRealmName {
+    realm: String,
+}
+
+/// Rows written before `alias_target` existed: only an empty column is set.
+pub(crate) async fn fill_alias_targets(
+    transaction: &DatabaseTransaction,
+    rows: &[(String, String)],
+) -> Result<u64, KerberosSqlError> {
+    let backend = transaction.get_database_backend();
+    let realm = StoredRealmName::find_by_statement(
+        backend.build(
+            Query::select()
+                .column(KerberosRealm::Realm)
+                .from(KerberosRealm::Table)
+                .and_where(Expr::col(KerberosRealm::Id).eq(1)),
+        ),
+    )
+    .one(transaction)
+    .await
+    .map_err(failed)?;
+    let Some(StoredRealmName { realm }) = realm else {
+        return Ok(0);
+    };
+    let mut filled = 0;
+    for (name, target) in rows {
+        let updated = transaction
+            .execute(
+                backend.build(
+                    Query::update()
+                        .table(KerberosPrincipals::Table)
+                        .value(KerberosPrincipals::AliasTarget, target_row(target, &realm))
+                        .and_where(Expr::col(KerberosPrincipals::Name).eq(name.as_str()))
+                        .and_where(Expr::col(KerberosPrincipals::AliasTarget).is_null()),
+                ),
+            )
+            .await
+            .map_err(failed)?;
+        filled += updated.rows_affected();
+    }
+    Ok(filled)
 }
 
 async fn user_exists(

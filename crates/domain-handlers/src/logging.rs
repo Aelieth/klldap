@@ -30,6 +30,7 @@ pub enum Protocol {
     Graphql,
     #[default]
     System,
+    Kadmin,
 }
 
 // Stored as text and append-only; the computer/keytab feature adds its kinds here.
@@ -316,6 +317,31 @@ pub fn record_outcome(kind: LogKind, target: Option<&str>, success: bool, detail
 pub fn event(kind: LogKind, target: Option<&str>, success: bool, detail: Option<&str>) -> LogEvent {
     let meta = current_request();
     build(&meta, meta.actor.as_ref(), kind, target, success, detail)
+}
+
+/// A kadmin request's row: the client principal is the actor.
+pub fn kadmin_event(
+    client: &str,
+    kind: LogKind,
+    target: Option<&str>,
+    success: bool,
+    detail: Option<&str>,
+) -> LogEvent {
+    let meta = current_request().with_protocol(Protocol::Kadmin);
+    LogEvent {
+        actor: Some(truncate(client, MAX_NAME_LEN)),
+        ..build(&meta, None, kind, target, success, detail)
+    }
+}
+
+pub fn record_kadmin(
+    client: &str,
+    kind: LogKind,
+    target: Option<&str>,
+    success: bool,
+    detail: Option<&str>,
+) {
+    record_event(kadmin_event(client, kind, target, success, detail));
 }
 
 /// The terminal line of a row stored without the sink.
@@ -608,6 +634,59 @@ mod tests {
         assert_eq!(inner.peer, meta.peer);
         assert_eq!(inner.forwarded_for.as_deref(), Some("10.1.1.1"));
         assert_eq!(current_request(), RequestMeta::default());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_kadmin_row_names_its_client_and_protocol() {
+        let (recorder, _guard) = install_recorder();
+        let meta = RequestMeta::ldap(Some(UserId::new("admin")), None);
+        with_request(meta, async {
+            record_kadmin(
+                "admin/admin@EXAMPLE.COM",
+                LogKind::AccessDenied,
+                Some("bob@EXAMPLE.COM"),
+                false,
+                Some("kadmin purge_keys"),
+            );
+        })
+        .await;
+        let row = kadmin_event("bob@EXAMPLE.COM", LogKind::PasswordChange, None, true, None);
+        let mut events = recorder.0.lock().unwrap().clone();
+        events.push(row.clone());
+        let shown = |e: &LogEvent| {
+            (
+                e.kind,
+                e.success,
+                e.protocol,
+                e.actor.clone(),
+                e.target.clone(),
+            )
+        };
+        assert_eq!(
+            events.iter().map(shown).collect::<Vec<_>>(),
+            vec![
+                (
+                    LogKind::AccessDenied,
+                    false,
+                    Protocol::Kadmin,
+                    Some("admin/admin@EXAMPLE.COM".to_owned()),
+                    Some("bob@EXAMPLE.COM".to_owned())
+                ),
+                (
+                    LogKind::PasswordChange,
+                    true,
+                    Protocol::Kadmin,
+                    Some("bob@EXAMPLE.COM".to_owned()),
+                    None
+                ),
+            ]
+        );
+        assert_eq!(Protocol::Kadmin.to_string(), "kadmin");
+        assert_eq!(
+            row.to_string(),
+            "✅ password_change by bob@EXAMPLE.COM (kadmin)"
+        );
     }
 
     #[test]

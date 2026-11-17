@@ -19,16 +19,16 @@ that build on them; the terminal lines are LLDAP's usual output plus these event
 | `schema_change` | attribute / object class added or deleted | target name, detail = the operation |
 | `system_config_change` | `allowedous` (OU create/delete), `posix_settings` | target key, detail = value; other keys log `updated` |
 | `posix_change` | the bulk uidNumber/gidNumber/home/shell reassignments | detail `reassign` |
-| `kerberos_sync`, `keytab_export` | principal create/delete/enable/disable, reconcile, the start's mark, keytab export (a password change writes a `password_change` row instead) | target principal user / host, detail = the operation |
+| `kerberos_sync`, `keytab_export` | principal create/delete/enable/disable, reconcile, the start's mark, keytab export, a kadmin unlock (a password change writes a `password_change` row instead) | target principal user / host, detail = the operation |
 | `keycloak_change` | Federation tab: test connection, save config, push realm | target url / realm |
 | `mfa_enroll` | TOTP enrollment: a state minted (`started`), confirmed (`totp`, `replaced`), or refused (`invalid code`, `expired enrollment`, `stale enrollment`, `corrupt enrollment state`, `foreign enrollment state`; a refused current code on a replacement carries the rejection detail) | actor = target user |
 | `mfa_reset` | a second factor cleared: by an admin or password manager (no detail — the actor says who), by the user (`self`; a refused code carries the rejection detail), by a password reset (`password reset`), by the one-shot admin reset (`forced admin reset`), or for everyone after a private-key rotation (`private key changed`, `system`, no target) | target user |
 | `policy_change` | a named policy created/updated/deleted, attached to or cleared from an OU, inheritance blocked/unblocked, or OU policy state dropped on `deleteOu` | target = policy name or the OU (`(root)` for the domain root); update detail lists field names, never values |
-| `access_denied` | a GraphQL field or an LDAP operation refused for lack of rights, a rejected JWT (junk/`Invalid JWT`, `Expired JWT`, logged out, disabled account, wrong algorithm) | actor if known, detail = the refusal message. Like failed binds, the first 8 per client address and protocol are stored one-to-one; a flood past that coalesces into `access_denied_flood` |
+| `access_denied` | a GraphQL field or an LDAP operation refused for lack of rights, a rejected JWT (junk/`Invalid JWT`, `Expired JWT`, logged out, disabled account, wrong algorithm), a kadmin write refused on a directory user's principal ([kerberos.md](kerberos.md#kadmin-and-directory-users)) | actor if known, detail = the refusal message. Like failed binds, the first 8 per client address and protocol are stored one-to-one; a flood past that coalesces into `access_denied_flood`. A kadmin refusal is never coalesced when the actor (the kadmin client) is not the target; one on the client's own principal coalesces per client |
 | `server_start`, `admin_bootstrap` | boot, admin created / password forced from the configuration | `system` |
 | `log_gap` | events dropped because the writer's queue overflowed | detail = how many |
 | `bind_flood` | brackets a flood of unknown-name bind failures from one client address and protocol: a `started` row the moment the source passes the first 8 failures, then a `resolved` row when it goes quiet (~20 s) or on shutdown | no actor; peer and protocol of the source; detail `unknown-user bind flood started`, then `unknown-user bind flood resolved: N binds, M names, Ds` (`M+` past 64). An unpaired `started` = still ongoing |
-| `access_denied_flood` | brackets a flood of refusals from one client address and protocol (authenticated abuse or a junk-JWT spammer), the same way `bind_flood` does for binds | no actor; peer and protocol of the source; detail `access-denied flood started`, then `access-denied flood resolved: N denials, M actors, Ds` (anonymous/junk-JWT counts as one actor) |
+| `access_denied_flood` | brackets a flood of refusals from one client address and protocol (authenticated abuse or a junk-JWT spammer), or of one kadmin client's refusals on its own principal, the same way `bind_flood` does for binds | no actor (a kadmin flood: the client); peer and protocol of the source; detail `access-denied flood started`, then `access-denied flood resolved: N denials, M actors, Ds` (anonymous/junk-JWT counts as one actor) |
 
 Reserved for the coming Kerberos keytab / computer feature: `computer_create`,
 `computer_update`, `computer_delete`, `keytab_rotate` (`keytab_export` keeps
@@ -39,7 +39,8 @@ Success is a column, not a kind: a wrong password is `bind` with `success = fals
 ## Rows
 
 `id` (bigint, the paging cursor), `timestamp` (UTC), `kind`, `success`, `protocol`
-(`ldap`, `http` for the `/auth` endpoints, `graphql`, `system` for boot-time work), `actor`
+(`ldap`, `http` for the `/auth` endpoints, `graphql`, `system` for boot-time work, `kadmin`
+for the embedded KDC's kadmin requests, whose actor is the client principal), `actor`
 (who asked — the *claimed* identity for authentication events, the verified one otherwise),
 `target` (what was acted upon), `peer` (client address as seen by the server),
 `forwarded_for` (the raw `X-Forwarded-For` header, HTTP only, untrusted), `detail` (a short

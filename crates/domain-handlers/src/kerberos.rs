@@ -132,10 +132,12 @@ pub trait KerberosSync: Send + Sync {
     /// A synced user's new keys and `change.rows`, in one transaction.
     async fn commit_password(
         &self,
-        _change: PasswordCommit,
+        change: PasswordCommit,
         _password: &str,
     ) -> Result<(), CommitError> {
-        Err(CommitError::Failed(NO_COMMIT.to_owned()))
+        let failed = CommitError::Failed(NO_COMMIT.to_owned());
+        crate::password::record_commit_failure(change.kind, &change.user, &failed);
+        Err(failed)
     }
     async fn delete_principal(&self, user: &UserId) -> Result<(), String>;
     async fn set_principal_enabled(&self, user: &UserId, enabled: bool) -> Result<(), String>;
@@ -155,8 +157,8 @@ pub const USER_GONE: &str = "the user is gone";
 /// A new principal name is a directory user's, or a case twin of one.
 pub const DIRECTORY_USER: &str = "the name belongs to a directory user";
 pub const DIRECTORY_TARGET: &str = "the alias's target belongs to a directory user";
-/// Starts the Failed answer of a commit whose record could not be read back.
-pub const UNREAD_AFTER_COMMIT: &str = "the result is unknown: the record could not be read back";
+/// Starts the Failed answer of a commit whose outcome could not be read back.
+pub const UNREAD_AFTER_COMMIT: &str = "the result is unknown: the commit could not be read back";
 
 /// A directory row that commits in the transaction of a Kerberos change.
 #[derive(Clone)]
@@ -171,8 +173,18 @@ pub enum HostRow {
     Log(LogEvent),
     /// None of these users may exist, or the transaction rolls back with `DIRECTORY_USER`.
     NoUser(Vec<UserId>),
-    /// None of these users may exist, or the transaction rolls back with `DIRECTORY_TARGET`.
-    NoAliasOnto(Vec<UserId>),
+    /// No name on these targets' chains may be a user's, or it rolls back with `DIRECTORY_TARGET`.
+    NoAliasOnto(AliasOnto),
+}
+
+pub type UserOf = Arc<dyn Fn(&str) -> Option<UserId> + Send + Sync>;
+
+/// The targets of new alias rows, followed through the principals' `alias_target` column.
+#[derive(Clone)]
+pub struct AliasOnto {
+    pub targets: Vec<String>,
+    pub hops: usize,
+    pub user_of: UserOf,
 }
 
 impl HostRow {
@@ -186,7 +198,7 @@ impl HostRow {
             Self::CreateUser(request) => format!("create {}", request.user_id),
             Self::Log(event) => format!("log {}", event.kind),
             Self::NoUser(users) => format!("no user {}", names(users)),
-            Self::NoAliasOnto(users) => format!("no alias onto {}", names(users)),
+            Self::NoAliasOnto(onto) => format!("no alias onto {}", onto.targets.join(", ")),
         }
     }
 }
@@ -385,16 +397,20 @@ pub trait KerberosStore: Send + Sync {
             Err(KerberosStoreError::Refused(NO_HOST_ROWS.to_owned()))
         }
     }
-    /// The user's stored OPAQUE record; `None` for no user or no record.
-    fn password_record(&self, _user: &UserId) -> Result<Option<Vec<u8>>, KerberosStoreError> {
-        Err(KerberosStoreError::NotReady(NO_HOST_ROWS.to_owned()))
-    }
     /// Which of `users` exist, read outside any transaction.
     fn directory_users(&self, _users: &[UserId]) -> Result<Vec<UserId>, KerberosStoreError> {
         Err(KerberosStoreError::NotReady(NO_HOST_ROWS.to_owned()))
     }
     /// Whether `user` is in `lldap_disabled`, read outside any transaction; false for no user.
     fn user_disabled(&self, _user: &UserId) -> Result<bool, KerberosStoreError> {
+        Err(KerberosStoreError::NotReady(NO_HOST_ROWS.to_owned()))
+    }
+    /// `start`, then each row name its alias rows lead to, at most `hops` further.
+    fn alias_chain(&self, _start: &str, _hops: usize) -> Result<Vec<String>, KerberosStoreError> {
+        Err(KerberosStoreError::NotReady(NO_HOST_ROWS.to_owned()))
+    }
+    /// Sets `alias_target` where it is empty, by (row name, target); the records stay as they are.
+    fn fill_alias_targets(&self, _rows: &[(String, String)]) -> Result<u64, KerberosStoreError> {
         Err(KerberosStoreError::NotReady(NO_HOST_ROWS.to_owned()))
     }
 }
@@ -565,8 +581,12 @@ mod tests {
                 false,
             ),
             (
-                HostRow::NoAliasOnto(vec![UserId::new("Bob")]),
-                "no alias onto bob",
+                HostRow::NoAliasOnto(AliasOnto {
+                    targets: vec!["Bob".to_owned(), "svc/a".to_owned()],
+                    hops: 10,
+                    user_of: Arc::new(|_: &str| None),
+                }),
+                "no alias onto Bob, svc/a",
                 false,
             ),
         ];
@@ -594,6 +614,50 @@ mod tests {
             sample_batch(),
         );
         assert!(matches!(refused, Err(KerberosStoreError::Refused(_))));
+    }
+
+    #[derive(Default)]
+    struct Rows(Mutex<Vec<crate::logging::LogEvent>>);
+
+    impl crate::logging::LogSink for Rows {
+        fn record(&self, event: crate::logging::LogEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_without_a_realm_a_synced_change_fails_with_one_row() {
+        let rows = Arc::new(Rows::default());
+        crate::logging::set_log_sink(rows.clone());
+        let change = PasswordCommit {
+            user: UserId::new("bob"),
+            rows: Vec::new(),
+            kind: LogKind::PasswordChange,
+        };
+        let answered = NoopKerberos::new("EXAMPLE.COM".to_owned())
+            .commit_password(change, "Bob-Pass-1")
+            .await;
+        crate::logging::set_log_sink(Arc::new(crate::logging::NoopLogSink));
+        let logged: Vec<_> = rows
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| (e.kind, e.target.clone(), e.success, e.detail.clone()))
+            .collect();
+        assert_eq!(
+            (answered, logged),
+            (
+                Err(CommitError::Failed(NO_COMMIT.to_owned())),
+                vec![(
+                    LogKind::PasswordChange,
+                    Some("bob".to_owned()),
+                    false,
+                    Some(format!("password change failed: {NO_COMMIT}"))
+                )]
+            )
+        );
     }
 
     #[test]

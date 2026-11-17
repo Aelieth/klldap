@@ -87,9 +87,9 @@ ACL text, read at boot.
   written: a refusal is LDAP 53 (unwillingToPerform) or a GraphQL error, and an
   offline KDC is 52 (unavailable), LDAP ADD included. A change that waits more
   than 10 s for another one is refused with 51 (busy) and writes nothing. If
-  the database's answer to the commit is lost, KLLDAP reads the stored record
-  back: the change is reported done if it landed, and as "the result is
-  unknown: try the new password" (LDAP 80) if the record cannot be read. An
+  the database's answer to the commit is lost, KLLDAP reads the realm's
+  generation back: the change is reported done if it landed, and as "the
+  result is unknown: try the new password" (LDAP 80) if it cannot be read. An
   LDAP ADD with a password creates the entry, its record and its principal
   together, or nothing. The web pages still set the directory password and
   sync Kerberos in two requests.
@@ -123,6 +123,64 @@ On a host, skip `docker exec` and set `KRB5_CONFIG=krb5.conf`, the file in
 the unit's working directory.
 
 `getprinc` shows attributes such as `REQUIRES_PRE_AUTH` and `DISALLOW_ALL_TIX`.
+
+## kadmin and directory users
+
+KLLDAP marks the principal of each user with `kerberosSync` as its own (see
+[Principals](#principals)). `getprinc` does not show the mark. kadmin reads
+such a principal as any other: `getprinc`, `listprincs` and `getstrs` work.
+KLLDAP answers each write to it:
+
+| kadmin command | What happens | kadmin reports |
+|---|---|---|
+| `cpw` | Carried out by KLLDAP. The keys and the directory password change in one transaction. | success |
+| `cpw` with fewer than 8 characters | Refused. Characters are counted, not bytes. | `Password is too short` |
+| `cpw` with a password that is not valid UTF-8 | Refused | `Unspecified password quality failure` |
+| `cpw -keepold`, `cpw -randkey`, `ktadd` | Refused | `Cannot change protected principal` |
+| `modprinc -unlock` alone | Carried out by KLLDAP. Only the failure count, the unlock time and the modification stamp change. The keys and the password stay. | success |
+| `modprinc` with any other option | Refused | `Cannot change protected principal` |
+| `setstr`, `delstr`, `purgekeys` | Refused | `Cannot change protected principal` |
+| `delprinc`, `renprinc` | Refused | `Cannot change protected principal` |
+| `alias` onto the principal, or onto one of its aliases | Refused | `Cannot change protected principal` |
+| `renprinc` of one of its aliases | Refused | `Cannot change protected principal` |
+| `delprinc` of one of its aliases | Carried out. The principal stays. | success |
+| `cpw` through one of its aliases | As `cpw` on the principal | as above |
+
+A directory user's name is reserved for that user. The name in another case
+counts as the same name:
+
+| kadmin command | kadmin reports |
+|---|---|
+| `addprinc` with the name, when no principal has it | ```Operation requires ``add'' privilege``` |
+| `renprinc` of another principal onto the name | ```Operation requires ``add'' privilege``` |
+| `alias` with the name | ```Operation requires ``add'' privilege``` |
+| `alias` onto the name, or onto an alias that leads to it | `Cannot change protected principal` |
+| `renprinc` of an alias that leads to the name | `Cannot change protected principal` |
+
+Each refusal writes one `access_denied` log row,
+`kadmin <operation> on <principal> by <client>: <code>`, for example
+`kadmin randkey on bob@EXAMPLE.COM by admin/admin@EXAMPLE.COM: PROTECT_PRINCIPAL`.
+A write sent through an alias adds `(requested as <alias>)`. A `cpw` that is
+carried out writes a `password_change` row,
+`kadmin change_password by <client>`, with `(self-service)` when users change
+their own. An unlock writes a `kerberos_sync` row. These rows have the
+protocol `kadmin`, and the kadmin client is their actor. An admin's refusals
+are each stored. A user's refusals on its own principal coalesce like other
+refusals: past the first 8, into `access_denied_flood` rows (see
+[logging.md](logging.md)). A principal that KLLDAP has not marked, such as
+`HTTP/<host>`, takes kadmin commands as usual, within the name rules above.
+
+Make these changes in the directory instead:
+
+- **Password:** the web UI, `ldappasswd`, LDAP Modify `userPassword`, or
+  GraphQL `setUserPassword`. The keys follow. kadmin `cpw` also works, as above.
+- **Disable:** add the user to `lldap_disabled`. Leaving the group enables the
+  principal again.
+- **Delete:** turn `kerberosSync` off for the user, or delete the user.
+- **Rename:** the principal's name is the user id, and it changes only with
+  the user.
+- **A principal for a directory user:** turn `kerberosSync` on for the user,
+  then set the user's password.
 
 ## Ports and clients
 

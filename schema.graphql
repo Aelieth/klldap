@@ -60,6 +60,7 @@ enum LogProtocol {
   HTTP
   GRAPHQL
   SYSTEM
+  KADMIN
 }
 
 enum PolicyScope {

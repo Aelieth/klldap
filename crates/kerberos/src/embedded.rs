@@ -1,5 +1,6 @@
 use crate::boot::{self, OpenRealm, RealmSettings};
 use crate::rotate;
+pub use crate::seam::Records;
 use crate::seam::{Host, SqlRealm, committing, committing_with};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
@@ -74,8 +75,10 @@ impl EmbeddedKerberos {
     pub fn start(
         settings: &RealmSettings,
         store: Arc<dyn lldap_domain_handlers::kerberos::KerberosStore>,
+        records: Records,
     ) -> Result<(Arc<Self>, RealmThreads)> {
-        Self::start_on(settings, Arc::new(SqlRealm::new(store)))
+        let host = SqlRealm::new(store).serving(&settings.realm, Some(records));
+        Self::start_on(settings, Arc::new(host))
     }
 
     pub(crate) fn start_on(
@@ -924,11 +927,11 @@ async fn logged<T: Send + 'static>(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::seam::verdict;
+    use crate::seam::{Verdict, verdict};
     use krb5_crypto::EncryptionType;
     use krb5_kdc::KDB_DISALLOW_ALL_TIX;
     use krb5_kdc::host::{
-        HostChange, KerberosStore, KerberosStoreError, LoadedRealm, MemoryRealm, Operation,
+        Denial, HostChange, KerberosStore, KerberosStoreError, LoadedRealm, MemoryRealm, Operation,
     };
     use lldap_domain_handlers::kerberos::HostRow;
     use lldap_domain_handlers::logging::{RequestMeta, with_request};
@@ -984,7 +987,12 @@ pub(crate) mod tests {
         }
         fn commit_change(&self, change: HostChange) -> Result<(), KerberosStoreError> {
             self.changes.lock().unwrap().push(change.intent.operation);
-            verdict(&change)?;
+            if let Verdict::Deny { code, .. } = verdict(&change, "EXAMPLE.COM")? {
+                return Err(KerberosStoreError::Denied(Denial {
+                    kadm5_code: code,
+                    text: String::new(),
+                }));
+            }
             self.realm.commit(change.batch)
         }
     }

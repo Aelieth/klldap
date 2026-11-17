@@ -164,6 +164,8 @@ const NO_COMMIT: &str = "this Kerberos backend cannot commit a password";
 const NO_HOST_ROWS: &str = "this Kerberos store writes no directory rows";
 
 pub const USER_GONE: &str = "the user is gone";
+/// A new principal name is a directory user's, or a case twin of one.
+pub const DIRECTORY_USER: &str = "the name belongs to a directory user";
 
 /// A directory row that commits in the transaction of a Kerberos change.
 #[derive(Clone)]
@@ -176,6 +178,8 @@ pub enum HostRow {
     },
     CreateUser(CreateUserRequest),
     Log(LogEvent),
+    /// None of these users may exist, or the transaction rolls back with `DIRECTORY_USER`.
+    NoUser(Vec<UserId>),
 }
 
 impl HostRow {
@@ -188,6 +192,10 @@ impl HostRow {
             Self::SetPassword { user, .. } => format!("password {user}"),
             Self::CreateUser(request) => format!("create {}", request.user_id),
             Self::Log(event) => format!("log {}", event.kind),
+            Self::NoUser(users) => {
+                let users: Vec<_> = users.iter().map(UserId::as_str).collect();
+                format!("no user {}", users.join(", "))
+            }
         }
     }
 }
@@ -393,6 +401,10 @@ pub trait KerberosStore: Send + Sync {
     fn password_record(&self, _user: &UserId) -> Result<Option<Vec<u8>>, KerberosStoreError> {
         Err(KerberosStoreError::NotReady(NO_HOST_ROWS.to_owned()))
     }
+    /// Which of `users` exist, read outside any transaction.
+    fn directory_users(&self, _users: &[UserId]) -> Result<Vec<UserId>, KerberosStoreError> {
+        Err(KerberosStoreError::NotReady(NO_HOST_ROWS.to_owned()))
+    }
 }
 
 const STORE_NOT_REGISTERED: &str = "Kerberos store not registered";
@@ -532,7 +544,7 @@ mod tests {
         use crate::logging::{LogKind, event};
         let now = chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc();
         let bob = UserId::new("bob");
-        let rows: [(HostRow, &str, bool); 3] = [
+        let rows: [(HostRow, &str, bool); 4] = [
             (
                 HostRow::SetPassword {
                     user: bob.clone(),
@@ -553,6 +565,11 @@ mod tests {
             (
                 HostRow::Log(event(LogKind::PasswordChange, Some("bob"), true, None)),
                 "log password_change",
+                false,
+            ),
+            (
+                HostRow::NoUser(vec![UserId::new("Alice"), UserId::new("carol")]),
+                "no user alice, carol",
                 false,
             ),
         ];

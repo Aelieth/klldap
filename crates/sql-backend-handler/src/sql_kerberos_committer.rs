@@ -7,15 +7,15 @@ use crate::sql_log_handler::to_active_model;
 use crate::sql_tables::DbConnection;
 use lldap_domain::types::UserId;
 use lldap_domain_handlers::kerberos::{
-    HostRow, KerberosStore, KerberosStoreError, LoadedRealm, NoopKerberosStore, RealmBatch,
-    USER_GONE, set_kerberos_store,
+    DIRECTORY_USER, HostRow, KerberosStore, KerberosStoreError, LoadedRealm, NoopKerberosStore,
+    RealmBatch, USER_GONE, set_kerberos_store,
 };
 use lldap_domain_handlers::password::kill_point;
 use lldap_domain_model::model::{self, UserColumn};
 use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ColumnTrait, DatabaseTransaction, DbErr, EntityTrait, QueryFilter, QuerySelect,
-    TransactionTrait,
+    ColumnTrait, ConnectionTrait, DatabaseTransaction, DbErr, EntityTrait, QueryFilter,
+    QuerySelect, TransactionTrait,
 };
 use std::future::Future;
 use std::sync::Arc;
@@ -68,6 +68,10 @@ enum Job {
         UserId,
         oneshot::Sender<Result<Option<Vec<u8>>, KerberosStoreError>>,
     ),
+    Users(
+        Vec<UserId>,
+        oneshot::Sender<Result<Vec<UserId>, KerberosStoreError>>,
+    ),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -100,6 +104,14 @@ impl KerberosStore for CommitterStore {
         let (tx, rx) = oneshot::channel();
         self.tx
             .blocking_send(Job::Record(user.clone(), tx))
+            .map_err(|_| stopped())?;
+        rx.blocking_recv().map_err(|_| stopped())?
+    }
+
+    fn directory_users(&self, users: &[UserId]) -> Result<Vec<UserId>, KerberosStoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .blocking_send(Job::Users(users.to_vec(), tx))
             .map_err(|_| stopped())?;
         rx.blocking_recv().map_err(|_| stopped())?
     }
@@ -247,6 +259,9 @@ async fn run(
             }
             Incoming::Job(Job::Record(user, reply)) => {
                 let _ = reply.send(read_record(&pool, &user, timings.step).await);
+            }
+            Incoming::Job(Job::Users(users, reply)) => {
+                let _ = reply.send(read_users(&pool, &users, timings.step).await);
             }
             Incoming::Job(Job::Shutdown(reply)) => {
                 clear_held(&pool, &phase, timings.step).await;
@@ -469,9 +484,35 @@ async fn write_host_rows(
                     .await
                     .map_err(row_failed)?;
             }
+            HostRow::NoUser(users) => {
+                if !existing_users(txn, users)
+                    .await
+                    .map_err(row_failed)?
+                    .is_empty()
+                {
+                    return Err(KerberosStoreError::Refused(DIRECTORY_USER.to_owned()));
+                }
+            }
         }
     }
     Ok(())
+}
+
+async fn existing_users(db: &impl ConnectionTrait, users: &[UserId]) -> Result<Vec<UserId>, DbErr> {
+    if users.is_empty() {
+        return Ok(Vec::new());
+    }
+    let found = model::User::find()
+        .select_only()
+        .column(UserColumn::UserId)
+        .filter(UserColumn::UserId.is_in(users.iter().cloned()))
+        .into_tuple::<(String,)>()
+        .all(db)
+        .await?;
+    Ok(found
+        .into_iter()
+        .map(|(user,)| UserId::from(user))
+        .collect())
 }
 
 async fn set_password_in(
@@ -512,6 +553,19 @@ async fn read_record(
             .one(pool)
             .await
             .map(|row| row.and_then(|(record,)| record))
+            .map_err(|err| KerberosStoreError::Failed(err.to_string()))
+    })
+    .await
+}
+
+async fn read_users(
+    pool: &DbConnection,
+    users: &[UserId],
+    step: Duration,
+) -> Result<Vec<UserId>, KerberosStoreError> {
+    within(step, || KerberosStoreError::Failed(late(step)), async {
+        existing_users(pool, users)
+            .await
             .map_err(|err| KerberosStoreError::Failed(err.to_string()))
     })
     .await
@@ -1626,6 +1680,23 @@ mod tests {
                 Err("did not answer within 100ms"),
                 nothing(5),
             ),
+            (
+                "a new name a directory user holds, in another case",
+                vec![HostRow::NoUser(vec![UserId::new("Alice")])],
+                Before::Nothing,
+                Err(DIRECTORY_USER),
+                nothing(5),
+            ),
+            (
+                "a new name no directory user holds",
+                vec![HostRow::NoUser(vec![UserId::new("bob")])],
+                Before::Nothing,
+                Ok(()),
+                After {
+                    principals: 1,
+                    ..nothing(6)
+                },
+            ),
         ];
         for (label, host, before, answer, expected) in rows {
             let db = db().await;
@@ -1707,5 +1778,27 @@ mod tests {
                 (got, _) => panic!("{label}: {:?}", got.map(|r| r.map(|r| r.len()))),
             }
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_the_directory_users_are_read_within_one_step() {
+        let db = db().await;
+        insert_alice(&db.pool).await;
+        let step = Duration::from_millis(100);
+        let asked = [UserId::new("Alice"), UserId::new("nobody")];
+        let found = read_users(&db.pool, &asked, step).await.unwrap();
+        let none = read_users(&db.pool, &[], step).await.unwrap();
+        let held = db.pool.begin().await.unwrap();
+        let late = read_users(&db.pool, &asked, step).await.unwrap_err();
+        held.rollback().await.unwrap();
+        assert_eq!(
+            (
+                found,
+                none,
+                late.to_string().contains("did not answer within 100ms")
+            ),
+            (vec![UserId::new("alice")], Vec::new(), true)
+        );
     }
 }

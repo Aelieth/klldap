@@ -43,7 +43,7 @@ use lldap_domain_handlers::kerberos::{
 };
 use lldap_domain_handlers::logging::{LogKind, record};
 use lldap_kerberos::boot::{RealmSettings, client_address};
-use lldap_kerberos::embedded::{EmbeddedKerberos, RealmThreads};
+use lldap_kerberos::embedded::{EmbeddedKerberos, RealmThreads, Records};
 
 use lldap_domain_handlers::handler::{
     GroupBackendHandler, GroupListerBackendHandler, GroupRequestFilter, MfaBackendHandler,
@@ -298,8 +298,12 @@ async fn set_up_server(
             let durable = warn_database_durability(&sql_pool)
                 .await
                 .context("while reading database durability");
+            let records = Records {
+                handler: Arc::new(backend_handler.clone()),
+                runtime: tokio::runtime::Handle::current(),
+            };
             let started = match durable {
-                Ok(()) => start_realm(settings).await,
+                Ok(()) => start_realm(settings, records).await,
                 Err(e) => Err(e),
             };
             match started {
@@ -339,10 +343,15 @@ async fn set_up_server(
     Ok((server_builder, realm_threads))
 }
 
-async fn start_realm(settings: RealmSettings) -> Result<(Arc<EmbeddedKerberos>, RealmThreads)> {
-    tokio::task::spawn_blocking(move || EmbeddedKerberos::start(&settings, kerberos_store()))
-        .await
-        .context("while starting the Kerberos realm")?
+async fn start_realm(
+    settings: RealmSettings,
+    records: Records,
+) -> Result<(Arc<EmbeddedKerberos>, RealmThreads)> {
+    tokio::task::spawn_blocking(move || {
+        EmbeddedKerberos::start(&settings, kerberos_store(), records)
+    })
+    .await
+    .context("while starting the Kerberos realm")?
 }
 
 async fn stop_realm(realm: RealmThreads) -> Result<()> {

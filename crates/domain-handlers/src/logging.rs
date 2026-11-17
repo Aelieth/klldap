@@ -312,6 +312,17 @@ pub fn record_outcome(kind: LogKind, target: Option<&str>, success: bool, detail
     ));
 }
 
+/// The row `record_outcome` would send, for a writer that stores it in its own transaction.
+pub fn event(kind: LogKind, target: Option<&str>, success: bool, detail: Option<&str>) -> LogEvent {
+    let meta = current_request();
+    build(&meta, meta.actor.as_ref(), kind, target, success, detail)
+}
+
+/// The terminal line of a row stored without the sink.
+pub fn print(event: &LogEvent) {
+    emit(event);
+}
+
 /// For authentication events the actor is the claimed identity, not a verified one.
 pub fn record_as(
     actor: Option<&UserId>,

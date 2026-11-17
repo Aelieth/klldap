@@ -1,4 +1,6 @@
+use crate::logging::LogEvent;
 use async_trait::async_trait;
+use lldap_domain::requests::CreateUserRequest;
 use lldap_domain::types::UserId;
 use lldap_domain_model::error::DomainError;
 use std::sync::{Arc, LazyLock, RwLock};
@@ -123,6 +125,18 @@ pub trait KerberosSync: Send + Sync {
         format!("{}@{}", user.as_str(), self.realm())
     }
     async fn sync_principal(&self, user: &UserId, password: &str) -> Result<(), String>;
+    /// Kerberos's own check of a new password, before anything is locked or written.
+    async fn check_password(&self, _user: &UserId, _password: &str) -> Result<(), String> {
+        Ok(())
+    }
+    /// A synced user's new keys and `change.rows`, in one transaction.
+    async fn commit_password(
+        &self,
+        _change: PasswordCommit,
+        _password: &str,
+    ) -> Result<Committed, CommitError> {
+        Err(CommitError::Failed(NO_COMMIT.to_owned()))
+    }
     async fn sync_if_enabled(
         &self,
         sync_enabled: bool,
@@ -146,6 +160,67 @@ pub trait KerberosSync: Send + Sync {
 }
 
 const NOT_REGISTERED: &str = "Kerberos backend not registered";
+const NO_COMMIT: &str = "this Kerberos backend cannot commit a password";
+const NO_HOST_ROWS: &str = "this Kerberos store writes no directory rows";
+
+pub const USER_GONE: &str = "the user is gone";
+
+/// A directory row that commits in the transaction of a Kerberos change.
+#[derive(Clone)]
+pub enum HostRow {
+    /// Exactly one user row must change, or the transaction rolls back.
+    SetPassword {
+        user: UserId,
+        record: Vec<u8>,
+        now: chrono::NaiveDateTime,
+    },
+    CreateUser(CreateUserRequest),
+    Log(LogEvent),
+}
+
+impl HostRow {
+    pub fn is_password(&self) -> bool {
+        matches!(self, Self::SetPassword { .. })
+    }
+
+    pub fn label(&self) -> String {
+        match self {
+            Self::SetPassword { user, .. } => format!("password {user}"),
+            Self::CreateUser(request) => format!("create {}", request.user_id),
+            Self::Log(event) => format!("log {}", event.kind),
+        }
+    }
+}
+
+impl std::fmt::Debug for HostRow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.label())
+    }
+}
+
+/// The prepared OPAQUE record and the rows that carry it; the password goes beside it.
+pub struct PasswordCommit {
+    pub user: UserId,
+    pub record: Vec<u8>,
+    pub disabled: bool,
+    pub rows: Vec<HostRow>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Committed {
+    Done,
+    /// The commit was answered Failed, and the stored record is the one this change prepared.
+    AnswerLost,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommitError {
+    Busy,
+    Refused(String),
+    UserGone,
+    Failed(String),
+    Unknown(String),
+}
 
 // Stands in when no realm is registered: idempotent cleanups succeed, operations that
 // need the realm fail, so a missing registration stays visible.
@@ -306,6 +381,18 @@ impl std::error::Error for KerberosStoreError {}
 pub trait KerberosStore: Send + Sync {
     fn load(&self) -> Result<LoadedRealm, KerberosStoreError>;
     fn commit(&self, batch: RealmBatch) -> Result<(), KerberosStoreError>;
+    /// `host` first, then the batch, in one transaction.
+    fn commit_with(&self, host: Vec<HostRow>, batch: RealmBatch) -> Result<(), KerberosStoreError> {
+        if host.is_empty() {
+            self.commit(batch)
+        } else {
+            Err(KerberosStoreError::Refused(NO_HOST_ROWS.to_owned()))
+        }
+    }
+    /// The user's stored OPAQUE record; `None` for no user or no record.
+    fn password_record(&self, _user: &UserId) -> Result<Option<Vec<u8>>, KerberosStoreError> {
+        Err(KerberosStoreError::NotReady(NO_HOST_ROWS.to_owned()))
+    }
 }
 
 const STORE_NOT_REGISTERED: &str = "Kerberos store not registered";
@@ -438,6 +525,61 @@ mod tests {
         assert_eq!(mock.committed.lock().unwrap().clone().unwrap(), batch);
         drop(restore);
         assert!(kerberos_store().load().is_err());
+    }
+
+    #[test]
+    fn test_host_rows_print_their_label_and_no_record() {
+        use crate::logging::{LogKind, event};
+        let now = chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc();
+        let bob = UserId::new("bob");
+        let rows: [(HostRow, &str, bool); 3] = [
+            (
+                HostRow::SetPassword {
+                    user: bob.clone(),
+                    record: vec![0xAB; 8],
+                    now,
+                },
+                "password bob",
+                true,
+            ),
+            (
+                HostRow::CreateUser(CreateUserRequest {
+                    user_id: bob,
+                    ..Default::default()
+                }),
+                "create bob",
+                false,
+            ),
+            (
+                HostRow::Log(event(LogKind::PasswordChange, Some("bob"), true, None)),
+                "log password_change",
+                false,
+            ),
+        ];
+        for (row, label, password) in rows {
+            assert_eq!(
+                (format!("{row:?}"), row.is_password()),
+                (label.to_owned(), password)
+            );
+        }
+        let refused = MockStore {
+            loaded: LoadedRealm {
+                principals: vec![],
+                policies: vec![],
+                realm: None,
+            },
+            committed: Mutex::new(None),
+        }
+        .commit_with(
+            vec![HostRow::Log(event(
+                LogKind::PasswordChange,
+                None,
+                true,
+                None,
+            ))],
+            sample_batch(),
+        );
+        assert!(matches!(refused, Err(KerberosStoreError::Refused(_))));
     }
 
     #[test]

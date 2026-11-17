@@ -11,6 +11,10 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# Aborts a password change at a named step (LLDAP_TEST_KILL_POINT); for kill tests only.
+kill-points = ["lldap_domain_handlers/kill-points"]
+
 [dependencies]
 actix = "0.13"
 actix-files = "0.7"

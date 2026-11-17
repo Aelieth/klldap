@@ -9,6 +9,10 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# A test hook that aborts a password change at a named step; never in a release build.
+kill-points = []
+
 [dependencies]
 async-trait = { workspace = true }
 base64 = { workspace = true }

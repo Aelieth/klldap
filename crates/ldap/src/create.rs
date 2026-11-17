@@ -8,6 +8,7 @@ use crate::{
         get_user_or_group_id_from_distinguished_name, parse_distinguished_name,
     },
     handler::make_add_response,
+    password::password_change_error,
 };
 use ldap3_proto::proto::{
     LdapAddRequest, LdapAttribute, LdapOp, LdapPartialAttribute, LdapResultCode,
@@ -17,7 +18,9 @@ use lldap_domain::{
     requests::{CreateGroupRequest, CreateUserRequest},
     types::{Attribute, AttributeType, Email, GroupName, UserId},
 };
-use lldap_domain_handlers::kerberos::kerberos_backend;
+use lldap_domain_handlers::password::{
+    PasswordSync, change_password_everywhere, create_synced_user,
+};
 use lldap_schema::{AttributeList, KERBEROS_SYNC, PublicSchema};
 use std::collections::HashMap;
 use tracing::{instrument, warn};
@@ -217,13 +220,34 @@ async fn create_user(
         } else {
             None
         };
+    let request = CreateUserRequest {
+        user_id: user_id.clone(),
+        email: Email::from(text("mail")?.or(text("email")?).unwrap_or_default()),
+        display_name: text("cn")?,
+        attributes: new_user_attributes,
+    };
+    if let Some(plain) = plain_password
+        && kerberossync_enabled
+    {
+        if backend_handler.get_user_details(&user_id).await.is_ok() {
+            return Err(LdapError {
+                code: LdapResultCode::OperationsError,
+                message: format!("Could not create user: {user_id} already exists"),
+            });
+        }
+        create_synced_user(backend_handler, request, plain)
+            .await
+            .map_err(|e| {
+                warn!("LDAP Add of {user_id} failed: {e}");
+                password_change_error(e)
+            })?;
+        return Ok(vec![make_add_response(
+            LdapResultCode::Success,
+            String::new(),
+        )]);
+    }
     backend_handler
-        .create_user(CreateUserRequest {
-            user_id: user_id.clone(),
-            email: Email::from(text("mail")?.or(text("email")?).unwrap_or_default()),
-            display_name: text("cn")?,
-            attributes: new_user_attributes,
-        })
+        .create_user(request)
         .await
         .map_err(|e| LdapError {
             code: LdapResultCode::OperationsError,
@@ -231,25 +255,12 @@ async fn create_user(
         })?;
 
     if let Some(plain) = plain_password {
-        crate::password::change_password(backend_handler, user_id.clone(), plain.as_bytes())
+        change_password_everywhere(backend_handler, &user_id, plain, PasswordSync::Off)
             .await
             .map_err(|e| LdapError {
                 code: LdapResultCode::Other,
-                message: format!("Error while setting the password: {e:#?}"),
+                message: format!("Error while setting the password: {e}"),
             })?;
-        if kerberossync_enabled {
-            match kerberos_backend().sync_principal(&user_id, plain).await {
-                Ok(()) => {
-                    if let Err(e) = backend_handler
-                        .ensure_kerberos_principal_consistency(&user_id, true)
-                        .await
-                    {
-                        warn!("Failed to record Kerberos principal name for {user_id}: {e}");
-                    }
-                }
-                Err(e) => warn!("Kerberos principal sync failed after LDAP user create: {e}"),
-            }
-        }
     }
 
     Ok(vec![make_add_response(
@@ -301,8 +312,11 @@ async fn create_group(
 mod tests {
     use super::*;
     use crate::handler::tests::setup_bound_admin_handler;
-    use crate::password::tests::expect_password_registration;
+    use crate::password::tests::{
+        expect_password_registration, expect_registration_start, install, kdc_rows,
+    };
     use lldap_domain::{deserialize, types::*};
+    use lldap_domain_model::error::DomainError;
     use lldap_test_utils::MockTestBackendHandler;
     use lldap_test_utils::recording_kerberos::{KerberosOp, RecordingGuard};
     use mockall::predicate::eq;
@@ -598,6 +612,28 @@ mod tests {
         }
     }
 
+    fn add_rows(user: &str) -> Vec<String> {
+        vec![
+            format!("create {user}"),
+            format!("password {user}"),
+            "log user_create".to_owned(),
+            "log password_change".to_owned(),
+        ]
+    }
+
+    fn synced_with_password() -> Vec<LdapPartialAttribute> {
+        vec![
+            LdapPartialAttribute {
+                atype: "kerberossync".to_owned(),
+                vals: vec![b"1".to_vec()],
+            },
+            LdapPartialAttribute {
+                atype: "userPassword".to_owned(),
+                vals: vec![b"s3cret".to_vec()],
+            },
+        ]
+    }
+
     #[tokio::test]
     #[serial]
     async fn test_create_user_kerberos_matrix() {
@@ -608,17 +644,20 @@ mod tests {
             ("kerberossync without a password", true, false),
         ];
         for (label, synced, with_password) in cases {
+            let one_transaction = synced && with_password;
             let mut mock = MockTestBackendHandler::new();
-            mock.expect_create_user().times(1).return_once(|_| Ok(()));
-            if with_password {
+            mock.expect_get_user_details()
+                .returning(|u| Err(DomainError::EntityNotFound(u.to_string())));
+            mock.expect_create_user()
+                .times(usize::from(!one_transaction))
+                .return_once(|_| Ok(()));
+            if one_transaction {
+                expect_registration_start(&mut mock, "bob");
+                mock.expect_registration_finish().times(0);
+            } else if with_password {
                 expect_password_registration(&mut mock, "bob");
             }
-            if synced && with_password {
-                mock.expect_ensure_kerberos_principal_consistency()
-                    .with(eq(UserId::new("bob")), eq(true))
-                    .times(1)
-                    .return_once(|_, _| Ok(()));
-            }
+            mock.expect_ensure_kerberos_principal_consistency().times(0);
             let mut extra = vec![];
             if synced {
                 extra.push(LdapPartialAttribute {
@@ -643,15 +682,86 @@ mod tests {
                 )]),
                 "{label}"
             );
-            let expected = if synced && with_password {
-                vec![KerberosOp::SyncPrincipal {
+            let expected = if one_transaction {
+                vec![KerberosOp::CommitPassword {
                     username: "bob".into(),
                     password: "s3cret".into(),
+                    disabled: false,
+                    rows: add_rows("bob"),
                 }]
             } else {
                 vec![]
             };
             assert_eq!(guard.recorder().take_ops(), expected, "{label}");
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_create_user_with_a_password_is_one_transaction_or_nothing() {
+        for (kdc, code, message) in kdc_rows() {
+            let (guard, _offline, reached) = install(kdc.clone());
+            let mut mock = MockTestBackendHandler::new();
+            mock.expect_get_user_details()
+                .returning(|u| Err(DomainError::EntityNotFound(u.to_string())));
+            mock.expect_create_user().times(0);
+            mock.expect_delete_user().times(0);
+            if reached {
+                expect_registration_start(&mut mock, "bob");
+            } else {
+                mock.expect_registration_start().times(0);
+            }
+            mock.expect_registration_finish().times(0);
+            let ldap_handler = setup_bound_admin_handler(mock).await;
+            let expected = match code {
+                LdapResultCode::Success => Ok(vec![make_add_response(code, message)]),
+                code => Err(LdapError { code, message }),
+            };
+            assert_eq!(
+                ldap_handler
+                    .create_user_or_group(add_user_request(synced_with_password()))
+                    .await,
+                expected,
+                "{kdc:?}"
+            );
+            let ops = guard.map(|g| g.recorder().take_ops()).unwrap_or_default();
+            let rows: Vec<_> = ops
+                .into_iter()
+                .map(|op| match op {
+                    KerberosOp::CommitPassword { rows, .. } => rows,
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+            let expected = match reached {
+                true => vec![add_rows("bob")],
+                false => vec![],
+            };
+            assert_eq!(rows, expected, "{kdc:?}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_create_synced_user_that_exists_is_refused_as_before() {
+        let guard = RecordingGuard::install();
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_get_user_details().returning(|u| {
+            Ok(User {
+                user_id: u.clone(),
+                ..Default::default()
+            })
+        });
+        mock.expect_create_user().times(0);
+        mock.expect_registration_start().times(0);
+        mock.expect_registration_finish().times(0);
+        let ldap_handler = setup_bound_admin_handler(mock).await;
+        let got = ldap_handler
+            .create_user_or_group(add_user_request(synced_with_password()))
+            .await;
+        assert!(
+            matches!(&got, Err(e) if e.code == LdapResultCode::OperationsError),
+            "{got:?}"
+        );
+        assert_eq!(guard.recorder().take_ops(), vec![]);
     }
 }

@@ -62,6 +62,17 @@ pub async fn register_password(
     username: UserId,
     password: &[u8],
 ) -> Result<()> {
+    let (_, request) = prepare_registration(handler, username, password).await?;
+    handler.registration_finish(request).await.map(|_| ())
+}
+
+/// The ceremony up to its one write, `registration_finish(request)`. The record that write
+/// stores is returned beside the request.
+pub async fn prepare_registration(
+    handler: &(impl OpaqueHandler + ?Sized),
+    username: UserId,
+    password: &[u8],
+) -> Result<(Vec<u8>, registration::ClientRegistrationFinishRequest)> {
     let mut rng = rand::rngs::OsRng;
     let registration_start = opaque::client::registration::start_registration(password, &mut rng)?;
     let start_response = handler
@@ -81,13 +92,17 @@ pub async fn register_password(
     })
     .await
     .map_err(|_| DomainError::InternalError(STRETCH_FAILED.to_string()))??;
-    handler
-        .registration_finish(registration::ClientRegistrationFinishRequest {
+    let password_file =
+        opaque::server::registration::get_password_file(registration_finish.message.clone())
+            .serialize()
+            .to_vec();
+    Ok((
+        password_file,
+        registration::ClientRegistrationFinishRequest {
             server_data: start_response.server_data,
             registration_upload: registration_finish.message,
-        })
-        .await
-        .map(|_| ())
+        },
+    ))
 }
 
 #[cfg(test)]

@@ -80,6 +80,19 @@ ACL text, read at boot.
   UTF-8 on every door. New principals require preauthentication
   (`REQUIRES_PRE_AUTH`). Turning the switch off deletes the principal; deleting
   the user deletes it too.
+- Through `setUserPassword`, LDAP Modify `userPassword`, `ldappasswd` and LDAP
+  ADD, a synced user's directory record, Kerberos keys and `password_change`
+  log row are written in one database transaction, so a stop at any point
+  leaves both old or both new. Kerberos checks the password before anything is
+  written: a refusal is LDAP 53 (unwillingToPerform) or a GraphQL error, and an
+  offline KDC is 52 (unavailable), LDAP ADD included. A change that waits more
+  than 10 s for another one is refused with 51 (busy) and writes nothing. If
+  the database's answer to the commit is lost, KLLDAP reads the stored record
+  back: the change is reported done if it landed, and as "the result is
+  unknown: try the new password" (LDAP 80) if the record cannot be read. An
+  LDAP ADD with a password creates the entry, its record and its principal
+  together, or nothing. The web pages still set the directory password and
+  sync Kerberos in two requests.
 - Users in `lldap_disabled` have their principal disabled (`DISALLOW_ALL_TIX`),
   and a password sync while disabled leaves it disabled. Leaving the group
   re-enables it.

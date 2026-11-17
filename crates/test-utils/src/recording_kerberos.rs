@@ -1,7 +1,8 @@
 use async_trait::async_trait;
 use lldap_domain::types::UserId;
 use lldap_domain_handlers::kerberos::{
-    DegradedKerberos, KerberosSync, NoopKerberos, set_kerberos_backend,
+    CommitError, Committed, DegradedKerberos, HostRow, KerberosSync, NoopKerberos, PasswordCommit,
+    set_kerberos_backend,
 };
 use std::sync::{Arc, Mutex};
 
@@ -9,30 +10,72 @@ pub const RECORDER_REALM: &str = "RECORDER.TEST";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KerberosOp {
-    SyncPrincipal { username: String, password: String },
-    DeletePrincipal { username: String },
-    SetEnabled { username: String, enabled: bool },
-    ExportKeytab { hostname: String },
+    SyncPrincipal {
+        username: String,
+        password: String,
+    },
+    CommitPassword {
+        username: String,
+        password: String,
+        disabled: bool,
+        rows: Vec<String>,
+    },
+    DeletePrincipal {
+        username: String,
+    },
+    SetEnabled {
+        username: String,
+        enabled: bool,
+    },
+    ExportKeytab {
+        hostname: String,
+    },
 }
 
 pub struct RecordingKerberos {
     ops: Mutex<Vec<KerberosOp>>,
     sync_error: Option<String>,
+    check_error: Option<String>,
+    commit: Result<Committed, CommitError>,
+}
+
+impl Default for RecordingKerberos {
+    fn default() -> Self {
+        Self {
+            ops: Mutex::new(Vec::new()),
+            sync_error: None,
+            check_error: None,
+            commit: Ok(Committed::Done),
+        }
+    }
 }
 
 impl RecordingKerberos {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            ops: Mutex::new(Vec::new()),
-            sync_error: None,
-        })
+        Arc::new(Self::default())
     }
 
     // Records each sync and refuses it with `cause`, as a KDC refusal would.
     pub fn failing(cause: &str) -> Arc<Self> {
         Arc::new(Self {
-            ops: Mutex::new(Vec::new()),
             sync_error: Some(cause.to_owned()),
+            commit: Err(CommitError::Failed(cause.to_owned())),
+            ..Self::default()
+        })
+    }
+
+    // The password check before any write refuses with `cause`, as a bound policy would.
+    pub fn refusing(cause: &str) -> Arc<Self> {
+        Arc::new(Self {
+            check_error: Some(cause.to_owned()),
+            ..Self::default()
+        })
+    }
+
+    pub fn answering(commit: Result<Committed, CommitError>) -> Arc<Self> {
+        Arc::new(Self {
+            commit,
+            ..Self::default()
         })
     }
 
@@ -55,6 +98,25 @@ impl KerberosSync for RecordingKerberos {
                 password: password.to_owned(),
             });
         self.sync_error.clone().map_or(Ok(()), Err)
+    }
+    async fn check_password(&self, _: &UserId, _: &str) -> Result<(), String> {
+        self.check_error.clone().map_or(Ok(()), Err)
+    }
+    async fn commit_password(
+        &self,
+        change: PasswordCommit,
+        password: &str,
+    ) -> Result<Committed, CommitError> {
+        self.ops
+            .lock()
+            .expect("ops")
+            .push(KerberosOp::CommitPassword {
+                username: change.user.as_str().to_owned(),
+                password: password.to_owned(),
+                disabled: change.disabled,
+                rows: change.rows.iter().map(HostRow::label).collect(),
+            });
+        self.commit.clone()
     }
     async fn delete_principal(&self, user: &UserId) -> Result<(), String> {
         self.ops
@@ -95,7 +157,18 @@ impl RecordingGuard {
     }
 
     pub fn install_failing(cause: &str) -> Self {
-        let rec = RecordingKerberos::failing(cause);
+        Self::installed(RecordingKerberos::failing(cause))
+    }
+
+    pub fn install_refusing(cause: &str) -> Self {
+        Self::installed(RecordingKerberos::refusing(cause))
+    }
+
+    pub fn install_answering(commit: Result<Committed, CommitError>) -> Self {
+        Self::installed(RecordingKerberos::answering(commit))
+    }
+
+    fn installed(rec: Arc<RecordingKerberos>) -> Self {
         set_kerberos_backend(rec.clone());
         Self { rec }
     }

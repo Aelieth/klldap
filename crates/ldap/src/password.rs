@@ -6,7 +6,6 @@ use crate::{
     dn::get_user_id_from_distinguished_name,
     handler::make_extended_response,
 };
-use anyhow::Result;
 use ldap3_proto::proto::{
     LdapBindCred, LdapBindRequest, LdapOp, LdapPasswordModifyRequest, LdapResultCode,
 };
@@ -14,7 +13,9 @@ use lldap_access_control::{AccessControlledBackendHandler, UserReadableBackendHa
 use lldap_auth::access_control::ValidationResults;
 use lldap_domain::types::{UserId, kerberos_sync_enabled};
 use lldap_domain_handlers::handler::{BackendHandler, BindRequest, LoginHandler};
-use lldap_domain_handlers::kerberos::kerberos_backend;
+use lldap_domain_handlers::password::{
+    PasswordChangeError, PasswordSync, change_password_everywhere,
+};
 use lldap_mfa::{MFA_ENROLLMENT_REQUIRED, TOTP_SEPARATOR, TotpFailure, totp_failure};
 use lldap_opaque_handler::OpaqueHandler;
 use tracing::{info, warn};
@@ -85,55 +86,61 @@ fn totp_diagnostic(message: &str) -> String {
     }
 }
 
-pub(crate) async fn change_password<B: OpaqueHandler>(
-    backend_handler: &B,
-    user: UserId,
-    password: &[u8],
-) -> Result<()> {
-    Ok(lldap_opaque_handler::register_password(backend_handler, user, password).await?)
+pub(crate) fn password_change_error(e: PasswordChangeError) -> LdapError {
+    let code = match &e {
+        PasswordChangeError::Refused(_) => LdapResultCode::UnwillingToPerform,
+        PasswordChangeError::InProgress => LdapResultCode::Busy,
+        PasswordChangeError::Unavailable(_) => LdapResultCode::Unavailable,
+        PasswordChangeError::NoSuchUser => LdapResultCode::NoSuchObject,
+        PasswordChangeError::Failed(_) | PasswordChangeError::Unknown => LdapResultCode::Other,
+    };
+    LdapError {
+        code,
+        message: e.to_string(),
+    }
 }
 
-/// Pushes the new password to the KDC when the user has kerberossync on.
-/// `Some` is the flag to record; `None` means the Kerberos half failed and the
-/// caller must not record it. A first password for an already-disabled user would
-/// otherwise mint a live principal, so the disabled state is reasserted.
-pub(crate) async fn sync_kerberos_after_password_change(
-    handler: &impl UserReadableBackendHandler,
+/// Changes the directory password and, with kerberossync on, the KDC's in the same
+/// transaction; a disabled user's first principal is made disabled.
+pub(crate) async fn change_password<Handler: BackendHandler + OpaqueHandler>(
+    backend_handler: &AccessControlledBackendHandler<Handler>,
+    readable_handler: &impl UserReadableBackendHandler,
+    opaque_handler: &impl OpaqueHandler,
     user_id: &UserId,
     password: &str,
-) -> Option<bool> {
-    let user = match handler.get_user_details(user_id).await {
-        Ok(user) => user,
-        Err(e) => {
-            warn!("Failed to fetch user for Kerberos sync check: {e}");
-            return Some(false);
-        }
-    };
+) -> LdapResult<()> {
+    let user = readable_handler
+        .get_user_details(user_id)
+        .await
+        .map_err(|e| LdapError {
+            code: LdapResultCode::Other,
+            message: format!("Failed to fetch user for Kerberos sync check: {e}"),
+        })?;
     let sync_enabled = kerberos_sync_enabled(&user.attributes);
-    let record = match kerberos_backend()
-        .sync_if_enabled(sync_enabled, user_id, password)
+    let disabled = sync_enabled
+        && readable_handler
+            .get_user_groups(user_id)
+            .await
+            .map_err(|e| LdapError {
+                code: LdapResultCode::OperationsError,
+                message: format!("Internal error while requesting user's groups: {e:#?}"),
+            })?
+            .iter()
+            .any(|g| g.display_name == "lldap_disabled".into());
+    let sync = PasswordSync::of(sync_enabled, disabled);
+    if let Err(e) = change_password_everywhere(opaque_handler, user_id, password, sync).await {
+        warn!("LDAP password change for {user_id} failed: {e}");
+        return Err(password_change_error(e));
+    }
+    if sync_enabled {
+        info!("Kerberos principal synced for user {user_id} (LDAP password change)");
+    } else if let Err(e) = backend_handler
+        .ensure_kerberos_principal_consistency(user_id, false)
         .await
     {
-        Err(e) => {
-            warn!("Kerberos sync failed after LDAP password change: {e}");
-            None
-        }
-        Ok(()) => {
-            if sync_enabled {
-                info!("Kerberos principal synced for user {user_id} (LDAP password change)");
-            }
-            Some(sync_enabled)
-        }
-    };
-    if sync_enabled
-        && let Ok(groups) = handler.get_user_groups(user_id).await
-        && groups
-            .iter()
-            .any(|g| g.display_name == "lldap_disabled".into())
-    {
-        kerberos_backend().reassert_disabled(user_id).await;
+        warn!("Failed to clear the Kerberos principal name for {user_id}: {e}");
     }
-    record
+    Ok(())
 }
 
 pub(crate) async fn do_password_modification<Handler: BackendHandler + OpaqueHandler>(
@@ -179,25 +186,12 @@ pub(crate) async fn do_password_modification<Handler: BackendHandler + OpaqueHan
                                 credentials.user, uid
                             ),
                         })
-                    } else if let Err(e) =
-                        change_password(opaque_handler, uid.clone(), password.as_bytes()).await
-                    {
-                        Err(LdapError {
-                            code: LdapResultCode::Other,
-                            message: format!("Error while changing the password: {e:#?}"),
-                        })
                     } else {
                         let readable = backend_handler
                             .get_readable_handler(credentials, uid.clone())
                             .expect("Unexpected permission error");
-                        if let Some(sync_enabled) =
-                            sync_kerberos_after_password_change(readable, &uid, password).await
-                            && let Err(e) = backend_handler
-                                .ensure_kerberos_principal_consistency(&uid, sync_enabled)
-                                .await
-                        {
-                            warn!("Failed to record Kerberos principal name for {uid}: {e}");
-                        }
+                        change_password(backend_handler, readable, opaque_handler, &uid, password)
+                            .await?;
                         Ok(vec![make_extended_response(
                             LdapResultCode::Success,
                             "".to_string(),
@@ -229,6 +223,11 @@ pub mod tests {
     use chrono::TimeZone;
     use ldap3_proto::proto::{LdapBindCred, LdapBindResponse, LdapOp, LdapResult as LdapResultOp};
     use lldap_domain::types::{GroupDetails, GroupId, UserId, Uuid};
+    use lldap_domain_handlers::kerberos::{CommitError, Committed};
+    use lldap_domain_handlers::password::{PASSWORD_CHANGE_IN_PROGRESS, RESULT_UNKNOWN};
+    use lldap_test_utils::recording_kerberos::{
+        DEGRADED_CAUSE, DegradedGuard, KerberosOp, RecordingGuard,
+    };
     use lldap_test_utils::{MockTestBackendHandler, setup_default_ldap_mock};
     use mockall::predicate::eq;
     use pretty_assertions::assert_eq;
@@ -392,6 +391,14 @@ pub mod tests {
     }
 
     pub fn expect_password_registration(mock: &mut MockTestBackendHandler, user: &str) {
+        expect_registration_start(mock, user);
+        mock.expect_registration_finish()
+            .times(1)
+            .return_once(|_| Ok(UserId::new("bob")));
+    }
+
+    /// A synced change derives its record with the server's start, then writes it elsewhere.
+    pub fn expect_registration_start(mock: &mut MockTestBackendHandler, user: &str) {
         use lldap_auth::{opaque, registration};
         let mut rng = rand::rngs::OsRng;
         let registration_start_request =
@@ -413,9 +420,6 @@ pub mod tests {
                 registration_response: start_response.message,
             })
         });
-        mock.expect_registration_finish()
-            .times(1)
-            .return_once(|_| Ok(UserId::new("bob")));
     }
 
     pub fn expect_password_change(mock: &mut MockTestBackendHandler, user: &str) {
@@ -486,12 +490,48 @@ pub mod tests {
         }
     }
 
+    pub fn synced_user(uid: &UserId) -> lldap_domain::types::User {
+        lldap_domain::types::User {
+            user_id: uid.clone(),
+            email: format!("{}@example.com", uid.as_str()).into(),
+            display_name: None,
+            creation_date: chrono::Utc::now().naive_utc(),
+            modified_date: chrono::Utc::now().naive_utc(),
+            password_modified_date: chrono::Utc::now().naive_utc(),
+            uuid: Uuid::from_name_and_date(uid.as_str(), &chrono::Utc::now().naive_utc()),
+            attributes: vec![lldap_domain::types::Attribute {
+                name: "kerberossync".into(),
+                value: 1i64.into(),
+            }],
+            krb_principal_name: None,
+            mfa_type: None,
+        }
+    }
+
+    pub fn committed(user: &str, password: &str, disabled: bool) -> KerberosOp {
+        KerberosOp::CommitPassword {
+            username: user.into(),
+            password: password.into(),
+            disabled,
+            rows: vec![format!("password {user}"), "log password_change".into()],
+        }
+    }
+
+    fn password_modify_request(user: &str) -> LdapOp {
+        LdapOp::ExtendedRequest(
+            LdapPasswordModifyRequest {
+                user_identity: Some(format!("uid={user},ou=people,dc=example,dc=com")),
+                old_password: None,
+                new_password: Some("newpassword".to_string()),
+            }
+            .into(),
+        )
+    }
+
     #[tokio::test]
     #[serial]
-    async fn test_password_modify_keeps_success_when_kerberos_sync_fails() {
-        use lldap_domain::types::{Attribute, User};
-        use lldap_test_utils::recording_kerberos::{KerberosOp, RecordingGuard};
-
+    async fn test_password_modify_reports_a_failed_change_with_the_directory_state() {
+        const CAUSE: &str = "the database did not answer";
         let disabled = HashSet::from([GroupDetails {
             group_id: GroupId(2),
             display_name: "lldap_disabled".into(),
@@ -500,62 +540,155 @@ pub mod tests {
             uuid: Uuid::from_name_and_date("lldap_disabled", &chrono::Utc::now().naive_utc()),
             attributes: vec![],
         }]);
-        let sync = KerberosOp::SyncPrincipal {
-            username: "bob".into(),
-            password: "newpassword".into(),
-        };
-        let disable = KerberosOp::SetEnabled {
-            username: "bob".into(),
-            enabled: false,
-        };
         let rows = [
-            ("in no group", HashSet::new(), vec![sync.clone()]),
-            ("in lldap_disabled", disabled, vec![sync, disable]),
+            ("in no group", HashSet::new(), false),
+            ("in lldap_disabled", disabled, true),
         ];
-        for (label, groups, expected_ops) in rows {
-            let guard = RecordingGuard::install_failing("password policy: min_length 40");
+        for (label, groups, in_disabled) in rows {
+            let guard = RecordingGuard::install_failing(CAUSE);
             let mut mock = MockTestBackendHandler::new();
-            mock.expect_get_user_details().returning(|uid| {
-                Ok(User {
-                    user_id: uid.clone(),
-                    email: format!("{}@example.com", uid.as_str()).into(),
-                    display_name: None,
-                    creation_date: chrono::Utc::now().naive_utc(),
-                    modified_date: chrono::Utc::now().naive_utc(),
-                    password_modified_date: chrono::Utc::now().naive_utc(),
-                    uuid: Uuid::from_name_and_date(uid.as_str(), &chrono::Utc::now().naive_utc()),
-                    attributes: vec![Attribute {
-                        name: "kerberossync".into(),
-                        value: 1i64.into(),
-                    }],
-                    krb_principal_name: None,
-                    mfa_type: None,
-                })
-            });
+            mock.expect_get_user_details()
+                .returning(|uid| Ok(synced_user(uid)));
             mock.expect_get_user_groups()
                 .returning(move |_| Ok(groups.clone()));
             setup_default_ldap_mock(&mut mock);
-            expect_password_registration(&mut mock, "bob");
+            expect_registration_start(&mut mock, "bob");
+            mock.expect_registration_finish().times(0);
             mock.expect_ensure_kerberos_principal_consistency().times(0);
             let mut ldap_handler = setup_bound_admin_handler(mock).await;
-            let request = LdapOp::ExtendedRequest(
-                LdapPasswordModifyRequest {
-                    user_identity: Some("uid=bob,ou=people,dc=example,dc=com".to_string()),
-                    old_password: None,
-                    new_password: Some("newpassword".to_string()),
-                }
-                .into(),
-            );
             assert_eq!(
-                ldap_handler.handle_ldap_message(request).await,
+                ldap_handler
+                    .handle_ldap_message(password_modify_request("bob"))
+                    .await,
                 Some(vec![make_extended_response(
-                    LdapResultCode::Success,
-                    "".to_string(),
+                    LdapResultCode::Other,
+                    format!("password change failed: {CAUSE}"),
                 )]),
                 "{label}"
             );
-            assert_eq!(guard.recorder().take_ops(), expected_ops, "{label}");
+            assert_eq!(
+                guard.recorder().take_ops(),
+                vec![committed("bob", "newpassword", in_disabled)],
+                "{label}"
+            );
         }
+    }
+
+    #[derive(Clone, Debug)]
+    pub(crate) enum Kdc {
+        Refusing,
+        Offline,
+        Answering(Result<Committed, CommitError>),
+    }
+
+    pub(crate) const REFUSAL: &str = "password policy: min_length 40";
+
+    pub(crate) fn kdc_rows() -> Vec<(Kdc, LdapResultCode, String)> {
+        let failed = |e| Kdc::Answering(Err(e));
+        vec![
+            (
+                Kdc::Refusing,
+                LdapResultCode::UnwillingToPerform,
+                format!("refused by Kerberos: {REFUSAL}"),
+            ),
+            (
+                Kdc::Offline,
+                LdapResultCode::Unavailable,
+                format!("Kerberos KDC unavailable: {DEGRADED_CAUSE}"),
+            ),
+            (
+                failed(CommitError::Busy),
+                LdapResultCode::Busy,
+                PASSWORD_CHANGE_IN_PROGRESS.to_owned(),
+            ),
+            (
+                failed(CommitError::Failed("late".to_owned())),
+                LdapResultCode::Other,
+                "password change failed: late".to_owned(),
+            ),
+            (
+                failed(CommitError::UserGone),
+                LdapResultCode::NoSuchObject,
+                "password change failed: no such user".to_owned(),
+            ),
+            (
+                failed(CommitError::Unknown("late".to_owned())),
+                LdapResultCode::Other,
+                RESULT_UNKNOWN.to_owned(),
+            ),
+            (
+                Kdc::Answering(Ok(Committed::AnswerLost)),
+                LdapResultCode::Success,
+                String::new(),
+            ),
+            (
+                Kdc::Answering(Ok(Committed::Done)),
+                LdapResultCode::Success,
+                String::new(),
+            ),
+        ]
+    }
+
+    // Each KDC answer, the guard that plays it, and whether the change reached the commit.
+    pub(crate) fn install(kdc: Kdc) -> (Option<RecordingGuard>, Option<DegradedGuard>, bool) {
+        match kdc {
+            Kdc::Refusing => (Some(RecordingGuard::install_refusing(REFUSAL)), None, false),
+            Kdc::Offline => (None, Some(DegradedGuard::install()), false),
+            Kdc::Answering(answer) => (Some(RecordingGuard::install_answering(answer)), None, true),
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_password_modify_answers_each_outcome_of_a_synced_change() {
+        for (kdc, code, message) in kdc_rows() {
+            let (guard, _offline, reached) = install(kdc.clone());
+            let mut mock = MockTestBackendHandler::new();
+            mock.expect_get_user_details()
+                .returning(|uid| Ok(synced_user(uid)));
+            setup_default_ldap_mock(&mut mock);
+            if reached {
+                expect_registration_start(&mut mock, "bob");
+            } else {
+                mock.expect_registration_start().times(0);
+            }
+            mock.expect_registration_finish().times(0);
+            mock.expect_ensure_kerberos_principal_consistency().times(0);
+            let mut ldap_handler = setup_bound_admin_handler(mock).await;
+            assert_eq!(
+                ldap_handler
+                    .handle_ldap_message(password_modify_request("bob"))
+                    .await,
+                Some(vec![make_extended_response(code, message)]),
+                "{kdc:?}"
+            );
+            let ops = guard.map(|g| g.recorder().take_ops()).unwrap_or_default();
+            let expected = match reached {
+                true => vec![committed("bob", "newpassword", false)],
+                false => vec![],
+            };
+            assert_eq!(ops, expected, "{kdc:?}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_password_modify_without_sync_is_the_directory_write_alone() {
+        let guard = RecordingGuard::install();
+        let mut mock = MockTestBackendHandler::new();
+        setup_default_ldap_mock(&mut mock);
+        expect_password_change(&mut mock, "bob");
+        let mut ldap_handler = setup_bound_admin_handler(mock).await;
+        assert_eq!(
+            ldap_handler
+                .handle_ldap_message(password_modify_request("bob"))
+                .await,
+            Some(vec![make_extended_response(
+                LdapResultCode::Success,
+                "".to_string()
+            )])
+        );
+        assert_eq!(guard.recorder().take_ops(), vec![]);
     }
 
     #[tokio::test]

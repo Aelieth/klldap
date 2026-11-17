@@ -1,13 +1,22 @@
+use crate::sql_backend_handler::SqlBackendHandler;
 use crate::sql_kerberos_handler::{
     KerberosSqlError, RealmHold, clear_open, commit_batch_with_transaction, heartbeat, load_realm,
     read_hold, take_realm,
 };
+use crate::sql_log_handler::to_active_model;
 use crate::sql_tables::DbConnection;
+use lldap_domain::types::UserId;
 use lldap_domain_handlers::kerberos::{
-    KerberosStore, KerberosStoreError, LoadedRealm, NoopKerberosStore, RealmBatch,
-    set_kerberos_store,
+    HostRow, KerberosStore, KerberosStoreError, LoadedRealm, NoopKerberosStore, RealmBatch,
+    USER_GONE, set_kerberos_store,
 };
-use sea_orm::TransactionTrait;
+use lldap_domain_handlers::password::kill_point;
+use lldap_domain_model::model::{self, UserColumn};
+use sea_orm::sea_query::Expr;
+use sea_orm::{
+    ColumnTrait, DatabaseTransaction, DbErr, EntityTrait, QueryFilter, QuerySelect,
+    TransactionTrait,
+};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -50,7 +59,15 @@ impl std::fmt::Display for KerberosLost {
 
 enum Job {
     Load(oneshot::Sender<Result<LoadedRealm, KerberosStoreError>>),
-    Commit(RealmBatch, oneshot::Sender<Result<(), KerberosStoreError>>),
+    Commit(
+        Vec<HostRow>,
+        RealmBatch,
+        oneshot::Sender<Result<(), KerberosStoreError>>,
+    ),
+    Record(
+        UserId,
+        oneshot::Sender<Result<Option<Vec<u8>>, KerberosStoreError>>,
+    ),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -68,9 +85,21 @@ impl KerberosStore for CommitterStore {
     }
 
     fn commit(&self, batch: RealmBatch) -> Result<(), KerberosStoreError> {
+        self.commit_with(Vec::new(), batch)
+    }
+
+    fn commit_with(&self, host: Vec<HostRow>, batch: RealmBatch) -> Result<(), KerberosStoreError> {
         let (tx, rx) = oneshot::channel();
         self.tx
-            .blocking_send(Job::Commit(batch, tx))
+            .blocking_send(Job::Commit(host, batch, tx))
+            .map_err(|_| stopped())?;
+        rx.blocking_recv().map_err(|_| stopped())?
+    }
+
+    fn password_record(&self, user: &UserId) -> Result<Option<Vec<u8>>, KerberosStoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .blocking_send(Job::Record(user.clone(), tx))
             .map_err(|_| stopped())?;
         rx.blocking_recv().map_err(|_| stopped())?
     }
@@ -212,9 +241,12 @@ async fn run(
             Incoming::Job(Job::Load(reply)) => {
                 answer_load(&pool, &phase, reply, &mut waiting, &lost_tx, timings.step).await;
             }
-            Incoming::Job(Job::Commit(batch, reply)) => {
-                phase = commit_job(&pool, phase, batch, reply, &lost_tx, &timings).await;
+            Incoming::Job(Job::Commit(host, batch, reply)) => {
+                phase = commit_job(&pool, phase, &host, batch, reply, &lost_tx, &timings).await;
                 release_loads(&pool, &phase, &mut waiting, &lost_tx, timings.step).await;
+            }
+            Incoming::Job(Job::Record(user, reply)) => {
+                let _ = reply.send(read_record(&pool, &user, timings.step).await);
             }
             Incoming::Job(Job::Shutdown(reply)) => {
                 clear_held(&pool, &phase, timings.step).await;
@@ -371,22 +403,43 @@ async fn beat(pool: &DbConnection, generation: i64, step: Duration) -> Result<i6
 enum WriteError {
     Unreachable(String),
     Batch(KerberosSqlError),
+    Host(KerberosStoreError),
+}
+
+// The kill points mark a password change's steps only; other changes pass them by.
+fn point(password: bool, name: &str) {
+    if password {
+        kill_point(name);
+    }
+}
+
+fn changes_a_password(host: &[HostRow]) -> bool {
+    host.iter().any(HostRow::is_password)
 }
 
 async fn write_batch(
     pool: &DbConnection,
+    host: &[HostRow],
     batch: &RealmBatch,
     generation: i64,
 ) -> Result<(), WriteError> {
+    let password = changes_a_password(host);
     let txn = pool
         .begin()
         .await
         .map_err(|err| WriteError::Unreachable(err.to_string()))?;
+    if let Err(err) = write_host_rows(&txn, host).await {
+        let _ = txn.rollback().await;
+        return Err(WriteError::Host(err));
+    }
+    point(password, "directory-written");
     match commit_batch_with_transaction(&txn, batch, generation).await {
-        Ok(()) => txn
-            .commit()
-            .await
-            .map_err(|err| WriteError::Unreachable(err.to_string())),
+        Ok(()) => {
+            point(password, "batch-written");
+            txn.commit()
+                .await
+                .map_err(|err| WriteError::Unreachable(err.to_string()))
+        }
         Err(err) => {
             let _ = txn.rollback().await;
             Err(WriteError::Batch(err))
@@ -394,14 +447,87 @@ async fn write_batch(
     }
 }
 
+async fn write_host_rows(
+    txn: &DatabaseTransaction,
+    host: &[HostRow],
+) -> Result<(), KerberosStoreError> {
+    for row in host {
+        match row {
+            HostRow::SetPassword { user, record, now } => {
+                set_password_in(txn, user, record, *now).await?;
+            }
+            HostRow::CreateUser(request) => {
+                SqlBackendHandler::create_user_in(txn, request.clone())
+                    .await
+                    .map_err(|e| {
+                        KerberosStoreError::Refused(format!("while creating the user: {e}"))
+                    })?;
+            }
+            HostRow::Log(event) => {
+                model::Logs::insert(to_active_model(event.clone()))
+                    .exec_without_returning(txn)
+                    .await
+                    .map_err(row_failed)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn set_password_in(
+    txn: &DatabaseTransaction,
+    user: &UserId,
+    record: &[u8],
+    now: chrono::NaiveDateTime,
+) -> Result<(), KerberosStoreError> {
+    let updated = model::User::update_many()
+        .col_expr(UserColumn::PasswordHash, Expr::value(record.to_vec()))
+        .col_expr(UserColumn::PasswordModifiedDate, Expr::value(now))
+        .col_expr(UserColumn::ModifiedDate, Expr::value(now))
+        .filter(ColumnTrait::eq(&UserColumn::UserId, user.clone()))
+        .exec(txn)
+        .await
+        .map_err(row_failed)?;
+    if updated.rows_affected == 1 {
+        Ok(())
+    } else {
+        Err(KerberosStoreError::Refused(USER_GONE.to_owned()))
+    }
+}
+
+fn row_failed(err: DbErr) -> KerberosStoreError {
+    KerberosStoreError::Refused(format!("while writing a directory row: {err}"))
+}
+
+async fn read_record(
+    pool: &DbConnection,
+    user: &UserId,
+    step: Duration,
+) -> Result<Option<Vec<u8>>, KerberosStoreError> {
+    within(step, || KerberosStoreError::Failed(late(step)), async {
+        model::User::find_by_id(user.clone())
+            .select_only()
+            .column(UserColumn::PasswordHash)
+            .into_tuple::<(Option<Vec<u8>>,)>()
+            .one(pool)
+            .await
+            .map(|row| row.and_then(|(record,)| record))
+            .map_err(|err| KerberosStoreError::Failed(err.to_string()))
+    })
+    .await
+}
+
 async fn commit_job(
     pool: &DbConnection,
     phase: Phase,
+    host: &[HostRow],
     batch: RealmBatch,
     reply: oneshot::Sender<Result<(), KerberosStoreError>>,
     lost_tx: &watch::Sender<Option<KerberosLost>>,
     timings: &Timings,
 ) -> Phase {
+    let password = changes_a_password(host);
+    point(password, "callback-entered");
     let Phase::Held(held) = phase else {
         let _ = reply.send(Err(not_held()));
         return phase;
@@ -410,13 +536,18 @@ async fn commit_job(
     let written = within(
         step,
         || WriteError::Unreachable(late(step)),
-        write_batch(pool, &batch, held.generation),
+        write_batch(pool, host, &batch, held.generation),
     )
     .await;
     match written {
         Ok(()) => {
+            point(password, "committed");
             let _ = reply.send(Ok(()));
             Phase::Held(fresh(held.generation + 1, true, timings))
+        }
+        Err(WriteError::Host(err)) => {
+            let _ = reply.send(Err(err));
+            Phase::Held(held)
         }
         Err(WriteError::Unreachable(reason)) => {
             let _ = reply.send(Err(KerberosStoreError::Failed(reason)));
@@ -1224,7 +1355,7 @@ mod tests {
         let (reply, answer) = oneshot::channel();
         let started = Instant::now();
         let held = Phase::Held(fresh(5, true, &timings));
-        let phase = commit_job(&pool, held, batch(), reply, &lost_tx, &timings).await;
+        let phase = commit_job(&pool, held, &[], batch(), reply, &lost_tx, &timings).await;
         let took = started.elapsed();
         let err = answer.await.unwrap().unwrap_err().to_string();
         assert!(
@@ -1239,7 +1370,7 @@ mod tests {
         assert_eq!(*lost.borrow(), None);
         tokio::time::sleep(timings.lost_after).await;
         let (reply, _answer) = oneshot::channel();
-        let phase = commit_job(&pool, phase, batch(), reply, &lost_tx, &timings).await;
+        let phase = commit_job(&pool, phase, &[], batch(), reply, &lost_tx, &timings).await;
         assert!(matches!(phase, Phase::Lost));
         assert_eq!(*lost.borrow(), Some(KerberosLost::DatabaseUnreachable));
     }
@@ -1351,6 +1482,229 @@ mod tests {
                 let take = take_owned(&db.other, 5, timings.step).await;
                 assert!(matches!(take, Err(Step::Replaced)), "{row}");
                 assert_eq!(hold(&db.other).await.0, 6, "{row}");
+            }
+        }
+    }
+
+    // X1: the directory's rows ride the batch's transaction; nothing is half written.
+    fn password_rows(user: &str, record: &[u8]) -> Vec<HostRow> {
+        use lldap_domain_handlers::logging::{LogKind, event};
+        vec![
+            HostRow::SetPassword {
+                user: UserId::new(user),
+                record: record.to_vec(),
+                now: chrono::Utc::now().naive_utc(),
+            },
+            HostRow::Log(event(LogKind::PasswordChange, Some(user), true, None)),
+        ]
+    }
+
+    fn create_rows(user: &str, record: &[u8]) -> Vec<HostRow> {
+        use lldap_domain::requests::CreateUserRequest;
+        use lldap_domain_handlers::logging::{LogKind, event};
+        let mut rows = vec![HostRow::CreateUser(CreateUserRequest {
+            user_id: UserId::new(user),
+            email: format!("{user}@ex.com").into(),
+            ..Default::default()
+        })];
+        rows.extend(password_rows(user, record));
+        rows.push(HostRow::Log(event(
+            LogKind::UserCreate,
+            Some(user),
+            true,
+            None,
+        )));
+        rows
+    }
+
+    const RECORD: &[u8] = b"opaque-record";
+
+    #[derive(Debug, PartialEq)]
+    struct After {
+        alice_record: bool,
+        carol: bool,
+        logs: u64,
+        principals: usize,
+        generation: i64,
+    }
+
+    async fn after(db: &Db) -> After {
+        use sea_orm::PaginatorTrait;
+        let step = Duration::from_secs(1);
+        let (realm, generation) = load_realm(&db.other).await.unwrap();
+        After {
+            alice_record: read_record(&db.other, &UserId::new("alice"), step)
+                .await
+                .unwrap()
+                .is_some_and(|record| record == RECORD),
+            carol: model::User::find_by_id(UserId::new("carol"))
+                .one(&db.other)
+                .await
+                .unwrap()
+                .is_some(),
+            logs: model::Logs::find().count(&db.other).await.unwrap(),
+            principals: realm.principals.len(),
+            generation,
+        }
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum Before {
+        Nothing,
+        GenerationMoved,
+        ConnectionHeld,
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_host_rows_and_the_batch_commit_in_one_transaction() {
+        let nothing = |generation| After {
+            alice_record: false,
+            carol: false,
+            logs: 0,
+            principals: 0,
+            generation,
+        };
+        type Row = (
+            &'static str,
+            Vec<HostRow>,
+            Before,
+            Result<(), &'static str>,
+            After,
+        );
+        let rows: Vec<Row> = vec![
+            (
+                "a password and its row",
+                password_rows("alice", RECORD),
+                Before::Nothing,
+                Ok(()),
+                After {
+                    alice_record: true,
+                    logs: 1,
+                    principals: 1,
+                    generation: 6,
+                    ..nothing(6)
+                },
+            ),
+            (
+                "the user is gone",
+                password_rows("nobody", RECORD),
+                Before::Nothing,
+                Err(USER_GONE),
+                nothing(5),
+            ),
+            (
+                "an Add: the user, its record and its rows",
+                create_rows("carol", RECORD),
+                Before::Nothing,
+                Ok(()),
+                After {
+                    carol: true,
+                    logs: 2,
+                    principals: 1,
+                    ..nothing(6)
+                },
+            ),
+            (
+                "an Add of an existing user",
+                create_rows("alice", RECORD),
+                Before::Nothing,
+                Err("while creating the user"),
+                nothing(5),
+            ),
+            (
+                "the generation moved",
+                password_rows("alice", RECORD),
+                Before::GenerationMoved,
+                Err("the realm's generation moved"),
+                nothing(7),
+            ),
+            (
+                "the step ran out",
+                password_rows("alice", RECORD),
+                Before::ConnectionHeld,
+                Err("did not answer within 100ms"),
+                nothing(5),
+            ),
+        ];
+        for (label, host, before, answer, expected) in rows {
+            let db = db().await;
+            insert_alice(&db.pool).await;
+            insert_realm(&db.pool, 5, true).await;
+            let timings = short_timings();
+            let (lost_tx, _lost) = watch::channel(None);
+            let (reply, answered) = oneshot::channel();
+            let held = Phase::Held(fresh(5, true, &timings));
+            if before == Before::GenerationMoved {
+                let txn = db.other.begin().await.unwrap();
+                heartbeat(&txn, 5).await.unwrap();
+                heartbeat(&txn, 6).await.unwrap();
+                txn.commit().await.unwrap();
+            }
+            let holding = match before {
+                Before::ConnectionHeld => Some(db.pool.begin().await.unwrap()),
+                _ => None,
+            };
+            commit_job(&db.pool, held, &host, batch(), reply, &lost_tx, &timings).await;
+            if let Some(txn) = holding {
+                txn.rollback().await.unwrap();
+            }
+            let got = answered.await.unwrap().map_err(|e| e.to_string());
+            match (&got, answer) {
+                (Ok(()), Ok(())) => {}
+                (Err(e), Err(part)) => assert!(e.contains(part), "{label}: {e}"),
+                _ => panic!("{label}: {got:?}"),
+            }
+            assert_eq!(after(&db).await, expected, "{label}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_the_stored_record_is_read_within_one_step() {
+        let db = db().await;
+        insert_alice(&db.pool).await;
+        let txn = db.pool.begin().await.unwrap();
+        set_password_in(&txn, &UserId::new("alice"), b"stored", Default::default())
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        let step = Duration::from_millis(100);
+        type Row = (
+            &'static str,
+            &'static str,
+            bool,
+            Result<Option<Vec<u8>>, &'static str>,
+        );
+        let rows: [Row; 3] = [
+            (
+                "a stored record",
+                "alice",
+                false,
+                Ok(Some(b"stored".to_vec())),
+            ),
+            ("no such user", "nobody", false, Ok(None)),
+            (
+                "the connection is held",
+                "alice",
+                true,
+                Err("did not answer within 100ms"),
+            ),
+        ];
+        for (label, user, held, expected) in rows {
+            let holding = if held {
+                Some(db.pool.begin().await.unwrap())
+            } else {
+                None
+            };
+            let got = read_record(&db.pool, &UserId::new(user), step).await;
+            if let Some(txn) = holding {
+                txn.rollback().await.unwrap();
+            }
+            match (got, expected) {
+                (Ok(record), Ok(want)) => assert!(record == want, "{label}"),
+                (Err(e), Err(part)) => assert!(e.to_string().contains(part), "{label}: {e}"),
+                (got, _) => panic!("{label}: {:?}", got.map(|r| r.map(|r| r.len()))),
             }
         }
     }

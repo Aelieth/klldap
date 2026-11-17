@@ -1,6 +1,6 @@
 use crate::boot::{self, OpenRealm, RealmSettings};
 use crate::rotate;
-use crate::seam::{Host, SqlRealm, committing};
+use crate::seam::{Host, SqlRealm, committing, committing_with};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use krb5_admin::{
@@ -8,19 +8,22 @@ use krb5_admin::{
 };
 use krb5_config::KadmindListen;
 use krb5_crypto::KeySalt;
+use krb5_kdc::host::{HostChange, KerberosStoreError};
 use krb5_kdc::{
-    AdminEnt, AdminFields, CreateKeys, CreatePlan, Error as StoreError, KDB_REQUIRES_PRE_AUTH,
-    KdcLog, ListenLimits, PrincipalRead, PrincipalStore, SharedDump, SharedStore, Shutdown,
-    kadm5_mask, lookup_principal_id,
+    AdminEnt, AdminFields, CreateKeys, CreatePlan, Error as StoreError, KDB_DISALLOW_ALL_TIX,
+    KDB_REQUIRES_PRE_AUTH, KdcLog, ListenLimits, PrincipalRead, PrincipalStore, SharedDump,
+    SharedStore, Shutdown, kadm5_mask, lookup_principal_id,
 };
 use krb5_types::PrincipalName;
 use lldap_domain::types::UserId;
 use lldap_domain_handlers::kerberos::{
-    KerberosSync, validate_kerberos_username, validate_keytab_hostname,
+    CommitError, Committed, KerberosSync, PasswordCommit, USER_GONE as NO_USER_ROW,
+    validate_kerberos_username, validate_keytab_hostname,
 };
 use lldap_domain_handlers::logging::{
     LogKind, current_request, record, record_outcome, with_request_sync,
 };
+use lldap_domain_handlers::password::kill_point;
 use std::collections::HashMap;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
@@ -33,6 +36,7 @@ use tracing::{Span, error, info};
 use zeroize::Zeroizing;
 
 const KADMIND_START: Duration = Duration::from_secs(10);
+const WRITE_WAIT: Duration = Duration::from_secs(10);
 const USER_GONE: &str = "user gone";
 const NO_SYNC: &str = "no sync";
 const DISABLED_AT_START: &str =
@@ -52,6 +56,7 @@ pub struct EmbeddedKerberos {
     keycloak_keytab: PathBuf,
     ready: Arc<AtomicBool>,
     writes: Arc<Mutex<()>>,
+    write_wait: Duration,
 }
 
 /// The KDC and kadmind threads. A thread that stops on its own stops the other one and
@@ -208,6 +213,7 @@ impl EmbeddedKerberos {
             keycloak_keytab: settings.keycloak_keytab.clone(),
             ready,
             writes: Arc::new(Mutex::new(())),
+            write_wait: WRITE_WAIT,
         }
     }
 
@@ -391,6 +397,25 @@ impl EmbeddedKerberos {
     }
 }
 
+impl EmbeddedKerberos {
+    /// A user whose principal name is an alias: the store is not touched, and one row says so.
+    async fn skipped_as_alias(&self, user: &UserId, op: &str) -> Result<bool, String> {
+        let (store, realm, id) = (self.store.clone(), self.realm.clone(), user.clone());
+        let alias = read_store(move || {
+            let (store, fresh) = krb5_kdc::read_fresh(&store);
+            fresh?;
+            Ok(alias_of(&store, &realm, &id))
+        })
+        .await?;
+        let Some(target) = alias else {
+            return Ok(false);
+        };
+        let detail = format!("{}: {op} skipped", aliased(user, &target));
+        record(LogKind::KerberosSync, Some(user.as_str()), Some(&detail));
+        Ok(true)
+    }
+}
+
 #[async_trait]
 impl KerberosSync for EmbeddedKerberos {
     fn ready(&self) -> bool {
@@ -410,13 +435,58 @@ impl KerberosSync for EmbeddedKerberos {
             user.as_str(),
             "sync",
             move || {
-                set_password(&own, &id, &password, &enctypes, &ent)
-                    .map_err(|e| anyhow!("while setting the Kerberos password: {e}"))
+                set_password(&own, &id, &password, &enctypes, &ent, || {
+                    committing(own.host.as_ref())
+                })
+                .map_err(|e| anyhow!("while setting the Kerberos password: {e}"))
             },
         )
         .await
     }
+    async fn check_password(&self, user: &UserId, password: &str) -> Result<(), String> {
+        validate_kerberos_username(user.as_str())?;
+        let (store, realm, id) = (self.store.clone(), self.realm.clone(), user.clone());
+        let password = Zeroizing::new(password.as_bytes().to_vec());
+        read_store(move || {
+            let (store, fresh) = krb5_kdc::read_fresh(&store);
+            fresh?;
+            not_an_alias(&store, &realm, &id)?;
+            store.check_password_quality(&user_principal(&id), &password)
+        })
+        .await
+    }
+    async fn commit_password(
+        &self,
+        change: PasswordCommit,
+        password: &str,
+    ) -> Result<Committed, CommitError> {
+        validate_kerberos_username(change.user.as_str()).map_err(CommitError::Refused)?;
+        let own = self.own();
+        let enctypes = self.enctypes.clone();
+        let mut ent = self.new_principal();
+        if change.disabled {
+            ent.attributes |= KDB_DISALLOW_ALL_TIX;
+        }
+        let password = Zeroizing::new(password.as_bytes().to_vec());
+        let serial = tokio::time::timeout(self.write_wait, self.writes.clone().lock_owned())
+            .await
+            .map_err(|_| CommitError::Busy)?;
+        let span = Span::current();
+        tokio::task::spawn_blocking(move || {
+            let _serial = serial;
+            span.in_scope(|| commit_owned(&own, &password, &enctypes, &ent, change))
+        })
+        .await
+        .unwrap_or_else(|e| {
+            Err(CommitError::Unknown(format!(
+                "the password change did not complete: {e}"
+            )))
+        })
+    }
     async fn delete_principal(&self, user: &UserId) -> Result<(), String> {
+        if self.skipped_as_alias(user, "delete").await? {
+            return Ok(());
+        }
         let (own, name) = (self.own(), user_principal(user));
         logged(
             &self.writes,
@@ -432,6 +502,9 @@ impl KerberosSync for EmbeddedKerberos {
     }
     async fn set_principal_enabled(&self, user: &UserId, enabled: bool) -> Result<(), String> {
         let op = if enabled { "enable" } else { "disable" };
+        if self.skipped_as_alias(user, op).await? {
+            return Ok(());
+        }
         let (own, name, id) = (self.own(), user_principal(user), user.clone());
         logged(
             &self.writes,
@@ -588,13 +661,18 @@ struct Own {
     actor: String,
 }
 
-fn set_password(
+// `commit` makes each attempt's closure; at most one of them reaches the host.
+fn set_password<C>(
     own: &Own,
     user: &UserId,
     password: &[u8],
     enctypes: &[KeySalt],
     ent: &AdminEnt,
-) -> Result<(), StoreError> {
+    commit: impl Fn() -> C,
+) -> Result<(), StoreError>
+where
+    C: FnOnce(HostChange) -> Result<(), KerberosStoreError>,
+{
     let name = user_principal(user);
     let change = || {
         krb5_kdc::change_password_shared_committing(
@@ -606,12 +684,12 @@ fn set_password(
             &own.actor,
             enctypes,
             |s| not_an_alias(s, &own.realm, user),
-            committing(own.host.as_ref()),
+            commit(),
         )
     };
     let mut next = after_change(change());
     if next == Next::Create {
-        next = after_create(create_marked(own, user, password, enctypes, ent));
+        next = after_create(create_marked(own, user, password, enctypes, ent, commit()));
     }
     if next == Next::ChangeAgain {
         next = after_change(change());
@@ -629,6 +707,7 @@ fn create_marked(
     password: &[u8],
     enctypes: &[KeySalt],
     ent: &AdminEnt,
+    commit: impl FnOnce(HostChange) -> Result<(), KerberosStoreError>,
 ) -> Result<(), StoreError> {
     let name = user_principal(user);
     let planned = {
@@ -640,7 +719,7 @@ fn create_marked(
     };
     let prepared = planned.map(CreatePlan::derive).transpose()?;
     let mut store = own.store.write().map_err(|_| poisoned())?;
-    store.change_committing(committing(own.host.as_ref()), |s| {
+    store.change_committing(commit, |s| {
         not_an_alias(s, &own.realm, user)?;
         let created = match prepared {
             Some(p) => s.create_prepared(p, &own.actor)?,
@@ -652,6 +731,65 @@ fn create_marked(
         }
         s.set_host_owned_in(&name, &own.realm, true)
     })?
+}
+
+// A synced user's change from step 5 on, on the blocking task that owns the `writes` guard.
+fn commit_owned(
+    own: &Own,
+    password: &[u8],
+    enctypes: &[KeySalt],
+    ent: &AdminEnt,
+    change: PasswordCommit,
+) -> Result<Committed, CommitError> {
+    let PasswordCommit {
+        user, record, rows, ..
+    } = change;
+    let made = set_password(own, &user, password, enctypes, ent, || {
+        committing_with(own.host.as_ref(), rows.clone())
+    });
+    if let Err(StoreError::InvalidArgument(why)) = &made
+        && why.starts_with(&aliased(&user, ""))
+    {
+        return Err(CommitError::Refused(why.clone()));
+    }
+    match made.map_err(unanswered) {
+        Ok(()) => {
+            kill_point("kerberos-changed");
+            Ok(Committed::Done)
+        }
+        Err(Ok(why)) => after_failed(own.host.password_record(&user), &record, why),
+        Err(Err(known)) => Err(known),
+    }
+}
+
+// Only Failed and NotReady can follow a commit that reached the database.
+fn unanswered(e: StoreError) -> Result<String, CommitError> {
+    match e {
+        StoreError::Host(KerberosStoreError::Failed(why) | KerberosStoreError::NotReady(why)) => {
+            Ok(why)
+        }
+        StoreError::Host(KerberosStoreError::Refused(why)) if why == NO_USER_ROW => {
+            Err(CommitError::UserGone)
+        }
+        e @ (StoreError::PasswordPolicy(_) | StoreError::PassTooSoon { .. }) => {
+            Err(CommitError::Refused(e.to_string()))
+        }
+        e => Err(CommitError::Failed(e.to_string())),
+    }
+}
+
+fn after_failed(
+    stored: Result<Option<Vec<u8>>, KerberosStoreError>,
+    prepared: &[u8],
+    why: String,
+) -> Result<Committed, CommitError> {
+    match stored {
+        Ok(Some(record)) if record == prepared => Ok(Committed::AnswerLost),
+        Ok(_) => Err(CommitError::Failed(why)),
+        Err(e) => Err(CommitError::Unknown(format!(
+            "{why}; the stored record could not be read: {e}"
+        ))),
+    }
 }
 
 fn in_change<T>(
@@ -747,6 +885,15 @@ fn not_an_alias(store: &PrincipalStore, realm: &str, user: &UserId) -> Result<()
     }
 }
 
+// A read waits for the write lock behind it, so it runs off the async workers too.
+async fn read_store<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, StoreError> + Send + 'static,
+) -> Result<T, String> {
+    tokio::task::spawn_blocking(move || f().map_err(|e| e.to_string()))
+        .await
+        .unwrap_or_else(|e| Err(format!("Kerberos call did not complete: {e}")))
+}
+
 // One store write at a time; the guard and the log row go with the call, so a dropped caller
 // keeps both.
 async fn logged<T: Send + 'static>(
@@ -783,6 +930,7 @@ pub(crate) mod tests {
     use krb5_kdc::host::{
         HostChange, KerberosStore, KerberosStoreError, LoadedRealm, MemoryRealm, Operation,
     };
+    use lldap_domain_handlers::kerberos::HostRow;
     use lldap_domain_handlers::logging::{RequestMeta, with_request};
     use lldap_test_utils::recording_log::LogGuard;
     use pretty_assertions::assert_eq;
@@ -798,6 +946,36 @@ pub(crate) mod tests {
         changes: std::sync::Mutex<Vec<Operation>>,
         own: AtomicUsize,
         started_at: std::sync::Mutex<Option<usize>>,
+        rows: std::sync::Mutex<Vec<String>>,
+        records: std::sync::Mutex<HashMap<String, Vec<u8>>>,
+        fault: std::sync::Mutex<Option<Fault>>,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Fault {
+        /// Commits, then answers Failed.
+        AnswerLost,
+        Failed,
+        Unreadable,
+        UserGone,
+    }
+
+    impl Counting {
+        pub(crate) fn set_fault(&self, fault: Option<Fault>) {
+            *self.fault.lock().unwrap() = fault;
+        }
+
+        pub(crate) fn rows(&self) -> Vec<String> {
+            self.rows.lock().unwrap().clone()
+        }
+
+        fn fault(&self) -> Option<Fault> {
+            *self.fault.lock().unwrap()
+        }
+    }
+
+    fn unanswered_db() -> KerberosStoreError {
+        KerberosStoreError::Failed("the database did not answer".to_owned())
     }
 
     impl KerberosStore for Counting {
@@ -812,9 +990,41 @@ pub(crate) mod tests {
     }
 
     impl Host for Counting {
-        fn write_own(&self, change: HostChange) -> Result<(), KerberosStoreError> {
+        fn write_own(
+            &self,
+            change: HostChange,
+            rows: Vec<HostRow>,
+        ) -> Result<(), KerberosStoreError> {
             self.own.fetch_add(1, Ordering::Relaxed);
-            self.realm.commit(change.batch)
+            match self.fault() {
+                Some(Fault::Failed | Fault::Unreadable) => return Err(unanswered_db()),
+                Some(Fault::UserGone) => {
+                    return Err(KerberosStoreError::Refused(NO_USER_ROW.to_owned()));
+                }
+                Some(Fault::AnswerLost) | None => {}
+            }
+            self.realm.commit(change.batch)?;
+            for row in &rows {
+                if let HostRow::SetPassword { user, record, .. } = row {
+                    let mut records = self.records.lock().unwrap();
+                    records.insert(user.as_str().to_owned(), record.clone());
+                }
+            }
+            self.rows
+                .lock()
+                .unwrap()
+                .extend(rows.iter().map(HostRow::label));
+            match self.fault() {
+                Some(Fault::AnswerLost) => Err(unanswered_db()),
+                _ => Ok(()),
+            }
+        }
+
+        fn password_record(&self, user: &UserId) -> Result<Option<Vec<u8>>, KerberosStoreError> {
+            if self.fault() == Some(Fault::Unreadable) {
+                return Err(unanswered_db());
+            }
+            Ok(self.records.lock().unwrap().get(user.as_str()).cloned())
         }
 
         fn start_pass_committed(&self) {
@@ -1377,10 +1587,31 @@ pub(crate) mod tests {
         let mut named = Vec::new();
         for (user, why) in users.iter().zip(&sentences) {
             let synced = embedded.sync_principal(user, "A-Password-1").await;
+            guard.recorder().take_events();
             let disabled = embedded.set_principal_enabled(user, false).await;
+            let skipped: Vec<_> = guard
+                .recorder()
+                .take_events()
+                .into_iter()
+                .map(|e| (e.target, e.detail))
+                .collect();
+            let deleted = embedded.delete_principal(user).await;
+            let delete_rows: Vec<_> = guard
+                .recorder()
+                .take_events()
+                .into_iter()
+                .map(|e| (e.target, e.detail))
+                .collect();
+            let row = |op: &str| {
+                vec![(
+                    Some(user.as_str().to_owned()),
+                    Some(format!("{why}: {op} skipped")),
+                )]
+            };
             named.push((
                 synced.unwrap_err().ends_with(why.as_str()),
-                disabled.unwrap_err().ends_with(why.as_str()),
+                disabled.is_ok() && skipped == row("disable"),
+                deleted.is_ok() && delete_rows == row("delete"),
             ));
         }
         let reconciled = embedded.reconcile(users.clone()).await.unwrap();
@@ -1410,7 +1641,7 @@ pub(crate) mod tests {
                 fields(&store, "svc")
             ),
             (
-                vec![(true, true); 2],
+                vec![(true, true, true); 2],
                 (0, 0),
                 StartPass::default(),
                 writes,
@@ -1427,5 +1658,283 @@ pub(crate) mod tests {
             Some((Some("nobody@EXAMPLE.COM".to_owned()), false)),
         ];
         assert_eq!((rows, raw), (expected_rows, expected_raw));
+    }
+
+    fn commit_of(user: &str, record: &[u8], disabled: bool) -> PasswordCommit {
+        use lldap_domain_handlers::logging::{LogKind, event};
+        PasswordCommit {
+            user: UserId::new(user),
+            record: record.to_vec(),
+            disabled,
+            rows: vec![
+                HostRow::SetPassword {
+                    user: UserId::new(user),
+                    record: record.to_vec(),
+                    now: chrono::Utc::now().naive_utc(),
+                },
+                HostRow::Log(event(LogKind::PasswordChange, Some(user), true, None)),
+            ],
+        }
+    }
+
+    fn kvno_in(store: &PrincipalStore, user: &str) -> Option<u32> {
+        store
+            .get_name(&user_principal(&UserId::new(user)))
+            .and_then(|p| p.top_kvno())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_each_answer_of_the_commit_and_what_the_door_learns() {
+        const RECORD: &[u8] = b"record-2";
+        type Row = (
+            &'static str,
+            Option<Fault>,
+            Result<Committed, CommitError>,
+            bool,
+        );
+        let rows: [Row; 5] = [
+            ("committed", None, Ok(Committed::Done), true),
+            (
+                "the answer was lost after the commit",
+                Some(Fault::AnswerLost),
+                Ok(Committed::AnswerLost),
+                true,
+            ),
+            (
+                "failed, and the stored record is not this one",
+                Some(Fault::Failed),
+                Err(CommitError::Failed(
+                    "the database did not answer".to_owned(),
+                )),
+                false,
+            ),
+            (
+                "failed, and the stored record cannot be read",
+                Some(Fault::Unreadable),
+                Err(CommitError::Unknown(
+                    "the database did not answer; the stored record could not be read: \
+                     Kerberos store failed: the database did not answer"
+                        .to_owned(),
+                )),
+                false,
+            ),
+            (
+                "the user was deleted in between",
+                Some(Fault::UserGone),
+                Err(CommitError::UserGone),
+                false,
+            ),
+        ];
+        for (label, fault, expected, new) in rows {
+            let temp = TempRealm::new();
+            let (embedded, store) = temp.embedded();
+            embedded
+                .sync_principal(&bob(), "Bob-Password-1")
+                .await
+                .unwrap();
+            let old = kvno_in(&store.read().unwrap(), "bob").unwrap();
+            temp.host.set_fault(fault);
+            let got = embedded
+                .commit_password(commit_of("bob", RECORD, false), "Bob-Password-2")
+                .await;
+            temp.host.set_fault(None);
+            let kvno = old + u32::from(new);
+            let stored = temp.host.password_record(&bob()).unwrap();
+            assert_eq!(
+                (
+                    got,
+                    kvno_in(&store.read().unwrap(), "bob"),
+                    kvno_in(&temp.reopened(), "bob"),
+                    stored.as_deref() == Some(RECORD),
+                ),
+                (expected, Some(kvno), Some(kvno), new),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_which_failures_may_follow_a_commit() {
+        type Row = (StoreError, Result<String, CommitError>);
+        let rows: [Row; 6] = [
+            (
+                StoreError::Host(KerberosStoreError::Failed("late".to_owned())),
+                Ok("late".to_owned()),
+            ),
+            (
+                StoreError::Host(KerberosStoreError::NotReady("not held".to_owned())),
+                Ok("not held".to_owned()),
+            ),
+            (
+                StoreError::Host(KerberosStoreError::Refused(NO_USER_ROW.to_owned())),
+                Err(CommitError::UserGone),
+            ),
+            (
+                StoreError::Host(KerberosStoreError::Refused("a row".to_owned())),
+                Err(CommitError::Failed(
+                    "Kerberos store refused the change: a row".to_owned(),
+                )),
+            ),
+            (
+                StoreError::PasswordPolicy("too short".to_owned()),
+                Err(CommitError::Refused(
+                    "password policy: too short".to_owned(),
+                )),
+            ),
+            (
+                StoreError::NotFound,
+                Err(CommitError::Failed("principal not found".to_owned())),
+            ),
+        ];
+        for (error, expected) in rows {
+            let label = error.to_string();
+            assert_eq!(unanswered(error), expected, "{label}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_the_wait_for_the_write_lock_is_bounded_and_writes_nothing() {
+        let temp = TempRealm::new();
+        let (mut embedded, store) = temp.embedded();
+        embedded.write_wait = Duration::from_millis(20);
+        let held = embedded.writes.clone().lock_owned().await;
+        let writes = temp.own_writes();
+        let busy = embedded
+            .commit_password(commit_of("bob", b"record", false), "Bob-Password-1")
+            .await;
+        assert_eq!(
+            (busy, temp.own_writes(), marked(&store, "bob")),
+            (Err(CommitError::Busy), writes, None)
+        );
+        drop(held);
+        let done = embedded
+            .commit_password(commit_of("bob", b"record", false), "Bob-Password-1")
+            .await;
+        assert_eq!(
+            (done, marked(&store, "bob")),
+            (Ok(Committed::Done), Some((true, false)))
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_first_password_makes_the_principal_with_the_directory_state() {
+        type Row<'a> = (&'a str, bool, Option<(bool, bool)>);
+        let rows: [Row; 2] = [
+            ("enabled", false, Some((true, false))),
+            ("disabled", true, Some((true, true))),
+        ];
+        for (label, disabled, expected) in rows {
+            let temp = TempRealm::new();
+            let (embedded, store) = temp.embedded();
+            let got = embedded
+                .commit_password(commit_of("dora", b"record", disabled), "Dora-Password-1")
+                .await;
+            assert_eq!(
+                (got, marked(&store, "dora"), temp.host.rows()),
+                (
+                    Ok(Committed::Done),
+                    expected,
+                    vec!["password dora".to_owned(), "log password_change".to_owned()]
+                ),
+                "{label}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_the_password_check_writes_nothing() {
+        let temp = TempRealm::new();
+        let (embedded, store) = temp.embedded();
+        assert_eq!(
+            embedded.check_password(&bob(), "short").await,
+            Ok(()),
+            "no principal yet, so no policy"
+        );
+        embedded
+            .sync_principal(&bob(), "Bob-Password-1")
+            .await
+            .unwrap();
+        let mut policy = krb5_kdc::NamedPolicy::new("min12");
+        policy.min_length = 12;
+        store.write().unwrap().put_policy(policy).unwrap();
+        in_change(&embedded.own(), |s| {
+            s.set_principal_policy(&user_principal(&bob()), Some("min12".to_owned()))
+        })
+        .unwrap();
+        let commits = temp.commits();
+        let refused = embedded.check_password(&bob(), "short").await.unwrap_err();
+        assert!(refused.contains("password policy"), "{refused}");
+        assert_eq!(
+            embedded
+                .check_password(&bob(), "Long-Enough-Password-2")
+                .await,
+            Ok(())
+        );
+        assert!(
+            embedded
+                .check_password(&UserId::new("bob/admin"), "Long-Enough-Password-3")
+                .await
+                .is_err()
+        );
+        assert_eq!(temp.commits(), commits, "the check commits nothing");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_password_change_for_a_user_name_that_is_an_alias_is_refused() {
+        let temp = TempRealm::new();
+        let (embedded, store) = temp.embedded();
+        unmarked(&embedded, "svc", false);
+        let passed = embedded.check_password(&bob(), "Bob-Password-1").await;
+        let svc_name = user_principal(&UserId::new("svc"));
+        in_change(&embedded.own(), |s| {
+            s.create_alias_in(
+                &user_principal(&bob()),
+                "EXAMPLE.COM",
+                &svc_name,
+                "EXAMPLE.COM",
+                "test",
+            )
+        })
+        .unwrap();
+        let why = "the principal name of user bob is an alias of svc@EXAMPLE.COM".to_owned();
+        let (writes, svc) = (temp.own_writes(), fields(&store, "svc"));
+        let checked = embedded.check_password(&bob(), "Bob-Password-1").await;
+        assert_eq!(
+            (passed, checked),
+            (Ok(()), Err(why.clone())),
+            "the check refuses once the name is an alias"
+        );
+        let committed = embedded
+            .commit_password(commit_of("bob", b"record", false), "Bob-Password-1")
+            .await;
+        let raw = store
+            .read()
+            .unwrap()
+            .get_raw("bob@EXAMPLE.COM")
+            .map(|p| (p.alias_target(), p.host_owned()));
+        assert_eq!(
+            (
+                committed,
+                fields(&store, "svc"),
+                temp.own_writes(),
+                temp.host.rows(),
+                temp.host.password_record(&bob()).unwrap(),
+                raw
+            ),
+            (
+                Err(CommitError::Refused(why)),
+                svc,
+                writes,
+                Vec::<String>::new(),
+                None,
+                Some((Some("svc@EXAMPLE.COM".to_owned()), false))
+            ),
+            "the commit refuses and nothing is written"
+        );
     }
 }

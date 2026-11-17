@@ -4,6 +4,11 @@
 
 ### Changed
 
+- A `kerberossync` user's password change through GraphQL `setUserPassword`, LDAP Modify
+  `userPassword`, `ldappasswd` or LDAP ADD writes the directory record, the Kerberos keys and
+  its one `password_change` row in one transaction; no `kerberos_sync` row is written for it.
+  An LDAP ADD with a password makes the entry and its principal together or not at all, and
+  answers 52 when the KDC is offline.
 - The policies page's notice lists the rules that are not enforced yet, read from the
   catalog, and names the build's version.
 - A read-only admin can read policies, the item catalog, effective items and OU policy

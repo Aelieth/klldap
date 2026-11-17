@@ -492,6 +492,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_the_prepared_record_is_the_one_registration_stores() {
+        let sql_pool = get_initialized_db().await;
+        let handler = SqlBackendHandler::new(generate_random_private_key(), sql_pool);
+        insert_user_no_password(&handler, "bob").await;
+        let (record, request) =
+            lldap_opaque_handler::prepare_registration(&handler, UserId::new("bob"), b"bob00")
+                .await
+                .unwrap();
+        handler.registration_finish(request).await.unwrap();
+        let stored = handler
+            .get_password_file_for_user(UserId::new("bob"))
+            .await
+            .unwrap();
+        assert!(stored == Some(record), "the stored record differs");
+        attempt_login(&handler, "bob", "bob00", None).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn test_bind_user() {
         let sql_pool = get_initialized_db().await;
         let handler = SqlOpaqueHandler::new(generate_random_private_key(), sql_pool.clone());

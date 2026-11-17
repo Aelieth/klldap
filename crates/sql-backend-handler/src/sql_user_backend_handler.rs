@@ -25,8 +25,9 @@ use lldap_domain_model::{
 };
 use lldap_schema::{KERBEROS_SYNC, PublicSchema};
 use sea_orm::{
-    ActiveModelTrait, ActiveValue, ColumnTrait, DatabaseTransaction, EntityTrait, ModelTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait, Set, TransactionTrait,
+    ActiveModelTrait, ActiveValue, ColumnTrait, ConnectionTrait, DatabaseTransaction, EntityTrait,
+    ModelTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, QueryTrait, Set,
+    TransactionTrait,
     sea_query::{
         Alias, Cond, Expr, Func, IntoColumnRef, IntoCondition, SimpleExpr, query::OnConflict,
     },
@@ -392,19 +393,115 @@ impl SqlBackendHandler {
 
         Ok(delete_principal)
     }
+
+    /// `create_user` on the caller's transaction, which the Kerberos committer also runs.
+    pub(crate) async fn create_user_in(
+        transaction: &DatabaseTransaction,
+        mut request: CreateUserRequest,
+    ) -> Result<()> {
+        validate_directory_username(request.user_id.as_str())
+            .map_err(DomainError::InternalError)?;
+        let now = chrono::Utc::now().naive_utc();
+        let uuid = Uuid::from_name_and_date(request.user_id.as_str(), &now);
+        let lower_email = request.email.as_str().to_lowercase();
+        let default_ou = allowed_ous_in(transaction)
+            .await?
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "people".to_string());
+        if !request.attributes.iter().any(|a| a.name.as_str() == "ou") {
+            request.attributes.push(Attribute {
+                name: "ou".into(),
+                value: AttributeValue::String(Cardinality::Singleton(default_ou)),
+            });
+        }
+
+        let schema = Self::get_schema_with_transaction(transaction).await?;
+
+        let settings = Self::get_posix_settings_with_transaction(transaction).await?;
+        let posix_numbers: Vec<(String, i64)> = request
+            .attributes
+            .iter()
+            .filter_map(|attr| match &attr.value {
+                AttributeValue::Integer(Cardinality::Singleton(value)) if *value != 0 => {
+                    Some((attr.name.as_str().to_owned(), *value))
+                }
+                _ => None,
+            })
+            .collect();
+        Self::validate_posix_numbers(transaction, &posix_numbers, None).await?;
+
+        let mut final_attributes = request.attributes;
+        Self::assign_posix_defaults(
+            transaction,
+            &settings,
+            &request.user_id,
+            &mut final_attributes,
+        )
+        .await?;
+
+        let new_user = model::users::ActiveModel {
+            user_id: Set(request.user_id.clone()),
+            email: Set(request.email),
+            lowercase_email: Set(lower_email),
+            display_name: to_value(&request.display_name),
+            creation_date: ActiveValue::Set(now),
+            uuid: ActiveValue::Set(uuid),
+            modified_date: ActiveValue::Set(now),
+            password_modified_date: ActiveValue::Set(now),
+            krb_principal_name: ActiveValue::Set(None),
+            ..Default::default()
+        };
+
+        let _group_id = new_user.insert(transaction).await?.user_id;
+        let mut new_user_attributes = Vec::new();
+
+        for attribute in final_attributes {
+            let canonical_name = schema
+                .user_attributes()
+                .get_by_name_or_alias(attribute.name.as_str())
+                .map(|s| s.name.clone().into())
+                .unwrap_or_else(|| attribute.name.clone());
+
+            if schema
+                .user_attributes()
+                .get_attribute_type(attribute.name.as_str())
+                .is_some()
+            {
+                let db_value = attribute_value_to_db_bytes(&attribute.value);
+                new_user_attributes.push(model::user_attributes::ActiveModel {
+                    user_id: Set(request.user_id.clone()),
+                    attribute_name: Set(canonical_name.clone()),
+                    value: Set(Serialized(db_value)),
+                });
+            }
+        }
+
+        if !new_user_attributes.is_empty() {
+            let _ = model::UserAttributes::insert_many(new_user_attributes)
+                .exec(transaction)
+                .await?;
+        }
+
+        Ok(())
+    }
+}
+
+async fn allowed_ous_in(db: &impl ConnectionTrait) -> Result<Vec<String>> {
+    let config = system_config::Entity::find()
+        .filter(system_config::Column::Key.eq("allowedous"))
+        .one(db)
+        .await?;
+
+    let json_str = config.map(|c| c.value).unwrap_or_else(|| "[]".to_string());
+    Ok(serde_json::from_str(&json_str)
+        .unwrap_or_else(|_| vec!["people".to_string(), "groups".to_string()]))
 }
 
 #[async_trait]
 impl SystemConfigBackendHandler for SqlBackendHandler {
     async fn get_allowed_ous(&self) -> Result<Vec<String>> {
-        let config = system_config::Entity::find()
-            .filter(system_config::Column::Key.eq("allowedous"))
-            .one(&self.sql_pool)
-            .await?;
-
-        let json_str = config.map(|c| c.value).unwrap_or_else(|| "[]".to_string());
-        Ok(serde_json::from_str(&json_str)
-            .unwrap_or_else(|_| vec!["people".to_string(), "groups".to_string()]))
+        allowed_ous_in(&self.sql_pool).await
     }
 
     async fn set_system_config(&self, key: &str, value: String) -> Result<()> {
@@ -518,103 +615,12 @@ impl UserBackendHandler for SqlBackendHandler {
     }
 
     #[instrument(skip(self), level = "debug", err, fields(user_id = ?request.user_id.as_str()))]
-    async fn create_user(&self, mut request: CreateUserRequest) -> Result<()> {
+    async fn create_user(&self, request: CreateUserRequest) -> Result<()> {
         require_kdc_ready()?;
-        validate_directory_username(request.user_id.as_str())
-            .map_err(DomainError::InternalError)?;
         let user_id = request.user_id.clone();
-        let now = chrono::Utc::now().naive_utc();
-        let uuid = Uuid::from_name_and_date(request.user_id.as_str(), &now);
-        let lower_email = request.email.as_str().to_lowercase();
-
-        let default_ou = self
-            .get_allowed_ous()
-            .await?
-            .into_iter()
-            .next()
-            .unwrap_or_else(|| "people".to_string());
-
-        if !request.attributes.iter().any(|a| a.name.as_str() == "ou") {
-            request.attributes.push(Attribute {
-                name: "ou".into(),
-                value: AttributeValue::String(Cardinality::Singleton(default_ou)),
-            });
-        }
-
         self.sql_pool
             .transaction::<_, (), DomainError>(|transaction| {
-                Box::pin(async move {
-                    let schema = Self::get_schema_with_transaction(transaction).await?;
-
-                    let settings = Self::get_posix_settings_with_transaction(transaction).await?;
-                    let posix_numbers: Vec<(String, i64)> = request
-                        .attributes
-                        .iter()
-                        .filter_map(|attr| match &attr.value {
-                            AttributeValue::Integer(Cardinality::Singleton(value))
-                                if *value != 0 =>
-                            {
-                                Some((attr.name.as_str().to_owned(), *value))
-                            }
-                            _ => None,
-                        })
-                        .collect();
-                    Self::validate_posix_numbers(transaction, &posix_numbers, None).await?;
-
-                    let mut final_attributes = request.attributes;
-                    Self::assign_posix_defaults(
-                        transaction,
-                        &settings,
-                        &request.user_id,
-                        &mut final_attributes,
-                    )
-                    .await?;
-
-                    let new_user = model::users::ActiveModel {
-                        user_id: Set(request.user_id.clone()),
-                        email: Set(request.email),
-                        lowercase_email: Set(lower_email),
-                        display_name: to_value(&request.display_name),
-                        creation_date: ActiveValue::Set(now),
-                        uuid: ActiveValue::Set(uuid),
-                        modified_date: ActiveValue::Set(now),
-                        password_modified_date: ActiveValue::Set(now),
-                        krb_principal_name: ActiveValue::Set(None),
-                        ..Default::default()
-                    };
-
-                    let _group_id = new_user.insert(transaction).await?.user_id;
-                    let mut new_user_attributes = Vec::new();
-
-                    for attribute in final_attributes {
-                        let canonical_name = schema
-                            .user_attributes()
-                            .get_by_name_or_alias(attribute.name.as_str())
-                            .map(|s| s.name.clone().into())
-                            .unwrap_or_else(|| attribute.name.clone());
-
-                        if schema
-                            .user_attributes()
-                            .get_attribute_type(attribute.name.as_str())
-                            .is_some()
-                        {
-                            let db_value = attribute_value_to_db_bytes(&attribute.value);
-                            new_user_attributes.push(model::user_attributes::ActiveModel {
-                                user_id: Set(request.user_id.clone()),
-                                attribute_name: Set(canonical_name.clone()),
-                                value: Set(Serialized(db_value)),
-                            });
-                        }
-                    }
-
-                    if !new_user_attributes.is_empty() {
-                        let _ = model::UserAttributes::insert_many(new_user_attributes)
-                            .exec(transaction)
-                            .await?;
-                    }
-
-                    Ok(())
-                })
+                Box::pin(async move { Self::create_user_in(transaction, request).await })
             })
             .await?;
         logging::record(LogKind::UserCreate, Some(user_id.as_str()), None);

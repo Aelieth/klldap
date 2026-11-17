@@ -2,7 +2,8 @@ use krb5_kdc::host::{
     Denial, HostChange, KerberosStore, KerberosStoreError, LoadedPrincipal, LoadedRealm, Operation,
     PolicyRow, PrincipalRow, RealmBatch, RealmState,
 };
-use lldap_domain_handlers::kerberos as directory;
+use lldap_domain::types::UserId;
+use lldap_domain_handlers::kerberos::{self as directory, HostRow};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -25,9 +26,10 @@ impl SqlRealm {
 }
 
 /// The host as KLLDAP drives it: kerber-rust's changes arrive at `commit_change`, our own
-/// `change_committing` changes at `write_own`.
+/// `change_committing` changes at `write_own`, with the directory rows that commit beside them.
 pub(crate) trait Host: KerberosStore {
-    fn write_own(&self, change: HostChange) -> Result<(), KerberosStoreError>;
+    fn write_own(&self, change: HostChange, rows: Vec<HostRow>) -> Result<(), KerberosStoreError>;
+    fn password_record(&self, user: &UserId) -> Result<Option<Vec<u8>>, KerberosStoreError>;
     /// Until the start pass has committed, only the bootstrap may come from outside.
     fn start_pass_committed(&self);
 }
@@ -35,11 +37,18 @@ pub(crate) trait Host: KerberosStore {
 pub(crate) fn committing(
     host: &dyn Host,
 ) -> impl FnOnce(HostChange) -> Result<(), KerberosStoreError> + '_ {
+    committing_with(host, Vec::new())
+}
+
+pub(crate) fn committing_with(
+    host: &dyn Host,
+    rows: Vec<HostRow>,
+) -> impl FnOnce(HostChange) -> Result<(), KerberosStoreError> + '_ {
     move |change| {
-        if change.rows.is_empty() && change.batch.is_empty() {
+        if rows.is_empty() && change.rows.is_empty() && change.batch.is_empty() {
             return Ok(());
         }
-        host.write_own(change)
+        host.write_own(change, rows)
     }
 }
 
@@ -102,13 +111,17 @@ impl KerberosStore for SqlRealm {
             return Err(KerberosStoreError::Refused("starting".to_owned()));
         }
         verdict(&change)?;
-        self.write(change.batch)
+        self.write(Vec::new(), change.batch)
     }
 }
 
 impl Host for SqlRealm {
-    fn write_own(&self, change: HostChange) -> Result<(), KerberosStoreError> {
-        self.write(change.batch)
+    fn write_own(&self, change: HostChange, rows: Vec<HostRow>) -> Result<(), KerberosStoreError> {
+        self.write(rows, change.batch)
+    }
+
+    fn password_record(&self, user: &UserId) -> Result<Option<Vec<u8>>, KerberosStoreError> {
+        self.store.password_record(user).map_err(store_error)
     }
 
     fn start_pass_committed(&self) {
@@ -117,30 +130,33 @@ impl Host for SqlRealm {
 }
 
 impl SqlRealm {
-    fn write(&self, batch: RealmBatch) -> Result<(), KerberosStoreError> {
+    fn write(&self, rows: Vec<HostRow>, batch: RealmBatch) -> Result<(), KerberosStoreError> {
         let upsert_principals = batch
             .upsert_principals
             .into_iter()
             .map(principal_row)
             .collect::<Result<_, _>>()?;
         self.store
-            .commit(directory::RealmBatch {
-                upsert_principals,
-                delete_principals: batch.delete_principals,
-                put_policies: batch
-                    .put_policies
-                    .into_iter()
-                    .map(|p| directory::PolicyRow {
-                        name: p.name,
-                        record: p.record,
-                    })
-                    .collect(),
-                delete_policies: batch.delete_policies,
-                realm: batch.realm.map(|r| directory::RealmState {
-                    realm: r.realm,
-                    state: r.state,
-                }),
-            })
+            .commit_with(
+                rows,
+                directory::RealmBatch {
+                    upsert_principals,
+                    delete_principals: batch.delete_principals,
+                    put_policies: batch
+                        .put_policies
+                        .into_iter()
+                        .map(|p| directory::PolicyRow {
+                            name: p.name,
+                            record: p.record,
+                        })
+                        .collect(),
+                    delete_policies: batch.delete_policies,
+                    realm: batch.realm.map(|r| directory::RealmState {
+                        realm: r.realm,
+                        state: r.state,
+                    }),
+                },
+            )
             .map_err(store_error)
     }
 }
@@ -278,7 +294,8 @@ mod tests {
             let realm = Arc::new(SqlRealm::new(store));
             realm.start_pass_committed();
             let own = Arc::clone(&realm);
-            let commit: conformance::OwnCommit = Arc::new(move |change| own.write_own(change));
+            let commit: conformance::OwnCommit =
+                Arc::new(move |change| own.write_own(change, Vec::new()));
             (realm as Arc<dyn KerberosStore>, commit)
         };
         let rows = conformance::run_own(&new_host);
@@ -551,6 +568,161 @@ mod tests {
         let schema = format!("klldap_owned_{}", std::process::id());
         let made = AtomicBool::new(false);
         owned_rows_on(&|runtime| {
+            runtime.block_on(async {
+                if !made.swap(true, Ordering::Relaxed) {
+                    let admin = Database::connect(url.as_str()).await.unwrap();
+                    for sql in [
+                        format!("DROP SCHEMA IF EXISTS {schema} CASCADE"),
+                        format!("CREATE SCHEMA {schema}"),
+                    ] {
+                        admin.execute_unprepared(&sql).await.unwrap();
+                    }
+                }
+                let mut opts = ConnectOptions::new(url.clone());
+                opts.set_schema_search_path(schema.clone())
+                    .max_connections(2)
+                    .sqlx_logging(false);
+                Database::connect(opts).await.unwrap()
+            })
+        });
+    }
+
+    fn count(pool: &DatabaseConnection, runtime: &Runtime, query: &str) -> i64 {
+        let statement = sea_orm::Statement::from_string(pool.get_database_backend(), query);
+        let row = runtime
+            .block_on(pool.query_one(statement))
+            .unwrap()
+            .unwrap();
+        row.try_get::<i64>("", "n").unwrap()
+    }
+
+    // X1: a synced user's change, its record and its row in one transaction, or none of them.
+    fn one_transaction_on(connect: Reconnect) {
+        use lldap_domain_handlers::kerberos::{CommitError, Committed, PasswordCommit};
+        use lldap_domain_handlers::logging::{LogKind, event};
+        let runtime = runtime();
+        let temp = TempRealm::new();
+        let profile = boot::profile(&temp.settings);
+        let (committer, pool) = committer_on(connect, &runtime);
+        for user in ["bob", "carol"] {
+            sql(
+                &pool,
+                &runtime,
+                &format!(
+                    "INSERT INTO users (user_id, email, lowercase_email, creation_date, uuid, \
+                     modified_date, password_modified_date) VALUES ('{user}', '{user}@ex.com', \
+                     '{user}@ex.com', '2026-01-01 00:00:00', 'uuid-{user}', \
+                     '2026-01-01 00:00:00', '2026-01-01 00:00:00')"
+                ),
+            );
+        }
+        let host = Arc::new(SqlRealm::new(committer.store()));
+        host.start_pass_committed();
+        let store = krb5_kdc::shared_dump(
+            boot::open_store(&temp.settings, &profile, host.clone()).unwrap(),
+        );
+        let ready = Arc::new(AtomicBool::new(true));
+        let embedded = EmbeddedKerberos::new(store.clone(), &temp.settings, ready, host.clone());
+        fn change(user: &str, record: &[u8]) -> PasswordCommit {
+            PasswordCommit {
+                user: UserId::new(user),
+                record: record.to_vec(),
+                disabled: false,
+                rows: vec![
+                    HostRow::SetPassword {
+                        user: UserId::new(user),
+                        record: record.to_vec(),
+                        now: chrono::Utc::now().naive_utc(),
+                    },
+                    HostRow::Log(event(LogKind::PasswordChange, Some(user), true, None)),
+                ],
+            }
+        }
+        fn kvno(store: &krb5_kdc::PrincipalStore, user: &str) -> Option<u32> {
+            let name = PrincipalName::new(PrincipalName::NT_PRINCIPAL, [user]);
+            store.get_name(&name).and_then(|p| p.top_kvno())
+        }
+        let stored = |user: &str| host.password_record(&UserId::new(user)).unwrap();
+        let logs = || {
+            count(
+                &pool,
+                &runtime,
+                "SELECT COUNT(*) AS n FROM logs WHERE kind = 'password_change'",
+            )
+        };
+
+        let done = runtime.block_on(embedded.commit_password(change("bob", b"r1"), "Bob-Pass-1"));
+        let reopened = boot::open_store(&temp.settings, &profile, host.clone()).unwrap();
+        assert_eq!(
+            (
+                done,
+                stored("bob") == Some(b"r1".to_vec()),
+                logs(),
+                kvno(&reopened, "bob")
+            ),
+            (Ok(Committed::Done), true, 1, Some(1)),
+            "committed: both new, with its row"
+        );
+
+        let carol = runtime.block_on(embedded.commit_password(change("carol", b"c1"), "Carol-1"));
+        assert_eq!(carol, Ok(Committed::Done));
+        sql(&pool, &runtime, "DELETE FROM users WHERE user_id = 'carol'");
+        let gone = runtime.block_on(embedded.commit_password(change("carol", b"c2"), "Carol-2"));
+        assert_eq!(
+            (gone, kvno(&store.read().unwrap(), "carol"), logs()),
+            (Err(CommitError::UserGone), Some(1), 2),
+            "the user deleted in between: refused, the keys put back"
+        );
+
+        sql(
+            &pool,
+            &runtime,
+            "UPDATE kerberos_realm SET generation = generation + 1",
+        );
+        let moved = runtime.block_on(embedded.commit_password(change("bob", b"r2"), "Bob-Pass-2"));
+        assert_eq!(
+            (
+                matches!(moved, Err(CommitError::Failed(_))),
+                stored("bob") == Some(b"r1".to_vec()),
+                logs(),
+                kvno(&store.read().unwrap(), "bob")
+            ),
+            (true, true, 2, Some(1)),
+            "the generation moved: failed, both old"
+        );
+        drop((embedded, store, host));
+        runtime.block_on(committer.shutdown());
+    }
+
+    #[test]
+    #[serial]
+    fn test_one_transaction_on_sqlite() {
+        let dir = std::env::temp_dir().join(format!("klldap-x1-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.join("x1.db").display());
+        one_transaction_on(&|runtime| {
+            let mut opts = ConnectOptions::new(url.clone());
+            opts.max_connections(1).sqlx_logging(false);
+            runtime.block_on(Database::connect(opts)).unwrap()
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial]
+    #[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+    fn test_one_transaction_on_postgres() {
+        let Ok(url) = std::env::var("KLLDAP_TEST_DATABASE_URL") else {
+            eprintln!("KLLDAP_TEST_DATABASE_URL not set; skipping");
+            return;
+        };
+        if !url.starts_with("postgres://") && !url.starts_with("postgresql://") {
+            eprintln!("KLLDAP_TEST_DATABASE_URL is not a postgres URL; skipping");
+            return;
+        }
+        let schema = format!("klldap_x1_{}", std::process::id());
+        let made = AtomicBool::new(false);
+        one_transaction_on(&|runtime| {
             runtime.block_on(async {
                 if !made.swap(true, Ordering::Relaxed) {
                     let admin = Database::connect(url.as_str()).await.unwrap();

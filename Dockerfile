@@ -44,10 +44,12 @@ RUN cargo chef cook --release --recipe-path recipe.json
 
 COPY --chown=lldap:lldap . .
 
+# Empty for every release image; `make test-kill-points` sets lldap/kill-points.
+ARG LLDAP_FEATURES=
 RUN cargo build --release \
     -p lldap \
     -p lldap_migration_tool \
-    -p lldap_set_password
+    -p lldap_set_password ${LLDAP_FEATURES:+--features "$LLDAP_FEATURES"}
 
 # Install wasm tools
 RUN cargo install wasm-pack --locked

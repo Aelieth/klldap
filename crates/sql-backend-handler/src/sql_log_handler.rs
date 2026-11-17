@@ -744,7 +744,7 @@ fn from_model(row: model::logs::Model) -> Option<LogRecord> {
     })
 }
 
-fn to_active_model(event: LogEvent) -> model::logs::ActiveModel {
+pub(crate) fn to_active_model(event: LogEvent) -> model::logs::ActiveModel {
     model::logs::ActiveModel {
         id: ActiveValue::NotSet,
         timestamp: ActiveValue::Set(event.timestamp),

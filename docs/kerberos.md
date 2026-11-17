@@ -292,6 +292,14 @@ realm does not open. The server comes up in the degraded state, and the
 cause says to restore the stash from the backup taken with the database.
 See [When the realm cannot open](#when-the-realm-cannot-open).
 
+A first start also writes `.k5.<REALM>.bootstrap` beside the stash, and
+removes it once the realm's first commit is confirmed. It exists only between
+a first start and that commit, so an ordinary backup never holds it. If the
+first commit does not answer, the next start finds the marker and retries
+with the same stash, or opens the realm if the commit had landed. A marker
+without its stash stops the start: restore the stash that belongs to it; only
+for a realm that never started may the marker be removed.
+
 On MySQL and MariaDB the columns `kerberos_principals.record`,
 `kerberos_policies.record` and `kerberos_realm.state` are `LONGBLOB`.
 Upstream's own migrations use a plain blob.

@@ -230,9 +230,16 @@ pub(crate) fn host_paths(settings: &RealmSettings) -> HostPaths {
 fn boot_error(e: StoreError) -> anyhow::Error {
     let cause = match &e {
         StoreError::StashWithoutHostRealm { stash } => Some(format!(
-            "the database holds no Kerberos realm, but the stash {} belongs to one; restore the \
-             database, or put the 0.7.2 dump back beside the stash to run the import again",
+            "the database holds no Kerberos realm, but the stash {0} belongs to one; restore the \
+             database, or put the 0.7.2 dump back beside the stash to run the import again (a \
+             marker {0}.bootstrap beside the stash would mean an unfinished first start, which \
+             is retried by itself; there is none)",
             stash.display()
+        )),
+        StoreError::BootstrapMarkerWithoutStash { marker } => Some(format!(
+            "{} marks a first start whose stash is missing; restore the stash that belongs to it. \
+             Only for a realm that never started may the marker be removed",
+            marker.display()
         )),
         StoreError::HostRecordsWithoutStash { stash, records } => Some(format!(
             "the database holds the realm ({records} records) but its stash {} is missing; \
@@ -596,7 +603,7 @@ mod tests {
                     fs::create_dir_all(&t.settings.data_dir).unwrap();
                     fs::write(t.settings.data_dir.join(".k5.EXAMPLE.COM"), b"key").unwrap();
                 },
-                "put the 0.7.2 dump back beside the stash",
+                "is retried by itself; there is none",
             ),
             (
                 true,
@@ -647,6 +654,68 @@ mod tests {
         let error = format!("{:#}", error.unwrap_err());
         let expected = "the database refused or did not answer the realm's first read or write";
         assert!(error.contains(expected), "{error}");
+    }
+
+    #[test]
+    fn test_a_first_start_whose_commit_did_not_answer_opens_at_the_next_start() {
+        use crate::embedded::tests::FirstCommit;
+        let rows = [
+            (
+                FirstCommit::Refused,
+                0,
+                "refused: retried with the same key",
+            ),
+            (FirstCommit::AnswerLost, 1, "landed: opened with that stash"),
+        ];
+        for (fault, written, label) in rows {
+            let temp = TempRealm::new();
+            let profile = profile(&temp.settings);
+            let stash = temp.settings.data_dir.join(".k5.EXAMPLE.COM");
+            let marker = temp.settings.data_dir.join(".k5.EXAMPLE.COM.bootstrap");
+            temp.host.set_first_commit(Some(fault));
+            let first = open_store(&temp.settings, &profile, temp.host()).map(drop);
+            let kept = fs::read(&stash).ok();
+            let after_first = (
+                first.is_err(),
+                kept.is_some(),
+                marker.exists(),
+                usize::from(!temp.host.realm.load().unwrap().principals.is_empty()),
+            );
+            let second = open_store(&temp.settings, &profile, temp.host()).map(drop);
+            assert_eq!(
+                (
+                    after_first,
+                    second.map_err(|e| format!("{e:#}")),
+                    fs::read(&stash).ok() == kept,
+                    marker.exists()
+                ),
+                ((true, true, true, written), Ok(()), true, false),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_marker_without_its_stash_is_refused_and_nothing_is_made() {
+        let temp = TempRealm::new();
+        fs::create_dir_all(&temp.settings.data_dir).unwrap();
+        let marker = temp.settings.data_dir.join(".k5.EXAMPLE.COM.bootstrap");
+        fs::write(&marker, "kerber-rust bootstrap EXAMPLE.COM 00\n").unwrap();
+        let error = open_store(&temp.settings, &profile(&temp.settings), temp.host()).unwrap_err();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("restore the stash that belongs to it")
+                && error.contains("Only for a realm that never started may the marker be removed"),
+            "{error}"
+        );
+        assert_eq!(
+            (
+                temp.settings.data_dir.join(".k5.EXAMPLE.COM").exists(),
+                temp.host.realm.load().unwrap().principals.is_empty(),
+                marker.exists()
+            ),
+            (false, true, true)
+        );
     }
 
     #[test]

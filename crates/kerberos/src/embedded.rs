@@ -1009,6 +1009,14 @@ pub(crate) mod tests {
         disabled: std::sync::Mutex<Vec<String>>,
         unread: AtomicBool,
         delay: std::sync::Mutex<Duration>,
+        first_commit: std::sync::Mutex<Option<FirstCommit>>,
+    }
+
+    /// The realm's first commit, once: refused, or written with its answer lost.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum FirstCommit {
+        Refused,
+        AnswerLost,
     }
 
     /// What the committer answers after its own read-back; nothing is written.
@@ -1025,6 +1033,9 @@ pub(crate) mod tests {
             *self.fault.lock().unwrap() = fault;
         }
 
+        pub(crate) fn set_first_commit(&self, fault: Option<FirstCommit>) {
+            *self.first_commit.lock().unwrap() = fault;
+        }
         pub(crate) fn set_delay(&self, delay: Duration) {
             *self.delay.lock().unwrap() = delay;
         }
@@ -1070,7 +1081,18 @@ pub(crate) mod tests {
                     text: String::new(),
                 }));
             }
-            self.realm.commit(change.batch)
+            let first = match change.intent.operation {
+                Operation::Bootstrap => self.first_commit.lock().unwrap().take(),
+                _ => None,
+            };
+            match first {
+                Some(FirstCommit::Refused) => Err(unanswered_db()),
+                Some(FirstCommit::AnswerLost) => {
+                    self.realm.commit(change.batch)?;
+                    Err(unanswered_db())
+                }
+                None => self.realm.commit(change.batch),
+            }
         }
     }
 

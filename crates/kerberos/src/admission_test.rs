@@ -175,21 +175,24 @@ mod tests {
     use super::*;
     use crate::embedded::tests::TempRealm;
     use crate::policy::tests::{tgs_body, ticket};
+    use crate::seam::committing;
     use krb5_asn1::{decode, encode};
-    use krb5_crypto::{EncryptionType, string_to_key};
+    use krb5_crypto::{EncryptionType, ProtocolKey, string_to_key};
     use krb5_kdc::admission::{AsReason, Mechanism, TgsKind};
-    use krb5_kdc::{PrincipalRead, SharedDump};
-    use krb5_types::{KrbError, PrincipalName};
+    use krb5_kdc::{IssuedAs, KDB_DISALLOW_ALL_TIX, Principal, PrincipalRead, SharedDump};
+    use krb5_types::{KrbError, PrincipalName, TgsRep};
     use lldap_domain::types::UserId;
     use lldap_domain_handlers::kerberos::KerberosSync;
     use pretty_assertions::assert_eq;
     use serial_test::serial;
     use std::path::Path;
     use std::process::Command;
+    use std::sync::Mutex;
 
     const REALM: &str = "EXAMPLE.COM";
     const PASSWORD: &str = "bob-pass-1";
     const CHILD: &str = "admission_test::tests::child_signs_in_bob_through_install_plugins";
+    const SERVICE: &str = "HTTP/svc.example.com";
 
     struct Scratch(PathBuf);
 
@@ -265,6 +268,125 @@ mod tests {
             "\"client\":\"{user}@{REALM}\",\"requested\":\"{user}@{REALM}\",\"peer\":null,\
              \"code\":{code},\"reason\":\"{reason:?}\",\"mechanism\":{mechanism}}}"
         )
+    }
+
+    /// Hands each question to `inner`, keeping one line per question or notice and each subject.
+    struct Recording {
+        inner: Arc<dyn HostAdmission>,
+        seen: Mutex<Vec<String>>,
+        subjects: Mutex<Vec<String>>,
+    }
+
+    impl Recording {
+        fn around(inner: Arc<dyn HostAdmission>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                seen: Mutex::default(),
+                subjects: Mutex::default(),
+            })
+        }
+
+        fn take(&self) -> (Vec<String>, Vec<String>) {
+            let take = |list: &Mutex<Vec<String>>| std::mem::take(&mut *list.lock().unwrap());
+            (take(&self.seen), take(&self.subjects))
+        }
+
+        fn note(&self, line: String) {
+            self.seen.lock().unwrap().push(line);
+        }
+    }
+
+    impl HostAdmission for Recording {
+        fn check_as(&self, q: &AsQuestion<'_>) -> Result<(), KdcRefusal> {
+            self.note(format!("as {} s4u2self {}", q.client.id(), q.s4u2self));
+            self.inner.check_as(q)
+        }
+
+        fn as_notice(&self, notice: AsNotice) {
+            self.note(format!("notice {}", notice.client));
+            self.inner.as_notice(notice);
+        }
+
+        fn check_tgs(&self, q: &TgsQuestion<'_>) -> Result<(), KdcRefusal> {
+            let client = q.client.map_or_else(|| "none".to_owned(), Principal::id);
+            self.note(format!("tgs {client} {:?}", q.kind));
+            let subject = q.subject.unparse_with_realm_lossy(REALM);
+            self.subjects.lock().unwrap().push(subject);
+            self.inner.check_tgs(q)
+        }
+    }
+
+    struct Service {
+        name: PrincipalName,
+        key: ProtocolKey,
+        tgt: IssuedAs,
+    }
+
+    /// Random keys and no directory user, written as the kadmin rows write; then its TGT.
+    fn service(temp: &TempRealm, store: &SharedDump) -> Service {
+        let name = PrincipalName::new(PrincipalName::NT_SRV_HST, SERVICE.split('/'));
+        store
+            .write()
+            .unwrap()
+            .change_committing(committing(&*temp.own()), |s| {
+                s.insert_new_randkey(&name, REALM, &[], "test")
+            })
+            .unwrap()
+            .unwrap();
+        let guard = store.read().unwrap();
+        let key = guard
+            .get_name(&name)
+            .unwrap()
+            .best_key()
+            .unwrap()
+            .key
+            .clone();
+        let padata = vec![krb5_protocol::pa_enc_timestamp(&key).unwrap()];
+        let request = krb5_protocol::as_req(name.clone(), REALM, 100, Some(padata)).unwrap();
+        let tgt = krb5_kdc::issue_as(&*guard, &request).unwrap();
+        Service { name, key, tgt }
+    }
+
+    /// The reply's client, the ticket's client and server; or the error code and e-text.
+    type Outcome = Result<[String; 3], (i32, Option<String>)>;
+
+    fn s4u2self(store: &SharedDump, svc: &Service, user: &str, x509: bool, nonce: u32) -> Outcome {
+        let session = &svc.tgt.session_key;
+        let for_user = if x509 {
+            krb5_protocol::pa_s4u_x509_user(session, name(user), REALM, nonce)
+        } else {
+            krb5_protocol::pa_for_user(session, name(user), REALM)
+        };
+        let mut request = krb5_protocol::tgs_req(
+            svc.tgt.rep.0.ticket.clone(),
+            session,
+            REALM,
+            &svc.name,
+            svc.name.clone(),
+            REALM,
+            nonce,
+        )
+        .unwrap();
+        request
+            .0
+            .padata
+            .get_or_insert_with(Vec::new)
+            .push(for_user.unwrap());
+        let reply =
+            krb5_kdc::handle_request(&*store.read().unwrap(), &encode(&request).unwrap()).unwrap();
+        if let Ok(e) = decode::<KrbError>(&reply) {
+            let text = e
+                .e_text
+                .map(|t| String::from_utf8_lossy(t.as_bytes()).into_owned());
+            return Err((e.error_code, text));
+        }
+        let rep = decode::<TgsRep>(&reply).unwrap().0;
+        let part = krb5_kdc::decrypt_ticket_part(&svc.key, &rep.ticket).unwrap();
+        Ok([
+            rep.cname.unparse_with_realm_lossy(REALM),
+            part.cname.unparse_with_realm_lossy(REALM),
+            rep.ticket.sname.unparse_with_realm_lossy(REALM),
+        ])
     }
 
     #[tokio::test]
@@ -548,5 +670,125 @@ mod tests {
         let (_, _, rest) = split_times(&got[1]);
         let expected = rest_of("bob", err::CLIENT_REVOKED, AsReason::HostRefused, None);
         assert_eq!(rest, expected);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_s4u2self_is_decided_on_the_impersonated_user() {
+        let temp = TempRealm::new();
+        let (embedded, store) = temp.embedded();
+        for user in ["bob", "carol", "dave", "erin"] {
+            embedded
+                .sync_principal(&UserId::new(user), PASSWORD)
+                .await
+                .unwrap();
+        }
+        embedded
+            .set_principal_enabled(&UserId::new("dave"), false)
+            .await
+            .unwrap();
+        embedded
+            .delete_principal(&UserId::new("erin"))
+            .await
+            .unwrap();
+        let svc = service(&temp, &store);
+        let entries = {
+            let guard = store.read().unwrap();
+            let disabled = guard
+                .get_name(&name("dave"))
+                .map(|p| p.attributes & KDB_DISALLOW_ALL_TIX);
+            (disabled, guard.get_name(&name("erin")).is_none())
+        };
+        assert_eq!(entries, (Some(KDB_DISALLOW_ALL_TIX), true));
+        let text = |t: &str| Some(t.to_owned());
+        assert_eq!(
+            s4u2self(&store, &svc, "bob", false, 1),
+            Err((err::CLIENT_REVOKED, text("LOCKED_OUT"))),
+            "no module installed"
+        );
+        let scratch = Scratch::new("s4u");
+        let refuse = scratch.file("refuse");
+        fs::write(&refuse, "carol@EXAMPLE.COM\n").unwrap();
+        let module = Recording::around(from_vars(Some(refuse.into()), None));
+        {
+            let mut guard = store.write().unwrap();
+            crate::boot::install_plugins(&mut guard);
+            guard.policy.plugins.set_host_admission(module.clone());
+        }
+        let asked = |user: &str| format!("as {user}@{REALM} s4u2self true");
+        let issued = |user: &str| -> Outcome {
+            let user = format!("{user}@{REALM}");
+            Ok([user.clone(), user, format!("{SERVICE}@{REALM}")])
+        };
+        type Row<'a> = (&'a str, &'a str, Outcome, Vec<String>);
+        let rows: [Row; 4] = [
+            (
+                "(a) listed",
+                "carol",
+                Err((err::CLIENT_REVOKED, None)),
+                vec![asked("carol")],
+            ),
+            (
+                "(b) disabled",
+                "dave",
+                Err((err::CLIENT_REVOKED, text("CLIENT LOCKED OUT"))),
+                vec![],
+            ),
+            (
+                "(c) allowed",
+                "bob",
+                issued("bob"),
+                vec![asked("bob"), format!("tgs bob@{REALM} S4u2Self")],
+            ),
+            (
+                "(e) gone",
+                "erin",
+                Err((err::C_PRINCIPAL_UNKNOWN, text("UNKNOWN_S4U2SELF_PRINCIPAL"))),
+                vec![],
+            ),
+        ];
+        for (nonce, (row, user, outcome, seen)) in (10..).step_by(2).zip(rows) {
+            for (x509, nonce) in [(false, nonce), (true, nonce + 1)] {
+                let got = s4u2self(&store, &svc, user, x509, nonce);
+                assert_eq!(
+                    (got, module.take().0),
+                    (outcome.clone(), seen.clone()),
+                    "{row}, PA-S4U-X509-USER {x509}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_s4u2self_asks_about_the_impersonated_user_as_its_subject() {
+        let temp = TempRealm::new();
+        let (embedded, store) = temp.embedded();
+        embedded
+            .sync_principal(&UserId::new("bob"), PASSWORD)
+            .await
+            .unwrap();
+        let svc = service(&temp, &store);
+        let module = Recording::around(Arc::new(AllowAll));
+        store
+            .write()
+            .unwrap()
+            .policy
+            .plugins
+            .set_host_admission(module.clone());
+        let bob = format!("bob@{REALM}");
+        for (x509, nonce) in [(false, 1), (true, 2)] {
+            let got = s4u2self(&store, &svc, "bob", x509, nonce).map(|[client, ..]| client);
+            let (seen, subjects) = module.take();
+            assert_eq!(
+                (got, seen.last().cloned(), subjects),
+                (
+                    Ok(bob.clone()),
+                    Some(format!("tgs {bob} S4u2Self")),
+                    vec![bob.clone()]
+                ),
+                "PA-S4U-X509-USER {x509}"
+            );
+        }
     }
 }

@@ -1,4 +1,4 @@
-use crate::policy::{AllowAll, LiveClients};
+use crate::policy::LiveClients;
 use crate::rotate;
 use crate::seam::Host;
 use anyhow::{Context, Result, anyhow, bail};
@@ -86,7 +86,16 @@ pub(crate) fn install_plugins(store: &mut PrincipalStore) {
         .policy
         .plugins
         .register_kdcpolicy(Arc::new(LiveClients));
-    store.policy.plugins.set_host_admission(Arc::new(AllowAll));
+    #[cfg(not(feature = "test-admission"))]
+    store
+        .policy
+        .plugins
+        .set_host_admission(Arc::new(crate::policy::AllowAll));
+    #[cfg(feature = "test-admission")]
+    store
+        .policy
+        .plugins
+        .set_host_admission(crate::admission_test::from_env());
 }
 
 pub(crate) fn open(settings: &RealmSettings, host: Arc<dyn Host>) -> Result<OpenRealm> {

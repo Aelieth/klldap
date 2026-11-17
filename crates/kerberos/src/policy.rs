@@ -84,7 +84,7 @@ impl HostAdmission for AllowAll {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::embedded::tests::TempRealm;
     use krb5_types::{
@@ -95,7 +95,7 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serial_test::serial;
 
-    fn ticket(realm: &str, user: &str) -> EncTicketPart {
+    pub(crate) fn ticket(realm: &str, user: &str) -> EncTicketPart {
         let now = KerberosTime::from_unix_seconds(1_700_000_000);
         EncTicketPart {
             flags: TicketFlags::initial_preauth(),
@@ -115,8 +115,8 @@ mod tests {
         }
     }
 
-    fn check(store: &dyn PrincipalRead, ticket: &EncTicketPart) -> Result<(), (i32, String)> {
-        let request = KdcReqBody {
+    pub(crate) fn tgs_body(ticket: &EncTicketPart) -> KdcReqBody {
+        KdcReqBody {
             kdc_options: KdcOptions::none(),
             cname: None,
             realm: ticket.crealm.clone(),
@@ -129,7 +129,11 @@ mod tests {
             addresses: None,
             enc_authorization_data: None,
             additional_tickets: None,
-        };
+        }
+    }
+
+    fn check(store: &dyn PrincipalRead, ticket: &EncTicketPart) -> Result<(), (i32, String)> {
+        let request = tgs_body(ticket);
         let krbtgt = PrincipalName::new(PrincipalName::NT_SRV_INST, ["krbtgt", "EXAMPLE.COM"]);
         let server = store.fetch_name(&krbtgt).unwrap().unwrap();
         let mut status = None;
@@ -238,5 +242,11 @@ mod tests {
             (Some(true), err::PREAUTH_REQUIRED),
             "the module installed; bob requires pre-authentication"
         );
+    }
+
+    #[test]
+    #[cfg_attr(feature = "test-admission", ignore = "a row of the default build")]
+    fn test_the_default_build_has_no_admission_test_module() {
+        assert_eq!([cfg!(feature = "test-admission")], [false]);
     }
 }

@@ -14,6 +14,8 @@ rust-version.workspace = true
 [features]
 # Aborts a password change at a named step (LLDAP_TEST_KILL_POINT); for kill tests only.
 kill-points = ["lldap_domain_handlers/kill-points"]
+# Answers Kerberos logins from test files (LLDAP_TEST_ADMISSION_*); for the gate only.
+test-admission = ["lldap-kerberos/test-admission"]
 
 [dependencies]
 actix = "0.13"

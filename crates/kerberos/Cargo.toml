@@ -10,6 +10,10 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+[features]
+# A login module driven by test files (LLDAP_TEST_ADMISSION_*); never in a release build.
+test-admission = []
+
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }

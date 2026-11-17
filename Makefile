@@ -5,7 +5,7 @@
 # - prepare-release-docker   → Reproducible AlmaLinux tarball build (recommended)
 # - docker-build             → Build and push the multi-arch images, default and rootless (amd64 + arm64)
 # - test                     → Local test image (klldap-test) from this tree, native CPU
-# - test-kill-points         → klldap-test-kill: klldap-test plus the kill-points hook, for the gate only
+# - test-kill-points         → klldap-test-kill: klldap-test plus the kill-points and test-admission hooks, for the gate only
 # - test-run                 → Run klldap-test with local volumes and test secrets
 
 .PHONY: prepare-release prepare-release-docker docker-build test test-kill-points test-run clean
@@ -103,14 +103,15 @@ test:
 		--tag klldap-test \
 		.
 
-# The gate's kill tests (phase 97, GATE_KILL_IMAGE=klldap-test-kill). Never pushed.
+# The gate's test hooks in one build: the kill tests (phase 97, GATE_KILL_IMAGE=klldap-test-kill)
+# and the admission test module (LLDAP_TEST_ADMISSION_REFUSE / _NOTICES). Never pushed.
 test-kill-points:
 	docker build \
 		--file Dockerfile \
 		--build-arg VERSION=$(VERSION)-test \
 		--build-arg CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=native" \
 		--build-arg CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=native" \
-		--build-arg LLDAP_FEATURES=lldap/kill-points \
+		--build-arg LLDAP_FEATURES="lldap/kill-points lldap/test-admission" \
 		--target default \
 		--tag klldap-test-kill \
 		.

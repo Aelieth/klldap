@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "test-admission")]
+mod admission_test;
 pub mod boot;
 pub mod embedded;
 mod migrate;

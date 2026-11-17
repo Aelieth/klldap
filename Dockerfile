@@ -44,7 +44,7 @@ RUN cargo chef cook --release --recipe-path recipe.json
 
 COPY --chown=lldap:lldap . .
 
-# Empty for every release image; `make test-kill-points` sets lldap/kill-points.
+# Empty for every release image; `make test-kill-points` sets lldap/kill-points lldap/test-admission.
 ARG LLDAP_FEATURES=
 RUN cargo build --release \
     -p lldap \

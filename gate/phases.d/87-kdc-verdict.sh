@@ -2,6 +2,7 @@
 # Phase: KDC verdict and notice. Every wrong answer is FAIL.
 # This phase's server is SQLite, not the main container's database.
 # The corrections against rows.md are logs/PROPER/K1/note-phases-6.md and PH/note-phases-7.md.
+# The S4U2Self rows are logs/PROPER/S4U/note.md.
 # This phase's server is GATE_KILL_IMAGE. The release image is GATE_IMAGE.
 
 D="$(phase_dir)"
@@ -15,6 +16,12 @@ AS=k1as
 HOLD=k1hold
 GONE=k1gone
 SVC=k1svc/k1
+S4U_SVC=k1s4u/gate.test
+S4U_OK=k1s4uok
+S4U_LIST=k1s4ulist
+S4U_OFF=k1s4uoff
+S4U_KT=/tmp/k1s4u.keytab
+S4U_CC=/tmp/k1s4u
 PASS=K1asPass2026!
 old_http="$HTTP_PORT"
 old_ldap="$LDAP_PORT"
@@ -116,6 +123,18 @@ no_prompt() {
         p_ok "$tag: kinit did not ask for a password"
     fi
 }
+s4u_kvno() {
+    gexec_in "$KDC_C" kvno -c "$S4U_CC" -k "$S4U_KT" -I "$1@$REALM" "$S4U_SVC@$REALM"
+}
+no_new_notice() {
+    local tag="$1" before="$2" after
+    after="$(notice_lines)" || after=""
+    if [ -n "$before" ] && [ "$after" = "$before" ]; then
+        p_ok "$tag: S4U2Self leaves no notice"
+    else
+        p_bad "$tag: S4U2Self changed the notice count ${before:-empty} -> ${after:-empty}"
+    fi
+}
 
 if [ -z "${GATE_KILL_IMAGE:-}" ]; then
     p_bad "GATE_KILL_IMAGE is unset; phase 87's server is the test image"
@@ -210,7 +229,7 @@ else
     p_bad "boot order failed: $(tr '\n' ' ' <"$D/boot.err")"
 fi
 
-for user in "$AS" "$HOLD" "$GONE"; do
+for user in "$AS" "$HOLD" "$GONE" "$S4U_OK" "$S4U_LIST" "$S4U_OFF"; do
     # shellcheck disable=SC2016
     graphql 'mutation($u: CreateUserInput!) { createUser(user: $u) { id } }' \
         '{"u": {"id": "'"$user"'", "email": "'"$user"'@gate.test",
@@ -423,6 +442,89 @@ elif grep -qi 'revoked' "$D/kvno-gone.log"; then
     p_ok "$GONE was refused a service ticket after deletion"
 else
     p_bad "$GONE service ticket did not say revoked (see kvno-gone.log)"
+fi
+
+for user in "$S4U_OK" "$S4U_LIST" "$S4U_OFF"; do
+    if gexec_in "$KDC_C" kadmin -k -t /data/kadm5.keytab -p "$ADMIN" -q "getprinc $user" \
+        >"$D/s4u-princ-$user.txt" 2>&1 \
+        && grep -q "^Principal: $user@$REALM" "$D/s4u-princ-$user.txt"; then
+        p_ok "s4u: $user has a principal"
+    else
+        p_bad "s4u: $user has no principal (see s4u-princ-$user.txt)"
+    fi
+done
+if gexec_in "$KDC_C" kadmin -k -t /data/kadm5.keytab -p "$ADMIN" -q "addprinc -randkey $S4U_SVC" \
+    >"$D/s4u-add.txt" 2>&1 && ! grep -q " while " "$D/s4u-add.txt" \
+    && gexec_in "$KDC_C" kadmin -k -t /data/kadm5.keytab -p "$ADMIN" -q "ktadd -k $S4U_KT $S4U_SVC" \
+        >"$D/s4u-ktadd.txt" 2>&1 && ! grep -q " while " "$D/s4u-ktadd.txt" \
+    && grep -q "added to keytab" "$D/s4u-ktadd.txt"; then
+    p_ok "s4u: $S4U_SVC exists, with its keys in $S4U_KT"
+else
+    p_bad "s4u: could not make $S4U_SVC and its keytab (see s4u-add.txt, s4u-ktadd.txt)"
+fi
+if gexec_in "$KDC_C" kinit -k -t "$S4U_KT" -c "$S4U_CC" "$S4U_SVC@$REALM" >"$D/s4u-kinit.log" 2>&1; then
+    p_ok "s4u: $S4U_SVC signed in with its keytab"
+else
+    p_bad "s4u: kinit -k of $S4U_SVC failed (see s4u-kinit.log)"
+fi
+# shellcheck disable=SC2016
+gexec_in "$KDC_C" sh -c 'printf "%s\n" "$0" >> /data/k1-refuse' "$S4U_LIST@$REALM" \
+    >"$D/s4u-refuse.log" 2>&1 || p_bad "s4u: could not list $S4U_LIST for refusal"
+s4u_gid="$(graphql '{ groups { id displayName } }' '{}' 2>"$D/s4u-groups.err" | python3 -c '
+import json, sys
+groups = json.load(sys.stdin)["groups"]
+print(next((g["id"] for g in groups if g["displayName"] == "lldap_disabled"), ""))' \
+    2>>"$D/s4u-groups.err")" || s4u_gid=""
+# shellcheck disable=SC2016
+graphql 'mutation($u: String!, $g: Int!) { addUserToGroup(userId: $u, groupId: $g) { ok } }' \
+    '{"u": "'"$S4U_OFF"'", "g": '"${s4u_gid:-0}"'}' >"$D/s4u-disable.json" 2>&1 \
+    || p_bad "s4u: adding $S4U_OFF to lldap_disabled failed (see s4u-disable.json, s4u-groups.err)"
+s4u_off=""
+for _ in $(seq 1 20); do
+    if gexec_in "$KDC_C" kadmin -k -t /data/kadm5.keytab -p "$ADMIN" -q "getprinc $S4U_OFF" \
+        >"$D/s4u-off-princ.txt" 2>&1 && grep -q DISALLOW_ALL_TIX "$D/s4u-off-princ.txt"; then
+        s4u_off=1
+        break
+    fi
+    sleep 0.5
+done
+if [ -n "$s4u_off" ]; then
+    p_ok "s4u: $S4U_OFF's principal is DISALLOW_ALL_TIX"
+else
+    p_bad "s4u: $S4U_OFF's principal is not DISALLOW_ALL_TIX (see s4u-off-princ.txt)"
+fi
+
+before="$(notice_lines)" || before=""
+if s4u_kvno "$S4U_LIST" >"$D/s4u-listed.log" 2>&1; then
+    p_bad "s4u listed: $S4U_SVC got a ticket for a refused user"
+elif grep -qi 'revoked' "$D/s4u-listed.log"; then
+    p_ok "s4u listed: S4U2Self for a refused user says revoked"
+else
+    p_bad "s4u listed: S4U2Self did not say revoked (see s4u-listed.log)"
+fi
+no_new_notice "s4u listed" "$before"
+before="$(notice_lines)" || before=""
+if s4u_kvno "$S4U_OFF" >"$D/s4u-disabled.log" 2>&1; then
+    p_bad "s4u disabled: $S4U_SVC got a ticket for a disabled user"
+elif grep -qi 'revoked' "$D/s4u-disabled.log"; then
+    p_ok "s4u disabled: S4U2Self for a disabled user says revoked"
+else
+    p_bad "s4u disabled: S4U2Self did not say revoked (see s4u-disabled.log)"
+fi
+no_new_notice "s4u disabled" "$before"
+before="$(notice_lines)" || before=""
+if s4u_kvno "$S4U_OK" >"$D/s4u-allowed.log" 2>&1 \
+    && grep -q 'keytab entry valid' "$D/s4u-allowed.log"; then
+    p_ok "s4u allowed: the S4U2Self ticket decrypts with $S4U_SVC's keytab"
+else
+    p_bad "s4u allowed: S4U2Self for an allowed user failed (see s4u-allowed.log)"
+fi
+no_new_notice "s4u allowed" "$before"
+if gexec_in "$KDC_C" klist -c "$S4U_CC" >"$D/s4u-klist.txt" 2>&1 \
+    && grep -A1 -F " $S4U_SVC@$REALM" "$D/s4u-klist.txt" | grep -qF "for client $S4U_OK@$REALM"; then
+    p_ok "s4u allowed: the cache holds $S4U_SVC's ticket with client $S4U_OK"
+else
+    p_bad "s4u allowed: no $S4U_SVC ticket with client $S4U_OK in the cache (see s4u-klist.txt)"
 fi
 
 kdc_stop

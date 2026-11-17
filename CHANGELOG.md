@@ -13,10 +13,11 @@
   change holds the write lock: a disabled principal of an enabled user is enabled, and an enabled
   principal of a disabled user is disabled.
 - KLLDAP's copies of the plaintext password of a GraphQL `setUserPassword`, an LDAP Modify
-  `userPassword`, an `ldappasswd` and an LDAP ADD are wiped when the request ends, and so are
-  the `userPassword` values of the decoded LDAP Modify and ADD requests. The `ldappasswd`
-  request's encoded value and the buffers the LDAP and HTTP libraries fill while reading and
-  decoding a request are not.
+  `userPassword`, an `ldappasswd` and an LDAP ADD are wiped when the request ends. So are the
+  decoded LDAP request's own copies, on every exit, a refusal included: the `userPassword`
+  values of a Modify or an ADD, and the encoded value of an `ldappasswd`. The copies the LDAP
+  library makes while it decodes a request, and the buffers the LDAP and HTTP libraries fill
+  while reading one, are not wiped.
 - The policies page's notice lists the rules that are not enforced yet, read from the
   catalog, and names the build's version.
 - A read-only admin can read policies, the item catalog, effective items and OU policy

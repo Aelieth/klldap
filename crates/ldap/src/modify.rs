@@ -416,6 +416,8 @@ mod tests {
     use pretty_assertions::assert_eq;
     use serial_test::serial;
     use std::collections::HashSet;
+    use std::panic::AssertUnwindSafe;
+    use std::task::Poll;
 
     fn make_password_modify_request(target_user: &str) -> LdapModifyRequest {
         LdapModifyRequest {
@@ -674,6 +676,60 @@ mod tests {
             assert_eq!(
                 (response, left),
                 (expected, vec![zeroed, vec![b"Bob".to_vec()]]),
+                "{label}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_the_password_bytes_of_a_modify_are_zeroed_when_its_answer_is_dropped_or_panics() {
+        let rows = [
+            ("dropped while it waits", false, "pending"),
+            ("panicked", true, "a test fault"),
+        ];
+        for (label, panics, expected) in rows {
+            let mut mock = MockTestBackendHandler::new();
+            setup_default_ldap_mock(&mut mock);
+            if panics {
+                mock.expect_registration_start()
+                    .returning(|_| panic!("a test fault"));
+            } else {
+                expect_registration_start(&mut mock, "bob");
+            }
+            let ldap_handler = setup_bound_admin_handler(mock).await;
+            let mut request = make_password_modify_request("bob");
+            let cn = modify_request("bob", LdapModifyType::Replace, "cn", &["Bob"]);
+            request.changes.extend(cn.changes);
+            let mut op = LdapOp::ModifyRequest(request);
+            let mut answer = Box::pin(ldap_handler.answer_and_wipe(&mut op));
+            let polled = std::future::poll_fn(|cx| {
+                let poll = AssertUnwindSafe(|| answer.as_mut().poll(cx));
+                Poll::Ready(std::panic::catch_unwind(poll))
+            })
+            .await;
+            let outcome = match polled {
+                Ok(Poll::Pending) => "pending",
+                Ok(Poll::Ready(_)) => "answered",
+                Err(payload) => payload.downcast_ref::<&str>().copied().unwrap_or("?"),
+            };
+            // Leaked, not dropped: after the panic only the unwinding can have zeroed the bytes.
+            if panics {
+                std::mem::forget(answer);
+            } else {
+                drop(answer);
+            }
+            let LdapOp::ModifyRequest(request) = op else {
+                unreachable!()
+            };
+            let left: Vec<_> = request
+                .changes
+                .into_iter()
+                .map(|c| c.modification.vals)
+                .collect();
+            assert_eq!(
+                (outcome, left),
+                (expected, vec![vec![vec![0; 11]], vec![b"Bob".to_vec()]]),
                 "{label}"
             );
         }

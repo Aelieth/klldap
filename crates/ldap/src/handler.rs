@@ -15,8 +15,9 @@ use crate::{
 };
 use ldap3_proto::proto::{
     LdapAddRequest, LdapBindRequest, LdapBindResponse, LdapCompareRequest, LdapExtendedRequest,
-    LdapExtendedResponse, LdapFilter, LdapModifyRequest, LdapOp, LdapPasswordModifyRequest,
-    LdapResult as LdapResultOp, LdapResultCode, LdapSearchRequest, OID_PASSWORD_MODIFY, OID_WHOAMI,
+    LdapExtendedResponse, LdapFilter, LdapModifyRequest, LdapOp, LdapPartialAttribute,
+    LdapPasswordModifyRequest, LdapResult as LdapResultOp, LdapResultCode, LdapSearchRequest,
+    OID_PASSWORD_MODIFY, OID_WHOAMI,
 };
 use lldap_access_control::AccessControlledBackendHandler;
 use lldap_auth::access_control::{Permission, ValidationResults};
@@ -362,7 +363,11 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
 
     pub(crate) async fn answer_and_wipe(&self, ldap_op: &mut LdapOp) -> Vec<LdapOp> {
         let ldap_op = WipePasswords(ldap_op);
-        match &*ldap_op.0 {
+        match &mut *ldap_op.0 {
+            LdapOp::AddRequest(request) => self
+                .create_user_or_group(request)
+                .await
+                .unwrap_or_else(|e: LdapError| vec![make_add_response(e.code, e.message)]),
             LdapOp::ModifyRequest(request) => self.do_modify_request(request).await,
             LdapOp::ExtendedRequest(request) => self.do_extended_request(request).await,
             op => unsupported(op),
@@ -370,7 +375,10 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
     }
 
     #[instrument(skip_all, level = "debug")]
-    pub async fn create_user_or_group(&self, request: LdapAddRequest) -> LdapResult<Vec<LdapOp>> {
+    pub async fn create_user_or_group(
+        &self,
+        request: &mut LdapAddRequest,
+    ) -> LdapResult<Vec<LdapOp>> {
         let backend_handler = self
             .user_info
             .as_ref()
@@ -421,7 +429,7 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
 
     async fn dispatch(&mut self, mut ldap_op: LdapOp) -> Option<Vec<LdapOp>> {
         Some(match ldap_op {
-            LdapOp::ModifyRequest(_) | LdapOp::ExtendedRequest(_) => {
+            LdapOp::AddRequest(_) | LdapOp::ModifyRequest(_) | LdapOp::ExtendedRequest(_) => {
                 self.answer_and_wipe(&mut ldap_op).await
             }
             LdapOp::BindRequest(request) => self.do_bind(&request).await,
@@ -440,10 +448,6 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
                 self.user_info = None;
                 return None;
             }
-            LdapOp::AddRequest(request) => self
-                .create_user_or_group(request)
-                .await
-                .unwrap_or_else(|e: LdapError| vec![make_add_response(e.code, e.message)]),
             LdapOp::DelRequest(request) => self
                 .delete_user_or_group(request)
                 .await
@@ -464,16 +468,16 @@ fn unsupported(op: &LdapOp) -> Vec<LdapOp> {
     )]
 }
 
-/// Zeroes in place, when dropped, a Modify's `userPassword` values and a PasswordModify's value.
+/// Zeroes in place, when dropped, an Add's or a Modify's `userPassword` values and a
+/// PasswordModify's value.
 struct WipePasswords<'r>(&'r mut LdapOp);
 
 impl Drop for WipePasswords<'_> {
     fn drop(&mut self) {
         match self.0 {
+            LdapOp::AddRequest(request) => wipe_passwords(request.attributes.iter_mut()),
             LdapOp::ModifyRequest(request) => {
-                let changes = request.changes.iter_mut().map(|c| &mut c.modification);
-                let passwords = changes.filter(|m| m.atype.eq_ignore_ascii_case("userpassword"));
-                passwords.flat_map(|m| m.vals.iter_mut()).for_each(wipe);
+                wipe_passwords(request.changes.iter_mut().map(|c| &mut c.modification));
             }
             LdapOp::ExtendedRequest(request) if request.name == OID_PASSWORD_MODIFY => {
                 request.value.iter_mut().for_each(wipe);
@@ -481,6 +485,11 @@ impl Drop for WipePasswords<'_> {
             _ => {}
         }
     }
+}
+
+fn wipe_passwords<'a>(attributes: impl Iterator<Item = &'a mut LdapPartialAttribute>) {
+    let passwords = attributes.filter(|a| a.atype.eq_ignore_ascii_case("userpassword"));
+    passwords.flat_map(|a| a.vals.iter_mut()).for_each(wipe);
 }
 
 fn wipe(value: &mut Vec<u8>) {

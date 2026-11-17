@@ -30,28 +30,22 @@ use zeroize::Zeroizing;
 pub(crate) async fn create_user_or_group(
     backend_handler: &impl AdminBackendHandler,
     ldap_info: &LdapInfo,
-    mut request: LdapAddRequest,
+    request: &mut LdapAddRequest,
 ) -> LdapResult<Vec<LdapOp>> {
     let password = take_password(&mut request.attributes);
+    let attributes = std::mem::take(&mut request.attributes);
     let base_dn_str = &ldap_info.base_dn_str;
     let dn_parts = parse_distinguished_name(&request.dn)?;
     let internal_ou = get_internal_ou_from_dn_parts(&dn_parts);
     match get_user_or_group_id_from_distinguished_name(&request.dn, &ldap_info.base_dn) {
         UserOrGroupName::User(user_id) => {
-            create_user(
-                backend_handler,
-                user_id,
-                request.attributes,
-                password,
-                internal_ou,
-            )
-            .await
+            create_user(backend_handler, user_id, attributes, password, internal_ou).await
         }
         UserOrGroupName::Group(group_name) => {
             create_group(
                 backend_handler,
                 group_name,
-                request.attributes,
+                attributes,
                 password,
                 internal_ou,
             )
@@ -363,7 +357,8 @@ async fn create_group(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::handler::tests::setup_bound_admin_handler;
+    use crate::handler::LdapHandler;
+    use crate::handler::tests::{setup_bound_admin_handler, setup_bound_handler_with_group};
     use crate::password::tests::{
         expect_password_registration, expect_registration_start, install, kdc_rows,
     };
@@ -395,7 +390,7 @@ mod tests {
 
         let ldap_handler = setup_bound_admin_handler(mock).await;
 
-        let request = LdapAddRequest {
+        let mut request = LdapAddRequest {
             dn: "uid=bob,ou=people,dc=example,dc=com".to_owned(),
             attributes: vec![LdapPartialAttribute {
                 atype: "cn".to_owned(),
@@ -404,7 +399,7 @@ mod tests {
         };
 
         assert_eq!(
-            ldap_handler.create_user_or_group(request).await,
+            ldap_handler.create_user_or_group(&mut request).await,
             Ok(vec![make_add_response(
                 LdapResultCode::Success,
                 String::new()
@@ -416,7 +411,7 @@ mod tests {
     async fn test_create_user_rejects_non_utf8_password() {
         let mock = MockTestBackendHandler::new();
         let ldap_handler = setup_bound_admin_handler(mock).await;
-        let request = LdapAddRequest {
+        let mut request = LdapAddRequest {
             dn: "uid=bob,ou=people,dc=example,dc=com".to_owned(),
             attributes: vec![LdapPartialAttribute {
                 atype: "userPassword".to_owned(),
@@ -424,7 +419,7 @@ mod tests {
             }],
         };
         assert_eq!(
-            ldap_handler.create_user_or_group(request).await,
+            ldap_handler.create_user_or_group(&mut request).await,
             Err(LdapError {
                 code: LdapResultCode::ConstraintViolation,
                 message: "userPassword must be valid UTF-8".to_string(),
@@ -494,16 +489,91 @@ mod tests {
             "cn=bob,ou=groups,dc=example,dc=com",
         ] {
             let ldap_handler = setup_bound_admin_handler(MockTestBackendHandler::new()).await;
-            let request = LdapAddRequest {
+            let mut request = LdapAddRequest {
                 dn: dn.to_owned(),
                 attributes: vec![two("cn", "Bob", "Bobby"), two("userPassword", "a", "b")],
             };
             assert_eq!(
-                ldap_handler.create_user_or_group(request).await,
+                ldap_handler.create_user_or_group(&mut request).await,
                 Err(constraint_violation(
                     "Expected a single value for attribute userPassword".to_owned()
                 )),
                 "{dn}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_the_password_bytes_of_an_add_are_zeroed_whichever_check_refuses_it() {
+        let attribute = |atype: &str, vals: Vec<Vec<u8>>| LdapPartialAttribute {
+            atype: atype.to_owned(),
+            vals,
+        };
+        let answer = |code, message: &str| vec![make_add_response(code, message.to_owned())];
+        let unauthorized = answer(
+            LdapResultCode::InsufficentAccessRights,
+            "Unauthorized write",
+        );
+        type Row = (
+            &'static str,
+            Option<&'static str>,
+            LdapPartialAttribute,
+            Vec<LdapOp>,
+            Vec<LdapPartialAttribute>,
+        );
+        let rows: [Row; 3] = [
+            (
+                "unbound",
+                None,
+                attribute("userPassword", vec![b"s3cret".to_vec()]),
+                unauthorized.clone(),
+                vec![
+                    attribute("cn", vec![b"Bob".to_vec()]),
+                    attribute("userPassword", vec![vec![0; 6]]),
+                ],
+            ),
+            (
+                "not an admin",
+                Some("regular"),
+                attribute("USERPASSWORD", vec![b"s3cret".to_vec()]),
+                unauthorized,
+                vec![
+                    attribute("cn", vec![b"Bob".to_vec()]),
+                    attribute("USERPASSWORD", vec![vec![0; 6]]),
+                ],
+            ),
+            (
+                "an admin, two values",
+                Some("lldap_admin"),
+                attribute("userPassword", vec![b"one".to_vec(), b"two".to_vec()]),
+                answer(
+                    LdapResultCode::ConstraintViolation,
+                    "Expected a single value for attribute userPassword",
+                ),
+                vec![],
+            ),
+        ];
+        let pairs = |attributes: Vec<LdapPartialAttribute>| -> Vec<(String, Vec<Vec<u8>>)> {
+            attributes.into_iter().map(|a| (a.atype, a.vals)).collect()
+        };
+        for (label, group, password, expected, left) in rows {
+            let mock = MockTestBackendHandler::new();
+            let ldap_handler = match group {
+                Some(group) => setup_bound_handler_with_group(mock, group).await,
+                None => LdapHandler::new_for_tests(mock, "dc=example,dc=com"),
+            };
+            let mut op = LdapOp::AddRequest(LdapAddRequest {
+                dn: "uid=bob,ou=people,dc=example,dc=com".to_owned(),
+                attributes: vec![attribute("cn", vec![b"Bob".to_vec()]), password],
+            });
+            let response = ldap_handler.answer_and_wipe(&mut op).await;
+            let LdapOp::AddRequest(request) = op else {
+                unreachable!()
+            };
+            assert_eq!(
+                (response, pairs(request.attributes)),
+                (expected, pairs(left)),
+                "{label}"
             );
         }
     }
@@ -553,7 +623,7 @@ mod tests {
 
         let ldap_handler = setup_bound_admin_handler(mock).await;
 
-        let request = LdapAddRequest {
+        let mut request = LdapAddRequest {
             dn: "uid=bob,ou=people,dc=example,dc=com".to_owned(),
             attributes: vec![
                 LdapPartialAttribute {
@@ -584,7 +654,7 @@ mod tests {
         };
 
         assert_eq!(
-            ldap_handler.create_user_or_group(request).await,
+            ldap_handler.create_user_or_group(&mut request).await,
             Ok(vec![make_add_response(
                 LdapResultCode::Success,
                 String::new()
@@ -612,7 +682,7 @@ mod tests {
             .times(1)
             .return_once(|_| Ok(GroupId(5)));
         let ldap_handler = setup_bound_admin_handler(mock).await;
-        let request = LdapAddRequest {
+        let mut request = LdapAddRequest {
             dn: "cn=bob,ou=groups,dc=example,dc=com".to_owned(),
             attributes: vec![LdapPartialAttribute {
                 atype: "cn".to_owned(),
@@ -620,7 +690,7 @@ mod tests {
             }],
         };
         assert_eq!(
-            ldap_handler.create_user_or_group(request).await,
+            ldap_handler.create_user_or_group(&mut request).await,
             Ok(vec![make_add_response(
                 LdapResultCode::Success,
                 String::new()
@@ -699,7 +769,7 @@ mod tests {
                 .times(usize::from(expected.is_ok()))
                 .return_once(|_| Ok(GroupId(5)));
             let ldap_handler = setup_bound_admin_handler(mock).await;
-            let request = LdapAddRequest {
+            let mut request = LdapAddRequest {
                 dn: "cn=bob,ou=groups,dc=example,dc=com".to_owned(),
                 attributes: vec![LdapPartialAttribute {
                     atype: "userPassword".to_owned(),
@@ -709,7 +779,7 @@ mod tests {
             let expected =
                 expected.map(|()| vec![make_add_response(LdapResultCode::Success, String::new())]);
             assert_eq!(
-                ldap_handler.create_user_or_group(request).await,
+                ldap_handler.create_user_or_group(&mut request).await,
                 expected,
                 "{label}"
             );
@@ -744,7 +814,7 @@ mod tests {
             .times(1)
             .return_once(|_| Ok(GroupId(5)));
         let ldap_handler = setup_bound_admin_handler(mock).await;
-        let request = LdapAddRequest {
+        let mut request = LdapAddRequest {
             dn: "cn=builders,ou=groups,dc=example,dc=com".to_owned(),
             attributes: vec![
                 LdapPartialAttribute {
@@ -766,7 +836,7 @@ mod tests {
             ],
         };
         assert_eq!(
-            ldap_handler.create_user_or_group(request).await,
+            ldap_handler.create_user_or_group(&mut request).await,
             Ok(vec![make_add_response(
                 LdapResultCode::Success,
                 String::new()
@@ -794,7 +864,7 @@ mod tests {
 
         let ldap_handler = setup_bound_admin_handler(mock).await;
 
-        let request = LdapAddRequest {
+        let mut request = LdapAddRequest {
             dn: "uid=bob,ou=people,dc=example,dc=com".to_owned(),
             attributes: vec![
                 LdapPartialAttribute {
@@ -813,7 +883,7 @@ mod tests {
         };
 
         assert_eq!(
-            ldap_handler.create_user_or_group(request).await,
+            ldap_handler.create_user_or_group(&mut request).await,
             Ok(vec![make_add_response(
                 LdapResultCode::Success,
                 String::new()
@@ -895,7 +965,7 @@ mod tests {
             let ldap_handler = setup_bound_admin_handler(mock).await;
             assert_eq!(
                 ldap_handler
-                    .create_user_or_group(add_user_request(extra))
+                    .create_user_or_group(&mut add_user_request(extra))
                     .await,
                 Ok(vec![make_add_response(
                     LdapResultCode::Success,
@@ -939,7 +1009,7 @@ mod tests {
             };
             assert_eq!(
                 ldap_handler
-                    .create_user_or_group(add_user_request(synced_with_password()))
+                    .create_user_or_group(&mut add_user_request(synced_with_password()))
                     .await,
                 expected,
                 "{kdc:?}"
@@ -976,7 +1046,7 @@ mod tests {
         mock.expect_registration_finish().times(0);
         let ldap_handler = setup_bound_admin_handler(mock).await;
         let got = ldap_handler
-            .create_user_or_group(add_user_request(synced_with_password()))
+            .create_user_or_group(&mut add_user_request(synced_with_password()))
             .await;
         assert!(
             matches!(&got, Err(e) if e.code == LdapResultCode::OperationsError),

@@ -11,9 +11,9 @@ use krb5_config::KadmindListen;
 use krb5_crypto::KeySalt;
 use krb5_kdc::host::{HostChange, KerberosStoreError};
 use krb5_kdc::{
-    AdminEnt, AdminFields, CreateKeys, CreatePlan, Error as StoreError, KDB_DISALLOW_ALL_TIX,
-    KDB_REQUIRES_PRE_AUTH, KdcLog, ListenLimits, PasswordPlan, PrincipalRead, PrincipalStore,
-    SharedDump, SharedStore, Shutdown, kadm5_mask, lookup_principal_id,
+    AdminEnt, AdminFields, Error as StoreError, KDB_DISALLOW_ALL_TIX, KDB_REQUIRES_PRE_AUTH,
+    KdcLog, ListenLimits, PrincipalRead, PrincipalStore, SharedDump, SharedStore, Shutdown,
+    kadm5_mask, lookup_principal_id,
 };
 use krb5_types::PrincipalName;
 use lldap_domain::types::UserId;
@@ -28,8 +28,8 @@ use lldap_domain_handlers::password::{kill_point, record_commit_failure, record_
 use std::collections::HashMap;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
@@ -705,9 +705,8 @@ where
     C: FnOnce(HostChange) -> Result<(), KerberosStoreError>,
 {
     let name = user_principal(user);
-    let change = || match locked {
-        Some(locked) => change_following(own, user, password, enctypes, locked, commit()),
-        None => krb5_kdc::change_password_shared_committing(
+    let change = || {
+        krb5_kdc::change_password_shared_committing_then(
             &own.store,
             &name,
             &own.realm,
@@ -717,11 +716,26 @@ where
             enctypes,
             |s| not_an_alias(s, &own.realm, user),
             commit(),
-        ),
+            |s| follow_directory(s, &name, locked, &own.actor),
+        )
     };
     let mut next = after_change(change());
     if next == Next::Create {
-        next = after_create(create_marked(own, user, password, enctypes, ent, commit()));
+        let created = krb5_kdc::create_password_shared_committing_then(
+            &own.store,
+            &name,
+            &own.realm,
+            password,
+            enctypes,
+            ent,
+            &own.actor,
+            commit(),
+            |s| {
+                follow_directory(s, &name, locked, &own.actor)?;
+                s.set_host_owned_in(&name, &own.realm, true)
+            },
+        );
+        next = after_create(created);
     }
     if next == Next::ChangeAgain {
         next = after_change(change());
@@ -733,78 +747,20 @@ where
     }
 }
 
-// kerber-rust v1.2.3-rc.1 `change_password_shared_committing` (crates/krb5-kdc/src/store/
-// password.rs:300-332) with the status set to the directory's in the same change.
-fn change_following(
-    own: &Own,
-    user: &UserId,
-    password: &[u8],
-    enctypes: &[KeySalt],
-    locked: bool,
-    commit: impl FnOnce(HostChange) -> Result<(), KerberosStoreError>,
+// `set_status` also writes `pw_expire`: the one the keys or the create left goes through.
+fn follow_directory(
+    s: &mut PrincipalStore,
+    name: &PrincipalName,
+    locked: Option<bool>,
+    actor: &str,
 ) -> Result<(), StoreError> {
-    let name = user_principal(user);
-    let planned = {
-        let (g, read) = krb5_kdc::read_fresh(&own.store);
-        match read {
-            Err(_) => Ok(None),
-            Ok(()) => not_an_alias(&g, &own.realm, user)
-                .and_then(|()| g.plan_password(&name, &own.realm, password, enctypes)),
+    let now = s.get_name(name).map(|p| (p.locked(), p.pw_expire));
+    match (locked, now) {
+        (Some(locked), Some((was, pw_expire))) if was != locked => {
+            s.set_status(name, locked, pw_expire, actor)
         }
-    };
-    let prepared = planned.and_then(|plan| plan.map(PasswordPlan::derive).transpose())?;
-    let mut store = own.store.write().unwrap_or_else(PoisonError::into_inner);
-    store.change_committing(commit, |s| {
-        let applied = match prepared {
-            Some(p) => s.apply_password(p, 0, &own.actor)?,
-            None => false,
-        };
-        if !applied {
-            not_an_alias(s, &own.realm, user)?;
-            s.set_password_etypes_keepold_n_in(
-                &name, &own.realm, password, 0, &own.actor, enctypes,
-            )?;
-        }
-        let now = s.get_name(&name).map(|p| (p.locked(), p.pw_expire));
-        match now {
-            Some((was, pw_expire)) if was != locked => {
-                s.set_status(&name, locked, pw_expire, &own.actor)
-            }
-            _ => Ok(()),
-        }
-    })?
-}
-
-fn create_marked(
-    own: &Own,
-    user: &UserId,
-    password: &[u8],
-    enctypes: &[KeySalt],
-    ent: &AdminEnt,
-    commit: impl FnOnce(HostChange) -> Result<(), KerberosStoreError>,
-) -> Result<(), StoreError> {
-    let name = user_principal(user);
-    let planned = {
-        let (g, read) = krb5_kdc::read_fresh(&own.store);
-        match read {
-            Err(_) => None,
-            Ok(()) => Some(g.plan_create_password(&name, &own.realm, password, enctypes, ent)?),
-        }
-    };
-    let prepared = planned.map(CreatePlan::derive).transpose()?;
-    let mut store = own.store.write().map_err(|_| poisoned())?;
-    store.change_committing(commit, |s| {
-        not_an_alias(s, &own.realm, user)?;
-        let created = match prepared {
-            Some(p) => s.create_prepared(p, &own.actor)?,
-            None => false,
-        };
-        if !created {
-            let keys = CreateKeys::Password(password);
-            s.create_principal_3_in(&name, &own.realm, keys, enctypes, ent, &own.actor)?;
-        }
-        s.set_host_owned_in(&name, &own.realm, true)
-    })?
+        _ => Ok(()),
+    }
 }
 
 const PANICKED: &str = "the password change panicked";
@@ -2042,10 +1998,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_change_following_mirrors_a_helper_of_this_signature() {
+    fn test_the_committing_helpers_take_the_edit_after_their_own_arguments() {
         type Checks = fn(&PrincipalStore) -> Result<(), StoreError>;
         type Commit = fn(HostChange) -> Result<(), KerberosStoreError>;
-        type Mirrored = fn(
+        type Edit = fn(&mut PrincipalStore) -> Result<(), StoreError>;
+        type Change = fn(
             &SharedDump,
             &PrincipalName,
             &str,
@@ -2055,8 +2012,21 @@ pub(crate) mod tests {
             &[KeySalt],
             Checks,
             Commit,
+            Edit,
         ) -> Result<(), StoreError>;
-        let _: Mirrored = krb5_kdc::change_password_shared_committing;
+        type Create = fn(
+            &SharedDump,
+            &PrincipalName,
+            &str,
+            &[u8],
+            &[KeySalt],
+            &AdminEnt,
+            &str,
+            Commit,
+            Edit,
+        ) -> Result<(), StoreError>;
+        let _: Change = krb5_kdc::change_password_shared_committing_then;
+        let _: Create = krb5_kdc::create_password_shared_committing_then;
     }
 
     #[tokio::test]

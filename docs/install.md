@@ -202,9 +202,10 @@ Moving between database backends is in [database_migration.md](database_migratio
 Write a dump of the Kerberos realm with the 0.7.2 image before the first 0.8.0 start; 0.8.0
 loads it and keeps the MIT files: [kerberos.md](kerberos.md#upgrading-from-072).
 
-At that first start, a migrated principal of a directory user without `kerberosSync` is
-disabled, not deleted, and a `kerberos_sync` log row names it. To use it again, turn
-`kerberosSync` on for the user and set the password once; or remove it with kadmin.
+At each start, a principal of a directory user without `kerberosSync`, a migrated one
+included, is disabled, not deleted, and a `kerberos_sync` log row names it. To use it again,
+turn `kerberosSync` on for the user, then change the user's password: the password change is
+what brings kinit back. Or remove the principal with kadmin.
 
 On MySQL and MariaDB schema changes are not transactional (the server commits at each DDL
 statement), so take a backup before the first 0.8.0 start; if a start is interrupted

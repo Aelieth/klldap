@@ -11,7 +11,7 @@ use krb5_crypto::KeySalt;
 use krb5_kdc::{
     AdminEnt, AdminFields, CreateKeys, CreatePlan, Error as StoreError, KDB_REQUIRES_PRE_AUTH,
     KdcLog, ListenLimits, PrincipalRead, PrincipalStore, SharedDump, SharedStore, Shutdown,
-    kadm5_mask,
+    kadm5_mask, lookup_principal_id,
 };
 use krb5_types::PrincipalName;
 use lldap_domain::types::UserId;
@@ -37,6 +37,7 @@ const USER_GONE: &str = "user gone";
 const NO_SYNC: &str = "no sync";
 const DISABLED_AT_START: &str =
     "disabled at start: a directory user without Kerberos sync has a principal";
+const START_CHUNK: usize = 100;
 
 pub struct EmbeddedKerberos {
     realm: String,
@@ -220,13 +221,16 @@ impl EmbeddedKerberos {
         let serial = self.writes.clone().lock_owned().await;
         tokio::task::spawn_blocking(move || {
             let _serial = serial;
-            let tgs = (PrincipalName::krbtgt(&own.realm), false);
-            let names = std::iter::once(tgs).chain(users.iter().map(|u| (user_principal(u), true)));
-            let (mut stale, mut missing) = (Vec::new(), 0);
             let mut store = own
                 .store
                 .write()
                 .map_err(|_| anyhow!("the principal store was poisoned"))?;
+            let tgs = (PrincipalName::krbtgt(&own.realm), false);
+            let users = users
+                .iter()
+                .filter(|u| alias_of(&store, &own.realm, u).is_none());
+            let names = std::iter::once(tgs).chain(users.map(|u| (user_principal(u), true)));
+            let (mut stale, mut missing) = (Vec::new(), 0);
             for (name, user) in names {
                 let Some(principal) = store
                     .fetch_name(&name)
@@ -285,42 +289,65 @@ impl EmbeddedKerberos {
         .context("the purge did not complete")?
     }
 
-    /// Once at start, before the listeners, on users read beforehand with their sync: marks each
+    /// At each start, before the listeners, on users read beforehand with their sync: marks each
     /// synced user's principal, removes a marked one no synced user has, and disables an
-    /// unmarked one of a user without sync. A second run writes nothing.
+    /// unmarked one of a user without sync, `START_CHUNK` per change. A second run writes nothing.
     pub async fn start_pass(&self, users: Vec<(UserId, bool)>) -> Result<StartPass> {
+        self.start_pass_in(users, START_CHUNK).await
+    }
+
+    async fn start_pass_in(&self, users: Vec<(UserId, bool)>, chunk: usize) -> Result<StartPass> {
         let own = self.own();
         let serial = self.writes.clone().lock_owned().await;
-        let swept = tokio::task::spawn_blocking(move || {
+        let (swept, aliases) = tokio::task::spawn_blocking(move || {
             let _serial = serial;
-            let directory: HashMap<String, bool> = users
-                .into_iter()
-                .map(|(user, sync)| (user.into_string(), sync))
-                .collect();
-            let mut store = own
-                .store
-                .write()
-                .map_err(|_| anyhow!("the principal store was poisoned"))?;
-            store
-                .change_committing(committing(own.host.as_ref()), |s| {
-                    let swept = sweep_plan(s, &own.realm, &directory);
-                    for one in &swept {
-                        match one.sweep {
-                            Sweep::Mark => s.set_host_owned_in(&one.name, &own.realm, true)?,
-                            Sweep::Remove(_) => s.remove_in(&one.name, &own.realm)?,
-                            Sweep::Disable => {
-                                s.set_status(&one.name, true, one.pw_expire, &own.actor)?;
+            let (swept, aliases) = {
+                let store = own
+                    .store
+                    .read()
+                    .map_err(|_| anyhow!("the principal store was poisoned"))?;
+                let aliases: Vec<_> = users
+                    .iter()
+                    .filter_map(|(user, _)| {
+                        Some((user.clone(), alias_of(&store, &own.realm, user)?))
+                    })
+                    .collect();
+                let directory: HashMap<String, bool> = users
+                    .into_iter()
+                    .map(|(user, sync)| (user.into_string(), sync))
+                    .collect();
+                (sweep_plan(&store, &own.realm, &directory), aliases)
+            };
+            for part in swept.chunks(chunk) {
+                let mut store = own
+                    .store
+                    .write()
+                    .map_err(|_| anyhow!("the principal store was poisoned"))?;
+                store
+                    .change_committing(committing(own.host.as_ref()), |s| {
+                        for one in part {
+                            match one.sweep {
+                                Sweep::Mark => s.set_host_owned_in(&one.name, &own.realm, true)?,
+                                Sweep::Remove(_) => s.remove_in(&one.name, &own.realm)?,
+                                Sweep::Disable => {
+                                    s.set_status(&one.name, true, one.pw_expire, &own.actor)?;
+                                }
                             }
                         }
-                    }
-                    Ok::<_, StoreError>(swept)
-                })
-                .and_then(|swept| swept)
-                .map_err(|e| anyhow!("while sweeping the Kerberos principals at start: {e}"))
-                .inspect(|_| own.host.start_pass_committed())
+                        Ok::<_, StoreError>(())
+                    })
+                    .and_then(|done| done)
+                    .map_err(|e| anyhow!("while sweeping the Kerberos principals at start: {e}"))?;
+            }
+            own.host.start_pass_committed();
+            Ok::<_, anyhow::Error>((swept, aliases))
         })
         .await
         .context("the start pass did not complete")??;
+        for (user, target) in &aliases {
+            let detail = aliased(user, target);
+            record(LogKind::KerberosSync, Some(user.as_str()), Some(&detail));
+        }
         let mut pass = StartPass::default();
         for one in &swept {
             let target = Some(one.target.as_str());
@@ -375,11 +402,7 @@ impl KerberosSync for EmbeddedKerberos {
     async fn sync_principal(&self, user: &UserId, password: &str) -> Result<(), String> {
         validate_kerberos_username(user.as_str())?;
         let own = self.own();
-        let (name, enctypes, ent) = (
-            user_principal(user),
-            self.enctypes.clone(),
-            self.new_principal(),
-        );
+        let (id, enctypes, ent) = (user.clone(), self.enctypes.clone(), self.new_principal());
         let password = Zeroizing::new(password.as_bytes().to_vec());
         logged(
             &self.writes,
@@ -387,7 +410,7 @@ impl KerberosSync for EmbeddedKerberos {
             user.as_str(),
             "sync",
             move || {
-                set_password(&own, &name, &password, &enctypes, &ent)
+                set_password(&own, &id, &password, &enctypes, &ent)
                     .map_err(|e| anyhow!("while setting the Kerberos password: {e}"))
             },
         )
@@ -409,18 +432,21 @@ impl KerberosSync for EmbeddedKerberos {
     }
     async fn set_principal_enabled(&self, user: &UserId, enabled: bool) -> Result<(), String> {
         let op = if enabled { "enable" } else { "disable" };
-        let (own, name) = (self.own(), user_principal(user));
+        let (own, name, id) = (self.own(), user_principal(user), user.clone());
         logged(
             &self.writes,
             LogKind::KerberosSync,
             user.as_str(),
             op,
             move || {
-                in_change(&own, |s| match s.fetch_name(&name)? {
-                    Some(principal) => {
-                        s.set_status(&name, !enabled, principal.pw_expire, &own.actor)
+                in_change(&own, |s| {
+                    not_an_alias(s, &own.realm, &id)?;
+                    match s.fetch_name(&name)? {
+                        Some(principal) => {
+                            s.set_status(&name, !enabled, principal.pw_expire, &own.actor)
+                        }
+                        None => Ok(()),
                     }
-                    None => Ok(()),
                 })
                 .map_err(|e| anyhow!("while setting the principal's status: {e}"))
             },
@@ -564,27 +590,28 @@ struct Own {
 
 fn set_password(
     own: &Own,
-    name: &PrincipalName,
+    user: &UserId,
     password: &[u8],
     enctypes: &[KeySalt],
     ent: &AdminEnt,
 ) -> Result<(), StoreError> {
+    let name = user_principal(user);
     let change = || {
         krb5_kdc::change_password_shared_committing(
             &own.store,
-            name,
+            &name,
             &own.realm,
             password,
             0,
             &own.actor,
             enctypes,
-            |_| Ok(()),
+            |s| not_an_alias(s, &own.realm, user),
             committing(own.host.as_ref()),
         )
     };
     let mut next = after_change(change());
     if next == Next::Create {
-        next = after_create(create_marked(own, name, password, enctypes, ent));
+        next = after_create(create_marked(own, user, password, enctypes, ent));
     }
     if next == Next::ChangeAgain {
         next = after_change(change());
@@ -598,30 +625,32 @@ fn set_password(
 
 fn create_marked(
     own: &Own,
-    name: &PrincipalName,
+    user: &UserId,
     password: &[u8],
     enctypes: &[KeySalt],
     ent: &AdminEnt,
 ) -> Result<(), StoreError> {
+    let name = user_principal(user);
     let planned = {
         let (g, read) = krb5_kdc::read_fresh(&own.store);
         match read {
             Err(_) => None,
-            Ok(()) => Some(g.plan_create_password(name, &own.realm, password, enctypes, ent)?),
+            Ok(()) => Some(g.plan_create_password(&name, &own.realm, password, enctypes, ent)?),
         }
     };
     let prepared = planned.map(CreatePlan::derive).transpose()?;
     let mut store = own.store.write().map_err(|_| poisoned())?;
     store.change_committing(committing(own.host.as_ref()), |s| {
+        not_an_alias(s, &own.realm, user)?;
         let created = match prepared {
             Some(p) => s.create_prepared(p, &own.actor)?,
             None => false,
         };
         if !created {
             let keys = CreateKeys::Password(password);
-            s.create_principal_3_in(name, &own.realm, keys, enctypes, ent, &own.actor)?;
+            s.create_principal_3_in(&name, &own.realm, keys, enctypes, ent, &own.actor)?;
         }
-        s.set_host_owned_in(name, &own.realm, true)
+        s.set_host_owned_in(&name, &own.realm, true)
     })?
 }
 
@@ -698,6 +727,26 @@ fn user_principal(user: &UserId) -> PrincipalName {
     PrincipalName::new(PrincipalName::NT_PRINCIPAL, [user.as_str()])
 }
 
+/// The principal that `user`'s own name is an alias record of, read unresolved.
+pub(crate) fn alias_of(store: &PrincipalStore, realm: &str, user: &UserId) -> Option<String> {
+    let id = lookup_principal_id(&user_principal(user), realm)?;
+    store.get_raw(&id)?.alias_target()
+}
+
+fn aliased(user: &UserId, target: &str) -> String {
+    format!(
+        "the principal name of user {} is an alias of {target}",
+        user.as_str()
+    )
+}
+
+fn not_an_alias(store: &PrincipalStore, realm: &str, user: &UserId) -> Result<(), StoreError> {
+    match alias_of(store, realm, user) {
+        Some(target) => Err(StoreError::InvalidArgument(aliased(user, &target))),
+        None => Ok(()),
+    }
+}
+
 // One store write at a time; the guard and the log row go with the call, so a dropped caller
 // keeps both.
 async fn logged<T: Send + 'static>(
@@ -748,6 +797,7 @@ pub(crate) mod tests {
         pub(crate) realm: MemoryRealm,
         changes: std::sync::Mutex<Vec<Operation>>,
         own: AtomicUsize,
+        started_at: std::sync::Mutex<Option<usize>>,
     }
 
     impl KerberosStore for Counting {
@@ -767,7 +817,9 @@ pub(crate) mod tests {
             self.realm.commit(change.batch)
         }
 
-        fn start_pass_committed(&self) {}
+        fn start_pass_committed(&self) {
+            *self.started_at.lock().unwrap() = Some(self.own.load(Ordering::Relaxed));
+        }
     }
 
     pub(crate) struct TempRealm {
@@ -1256,5 +1308,124 @@ pub(crate) mod tests {
                 .is_some_and(|p| p.host_owned()),
             "the upgrade's mark survives a reload"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_the_start_pass_commits_in_chunks_and_sets_the_flag_after_the_last() {
+        let temp = TempRealm::new();
+        let (embedded, store) = temp.embedded();
+        let names = ["u1", "u2", "u3", "u4", "u5"];
+        for user in names {
+            unmarked(&embedded, user, false);
+        }
+        let users: Vec<_> = names.iter().map(|u| (UserId::new(u), true)).collect();
+        let before = temp.own_writes();
+        let pass = embedded.start_pass_in(users.clone(), 2).await.unwrap();
+        let after: Vec<_> = names.iter().map(|u| marked(&store, u)).collect();
+        let flagged_at = temp.host.started_at.lock().unwrap().take();
+        assert_eq!(
+            (pass.marked, temp.own_writes() - before, flagged_at, after),
+            (5, 3, Some(temp.own_writes()), vec![Some((true, false)); 5])
+        );
+        let again = embedded.start_pass_in(users, 2).await.unwrap();
+        assert_eq!(
+            (again, temp.own_writes() - before),
+            (StartPass::default(), 3),
+            "a second start writes nothing"
+        );
+    }
+
+    fn fields(store: &SharedDump, user: &str) -> Option<(u32, u64, bool, Option<u32>)> {
+        let guard = store.read().unwrap();
+        let p = guard.get_name(&user_principal(&UserId::new(user)))?;
+        let kvno = p.keys.iter().map(|k| k.kvno).max();
+        Some((p.attributes, p.max_life, p.locked(), kvno))
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_user_name_that_is_an_alias_is_never_written_through() {
+        let guard = LogGuard::install();
+        let temp = TempRealm::new();
+        let (embedded, store) = temp.embedded();
+        unmarked(&embedded, "svc", false);
+        let aliases = [("bob", "svc"), ("carl", "nobody")];
+        for (alias, target) in aliases {
+            let name = |user| user_principal(&UserId::new(user));
+            in_change(&embedded.own(), |s| {
+                s.create_alias_in(
+                    &name(alias),
+                    "EXAMPLE.COM",
+                    &name(target),
+                    "EXAMPLE.COM",
+                    "test",
+                )
+            })
+            .unwrap();
+        }
+        embedded.reconcile(Vec::new()).await.unwrap();
+        let (writes, svc) = (temp.own_writes(), fields(&store, "svc"));
+        let users: Vec<_> = aliases
+            .iter()
+            .map(|(alias, _)| UserId::new(alias))
+            .collect();
+        let sentences: Vec<_> = aliases
+            .iter()
+            .map(|(a, t)| format!("the principal name of user {a} is an alias of {t}@EXAMPLE.COM"))
+            .collect();
+        let mut named = Vec::new();
+        for (user, why) in users.iter().zip(&sentences) {
+            let synced = embedded.sync_principal(user, "A-Password-1").await;
+            let disabled = embedded.set_principal_enabled(user, false).await;
+            named.push((
+                synced.unwrap_err().ends_with(why.as_str()),
+                disabled.unwrap_err().ends_with(why.as_str()),
+            ));
+        }
+        let reconciled = embedded.reconcile(users.clone()).await.unwrap();
+        guard.recorder().take_events();
+        let synced = users.iter().map(|u| (u.clone(), true)).collect();
+        let pass = embedded.start_pass(synced).await.unwrap();
+        let rows: Vec<_> = guard
+            .recorder()
+            .take_events()
+            .into_iter()
+            .map(|e| (e.target, e.detail))
+            .collect();
+        let raw: Vec<_> = aliases
+            .iter()
+            .map(|(alias, _)| {
+                let read = store.read().unwrap();
+                let p = read.get_raw(&format!("{alias}@EXAMPLE.COM"))?;
+                Some((p.alias_target(), p.host_owned()))
+            })
+            .collect();
+        assert_eq!(
+            (
+                named,
+                reconciled,
+                pass,
+                temp.own_writes(),
+                fields(&store, "svc")
+            ),
+            (
+                vec![(true, true); 2],
+                (0, 0),
+                StartPass::default(),
+                writes,
+                svc
+            )
+        );
+        let expected_rows: Vec<_> = aliases
+            .iter()
+            .zip(&sentences)
+            .map(|((alias, _), why)| (Some((*alias).to_owned()), Some(why.clone())))
+            .collect();
+        let expected_raw = vec![
+            Some((Some("svc@EXAMPLE.COM".to_owned()), false)),
+            Some((Some("nobody@EXAMPLE.COM".to_owned()), false)),
+        ];
+        assert_eq!((rows, raw), (expected_rows, expected_raw));
     }
 }

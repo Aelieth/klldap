@@ -195,15 +195,17 @@ mod tests {
         KerberosCommitterHandle, sql_tables::init_table, start_unregistered_committer,
     };
     use pretty_assertions::assert_eq;
-    use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection};
+    use sea_orm::{
+        ConnectOptions, ConnectionTrait, Database, DatabaseConnection, TransactionTrait,
+    };
     use serial_test::serial;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Duration;
     use tokio::runtime::Runtime;
 
     type Connect<'a> = &'a dyn Fn(usize, &Runtime) -> DatabaseConnection;
 
-    // kerber-rust's own checks of a host store, each on a fresh database and committer.
     /// kerber-rust's suite plays the host and hands its own changes to `commit_change`; this
     /// routes them to our own-write path and everything else to `SqlRealm`.
     struct Conformance(SqlRealm);
@@ -342,6 +344,25 @@ mod tests {
             .unwrap();
     }
 
+    fn sqlite_one_connection(url: &str, runtime: &Runtime) -> DatabaseConnection {
+        let mut opts = ConnectOptions::new(url.to_owned());
+        opts.max_connections(1).sqlx_logging(false);
+        runtime.block_on(Database::connect(opts)).unwrap()
+    }
+
+    fn add_user(pool: &DatabaseConnection, runtime: &Runtime, user: &str) {
+        sql(
+            pool,
+            runtime,
+            &format!(
+                "INSERT INTO users (user_id, email, lowercase_email, creation_date, uuid, \
+                 modified_date, password_modified_date) VALUES ('{user}', '{user}@ex.com', \
+                 '{user}@ex.com', '2026-01-01 00:00:00', 'uuid-{user}', \
+                 '2026-01-01 00:00:00', '2026-01-01 00:00:00')"
+            ),
+        );
+    }
+
     fn answer(out: Result<Result<(), StoreError>, StoreError>) -> &'static str {
         match out.and_then(|done| done) {
             Ok(()) => "written",
@@ -368,16 +389,7 @@ mod tests {
         let profile = boot::profile(&temp.settings);
         let (committer, pool) = committer_on(connect, &runtime);
         for user in ["bob", "gone", "carol", "dave"] {
-            sql(
-                &pool,
-                &runtime,
-                &format!(
-                    "INSERT INTO users (user_id, email, lowercase_email, creation_date, uuid, \
-                     modified_date, password_modified_date) VALUES ('{user}', '{user}@ex.com', \
-                     '{user}@ex.com', '2026-01-01 00:00:00', 'uuid-{user}', \
-                     '2026-01-01 00:00:00', '2026-01-01 00:00:00')"
-                ),
-            );
+            add_user(&pool, &runtime, user);
         }
         let host = {
             let host = Arc::new(SqlRealm::new(committer.store()));
@@ -479,11 +491,70 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("klldap-owned-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.join("u0.db").display());
-        owned_rows_on(&|runtime| {
-            let mut opts = ConnectOptions::new(url.clone());
-            opts.max_connections(1).sqlx_logging(false);
-            runtime.block_on(Database::connect(opts)).unwrap()
+        owned_rows_on(&|runtime| sqlite_one_connection(&url, runtime));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial]
+    fn test_a_held_connection_fails_a_change_within_one_step_on_sqlite() {
+        let dir = std::env::temp_dir().join(format!("klldap-stall-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.join("stall.db").display());
+        let runtime = runtime();
+        let temp = TempRealm::new();
+        let (committer, pool) =
+            committer_on(&|runtime| sqlite_one_connection(&url, runtime), &runtime);
+        add_user(&pool, &runtime, "bob");
+        let host = Arc::new(SqlRealm::new(committer.store()));
+        host.start_pass_committed();
+        let profile = boot::profile(&temp.settings);
+        let store = krb5_kdc::shared_dump(
+            boot::open_store(&temp.settings, &profile, host.clone()).unwrap(),
+        );
+        let ready = Arc::new(AtomicBool::new(true));
+        let embedded = EmbeddedKerberos::new(store.clone(), &temp.settings, ready, host.clone());
+        let bob = UserId::new("bob");
+        let sync = |password| runtime.block_on(embedded.sync_principal(&bob, password));
+        let kvno = || {
+            let name = PrincipalName::new(PrincipalName::NT_PRINCIPAL, ["bob"]);
+            let guard = store.read().unwrap();
+            guard.get_name(&name)?.keys.iter().map(|k| k.kvno).max()
+        };
+        sync("A-Password-1").unwrap();
+        let (old_kvno, old_rows) = (kvno(), host.load().unwrap());
+        let (held_tx, held) = std::sync::mpsc::channel();
+        let holder = runtime.spawn({
+            let pool = pool.clone();
+            async move {
+                let txn = pool.begin().await.unwrap();
+                let statement = "UPDATE users SET display_name = 'held' WHERE user_id = 'bob'";
+                txn.execute_unprepared(statement).await.unwrap();
+                held_tx.send(()).unwrap();
+                tokio::time::sleep(Duration::from_secs(6)).await;
+                txn.rollback().await.unwrap();
+            }
         });
+        held.recv().unwrap();
+        let stalled = sync("A-Password-2").unwrap_err();
+        runtime.block_on(holder).unwrap();
+        assert_eq!(
+            (
+                stalled.ends_with("the database did not answer within 5s"),
+                kvno(),
+                host.load().unwrap() == old_rows
+            ),
+            (true, old_kvno, true),
+            "{stalled}"
+        );
+        sync("A-Password-3").unwrap();
+        assert_eq!(
+            kvno(),
+            old_kvno.map(|k| k + 1),
+            "the next change is written"
+        );
+        drop((embedded, store, host));
+        runtime.block_on(committer.shutdown());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -570,9 +641,7 @@ mod tests {
                 "sqlite://{}?mode=rwc",
                 file.join(format!("{n}.db")).display()
             );
-            let mut opts = ConnectOptions::new(url);
-            opts.max_connections(1).sqlx_logging(false);
-            runtime.block_on(Database::connect(opts)).unwrap()
+            sqlite_one_connection(&url, runtime)
         });
         let _ = std::fs::remove_dir_all(&dir);
     }

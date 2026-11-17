@@ -703,10 +703,29 @@ fn kerberos_migrates_a_dump() {
         "kinit livebob on the migrated realm",
     );
     assert!(realm.data_dir.join("mit-db2.bak/principal.dump").is_file());
+    let db_url = realm.fixture.db_url().to_owned();
+    let marked_rows = |detail: &str| {
+        query_i64(
+            &db_url,
+            &format!(
+                "SELECT COUNT(*) FROM logs WHERE kind = 'kerberos_sync' AND detail LIKE '{detail}'"
+            ),
+        )
+    };
+    assert_eq!(
+        marked_rows("marked at start: 1 principals"),
+        1,
+        "the first start marks livebob"
+    );
     realm.fixture.restart();
     expect_ok(
         &kinit(&realm.krb, FIRST),
         "kinit livebob after the second boot",
+    );
+    assert_eq!(
+        marked_rows("marked at start:%"),
+        1,
+        "a second start marks nothing"
     );
     let log = realm.fixture.server_log();
     assert_eq!(log.matches("Migrated the MIT realm").count(), 1, "{log}");
@@ -739,12 +758,9 @@ fn kerberos_migrates_a_dump_for_a_user_without_sync() {
     realm
         .fixture
         .restart_with_env("LLDAP_KERBEROS_OPTIONS__ENABLED", "true");
-    let refused = kinit(&realm.krb, FIRST);
-    expect_fail(&refused, "kinit livebob without sync on the migrated realm");
-    assert!(
-        output_text(&refused).contains("revoked"),
-        "{}",
-        output_text(&refused)
+    expect_revoked(
+        &kinit(&realm.krb, FIRST),
+        "kinit livebob without sync on the migrated realm",
     );
     let admin_keytab = realm.admin_keytab.display().to_string();
     let princ = realm.krb.run(
@@ -776,7 +792,7 @@ fn kerberos_migrates_a_dump_for_a_user_without_sync() {
     };
     assert_eq!(disabled_rows(), 1, "one row names the disabled principal");
     realm.fixture.restart();
-    expect_fail(
+    expect_revoked(
         &kinit(&realm.krb, FIRST),
         "kinit livebob without sync after the second boot",
     );

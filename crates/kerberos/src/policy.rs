@@ -227,10 +227,16 @@ mod tests {
             "no admission module"
         );
         crate::boot::install_plugins(&mut store.write().unwrap());
-        assert_ne!(
-            first_as(&store),
-            krb5_types::err::CLIENT_REVOKED,
-            "the module installed"
+        let bob = PrincipalName::new(PrincipalName::NT_PRINCIPAL, ["bob"]);
+        let preauth = store
+            .read()
+            .unwrap()
+            .get_name(&bob)
+            .map(Principal::requires_preauth);
+        assert_eq!(
+            (preauth, first_as(&store)),
+            (Some(true), err::PREAUTH_REQUIRED),
+            "the module installed; bob requires pre-authentication"
         );
     }
 }

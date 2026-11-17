@@ -238,7 +238,9 @@ pub(crate) fn verdict(change: &HostChange, realm: &str) -> Result<Verdict, Kerbe
             "an undeclared write to a directory user's principal: {}",
             row.id
         ))),
-        Operation::Modify if owned.len() == 1 && unlock_only(intent) && unlocked_only(change) => {
+        Operation::Modify
+            if owned.len() == 1 && unlock_only(intent) && unlocked_only(change, realm) =>
+        {
             Ok(Verdict::Unlock(named))
         }
         Operation::ChangePassword if owned.len() == 1 => Ok(password_verdict(intent, named)),
@@ -282,7 +284,7 @@ fn unlock_only(intent: &WriteIntent) -> bool {
 }
 
 /// One record, in which only the fail count, one `TL_LAST_ADMIN_UNLOCK` and the stamp moved.
-fn unlocked_only(change: &HostChange) -> bool {
+fn unlocked_only(change: &HostChange, realm: &str) -> bool {
     let batch = &change.batch;
     let [row] = change.rows.as_slice() else {
         return false;
@@ -290,8 +292,15 @@ fn unlocked_only(change: &HostChange) -> bool {
     let (Some(before), Some(after)) = (&row.before, &row.after) else {
         return false;
     };
+    let judged = row_name(row.id.clone(), realm);
     batch.put_policies.is_empty()
         && batch.delete_policies.is_empty()
+        && batch.delete_principals.is_empty()
+        && batch.upsert_principals.len() == 1
+        && batch
+            .upsert_principals
+            .iter()
+            .all(|p| row_name(p.name.clone(), realm) == judged)
         && batch.realm.is_none()
         && row.mask & !UNLOCK_ROW_BITS == 0
         && after.fail_auth_count == 0
@@ -2376,6 +2385,30 @@ mod tests {
             "carried out: the keys, the record and one row"
         );
 
+        let own_purge = |declared: bool| {
+            let intent = intent_of(Operation::PurgeKeys, kadmin(true), &["bob"], &nothing());
+            let edit = |s: &mut PrincipalStore| s.purgekeys_in(&bob, "EXAMPLE.COM", 0, ADMIN);
+            kadmin_write(&store, declared, intent, &bob, &edit)
+        };
+        let answers = [own_purge(true), own_purge(false)];
+        let keyed: Vec<_> = guard
+            .recorder()
+            .take_events()
+            .into_iter()
+            .filter(|e| e.kind == LogKind::AccessDenied)
+            .map(|e| (e.protocol, e.actor, e.target))
+            .collect();
+        let bob_at = Some("bob@EXAMPLE.COM".to_owned());
+        let refused = "PROTECT_PRINCIPAL".to_owned();
+        assert_eq!(
+            (answers, keyed),
+            (
+                [refused.clone(), refused],
+                vec![(logging::Protocol::Kadmin, bob_at.clone(), bob_at); 2]
+            ),
+            "a user's own refusal: actor and target are one string, the coalescer's key"
+        );
+
         let cpw_through = |text: &'static str, keepold: u32, declared: bool| {
             let fill = with_password(text, keepold);
             let intent = intent_of(Operation::ChangePassword, kadmin(false), &["bobby"], &fill);
@@ -3231,7 +3264,10 @@ mod tests {
                     host_owned: owned,
                 }],
                 prepared: None,
-                batch: RealmBatch::default(),
+                batch: RealmBatch {
+                    upsert_principals: vec![row(1, None)],
+                    ..RealmBatch::default()
+                },
             };
             let got = match verdict(&change, "EXAMPLE.COM") {
                 Ok(Verdict::Write { new, onto }) if new.is_empty() && onto.is_empty() => {
@@ -3301,8 +3337,53 @@ mod tests {
         let same: fn(&mut HostChange) = |_| {};
         let pass = "unlock bob@EXAMPLE.COM";
         let deny = "PROTECT_PRINCIPAL bob@EXAMPLE.COM";
-        let cases: [Case; 15] = [
+        let cases: [Case; 24] = [
             ("MIT's unlock", mit, rows, mit_unlocked, same, pass),
+            (
+                "an existing TL entry removed",
+                mit,
+                rows,
+                |p| {
+                    mit_unlocked(p);
+                    p.tl_data.retain(|t| t.ty != krb5_kdc::TL_LAST_PWD_CHANGE);
+                },
+                same,
+                deny,
+            ),
+            (
+                "the last password change moved",
+                mit,
+                rows,
+                |p| {
+                    mit_unlocked(p);
+                    for t in &mut p.tl_data {
+                        if t.ty == krb5_kdc::TL_LAST_PWD_CHANGE {
+                            t.contents = vec![9, 0, 0, 0];
+                        }
+                    }
+                },
+                same,
+                deny,
+            ),
+            (
+                "the KVNO, by the mask",
+                mit,
+                rows | kadm5_mask::KVNO,
+                mit_unlocked,
+                same,
+                deny,
+            ),
+            (
+                "the last failure time",
+                mit,
+                rows,
+                |p| {
+                    mit_unlocked(p);
+                    p.last_failed = 7;
+                },
+                same,
+                deny,
+            ),
             ("the one-bit unlock", unlock, stamp, unlocked, same, pass),
             (
                 "a second TL entry",
@@ -3444,9 +3525,61 @@ mod tests {
                 |c| c.rows[0].before = None,
                 deny,
             ),
+            (
+                "the batch upserts the judged row",
+                mit,
+                rows,
+                mit_unlocked,
+                same,
+                pass,
+            ),
+            (
+                "the batch upserts nothing",
+                mit,
+                rows,
+                mit_unlocked,
+                |c| c.batch.upsert_principals.clear(),
+                deny,
+            ),
+            (
+                "the batch upserts the judged row twice",
+                mit,
+                rows,
+                mit_unlocked,
+                |c| c.batch.upsert_principals.push(row(1, None)),
+                deny,
+            ),
+            (
+                "the batch upserts another row too",
+                mit,
+                rows,
+                mit_unlocked,
+                |c| {
+                    c.batch.upsert_principals.push(PrincipalRow {
+                        name: "alice@EXAMPLE.COM".to_owned(),
+                        ..row(1, None)
+                    })
+                },
+                deny,
+            ),
+            (
+                "the batch deletes a principal",
+                mit,
+                rows,
+                mit_unlocked,
+                |c| {
+                    c.batch
+                        .delete_principals
+                        .push("alice@EXAMPLE.COM".to_owned())
+                },
+                deny,
+            ),
         ];
         let mut before = krb5_kdc::PrincipalBuilder::new(name("bob"), "EXAMPLE.COM").build();
         before.fail_auth_count = 5;
+        before
+            .tl_data
+            .push(tl(krb5_kdc::TL_LAST_PWD_CHANGE, &[1, 0, 0, 0]));
         before
             .tl_data
             .push(tl(TL_MOD_PRINC, b"\x01\0\0\0db_creation@EXAMPLE.COM\0"));
@@ -3466,7 +3599,10 @@ mod tests {
                     host_owned: true,
                 }],
                 prepared: None,
-                batch: RealmBatch::default(),
+                batch: RealmBatch {
+                    upsert_principals: vec![row(1, None)],
+                    ..RealmBatch::default()
+                },
             };
             around(&mut change);
             let answer = verdict(&change, "EXAMPLE.COM").map(shown);

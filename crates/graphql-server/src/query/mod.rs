@@ -901,7 +901,7 @@ mod tests {
             .withf(|filter, limit, cursor| {
                 *filter
                     == LogFilter {
-                        actor: Some(UserId::new("bob")),
+                        actor: Some("Bob".to_owned()),
                         kinds: vec![LogKind::Bind],
                         success: Some(false),
                         protocol: Some(Protocol::Ldap),

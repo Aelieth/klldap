@@ -183,7 +183,7 @@ pub const LOGIN_KINDS: &[LogKind] = &[LogKind::Bind, LogKind::Login];
 /// current members of a group.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct LogFilter {
-    pub actor: Option<UserId>,
+    pub actor: Option<String>,
     pub target: Option<String>,
     pub kinds: Vec<LogKind>,
     pub success: Option<bool>,

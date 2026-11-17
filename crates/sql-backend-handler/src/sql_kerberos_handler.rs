@@ -3,8 +3,10 @@ use lldap_domain_handlers::kerberos::{
     LoadedPrincipal, LoadedRealm, PolicyRow, PrincipalRow, RealmBatch, RealmState,
     user_id_for_principal_name,
 };
-use sea_orm::sea_query::{Alias, Expr, OnConflict, Query, Value};
-use sea_orm::{ConnectionTrait, DatabaseTransaction, DbErr, FromQueryResult};
+use sea_orm::sea_query::{
+    Alias, Expr, InsertStatement, MysqlQueryBuilder, OnConflict, Query, SelectStatement, Value,
+};
+use sea_orm::{ConnectionTrait, DatabaseTransaction, DbErr, FromQueryResult, SqlErr};
 
 #[derive(Debug)]
 pub(crate) enum KerberosSqlError {
@@ -73,21 +75,7 @@ pub async fn load_realm(db: &impl ConnectionTrait) -> Result<(LoadedRealm, i64),
     .all(db)
     .await
     .map_err(failed)?;
-    let realm = StoredRealm::find_by_statement(
-        backend.build(
-            Query::select()
-                .columns([
-                    KerberosRealm::Realm,
-                    KerberosRealm::Generation,
-                    KerberosRealm::State,
-                ])
-                .from(KerberosRealm::Table)
-                .and_where(Expr::col(KerberosRealm::Id).eq(1)),
-        ),
-    )
-    .one(db)
-    .await
-    .map_err(failed)?;
+    let realm = stored_realm(db).await?;
     let generation = realm.as_ref().map(|row| row.generation).unwrap_or(0);
     let mut principals: Vec<LoadedPrincipal> = principals
         .into_iter()
@@ -118,6 +106,24 @@ pub async fn load_realm(db: &impl ConnectionTrait) -> Result<(LoadedRealm, i64),
     ))
 }
 
+async fn stored_realm(db: &impl ConnectionTrait) -> Result<Option<StoredRealm>, KerberosSqlError> {
+    StoredRealm::find_by_statement(
+        db.get_database_backend().build(
+            Query::select()
+                .columns([
+                    KerberosRealm::Realm,
+                    KerberosRealm::Generation,
+                    KerberosRealm::State,
+                ])
+                .from(KerberosRealm::Table)
+                .and_where(Expr::col(KerberosRealm::Id).eq(1)),
+        ),
+    )
+    .one(db)
+    .await
+    .map_err(failed)
+}
+
 pub async fn commit_batch_with_transaction(
     transaction: &DatabaseTransaction,
     batch: &RealmBatch,
@@ -145,22 +151,7 @@ async fn prepare_realm(
     generation: i64,
 ) -> Result<String, KerberosSqlError> {
     let backend = transaction.get_database_backend();
-    let stored = StoredRealm::find_by_statement(
-        backend.build(
-            Query::select()
-                .columns([
-                    KerberosRealm::Realm,
-                    KerberosRealm::Generation,
-                    KerberosRealm::State,
-                ])
-                .from(KerberosRealm::Table)
-                .and_where(Expr::col(KerberosRealm::Id).eq(1)),
-        ),
-    )
-    .one(transaction)
-    .await
-    .map_err(failed)?;
-    let Some(stored) = stored else {
+    let Some(stored) = stored_realm(transaction).await? else {
         let Some(incoming) = &batch.realm else {
             return Err(KerberosSqlError::Refused(
                 "a first commit needs the realm".to_owned(),
@@ -525,17 +516,93 @@ struct HoldRow {
 pub(crate) async fn read_hold(
     db: &impl ConnectionTrait,
 ) -> Result<Option<RealmHold>, KerberosSqlError> {
-    let row = HoldRow::find_by_statement(
-        db.get_database_backend().build(
-            Query::select()
-                .columns([KerberosRealm::Generation, KerberosRealm::Open])
-                .from(KerberosRealm::Table)
-                .and_where(Expr::col(KerberosRealm::Id).eq(1)),
-        ),
-    )
-    .one(db)
-    .await
-    .map_err(failed)?;
+    select_hold(db, false).await
+}
+
+/// `FOR UPDATE`: waits for a transaction that holds the realm row. SQLite's builder drops it.
+pub(crate) async fn read_hold_locked(
+    transaction: &DatabaseTransaction,
+) -> Result<Option<RealmHold>, KerberosSqlError> {
+    select_hold(transaction, true).await
+}
+
+fn hold_select(locked: bool) -> SelectStatement {
+    let mut select = Query::select();
+    select
+        .columns([KerberosRealm::Generation, KerberosRealm::Open])
+        .from(KerberosRealm::Table)
+        .and_where(Expr::col(KerberosRealm::Id).eq(1));
+    if locked {
+        select.lock_exclusive();
+    }
+    select
+}
+
+fn realm_probe() -> InsertStatement {
+    Query::insert()
+        .into_table(KerberosRealm::Table)
+        .columns([
+            KerberosRealm::Id,
+            KerberosRealm::Realm,
+            KerberosRealm::Generation,
+            KerberosRealm::Open,
+            KerberosRealm::State,
+        ])
+        .values_panic([
+            Expr::value(1i32),
+            Expr::value(""),
+            Expr::value(0i64),
+            Expr::value(false),
+            Expr::value(bytes_value(Vec::new())),
+        ])
+        .to_owned()
+}
+
+/// `true` when the realm row's key is taken; the insert waits for a first commit in flight.
+pub(crate) async fn probe_realm_row(
+    transaction: &DatabaseTransaction,
+) -> Result<bool, KerberosSqlError> {
+    let statement = transaction.get_database_backend().build(&realm_probe());
+    match transaction.execute(statement).await {
+        Ok(_) => Ok(false),
+        Err(err) if matches!(err.sql_err(), Some(SqlErr::UniqueConstraintViolation(_))) => Ok(true),
+        Err(err) => Err(failed(err)),
+    }
+}
+
+pub(crate) struct FirstRow {
+    pub generation: i64,
+    pub ours: bool,
+}
+
+/// A bootstrap seals its realm state with a fresh key: equal bytes are this server's row.
+pub(crate) async fn read_first_row(
+    db: &impl ConnectionTrait,
+    ours: Option<&RealmState>,
+) -> Result<Option<FirstRow>, KerberosSqlError> {
+    Ok(stored_realm(db).await?.map(|row| FirstRow {
+        generation: row.generation,
+        ours: ours.is_some_and(|ours| ours.realm == row.realm && ours.state == row.state),
+    }))
+}
+
+pub(crate) fn mysql_locked_hold() -> String {
+    hold_select(true).to_string(MysqlQueryBuilder)
+}
+
+pub(crate) fn mysql_realm_probe() -> String {
+    realm_probe().to_string(MysqlQueryBuilder)
+}
+
+async fn select_hold(
+    db: &impl ConnectionTrait,
+    locked: bool,
+) -> Result<Option<RealmHold>, KerberosSqlError> {
+    let statement = db.get_database_backend().build(&hold_select(locked));
+    let row = HoldRow::find_by_statement(statement)
+        .one(db)
+        .await
+        .map_err(failed)?;
     Ok(row.map(|row| RealmHold {
         generation: row.generation,
         open: row.open,
@@ -946,6 +1013,112 @@ pub(crate) mod tests {
         assert_eq!(generation, 1);
         assert_eq!(loaded.principals.len(), 1);
         assert_eq!(loaded.principals[0].name, "alice");
+    }
+
+    #[tokio::test]
+    async fn test_an_alias_cycle_ends_after_its_hops() {
+        let pool = memory().await;
+        init_table(&pool).await.unwrap();
+        let alias = |name: &str, target: &str| PrincipalRow {
+            alias_target: Some(target.to_owned()),
+            ..principal(name, vec![1])
+        };
+        let batch = realm_batch(vec![9], vec![alias("a", "b"), alias("b", "a")]);
+        commit(&pool, &batch, 0).await.unwrap();
+        assert_eq!(
+            alias_chain(&pool, "a", 3).await.unwrap(),
+            vec!["a", "b", "a", "b"]
+        );
+    }
+
+    #[test]
+    fn test_the_waiting_read_locks_the_realm_row() {
+        use sea_orm::DbBackend;
+        let locks = |backend: DbBackend, locked: bool| {
+            backend
+                .build(&hold_select(locked))
+                .sql
+                .ends_with("FOR UPDATE")
+        };
+        assert_eq!(
+            [
+                locks(DbBackend::Postgres, true),
+                locks(DbBackend::MySql, true),
+                locks(DbBackend::Sqlite, true),
+                locks(DbBackend::Postgres, false),
+            ],
+            [true, true, false, false]
+        );
+        let (read, probe) = (mysql_locked_hold(), mysql_realm_probe());
+        assert_eq!(
+            (
+                read.ends_with("FROM `kerberos_realm` WHERE `id` = 1 FOR UPDATE"),
+                probe.starts_with("INSERT INTO `kerberos_realm` (`id`, `realm`"),
+                probe.contains("VALUES (1, "),
+            ),
+            (true, true, true),
+            "{read}; {probe}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_the_probe_meets_the_realm_rows_key() {
+        async fn probe(pool: &DbConnection) -> (bool, Option<i64>) {
+            let txn = pool.begin().await.unwrap();
+            let probed = probe_realm_row(&txn).await.unwrap();
+            txn.rollback().await.unwrap();
+            let left = read_hold(pool).await.unwrap().map(|hold| hold.generation);
+            (probed, left)
+        }
+        let pool = memory().await;
+        init_table(&pool).await.unwrap();
+        let empty = probe(&pool).await;
+        commit(&pool, &realm_batch(vec![9], Vec::new()), 0)
+            .await
+            .unwrap();
+        let landed = probe(&pool).await;
+        assert_eq!(
+            (empty, landed),
+            ((false, None), (true, Some(1))),
+            "an empty table: the probe's row is rolled back; a first row: its key is met"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_the_first_row_is_ours_only_with_our_realm_and_sealed_state() {
+        let pool = memory().await;
+        init_table(&pool).await.unwrap();
+        let empty = read_first_row(&pool, None).await.unwrap().is_none();
+        commit(&pool, &realm_batch(vec![9], Vec::new()), 0)
+            .await
+            .unwrap();
+        let state = |realm: &str, state: Vec<u8>| RealmState {
+            realm: realm.to_owned(),
+            state,
+        };
+        let cases = [
+            ("our realm and state", Some(state("EXAMPLE.COM", vec![9]))),
+            ("another state", Some(state("EXAMPLE.COM", vec![8]))),
+            ("another realm", Some(state("EXAMPLE.ORG", vec![9]))),
+            ("no realm in the batch", None),
+        ];
+        let mut got = Vec::new();
+        for (label, ours) in cases {
+            let row = read_first_row(&pool, ours.as_ref()).await.unwrap();
+            got.push((label, row.map(|row| (row.generation, row.ours))));
+        }
+        assert_eq!(
+            (empty, got),
+            (
+                true,
+                vec![
+                    ("our realm and state", Some((1, true))),
+                    ("another state", Some((1, false))),
+                    ("another realm", Some((1, false))),
+                    ("no realm in the batch", Some((1, false))),
+                ]
+            )
+        );
     }
 
     #[tokio::test]

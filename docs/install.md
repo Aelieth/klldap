@@ -6,8 +6,11 @@ Images are amd64 and arm64, `aelieth/klldap:0.8.0`. The arm64 image is built und
 
 KLLDAP 0.8.0 is 64-bit only (x86_64 and arm64); there is no 32-bit or ARMv7 build.
 
-**Set a restart policy. If a Kerberos thread dies, the process exits non-zero,
-and without a restart policy the container stays down.**
+**Set a restart policy. If a Kerberos thread dies, or the server gives the
+Kerberos realm up because its writes stopped reaching the database, the process
+exits non-zero, and without a restart policy the container stays down. With
+one, the server is back once the database answers again, after the restart and
+a thirty-five-second watch.**
 
 - [With Docker](#with-docker)
 - [With Podman](#with-podman)
@@ -19,6 +22,7 @@ and without a restart policy the container stays down.**
 - [Cross-compilation](#cross-compilation)
 - [Migrating from LLDAP](#migrating-from-lldap)
 - [Upgrading from KLLDAP 0.7.2](#upgrading-from-klldap-072)
+- [Upgrading from KLLDAP 0.8.0](#upgrading-from-klldap-080)
 
 ### With Docker
 
@@ -215,3 +219,14 @@ mid-migration the next start completes it.
 unreachable after the upgrade.** If `key_seed` is unset, keep the key file the
 first start writes: that write is not synced, and a lost key makes the next
 start refuse.
+
+### Upgrading from KLLDAP 0.8.0
+
+Stop every KLLDAP server that uses the database before the first 0.8.1 start, and
+do not run 0.8.0 and 0.8.1 side by side. A server that finds the Kerberos realm left
+open watches it before it takes it over: 0.8.0 for thirty seconds, 0.8.1 for
+thirty-five. A 0.8.1 holder stops serving within thirty seconds of the start of
+its last write that reached the database. A 0.8.0 holder can serve that long, and
+longer under sustained load. So a 0.8.0 server could take the realm over from a
+0.8.1 holder that still serves, or a 0.8.1 server from a busy 0.8.0 holder, and
+two servers could serve the realm at once.

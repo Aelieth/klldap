@@ -24,6 +24,17 @@
   states. Every policy write stays admin-only.
 - `clearOuPolicy` and `effectivePolicyItems` refuse an OU that is not registered
   (`Unknown OU`).
+- The Kerberos realm's watch is thirty-five seconds (thirty in 0.8.0). A server that finds
+  the realm left open watches it that long before it takes it over, and a holder gives the
+  realm up within thirty seconds of the start of its last write that reached the database,
+  then exits. **Before the first 0.8.1 start, stop every server that uses the database; do
+  not run 0.8.0 and 0.8.1 side by side**
+  ([install.md](docs/install.md#upgrading-from-klldap-080)).
+- A lost answer to the realm's first commit is probed: the server inserts the realm row's key
+  in a transaction it rolls back, for sixty seconds (about seventy-five from the commit's
+  start). The commit counts as landed only when the row holds this server's own realm and
+  realm record; a row another server created first is answered "another server created the
+  realm first", and this server stops.
 - A password-reset finish registers only the reset token's own user.
 
 ### Fixed

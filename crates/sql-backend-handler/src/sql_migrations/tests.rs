@@ -1850,6 +1850,10 @@ fn mysql_database_name(url: &str) -> String {
 }
 
 async fn connect_scratch_mysql() -> Option<DbConnection> {
+    connect_scratch_mysql_sized(2).await
+}
+
+async fn connect_scratch_mysql_sized(connections: u32) -> Option<DbConnection> {
     let Ok(url) = std::env::var("KLLDAP_TEST_DATABASE_URL") else {
         eprintln!("KLLDAP_TEST_DATABASE_URL not set; skipping");
         return None;
@@ -1881,7 +1885,7 @@ async fn connect_scratch_mysql() -> Option<DbConnection> {
             .expect("reset scratch database");
     }
     let mut opts = sea_orm::ConnectOptions::new(url);
-    opts.max_connections(2).sqlx_logging(false);
+    opts.max_connections(connections).sqlx_logging(false);
     Some(
         Database::connect(opts)
             .await
@@ -3124,6 +3128,65 @@ async fn test_postgres_take_one_wins() {
         return;
     };
     crate::sql_kerberos_handler::tests::scenario_take_one_wins(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_read_back_waits_for_the_holder() {
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres().await else {
+        return;
+    };
+    crate::sql_kerberos_committer::tests::scenario_read_back_waits_for_the_holder(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_read_back_waits_for_the_holder() {
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql().await else {
+        return;
+    };
+    crate::sql_kerberos_committer::tests::scenario_read_back_waits_for_the_holder(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_first_commit_probe_waits_for_the_insert() {
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres().await else {
+        return;
+    };
+    crate::sql_kerberos_committer::tests::scenario_the_first_commit_probe_waits_for_the_insert(
+        &pool,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_first_commit_probe_waits_for_the_insert() {
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql().await else {
+        return;
+    };
+    crate::sql_kerberos_committer::tests::scenario_the_first_commit_probe_waits_for_the_insert(
+        &pool,
+    )
+    .await;
+}
+
+#[tokio::test]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_the_lock_wait_is_bounded_and_put_back() {
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql_sized(5).await else {
+        return;
+    };
+    crate::sql_kerberos_committer::tests::scenario_the_mysql_lock_wait_is_bounded_and_put_back(
+        &pool,
+    )
+    .await;
 }
 
 #[tokio::test]

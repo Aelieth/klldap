@@ -1584,7 +1584,7 @@ fn probe_absent<T>(backend: sea_orm::DbBackend, probed: Result<T, DbErr>) -> Res
     }
 }
 
-// The add runs only where an interrupted or MySQL-skipped v12 left a gap.
+// Adds a missing column: a gap an interrupted or MySQL-skipped v12 left, or `alias_target`.
 async fn ensure_column(
     transaction: &DatabaseTransaction,
     backend: sea_orm::DbBackend,

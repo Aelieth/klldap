@@ -557,7 +557,7 @@ impl LogBackendHandler for SqlBackendHandler {
         since: Option<chrono::NaiveDateTime>,
     ) -> DomainResult<LogActivity> {
         let scope = LogFilter {
-            actor: Some(actor.clone()),
+            actor: Some(actor.as_str().to_owned()),
             kinds,
             since,
             ..Default::default()
@@ -600,12 +600,7 @@ fn filter_condition(filter: &LogFilter) -> Condition {
         .member_of_id
         .map(|group_id| MembershipColumn::GroupId.eq(group_id));
     Condition::all()
-        .add_option(
-            filter
-                .actor
-                .as_ref()
-                .map(|actor| LogsColumn::Actor.eq(actor)),
-        )
+        .add_option(filter.actor.as_deref().map(actor_condition))
         .add_option(filter.target.as_deref().map(|t| LogsColumn::Target.eq(t)))
         .add_option(kinds)
         .add_option(filter.success.map(|s| LogsColumn::Success.eq(s)))
@@ -619,6 +614,18 @@ fn filter_condition(filter: &LogFilter) -> Condition {
         .add_option(filter.until.map(|t| LogsColumn::Timestamp.lte(t)))
         .add_option(member_of.map(members))
         .add_option(member_of_id.map(members))
+}
+
+// A kadmin principal matches as typed; a user id is stored lowercased, `@` allowed.
+fn actor_condition(actor: &str) -> SimpleExpr {
+    let lowered = UserId::new(actor).into_string();
+    if lowered == actor {
+        LogsColumn::Actor.eq(actor)
+    } else {
+        LogsColumn::Actor
+            .eq(actor)
+            .or(LogsColumn::Actor.eq(lowered))
+    }
 }
 
 fn members(group: SimpleExpr) -> SimpleExpr {
@@ -1064,6 +1071,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_the_actor_filter_matches_the_value_as_given_or_lowercased() {
+        use lldap_auth::opaque::server::generate_random_private_key;
+        let pool = get_initialized_db().await;
+        let handler = SqlBackendHandler::new(generate_random_private_key(), pool.clone());
+        let stored = ["admin/admin@GATE.TEST", "bob", "bob@example", "carol"];
+        let events = stored.map(|actor| to_active_model(event(LogKind::Bind, actor, 0)));
+        insert_rows(&pool, events.into()).await.unwrap();
+        let rows = [
+            (
+                "a kadmin principal with an upper-case realm",
+                "admin/admin@GATE.TEST",
+            ),
+            ("a user id typed in mixed case", "Bob"),
+            ("a user id with @ typed in mixed case", "Bob@Example"),
+        ];
+        let mut got = Vec::new();
+        for (label, typed) in rows {
+            let filter = LogFilter {
+                actor: Some(typed.to_owned()),
+                ..Default::default()
+            };
+            let found = handler
+                .list_log_events(filter, 100, LogCursor::Newest)
+                .await
+                .unwrap();
+            let actors: Vec<_> = found.into_iter().filter_map(|r| r.event.actor).collect();
+            got.push((label, actors));
+        }
+        let only = |actor: &str| vec![actor.to_owned()];
+        assert_eq!(
+            got,
+            vec![
+                (rows[0].0, only("admin/admin@GATE.TEST")),
+                (rows[1].0, only("bob")),
+                (rows[2].0, only("bob@example")),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn test_list_log_events_filters_cursors_and_membership() {
         use crate::sql_backend_handler::tests::{
             insert_group, insert_membership, insert_user_no_password,
@@ -1109,7 +1156,7 @@ mod tests {
         };
         let ids = |records: &[LogRecord]| records.iter().map(|r| r.id).collect::<Vec<_>>();
         let actor = |name: &str| LogFilter {
-            actor: Some(UserId::new(name)),
+            actor: Some(name.to_owned()),
             ..Default::default()
         };
 
@@ -1133,7 +1180,7 @@ mod tests {
         assert_eq!(
             ids(&list(actor("BOB"), 100, LogCursor::Newest).await),
             vec![4, 1],
-            "actors are lowercased user ids"
+            "a user id typed in another case"
         );
         assert_eq!(
             ids(&list(actor("bob"), 100, LogCursor::Before(4)).await),
@@ -2148,7 +2195,7 @@ mod tests {
         );
         let bob_days = summarize(
             LogFilter {
-                actor: Some(UserId::new("bob")),
+                actor: Some("bob".to_owned()),
                 ..Default::default()
             },
             vec![LogDimension::Actor, LogDimension::Day],
@@ -2242,7 +2289,7 @@ mod tests {
 
         let pool = get_initialized_db().await;
         let scope = LogFilter {
-            actor: Some(UserId::new("bob")),
+            actor: Some("bob".to_owned()),
             kinds: LOGIN_KINDS.to_vec(),
             ..Default::default()
         };

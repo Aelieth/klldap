@@ -35,7 +35,7 @@ We want to dump (almost) all existing values to some file - the exception being 
 the `sqlite_sequence` table, when it exists). Be sure to stop/pause LLDAP during this step, as some
 databases (SQLite in this example) will give an error if LLDAP is in the middle of a write. Stop the server
 before the dump: a dump from a server that is still running, or that was not stopped cleanly, can leave
-`kerberos_realm.open` set, and the moved server then waits out a thirty-second watch before it serves.
+`kerberos_realm.open` set, and the moved server then waits out a thirty-five-second watch before it serves.
 The dump should consist just INSERT
 statements. There are various ways to do this, but a simple enough way is filtering a
 whole database dump. This repo contains [a script](../scripts/sqlite_dump_commands.sh) to generate SQLite commands for creating an appropriate dump:

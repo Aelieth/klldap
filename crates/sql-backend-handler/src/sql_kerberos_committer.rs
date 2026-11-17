@@ -1,7 +1,8 @@
 use crate::sql_backend_handler::SqlBackendHandler;
 use crate::sql_kerberos_handler::{
     KerberosSqlError, RealmHold, alias_chain, clear_open, commit_batch_with_transaction,
-    fill_alias_targets, heartbeat, load_realm, read_hold, take_realm,
+    fill_alias_targets, heartbeat, load_realm, mysql_locked_hold, mysql_realm_probe,
+    probe_realm_row, read_first_row, read_hold, read_hold_locked, take_realm,
 };
 use crate::sql_log_handler::to_active_model;
 use crate::sql_opaque_handler::user_disabled_in;
@@ -9,13 +10,15 @@ use crate::sql_tables::DbConnection;
 use lldap_domain::types::UserId;
 use lldap_domain_handlers::kerberos::{
     AliasOnto, DIRECTORY_TARGET, DIRECTORY_USER, HostRow, KerberosStore, KerberosStoreError,
-    LoadedRealm, NoopKerberosStore, RealmBatch, UNREAD_AFTER_COMMIT, USER_GONE, set_kerberos_store,
+    LoadedRealm, NoopKerberosStore, RealmBatch, RealmState, UNREAD_AFTER_COMMIT, USER_GONE,
+    set_kerberos_store,
 };
 use lldap_domain_handlers::password::{ANSWER_LOST, kill_point};
 use lldap_domain_model::model::{self, UserColumn};
 use sea_orm::sea_query::Expr;
+use sea_orm::sqlx::{self, MySql, Row, mysql::MySqlRow, pool::PoolConnection};
 use sea_orm::{
-    ColumnTrait, ConnectionTrait, DatabaseTransaction, DbErr, EntityTrait, QueryFilter,
+    ColumnTrait, ConnectionTrait, DatabaseTransaction, DbBackend, DbErr, EntityTrait, QueryFilter,
     QuerySelect, TransactionTrait,
 };
 use std::future::Future;
@@ -27,9 +30,10 @@ use tracing::warn;
 
 const HEARTBEAT: Duration = Duration::from_secs(10);
 const LOST_AFTER: Duration = Duration::from_secs(20);
-const WATCH: Duration = Duration::from_secs(30);
+const WATCH: Duration = Duration::from_secs(35);
 const STEP: Duration = Duration::from_secs(5);
 const RETRY: Duration = Duration::from_secs(1);
+const FIRST_PROBE: Duration = Duration::from_secs(60);
 const QUEUE: usize = 16;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -37,6 +41,7 @@ pub enum KerberosLost {
     Replaced,
     Occupied,
     DatabaseUnreachable,
+    HeartbeatTooLate,
 }
 
 impl std::fmt::Display for KerberosLost {
@@ -55,6 +60,10 @@ impl std::fmt::Display for KerberosLost {
             Self::DatabaseUnreachable => {
                 write!(f, "no write reached the database for twenty seconds")
             }
+            Self::HeartbeatTooLate => write!(
+                f,
+                "the heartbeat started too late to confirm a lost answer; the realm is given up"
+            ),
         }
     }
 }
@@ -64,6 +73,7 @@ enum Job {
     Commit(
         Vec<HostRow>,
         RealmBatch,
+        Arc<AtomicBool>,
         oneshot::Sender<Result<(), KerberosStoreError>>,
     ),
     Users(
@@ -102,10 +112,11 @@ impl KerberosStore for CommitterStore {
 
     fn commit_with(&self, host: Vec<HostRow>, batch: RealmBatch) -> Result<(), KerberosStoreError> {
         let (tx, rx) = oneshot::channel();
+        let taken = Arc::new(AtomicBool::new(false));
         self.tx
-            .blocking_send(Job::Commit(host, batch, tx))
+            .blocking_send(Job::Commit(host, batch, taken.clone(), tx))
             .map_err(|_| stopped())?;
-        rx.blocking_recv().map_err(|_| stopped())?
+        rx.blocking_recv().map_err(|_| dropped(&taken))?
     }
 
     fn directory_users(&self, users: &[UserId]) -> Result<Vec<UserId>, KerberosStoreError> {
@@ -143,6 +154,14 @@ impl KerberosStore for CommitterStore {
 
 fn stopped() -> KerberosStoreError {
     KerberosStoreError::Failed("kerberos committer stopped".to_owned())
+}
+
+fn dropped(taken: &AtomicBool) -> KerberosStoreError {
+    if taken.load(Ordering::Acquire) {
+        unsettled("kerberos committer stopped", "the commit was under way")
+    } else {
+        stopped()
+    }
 }
 
 fn not_held() -> KerberosStoreError {
@@ -183,10 +202,18 @@ struct Timings {
     lost_after: Duration,
     watch: Duration,
     step: Duration,
+    /// How long the realm's first commit is probed for after its answer was lost.
+    first_probe: Duration,
     /// Tests only: the next password COMMIT that succeeds is answered as lost.
     lose_an_answer: AtomicBool,
     /// Tests only: a wait after COMMIT, so the step runs out once COMMIT was sent.
     stall_after_commit: Duration,
+    /// Tests only: the next heartbeat that commits is answered as lost.
+    lose_a_beat: AtomicBool,
+    /// Tests only: the next heartbeat rolls back after its UPDATE and is answered as lost.
+    drop_a_beat: AtomicBool,
+    /// Tests only: a wait between a lost answer and its read-back.
+    stall_before_read: Duration,
 }
 
 pub fn start_kerberos_committer(pool: DbConnection) -> KerberosCommitterHandle {
@@ -199,8 +226,12 @@ fn standard(lose_an_answer: bool) -> Timings {
         lost_after: LOST_AFTER,
         watch: WATCH,
         step: STEP,
+        first_probe: FIRST_PROBE,
         lose_an_answer: AtomicBool::new(lose_an_answer),
         stall_after_commit: Duration::ZERO,
+        lose_a_beat: AtomicBool::new(false),
+        drop_a_beat: AtomicBool::new(false),
+        stall_before_read: Duration::ZERO,
     }
 }
 
@@ -229,8 +260,7 @@ pub(crate) fn start_kerberos_committer_for(
             lost_after,
             watch,
             step,
-            lose_an_answer: AtomicBool::new(false),
-            stall_after_commit: Duration::ZERO,
+            ..standard(false)
         },
     );
     set_kerberos_store(handle.store());
@@ -255,6 +285,7 @@ struct Held {
     row: bool,
     last_ok: Instant,
     next: Instant,
+    unsettled: bool,
 }
 
 enum Phase {
@@ -279,20 +310,27 @@ async fn run(
     let mut phase = open_phase(&pool, &timings, &lost_tx).await;
     let mut waiting = Vec::new();
     loop {
-        let wake = wake_at(&phase);
-        let incoming = tokio::select! {
-            biased;
-            job = rx.recv() => match job {
-                Some(job) => Incoming::Job(job),
-                None => Incoming::Closed,
-            },
-            _ = sleep_until(wake), if wake.is_some() => Incoming::Timer,
+        let due = wake_time(&phase).is_some_and(|at| at <= Instant::now());
+        let incoming = if due {
+            Incoming::Timer
+        } else {
+            let wake = wake_at(&phase);
+            tokio::select! {
+                biased;
+                job = rx.recv() => match job {
+                    Some(job) => Incoming::Job(job),
+                    None => Incoming::Closed,
+                },
+                _ = sleep_until(wake), if wake.is_some() => Incoming::Timer,
+            }
         };
         match incoming {
             Incoming::Job(Job::Load(reply)) => {
-                answer_load(&pool, &phase, reply, &mut waiting, &lost_tx, timings.step).await;
+                phase =
+                    answer_load(&pool, phase, reply, &mut waiting, &lost_tx, timings.step).await;
             }
-            Incoming::Job(Job::Commit(host, batch, reply)) => {
+            Incoming::Job(Job::Commit(host, batch, taken, reply)) => {
+                taken.store(true, Ordering::Release);
                 phase = commit_job(&pool, phase, &host, batch, reply, &lost_tx, &timings).await;
                 release_loads(&pool, &phase, &mut waiting, &lost_tx, timings.step).await;
             }
@@ -332,13 +370,14 @@ async fn open_phase(
     timings: &Timings,
     lost_tx: &watch::Sender<Option<KerberosLost>>,
 ) -> Phase {
+    let started = Instant::now();
     match hold_within(pool, timings.step).await {
         Ok(None) => Phase::Held(fresh(0, false, timings)),
         Ok(Some(hold)) if !hold.open => match take_owned(pool, hold.generation, timings.step).await
         {
-            Ok(generation) => Phase::Held(fresh(generation, true, timings)),
+            Ok(generation) => Phase::Held(fresh_from(started, generation, true, timings)),
             Err(Step::Replaced) => lose(lost_tx, KerberosLost::Occupied),
-            Err(Step::Database) => starting(timings),
+            Err(Step::Database | Step::Late) => starting(timings),
         },
         Ok(Some(hold)) => Phase::Watching {
             generation: hold.generation,
@@ -360,23 +399,31 @@ fn starting_from(since: Instant, timings: &Timings) -> Phase {
 }
 
 fn fresh(generation: i64, row: bool, timings: &Timings) -> Held {
-    let now = Instant::now();
+    fresh_from(Instant::now(), generation, row, timings)
+}
+
+// From the write's start: a watcher may have read the new generation from then on.
+fn fresh_from(started: Instant, generation: i64, row: bool, timings: &Timings) -> Held {
     Held {
         generation,
         row,
-        last_ok: now,
-        next: now + timings.heartbeat,
+        last_ok: started,
+        next: Instant::now() + timings.heartbeat,
+        unsettled: false,
+    }
+}
+
+fn wake_time(phase: &Phase) -> Option<Instant> {
+    match phase {
+        Phase::Starting { next, .. } => Some(*next),
+        Phase::Watching { until, .. } => Some(*until),
+        Phase::Held(held) if held.row => Some(held.next),
+        Phase::Held(_) | Phase::Lost => None,
     }
 }
 
 fn wake_at(phase: &Phase) -> Option<tokio::time::Instant> {
-    let at = match phase {
-        Phase::Starting { next, .. } => *next,
-        Phase::Watching { until, .. } => *until,
-        Phase::Held(held) if held.row => held.next,
-        Phase::Held(_) | Phase::Lost => return None,
-    };
-    Some(at.into())
+    wake_time(phase).map(Into::into)
 }
 
 async fn sleep_until(at: Option<tokio::time::Instant>) {
@@ -389,6 +436,7 @@ async fn sleep_until(at: Option<tokio::time::Instant>) {
 enum Step {
     Replaced,
     Database,
+    Late,
 }
 
 // Bounded so an unreachable database fails the step instead of waiting out the pool's acquire.
@@ -439,11 +487,24 @@ async fn take_owned(pool: &DbConnection, generation: i64, step: Duration) -> Res
     .await
 }
 
-async fn beat(pool: &DbConnection, generation: i64, step: Duration) -> Result<i64, Step> {
-    within(step, || Step::Database, async {
+async fn beat(
+    pool: &DbConnection,
+    held: &Held,
+    started: Instant,
+    timings: &Timings,
+) -> Result<i64, Step> {
+    let generation = held.generation;
+    let sent = AtomicBool::new(false);
+    let beaten = within(timings.step, || Step::Database, async {
         let txn = pool.begin().await.map_err(|_| Step::Database)?;
         match heartbeat(&txn, generation).await {
+            Ok(_) if timings.drop_a_beat.swap(false, Ordering::AcqRel) => {
+                sent.store(true, Ordering::Release);
+                let _ = txn.rollback().await;
+                Err(Step::Database)
+            }
             Ok(next) => {
+                sent.store(true, Ordering::Release);
                 txn.commit().await.map_err(|_| Step::Database)?;
                 Ok(next)
             }
@@ -457,7 +518,27 @@ async fn beat(pool: &DbConnection, generation: i64, step: Duration) -> Result<i6
             }
         }
     })
-    .await
+    .await;
+    let lost = match &beaten {
+        Ok(_) => timings.lose_a_beat.swap(false, Ordering::AcqRel),
+        Err(Step::Database) => sent.load(Ordering::Acquire),
+        Err(Step::Replaced | Step::Late) => false,
+    };
+    if !lost {
+        return beaten;
+    }
+    if !beat_reads_back(held, started, timings) {
+        return Err(Step::Late);
+    }
+    match settle(pool, held, started, None, timings).await {
+        Settled::Landed => Ok(generation + 1),
+        Settled::Unchanged | Settled::Unread(_) => Err(Step::Database),
+        Settled::Moved | Settled::CreatedElsewhere => Err(Step::Replaced),
+    }
+}
+
+fn beat_reads_back(held: &Held, started: Instant, timings: &Timings) -> bool {
+    started < held.last_ok + timings.lost_after
 }
 
 #[derive(Debug)]
@@ -704,6 +785,7 @@ async fn commit_job(
         let _ = reply.send(Err(not_held()));
         return phase;
     };
+    let started = Instant::now();
     let step = timings.step;
     let sent = AtomicBool::new(false);
     let ran_out = || {
@@ -731,10 +813,15 @@ async fn commit_job(
         Ok(()) => {
             point(password, "committed");
             let _ = reply.send(Ok(()));
-            Phase::Held(fresh(held.generation + 1, true, timings))
+            Phase::Held(fresh_from(started, held.generation + 1, true, timings))
         }
         Err(WriteError::Unanswered(reason)) => {
-            let (answer, phase) = read_back(pool, held, host, reason, lost_tx, timings).await;
+            let wrote = Written {
+                host,
+                realm: batch.realm.as_ref(),
+            };
+            let (answer, phase) =
+                read_back(pool, held, started, wrote, reason, lost_tx, timings).await;
             let _ = reply.send(answer);
             phase
         }
@@ -760,39 +847,247 @@ async fn commit_job(
     }
 }
 
+struct Written<'a> {
+    host: &'a [HostRow],
+    realm: Option<&'a RealmState>,
+}
+
+const CREATED_FIRST: &str = "another server created the realm first";
+
 /// A lost answer: only the holder moves the realm's generation, by one per commit.
 async fn read_back(
     pool: &DbConnection,
     held: Held,
-    host: &[HostRow],
+    started: Instant,
+    wrote: Written<'_>,
     reason: String,
     lost_tx: &watch::Sender<Option<KerberosLost>>,
     timings: &Timings,
 ) -> (Result<(), KerberosStoreError>, Phase) {
-    let (before, after) = (held.row.then_some(held.generation), held.generation + 1);
-    match hold_within(pool, timings.step).await {
-        Ok(hold) => match hold.map(|hold| hold.generation) {
-            Some(now) if now == after => {
-                match host.iter().find_map(written_user) {
-                    Some(user) => warn!("The commit for user {user}: {ANSWER_LOST}"),
-                    None => warn!("The Kerberos commit to generation {after}: {ANSWER_LOST}"),
-                }
-                (Ok(()), Phase::Held(fresh(after, true, timings)))
+    let after = held.generation + 1;
+    match settle(pool, &held, started, wrote.realm, timings).await {
+        Settled::Landed => {
+            match wrote.host.iter().find_map(written_user) {
+                Some(user) => warn!("The commit for user {user}: {ANSWER_LOST}"),
+                None => warn!("The Kerberos commit to generation {after}: {ANSWER_LOST}"),
             }
-            now if now == before => {
-                let phase = db_failed(held, timings, lost_tx);
-                (Err(KerberosStoreError::Failed(reason)), phase)
-            }
-            _ => {
-                let why = unsettled(&reason, KerberosLost::Replaced);
-                (Err(why), lose(lost_tx, KerberosLost::Replaced))
-            }
-        },
-        Err(err) => {
+            (
+                Ok(()),
+                Phase::Held(fresh_from(started, after, true, timings)),
+            )
+        }
+        Settled::Unchanged => {
             let phase = db_failed(held, timings, lost_tx);
-            (Err(unsettled(&reason, err)), phase)
+            (Err(KerberosStoreError::Failed(reason)), phase)
+        }
+        Settled::Unread(why) => {
+            let held = Held {
+                unsettled: true,
+                ..held
+            };
+            let phase = db_failed(held, timings, lost_tx);
+            (Err(unsettled(&reason, why)), phase)
+        }
+        Settled::Moved => {
+            let why = unsettled(&reason, KerberosLost::Replaced);
+            (Err(why), lose(lost_tx, KerberosLost::Replaced))
+        }
+        Settled::CreatedElsewhere => {
+            let why = KerberosStoreError::Failed(format!("{reason}; {CREATED_FIRST}"));
+            (Err(why), lose(lost_tx, KerberosLost::Occupied))
         }
     }
+}
+
+enum Settled {
+    Landed,
+    Unchanged,
+    Unread(String),
+    Moved,
+    CreatedElsewhere,
+}
+
+async fn settle(
+    pool: &DbConnection,
+    held: &Held,
+    started: Instant,
+    ours: Option<&RealmState>,
+    timings: &Timings,
+) -> Settled {
+    if !timings.stall_before_read.is_zero() {
+        tokio::time::sleep(timings.stall_before_read).await;
+    }
+    if !held.row {
+        return first_row(pool, held, ours, timings).await;
+    }
+    let read = settled_hold(pool, timings.step).await;
+    let in_time = started < held.last_ok + timings.lost_after
+        && Instant::now() < held.last_ok + timings.lost_after + timings.step * 2;
+    match read {
+        Err(err) => Settled::Unread(err.to_string()),
+        Ok(hold) => match hold.map(|hold| hold.generation) {
+            Some(now) if now == held.generation + 1 && in_time => Settled::Landed,
+            Some(now) if now == held.generation => Settled::Unchanged,
+            _ => Settled::Moved,
+        },
+    }
+}
+
+// The first commit INSERTs the realm row: an INSERT of its key waits for that one to end.
+async fn first_row(
+    pool: &DbConnection,
+    held: &Held,
+    ours: Option<&RealmState>,
+    timings: &Timings,
+) -> Settled {
+    let until = Instant::now() + timings.first_probe;
+    let step = timings.step;
+    loop {
+        let probed = match probe_within(pool, step).await {
+            Ok(true) => within(
+                step,
+                || KerberosSqlError::Failed(late(step)),
+                read_first_row(pool, ours),
+            )
+            .await
+            .map(|row| match row {
+                Some(row) if row.generation != held.generation + 1 => Settled::Moved,
+                Some(row) if row.ours => Settled::Landed,
+                Some(_) => Settled::CreatedElsewhere,
+                None => Settled::Moved,
+            }),
+            Ok(false) => Ok(Settled::Unchanged),
+            Err(err) => Err(err),
+        };
+        match probed {
+            Ok(settled) => return settled,
+            Err(err) if Instant::now() >= until => return Settled::Unread(err.to_string()),
+            Err(_) => tokio::time::sleep(RETRY.min(step)).await,
+        }
+    }
+}
+
+fn sqlite(pool: &DbConnection) -> bool {
+    pool.get_database_backend() == DbBackend::Sqlite
+}
+
+fn mysql(pool: &DbConnection) -> bool {
+    pool.get_database_backend() == DbBackend::MySql
+}
+
+fn sql_failed(err: DbErr) -> KerberosSqlError {
+    KerberosSqlError::Failed(err.to_string())
+}
+
+fn sqlx_failed(err: sqlx::Error) -> KerberosSqlError {
+    KerberosSqlError::Failed(err.to_string())
+}
+
+// SQLite's one connection reads after the COMMIT in flight; elsewhere the row lock waits for it.
+async fn settled_hold(
+    pool: &DbConnection,
+    step: Duration,
+) -> Result<Option<RealmHold>, KerberosSqlError> {
+    if sqlite(pool) {
+        return hold_within(pool, step).await;
+    }
+    within(step, || KerberosSqlError::Failed(late(step)), async {
+        if mysql(pool) {
+            let read = mysql_waiting(pool, step, &mysql_locked_hold()).await?;
+            return read
+                .and_then(|row| row.map(hold_of).transpose())
+                .map_err(sqlx_failed);
+        }
+        let txn = pool.begin().await.map_err(sql_failed)?;
+        lock_timeout(&txn, step).await?;
+        let hold = read_hold_locked(&txn).await;
+        let _ = txn.rollback().await;
+        hold
+    })
+    .await
+}
+
+async fn probe_within(pool: &DbConnection, step: Duration) -> Result<bool, KerberosSqlError> {
+    within(step, || KerberosSqlError::Failed(late(step)), async {
+        if mysql(pool) {
+            return match mysql_waiting(pool, step, &mysql_realm_probe()).await? {
+                Ok(_) => Ok(false),
+                Err(sqlx::Error::Database(err)) if err.is_unique_violation() => Ok(true),
+                Err(err) => Err(sqlx_failed(err)),
+            };
+        }
+        let txn = pool.begin().await.map_err(sql_failed)?;
+        lock_timeout(&txn, step).await?;
+        let probed = probe_realm_row(&txn).await;
+        let _ = txn.rollback().await;
+        probed
+    })
+    .await
+}
+
+async fn lock_timeout(txn: &DatabaseTransaction, step: Duration) -> Result<(), KerberosSqlError> {
+    if txn.get_database_backend() == DbBackend::Postgres {
+        let wait = format!("SET LOCAL lock_timeout = {}", step.as_millis());
+        txn.execute_unprepared(&wait).await.map_err(sql_failed)?;
+    }
+    Ok(())
+}
+
+fn hold_of(row: MySqlRow) -> Result<RealmHold, sqlx::Error> {
+    Ok(RealmHold {
+        generation: row.try_get(0)?,
+        open: row.try_get(1)?,
+    })
+}
+
+// MySQL bounds a lock wait per session: a connection whose bound is not put back is closed.
+struct SessionWait {
+    conn: PoolConnection<MySql>,
+    put_back: bool,
+}
+
+impl Drop for SessionWait {
+    fn drop(&mut self) {
+        if !self.put_back {
+            self.conn.close_on_drop();
+        }
+    }
+}
+
+async fn mysql_waiting(
+    pool: &DbConnection,
+    step: Duration,
+    sql: &str,
+) -> Result<Result<Option<MySqlRow>, sqlx::Error>, KerberosSqlError> {
+    let conn = pool
+        .get_mysql_connection_pool()
+        .acquire()
+        .await
+        .map_err(sqlx_failed)?;
+    let mut wait = SessionWait {
+        conn,
+        put_back: false,
+    };
+    let bound = format!(
+        "SET @klldap_wait = @@SESSION.innodb_lock_wait_timeout, \
+         SESSION innodb_lock_wait_timeout = {}",
+        step.as_secs().max(1)
+    );
+    sqlx::query(&bound)
+        .execute(&mut *wait.conn)
+        .await
+        .map_err(sqlx_failed)?;
+    let mut txn = sqlx::Connection::begin(&mut *wait.conn)
+        .await
+        .map_err(sqlx_failed)?;
+    let done = sqlx::query(sql).fetch_optional(&mut *txn).await;
+    txn.rollback().await.map_err(sqlx_failed)?;
+    sqlx::query("SET SESSION innodb_lock_wait_timeout = @klldap_wait")
+        .execute(&mut *wait.conn)
+        .await
+        .map_err(sqlx_failed)?;
+    wait.put_back = true;
+    Ok(done)
 }
 
 fn written_user(row: &HostRow) -> Option<&UserId> {
@@ -841,11 +1136,14 @@ async fn no_row_failure(
 }
 
 fn retry(held: Held, timings: &Timings) -> Held {
-    let lost_at = held.last_ok + timings.lost_after;
     Held {
-        next: (Instant::now() + RETRY).min(lost_at),
+        next: retry_wake(&held, Instant::now(), timings),
         ..held
     }
+}
+
+fn retry_wake(held: &Held, now: Instant, timings: &Timings) -> Instant {
+    (now + RETRY).min(held.last_ok + timings.lost_after)
 }
 
 async fn on_wake(
@@ -854,6 +1152,7 @@ async fn on_wake(
     timings: &Timings,
     lost_tx: &watch::Sender<Option<KerberosLost>>,
 ) -> Phase {
+    let started = Instant::now();
     match phase {
         Phase::Starting { since, .. } => {
             if since.elapsed() >= timings.lost_after {
@@ -863,9 +1162,11 @@ async fn on_wake(
                 Ok(None) => Phase::Held(fresh(0, false, timings)),
                 Ok(Some(hold)) if !hold.open => {
                     match take_owned(pool, hold.generation, timings.step).await {
-                        Ok(generation) => Phase::Held(fresh(generation, true, timings)),
+                        Ok(generation) => {
+                            Phase::Held(fresh_from(started, generation, true, timings))
+                        }
                         Err(Step::Replaced) => lose(lost_tx, KerberosLost::Occupied),
-                        Err(Step::Database) => starting_from(since, timings),
+                        Err(Step::Database | Step::Late) => starting_from(since, timings),
                     }
                 }
                 Ok(Some(hold)) => Phase::Watching {
@@ -878,9 +1179,11 @@ async fn on_wake(
         Phase::Watching { generation, .. } => match hold_within(pool, timings.step).await {
             Ok(Some(hold)) if hold.generation == generation => {
                 match take_owned(pool, generation, timings.step).await {
-                    Ok(next) => Phase::Held(fresh(next, true, timings)),
+                    Ok(next) => Phase::Held(fresh_from(started, next, true, timings)),
                     Err(Step::Replaced) => lose(lost_tx, KerberosLost::Occupied),
-                    Err(Step::Database) => lose(lost_tx, KerberosLost::DatabaseUnreachable),
+                    Err(Step::Database | Step::Late) => {
+                        lose(lost_tx, KerberosLost::DatabaseUnreachable)
+                    }
                 }
             }
             Ok(_) => lose(lost_tx, KerberosLost::Occupied),
@@ -888,20 +1191,19 @@ async fn on_wake(
         },
         Phase::Held(held) if held.row => {
             let silent = held.last_ok.elapsed();
-            let overdue = silent >= timings.lost_after;
-            match beat(pool, held.generation, timings.step).await {
+            match beat(pool, &held, started, timings).await {
                 Ok(next) => {
-                    if overdue {
+                    if silent >= timings.lost_after {
                         warn!(
                             "Woke {} s after the last write to the Kerberos realm; the heartbeat still held it",
                             silent.as_secs()
                         );
                     }
-                    Phase::Held(fresh(next, true, timings))
+                    Phase::Held(fresh_from(started, next, true, timings))
                 }
                 Err(Step::Replaced) => lose(lost_tx, KerberosLost::Replaced),
-                Err(Step::Database) if overdue => lose(lost_tx, KerberosLost::DatabaseUnreachable),
-                Err(Step::Database) => Phase::Held(retry(held, timings)),
+                Err(Step::Database) => db_failed(held, timings, lost_tx),
+                Err(Step::Late) => lose(lost_tx, KerberosLost::HeartbeatTooLate),
             }
         }
         other => other,
@@ -953,20 +1255,62 @@ fn lost_answer(lost_tx: &watch::Sender<Option<KerberosLost>>) -> KerberosStoreEr
 
 async fn answer_load(
     pool: &DbConnection,
-    phase: &Phase,
+    phase: Phase,
     reply: oneshot::Sender<Result<LoadedRealm, KerberosStoreError>>,
     waiting: &mut Vec<oneshot::Sender<Result<LoadedRealm, KerberosStoreError>>>,
     lost_tx: &watch::Sender<Option<KerberosLost>>,
     step: Duration,
-) {
+) -> Phase {
     match phase {
+        Phase::Held(held) if held.unsettled => {
+            let (loaded, phase) = reload_unsettled(pool, held, lost_tx, step).await;
+            let _ = reply.send(loaded);
+            phase
+        }
         Phase::Held(_) => {
             let _ = reply.send(read_loaded(pool, step).await);
+            phase
         }
         Phase::Lost => {
             let _ = reply.send(Err(lost_answer(lost_tx)));
+            phase
         }
-        Phase::Starting { .. } | Phase::Watching { .. } => waiting.push(reply),
+        Phase::Starting { .. } | Phase::Watching { .. } => {
+            waiting.push(reply);
+            phase
+        }
+    }
+}
+
+const UNSETTLED: &str = "the realm waits for its last commit to end";
+
+async fn reload_unsettled(
+    pool: &DbConnection,
+    held: Held,
+    lost_tx: &watch::Sender<Option<KerberosLost>>,
+    step: Duration,
+) -> (Result<LoadedRealm, KerberosStoreError>, Phase) {
+    let loaded = within(step, || KerberosSqlError::Failed(late(step)), async {
+        settled_hold(pool, step).await?;
+        load_realm(pool).await
+    })
+    .await;
+    match loaded {
+        Err(err) => {
+            let why = KerberosStoreError::NotReady(format!("{UNSETTLED}: {err}"));
+            (Err(why), Phase::Held(held))
+        }
+        Ok((_, generation)) if generation != held.generation => {
+            let why = KerberosStoreError::Failed(KerberosLost::Replaced.to_string());
+            (Err(why), lose(lost_tx, KerberosLost::Replaced))
+        }
+        Ok((realm, _)) => {
+            let held = Held {
+                unsettled: false,
+                ..held
+            };
+            (Ok(realm), Phase::Held(held))
+        }
     }
 }
 
@@ -1013,7 +1357,7 @@ fn store_err(err: KerberosSqlError) -> KerberosStoreError {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::sql_migrations::{KerberosRealm, Users};
     use crate::sql_tables::init_table;
@@ -1061,7 +1405,7 @@ mod tests {
         Db { pool, other, path }
     }
 
-    async fn insert_realm(pool: &DbConnection, generation: i64, open: bool) {
+    async fn insert_realm(pool: &impl ConnectionTrait, generation: i64, open: bool) {
         pool.execute(
             pool.get_database_backend().build(
                 Query::insert()
@@ -1583,8 +1927,8 @@ mod tests {
             lost_after: Duration::from_millis(400),
             watch: Duration::from_secs(5),
             step: Duration::from_millis(100),
-            lose_an_answer: AtomicBool::new(false),
-            stall_after_commit: Duration::ZERO,
+            first_probe: Duration::from_millis(300),
+            ..standard(false)
         }
     }
 
@@ -1706,6 +2050,7 @@ mod tests {
                 row: true,
                 last_ok: Instant::now() - Duration::from_secs(25),
                 next: Instant::now(),
+                unsettled: false,
             };
             let phase = on_wake(&db.pool, Phase::Held(woken), &timings, &lost_tx).await;
             let generation = match phase {
@@ -2096,25 +2441,22 @@ mod tests {
                     _ => None,
                 };
                 let held = fresh(5, true, &timings);
-                let (answered, phase) =
-                    read_back(&db.pool, held, host, LOST.to_owned(), &lost_tx, &timings).await;
+                let started = Instant::now();
+                let (answered, phase) = read_back(
+                    &db.pool,
+                    held,
+                    started,
+                    written(host),
+                    LOST.to_owned(),
+                    &lost_tx,
+                    &timings,
+                )
+                .await;
                 if let Some(txn) = holding {
                     txn.rollback().await.unwrap();
                 }
-                let answered = match answered {
-                    Ok(()) => "ok".to_owned(),
-                    Err(KerberosStoreError::Failed(why)) if why == LOST => "failed".to_owned(),
-                    Err(KerberosStoreError::Failed(why))
-                        if why.starts_with(UNREAD_AFTER_COMMIT) =>
-                    {
-                        "unknown".to_owned()
-                    }
-                    Err(e) => e.to_string(),
-                };
-                let at = match &phase {
-                    Phase::Held(held) => Some(held.generation),
-                    _ => None,
-                };
+                let answered = answer_of(answered, LOST);
+                let at = generation_of(&phase);
                 let stored = after(&db).await;
                 let (reply, then) = oneshot::channel();
                 commit_job(&db.pool, phase, &[], batch(), reply, &lost_tx, &timings).await;
@@ -2153,32 +2495,1047 @@ mod tests {
         }
         assert_eq!(got, want, "the step ran out after COMMIT was sent");
 
-        let mut first = Vec::new();
-        for written in [true, false] {
+        let ms = Duration::from_millis;
+        let mut stalled = Vec::new();
+        for stall in [ms(50), ms(400)] {
             let db = db().await;
             insert_alice(&db.pool).await;
+            insert_realm(&db.pool, 5, true).await;
+            let timings = Timings {
+                stall_before_read: stall,
+                ..short_timings()
+            };
+            let wrote = write_batch(&db.pool, &[], &batch(), 5, &AtomicBool::new(false)).await;
+            assert!(matches!(wrote, Ok(())), "{wrote:?}");
+            let (lost_tx, cause) = watch::channel(None);
+            let held = Held {
+                last_ok: Instant::now() - ms(300),
+                ..fresh(5, true, &timings)
+            };
+            let lost = LOST.to_owned();
+            let started = Instant::now();
+            let (answered, phase) = read_back(
+                &db.pool,
+                held,
+                started,
+                written(&[]),
+                lost,
+                &lost_tx,
+                &timings,
+            )
+            .await;
+            let at = generation_of(&phase);
+            stalled.push((stall, answer_of(answered, LOST), at, cause.borrow().clone()));
+        }
+        assert_eq!(
+            stalled,
+            vec![
+                (ms(50), "ok".to_owned(), Some(6), None),
+                (
+                    ms(400),
+                    "unknown".to_owned(),
+                    None,
+                    Some(KerberosLost::Replaced)
+                ),
+            ],
+            "the job started in time; a read that returns past lost_after and two steps may be a \
+             watcher's take"
+        );
+
+        let db = db().await;
+        insert_alice(&db.pool).await;
+        insert_realm(&db.pool, 5, true).await;
+        let timings = short_timings();
+        let wrote = write_batch(&db.pool, &[], &batch(), 5, &AtomicBool::new(false)).await;
+        assert!(matches!(wrote, Ok(())), "{wrote:?}");
+        let (lost_tx, cause) = watch::channel(None);
+        let late = Held {
+            last_ok: Instant::now() - timings.lost_after * 2,
+            ..fresh(5, true, &timings)
+        };
+        let started = Instant::now();
+        let (answered, phase) = read_back(
+            &db.pool,
+            late,
+            started,
+            written(&[]),
+            LOST.to_owned(),
+            &lost_tx,
+            &timings,
+        )
+        .await;
+        assert_eq!(
+            (
+                answer_of(answered, LOST),
+                generation_of(&phase),
+                cause.borrow().clone()
+            ),
+            ("unknown".to_owned(), None, Some(KerberosLost::Replaced)),
+            "a job started past lost_after: one up may be a watcher's take"
+        );
+    }
+
+    fn answer_of(answered: Result<(), KerberosStoreError>, lost: &str) -> String {
+        match answered {
+            Ok(()) => "ok".to_owned(),
+            Err(KerberosStoreError::Failed(why)) if why == lost => "failed".to_owned(),
+            Err(KerberosStoreError::Failed(why)) if why.ends_with(CREATED_FIRST) => {
+                "created first".to_owned()
+            }
+            Err(KerberosStoreError::Failed(why)) if why.starts_with(UNREAD_AFTER_COMMIT) => {
+                "unknown".to_owned()
+            }
+            Err(e) => e.to_string(),
+        }
+    }
+
+    fn generation_of(phase: &Phase) -> Option<i64> {
+        match phase {
+            Phase::Held(held) => Some(held.generation),
+            _ => None,
+        }
+    }
+
+    // Each start from last_ok, to the ms: a beat by the latest wake plus one job's step, a commit
+    // before that wake; a write takes a step, a read-back one more (a beat's if `beat_reads_back`).
+    #[test]
+    fn test_the_longest_hold_from_the_wakes_one_job_and_the_late_beat_rule_leaves_a_step() {
+        let timings = standard(false);
+        let held = fresh(5, true, &timings);
+        let at = |offset: Duration| held.last_ok + offset;
+        let renewed = timings.step * 2 + timings.heartbeat;
+        let capped = retry_wake(&held, at(timings.watch), &timings) - held.last_ok;
+        let latest_wake = renewed.max(capped);
+        let last_start = u64::try_from((latest_wake + timings.step).as_millis()).unwrap();
+        let longest = |late_rule: bool| {
+            (0..=last_start)
+                .map(Duration::from_millis)
+                .map(|start| {
+                    let reads_back = !late_rule || beat_reads_back(&held, at(start), &timings);
+                    let beat = start + timings.step * (1 + u32::from(reads_back));
+                    let commit = start + timings.step * 2;
+                    if start < latest_wake {
+                        beat.max(commit)
+                    } else {
+                        beat
+                    }
+                })
+                .max()
+                .unwrap_or_default()
+        };
+        let (with_rule, without) = (longest(true), longest(false));
+        let secs = Duration::from_secs;
+        assert_eq!(
+            (
+                with_rule,
+                timings.watch.checked_sub(with_rule),
+                timings.watch.checked_sub(without)
+            ),
+            (secs(30), Some(secs(5)), Some(Duration::ZERO)),
+            "the late-beat rule is what leaves the slack"
+        );
+        assert_eq!(
+            (HEARTBEAT, LOST_AFTER, STEP, WATCH, FIRST_PROBE),
+            (secs(10), secs(20), secs(5), secs(35), secs(60)),
+            "the values docs/kerberos.md states"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_beat_decides_after_it_ends_whether_the_realm_is_lost() {
+        #[derive(Clone, Copy, PartialEq)]
+        enum Fault {
+            DroppedAnswer,
+            LandedAnswerLost,
+            ConnectionHeld,
+        }
+        let unreachable = Some(KerberosLost::DatabaseUnreachable);
+        let late = Duration::from_millis(350);
+        let rows = [
+            (
+                "a dropped answer read back before lost_after",
+                Duration::ZERO,
+                Fault::DroppedAnswer,
+                (Some(5), None, 5),
+            ),
+            (
+                "a dropped answer read back past lost_after",
+                late,
+                Fault::DroppedAnswer,
+                (None, unreachable.clone(), 5),
+            ),
+            (
+                "a beat whose step ends past lost_after",
+                late,
+                Fault::ConnectionHeld,
+                (None, unreachable, 5),
+            ),
+            (
+                "a landed beat read back past lost_after, inside two steps",
+                late,
+                Fault::LandedAnswerLost,
+                (Some(6), None, 6),
+            ),
+        ];
+        let (mut got, mut want) = (Vec::new(), Vec::new());
+        for (label, silent, fault, expected) in rows {
+            let db = db().await;
+            insert_realm(&db.pool, 5, true).await;
+            let timings = Timings {
+                drop_a_beat: AtomicBool::new(fault == Fault::DroppedAnswer),
+                lose_a_beat: AtomicBool::new(fault == Fault::LandedAnswerLost),
+                stall_before_read: Duration::from_millis(100),
+                ..short_timings()
+            };
+            let (lost_tx, lost) = watch::channel(None);
+            let woken = Held {
+                last_ok: Instant::now() - silent,
+                ..fresh(5, true, &timings)
+            };
+            let holding = match fault {
+                Fault::ConnectionHeld => Some(db.pool.begin().await.unwrap()),
+                _ => None,
+            };
+            let phase = on_wake(&db.pool, Phase::Held(woken), &timings, &lost_tx).await;
+            if let Some(txn) = holding {
+                txn.rollback().await.unwrap();
+            }
+            let cause = lost.borrow().clone();
+            got.push((
+                label,
+                (generation_of(&phase), cause, hold(&db.other).await.0),
+            ));
+            want.push((label, expected));
+        }
+        assert_eq!(got, want);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_lost_beat_answer_is_settled_by_the_realm_generation() {
+        let mut got = Vec::new();
+        for silent in [Duration::ZERO, Duration::from_millis(500)] {
+            let db = db().await;
+            insert_realm(&db.pool, 5, true).await;
+            let timings = Timings {
+                lose_a_beat: AtomicBool::new(true),
+                ..short_timings()
+            };
+            let (lost_tx, lost) = watch::channel(None);
+            let woken = Held {
+                last_ok: Instant::now() - silent,
+                ..fresh(5, true, &timings)
+            };
+            let phase = on_wake(&db.pool, Phase::Held(woken), &timings, &lost_tx).await;
+            let first = (generation_of(&phase), lost.borrow().clone());
+            let phase = on_wake(&db.pool, phase, &timings, &lost_tx).await;
+            let second = (generation_of(&phase), lost.borrow().clone());
+            got.push((silent, first, second, hold(&db.other).await.0));
+        }
+        let given_up = (None, Some(KerberosLost::HeartbeatTooLate));
+        assert_eq!(
+            got,
+            vec![
+                (Duration::ZERO, (Some(6), None), (Some(7), None), 7),
+                (Duration::from_millis(500), given_up.clone(), given_up, 6),
+            ],
+            "its own landed beat is held on; past lost_after a lost answer is not read back"
+        );
+
+        let ms = Duration::from_millis;
+        let cases = [
+            ("one up, in time", 6, false, ms(0), ms(0), "landed"),
+            ("one up, past lost_after", 6, false, ms(500), ms(0), "moved"),
+            (
+                "one up, the job in time, its read returned past two steps",
+                6,
+                false,
+                ms(700),
+                ms(400),
+                "moved",
+            ),
+            ("unchanged", 5, false, ms(0), ms(0), "unchanged"),
+            ("two up: another holder", 7, false, ms(0), ms(0), "moved"),
+            ("the connection held", 6, true, ms(0), ms(0), "unread"),
+        ];
+        let (mut got, mut want) = (Vec::new(), Vec::new());
+        for (label, stored, holding, silent, started_ago, expected) in cases {
+            let db = db().await;
+            insert_realm(&db.pool, stored, true).await;
             let timings = short_timings();
-            let (lost_tx, _cause) = watch::channel(None);
-            if written {
-                let wrote = write_batch(&db.pool, &[], &batch(), 0, &AtomicBool::new(false)).await;
+            let held = Held {
+                last_ok: Instant::now() - silent,
+                ..fresh(5, true, &timings)
+            };
+            let holding = if holding {
+                Some(db.pool.begin().await.unwrap())
+            } else {
+                None
+            };
+            let started = Instant::now() - started_ago;
+            let settled = settle(&db.pool, &held, started, None, &timings).await;
+            if let Some(txn) = holding {
+                txn.rollback().await.unwrap();
+            }
+            let settled = match settled {
+                Settled::Landed => "landed",
+                Settled::Unchanged => "unchanged",
+                Settled::Unread(_) => "unread",
+                Settled::Moved => "moved",
+                Settled::CreatedElsewhere => "created elsewhere",
+            };
+            got.push((label, settled));
+            want.push((label, expected));
+        }
+        assert_eq!(got, want);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_reply_dropped_after_the_job_was_taken_is_unknown() {
+        let db = db().await;
+        insert_alice(&db.pool).await;
+        insert_realm(&db.pool, 5, false).await;
+        let timings = Timings {
+            step: Duration::from_secs(120),
+            stall_after_commit: Duration::from_secs(60),
+            ..standard(false)
+        };
+        let handle = spawn_committer(db.pool.clone(), timings);
+        let commit = |store: Arc<dyn KerberosStore>| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(store.commit(batch()).map_err(|err| err.to_string()));
+            });
+            rx
+        };
+        let taken = commit(handle.store());
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while hold(&db.other).await != (7, true) {
+            assert!(Instant::now() < deadline, "the commit did not land");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let queued = commit(handle.store());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        handle.task.abort();
+        let answers = [wait_thread(taken).await, wait_thread(queued).await].map(|answer| {
+            let err = answer.unwrap().unwrap_err();
+            (
+                err.contains(UNREAD_AFTER_COMMIT),
+                err.contains("kerberos committer stopped"),
+            )
+        });
+        assert_eq!(
+            answers,
+            [(true, true), (false, true)],
+            "taken, then dropped: unknown; still queued: nothing ran"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_the_fill_is_refused_unless_the_realm_is_held() {
+        let db = db().await;
+        insert_alice(&db.pool).await;
+        insert_realm(&db.pool, 5, true).await;
+        let wrote = write_batch(&db.pool, &[], &batch(), 5, &AtomicBool::new(false)).await;
+        assert!(matches!(wrote, Ok(())), "{wrote:?}");
+        let timings = short_timings();
+        let rows = [("alice".to_owned(), "y@EXAMPLE.COM".to_owned())];
+        let now = Instant::now();
+        let phases = [
+            (
+                "starting",
+                Phase::Starting {
+                    since: now,
+                    next: now,
+                },
+            ),
+            (
+                "watching",
+                Phase::Watching {
+                    generation: 6,
+                    until: now,
+                },
+            ),
+            ("lost", Phase::Lost),
+            ("held", Phase::Held(fresh(6, true, &timings))),
+        ];
+        let mut got = Vec::new();
+        for (label, phase) in phases {
+            let filled = fill_aliases(&db.pool, &phase, &rows, timings.step).await;
+            let chain = alias_chain(&db.other, "alice", 1).await.unwrap();
+            got.push((label, filled.map_err(|err| err.to_string()), chain));
+        }
+        let refused = Err(not_held().to_string());
+        let alice = vec!["alice".to_owned()];
+        assert_eq!(
+            got,
+            vec![
+                ("starting", refused.clone(), alice.clone()),
+                ("watching", refused.clone(), alice.clone()),
+                ("lost", refused, alice),
+                ("held", Ok(1), vec!["alice".to_owned(), "y".to_owned()]),
+            ]
+        );
+    }
+
+    fn written(host: &[HostRow]) -> Written<'_> {
+        Written { host, realm: None }
+    }
+
+    async fn commit_on(handle: &KerberosCommitterHandle, batch: RealmBatch) -> Result<(), String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let store = handle.store();
+        std::thread::spawn(move || {
+            let _ = tx.send(store.commit(batch).map_err(|err| err.to_string()));
+        });
+        wait_thread(rx).await?
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_the_first_commit_is_settled_by_a_probe_of_its_key() {
+        const LOST: &str = "the answer to COMMIT was lost";
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum First {
+            Ours,
+            Nothing,
+            Held,
+            AnotherCommitter,
+            AnotherState,
+            OursTakenSince,
+        }
+        let occupied = Some(KerberosLost::Occupied);
+        let rows = [
+            (First::Ours, "ok", Some((1, true, false)), None, true),
+            (
+                First::Nothing,
+                "failed",
+                Some((0, false, false)),
+                None,
+                false,
+            ),
+            (First::Held, "unknown", Some((0, false, true)), None, false),
+            (
+                First::AnotherCommitter,
+                "created first",
+                None,
+                occupied.clone(),
+                true,
+            ),
+            (First::AnotherState, "created first", None, occupied, true),
+            (
+                First::OursTakenSince,
+                "unknown",
+                None,
+                Some(KerberosLost::Replaced),
+                true,
+            ),
+        ];
+        let ours = batch().realm.unwrap();
+        let (mut got, mut want) = (Vec::new(), Vec::new());
+        for (first, answer, at, cause, row) in rows {
+            let db = db().await;
+            insert_alice(&db.pool).await;
+            let timings = Timings {
+                lost_after: Duration::from_secs(5),
+                ..short_timings()
+            };
+            let mut theirs = None;
+            match first {
+                First::Ours | First::OursTakenSince => {
+                    let wrote =
+                        write_batch(&db.pool, &[], &batch(), 0, &AtomicBool::new(false)).await;
+                    assert!(matches!(wrote, Ok(())), "{first:?}");
+                }
+                First::AnotherCommitter => {
+                    let other = Timings {
+                        heartbeat: Duration::from_secs(60),
+                        ..short_timings()
+                    };
+                    let handle = spawn_committer(db.other.clone(), other);
+                    let their_batch = RealmBatch {
+                        realm: Some(RealmState {
+                            state: vec![8],
+                            ..ours.clone()
+                        }),
+                        ..batch()
+                    };
+                    assert_eq!(commit_on(&handle, their_batch).await, Ok(()), "{first:?}");
+                    theirs = Some(handle);
+                }
+                First::AnotherState => insert_realm(&db.pool, 1, true).await,
+                First::Nothing | First::Held => {}
+            }
+            if first == First::OursTakenSince {
+                let take = take_owned(&db.other, 1, timings.step).await;
+                assert!(matches!(take, Ok(2)), "{first:?}");
+            }
+            let holding = match first {
+                First::Held => Some(db.pool.begin().await.unwrap()),
+                _ => None,
+            };
+            let (lost_tx, lost) = watch::channel(None);
+            let (empty, reason) = (fresh(0, false, &timings), LOST.to_owned());
+            let wrote = Written {
+                host: &[],
+                realm: Some(&ours),
+            };
+            let started = Instant::now();
+            let (answered, phase) =
+                read_back(&db.pool, empty, started, wrote, reason, &lost_tx, &timings).await;
+            let took = started.elapsed();
+            if let Some(txn) = holding {
+                txn.rollback().await.unwrap();
+            }
+            let held = match phase {
+                Phase::Held(held) => Some((held.generation, held.row, held.unsettled)),
+                _ => None,
+            };
+            let stored = read_hold(&db.other).await.unwrap().is_some();
+            let probed = (
+                took >= timings.first_probe,
+                took < timings.first_probe + RETRY.min(timings.step) + timings.step * 2,
+            );
+            let cause_now = lost.borrow().clone();
+            got.push((
+                first,
+                answer_of(answered, LOST),
+                held,
+                cause_now,
+                stored,
+                probed,
+            ));
+            let probed_out = (first == First::Held, true);
+            want.push((first, answer.to_owned(), at, cause, row, probed_out));
+            if let Some(handle) = theirs {
+                handle.shutdown().await;
+            }
+        }
+        assert_eq!(
+            got, want,
+            "Ok only for this server's own realm row; probed for first_probe, then at most a \
+             pause and the last probe's two steps"
+        );
+    }
+
+    async fn reload(
+        pool: &DbConnection,
+        phase: Phase,
+        lost_tx: &watch::Sender<Option<KerberosLost>>,
+        step: Duration,
+    ) -> (String, Phase) {
+        let (reply, answer) = oneshot::channel();
+        let phase = answer_load(pool, phase, reply, &mut Vec::new(), lost_tx, step).await;
+        let replaced = KerberosLost::Replaced.to_string();
+        let answer = match answer.await.unwrap() {
+            Ok(_) => "loaded".to_owned(),
+            Err(KerberosStoreError::NotReady(why)) if why.starts_with(UNSETTLED) => {
+                "not ready".to_owned()
+            }
+            Err(KerberosStoreError::Failed(why)) if why == replaced => "replaced".to_owned(),
+            Err(err) => err.to_string(),
+        };
+        (answer, phase)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_the_reload_after_an_unknown_starts_with_the_locking_read() {
+        const LOST: &str = "the answer to COMMIT was lost";
+        let mut got = Vec::new();
+        for landed in [true, false] {
+            let db = db().await;
+            insert_alice(&db.pool).await;
+            insert_realm(&db.pool, 5, true).await;
+            let timings = Timings {
+                lost_after: Duration::from_secs(5),
+                ..short_timings()
+            };
+            if landed {
+                let wrote = write_batch(&db.pool, &[], &batch(), 5, &AtomicBool::new(false)).await;
                 assert!(matches!(wrote, Ok(())), "{wrote:?}");
             }
-            let empty = fresh(0, false, &timings);
-            let (answered, phase) =
-                read_back(&db.pool, empty, &[], LOST.to_owned(), &lost_tx, &timings).await;
-            let at = match phase {
+            let (lost_tx, cause) = watch::channel(None);
+            let holding = db.pool.begin().await.unwrap();
+            let (held, lost) = (fresh(5, true, &timings), LOST.to_owned());
+            let (answered, phase) = read_back(
+                &db.pool,
+                held,
+                Instant::now(),
+                written(&[]),
+                lost,
+                &lost_tx,
+                &timings,
+            )
+            .await;
+            let (during, phase) = reload(&db.pool, phase, &lost_tx, timings.step).await;
+            holding.rollback().await.unwrap();
+            let (after, phase) = reload(&db.pool, phase, &lost_tx, timings.step).await;
+            let (again, phase) = reload(&db.pool, phase, &lost_tx, timings.step).await;
+            let reloads = [during, after, again];
+            let answered = answer_of(answered, LOST);
+            got.push((
+                landed,
+                answered,
+                reloads,
+                generation_of(&phase),
+                cause.borrow().clone(),
+            ));
+        }
+        let unknown = "unknown".to_owned();
+        let reloads = |after: &str| ["not ready".to_owned(), after.to_owned(), after.to_owned()];
+        assert_eq!(
+            got,
+            vec![
+                (
+                    true,
+                    unknown.clone(),
+                    reloads("replaced"),
+                    None,
+                    Some(KerberosLost::Replaced)
+                ),
+                (false, unknown, reloads("loaded"), Some(5), None),
+            ],
+            "the realm is not ready until the row's lock is had; a commit that landed late \
+             gives the realm up"
+        );
+    }
+
+    async fn flood_reads(tx: mpsc::Sender<Job>, until: Instant) {
+        while Instant::now() < until {
+            let (reply, _) = oneshot::channel();
+            let read = Job::Users(vec![UserId::new("alice")], reply);
+            if tx.send(read).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    async fn held_at(db: &Db, generation: i64) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let (now, open) = hold(&db.other).await;
+            if open && now >= generation {
+                return;
+            }
+            assert!(Instant::now() < deadline, "not held at {generation}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_queue_full_of_reads_does_not_starve_the_heartbeat() {
+        let db = db().await;
+        insert_alice(&db.pool).await;
+        insert_realm(&db.pool, 5, false).await;
+        let timings = Timings {
+            heartbeat: Duration::from_millis(50),
+            ..short_timings()
+        };
+        let lost_after = timings.lost_after;
+        let handle = spawn_committer(db.pool.clone(), timings);
+        held_at(&db, 6).await;
+        let until = Instant::now() + lost_after * 3;
+        let flood = tokio::spawn(flood_reads(handle.tx.clone(), until));
+        let (mut last, mut seen, mut widest) = (Instant::now(), 6, Duration::ZERO);
+        while Instant::now() < until {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let generation = hold(&db.other).await.0;
+            if generation > seen {
+                widest = widest.max(last.elapsed());
+                (last, seen) = (Instant::now(), generation);
+            }
+        }
+        widest = widest.max(last.elapsed());
+        flood.await.unwrap();
+        let cause = handle.lost().borrow().clone();
+        handle.shutdown().await;
+        assert_eq!(
+            (widest < lost_after, cause),
+            (true, None),
+            "the widest gap between beats {widest:?}, generation {seen}"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_queue_full_of_reads_after_a_lost_beat_answer_still_ends_inside_the_slack() {
+        let db = db().await;
+        insert_alice(&db.pool).await;
+        insert_realm(&db.pool, 5, false).await;
+        let timings = Timings {
+            heartbeat: Duration::from_millis(350),
+            drop_a_beat: AtomicBool::new(true),
+            stall_before_read: Duration::from_millis(100),
+            ..short_timings()
+        };
+        let (lost_after, step) = (timings.lost_after, timings.step);
+        let before_the_take = Instant::now();
+        let handle = spawn_committer(db.pool.clone(), timings);
+        held_at(&db, 6).await;
+        let until = before_the_take + lost_after * 3;
+        let flood = tokio::spawn(flood_reads(handle.tx.clone(), until));
+        let lost = handle.lost();
+        let ended = loop {
+            if let Some(cause) = lost.borrow().clone() {
+                break Some((cause, before_the_take.elapsed()));
+            }
+            if Instant::now() > until {
+                break None;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        flood.await.unwrap();
+        let stored = hold(&db.other).await.0;
+        handle.shutdown().await;
+        let given_up = |cause: &KerberosLost| {
+            matches!(
+                cause,
+                KerberosLost::DatabaseUnreachable | KerberosLost::HeartbeatTooLate
+            )
+        };
+        let inside = ended
+            .as_ref()
+            .map(|(cause, at)| (given_up(cause), *at < lost_after + step * 2));
+        assert_eq!((inside, stored), (Some((true, true)), 6), "{ended:?}");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_beat_held_behind_a_jobs_full_step_then_a_lost_answer_ends_inside_the_slack() {
+        let db = db().await;
+        insert_alice(&db.pool).await;
+        insert_realm(&db.pool, 5, false).await;
+        let ms = Duration::from_millis;
+        let timings = Timings {
+            heartbeat: ms(850),
+            lost_after: ms(1000),
+            step: ms(300),
+            drop_a_beat: AtomicBool::new(true),
+            stall_before_read: ms(800),
+            ..short_timings()
+        };
+        let (lost_after, step) = (timings.lost_after, timings.step);
+        let job_at = lost_after - step + ms(10);
+        let before_the_take = Instant::now();
+        let handle = spawn_committer(db.pool.clone(), timings);
+        held_at(&db, 6).await;
+        let seen = Instant::now();
+        tokio::time::sleep_until((seen + job_at).into()).await;
+        let holding = db.pool.begin().await.unwrap();
+        let (reply, answer) = oneshot::channel();
+        let read = Job::Users(vec![UserId::new("alice")], reply);
+        assert!(handle.tx.send(read).await.is_ok());
+        let job_started = Instant::now();
+        let job = answer.await.unwrap().is_err() && job_started.elapsed() >= step;
+        holding.rollback().await.unwrap();
+        let mut lost = handle.lost();
+        let cause = wait_lost(&mut lost).await;
+        let ended = before_the_take.elapsed();
+        let stored = hold(&db.other).await.0;
+        handle.shutdown().await;
+        assert_eq!(
+            (job, cause, ended < lost_after + step * 2, stored),
+            (true, KerberosLost::HeartbeatTooLate, true, 6),
+            "taken {:?} after the take began, the job held the beat a step past lost_after; \
+             given up at {ended:?}",
+            seen - before_the_take
+        );
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Holder {
+        Commits,
+        RollsBack,
+        HoldsPastTheStep,
+    }
+
+    async fn clear_realm(pool: &DbConnection) {
+        for table in ["kerberos_principals", "kerberos_policies", "kerberos_realm"] {
+            pool.execute_unprepared(&format!("DELETE FROM {table}"))
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn ends(txn: DatabaseTransaction, holder: Holder, hold_ms: u64) {
+        tokio::time::sleep(Duration::from_millis(hold_ms)).await;
+        match holder {
+            Holder::RollsBack => txn.rollback().await.unwrap(),
+            _ => txn.commit().await.unwrap(),
+        }
+    }
+
+    /// Lane rows: the read-back, and the reload after it, wait for the realm row's holder.
+    pub(crate) async fn scenario_read_back_waits_for_the_holder(pool: &DbConnection) {
+        const LOST: &str = "the answer to COMMIT was lost";
+        init_table(pool).await.unwrap();
+        insert_alice(pool).await;
+        let loaded = ["loaded", "loaded"];
+        type Row = (
+            Holder,
+            u64,
+            u64,
+            &'static str,
+            bool,
+            Option<i64>,
+            [&'static str; 2],
+            i64,
+            (bool, Option<KerberosLost>),
+        );
+        let rows: [Row; 3] = [
+            (
+                Holder::Commits,
+                200,
+                2000,
+                "ok",
+                true,
+                Some(6),
+                loaded,
+                6,
+                (true, None),
+            ),
+            (
+                Holder::RollsBack,
+                200,
+                2000,
+                "failed",
+                true,
+                Some(5),
+                loaded,
+                5,
+                (true, None),
+            ),
+            (
+                Holder::HoldsPastTheStep,
+                1000,
+                300,
+                "unknown",
+                false,
+                Some(5),
+                ["not ready", "replaced"],
+                6,
+                (false, Some(KerberosLost::Replaced)),
+            ),
+        ];
+        let (mut got, mut want) = (Vec::new(), Vec::new());
+        for (holder, hold_ms, step_ms, answer, waited, at, reloads, stored, then) in rows {
+            clear_realm(pool).await;
+            let timings = Timings {
+                lost_after: Duration::from_secs(5),
+                step: Duration::from_millis(step_ms),
+                ..short_timings()
+            };
+            insert_realm(pool, 5, true).await;
+            let txn = pool.begin().await.unwrap();
+            assert_eq!(heartbeat(&txn, 5).await.unwrap(), 6, "{holder:?}");
+            let held = fresh(5, true, &timings);
+            let (lost_tx, cause) = watch::channel(None);
+            let started = Instant::now();
+            let reads = async {
+                let lost = LOST.to_owned();
+                let (answered, phase) =
+                    read_back(pool, held, started, written(&[]), lost, &lost_tx, &timings).await;
+                let took = started.elapsed();
+                let at = generation_of(&phase);
+                let (during, phase) = reload(pool, phase, &lost_tx, timings.step).await;
+                (answer_of(answered, LOST), took, at, during, phase)
+            };
+            let ((answered, took, at_read, during, phase), ()) =
+                tokio::join!(reads, ends(txn, holder, hold_ms));
+            let (after, phase) = reload(pool, phase, &lost_tx, timings.step).await;
+            let read = (
+                answered,
+                took >= Duration::from_millis(hold_ms),
+                took < timings.step + Duration::from_millis(500),
+                at_read,
+            );
+            let generation = load_realm(pool).await.unwrap().1;
+            let (reply, next) = oneshot::channel();
+            commit_job(pool, phase, &[], batch(), reply, &lost_tx, &timings).await;
+            let next = (next.await.unwrap().is_ok(), cause.borrow().clone());
+            got.push((holder, read, [during, after], generation, next));
+            want.push((
+                holder,
+                (answer.to_owned(), waited, true, at),
+                reloads.map(str::to_owned),
+                stored,
+                then,
+            ));
+        }
+        assert_eq!(got, want);
+    }
+
+    /// Lane rows: the first commit's probe waits for the INSERT of the realm row in flight.
+    pub(crate) async fn scenario_the_first_commit_probe_waits_for_the_insert(pool: &DbConnection) {
+        const LOST: &str = "the answer to COMMIT was lost";
+        init_table(pool).await.unwrap();
+        type Row = (
+            Holder,
+            bool,
+            u64,
+            &'static str,
+            bool,
+            bool,
+            Option<(i64, bool)>,
+            i64,
+        );
+        let rows: [Row; 4] = [
+            (
+                Holder::Commits,
+                false,
+                200,
+                "ok",
+                true,
+                false,
+                Some((1, true)),
+                1,
+            ),
+            (
+                Holder::Commits,
+                true,
+                200,
+                "created first",
+                true,
+                false,
+                None,
+                1,
+            ),
+            (
+                Holder::RollsBack,
+                false,
+                200,
+                "failed",
+                true,
+                false,
+                Some((0, false)),
+                0,
+            ),
+            (
+                Holder::HoldsPastTheStep,
+                false,
+                1500,
+                "unknown",
+                false,
+                true,
+                Some((0, false)),
+                1,
+            ),
+        ];
+        let (mut got, mut want) = (Vec::new(), Vec::new());
+        for (holder, another, hold_ms, answer, waited, probed_out, at, stored) in rows {
+            clear_realm(pool).await;
+            let timings = Timings {
+                lost_after: Duration::from_secs(5),
+                step: Duration::from_millis(300),
+                first_probe: Duration::from_millis(900),
+                ..short_timings()
+            };
+            let ours = RealmState {
+                realm: "EXAMPLE.COM".to_owned(),
+                state: if another { vec![8] } else { vec![1] },
+            };
+            let txn = pool.begin().await.unwrap();
+            insert_realm(&txn, 1, true).await;
+            let (lost_tx, _cause) = watch::channel(None);
+            let started = Instant::now();
+            let reads = async {
+                let (empty, lost) = (fresh(0, false, &timings), LOST.to_owned());
+                let wrote = Written {
+                    host: &[],
+                    realm: Some(&ours),
+                };
+                let read = read_back(pool, empty, started, wrote, lost, &lost_tx, &timings).await;
+                (read, started.elapsed())
+            };
+            let (((answered, phase), took), ()) = tokio::join!(reads, ends(txn, holder, hold_ms));
+            let held = match phase {
                 Phase::Held(held) => Some((held.generation, held.row)),
                 _ => None,
             };
-            first.push((written, answered.is_ok(), at));
+            let generation = load_realm(pool).await.unwrap().1;
+            let probed = took >= timings.first_probe;
+            let read = (
+                answer_of(answered, LOST),
+                took >= Duration::from_millis(hold_ms),
+            );
+            got.push((holder, another, read, probed, held, generation));
+            want.push((
+                holder,
+                another,
+                (answer.to_owned(), waited),
+                probed_out,
+                at,
+                stored,
+            ));
         }
-        assert_eq!(
-            first,
-            vec![
-                (true, true, Some((1, true))),
-                (false, false, Some((0, false)))
-            ],
-            "the first commit on an empty database"
-        );
+        assert_eq!(got, want);
+    }
+
+    async fn five_sessions(pool: &DbConnection) -> (usize, usize) {
+        const WAITS: &str = "SELECT CAST(@@SESSION.innodb_lock_wait_timeout AS SIGNED), \
+                             CAST(@@GLOBAL.innodb_lock_wait_timeout AS SIGNED)";
+        let mysql = pool.get_mysql_connection_pool();
+        let mut conns = Vec::new();
+        for _ in 0..5 {
+            let conn = tokio::time::timeout(Duration::from_secs(5), mysql.acquire()).await;
+            conns.extend(conn.ok().and_then(Result::ok));
+        }
+        let mut put_back = 0;
+        for conn in &mut conns {
+            let (session, global): (i64, i64) =
+                sqlx::query_as(WAITS).fetch_one(&mut **conn).await.unwrap();
+            put_back += usize::from(session == global);
+        }
+        (conns.len(), put_back)
+    }
+
+    /// MySQL lane row: a pool of five; the realm row held past the step, or released inside it.
+    pub(crate) async fn scenario_the_mysql_lock_wait_is_bounded_and_put_back(pool: &DbConnection) {
+        const LOST: &str = "the answer to COMMIT was lost";
+        init_table(pool).await.unwrap();
+        insert_realm(pool, 5, true).await;
+        let rows = [
+            (
+                "held past the step: the read is dropped",
+                2000,
+                300,
+                "unknown",
+            ),
+            (
+                "released inside the step: the bound is put back",
+                300,
+                1500,
+                "failed",
+            ),
+        ];
+        let (mut got, mut want) = (Vec::new(), Vec::new());
+        for (label, hold_ms, step_ms, answer) in rows {
+            let timings = Timings {
+                lost_after: Duration::from_secs(5),
+                step: Duration::from_millis(step_ms),
+                ..short_timings()
+            };
+            let txn = pool.begin().await.unwrap();
+            assert_eq!(heartbeat(&txn, 5).await.unwrap(), 6, "{label}");
+            let (lost_tx, _cause) = watch::channel(None);
+            let started = Instant::now();
+            let reads = async {
+                let (held, lost) = (fresh(5, true, &timings), LOST.to_owned());
+                let (answered, _) =
+                    read_back(pool, held, started, written(&[]), lost, &lost_tx, &timings).await;
+                (answered, started.elapsed())
+            };
+            let ((answered, took), ()) = tokio::join!(reads, ends(txn, Holder::RollsBack, hold_ms));
+            let within = took < timings.step + Duration::from_secs(1);
+            let sessions = five_sessions(pool).await;
+            got.push((label, answer_of(answered, LOST), within, sessions));
+            want.push((label, answer.to_owned(), true, (5, 5)));
+        }
+        assert_eq!(got, want);
     }
 }

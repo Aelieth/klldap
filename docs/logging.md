@@ -132,8 +132,10 @@ ones. Non-admins get `Unauthorized to read the logs`, itself an `access_denied` 
 `filter` (shared by all three queries): `actor`, `target`, `kinds` (a list; empty means
 any), `success`, `protocol`, `peer`, `since`/`until` (inclusive), `memberOf` (group display
 name) / `memberOfId` — the last two keep the events whose actor is currently a member of
-the group. `actor` is a user id (lowercased like the stored actors); `target` and `peer`
-match the stored string exactly. `limit` defaults to 100 (max 1000). `beforeId` continues
+the group. `actor` matches a stored actor equal to the value as given or to the value
+lowercased: a kadmin client's principal as typed, a user id (stored lowercased, and it may
+hold `@`) in any case; `target` and `peer` match the stored string exactly. `limit`
+defaults to 100 (max 1000). `beforeId` continues
 from the last `id` of the previous page; `afterId` pages the other way — oldest first, from
 the given `id` (`"0"` for the beginning) — which is how another service tails the log: keep
 the last `id` seen, ask again with `afterId`, ids are assigned in order by a single writer

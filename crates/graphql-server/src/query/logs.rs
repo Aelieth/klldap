@@ -250,7 +250,7 @@ pub struct LogFilterInput {
 impl From<LogFilterInput> for logging::LogFilter {
     fn from(filter: LogFilterInput) -> Self {
         Self {
-            actor: filter.actor.as_deref().map(UserId::new),
+            actor: filter.actor,
             target: filter.target,
             kinds: filter
                 .kinds
@@ -393,5 +393,18 @@ mod tests {
             GraphQLLogDimension::iter().count(),
             logging::LogDimension::iter().count()
         );
+    }
+
+    #[test]
+    fn test_the_actor_filter_is_passed_on_as_given() {
+        let typed = ["Bob", "admin/admin@EXAMPLE.COM", "Bob@Example", "HTTP/web"];
+        let actors = typed.map(|actor| {
+            let filter = LogFilterInput {
+                actor: Some(actor.to_owned()),
+                ..Default::default()
+            };
+            logging::LogFilter::from(filter).actor.unwrap()
+        });
+        assert_eq!(actors, typed, "the store matches it as given or lowercased");
     }
 }

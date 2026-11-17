@@ -208,7 +208,7 @@ pub(crate) fn open_store(
     let admin = AdminSpec::new(admin_principal());
     let (store, booted) =
         krb5_kdc::open_or_create_host(&paths, profile, Some(admin), host, &host_paths)
-            .map_err(boot_error)
+            .map_err(|e| boot_error(e, &host_paths))
             .with_context(|| format!("while opening the Kerberos realm {realm}"))?;
     let keytab = booted
         .admin_keytab
@@ -227,7 +227,7 @@ pub(crate) fn host_paths(settings: &RealmSettings) -> HostPaths {
     }
 }
 
-fn boot_error(e: StoreError) -> anyhow::Error {
+fn boot_error(e: StoreError, paths: &HostPaths) -> anyhow::Error {
     let cause = match &e {
         StoreError::StashWithoutHostRealm { stash } => Some(format!(
             "the database holds no Kerberos realm, but the stash {0} belongs to one; restore the \
@@ -260,7 +260,24 @@ fn boot_error(e: StoreError) -> anyhow::Error {
             "{} is not a kerber-rust lockout file; restore it, or put an empty file in its place",
             path.display()
         )),
-        StoreError::Record(_) => Some("a Kerberos record in the database does not open".to_owned()),
+        StoreError::Record(_) => {
+            let mut marker = paths.stash.as_os_str().to_owned();
+            marker.push(".bootstrap");
+            let (stash, marker) = (paths.stash.display(), PathBuf::from(marker));
+            Some(match marker.exists() {
+                true => format!(
+                    "the database holds a realm that the stash {stash} does not open, and the \
+                     marker {} is beside it: this server's own first start never completed and \
+                     another server created the realm; copy that server's stash here in place of \
+                     this one and remove the marker",
+                    marker.display()
+                ),
+                false => format!(
+                    "a Kerberos record in the database does not open with the stash {stash}; \
+                     restore the stash that belongs to the database"
+                ),
+            })
+        }
         StoreError::Host(_) => Some(
             "the database refused or did not answer the realm's first read or write".to_owned(),
         ),
@@ -693,6 +710,43 @@ mod tests {
                 "{label}"
             );
         }
+    }
+
+    #[test]
+    fn test_a_first_start_that_lost_the_realm_to_another_server_stops_with_its_sentence() {
+        use crate::embedded::tests::FirstCommit;
+        let (winner, loser) = (TempRealm::new(), TempRealm::new());
+        let shared = winner.host();
+        winner.host.set_first_commit(Some(FirstCommit::Refused));
+        let lost = open_store(&loser.settings, &profile(&loser.settings), shared.clone());
+        open_store(&winner.settings, &profile(&winner.settings), shared.clone()).unwrap();
+        let stash = loser.settings.data_dir.join(".k5.EXAMPLE.COM");
+        let marker = loser.settings.data_dir.join(".k5.EXAMPLE.COM.bootstrap");
+        let state = || {
+            (
+                fs::read(&stash).ok(),
+                fs::read(&marker).ok(),
+                winner.host.realm.load().unwrap().principals,
+            )
+        };
+        let before = state();
+        let error = format!(
+            "{:#}",
+            open_store(&loser.settings, &profile(&loser.settings), shared).unwrap_err()
+        );
+        assert!(
+            lost.is_err()
+                && before.0.is_some()
+                && before.1.is_some()
+                && error.contains("another server created the realm")
+                && error.contains("copy that server's stash here in place of this one"),
+            "{error}"
+        );
+        assert_eq!(
+            state(),
+            before,
+            "the restart changes nothing on disk or in the database"
+        );
     }
 
     #[test]

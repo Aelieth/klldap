@@ -88,8 +88,15 @@ ACL text, read at boot.
   offline KDC is 52 (unavailable), LDAP ADD included. A change that waits more
   than 10 s for another one is refused with 51 (busy) and writes nothing. If
   the database's answer to the commit is lost, KLLDAP reads the realm's
-  generation back: the change is reported done if it landed, and as "the
-  result is unknown: try the new password" (LDAP 80) if it cannot be read. An
+  generation back, and the read waits for the commit to finish. The change is
+  reported done if it landed, with a warning in the server log, and failed if
+  it did not. It is reported as "the result is unknown: try the new password"
+  (LDAP 80) if the read does not finish within 5 s; the KDC then reloads the
+  realm from the database, and that reload first waits up to 5 s for the commit
+  to end. Until it has, the realm is not ready. If the commit landed after
+  all, this server stops serving the realm and exits; the next start loads it.
+  It is unknown too if another server moved the generation meanwhile; this
+  server then stops serving the realm and exits. An
   LDAP ADD with a password creates the entry, its record and its principal
   together, or nothing. The web pages still set the directory password and
   sync Kerberos in two requests.
@@ -137,6 +144,7 @@ KLLDAP answers each write to it:
 | `cpw` with fewer than 8 characters | Refused. Characters are counted, not bytes. | `Password is too short` |
 | `cpw` with a password that is not valid UTF-8 | Refused | `Unspecified password quality failure` |
 | `cpw -keepold`, `cpw -randkey`, `ktadd` | Refused | `Cannot change protected principal` |
+| `ktadd -norandkey` | Refused by kerber-rust itself: the keys are never read out. No log row is written. | ```Operation requires ``extract-keys'' privilege``` |
 | `modprinc -unlock` alone | Carried out by KLLDAP. Only the failure count, the unlock time and the modification stamp change. The keys and the password stay. | success |
 | `modprinc` with any other option | Refused | `Cannot change protected principal` |
 | `setstr`, `delstr`, `purgekeys` | Refused | `Cannot change protected principal` |
@@ -331,11 +339,35 @@ failure, as MIT does.
 
 While the database is down, an administrative write is refused at once. The
 kadmin client reports "Unable to access Kerberos database". A kadmin read of
-an existing principal is still answered. The server exits after twenty seconds
-without the database. A step still in flight can make that twenty-five. A
-start that finds the realm left open waits out a thirty-second watch. A second
-server pointed at the same database starts, waits out the watch, then exits
-and names the cause.
+an existing principal is still answered. The server gives the realm up after
+twenty seconds without the database. A step still in flight can make that
+twenty-five, or thirty: when the answer to a commit or a heartbeat is lost and
+read back, or when a heartbeat first waits out another request's five-second
+step. A heartbeat that starts that late does not read a lost answer back; the
+cause then says "the heartbeat started too late to confirm a lost answer". A
+start that finds the realm left open waits out a thirty-five-second watch,
+five seconds past that. A second server pointed at the same database starts,
+waits out the watch, then exits and names the cause.
+
+A server that gives the realm up exits non-zero and relies on its restart
+policy. The restarted server finds the realm left open, waits out the
+thirty-five-second watch, takes the realm over and serves again; until then
+the KDC, LDAP and the web interface do not answer. Without a restart policy
+it stays down.
+
+At the first start, a lost answer to the realm's first commit is probed: the
+server inserts the realm row's key in a transaction it rolls back, which waits
+for a first commit still in flight. It probes for sixty seconds. With the
+commit's own five-second step before that, then a one-second pause and up to
+two more steps for the last probe and its read, the start can wait about
+seventy-five seconds before the answer is reported unknown. The commit counts as landed only when the realm
+row holds this server's own realm and realm record. A row that another server
+created first is reported as "another server created the realm first"; the
+realm does not open and the process exits non-zero.
+
+To upgrade, stop every server that uses the database before the first start
+of the new version. 0.8.0 watches for thirty seconds and 0.8.1 for
+thirty-five, so the two side by side have no slack.
 
 ## Upgrading from 0.7.2
 

@@ -28,6 +28,7 @@ use lldap_opaque_handler::OpaqueHandler;
 use lldap_schema::PublicSchema;
 use std::net::IpAddr;
 use tracing::{debug, instrument};
+use zeroize::Zeroize;
 
 use super::delete::make_del_response;
 
@@ -359,6 +360,15 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
         .unwrap_or_else(|e: LdapError| vec![make_modify_response(e.code, e.message)])
     }
 
+    pub(crate) async fn answer_and_wipe(&self, ldap_op: &mut LdapOp) -> Vec<LdapOp> {
+        let ldap_op = WipePasswords(ldap_op);
+        match &*ldap_op.0 {
+            LdapOp::ModifyRequest(request) => self.do_modify_request(request).await,
+            LdapOp::ExtendedRequest(request) => self.do_extended_request(request).await,
+            op => unsupported(op),
+        }
+    }
+
     #[instrument(skip_all, level = "debug")]
     pub async fn create_user_or_group(&self, request: LdapAddRequest) -> LdapResult<Vec<LdapOp>> {
         let backend_handler = self
@@ -409,8 +419,11 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
         .await
     }
 
-    async fn dispatch(&mut self, ldap_op: LdapOp) -> Option<Vec<LdapOp>> {
+    async fn dispatch(&mut self, mut ldap_op: LdapOp) -> Option<Vec<LdapOp>> {
         Some(match ldap_op {
+            LdapOp::ModifyRequest(_) | LdapOp::ExtendedRequest(_) => {
+                self.answer_and_wipe(&mut ldap_op).await
+            }
             LdapOp::BindRequest(request) => self.do_bind(&request).await,
             LdapOp::SearchRequest(request) => self
                 .do_search_or_dse(&request)
@@ -427,8 +440,6 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
                 self.user_info = None;
                 return None;
             }
-            LdapOp::ModifyRequest(request) => self.do_modify_request(&request).await,
-            LdapOp::ExtendedRequest(request) => self.do_extended_request(&request).await,
             LdapOp::AddRequest(request) => self
                 .create_user_or_group(request)
                 .await
@@ -441,12 +452,40 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
                 .do_compare(request)
                 .await
                 .unwrap_or_else(|e: LdapError| vec![make_search_error(e.code, e.message)]),
-            op => vec![make_extended_response(
-                LdapResultCode::UnwillingToPerform,
-                format!("Unsupported operation: {op:#?}"),
-            )],
+            op => unsupported(&op),
         })
     }
+}
+
+fn unsupported(op: &LdapOp) -> Vec<LdapOp> {
+    vec![make_extended_response(
+        LdapResultCode::UnwillingToPerform,
+        format!("Unsupported operation: {op:#?}"),
+    )]
+}
+
+/// Zeroes in place, when dropped, a Modify's `userPassword` values and a PasswordModify's value.
+struct WipePasswords<'r>(&'r mut LdapOp);
+
+impl Drop for WipePasswords<'_> {
+    fn drop(&mut self) {
+        match self.0 {
+            LdapOp::ModifyRequest(request) => {
+                let changes = request.changes.iter_mut().map(|c| &mut c.modification);
+                let passwords = changes.filter(|m| m.atype.eq_ignore_ascii_case("userpassword"));
+                passwords.flat_map(|m| m.vals.iter_mut()).for_each(wipe);
+            }
+            LdapOp::ExtendedRequest(request) if request.name == OID_PASSWORD_MODIFY => {
+                request.value.iter_mut().for_each(wipe);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn wipe(value: &mut Vec<u8>) {
+    value.as_mut_slice().zeroize();
+    value.spare_capacity_mut().zeroize();
 }
 
 // Every denial ends in a result op with InsufficentAccessRights, so one look at the

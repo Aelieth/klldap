@@ -404,6 +404,7 @@ mod tests {
         setup_bound_admin_handler, setup_bound_handler_with_group,
         setup_bound_password_manager_handler,
     };
+    use crate::handler::{LdapHandler, make_extended_response};
     use crate::password::tests::{
         committed, expect_password_change, expect_registration_start, install, kdc_rows,
     };
@@ -589,6 +590,93 @@ mod tests {
                 "userPassword must be valid UTF-8"
             )
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_the_password_bytes_of_a_modify_are_zeroed_on_every_exit() {
+        type Row = (
+            &'static str,
+            Option<&'static str>,
+            Vec<Vec<u8>>,
+            Vec<LdapOp>,
+        );
+        let rows: [Row; 5] = [
+            (
+                "changed",
+                Some("lldap_admin"),
+                vec![b"newpassword".to_vec()],
+                make_modify_success_response(),
+            ),
+            (
+                "two values",
+                Some("lldap_admin"),
+                vec![b"one".to_vec(), b"two".to_vec()],
+                make_modify_failure_response(
+                    LdapResultCode::InvalidAttributeSyntax,
+                    "Wrong number of values for password attribute: 2",
+                ),
+            ),
+            (
+                "not UTF-8",
+                Some("lldap_admin"),
+                vec![vec![0xff, 0xfe]],
+                make_modify_failure_response(
+                    LdapResultCode::ConstraintViolation,
+                    "userPassword must be valid UTF-8",
+                ),
+            ),
+            (
+                "refused",
+                Some("regular"),
+                vec![b"newpassword".to_vec()],
+                make_modify_failure_response(
+                    LdapResultCode::InsufficentAccessRights,
+                    "User `test` cannot modify user `bob`",
+                ),
+            ),
+            (
+                "unbound",
+                None,
+                vec![b"newpassword".to_vec()],
+                vec![make_extended_response(
+                    LdapResultCode::InsufficentAccessRights,
+                    "No user currently bound".to_string(),
+                )],
+            ),
+        ];
+        for (label, group, vals, expected) in rows {
+            let mut mock = MockTestBackendHandler::new();
+            setup_default_ldap_mock(&mut mock);
+            if expected == make_modify_success_response() {
+                expect_password_change(&mut mock, "bob");
+                mock.expect_update_user().times(1).return_once(|_| Ok(()));
+            }
+            let ldap_handler = match group {
+                Some(group) => setup_bound_handler_with_group(mock, group).await,
+                None => LdapHandler::new_for_tests(mock, "dc=example,dc=com"),
+            };
+            let mut request = make_password_modify_request("bob");
+            request.changes[0].modification.vals = vals.clone();
+            let cn = modify_request("bob", LdapModifyType::Replace, "cn", &["Bob"]);
+            request.changes.extend(cn.changes);
+            let mut op = LdapOp::ModifyRequest(request);
+            let response = ldap_handler.answer_and_wipe(&mut op).await;
+            let LdapOp::ModifyRequest(request) = op else {
+                unreachable!()
+            };
+            let zeroed: Vec<Vec<u8>> = vals.iter().map(|v| vec![0; v.len()]).collect();
+            let left: Vec<_> = request
+                .changes
+                .iter()
+                .map(|c| c.modification.vals.clone())
+                .collect();
+            assert_eq!(
+                (response, left),
+                (expected, vec![zeroed, vec![b"Bob".to_vec()]]),
+                "{label}"
+            );
+        }
     }
 
     fn modify_request(

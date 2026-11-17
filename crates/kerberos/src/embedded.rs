@@ -24,12 +24,12 @@ use lldap_domain_handlers::kerberos::{
 use lldap_domain_handlers::logging::{
     self, LogKind, current_request, record, record_outcome, with_request_sync,
 };
-use lldap_domain_handlers::password::{kill_point, record_commit_failure};
+use lldap_domain_handlers::password::{kill_point, record_commit_failure, record_unreported};
 use std::collections::HashMap;
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
@@ -488,21 +488,21 @@ impl KerberosSync for EmbeddedKerberos {
                     let printed = logged_rows(&change.rows);
                     let done = panic::catch_unwind(AssertUnwindSafe(|| {
                         commit_owned(&own, &password, &enctypes, &ent, change)
-                    }))
-                    .unwrap_or_else(|_| Err(CommitError::Unknown(PANICKED.to_owned())));
+                    }));
                     match &done {
-                        Ok(()) => printed.iter().for_each(logging::print),
-                        Err(e) => record_commit_failure(kind, &worker, e),
+                        Ok(Ok(())) => printed.iter().for_each(logging::print),
+                        Ok(Err(e)) => record_commit_failure(kind, &worker, e),
+                        Err(_) => record_unreported(kind, &worker, PANICKED),
                     }
-                    done
+                    done.unwrap_or_else(|_| Err(CommitError::Unknown(PANICKED.to_owned())))
                 })
             })
         })
         .await
         .unwrap_or_else(|e| {
-            let unknown = CommitError::Unknown(format!("the password change did not run: {e}"));
-            record_commit_failure(kind, &user, &unknown);
-            Err(unknown)
+            let cause = format!("the password change did not run: {e}");
+            record_unreported(kind, &user, &cause);
+            Err(CommitError::Unknown(cause))
         })
     }
     async fn delete_principal(&self, user: &UserId) -> Result<(), String> {
@@ -726,7 +726,8 @@ where
     }
 }
 
-// `change_password_shared_committing` with the status set to the directory's in the same change.
+// kerber-rust v1.2.3-rc.1 `change_password_shared_committing` (crates/krb5-kdc/src/store/
+// password.rs:300-332) with the status set to the directory's in the same change.
 fn change_following(
     own: &Own,
     user: &UserId,
@@ -745,7 +746,7 @@ fn change_following(
         }
     };
     let prepared = planned.and_then(|plan| plan.map(PasswordPlan::derive).transpose())?;
-    let mut store = own.store.write().map_err(|_| poisoned())?;
+    let mut store = own.store.write().unwrap_or_else(PoisonError::into_inner);
     store.change_committing(commit, |s| {
         let applied = match prepared {
             Some(p) => s.apply_password(p, 0, &own.actor)?,
@@ -1028,6 +1029,7 @@ pub(crate) mod tests {
         Failed,
         Unknown,
         UserGone,
+        Panic,
     }
 
     impl Counting {
@@ -1098,7 +1100,7 @@ pub(crate) mod tests {
                 Some(Fault::UserGone) => {
                     return Err(KerberosStoreError::Refused(NO_USER_ROW.to_owned()));
                 }
-                None => {}
+                Some(Fault::Panic) | None => {}
             }
             self.realm.commit(change.batch)?;
             for row in &rows {
@@ -1115,6 +1117,9 @@ pub(crate) mod tests {
         }
 
         fn user_disabled(&self, user: &UserId) -> Result<bool, KerberosStoreError> {
+            if self.fault() == Some(Fault::Panic) {
+                panic!("the test host panicked");
+            }
             if self.unread.load(Ordering::Relaxed) {
                 return Err(unanswered_db());
             }
@@ -1964,6 +1969,37 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn test_a_change_that_panicked_is_unknown_and_its_row_says_it_did_not_report() {
+        use lldap_domain_handlers::password::UNREPORTED_ROW;
+        let guard = LogGuard::install();
+        let temp = TempRealm::new();
+        let (embedded, store) = temp.embedded();
+        guard.recorder().take_events();
+        temp.host.set_fault(Some(Fault::Panic));
+        let alice = RequestMeta::ldap(Some(UserId::new("alice")), None);
+        let call = embedded.commit_password(commit_of("bob", b"record"), "Bob-Password-1");
+        let got = with_request(alice, call).await;
+        temp.host.set_fault(None);
+        let events: Vec<_> = guard
+            .recorder()
+            .take_events()
+            .into_iter()
+            .filter(|e| e.kind == LogKind::PasswordChange)
+            .map(|e| (e.success, e.detail.unwrap_or_default()))
+            .collect();
+        assert_eq!(
+            (got, events, temp.host.rows(), marked(&store, "bob")),
+            (
+                Err(CommitError::Unknown(PANICKED.to_owned())),
+                vec![(false, UNREPORTED_ROW.to_owned())],
+                Vec::<String>::new(),
+                None
+            )
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_the_wait_for_the_write_lock_is_bounded_and_writes_nothing() {
         let temp = TempRealm::new();
         let (mut embedded, store) = temp.embedded();
@@ -1982,6 +2018,24 @@ pub(crate) mod tests {
             .commit_password(commit_of("bob", b"record"), "Bob-Password-1")
             .await;
         assert_eq!((done, marked(&store, "bob")), (Ok(()), Some((true, false))));
+    }
+
+    #[test]
+    fn test_change_following_mirrors_a_helper_of_this_signature() {
+        type Checks = fn(&PrincipalStore) -> Result<(), StoreError>;
+        type Commit = fn(HostChange) -> Result<(), KerberosStoreError>;
+        type Mirrored = fn(
+            &SharedDump,
+            &PrincipalName,
+            &str,
+            &[u8],
+            u32,
+            &str,
+            &[KeySalt],
+            Checks,
+            Commit,
+        ) -> Result<(), StoreError>;
+        let _: Mirrored = krb5_kdc::change_password_shared_committing;
     }
 
     #[tokio::test]

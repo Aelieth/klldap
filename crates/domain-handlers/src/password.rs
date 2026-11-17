@@ -12,6 +12,7 @@ pub const PASSWORD_CHANGE_IN_PROGRESS: &str = "a password change is in progress,
 pub const RESULT_UNKNOWN: &str = "the result is unknown: try the new password";
 pub const ANSWER_LOST: &str = "the answer was lost; the change had committed";
 pub const UNKNOWN_ROW: &str = "result unknown: the database did not answer";
+pub const UNREPORTED_ROW: &str = "result unknown: the change did not report";
 pub const PASSWORD_MIN_LENGTH: usize = 8;
 
 /// The directory's floor, in characters (Unicode scalar values), at every door.
@@ -91,6 +92,12 @@ pub fn record_commit_failure(kind: LogKind, user: &UserId, error: &CommitError) 
         warn!("A password change's result is unknown: {cause}");
     }
     record_failed(kind, user, &commit_error(error.clone()));
+}
+
+/// The row of a change whose task panicked or did not run.
+pub fn record_unreported(kind: LogKind, user: &UserId, cause: &str) {
+    warn!("A password change's result is unknown: {cause}");
+    logging::record_failure(kind, Some(user.as_str()), UNREPORTED_ROW);
 }
 
 fn record_failed(kind: LogKind, user: &UserId, error: &PasswordChangeError) {

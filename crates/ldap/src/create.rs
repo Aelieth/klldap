@@ -48,7 +48,14 @@ pub(crate) async fn create_user_or_group(
             .await
         }
         UserOrGroupName::Group(group_name) => {
-            create_group(backend_handler, group_name, request.attributes, internal_ou).await
+            create_group(
+                backend_handler,
+                group_name,
+                request.attributes,
+                password,
+                internal_ou,
+            )
+            .await
         }
         err => Err(err.into_ldap_error(
             &request.dn,
@@ -314,9 +321,14 @@ async fn create_group(
     backend_handler: &impl AdminBackendHandler,
     group_name: GroupName,
     attributes: Vec<LdapAttribute>,
+    password: Taken,
     internal_ou: String,
 ) -> LdapResult<Vec<LdapOp>> {
+    let ignored = one_password(password)?.is_some();
     let attributes = parse_attributes(attributes)?;
+    if ignored {
+        warn!("LDAP add: ignoring attribute userpassword (not in the schema)");
+    }
     let mut group_attributes = vec![typed_attribute(
         "ou",
         &[internal_ou],
@@ -472,6 +484,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_an_add_reads_its_password_before_any_other_attribute() {
+        let two = |atype: &str, a: &str, b: &str| LdapPartialAttribute {
+            atype: atype.to_owned(),
+            vals: vec![a.as_bytes().to_vec(), b.as_bytes().to_vec()],
+        };
+        for dn in [
+            "uid=bob,ou=people,dc=example,dc=com",
+            "cn=bob,ou=groups,dc=example,dc=com",
+        ] {
+            let ldap_handler = setup_bound_admin_handler(MockTestBackendHandler::new()).await;
+            let request = LdapAddRequest {
+                dn: dn.to_owned(),
+                attributes: vec![two("cn", "Bob", "Bobby"), two("userPassword", "a", "b")],
+            };
+            assert_eq!(
+                ldap_handler.create_user_or_group(request).await,
+                Err(constraint_violation(
+                    "Expected a single value for attribute userPassword".to_owned()
+                )),
+                "{dn}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn test_create_user_persists_schema_known_extra_attributes() {
         let mut mock = MockTestBackendHandler::new();
 
@@ -589,6 +626,99 @@ mod tests {
                 String::new()
             )])
         );
+    }
+
+    #[derive(Clone, Default)]
+    struct Warnings(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    struct Message(String);
+
+    impl tracing::field::Visit for Message {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    impl tracing::Subscriber for Warnings {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                let mut message = Message(String::new());
+                event.record(&mut message);
+                self.0.lock().unwrap().push(message.0);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn test_a_group_add_with_a_password_warns_and_does_not_keep_it() {
+        const WARNING: &str = "LDAP add: ignoring attribute userpassword (not in the schema)";
+        type Row = (&'static str, &'static [&'static str], LdapResult<()>, usize);
+        let rows: [Row; 3] = [
+            ("one value", &["s3cret"], Ok(()), 1),
+            (
+                "two values",
+                &["a", "b"],
+                Err(constraint_violation(
+                    "Expected a single value for attribute userPassword".to_owned(),
+                )),
+                0,
+            ),
+            (
+                "no value",
+                &[],
+                Err(constraint_violation(
+                    "Missing value for attribute userpassword".to_owned(),
+                )),
+                0,
+            ),
+        ];
+        for (label, vals, expected, warned) in rows {
+            let warnings = Warnings::default();
+            let _default = tracing::subscriber::set_default(warnings.clone());
+            let mut mock = MockTestBackendHandler::new();
+            mock.expect_create_group()
+                .with(eq(CreateGroupRequest {
+                    display_name: GroupName::new("bob"),
+                    attributes: vec![Attribute {
+                        name: "ou".into(),
+                        value: "groups".to_string().into(),
+                    }],
+                }))
+                .times(usize::from(expected.is_ok()))
+                .return_once(|_| Ok(GroupId(5)));
+            let ldap_handler = setup_bound_admin_handler(mock).await;
+            let request = LdapAddRequest {
+                dn: "cn=bob,ou=groups,dc=example,dc=com".to_owned(),
+                attributes: vec![LdapPartialAttribute {
+                    atype: "userPassword".to_owned(),
+                    vals: vals.iter().map(|v| v.as_bytes().to_vec()).collect(),
+                }],
+            };
+            let expected =
+                expected.map(|()| vec![make_add_response(LdapResultCode::Success, String::new())]);
+            assert_eq!(
+                ldap_handler.create_user_or_group(request).await,
+                expected,
+                "{label}"
+            );
+            assert_eq!(
+                warnings.0.lock().unwrap().clone(),
+                vec![WARNING.to_owned(); warned],
+                "{label}"
+            );
+        }
     }
 
     #[tokio::test]

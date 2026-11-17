@@ -101,8 +101,8 @@ pub(crate) fn password_change_error(e: PasswordChangeError) -> LdapError {
     }
 }
 
-/// Changes the directory password and, with kerberossync on, the KDC's in the same
-/// transaction; a disabled user's first principal is made disabled.
+/// Changes the directory password and, with kerberossync on, the KDC's keys in the same
+/// transaction, which also sets the principal's status from `lldap_disabled`.
 pub(crate) async fn change_password<Handler: BackendHandler + OpaqueHandler>(
     backend_handler: &AccessControlledBackendHandler<Handler>,
     readable_handler: &impl UserReadableBackendHandler,
@@ -229,7 +229,9 @@ pub mod tests {
         },
     };
     use chrono::TimeZone;
-    use ldap3_proto::proto::{LdapBindCred, LdapBindResponse, LdapOp, LdapResult as LdapResultOp};
+    use ldap3_proto::proto::{
+        LdapBindCred, LdapBindResponse, LdapExtendedRequest, LdapOp, LdapResult as LdapResultOp,
+    };
     use lldap_domain::types::{GroupDetails, GroupId, UserId, Uuid};
     use lldap_domain_handlers::kerberos::CommitError;
     use lldap_domain_handlers::password::{PASSWORD_CHANGE_IN_PROGRESS, RESULT_UNKNOWN};
@@ -533,6 +535,90 @@ pub mod tests {
             }
             .into(),
         )
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_the_encoded_passwords_of_a_password_modify_are_zeroed_on_every_exit() {
+        let request = |user: Option<&str>| {
+            LdapExtendedRequest::from(LdapPasswordModifyRequest {
+                user_identity: user.map(|u| format!("uid={u},ou=people,dc=example,dc=com")),
+                old_password: Some("oldpassword".to_string()),
+                new_password: Some("newpassword".to_string()),
+            })
+        };
+        let mut cut = request(Some("bob"));
+        let value = cut.value.as_mut().unwrap();
+        value.truncate(value.len() - 1);
+        let answer = |code, message: &str| make_extended_response(code, message.to_string());
+        let success = answer(LdapResultCode::Success, "");
+        let rows = [
+            (
+                "changed",
+                Some("lldap_admin"),
+                request(Some("bob")),
+                success.clone(),
+            ),
+            (
+                "refused",
+                Some("regular"),
+                request(Some("bob")),
+                answer(
+                    LdapResultCode::InsufficentAccessRights,
+                    "User `test` cannot modify user `bob`",
+                ),
+            ),
+            (
+                "no user",
+                Some("lldap_admin"),
+                request(None),
+                answer(
+                    LdapResultCode::ConstraintViolation,
+                    "Missing either user_id or password",
+                ),
+            ),
+            (
+                "not BER",
+                Some("lldap_admin"),
+                cut,
+                answer(
+                    LdapResultCode::ProtocolError,
+                    "Error while parsing password modify request: PasswordModifyRequestBer",
+                ),
+            ),
+            (
+                "unbound",
+                None,
+                request(Some("bob")),
+                answer(
+                    LdapResultCode::InsufficentAccessRights,
+                    "No user currently bound",
+                ),
+            ),
+        ];
+        for (label, group, request, expected) in rows {
+            let mut mock = MockTestBackendHandler::new();
+            setup_default_ldap_mock(&mut mock);
+            if expected == success {
+                expect_password_change(&mut mock, "bob");
+            }
+            let ldap_handler = match group {
+                Some(group) => setup_bound_handler_with_group(mock, group).await,
+                None => LdapHandler::new_for_tests(mock, "dc=example,dc=com"),
+            };
+            let zeroed = request.value.as_ref().map(|v| vec![0u8; v.len()]);
+            let mut op = LdapOp::ExtendedRequest(request);
+            let response = ldap_handler.answer_and_wipe(&mut op).await;
+            let LdapOp::ExtendedRequest(request) = op else {
+                unreachable!()
+            };
+            assert!(zeroed.as_ref().is_some_and(|z| !z.is_empty()), "{label}");
+            assert_eq!(
+                (response, request.value),
+                (vec![expected], zeroed),
+                "{label}"
+            );
+        }
     }
 
     #[tokio::test]

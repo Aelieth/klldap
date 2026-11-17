@@ -267,7 +267,9 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
     #[instrument(skip_all, level = "debug")]
     async fn do_extended_request(&self, request: &LdapExtendedRequest) -> Vec<LdapOp> {
         match request.name.as_str() {
-            OID_PASSWORD_MODIFY => match LdapPasswordModifyRequest::try_from(request) {
+            OID_PASSWORD_MODIFY => match LdapPasswordModifyRequest::try_from(request)
+                .map(password::PasswordModify::from)
+            {
                 Ok(password_request) => {
                     let credentials = match self.get_credentials() {
                         Credentials::Bound(cred) => cred,
@@ -278,7 +280,7 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
                         self.ldap_info,
                         &self.backend_handler,
                         self.get_opaque_handler(),
-                        &password_request,
+                        password_request,
                     )
                     .await
                     .unwrap_or_else(|e: LdapError| vec![make_extended_response(e.code, e.message)])

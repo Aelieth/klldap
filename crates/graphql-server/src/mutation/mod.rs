@@ -44,6 +44,7 @@ use lldap_validation::attributes::{ALLOWED_CHARACTERS_DESCRIPTION, validate_attr
 use posix::{PosixSettingsInput, PosixSettingsResponse};
 use std::sync::Arc;
 use tracing::{Instrument, debug, debug_span, info, warn};
+use zeroize::Zeroizing;
 
 #[derive(PartialEq, Eq, Debug)]
 /// The top-level GraphQL mutation type.
@@ -121,6 +122,7 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         user_id: String,
         password: String,
     ) -> FieldResult<Success> {
+        let password = Zeroizing::new(password);
         let span = debug_span!("[GraphQL mutation] set_user_password");
         let target_user_id = UserId::new(&user_id);
         span.in_scope(|| debug!("Setting password for user: {target_user_id}"));
@@ -147,10 +149,7 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             .await
             .map_err(|e| anyhow!("Failed to fetch user for Kerberos sync check: {e}"))?;
         let sync_enabled = kerberos_sync_enabled(&user.attributes);
-        let disabled = groups
-            .iter()
-            .any(|g| g.display_name == "lldap_disabled".into());
-        let sync = PasswordSync::of(sync_enabled, disabled);
+        let sync = PasswordSync::of(sync_enabled);
         if let Err(e) = change_password_everywhere(handler, &target_user_id, &password, sync).await
         {
             warn!("Password set for {target_user_id} failed: {e}");
@@ -1630,11 +1629,10 @@ mod tests {
             .returning(move |_| Ok(groups.clone()));
     }
 
-    fn alice_committed(disabled: bool) -> KerberosOp {
+    fn alice_committed() -> KerberosOp {
         KerberosOp::CommitPassword {
             username: "alice".into(),
             password: "s3cret".into(),
-            disabled,
             rows: vec!["password alice".into(), "log password_change".into()],
         }
     }
@@ -1672,18 +1670,18 @@ mod tests {
         let (value, errors) = set_password("Alice", mock).await;
         assert_eq!(errors.len(), 0, "{errors:?}");
         assert_eq!(value, graphql_value!({"setUserPassword": {"ok": true}}));
-        assert_eq!(guard.recorder().take_ops(), vec![alice_committed(false)]);
+        assert_eq!(guard.recorder().take_ops(), vec![alice_committed()]);
     }
 
     #[tokio::test]
     #[serial]
-    async fn test_set_user_password_reports_a_failed_change_with_the_directory_state() {
+    async fn test_set_user_password_reports_a_failed_change_in_any_group() {
         const CAUSE: &str = "the database did not answer";
         let rows = [
-            ("in no group", std::collections::HashSet::new(), false),
-            ("in lldap_disabled", group_set("lldap_disabled"), true),
+            ("in no group", std::collections::HashSet::new()),
+            ("in lldap_disabled", group_set("lldap_disabled")),
         ];
-        for (label, groups, disabled) in rows {
+        for (label, groups) in rows {
             let mut mock = MockTestBackendHandler::new();
             expect_registration_start(&mut mock, "alice");
             mock.expect_registration_finish().times(0);
@@ -1703,7 +1701,7 @@ mod tests {
             );
             assert_eq!(
                 guard.recorder().take_ops(),
-                vec![alice_committed(disabled)],
+                vec![alice_committed()],
                 "{label}"
             );
         }
@@ -1779,7 +1777,7 @@ mod tests {
             }
             let ops = guard.map(|g| g.recorder().take_ops()).unwrap_or_default();
             let expected = match reached {
-                true => vec![alice_committed(false)],
+                true => vec![alice_committed()],
                 false => vec![],
             };
             assert_eq!(ops, expected, "{kdc:?}");

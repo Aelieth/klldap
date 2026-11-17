@@ -93,9 +93,11 @@ ACL text, read at boot.
   LDAP ADD with a password creates the entry, its record and its principal
   together, or nothing. The web pages still set the directory password and
   sync Kerberos in two requests.
-- Users in `lldap_disabled` have their principal disabled (`DISALLOW_ALL_TIX`),
-  and a password sync while disabled leaves it disabled. Leaving the group
-  re-enables it.
+- Users in `lldap_disabled` have their principal disabled (`DISALLOW_ALL_TIX`).
+  Leaving the group re-enables it. A `kerberosSync` user's password change
+  also sets the principal's status from the group, in the same transaction as
+  the keys: it reads the membership once it holds the write lock, so a user
+  disabled while the change waits gets a disabled principal.
 - The read-only, admin-visible `krbPrincipalName` attribute shows the principal
   recorded for the user.
 - The web UI never sends a plaintext password: it encrypts it with the RSA key

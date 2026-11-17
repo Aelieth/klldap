@@ -19,6 +19,7 @@ use lldap_domain_handlers::password::{
 use lldap_mfa::{MFA_ENROLLMENT_REQUIRED, TOTP_SEPARATOR, TotpFailure, totp_failure};
 use lldap_opaque_handler::OpaqueHandler;
 use tracing::{info, warn};
+use zeroize::Zeroizing;
 
 pub(crate) fn parse_bind_request<'a>(
     ldap_info: &LdapInfo,
@@ -117,17 +118,7 @@ pub(crate) async fn change_password<Handler: BackendHandler + OpaqueHandler>(
             message: format!("Failed to fetch user for Kerberos sync check: {e}"),
         })?;
     let sync_enabled = kerberos_sync_enabled(&user.attributes);
-    let disabled = sync_enabled
-        && readable_handler
-            .get_user_groups(user_id)
-            .await
-            .map_err(|e| LdapError {
-                code: LdapResultCode::OperationsError,
-                message: format!("Internal error while requesting user's groups: {e:#?}"),
-            })?
-            .iter()
-            .any(|g| g.display_name == "lldap_disabled".into());
-    let sync = PasswordSync::of(sync_enabled, disabled);
+    let sync = PasswordSync::of(sync_enabled);
     if let Err(e) = change_password_everywhere(opaque_handler, user_id, password, sync).await {
         warn!("LDAP password change for {user_id} failed: {e}");
         return Err(password_change_error(e));
@@ -143,12 +134,29 @@ pub(crate) async fn change_password<Handler: BackendHandler + OpaqueHandler>(
     Ok(())
 }
 
+/// A PasswordModify request whose passwords are wiped when it is dropped.
+pub(crate) struct PasswordModify {
+    user_identity: Option<String>,
+    new_password: Option<Zeroizing<String>>,
+    _old_password: Option<Zeroizing<String>>,
+}
+
+impl From<LdapPasswordModifyRequest> for PasswordModify {
+    fn from(request: LdapPasswordModifyRequest) -> Self {
+        Self {
+            user_identity: request.user_identity,
+            new_password: request.new_password.map(Zeroizing::new),
+            _old_password: request.old_password.map(Zeroizing::new),
+        }
+    }
+}
+
 pub(crate) async fn do_password_modification<Handler: BackendHandler + OpaqueHandler>(
     credentials: &ValidationResults,
     ldap_info: &LdapInfo,
     backend_handler: &AccessControlledBackendHandler<Handler>,
     opaque_handler: &impl OpaqueHandler,
-    request: &LdapPasswordModifyRequest,
+    request: PasswordModify,
 ) -> LdapResult<Vec<LdapOp>> {
     match (&request.user_identity, &request.new_password) {
         (Some(user), Some(password)) => {
@@ -508,11 +516,10 @@ pub mod tests {
         }
     }
 
-    pub fn committed(user: &str, password: &str, disabled: bool) -> KerberosOp {
+    pub fn committed(user: &str, password: &str) -> KerberosOp {
         KerberosOp::CommitPassword {
             username: user.into(),
             password: password.into(),
-            disabled,
             rows: vec![format!("password {user}"), "log password_change".into()],
         }
     }
@@ -530,7 +537,7 @@ pub mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn test_password_modify_reports_a_failed_change_with_the_directory_state() {
+    async fn test_password_modify_reports_a_failed_change_in_any_group() {
         const CAUSE: &str = "the database did not answer";
         let disabled = HashSet::from([GroupDetails {
             group_id: GroupId(2),
@@ -541,10 +548,10 @@ pub mod tests {
             attributes: vec![],
         }]);
         let rows = [
-            ("in no group", HashSet::new(), false),
-            ("in lldap_disabled", disabled, true),
+            ("in no group", HashSet::new()),
+            ("in lldap_disabled", disabled),
         ];
-        for (label, groups, in_disabled) in rows {
+        for (label, groups) in rows {
             let guard = RecordingGuard::install_failing(CAUSE);
             let mut mock = MockTestBackendHandler::new();
             mock.expect_get_user_details()
@@ -568,7 +575,7 @@ pub mod tests {
             );
             assert_eq!(
                 guard.recorder().take_ops(),
-                vec![committed("bob", "newpassword", in_disabled)],
+                vec![committed("bob", "newpassword")],
                 "{label}"
             );
         }
@@ -664,7 +671,7 @@ pub mod tests {
             );
             let ops = guard.map(|g| g.recorder().take_ops()).unwrap_or_default();
             let expected = match reached {
-                true => vec![committed("bob", "newpassword", false)],
+                true => vec![committed("bob", "newpassword")],
                 false => vec![],
             };
             assert_eq!(ops, expected, "{kdc:?}");

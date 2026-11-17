@@ -9,6 +9,12 @@
   its one `password_change` row in one transaction; no `kerberos_sync` row is written for it.
   An LDAP ADD with a password makes the entry and its principal together or not at all, and
   answers 52 when the KDC is offline.
+- That password change also sets the principal's status from `lldap_disabled`, read once the
+  change holds the write lock: a disabled principal of an enabled user is enabled, and an enabled
+  principal of a disabled user is disabled.
+- KLLDAP's copies of the plaintext password of a GraphQL `setUserPassword`, an LDAP Modify
+  `userPassword`, an `ldappasswd` and an LDAP ADD are wiped when the request ends. Buffers the
+  LDAP and HTTP libraries fill while decoding the request are not.
 - The policies page's notice lists the rules that are not enforced yet, read from the
   catalog, and names the build's version.
 - A read-only admin can read policies, the item catalog, effective items and OU policy

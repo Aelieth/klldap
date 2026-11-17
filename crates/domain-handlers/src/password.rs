@@ -27,16 +27,12 @@ pub fn kill_point(_: &str) {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PasswordSync {
     Off,
-    On { disabled: bool },
+    On,
 }
 
 impl PasswordSync {
-    pub fn of(enabled: bool, disabled: bool) -> Self {
-        if enabled {
-            Self::On { disabled }
-        } else {
-            Self::Off
-        }
+    pub fn of(enabled: bool) -> Self {
+        if enabled { Self::On } else { Self::Off }
     }
 }
 
@@ -94,12 +90,12 @@ pub async fn change_password_everywhere(
     password: &str,
     sync: PasswordSync,
 ) -> Result<(), PasswordChangeError> {
-    let PasswordSync::On { disabled } = sync else {
+    if sync == PasswordSync::Off {
         return register_password(handler, user.clone(), password.as_bytes())
             .await
             .map_err(change_error);
-    };
-    let changed = commit_synced(handler, user, password, disabled, None).await;
+    }
+    let changed = commit_synced(handler, user, password, None).await;
     finish(LogKind::PasswordChange, user, changed)
 }
 
@@ -111,7 +107,7 @@ pub async fn create_synced_user(
     password: &str,
 ) -> Result<(), PasswordChangeError> {
     let user = request.user_id.clone();
-    let changed = commit_synced(handler, &user, password, false, Some(request)).await;
+    let changed = commit_synced(handler, &user, password, Some(request)).await;
     finish(LogKind::UserCreate, &user, changed)
 }
 
@@ -144,7 +140,6 @@ async fn commit_synced(
     handler: &(impl OpaqueHandler + ?Sized),
     user: &UserId,
     password: &str,
-    disabled: bool,
     create: Option<CreateUserRequest>,
 ) -> Result<(Committed, Vec<LogEvent>), PasswordChangeError> {
     require_kdc_ready().map_err(change_error)?;
@@ -161,7 +156,6 @@ async fn commit_synced(
     let change = PasswordCommit {
         user: user.clone(),
         record,
-        disabled,
         rows,
     };
     let committed = kerberos
@@ -268,10 +262,9 @@ mod tests {
 
     #[test]
     fn test_sync_off_and_on() {
-        assert_eq!(PasswordSync::of(false, true), PasswordSync::Off);
         assert_eq!(
-            PasswordSync::of(true, true),
-            PasswordSync::On { disabled: true }
+            (PasswordSync::of(false), PasswordSync::of(true)),
+            (PasswordSync::Off, PasswordSync::On)
         );
     }
 

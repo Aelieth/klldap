@@ -24,19 +24,28 @@ use lldap_domain_handlers::password::{
 use lldap_schema::{AttributeList, KERBEROS_SYNC, PublicSchema};
 use std::collections::HashMap;
 use tracing::{instrument, warn};
+use zeroize::Zeroizing;
 
 #[instrument(skip_all, level = "debug")]
 pub(crate) async fn create_user_or_group(
     backend_handler: &impl AdminBackendHandler,
     ldap_info: &LdapInfo,
-    request: LdapAddRequest,
+    mut request: LdapAddRequest,
 ) -> LdapResult<Vec<LdapOp>> {
+    let password = take_password(&mut request.attributes);
     let base_dn_str = &ldap_info.base_dn_str;
     let dn_parts = parse_distinguished_name(&request.dn)?;
     let internal_ou = get_internal_ou_from_dn_parts(&dn_parts);
     match get_user_or_group_id_from_distinguished_name(&request.dn, &ldap_info.base_dn) {
         UserOrGroupName::User(user_id) => {
-            create_user(backend_handler, user_id, request.attributes, internal_ou).await
+            create_user(
+                backend_handler,
+                user_id,
+                request.attributes,
+                password,
+                internal_ou,
+            )
+            .await
         }
         UserOrGroupName::Group(group_name) => {
             create_group(backend_handler, group_name, request.attributes, internal_ou).await
@@ -70,6 +79,38 @@ fn single_value(mut attribute: LdapPartialAttribute) -> LdapResult<(String, Vec<
             attribute.atype
         ))),
     }
+}
+
+type Taken = Vec<(String, Zeroizing<Vec<Vec<u8>>>)>;
+
+/// Every `userPassword` attribute, out of the request before anything reads it; wiped on drop.
+fn take_password(attributes: &mut Vec<LdapAttribute>) -> Taken {
+    let mut taken = Vec::new();
+    attributes.retain_mut(|a| {
+        let password = a.atype.eq_ignore_ascii_case("userpassword");
+        if password {
+            let vals = Zeroizing::new(std::mem::take(&mut a.vals));
+            taken.push((std::mem::take(&mut a.atype), vals));
+        }
+        !password
+    });
+    taken
+}
+
+fn one_password(taken: Taken) -> LdapResult<Option<Zeroizing<Vec<u8>>>> {
+    let mut password = None;
+    for (atype, mut vals) in taken {
+        if vals.len() > 1 {
+            return Err(constraint_violation(format!(
+                "Expected a single value for attribute {atype}"
+            )));
+        }
+        let missing = format!("Missing value for attribute {}", atype.to_ascii_lowercase());
+        password = Some(Zeroizing::new(
+            vals.pop().ok_or_else(|| constraint_violation(missing))?,
+        ));
+    }
+    Ok(password)
 }
 
 fn parse_attributes(attributes: Vec<LdapAttribute>) -> LdapResult<HashMap<String, Vec<u8>>> {
@@ -139,8 +180,10 @@ async fn create_user(
     backend_handler: &impl AdminBackendHandler,
     user_id: UserId,
     attributes: Vec<LdapAttribute>,
+    password: Taken,
     internal_ou: String,
 ) -> LdapResult<Vec<LdapOp>> {
+    let password = one_password(password)?;
     let mut attributes = parse_attributes(attributes)?;
     // kerberossync defaults to 0, matching PublicSchema; the OU comes from the DN in full
     // internal form so bind and search rebuild the same DN.
@@ -212,14 +255,11 @@ async fn create_user(
     );
 
     let kerberossync_enabled = lldap_domain::types::kerberos_sync_enabled(&new_user_attributes);
-    let plain_password =
-        if let Some(password) = attributes.get("userpassword") {
-            Some(std::str::from_utf8(password).map_err(|_| {
-                constraint_violation("userPassword must be valid UTF-8".to_string())
-            })?)
-        } else {
-            None
-        };
+    let plain_password = password
+        .as_deref()
+        .map(|bytes| std::str::from_utf8(bytes.as_slice()))
+        .transpose()
+        .map_err(|_| constraint_violation("userPassword must be valid UTF-8".to_string()))?;
     let request = CreateUserRequest {
         user_id: user_id.clone(),
         email: Email::from(text("mail")?.or(text("email")?).unwrap_or_default()),
@@ -378,6 +418,57 @@ mod tests {
                 message: "userPassword must be valid UTF-8".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn test_the_password_leaves_the_add_request_before_any_other_attribute() {
+        let attribute = |atype: &str, vals: &[&str]| LdapPartialAttribute {
+            atype: atype.to_owned(),
+            vals: vals.iter().map(|v| v.as_bytes().to_vec()).collect(),
+        };
+        type Row = (
+            &'static str,
+            Vec<LdapPartialAttribute>,
+            Result<Option<&'static str>, &'static str>,
+        );
+        let rows: [Row; 5] = [
+            ("no password", vec![], Ok(None)),
+            (
+                "one value",
+                vec![attribute("userPassword", &["s3cret"])],
+                Ok(Some("s3cret")),
+            ),
+            (
+                "the last of two attributes",
+                vec![
+                    attribute("userpassword", &["first"]),
+                    attribute("USERPASSWORD", &["last"]),
+                ],
+                Ok(Some("last")),
+            ),
+            (
+                "two values",
+                vec![attribute("userPassword", &["a", "b"])],
+                Err("Expected a single value for attribute userPassword"),
+            ),
+            (
+                "no value",
+                vec![attribute("userPassword", &[])],
+                Err("Missing value for attribute userpassword"),
+            ),
+        ];
+        for (label, passwords, expected) in rows {
+            let mut attributes = vec![attribute("cn", &["Bob"])];
+            attributes.extend(passwords);
+            let got = one_password(take_password(&mut attributes))
+                .map(|p| p.map(|p| String::from_utf8_lossy(&p).into_owned()))
+                .map_err(|e| e.message);
+            let left: Vec<_> = attributes.iter().map(|a| a.atype.as_str()).collect();
+            let expected = expected
+                .map(|p| p.map(str::to_owned))
+                .map_err(str::to_owned);
+            assert_eq!((got, left), (expected, vec!["cn"]), "{label}");
+        }
     }
 
     #[tokio::test]
@@ -686,7 +777,6 @@ mod tests {
                 vec![KerberosOp::CommitPassword {
                     username: "bob".into(),
                     password: "s3cret".into(),
-                    disabled: false,
                     rows: add_rows("bob"),
                 }]
             } else {

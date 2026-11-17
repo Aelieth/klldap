@@ -12,8 +12,8 @@ use krb5_crypto::KeySalt;
 use krb5_kdc::host::{HostChange, KerberosStoreError};
 use krb5_kdc::{
     AdminEnt, AdminFields, CreateKeys, CreatePlan, Error as StoreError, KDB_DISALLOW_ALL_TIX,
-    KDB_REQUIRES_PRE_AUTH, KdcLog, ListenLimits, PrincipalRead, PrincipalStore, SharedDump,
-    SharedStore, Shutdown, kadm5_mask, lookup_principal_id,
+    KDB_REQUIRES_PRE_AUTH, KdcLog, ListenLimits, PasswordPlan, PrincipalRead, PrincipalStore,
+    SharedDump, SharedStore, Shutdown, kadm5_mask, lookup_principal_id,
 };
 use krb5_types::PrincipalName;
 use lldap_domain::types::UserId;
@@ -42,6 +42,7 @@ const USER_GONE: &str = "user gone";
 const NO_SYNC: &str = "no sync";
 const DISABLED_AT_START: &str =
     "disabled at start: a directory user without Kerberos sync has a principal";
+const STATE_UNREAD: &str = "the user's lldap_disabled membership was not read";
 const START_CHUNK: usize = 100;
 
 pub struct EmbeddedKerberos {
@@ -438,7 +439,7 @@ impl KerberosSync for EmbeddedKerberos {
             user.as_str(),
             "sync",
             move || {
-                set_password(&own, &id, &password, &enctypes, &ent, || {
+                set_password(&own, &id, &password, &enctypes, &ent, None, || {
                     committing(own.host.as_ref())
                 })
                 .map_err(|e| anyhow!("while setting the Kerberos password: {e}"))
@@ -464,12 +465,7 @@ impl KerberosSync for EmbeddedKerberos {
         password: &str,
     ) -> Result<Committed, CommitError> {
         validate_kerberos_username(change.user.as_str()).map_err(CommitError::Refused)?;
-        let own = self.own();
-        let enctypes = self.enctypes.clone();
-        let mut ent = self.new_principal();
-        if change.disabled {
-            ent.attributes |= KDB_DISALLOW_ALL_TIX;
-        }
+        let (own, enctypes, ent) = (self.own(), self.enctypes.clone(), self.new_principal());
         let password = Zeroizing::new(password.as_bytes().to_vec());
         let serial = tokio::time::timeout(self.write_wait, self.writes.clone().lock_owned())
             .await
@@ -664,21 +660,24 @@ struct Own {
     actor: String,
 }
 
-// `commit` makes each attempt's closure; at most one of them reaches the host.
+// `commit` makes each attempt's closure; at most one of them reaches the host. `locked` is the
+// directory's state for an existing principal, set with its keys; None leaves its status.
 fn set_password<C>(
     own: &Own,
     user: &UserId,
     password: &[u8],
     enctypes: &[KeySalt],
     ent: &AdminEnt,
+    locked: Option<bool>,
     commit: impl Fn() -> C,
 ) -> Result<(), StoreError>
 where
     C: FnOnce(HostChange) -> Result<(), KerberosStoreError>,
 {
     let name = user_principal(user);
-    let change = || {
-        krb5_kdc::change_password_shared_committing(
+    let change = || match locked {
+        Some(locked) => change_following(own, user, password, enctypes, locked, commit()),
+        None => krb5_kdc::change_password_shared_committing(
             &own.store,
             &name,
             &own.realm,
@@ -688,7 +687,7 @@ where
             enctypes,
             |s| not_an_alias(s, &own.realm, user),
             commit(),
-        )
+        ),
     };
     let mut next = after_change(change());
     if next == Next::Create {
@@ -702,6 +701,47 @@ where
         Next::Fail(e) => Err(e),
         Next::Create | Next::ChangeAgain => Err(StoreError::NotFound),
     }
+}
+
+// `change_password_shared_committing` with the status set to the directory's in the same change.
+fn change_following(
+    own: &Own,
+    user: &UserId,
+    password: &[u8],
+    enctypes: &[KeySalt],
+    locked: bool,
+    commit: impl FnOnce(HostChange) -> Result<(), KerberosStoreError>,
+) -> Result<(), StoreError> {
+    let name = user_principal(user);
+    let planned = {
+        let (g, read) = krb5_kdc::read_fresh(&own.store);
+        match read {
+            Err(_) => Ok(None),
+            Ok(()) => not_an_alias(&g, &own.realm, user)
+                .and_then(|()| g.plan_password(&name, &own.realm, password, enctypes)),
+        }
+    };
+    let prepared = planned.and_then(|plan| plan.map(PasswordPlan::derive).transpose())?;
+    let mut store = own.store.write().map_err(|_| poisoned())?;
+    store.change_committing(commit, |s| {
+        let applied = match prepared {
+            Some(p) => s.apply_password(p, 0, &own.actor)?,
+            None => false,
+        };
+        if !applied {
+            not_an_alias(s, &own.realm, user)?;
+            s.set_password_etypes_keepold_n_in(
+                &name, &own.realm, password, 0, &own.actor, enctypes,
+            )?;
+        }
+        let now = s.get_name(&name).map(|p| (p.locked(), p.pw_expire));
+        match now {
+            Some((was, pw_expire)) if was != locked => {
+                s.set_status(&name, locked, pw_expire, &own.actor)
+            }
+            _ => Ok(()),
+        }
+    })?
 }
 
 fn create_marked(
@@ -744,10 +784,16 @@ fn commit_owned(
     ent: &AdminEnt,
     change: PasswordCommit,
 ) -> Result<Committed, CommitError> {
-    let PasswordCommit {
-        user, record, rows, ..
-    } = change;
-    let made = set_password(own, &user, password, enctypes, ent, || {
+    let PasswordCommit { user, record, rows } = change;
+    let disabled = own
+        .host
+        .user_disabled(&user)
+        .map_err(|e| CommitError::Failed(format!("{STATE_UNREAD}: {e}")))?;
+    let mut ent = ent.clone();
+    if disabled {
+        ent.attributes |= KDB_DISALLOW_ALL_TIX;
+    }
+    let made = set_password(own, &user, password, enctypes, &ent, Some(disabled), || {
         committing_with(own.host.as_ref(), rows.clone())
     });
     if let Err(StoreError::InvalidArgument(why)) = &made
@@ -952,6 +998,8 @@ pub(crate) mod tests {
         rows: std::sync::Mutex<Vec<String>>,
         records: std::sync::Mutex<HashMap<String, Vec<u8>>>,
         fault: std::sync::Mutex<Option<Fault>>,
+        disabled: std::sync::Mutex<Vec<String>>,
+        unread: AtomicBool,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -970,6 +1018,12 @@ pub(crate) mod tests {
 
         pub(crate) fn rows(&self) -> Vec<String> {
             self.rows.lock().unwrap().clone()
+        }
+
+        pub(crate) fn set_directory(&self, disabled: Option<&[&str]>) {
+            self.unread.store(disabled.is_none(), Ordering::Relaxed);
+            let users = disabled.unwrap_or_default().iter().map(|u| (*u).to_owned());
+            *self.disabled.lock().unwrap() = users.collect();
         }
 
         fn fault(&self) -> Option<Fault> {
@@ -1033,6 +1087,18 @@ pub(crate) mod tests {
                 return Err(unanswered_db());
             }
             Ok(self.records.lock().unwrap().get(user.as_str()).cloned())
+        }
+
+        fn user_disabled(&self, user: &UserId) -> Result<bool, KerberosStoreError> {
+            if self.unread.load(Ordering::Relaxed) {
+                return Err(unanswered_db());
+            }
+            Ok(self
+                .disabled
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|u| u == user.as_str()))
         }
 
         fn start_pass_committed(&self) {
@@ -1117,6 +1183,12 @@ pub(crate) mod tests {
             if let Some(dir) = self.settings.data_dir.parent() {
                 let _ = std::fs::remove_dir_all(dir);
             }
+        }
+    }
+
+    impl EmbeddedKerberos {
+        pub(crate) async fn hold_writes(&self) -> tokio::sync::OwnedMutexGuard<()> {
+            self.writes.clone().lock_owned().await
         }
     }
 
@@ -1668,12 +1740,11 @@ pub(crate) mod tests {
         assert_eq!((rows, raw), (expected_rows, expected_raw));
     }
 
-    fn commit_of(user: &str, record: &[u8], disabled: bool) -> PasswordCommit {
+    fn commit_of(user: &str, record: &[u8]) -> PasswordCommit {
         use lldap_domain_handlers::logging::{LogKind, event};
         PasswordCommit {
             user: UserId::new(user),
             record: record.to_vec(),
-            disabled,
             rows: vec![
                 HostRow::SetPassword {
                     user: UserId::new(user),
@@ -1744,7 +1815,7 @@ pub(crate) mod tests {
             let old = kvno_in(&store.read().unwrap(), "bob").unwrap();
             temp.host.set_fault(fault);
             let got = embedded
-                .commit_password(commit_of("bob", RECORD, false), "Bob-Password-2")
+                .commit_password(commit_of("bob", RECORD), "Bob-Password-2")
                 .await;
             temp.host.set_fault(None);
             let kvno = old + u32::from(new);
@@ -1810,7 +1881,7 @@ pub(crate) mod tests {
         let held = embedded.writes.clone().lock_owned().await;
         let writes = temp.own_writes();
         let busy = embedded
-            .commit_password(commit_of("bob", b"record", false), "Bob-Password-1")
+            .commit_password(commit_of("bob", b"record"), "Bob-Password-1")
             .await;
         assert_eq!(
             (busy, temp.own_writes(), marked(&store, "bob")),
@@ -1818,7 +1889,7 @@ pub(crate) mod tests {
         );
         drop(held);
         let done = embedded
-            .commit_password(commit_of("bob", b"record", false), "Bob-Password-1")
+            .commit_password(commit_of("bob", b"record"), "Bob-Password-1")
             .await;
         assert_eq!(
             (done, marked(&store, "bob")),
@@ -1828,24 +1899,131 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn test_a_first_password_makes_the_principal_with_the_directory_state() {
-        type Row<'a> = (&'a str, bool, Option<(bool, bool)>);
-        let rows: [Row; 2] = [
-            ("enabled", false, Some((true, false))),
-            ("disabled", true, Some((true, true))),
+    async fn test_the_principal_takes_the_directory_state_in_the_change_of_its_keys() {
+        enum Before {
+            Nothing,
+            Marked(bool),
+            Unmarked(bool),
+        }
+        const ENABLED: Option<&[&str]> = Some(&[]);
+        const DISABLED: Option<&[&str]> = Some(&["dora"]);
+        let unread = Err(CommitError::Failed(format!(
+            "{STATE_UNREAD}: Kerberos store failed: the database did not answer"
+        )));
+        let done = || Ok(Committed::Done);
+        type Row = (
+            &'static str,
+            Before,
+            Option<&'static [&'static str]>,
+            Result<Committed, CommitError>,
+            (bool, bool),
+        );
+        let rows: [Row; 8] = [
+            (
+                "new, enabled user",
+                Before::Nothing,
+                ENABLED,
+                done(),
+                (true, false),
+            ),
+            (
+                "new, disabled user",
+                Before::Nothing,
+                DISABLED,
+                done(),
+                (true, true),
+            ),
+            (
+                "marked and disabled, enabled user: enabled",
+                Before::Marked(true),
+                ENABLED,
+                done(),
+                (true, false),
+            ),
+            (
+                "marked and enabled, disabled user: disabled",
+                Before::Marked(false),
+                DISABLED,
+                done(),
+                (true, true),
+            ),
+            (
+                "marked and disabled, disabled user",
+                Before::Marked(true),
+                DISABLED,
+                done(),
+                (true, true),
+            ),
+            (
+                "unmarked and enabled, disabled user: disabled",
+                Before::Unmarked(false),
+                DISABLED,
+                done(),
+                (false, true),
+            ),
+            (
+                "unmarked and disabled, enabled user: enabled, not marked",
+                Before::Unmarked(true),
+                ENABLED,
+                done(),
+                (false, false),
+            ),
+            (
+                "the state is not read: nothing written",
+                Before::Marked(false),
+                None,
+                unread,
+                (true, false),
+            ),
         ];
-        for (label, disabled, expected) in rows {
+        let dora = UserId::new("dora");
+        for (label, before, directory, expected, after) in rows {
             let temp = TempRealm::new();
             let (embedded, store) = temp.embedded();
+            match before {
+                Before::Nothing => {}
+                Before::Marked(locked) => {
+                    embedded
+                        .sync_principal(&dora, "Dora-Password-0")
+                        .await
+                        .unwrap();
+                    in_change(&embedded.own(), |s| {
+                        s.set_status(&user_principal(&dora), locked, 0, "test")
+                    })
+                    .unwrap();
+                }
+                Before::Unmarked(locked) => unmarked(&embedded, "dora", locked),
+            }
+            temp.host.set_directory(directory);
+            let (kvno, writes) = (kvno_in(&store.read().unwrap(), "dora"), temp.own_writes());
             let got = embedded
-                .commit_password(commit_of("dora", b"record", disabled), "Dora-Password-1")
+                .commit_password(commit_of("dora", b"record"), "Dora-Password-1")
                 .await;
+            let written = got.is_ok();
+            let reopened = temp
+                .reopened()
+                .get_name(&user_principal(&dora))
+                .map(|p| (p.host_owned(), p.locked()));
+            let rows = match written {
+                true => vec!["password dora".to_owned(), "log password_change".to_owned()],
+                false => vec![],
+            };
             assert_eq!(
-                (got, marked(&store, "dora"), temp.host.rows()),
                 (
-                    Ok(Committed::Done),
+                    got,
+                    marked(&store, "dora"),
+                    reopened,
+                    temp.own_writes() - writes,
+                    kvno_in(&store.read().unwrap(), "dora") != kvno,
+                    temp.host.rows()
+                ),
+                (
                     expected,
-                    vec!["password dora".to_owned(), "log password_change".to_owned()]
+                    Some(after),
+                    Some(after),
+                    usize::from(written),
+                    written,
+                    rows
                 ),
                 "{label}"
             );
@@ -1918,7 +2096,7 @@ pub(crate) mod tests {
             "the check refuses once the name is an alias"
         );
         let committed = embedded
-            .commit_password(commit_of("bob", b"record", false), "Bob-Password-1")
+            .commit_password(commit_of("bob", b"record"), "Bob-Password-1")
             .await;
         let raw = store
             .read()

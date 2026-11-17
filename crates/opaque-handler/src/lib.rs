@@ -81,7 +81,7 @@ pub async fn prepare_registration(
             registration_start_request: registration_start.message,
         })
         .await?;
-    let password = password.to_vec();
+    let password = zeroize::Zeroizing::new(password.to_vec());
     let registration_finish = stretch(move || {
         opaque::client::registration::finish_registration(
             registration_start.state,

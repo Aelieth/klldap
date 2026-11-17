@@ -14,7 +14,7 @@ use lldap_domain_model::{
 };
 use lldap_mfa::{MFA_ENROLLMENT_REQUIRED, TOTP_CODE_REQUIRED, split_totp_suffix};
 use lldap_opaque_handler::{OpaqueHandler, STRETCH_FAILED, login, registration, stretch};
-use sea_orm::{ActiveModelTrait, ActiveValue, EntityTrait, QuerySelect};
+use sea_orm::{ActiveModelTrait, ActiveValue, ConnectionTrait, DbErr, EntityTrait, QuerySelect};
 use tracing::{debug, info, instrument, warn};
 
 type SqlOpaqueHandler = SqlBackendHandler;
@@ -99,23 +99,39 @@ impl SqlBackendHandler {
     }
 
     pub(crate) async fn is_member_of(&self, user_id: &UserId, group_name: &str) -> Result<bool> {
-        use lldap_domain_model::model::{groups, memberships};
-        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-
-        let Some(group) = groups::Entity::find()
-            .filter(groups::Column::DisplayName.eq(group_name))
-            .one(&self.sql_pool)
-            .await?
-        else {
-            return Ok(false);
-        };
-        Ok(memberships::Entity::find()
-            .filter(memberships::Column::UserId.eq(user_id.as_str()))
-            .filter(memberships::Column::GroupId.eq(group.group_id))
-            .one(&self.sql_pool)
-            .await?
-            .is_some())
+        Ok(member_of(&self.sql_pool, user_id, group_name).await?)
     }
+}
+
+/// `is_user_disabled` on any connection.
+pub(crate) async fn user_disabled_in(
+    db: &impl ConnectionTrait,
+    user_id: &UserId,
+) -> std::result::Result<bool, DbErr> {
+    member_of(db, user_id, "lldap_disabled").await
+}
+
+async fn member_of(
+    db: &impl ConnectionTrait,
+    user_id: &UserId,
+    group_name: &str,
+) -> std::result::Result<bool, DbErr> {
+    use lldap_domain_model::model::{groups, memberships};
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+    let Some(group) = groups::Entity::find()
+        .filter(groups::Column::DisplayName.eq(group_name))
+        .one(db)
+        .await?
+    else {
+        return Ok(false);
+    };
+    Ok(memberships::Entity::find()
+        .filter(memberships::Column::UserId.eq(user_id.as_str()))
+        .filter(memberships::Column::GroupId.eq(group.group_id))
+        .one(db)
+        .await?
+        .is_some())
 }
 
 fn invalid_credentials(user_id: &UserId) -> DomainError {

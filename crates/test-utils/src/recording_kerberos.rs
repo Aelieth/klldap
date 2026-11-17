@@ -17,7 +17,6 @@ pub enum KerberosOp {
     CommitPassword {
         username: String,
         password: String,
-        disabled: bool,
         rows: Vec<String>,
     },
     DeletePrincipal {
@@ -113,7 +112,6 @@ impl KerberosSync for RecordingKerberos {
             .push(KerberosOp::CommitPassword {
                 username: change.user.as_str().to_owned(),
                 password: password.to_owned(),
-                disabled: change.disabled,
                 rows: change.rows.iter().map(HostRow::label).collect(),
             });
         self.commit.clone()

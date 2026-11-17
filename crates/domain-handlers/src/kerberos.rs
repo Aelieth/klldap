@@ -137,18 +137,6 @@ pub trait KerberosSync: Send + Sync {
     ) -> Result<Committed, CommitError> {
         Err(CommitError::Failed(NO_COMMIT.to_owned()))
     }
-    async fn sync_if_enabled(
-        &self,
-        sync_enabled: bool,
-        user: &UserId,
-        password: &str,
-    ) -> Result<(), String> {
-        if sync_enabled {
-            self.sync_principal(user, password).await
-        } else {
-            Ok(())
-        }
-    }
     async fn delete_principal(&self, user: &UserId) -> Result<(), String>;
     async fn set_principal_enabled(&self, user: &UserId, enabled: bool) -> Result<(), String>;
     async fn reassert_disabled(&self, user: &UserId) {
@@ -210,7 +198,6 @@ impl std::fmt::Debug for HostRow {
 pub struct PasswordCommit {
     pub user: UserId,
     pub record: Vec<u8>,
-    pub disabled: bool,
     pub rows: Vec<HostRow>,
 }
 
@@ -403,6 +390,10 @@ pub trait KerberosStore: Send + Sync {
     }
     /// Which of `users` exist, read outside any transaction.
     fn directory_users(&self, _users: &[UserId]) -> Result<Vec<UserId>, KerberosStoreError> {
+        Err(KerberosStoreError::NotReady(NO_HOST_ROWS.to_owned()))
+    }
+    /// Whether `user` is in `lldap_disabled`, read outside any transaction; false for no user.
+    fn user_disabled(&self, _user: &UserId) -> Result<bool, KerberosStoreError> {
         Err(KerberosStoreError::NotReady(NO_HOST_ROWS.to_owned()))
     }
 }

@@ -64,6 +64,9 @@ kp_successes() {
     python3 -c 'import json,sys; print(len(json.load(sys.stdin)["logs"]))' <<<"$out" 2>/dev/null || echo error
 }
 
+# kp_add_rows <user>: the Add's success rows, password_change then user_create.
+kp_add_rows() { echo "$(kp_successes PASSWORD_CHANGE "$1") $(kp_successes USER_CREATE "$1")"; }
+
 # kp_want <point>: old before the commit, new from it on.
 kp_want() { case "$1" in committed | kerberos-changed) echo new ;; *) echo old ;; esac; }
 
@@ -152,13 +155,14 @@ kp_cycle() {
 
 # kp_add_cycle <point>: an LDAP Add with a password for a synced user, killed at <point>.
 kp_add_cycle() {
-    local point="$1" want pw code found=no bound=no kinited=no add add_dn
+    local point="$1" want pw code found=no bound=no kinited=no add add_dn before after
     local row="X1.kill-add-$point"
     want="$(kp_want "$point")"
     add="${KP_RUN}a$(printf %02d "${#KP_ADDS[@]}")"
     add_dn="uid=${add},ou=people,${BASE_DN}"
     KP_ADDS+=("$add")
     pw="$(kp_gen)"
+    before="$(kp_add_rows "$add")"
     if ! kp_swap "kill-add-$point" "$GATE_KILL_IMAGE" --init -e "LLDAP_TEST_KILL_POINT=$point"; then
         p_bad "[$row] the kill image did not come up"
         kp_swap release "$KP_RELEASE"
@@ -187,13 +191,17 @@ EOF
     lsearch -b "$add_dn" -s base uid >"$KP_D/add-entry-$point.ldif" 2>&1 && grep -q "^uid: $add$" "$KP_D/add-entry-$point.ldif" && found=yes
     kp_bind "$add_dn" "$pw" && bound=yes
     kp_kinit "$add" "$pw" && kinited=yes
+    after="$(kp_add_rows "$add")"
     local got="entry=$found bind=$bound kinit=$kinited"
-    local want_got="entry=no bind=no kinit=no"
-    [ "$want" = new ] && want_got="entry=yes bind=yes kinit=yes"
-    if [ "$code" = 134 ] && [ "$got" = "$want_got" ]; then
-        p_ok "[$row] an Add killed at $point (exit 134), then the release image: $got"
+    local want_got="entry=no bind=no kinit=no" want_rows="0 0"
+    if [ "$want" = new ]; then
+        want_got="entry=yes bind=yes kinit=yes"
+        want_rows="1 1"
+    fi
+    if [ "$code" = 134 ] && [ "$got" = "$want_got" ] && [ "$before" = "0 0" ] && [ "$after" = "$want_rows" ]; then
+        p_ok "[$row] an Add killed at $point (exit 134), then the release image: $got; success rows (password_change, user_create) $after"
     else
-        p_bad "[$row] exit '${code:-none}', $got; want 134, $want_got"
+        p_bad "[$row] exit '${code:-none}', $got, success rows $before -> $after; want 134, $want_got, 0 0 -> $want_rows"
     fi
 }
 

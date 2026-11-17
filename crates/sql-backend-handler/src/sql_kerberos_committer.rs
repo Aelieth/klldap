@@ -4,6 +4,7 @@ use crate::sql_kerberos_handler::{
     read_hold, take_realm,
 };
 use crate::sql_log_handler::to_active_model;
+use crate::sql_opaque_handler::user_disabled_in;
 use crate::sql_tables::DbConnection;
 use lldap_domain::types::UserId;
 use lldap_domain_handlers::kerberos::{
@@ -72,6 +73,7 @@ enum Job {
         Vec<UserId>,
         oneshot::Sender<Result<Vec<UserId>, KerberosStoreError>>,
     ),
+    Disabled(UserId, oneshot::Sender<Result<bool, KerberosStoreError>>),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -112,6 +114,14 @@ impl KerberosStore for CommitterStore {
         let (tx, rx) = oneshot::channel();
         self.tx
             .blocking_send(Job::Users(users.to_vec(), tx))
+            .map_err(|_| stopped())?;
+        rx.blocking_recv().map_err(|_| stopped())?
+    }
+
+    fn user_disabled(&self, user: &UserId) -> Result<bool, KerberosStoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .blocking_send(Job::Disabled(user.clone(), tx))
             .map_err(|_| stopped())?;
         rx.blocking_recv().map_err(|_| stopped())?
     }
@@ -262,6 +272,9 @@ async fn run(
             }
             Incoming::Job(Job::Users(users, reply)) => {
                 let _ = reply.send(read_users(&pool, &users, timings.step).await);
+            }
+            Incoming::Job(Job::Disabled(user, reply)) => {
+                let _ = reply.send(read_disabled(&pool, &user, timings.step).await);
             }
             Incoming::Job(Job::Shutdown(reply)) => {
                 clear_held(&pool, &phase, timings.step).await;
@@ -565,6 +578,19 @@ async fn read_users(
 ) -> Result<Vec<UserId>, KerberosStoreError> {
     within(step, || KerberosStoreError::Failed(late(step)), async {
         existing_users(pool, users)
+            .await
+            .map_err(|err| KerberosStoreError::Failed(err.to_string()))
+    })
+    .await
+}
+
+async fn read_disabled(
+    pool: &DbConnection,
+    user: &UserId,
+    step: Duration,
+) -> Result<bool, KerberosStoreError> {
+    within(step, || KerberosStoreError::Failed(late(step)), async {
+        user_disabled_in(pool, user)
             .await
             .map_err(|err| KerberosStoreError::Failed(err.to_string()))
     })
@@ -1799,6 +1825,41 @@ mod tests {
                 late.to_string().contains("did not answer within 100ms")
             ),
             (vec![UserId::new("alice")], Vec::new(), true)
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_the_disabled_state_is_read_within_one_step() {
+        let db = db().await;
+        insert_alice(&db.pool).await;
+        let step = Duration::from_millis(100);
+        let (alice, nobody) = (UserId::new("alice"), UserId::new("nobody"));
+        let no_group = read_disabled(&db.pool, &alice, step).await.unwrap();
+        db.pool
+            .execute_unprepared(
+                "INSERT INTO groups (group_id, display_name, lowercase_display_name, \
+                 creation_date, uuid, modified_date) VALUES (7, 'lldap_disabled', \
+                 'lldap_disabled', '2026-01-01 00:00:00', 'g7', '2026-01-01 00:00:00')",
+            )
+            .await
+            .unwrap();
+        let not_in_it = read_disabled(&db.pool, &alice, step).await.unwrap();
+        db.pool
+            .execute_unprepared("INSERT INTO memberships (user_id, group_id) VALUES ('alice', 7)")
+            .await
+            .unwrap();
+        let in_it = read_disabled(&db.pool, &alice, step).await.unwrap();
+        let no_user = read_disabled(&db.pool, &nobody, step).await.unwrap();
+        let held = db.pool.begin().await.unwrap();
+        let late = read_disabled(&db.pool, &alice, step).await.unwrap_err();
+        held.rollback().await.unwrap();
+        assert_eq!(
+            (
+                (no_group, not_in_it, in_it, no_user),
+                late.to_string().contains("did not answer within 100ms")
+            ),
+            ((false, false, true, false), true)
         );
     }
 }

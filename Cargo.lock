@@ -3541,6 +3541,7 @@ dependencies = [
  "tokio",
  "tracing",
  "urlencoding",
+ "zeroize",
 ]
 
 [[package]]
@@ -3583,6 +3584,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -3629,6 +3631,7 @@ dependencies = [
  "lldap_domain_model",
  "rand 0.8.6",
  "tokio",
+ "zeroize",
 ]
 
 [[package]]

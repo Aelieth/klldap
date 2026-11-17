@@ -19,6 +19,7 @@ use lldap_domain::{
 use lldap_domain_handlers::handler::BackendHandler;
 use lldap_opaque_handler::OpaqueHandler;
 use lldap_schema::PublicSchema;
+use zeroize::Zeroizing;
 
 // The profile attribute an LDAP Modify targets, after folding wire-name aliases (sn, cn, surname,
 // jpegphoto, ...) to the schema canonical name. Bridges canonical → DB attribute name / field.
@@ -86,12 +87,13 @@ async fn handle_password_modify<Handler: BackendHandler + OpaqueHandler>(
         code: LdapResultCode::ConstraintViolation,
         message: "userPassword must be valid UTF-8".to_string(),
     })?;
+    let plain_pass = Zeroizing::new(plain_pass.to_owned());
     password::change_password(
         backend_handler,
         readable_handler,
         opaque_handler,
         &user_id,
-        plain_pass,
+        &plain_pass,
     )
     .await
 }
@@ -1085,7 +1087,7 @@ mod tests {
     }
 
     // A kerberossync=1 user's password and keys change in one transaction; a user already in
-    // lldap_disabled gets a disabled principal in that same change.
+    // lldap_disabled is committed alike, as the change reads that state under its lock.
     #[tokio::test]
     #[serial]
     async fn test_modify_password_kerberos_matrix() {
@@ -1094,9 +1096,9 @@ mod tests {
         let cases = [
             ("sync enabled", true, false, false),
             ("sync disabled", false, false, false),
-            ("born disabled: a disabled principal", true, true, false),
+            ("in lldap_disabled", true, true, false),
             ("the change fails: nothing written", true, false, true),
-            ("born disabled, the change fails", true, true, true),
+            ("in lldap_disabled, the change fails", true, true, true),
         ];
         for (label, synced, disabled, fails) in cases {
             let guard = if fails {
@@ -1140,7 +1142,7 @@ mod tests {
                 "{label}"
             );
             let expected = match synced {
-                true => vec![committed("bob", "newpassword", disabled)],
+                true => vec![committed("bob", "newpassword")],
                 false => vec![],
             };
             assert_eq!(guard.recorder().take_ops(), expected, "{label}");

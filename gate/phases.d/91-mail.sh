@@ -2,7 +2,8 @@
 # Phase: password-reset mail. The sink is python:3.14-alpine on this run's network,
 # host name smtp-gate. NONE, TLS and STARTTLS deliver one mail each. TLS without
 # the SMTP root is refused, and the default log does not contain the reset token.
-# The program is inlined here.
+# The program is inlined here. Row U1.reset-page opens a NONE reset link in a browser for a
+# synced user, whose page seals the new password for both stores.
 
 # shellcheck disable=SC2154
 D="$(phase_dir)"
@@ -13,12 +14,16 @@ MAIL_TLS="$CONTAINER-mail-tls"
 MAIL_START="$CONTAINER-mail-starttls"
 MAIL_BAD="$CONTAINER-mail-untrusted"
 MAIL_VOL="klldap-gate-mail-$RUNID"
-EXTRA_CONTAINERS+=("$SINK" "$MAIL_NONE" "$MAIL_TLS" "$MAIL_START" "$MAIL_BAD")
+BROWSER_IMAGE="mcr.microsoft.com/playwright@sha256:766137e2d9caad4744187e53cdc89320ba6f2eb57cff097374020944b44dd0a9"
+BROWSER_CTN="klldap-resetpage-${RUNID}"
+EXTRA_CONTAINERS+=("$SINK" "$MAIL_NONE" "$MAIL_TLS" "$MAIL_START" "$MAIL_BAD" "$BROWSER_CTN")
 EXTRA_VOLUMES+=("$MAIL_VOL")
 MAIL_USER="mailuser"
 MAIL_ADDR="${MAIL_USER}@gate.test"
 NEW_PASS="MailUserPass2026!"
 ROOT_FILE="/smtp-root/cert/ca.pem"
+RESET_USER="mailweb"
+RESET_ADDR="${RESET_USER}@gate.test"
 
 SAVED_HTTP="$HTTP_PORT"
 SAVED_LDAP="$LDAP_PORT"
@@ -30,7 +35,7 @@ mail_restore() {
 }
 
 mail_stop() {
-    docker rm -fv "$SINK" "$MAIL_NONE" "$MAIL_TLS" "$MAIL_START" "$MAIL_BAD" >/dev/null 2>&1 || true
+    docker rm -fv "$SINK" "$MAIL_NONE" "$MAIL_TLS" "$MAIL_START" "$MAIL_BAD" "$BROWSER_CTN" >/dev/null 2>&1 || true
     docker volume rm "$MAIL_VOL" >/dev/null 2>&1 || true
     mail_restore
 }
@@ -211,7 +216,7 @@ use_mail_ports() {
 }
 
 step1_code() {
-    STEP_URL="http://127.0.0.1:${HTTP_PORT}/auth/reset/step1/${MAIL_USER}" \
+    STEP_URL="http://127.0.0.1:${HTTP_PORT}/auth/reset/step1/${1:-$MAIL_USER}" \
         t python3 - <<'PY'
 import os, urllib.error, urllib.request
 req = urllib.request.Request(os.environ["STEP_URL"], data=b"", method="POST")
@@ -238,6 +243,15 @@ try:
 except Exception:
     text = ""
 sys.stdout.write(text)
+' "$1"
+}
+
+mail_token() {
+    python3 -c '
+import re, sys
+text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+m = re.search(r"reset-password/step2/([A-Za-z0-9]+)", text)
+print(m.group(1) if m else "")
 ' "$1"
 }
 
@@ -270,12 +284,7 @@ mail_delivered() {
         return 0
     fi
     local reset_tok jwt
-    reset_tok="$(python3 -c '
-import re, sys
-text = open(sys.argv[1], encoding="utf-8", errors="replace").read()
-m = re.search(r"reset-password/step2/([A-Za-z0-9]+)", text)
-print(m.group(1) if m else "")
-' "$D/${label}-body.txt")"
+    reset_tok="$(mail_token "$D/${label}-body.txt")"
     jwt="$(STEP2="http://127.0.0.1:${HTTP_PORT}/auth/reset/step2/${reset_tok}" \
         t python3 - <<'PY'
 import json, os, urllib.request
@@ -344,4 +353,158 @@ else
     fi
 fi
 
+reset_gen() { python3 -c 'import secrets; print("Rp" + secrets.token_hex(8))'; }
+
+reset_vars() {
+    ID="$RESET_USER" PW="$1" python3 -c 'import json,os; print(json.dumps({"id": os.environ["ID"], "pw": os.environ["PW"]}))'
+}
+
+reset_bind() {
+    local f="$D/.reset-bindpw" rc
+    (umask 077 && printf '%s' "$1" >"$f")
+    t ldapwhoami -x -H "$(ldap_url)" -D "uid=${RESET_USER},ou=people,${BASE_DN}" -y "$f" >/dev/null 2>&1
+    rc=$?
+    rm -f "$f"
+    return "$rc"
+}
+
+reset_kinit() {
+    # shellcheck disable=SC2016
+    printf '%s\n' "$1" | t docker exec -i "$MAIL_NONE" sh -c 'KRB5CCNAME=/tmp/gate_cc_$$ kinit "$0"' \
+        "${RESET_USER}@${REALM}" >"$2" 2>&1
+}
+
+reset_wait() {
+    local _
+    for _ in $(seq 1 10); do
+        reset_kinit "$1" "$D/reset-page-wait.log" && return 0
+        sleep 1
+    done
+    return 1
+}
+
+reset_sides() {
+    local new="$1" old="$2" tag="$3" bn=no bo=no kn=other ko=other
+    if reset_bind "$new"; then bn=yes; fi
+    if reset_bind "$old"; then bo=yes; fi
+    if reset_kinit "$new" "$D/reset-page-${tag}-kinit-new.log"; then
+        kn=yes
+    elif grep -q "Password incorrect" "$D/reset-page-${tag}-kinit-new.log"; then
+        kn=incorrect
+    fi
+    if reset_kinit "$old" "$D/reset-page-${tag}-kinit-old.log"; then
+        ko=yes
+    elif grep -q "Password incorrect" "$D/reset-page-${tag}-kinit-old.log"; then
+        ko=incorrect
+    fi
+    FOUR="bind-new=${bn} bind-old=${bo} kinit-new=${kn} kinit-old=${ko}"
+    case "$FOUR" in
+    "bind-new=yes bind-old=no kinit-new=yes kinit-old=incorrect") CLASS="both" ;;
+    "bind-new=no bind-old=yes kinit-new=incorrect kinit-old=yes") CLASS="stay" ;;
+    "bind-new=yes bind-old=no kinit-new=incorrect kinit-old=yes") CLASS="directory-only" ;;
+    "bind-new=no bind-old=yes kinit-new=yes kinit-old=incorrect") CLASS="kerberos-only" ;;
+    *) CLASS="bad" ;;
+    esac
+}
+
+reset_browser() {
+    docker rm -f "$BROWSER_CTN" >/dev/null 2>&1 || true
+    (
+        export BROWSER_RESET_TOKEN="$1"
+        export BROWSER_PASS="$2"
+        timeout 180 docker run --rm --name "$BROWSER_CTN" \
+            --network "$NET" \
+            --init \
+            --shm-size=1g \
+            --user "$(id -u):$(id -g)" \
+            --entrypoint node \
+            -v "$GATE_ROOT/lib/reset-password.mjs:/work/reset-password.mjs:ro" \
+            -v "$D:/out" \
+            -e HOME=/tmp/home \
+            -e BROWSER_OUT=/out \
+            -e BROWSER_URL="http://${MAIL_NONE}:17170" \
+            -e BROWSER_RESET_TOKEN \
+            -e BROWSER_PASS \
+            "$BROWSER_IMAGE" /work/reset-password.mjs \
+            >"$D/reset-page.out" 2>"$D/reset-page.err"
+    )
+}
+
+# A logged-out reset through the page, on a synced user of the NONE container.
+reset_page() {
+    local row="U1.reset-page" old new before n code got tok ctx page text bad
+    if ! docker image inspect "$BROWSER_IMAGE" >/dev/null 2>&1; then
+        p_skip "[$row] browser image absent: ${BROWSER_IMAGE}"
+        return 0
+    fi
+    if [ -z "$(docker ps -q -f "name=^${MAIL_NONE}$")" ] || ! use_mail_ports "$MAIL_NONE"; then
+        p_bad "[$row] the NONE mail container is not running or its admin login failed"
+        return 0
+    fi
+    old="$(reset_gen)"
+    new="$(reset_gen)"
+    if [ -z "$old" ] || [ -z "$new" ] || [ "$old" = "$new" ]; then
+        p_bad "[$row] could not make the per-run passwords"
+        return 0
+    fi
+    # shellcheck disable=SC2016
+    if ! graphql 'mutation($u: CreateUserInput!) { createUser(user: $u) { id } }' \
+        '{"u": {"id": "'"$RESET_USER"'", "email": "'"$RESET_ADDR"'", "attributes": [{"name": "kerberossync", "value": ["1"]}]}}' \
+        >"$D/reset-page-create.json" 2>&1 \
+        || ! graphql 'mutation($id: String!, $pw: String!) { setUserPassword(userId: $id, password: $pw) { ok } }' \
+            "$(reset_vars "$old")" >"$D/reset-page-set.json" 2>&1; then
+        p_bad "[$row] the synced user could not be made (see reset-page-create.json, reset-page-set.json)"
+        return 0
+    fi
+    reset_wait "$old" || true
+    reset_sides "$old" "$new" init
+    if [ "$CLASS" != both ]; then
+        p_bad "[$row] the first password does not bind and kinit ($FOUR)"
+        return 0
+    fi
+    before="$(mail_count | tr -d '[:space:]')"
+    n=$((before + 1))
+    code="$(step1_code "$RESET_USER")"
+    got="$(mail_count | tr -d '[:space:]')"
+    docker exec "$SINK" cat "/data/mail/${n}.eml" >"$D/reset-page-mail.txt" 2>/dev/null || true
+    mail_decode "$D/reset-page-mail.txt" >"$D/reset-page-body.txt" || true
+    tok="$(mail_token "$D/reset-page-body.txt")"
+    if [ "$code" != "200" ] || [ "$got" != "$n" ] || [ -z "$tok" ] \
+        || ! grep -q "To: $RESET_ADDR" "$D/reset-page-mail.txt"; then
+        p_bad "[$row] no reset mail for $RESET_USER (status $code, count $got, wanted message $n)"
+        return 0
+    fi
+    reset_browser "$tok" "$new" || true
+    docker logs "$MAIL_NONE" >"$D/reset-page-docker.log" 2>&1 || true
+    ctx="$(grep '^CONTEXT ' "$D/reset-page.out" 2>/dev/null | head -1 || true)"
+    if [ -n "$ctx" ]; then
+        note "$ctx"
+    fi
+    page="$(grep '^PAGE ' "$D/reset-page.out" 2>/dev/null | head -1 || true)"
+    if [ -z "$page" ]; then
+        bad="$(grep "^ROW ${row} FAIL " "$D/reset-page.out" 2>/dev/null | head -1 || true)"
+        bad="${bad#ROW "${row}" FAIL }"
+        p_bad "[$row] browser: ${bad:-no page line (see reset-page.err)}"
+        return 0
+    fi
+    text="${page#PAGE * }"
+    if [ "${page#PAGE login }" != "$page" ]; then
+        reset_wait "$new" || true
+    fi
+    reset_sides "$new" "$old" page
+    case "$page" in
+    "PAGE login "*)
+        if [ "$CLASS" = both ]; then
+            p_ok "[$row] the reset page sealed the new password for the synced user and went back to login: bind and kinit take it and refuse the old (${FOUR})"
+        else
+            p_bad "[$row] the reset page went back to login but bind and kinit are ${CLASS}, want both new (${FOUR})"
+        fi
+        ;;
+    "PAGE noform "*) p_bad "[$row] the reset form did not appear: ${text} (${FOUR})" ;;
+    "PAGE stayed "*) p_bad "[$row] the reset page did not go back to login (${CLASS}): ${text} (${FOUR})" ;;
+    *) p_bad "[$row] unknown page line: ${page}" ;;
+    esac
+}
+
+reset_page
 mail_stop

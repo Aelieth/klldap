@@ -65,29 +65,35 @@ gate_login() {
     local user="${1:-admin}" pass="${2:-$ADMIN_PASS}"
     LOGIN_URL="$(http_url)/auth/simple/login" LOGIN_USER="$user" LOGIN_PASS="$pass" \
         t python3 - <<'PY'
-import json, os, urllib.request
+import json, os, sys, urllib.error, urllib.request
 req = urllib.request.Request(
     os.environ["LOGIN_URL"],
     data=json.dumps({"username": os.environ["LOGIN_USER"],
                      "password": os.environ["LOGIN_PASS"]}).encode(),
     headers={"Content-Type": "application/json"})
-print(json.load(urllib.request.urlopen(req))["token"])
+try:
+    print(json.load(urllib.request.urlopen(req))["token"])
+except urllib.error.HTTPError as e:
+    sys.exit("HTTP %d: %s" % (e.code, e.read().decode(errors="replace")[:500]))
 PY
 }
 
-# graphql <query> <variables-json>: prints the data JSON; fails on transport or
-# GraphQL errors (error text on stderr). Uses $TOKEN.
+# graphql <query> <variables-json>: prints the data JSON; fails on transport, HTTP or
+# GraphQL errors (error text, or the HTTP status and body, on stderr). Uses $TOKEN.
 graphql() {
     GQ_URL="$(http_url)/api/graphql" GQ_TOKEN="$TOKEN" GQ_QUERY="$1" GQ_VARS="${2:-{\}}" \
         t python3 - <<'PY'
-import json, os, sys, urllib.request
+import json, os, sys, urllib.error, urllib.request
 req = urllib.request.Request(
     os.environ["GQ_URL"],
     data=json.dumps({"query": os.environ["GQ_QUERY"],
                      "variables": json.loads(os.environ["GQ_VARS"])}).encode(),
     headers={"Content-Type": "application/json",
              "Authorization": "Bearer " + os.environ["GQ_TOKEN"]})
-body = json.load(urllib.request.urlopen(req))
+try:
+    body = json.load(urllib.request.urlopen(req))
+except urllib.error.HTTPError as e:
+    sys.exit("HTTP %d: %s" % (e.code, e.read().decode(errors="replace")[:500]))
 if body.get("errors"):
     sys.exit("GraphQL error: " + json.dumps(body["errors"]))
 json.dump(body["data"], sys.stdout)

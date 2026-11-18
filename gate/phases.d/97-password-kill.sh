@@ -16,6 +16,7 @@ KP_SET='mutation($id: String!, $pw: String!) { setUserPassword(userId: $id, pass
 KP_RELEASE="$GATE_IMAGE"
 KP_ARGS=(${GATE_EXTRA_RUN_ARGS[@]+"${GATE_EXTRA_RUN_ARGS[@]}"})
 KP_SEQ=0 KP_UP="release" KP_CUR="" KP_SIDE=""
+TOKEN="$(gate_login)" || p_bad "[X1.kill-login] the admin could not log in"
 
 kp_gen() { python3 -c 'import secrets; print("Kp" + secrets.token_hex(10) + "!")'; }
 kp_vars() { ID="$1" PW="$2" python3 -c 'import json,os; print(json.dumps({"id": os.environ["ID"], "pw": os.environ["PW"]}))'; }

@@ -237,6 +237,47 @@ ok = (row.get("detail") == os.environ["WANT"] and row.get("success") is False
 print("one" if ok else "%d %s" % (len(rows), json.dumps(rows)[:300]))' 2>/dev/null
 }
 
+log_mark() { graphql '{ logs(limit: 1) { id } }' '{}' 2>/dev/null | json_get logs.0.id 2>/dev/null; }
+
+# log_once <true|false> <kind> <target> <detail> <mark> <protocol>: one such row after the marker; else FAIL_WHY.
+log_once() {
+    local got="" i
+    FAIL_WHY=""
+    if [ -z "$5" ]; then
+        FAIL_WHY="no log marker could be read"
+        return 1
+    fi
+    for i in $(seq 1 20); do
+        got="$(once_rows "$@")"
+        case "$got" in "" | "0 "*) sleep 0.5 ;; *) break ;; esac
+    done
+    [ "$got" = one ] && sleep 1 && got="$(once_rows "$@")"
+    [ "$got" = one ] || FAIL_WHY="$2 rows for $3 after the marker: ${got:-unread}; want one, success $1, protocol $6, '$4'"
+    [ -z "$FAIL_WHY" ]
+}
+fail_once() { log_once false "$@"; }
+once_rows() {
+    graphql "query(\$id: ID!, \$t: String!) { logs(filter: {kinds: [$2], target: \$t}, afterId: \$id, limit: 20) { success protocol detail } }" \
+        "$(ID="$5" T="$3" python3 -c 'import json,os; print(json.dumps({"id": os.environ["ID"], "t": os.environ["T"]}))')" 2>/dev/null |
+        OK="$1" WANT="$4" PROTO="$6" python3 -c '
+import json, os, sys
+rows = json.load(sys.stdin)["logs"]
+row = rows[0] if len(rows) == 1 else {}
+ok = (row.get("success") is (os.environ["OK"] == "true") and row.get("detail") == os.environ["WANT"]
+      and row.get("protocol") == os.environ["PROTO"])
+print("one" if ok else "%d %s" % (len(rows), json.dumps(rows)[:300]))' 2>/dev/null
+}
+
+fail_row() {
+    local row="$1"
+    shift
+    if fail_once "$@"; then
+        p_ok "[$row] one $1 row names $2 after the refusal: success false, protocol $5, '$3'"
+    else
+        p_bad "[$row] $FAIL_WHY"
+    fi
+}
+
 # kinit_pw <principal> <password>: password kinit inside the container, isolated cache.
 kinit_pw() {
     gexec sh -c "printf '%s\n' \"\$1\" | KRB5CCNAME=/tmp/gate_cc_\$\$ kinit \"\$0\"" \
@@ -245,10 +286,12 @@ kinit_pw() {
 
 WIRE_IMAGE="mcr.microsoft.com/playwright@sha256:766137e2d9caad4744187e53cdc89320ba6f2eb57cff097374020944b44dd0a9"
 
-wire_seal() {
+wire_seal() { printf '%s' "$2" | wire_seal_in "$1" "$3"; }
+
+wire_seal_in() {
     local hex
-    hex="$(printf '%s' "klldap-kerberos-envelope-v1:$3" | python3 -c 'import sys; print(sys.stdin.buffer.read().hex())')"
-    printf '%s' "$2" | t docker exec -i -e KEY="$1" -e HEX="$hex" "$CONTAINER" sh -c '
+    hex="$(printf '%s' "klldap-kerberos-envelope-v1:$2" | python3 -c 'import sys; print(sys.stdin.buffer.read().hex())')"
+    t docker exec -i -e KEY="$1" -e HEX="$hex" "$CONTAINER" sh -c '
         printf %s "$KEY" | base64 -d >/tmp/gate_wire.der &&
             openssl rsa -RSAPublicKey_in -inform DER -in /tmp/gate_wire.der -pubout -out /tmp/gate_wire.pem 2>/dev/null &&
             openssl pkeyutl -encrypt -pubin -inkey /tmp/gate_wire.pem -pkeyopt rsa_padding_mode:oaep \

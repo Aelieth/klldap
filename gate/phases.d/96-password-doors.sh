@@ -5,6 +5,7 @@
 # directory user, 9 characters pass every door, pol-svc keeps its effect. add-pol is a
 # counted SKIP until min-length is an OU policy. The two kadmin rows are
 # re-scoped, see K1. The e-mail reset page follows after this revision has run.
+# Part C: a password with U+0000 at each door, and each refusal's one failure row.
 
 D="$(phase_dir)"
 DOOR="pwdoor"
@@ -164,6 +165,16 @@ w1_judge() {
     "") p_bad "${name}: not reached" ;;
     *) p_bad "${name}: ${line#ROW "${name}" }" ;;
     esac
+}
+
+w1_logged() {
+    local name="$1"
+    shift
+    if fail_once "$@"; then
+        w1_say "$name" PASS "one $1 row for $2, success false, protocol $5: $3"
+    else
+        w1_say "$name" FAIL "$FAIL_WHY"
+    fi
 }
 
 w1_vars() {
@@ -384,6 +395,7 @@ if [ "$CLASS" != both ]; then
     p_bad "initial password does not bind and kinit ($FOUR)"
 fi
 
+W1_MARK="$(log_mark)"
 gql_code=0
 if w1_set "$DOOR" "$ONE_GQL" "$D/one-graphql.json" "$D/one-graphql.err"; then
     gql_code=0
@@ -397,7 +409,9 @@ if [ "$gql_code" -eq 0 ]; then took=1; fi
 w1_sentence_row one-graphql "$took" "$gql_answer" stay \
     "the password must be at least 8 characters" "$D/one-graphql.err"
 w1_track "$ONE_GQL"
+w1_logged one-graphql-row PASSWORD_CHANGE "$DOOR" "the password must be at least 8 characters" "$W1_MARK" GRAPHQL
 
+W1_MARK="$(log_mark)"
 ldap_code=0
 if t ldappasswd -x -H "$(ldap_url)" -D "$(admin_dn)" -w "$ADMIN_PASS" -s "$ONE_MOD" "$DN" \
     >"$D/one-modify.log" 2>&1; then
@@ -412,6 +426,7 @@ if [ "$ldap_code" -eq 0 ]; then took=1; fi
 w1_sentence_row one-modify "$took" "$ldap_answer" stay \
     "the password must be at least 8 characters" "$D/one-modify.log"
 w1_track "$ONE_MOD"
+w1_logged one-modify-row PASSWORD_CHANGE "$DOOR" "the password must be at least 8 characters" "$W1_MARK" LDAP
 
 cat >"$D/one-replace.ldif" <<EOF
 dn: $DN
@@ -679,6 +694,117 @@ else
     docker rm -f "$BROWSER_CTN" >/dev/null 2>&1 || true
 fi
 
+# MIT kadmin's -pw is a C string, so no NUL: its row sends a byte that is not UTF-8 (PASS_Q_GENERIC too).
+NUL="pwnul"
+NUL_DN="uid=${NUL},ou=people,${BASE_DN}"
+NUL_OLD="$(w1_gen 24)" NUL_A="$(w1_gen 9)" NUL_B="$(w1_gen 6)"
+NUL_SAID="the password must not contain a NUL character (U+0000)"
+NUL_KV="" NUL_KEPT=""
+
+w1_kvno() { kadmin_q "getprinc $1" 2>/dev/null | awk '/Key: vno/ {print $3; exit}' | tr -d ','; }
+w1_nul_bytes() { printf '%s\000%s' "$NUL_A" "$NUL_B"; }
+w1_nul_vars() {
+    ID="$1" A="$NUL_A" B="$NUL_B" python3 -c 'import json,os; print(json.dumps({"id": os.environ["ID"], "pw": os.environ["A"] + "\0" + os.environ["B"]}))'
+}
+
+w1_nul_kept() {
+    local b=no k=no kv
+    w1_bind "$NUL_OLD" "$NUL_DN" && b=yes
+    w1_kinit "$NUL_OLD" "$NUL" "$D/kinit-$1.log" && k=yes
+    kv="$(w1_kvno "$NUL")"
+    NUL_KEPT="bind-old=$b kinit-old=$k kvno=${NUL_KV:-none}->${kv:-none}"
+    [ "$b $k" = "yes yes" ] && [ -n "$kv" ] && [ "$kv" = "$NUL_KV" ]
+}
+
+w1_nul_row() {
+    local name="$1" refused="$2" answer="$3" kept=no
+    shift 3
+    FAIL_WHY=""
+    w1_nul_kept "$name" && kept=yes
+    if [ "$refused" = yes ] && [ "$kept" = yes ] && fail_once "$@"; then
+        w1_say "$name" PASS "$answer" "$NUL_KEPT | one $1 failure row: $3"
+    else
+        w1_say "$name" FAIL "$answer" "refused=$refused $NUL_KEPT${FAIL_WHY:+ | $FAIL_WHY}"
+    fi
+    if [ "$kept" = no ]; then
+        w1_set "$NUL" "$NUL_OLD" "$D/nul-realign.json" "$D/nul-realign.err" || p_bad "$name: could not set $NUL's password back"
+        NUL_KV="$(w1_kvno "$NUL")"
+    fi
+}
+
+w1_create "$NUL" || p_bad "createUser $NUL failed"
+w1_set "$NUL" "$NUL_OLD" "$D/nul-set.json" "$D/nul-set.err" || p_bad "initial setUserPassword $NUL failed"
+NUL_KV="$(w1_kvno "$NUL")"
+
+W1_MARK="$(log_mark)"
+refused=no
+if ! w1_graphql "$SET_PW" "$(w1_nul_vars "$NUL")" >"$D/nul-graphql.json" 2>"$D/nul-graphql.err" \
+    && grep -qF "$NUL_SAID" "$D/nul-graphql.err"; then
+    refused=yes
+fi
+w1_nul_row nul-graphql "$refused" "$(w1_file "$D/nul-graphql.err")" \
+    PASSWORD_CHANGE "$NUL" "$NUL_SAID" "$W1_MARK" GRAPHQL
+
+W1_MARK="$(log_mark)"
+refused=no
+(umask 077 && w1_nul_bytes >"$D/nul-passwd.pw")
+t ldappasswd -x -H "$(ldap_url)" -D "$(admin_dn)" -w "$ADMIN_PASS" -T "$D/nul-passwd.pw" "$NUL_DN" \
+    >"$D/nul-passwd.log" 2>&1
+rm -f "$D/nul-passwd.pw"
+if grep -qF "Server is unwilling to perform (53)" "$D/nul-passwd.log" && grep -qF "$NUL_SAID" "$D/nul-passwd.log"; then
+    refused=yes
+fi
+w1_nul_row nul-passwd "$refused" "$(w1_file "$D/nul-passwd.log")" \
+    PASSWORD_CHANGE "$NUL" "$NUL_SAID" "$W1_MARK" LDAP
+
+W1_MARK="$(log_mark)"
+refused=no
+(umask 077 && printf 'dn: %s\nchangetype: modify\nreplace: userPassword\nuserPassword:: %s\n' \
+    "$NUL_DN" "$(w1_nul_bytes | base64 -w0)" >"$D/nul-modify.ldif")
+ldap_code=0
+lmodify -f "$D/nul-modify.ldif" >"$D/nul-modify.log" 2>&1 || ldap_code=$?
+rm -f "$D/nul-modify.ldif"
+if [ "$ldap_code" -eq 53 ] && grep -qF "$NUL_SAID" "$D/nul-modify.log"; then
+    refused=yes
+fi
+w1_nul_row nul-modify "$refused" "exit=${ldap_code} $(w1_file "$D/nul-modify.log")" \
+    PASSWORD_CHANGE "$NUL" "$NUL_SAID" "$W1_MARK" LDAP
+
+if ! docker image inspect "$WIRE_IMAGE" >/dev/null 2>&1; then
+    w1_say nul-web SKIP "browser image absent: $WIRE_IMAGE"
+else
+    NUL_KEY="$(graphql '{ kerberosInfo { publicKeyDerBase64 } }' 2>"$D/nul-key.err" | json_get kerberosInfo.publicKeyDerBase64 2>>"$D/nul-key.err")"
+    NUL_SEALED=""
+    [ -z "$NUL_KEY" ] || NUL_SEALED="$(w1_nul_bytes | wire_seal_in "$NUL_KEY" "$NUL")"
+    W1_MARK="$(log_mark)"
+    refused=no
+    if [ -z "$NUL_SEALED" ]; then
+        WIRE_LINE="not run: no transport key, or OpenSSL did not seal (see nul-key.err, seal.err)" WIRE_ALERT=""
+    else
+        wire_page nul-web change "$NUL" "$(w1_gen 24)" swap "$NUL_SEALED"
+        if [ "$WIRE_LINE" = "WIRE start-key=yes finish-envelope=yes rewrite=swapped finish-status=400 graphql-seal=no create-sent=no page=stayed" ] \
+            && grep -qF "$NUL_SAID" <<<"$WIRE_ALERT"; then
+            refused=yes
+        fi
+    fi
+    w1_nul_row nul-web "$refused" "$WIRE_LINE ${WIRE_ALERT:+alert: $WIRE_ALERT}" \
+        PASSWORD_CHANGE "$NUL" "$NUL_SAID" "$W1_MARK" HTTP
+fi
+
+W1_MARK="$(log_mark)"
+refused=no
+# The query goes in on stdin: docker's API carries argv as JSON text, which would replace the byte.
+# shellcheck disable=SC2016
+printf 'cpw -pw %s\377%s %s' "$NUL_A" "$NUL_B" "$NUL" | t docker exec -i "$CONTAINER" \
+    sh -c 'kadmin -k -t /data/kadm5.keytab -p "admin/admin@$0" -q "$(cat)"' "$REALM" >"$D/notutf8-kadmin.log" 2>&1
+if grep -qF "Unspecified password quality failure" "$D/notutf8-kadmin.log" && w1_kadmin_refused "$D/notutf8-kadmin.log"; then
+    refused=yes
+fi
+w1_nul_row notutf8-kadmin "$refused" "$(w1_file "$D/notutf8-kadmin.log")" ACCESS_DENIED "$NUL@$REALM" \
+    "kadmin change_password on $NUL@$REALM by admin/admin@$REALM: PASS_Q_GENERIC" "$W1_MARK" KADMIN
+
+w1_drop_user "$NUL"
+
 w1_judge one-graphql
 w1_judge one-modify
 w1_judge one-replace
@@ -698,5 +824,12 @@ if docker image inspect "$BROWSER_IMAGE" >/dev/null 2>&1; then
     w1_judge web-pol-bind
     w1_judge web-pol
 fi
+w1_judge one-graphql-row
+w1_judge one-modify-row
+w1_judge nul-graphql
+w1_judge nul-passwd
+w1_judge nul-modify
+w1_judge nul-web
+w1_judge notutf8-kadmin
 unset DOOR_SECRETS
 w1_summary

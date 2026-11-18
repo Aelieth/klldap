@@ -32,6 +32,7 @@ const wire = {
   finishStatus: "none",
   graphqlSeal: "no",
   createSent: "no",
+  createSync: "none",
 };
 const startIds = new Set();
 
@@ -124,7 +125,10 @@ function onEvent(msg) {
     if (url.includes(START)) startIds.add(params.requestId);
     if (url.includes(FINISH) && !finishMode) wire.finishEnvelope = hasEnvelope(body);
     if (url.includes("/api/graphql") && body.includes("syncKerberosPassword")) wire.graphqlSeal = "yes";
-    if (url.includes("/api/graphql") && body.includes("createUser")) wire.createSent = "yes";
+    if (url.includes("/api/graphql") && body.includes("createUser")) {
+      wire.createSent = "yes";
+      wire.createSync = body.includes('"kerberossync"') ? "yes" : "no";
+    }
   }
   if (msg.method === "Network.responseReceived" && (params.response?.url || "").includes(FINISH)) {
     wire.finishStatus = String(params.response.status);
@@ -334,6 +338,7 @@ try {
   say(
     `WIRE start-key=${wire.startKey} finish-envelope=${wire.finishEnvelope} rewrite=${wire.rewrite} finish-status=${wire.finishStatus} graphql-seal=${wire.graphqlSeal} create-sent=${wire.createSent} page=${page}`,
   );
+  if (pageKind === "create") say(`CREATE kerberossync=${wire.createSync}`);
   if (alert) say(`ALERT ${redact(alert).slice(0, 400)}`);
 } catch (err) {
   failed = true;

@@ -167,7 +167,7 @@ env_synced() {
 }
 
 env_nosync() {
-    local new sealed bn=no bo=no made=no
+    local new sealed bn=no bo=no made=no mark
     local want="WIRE start-key=no finish-envelope=no rewrite=added finish-status=400 graphql-seal=no create-sent=no page=stayed"
     new="$(env_gen)"
     sealed="$(wire_seal "$ENV_KEY" "$new" "$ENV_PLAIN")"
@@ -175,6 +175,7 @@ env_nosync() {
         p_bad "[U1.env-nosync-refused] OpenSSL did not seal (see seal.err)"
         return
     }
+    mark="$(log_mark)"
     wire_page env-nosync change "$ENV_PLAIN" "$new" add "$sealed"
     env_bind "$ENV_PLAIN" "$new" && bn=yes
     env_bind "$ENV_PLAIN" "$ENV_PLAIN_OLD" && bo=yes
@@ -185,10 +186,12 @@ env_nosync() {
     else
         p_bad "[U1.env-nosync-refused] $WIRE_LINE (alert: ${WIRE_ALERT:-none}); bind-new=$bn bind-old=$bo principal=$made; want $want, the sync sentence, bind-new=no bind-old=yes principal=no"
     fi
+    fail_row U1.env-nosync-refused-row PASSWORD_CHANGE "$ENV_PLAIN" \
+        "a Kerberos password envelope is taken only for a user with Kerberos sync" "$mark" HTTP
 }
 
 env_other() {
-    local typed sealed
+    local typed sealed mark
     local want="WIRE start-key=yes finish-envelope=yes rewrite=swapped finish-status=400 graphql-seal=no create-sent=no page=stayed"
     typed="$(env_gen)"
     sealed="$(wire_seal "$ENV_KEY" "$typed" "$ENV_PLAIN")"
@@ -196,6 +199,7 @@ env_other() {
         p_bad "[U1.env-other-label] OpenSSL did not seal (see seal.err)"
         return
     }
+    mark="$(log_mark)"
     wire_page env-other change "$ENV_USER" "$typed" swap "$sealed"
     env_sides "$ENV_USER" "$typed" "$ENV_OLD"
     if [ "$WIRE_LINE" = "$want" ] && [ "$ENV_GOT" = "$ENV_BOTH_OLD" ] &&
@@ -204,6 +208,8 @@ env_other() {
     else
         p_bad "[U1.env-other-label] $WIRE_LINE (alert: ${WIRE_ALERT:-none}); $ENV_GOT; want $want, 'did not open', $ENV_BOTH_OLD"
     fi
+    fail_row U1.env-other-label-row PASSWORD_CHANGE "$ENV_USER" \
+        "the Kerberos password envelope did not open: Decryption failed" "$mark" HTTP
 }
 
 if ! docker image inspect "$WIRE_IMAGE" >/dev/null 2>&1; then
@@ -308,6 +314,7 @@ graphql 'mutation($u: String!, $g: Int!) { addUserToGroup(userId: $u, groupId: $
     '{"u": "'"$POL_USER"'", "g": '"${disabled_gid:-0}"'}' >"$D/disable-policy.json" 2>&1 \
     || p_bad "addUserToGroup lldap_disabled for $POL_USER failed"
 kvno_before="$(princ_kvno "$POL_USER")"
+floor_mark="$(log_mark)"
 if graphql "$SET_PW" '{"id": "'"$POL_USER"'", "pw": "'"$POL_SHORT"'"}' \
     >"$D/setpw-policy-disabled.json" 2>"$D/setpw-policy-disabled.err"; then
     p_bad "disabled: setUserPassword took a 7-character password"
@@ -316,6 +323,8 @@ elif grep -qF "$POL_FLOOR" "$D/setpw-policy-disabled.err"; then
 else
     p_bad "disabled: setUserPassword: unexpected answer (see setpw-policy-disabled.err)"
 fi
+fail_row U1.floor-graphql-row PASSWORD_CHANGE "$POL_USER" "$POL_FLOOR" "$floor_mark" GRAPHQL
+floor_mark="$(log_mark)"
 if t ldappasswd -x -H "$(ldap_url)" -D "$(admin_dn)" -w "$ADMIN_PASS" -s "$POL_SHORT" "$POL_DN" \
     >"$D/ldappasswd-policy-disabled.log" 2>&1; then
     p_bad "disabled: ldappasswd took a 7-character password"
@@ -324,6 +333,7 @@ elif grep -qF "$POL_FLOOR" "$D/ldappasswd-policy-disabled.log"; then
 else
     p_bad "disabled: ldappasswd: unexpected answer (see ldappasswd-policy-disabled.log)"
 fi
+fail_row U1.floor-ldappasswd-row PASSWORD_CHANGE "$POL_USER" "$POL_FLOOR" "$floor_mark" LDAP
 if principal_attrs "$POL_USER" >"$D/attrs-policy.txt" && grep -q DISALLOW_ALL_TIX "$D/attrs-policy.txt" \
     && [ -n "$kvno_before" ] && [ "$(princ_kvno "$POL_USER")" = "$kvno_before" ]; then
     p_ok "a refused change leaves DISALLOW_ALL_TIX in place and the key version at $kvno_before"
@@ -344,6 +354,7 @@ BAD_USER="gate~env"
 BAD_PASS="GateBadIdPass2026!"
 BAD_DN="uid=$BAD_USER,ou=people,$BASE_DN"
 BAD_RULE="Kerberos sync cannot be turned on for user $BAD_USER: Kerberos username must be ASCII alphanumeric plus '.', '_' or '-'"
+bad_mark="$(log_mark)"
 if graphql 'mutation($u: CreateUserInput!) { createUser(user: $u) { id } }' \
     '{"u": {"id": "'"$BAD_USER"'", "email": "gate-env@gate.test",
             "attributes": [{"name": "kerberossync", "value": ["1"]}]}}' \
@@ -359,6 +370,7 @@ if lsearch -b "$BAD_DN" -s base uid >"$D/badid-absent.ldif" 2>&1 && grep -q "^dn
 else
     p_ok "the refused create made no entry for $BAD_USER"
 fi
+fail_row U1.name-rule-create-row USER_CREATE "$BAD_USER" "$BAD_RULE" "$bad_mark" GRAPHQL
 if graphql 'mutation($u: CreateUserInput!) { createUser(user: $u) { id } }' \
     '{"u": {"id": "'"$BAD_USER"'", "email": "gate-env@gate.test"}}' \
     >"$D/create-badid-plain.json" 2>&1; then
@@ -369,6 +381,7 @@ if graphql 'mutation($u: CreateUserInput!) { createUser(user: $u) { id } }' \
     else
         p_bad "$BAD_USER without sync: setUserPassword or the bind failed (see setpw-badid.err)"
     fi
+    bad_mark="$(log_mark)"
     if graphql 'mutation($u: UpdateUserInput!) { updateUser(user: $u) { ok } }' \
         '{"u": {"id": "'"$BAD_USER"'", "insertAttributes": [{"name": "kerberossync", "value": ["1"]}]}}' \
         >"$D/sync-on-badid.json" 2>"$D/sync-on-badid.err"; then
@@ -378,6 +391,7 @@ if graphql 'mutation($u: CreateUserInput!) { createUser(user: $u) { id } }' \
     else
         p_bad "turning kerberosSync on for $BAD_USER: unexpected answer (see sync-on-badid.err)"
     fi
+    fail_row U1.name-rule-sync-on-row USER_UPDATE "$BAD_USER" "$BAD_RULE" "$bad_mark" GRAPHQL
     if kadmin_q "getprinc $BAD_USER" >"$D/getprinc-badid.txt" 2>&1 && grep -q "^Principal:" "$D/getprinc-badid.txt"; then
         p_bad "a principal exists for $BAD_USER"
     else

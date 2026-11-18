@@ -8,12 +8,22 @@ PP_RUN="pp$(date +%H%M%S)"
 PP_PM="${PP_RUN}m" PP_SYNC="${PP_RUN}s" PP_PLAIN="${PP_RUN}p" PP_BIG="${PP_RUN}b" PP_NEW="${PP_RUN}n"
 PP_GONE_MUT='mutation($u: String!, $e: String!) { syncKerberosPassword(userId: $u, encryptedPassword: $e) }'
 PP_SET='mutation($id: String!, $pw: String!) { setUserPassword(userId: $id, password: $pw) { ok } }'
+PP_UPD='mutation($u: UpdateUserInput!) { updateUser(user: $u) { ok } }'
 PP_KEY="" PP_GOT="" PP_WIRE="" PP_ALERT=""
 PP_BOTH_NEW="bind-new=yes bind-old=no kinit-new=yes kinit-old=no"
 PP_BOTH_OLD="bind-new=no bind-old=yes kinit-new=no kinit-old=yes"
 PP_BROWSER_IMAGE="mcr.microsoft.com/playwright@sha256:766137e2d9caad4744187e53cdc89320ba6f2eb57cff097374020944b44dd0a9"
 PP_BROWSER_CTN="klldap-pp-wire-${RUNID}"
 EXTRA_CONTAINERS+=("$PP_BROWSER_CTN")
+PP_OFF_CTN="klldap-pp-krboff-${RUNID}" PP_OFF_DATA="klldap-pp-krboff-data-${RUNID}" PP_OFF_KDC="klldap-pp-krboff-kdc-${RUNID}"
+PP_OFF_PORT="" PP_OFF_TOK=""
+PP_OFF_DISABLED="Kerberos is disabled on this server (kerberos_options.enabled is false)"
+PP_OFF_SAID="$PP_OFF_DISABLED: enable Kerberos, or turn the user's Kerberos sync off first"
+PP_OFF_CREATE="Kerberos is disabled; create the user without Kerberos sync"
+PP_OFF_SYNC_ON="$PP_OFF_DISABLED: Kerberos sync is turned on only with Kerberos enabled"
+PP_OFF_LEFT="Kerberos is disabled: the principal is left for the start pass, which removes it at the next start with Kerberos enabled"
+EXTRA_CONTAINERS+=("$PP_OFF_CTN")
+EXTRA_VOLUMES+=("$PP_OFF_DATA" "$PP_OFF_KDC")
 # shellcheck disable=SC2034
 TOKEN="$(gate_login)" || p_bad "[U1.pages-login] the admin could not log in"
 
@@ -156,7 +166,8 @@ pp_gone() {
 }
 
 pp_floor() {
-    local short="Short7x" rc row="U1.synced-floor"
+    local short="Short7x" rc row="U1.synced-floor" mark
+    mark="$(log_mark)"
     pp_register "$TOKEN" "$PP_SYNC" "$short" --bypass-password-policy >"$PP_D/floor-register.log" 2>&1
     rc=$?
     pp_sides "$PP_SYNC" "$short" "$PP_SYNC_PASS"
@@ -167,6 +178,7 @@ pp_floor() {
     else
         p_bad "[$row] tool exit $rc ($(tail -1 "$PP_D/floor-register.log" 2>/dev/null)); $PP_GOT, want $PP_BOTH_OLD"
     fi
+    fail_row "$row-row" PASSWORD_CHANGE "$PP_SYNC" "the password must be at least 8 characters" "$mark" HTTP
 }
 
 pp_manager() {
@@ -233,7 +245,7 @@ pp_wire_rows() {
 }
 
 pp_inject_nosync() {
-    local row="U1.envelope-nosync-refused" new sealed
+    local row="U1.envelope-nosync-refused" new sealed mark
     local want="WIRE start-key=no finish-envelope=no rewrite=added finish-status=400 graphql-seal=no create-sent=no page=stayed"
     new="$(pp_gen)"
     sealed="$(pp_seal "$new" "$PP_PLAIN")"
@@ -241,6 +253,7 @@ pp_inject_nosync() {
         p_bad "[$row] OpenSSL did not seal (see seal.err)"
         return
     }
+    mark="$(log_mark)"
     pp_wire plain-add change "$PP_PLAIN" "$new" add "$sealed"
     pp_binds "$PP_PLAIN" "$new" "$PP_PLAIN_PASS"
     if [ "$PP_WIRE" = "$want" ] && [ "$PP_GOT" = "bind-new=no bind-old=yes" ] &&
@@ -249,6 +262,8 @@ pp_inject_nosync() {
     else
         p_bad "[$row] $PP_WIRE (alert: ${PP_ALERT:-none}); $PP_GOT; want $want, the sync sentence, bind-new=no bind-old=yes"
     fi
+    fail_row "$row-row" PASSWORD_CHANGE "$PP_PLAIN" \
+        "a Kerberos password envelope is taken only for a user with Kerberos sync" "$mark" HTTP
 }
 
 # The server commits the envelope's password, sealed by OpenSSL with the user's label, not the typed one.
@@ -275,7 +290,7 @@ pp_swap_label() {
 }
 
 pp_swap_other() {
-    local row="U1.envelope-other-label" typed sealed
+    local row="U1.envelope-other-label" typed sealed mark
     local want="WIRE start-key=yes finish-envelope=yes rewrite=swapped finish-status=400 graphql-seal=no create-sent=no page=stayed"
     typed="$(pp_gen)"
     sealed="$(pp_seal "$typed" "$PP_PLAIN")"
@@ -283,6 +298,7 @@ pp_swap_other() {
         p_bad "[$row] OpenSSL did not seal (see seal.err)"
         return
     }
+    mark="$(log_mark)"
     pp_wire sync-other change "$PP_SYNC" "$typed" swap "$sealed"
     pp_sides "$PP_SYNC" "$typed" "$PP_SYNC_PASS"
     if [ "$PP_WIRE" = "$want" ] && [ "$PP_GOT" = "$PP_BOTH_OLD" ] &&
@@ -291,6 +307,8 @@ pp_swap_other() {
     else
         p_bad "[$row] $PP_WIRE (alert: ${PP_ALERT:-none}); $PP_GOT; want $want, 'did not open', $PP_BOTH_OLD"
     fi
+    fail_row "$row-row" PASSWORD_CHANGE "$PP_SYNC" \
+        "the Kerberos password envelope did not open: Decryption failed" "$mark" HTTP
 }
 
 pp_create_big() {
@@ -331,6 +349,204 @@ pp_no_progress() {
     fi
 }
 
+pp_off_up() {
+    PP_OFF_PORT="" PP_OFF_TOK=""
+    docker rm -fv "$PP_OFF_CTN" >/dev/null 2>&1
+    docker run -d --name "$PP_OFF_CTN" --network "$NET" -p "127.0.0.1::17170" \
+        -v "$PP_OFF_DATA:/data" -v "$PP_OFF_KDC:/var/kerberos/krb5kdc" \
+        -e LLDAP_JWT_SECRET="$JWT_SECRET" -e LLDAP_KEY_SEED="$KEY_SEED" \
+        -e LLDAP_LDAP_BASE_DN="$BASE_DN" -e LLDAP_LDAP_USER_PASS="$ADMIN_PASS" \
+        "$@" "$GATE_IMAGE" >/dev/null 2>>"$PP_D/krb-off.err" || return 1
+    for _ in $(seq 1 120); do
+        docker exec "$PP_OFF_CTN" /app/lldap healthcheck --config-file /data/lldap_config.toml >/dev/null 2>&1 && break
+        [ -z "$(docker ps -q -f "name=^$PP_OFF_CTN$")" ] && break
+        sleep 1
+    done
+    PP_OFF_PORT="$(docker port "$PP_OFF_CTN" 17170/tcp 2>/dev/null | head -1 | sed 's/.*://')"
+    [ -n "$PP_OFF_PORT" ] && PP_OFF_TOK="$(HTTP_PORT="$PP_OFF_PORT" gate_login 2>>"$PP_D/krb-off.err")"
+}
+
+# The blinded element is ristretto255's base point, a valid one; a start registers nothing.
+pp_off_start() {
+    START_URL="http://127.0.0.1:$PP_OFF_PORT/auth/opaque/register/start" START_TOKEN="$PP_OFF_TOK" START_USER="$1" \
+        t python3 - <<'PY'
+import json, os, urllib.error, urllib.request
+point = list(bytes.fromhex("e2f2ae0a6abc4e71a884a961c500515f58e30b6aa582dd8db6a65945e08d2d76"))
+body = {"username": os.environ["START_USER"], "registration_start_request": {"blinded_element": point}}
+req = urllib.request.Request(os.environ["START_URL"], data=json.dumps(body).encode(),
+                             headers={"Content-Type": "application/json",
+                                      "Authorization": "Bearer " + os.environ["START_TOKEN"]})
+try:
+    resp = urllib.request.urlopen(req)
+    code, text = resp.status, resp.read().decode(errors="replace")
+except urllib.error.HTTPError as e:
+    code, text = e.code, e.read().decode(errors="replace")
+try:
+    answer = json.loads(text)
+except ValueError:
+    answer = None
+if isinstance(answer, dict) and "kerberos_envelope_key" in answer:
+    shape = "key"
+elif isinstance(answer, dict) and {"server_data", "registration_response"} <= set(answer):
+    shape = "start"
+else:
+    shape = "text"
+print(code, shape, " ".join(text.split())[:300])
+PY
+}
+
+pp_off_gql() { HTTP_PORT="$PP_OFF_PORT" TOKEN="$PP_OFF_TOK" graphql "$@"; }
+pp_off_mark() { HTTP_PORT="$PP_OFF_PORT" TOKEN="$PP_OFF_TOK" log_mark; }
+pp_off_once() { HTTP_PORT="$PP_OFF_PORT" TOKEN="$PP_OFF_TOK" log_once "$@"; }
+pp_off_made() { HTTP_PORT="$PP_OFF_PORT" TOKEN="$PP_OFF_TOK" pp_made "$1"; }
+pp_off_login() { HTTP_PORT="$PP_OFF_PORT" gate_login "$1" "$2" >/dev/null 2>&1; }
+pp_off_make() {
+    local attrs=""
+    [ "${2:-}" = sync ] && attrs=', "attributes": [{"name": "kerberossync", "value": ["1"]}]'
+    pp_off_gql 'mutation($u: CreateUserInput!) { createUser(user: $u) { id } }' \
+        '{"u": {"id": "'"$1"'", "email": "'"$1"'@gate.test"'"$attrs"'}}'
+}
+pp_off_sync() {
+    local out
+    out="$(pp_off_gql 'query($u: String!) { user(userId: $u) { attributes { name value } } }' '{"u": "'"$1"'"}' 2>&1)" || {
+        echo nouser
+        return
+    }
+    python3 -c '
+import json, sys
+attrs = json.load(sys.stdin)["user"]["attributes"]
+vals = [",".join(a["value"]) for a in attrs if a["name"] == "kerberossync"]
+print(vals[0] if vals else "absent")' <<<"$out" 2>/dev/null || echo error
+}
+
+pp_off_create_page() {
+    local row="U1.krb-off-create-page" user="${PP_RUN}w" pw sent attr login=no
+    local want="WIRE start-key=no finish-envelope=no rewrite=none finish-status=200 graphql-seal=no create-sent=yes page=done"
+    if ! docker image inspect "$PP_BROWSER_IMAGE" >/dev/null 2>&1; then
+        p_skip "[$row] browser image absent: ${PP_BROWSER_IMAGE}; the create page did not run"
+        return
+    fi
+    pw="$(pp_gen)"
+    CONTAINER="$PP_OFF_CTN" pp_wire off-create create "$user" "$pw" "" "" "$user@gate.test"
+    sent="$(grep -m1 '^CREATE ' "$PP_D/wire-off-create.out" 2>/dev/null)"
+    attr="$(pp_off_sync "$user")"
+    pp_off_login "$user" "$pw" && login=yes
+    if [ "$PP_WIRE" = "$want" ] && [ "$sent" = "CREATE kerberossync=no" ] && [ "$attr $login" = "absent yes" ]; then
+        p_ok "[$row] Kerberos disabled: the create page's createUser carries no kerberossync, the user has none, and its password logs in"
+    else
+        p_bad "[$row] $PP_WIRE ${PP_ALERT:+(alert: $PP_ALERT) }; ${sent:-no CREATE line}; kerberossync=$attr login=$login; want $want, CREATE kerberossync=no, absent, yes"
+    fi
+}
+
+# The users are made with Kerberos on; the same volumes then start with Kerberos disabled.
+pp_krb_off() {
+    local sync="${PP_RUN}o" plain="${PP_RUN}q" off="${PP_RUN}f" gone="${PP_RUN}d" made="${PP_RUN}c"
+    local got mark pw new row="U1.krb-off-start-synced" ctl="U1.krb-off-start-plain"
+    pw="$(pp_gen)" new="$(pp_gen)"
+    if ! pp_off_up || ! pp_off_make "$sync" sync >"$PP_D/krb-off-users.json" 2>&1 ||
+        ! pp_off_make "$plain" >>"$PP_D/krb-off-users.json" 2>&1 ||
+        ! pp_off_make "$off" sync >>"$PP_D/krb-off-users.json" 2>&1 ||
+        ! pp_off_make "$gone" sync >>"$PP_D/krb-off-users.json" 2>&1 ||
+        ! pp_off_gql "$PP_SET" "$(pp_vars "$sync" "$pw")" >>"$PP_D/krb-off-users.json" 2>&1; then
+        docker logs "$PP_OFF_CTN" >"$PP_D/krb-off-on-docker.log" 2>&1
+        p_bad "[U1.krb-off-setup] the second server with Kerberos on did not start, or did not make its users (see krb-off.err, krb-off-users.json, krb-off-on-docker.log)"
+        return
+    fi
+    docker logs "$PP_OFF_CTN" >"$PP_D/krb-off-on-docker.log" 2>&1
+    if ! pp_off_up -e LLDAP_KERBEROS_OPTIONS__ENABLED=false ||
+        [ "$(pp_off_gql '{ kerberosInfo { enabled } }' 2>/dev/null | json_get kerberosInfo.enabled 2>/dev/null)" != False ]; then
+        docker logs "$PP_OFF_CTN" >"$PP_D/krb-off-docker.log" 2>&1
+        p_bad "[U1.krb-off-setup] the same volumes did not start with Kerberos disabled, or kerberosInfo.enabled is not false (see krb-off.err, krb-off-docker.log)"
+        return
+    fi
+    mark="$(pp_off_mark)"
+    got="$(pp_off_start "$sync" 2>&1)"
+    case "$got" in
+    "400 text "*"$PP_OFF_SAID"*)
+        if pp_off_once false PASSWORD_CHANGE "$sync" "$PP_OFF_SAID" "$mark" HTTP; then
+            p_ok "[$row] Kerberos disabled: register/start for the synced $sync answers 400 '$PP_OFF_SAID', no key, and one password_change failure row (protocol HTTP)"
+        else
+            p_bad "[$row] the 400 and the sentence came, but: $FAIL_WHY"
+        fi
+        ;;
+    *) p_bad "[$row] register/start for the synced $sync answered '$got'; want 400, no key, '$PP_OFF_SAID'" ;;
+    esac
+    got="$(pp_off_start "$plain" 2>&1)"
+    case "$got" in
+    "200 start "*) p_ok "[$ctl] Kerberos disabled: register/start for $plain, without sync, answers 200 with upstream's answer (server_data, registration_response) and no kerberos_envelope_key" ;;
+    *) p_bad "[$ctl] register/start for $plain answered '$got'; want 200 and upstream's answer without a key" ;;
+    esac
+
+    row="U1.krb-off-create-sync" FAIL_WHY=""
+    mark="$(pp_off_mark)"
+    if pp_off_make "$made" sync >"$PP_D/krb-off-create.json" 2>"$PP_D/krb-off-create.err"; then
+        p_bad "[$row] createUser with kerberossync=1 answered ok with Kerberos disabled"
+    elif grep -qF "$PP_OFF_CREATE" "$PP_D/krb-off-create.err" && [ "$(pp_off_made "$made")" = no ] &&
+        pp_off_once false USER_CREATE "$made" "$PP_OFF_CREATE" "$mark" GRAPHQL; then
+        p_ok "[$row] Kerberos disabled: createUser with kerberossync=1 is refused with '$PP_OFF_CREATE', no user is made, one user_create failure row"
+    else
+        p_bad "[$row] $(head -c 300 "$PP_D/krb-off-create.err"); made=$(pp_off_made "$made"); ${FAIL_WHY:-want '$PP_OFF_CREATE' and no user}"
+    fi
+
+    pp_off_create_page
+
+    row="U1.krb-off-sync-off" FAIL_WHY=""
+    got="$(pp_off_sync "$off")"
+    mark="$(pp_off_mark)"
+    if [ "$got" = 1 ] &&
+        pp_off_gql "$PP_UPD" '{"u": {"id": "'"$off"'", "removeAttributes": ["kerberossync"]}}' >"$PP_D/krb-off-syncoff.json" 2>&1 &&
+        [ "$(pp_off_sync "$off")" = absent ] && pp_off_once true KERBEROS_SYNC "$off" "$PP_OFF_LEFT" "$mark" GRAPHQL; then
+        p_ok "[$row] Kerberos disabled: sync off for the synced $off is allowed, directory-only: kerberossync goes from 1 to absent, and one kerberos_sync row says '$PP_OFF_LEFT'"
+    else
+        p_bad "[$row] kerberossync before=$got after=$(pp_off_sync "$off"); $(head -c 300 "$PP_D/krb-off-syncoff.json" 2>/dev/null); ${FAIL_WHY:-want 1, ok, then absent}"
+    fi
+
+    row="U1.krb-off-delete" FAIL_WHY=""
+    mark="$(pp_off_mark)"
+    if pp_off_gql 'mutation($u: String!) { deleteUser(userId: $u) { ok } }' '{"u": "'"$gone"'"}' >"$PP_D/krb-off-delete.json" 2>&1 &&
+        [ "$(pp_off_made "$gone")" = no ] && pp_off_once true KERBEROS_SYNC "$gone" "$PP_OFF_LEFT" "$mark" GRAPHQL; then
+        p_ok "[$row] Kerberos disabled: deleting the synced $gone is allowed, directory-only, and one kerberos_sync row says '$PP_OFF_LEFT'"
+    else
+        p_bad "[$row] $(head -c 300 "$PP_D/krb-off-delete.json"); still there=$(pp_off_made "$gone"); ${FAIL_WHY:-want ok and no user}"
+    fi
+
+    row="U1.krb-off-sync-on" FAIL_WHY=""
+    mark="$(pp_off_mark)"
+    if pp_off_gql "$PP_UPD" '{"u": {"id": "'"$plain"'", "insertAttributes": [{"name": "kerberossync", "value": ["1"]}]}}' \
+        >"$PP_D/krb-off-syncon.json" 2>"$PP_D/krb-off-syncon.err"; then
+        p_bad "[$row] turning kerberossync on answered ok with Kerberos disabled"
+    elif grep -qF "$PP_OFF_SYNC_ON" "$PP_D/krb-off-syncon.err" && [ "$(pp_off_sync "$plain")" = absent ] &&
+        pp_off_once false USER_UPDATE "$plain" "$PP_OFF_SYNC_ON" "$mark" GRAPHQL; then
+        p_ok "[$row] Kerberos disabled: sync on for $plain is refused with '$PP_OFF_SYNC_ON', kerberossync stays absent, one user_update failure row"
+    else
+        p_bad "[$row] $(head -c 300 "$PP_D/krb-off-syncon.err"); kerberossync=$(pp_off_sync "$plain"); ${FAIL_WHY:-want the sentence and no kerberossync}"
+    fi
+
+    row="U1.krb-off-setpw-synced" FAIL_WHY=""
+    mark="$(pp_off_mark)"
+    if pp_off_gql "$PP_SET" "$(pp_vars "$sync" "$new")" >"$PP_D/krb-off-setpw.json" 2>"$PP_D/krb-off-setpw.err"; then
+        p_bad "[$row] setUserPassword for the synced $sync answered ok with Kerberos disabled"
+    elif grep -qF "$PP_OFF_SAID" "$PP_D/krb-off-setpw.err" && pp_off_login "$sync" "$pw" && ! pp_off_login "$sync" "$new" &&
+        pp_off_once false PASSWORD_CHANGE "$sync" "$PP_OFF_SAID" "$mark" GRAPHQL; then
+        p_ok "[$row] Kerberos disabled: setUserPassword for the synced $sync is a GraphQL error '$PP_OFF_SAID'; the old password still logs in, one password_change failure row"
+    else
+        p_bad "[$row] $(head -c 300 "$PP_D/krb-off-setpw.err"); ${FAIL_WHY:-want the sentence, the old password kept}"
+    fi
+
+    row="U1.krb-off-ldappasswd-synced" FAIL_WHY=""
+    mark="$(pp_off_mark)"
+    gexec_in "$PP_OFF_CTN" ldappasswd -x -H ldap://127.0.0.1:3890 -D "$(admin_dn)" -w "$ADMIN_PASS" -s "$new" "$(pp_dn "$sync")" \
+        >"$PP_D/krb-off-ldappasswd.log" 2>&1
+    if grep -qF "Server is unwilling to perform (53)" "$PP_D/krb-off-ldappasswd.log" && grep -qF "$PP_OFF_SAID" "$PP_D/krb-off-ldappasswd.log" &&
+        pp_off_login "$sync" "$pw" && ! pp_off_login "$sync" "$new" &&
+        pp_off_once false PASSWORD_CHANGE "$sync" "$PP_OFF_SAID" "$mark" LDAP; then
+        p_ok "[$row] Kerberos disabled: ldappasswd for the synced $sync answers 53 '$PP_OFF_SAID'; the old password still logs in, one password_change failure row"
+    else
+        p_bad "[$row] $(tr '\n' ' ' <"$PP_D/krb-off-ldappasswd.log" | head -c 300); ${FAIL_WHY:-want 53, the sentence, the old password kept}"
+    fi
+    docker logs "$PP_OFF_CTN" >"$PP_D/krb-off-docker.log" 2>&1
+}
+
 if pp_setup; then
     pp_gone
     pp_floor
@@ -351,3 +567,6 @@ docker rm -f "$PP_BROWSER_CTN" >/dev/null 2>&1 || true
 for u in "$PP_PM" "$PP_SYNC" "$PP_PLAIN" "$PP_BIG" "$PP_NEW"; do
     graphql 'mutation($u: String!) { deleteUser(userId: $u) { ok } }' '{"u": "'"$u"'"}' >/dev/null 2>&1
 done
+pp_krb_off
+docker rm -fv "$PP_OFF_CTN" >/dev/null 2>&1
+docker volume rm "$PP_OFF_DATA" "$PP_OFF_KDC" >/dev/null 2>&1

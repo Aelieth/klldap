@@ -422,7 +422,22 @@ static BACKEND: LazyLock<RwLock<Arc<dyn KerberosSync>>> =
     LazyLock::new(|| RwLock::new(Arc::new(NoopKerberos::default())));
 
 pub fn kerberos_backend() -> Arc<dyn KerberosSync> {
+    #[cfg(feature = "test-backend-scope")]
+    if let Some(backend) = THREAD_BACKEND.with(|scoped| scoped.borrow().clone()) {
+        return backend;
+    }
     BACKEND.read().expect("kerberos backend").clone()
+}
+
+#[cfg(feature = "test-backend-scope")]
+thread_local! {
+    static THREAD_BACKEND: std::cell::RefCell<Option<Arc<dyn KerberosSync>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(feature = "test-backend-scope")]
+pub fn set_thread_kerberos_backend(backend: Option<Arc<dyn KerberosSync>>) {
+    THREAD_BACKEND.with(|scoped| *scoped.borrow_mut() = backend);
 }
 
 pub fn set_kerberos_backend(backend: Arc<dyn KerberosSync>) {

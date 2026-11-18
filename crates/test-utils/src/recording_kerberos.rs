@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use lldap_domain::types::UserId;
 use lldap_domain_handlers::kerberos::{
-    CommitError, DegradedKerberos, Held, HostRow, KerberosSync, NoopKerberos, PasswordCommit,
-    UserChange, set_kerberos_backend,
+    CommitError, DegradedKerberos, Held, HostRow, KerberosSync, PasswordCommit, UserChange,
+    set_thread_kerberos_backend,
 };
 use lldap_domain_handlers::password::record_commit_failure;
 use std::sync::{Arc, Mutex};
@@ -189,7 +189,7 @@ pub struct RecordingGuard {
 impl RecordingGuard {
     pub fn install() -> Self {
         let rec = RecordingKerberos::new();
-        set_kerberos_backend(rec.clone());
+        set_thread_kerberos_backend(Some(rec.clone()));
         Self { rec }
     }
 
@@ -218,7 +218,7 @@ impl RecordingGuard {
     }
 
     fn installed(rec: Arc<RecordingKerberos>) -> Self {
-        set_kerberos_backend(rec.clone());
+        set_thread_kerberos_backend(Some(rec.clone()));
         Self { rec }
     }
 
@@ -229,7 +229,7 @@ impl RecordingGuard {
 
 impl Drop for RecordingGuard {
     fn drop(&mut self) {
-        set_kerberos_backend(Arc::new(NoopKerberos::default()));
+        set_thread_kerberos_backend(None);
     }
 }
 
@@ -259,14 +259,14 @@ pub struct NotReadyGuard;
 
 impl NotReadyGuard {
     pub fn install() -> Self {
-        set_kerberos_backend(Arc::new(NotReadyKerberos));
+        set_thread_kerberos_backend(Some(Arc::new(NotReadyKerberos)));
         Self
     }
 }
 
 impl Drop for NotReadyGuard {
     fn drop(&mut self) {
-        set_kerberos_backend(Arc::new(NoopKerberos::default()));
+        set_thread_kerberos_backend(None);
     }
 }
 
@@ -276,16 +276,16 @@ pub struct DegradedGuard;
 
 impl DegradedGuard {
     pub fn install() -> Self {
-        set_kerberos_backend(Arc::new(DegradedKerberos::new(
+        set_thread_kerberos_backend(Some(Arc::new(DegradedKerberos::new(
             RECORDER_REALM.to_owned(),
             DEGRADED_CAUSE.to_owned(),
-        )));
+        ))));
         Self
     }
 }
 
 impl Drop for DegradedGuard {
     fn drop(&mut self) {
-        set_kerberos_backend(Arc::new(NoopKerberos::default()));
+        set_thread_kerberos_backend(None);
     }
 }

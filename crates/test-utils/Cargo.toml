@@ -23,6 +23,7 @@ path = "../domain"
 
 [dependencies.lldap_domain_handlers]
 path = "../domain-handlers"
+features = ["test-backend-scope"]
 
 [dependencies.lldap_domain_model]
 path = "../domain-model"

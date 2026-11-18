@@ -173,12 +173,14 @@ cp -a "$GATE_FIXTURE_KDC" "$B/krb5kdc"
 rm -f "$B/krb5kdc/principal.dump" "$B/krb5kdc/principal.dump.dump_ok"
 
 # B4 binds as admin with a known password: one run sets it (the server exits after applying
-# the flag, before the realm). A 0.7.2 install's data keeps its own key.
+# the flag). The realm cannot open here, so the admin, who has no sync, is reset with Kerberos
+# disabled. A 0.7.2 install's data keeps its own key.
 if [ -n "${GATE_FIXTURE_ADMIN_PASS:-}" ]; then
     timeout 120 docker run --rm --name "$MIG_B-prep" \
         -v "$B/data:/data" -v "$B/krb5kdc:$KDC" \
         -e LLDAP_JWT_SECRET="$JWT_SECRET" -e LLDAP_LDAP_BASE_DN="$GATE_FIXTURE_BASE_DN" \
         -e LLDAP_FORCE_LDAP_USER_PASS_RESET=true -e LLDAP_LDAP_USER_PASS="$GATE_FIXTURE_ADMIN_PASS" \
+        -e LLDAP_KERBEROS_OPTIONS__ENABLED=false \
         "$GATE_IMAGE" >"$D/branch-b-pass-reset.log" 2>&1
     grep -q "Restart the server without" "$D/branch-b-pass-reset.log" \
         || p_bad "branch B's admin password reset did not apply (see branch-b-pass-reset.log)"

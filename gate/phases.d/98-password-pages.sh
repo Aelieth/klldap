@@ -21,7 +21,8 @@ PP_OFF_DISABLED="Kerberos is disabled on this server (kerberos_options.enabled i
 PP_OFF_SAID="$PP_OFF_DISABLED: enable Kerberos, or turn the user's Kerberos sync off first"
 PP_OFF_CREATE="Kerberos is disabled; create the user without Kerberos sync"
 PP_OFF_SYNC_ON="$PP_OFF_DISABLED: Kerberos sync is turned on only with Kerberos enabled"
-PP_OFF_LEFT="Kerberos is disabled: the principal is left for the start pass, which removes it at the next start with Kerberos enabled"
+PP_OFF_LEFT="Kerberos is disabled: a principal, if there is one, is left for the start pass, which removes it at the next start with Kerberos enabled"
+PP_OFF_STATUS="Kerberos is disabled: the status of a principal, if there is one, is left for the start pass, which sets it from lldap_disabled at the next start with Kerberos enabled"
 EXTRA_CONTAINERS+=("$PP_OFF_CTN")
 EXTRA_VOLUMES+=("$PP_OFF_DATA" "$PP_OFF_KDC")
 # shellcheck disable=SC2034
@@ -543,6 +544,21 @@ pp_krb_off() {
         p_ok "[$row] Kerberos disabled: ldappasswd for the synced $sync answers 53 '$PP_OFF_SAID'; the old password still logs in, one password_change failure row"
     else
         p_bad "[$row] $(tr '\n' ' ' <"$PP_D/krb-off-ldappasswd.log" | head -c 300); ${FAIL_WHY:-want 53, the sentence, the old password kept}"
+    fi
+
+    row="U1.krb-off-disable" FAIL_WHY=""
+    local gid
+    mark="$(pp_off_mark)"
+    gid="$(pp_off_gql '{ groups { id displayName } }' '{}' 2>/dev/null | python3 -c '
+import json, sys
+print(next(g["id"] for g in json.load(sys.stdin)["groups"] if g["displayName"] == "lldap_disabled"))' 2>/dev/null)"
+    if [ -n "$gid" ] &&
+        pp_off_gql 'mutation($u: String!, $g: Int!) { addUserToGroup(userId: $u, groupId: $g) { ok } }' \
+            '{"u": "'"$sync"'", "g": '"$gid"'}' >"$PP_D/krb-off-disable.json" 2>&1 &&
+        pp_off_once true KERBEROS_SYNC "$sync" "$PP_OFF_STATUS" "$mark" GRAPHQL; then
+        p_ok "[$row] Kerberos disabled: adding the synced $sync to lldap_disabled is allowed, and one kerberos_sync row says '$PP_OFF_STATUS'"
+    else
+        p_bad "[$row] lldap_disabled=${gid:-not found}; $(head -c 300 "$PP_D/krb-off-disable.json" 2>/dev/null); ${FAIL_WHY:-want ok and one kerberos_sync row}"
     fi
     docker logs "$PP_OFF_CTN" >"$PP_D/krb-off-docker.log" 2>&1
 }

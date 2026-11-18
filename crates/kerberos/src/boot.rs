@@ -87,10 +87,9 @@ pub(crate) fn install_plugins(store: &mut PrincipalStore) {
         .plugins
         .register_kdcpolicy(Arc::new(LiveClients));
     #[cfg(not(feature = "test-admission"))]
-    store
-        .policy
-        .plugins
-        .set_host_admission(Arc::new(crate::policy::AllowAll));
+    let verdict = crate::admission::KdcVerdict::new(store.realm());
+    #[cfg(not(feature = "test-admission"))]
+    store.policy.plugins.set_host_admission(Arc::new(verdict));
     #[cfg(feature = "test-admission")]
     store
         .policy

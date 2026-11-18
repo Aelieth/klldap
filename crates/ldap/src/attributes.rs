@@ -1,13 +1,14 @@
 use crate::{
     core::utils::is_ignored_attribute,
-    dn::{DEFAULT_PRIMARY_GROUP_OU, DEFAULT_PRIMARY_USER_OU, build_group_dn, build_user_dn},
+    dn::{DEFAULT_PRIMARY_GROUP_OU, build_group_dn, build_user_dn},
     schema::{ExpandedAttributes, GroupFieldType, UserFieldType},
 };
 use chrono::{NaiveDateTime, TimeZone};
 use ldap3_proto::{LdapPartialAttribute, LdapSearchResultEntry};
+pub use lldap_domain::types::get_ou_from_attributes;
 use lldap_domain::types::{
     Attribute, AttributeName, AttributeValue, Cardinality, Group, GroupDetails, GroupMember,
-    LdapObjectClass, User, UserId,
+    LdapObjectClass, User, UserId, user_ou,
 };
 use lldap_schema::{AttributeList, PublicSchema};
 use std::collections::HashSet;
@@ -78,20 +79,6 @@ pub fn get_custom_attribute(
                 l.iter().map(to_generalized_time).collect()
             }
         })
-}
-
-pub fn get_ou_from_attributes(attributes: &[Attribute], default: &str) -> String {
-    attributes
-        .iter()
-        .find(|a| a.name.as_str().eq_ignore_ascii_case("ou"))
-        .and_then(|a| match &a.value {
-            AttributeValue::String(Cardinality::Singleton(s)) => Some(s.clone()),
-            AttributeValue::String(Cardinality::Unbounded(list)) if !list.is_empty() => {
-                Some(list[0].clone())
-            }
-            _ => None,
-        })
-        .unwrap_or_else(|| default.to_string())
 }
 
 pub(crate) fn inject_operational_attributes(
@@ -177,7 +164,7 @@ fn object_classes(classes: Vec<Vec<u8>>) -> Vec<LdapObjectClass> {
 }
 
 pub fn get_user_ou(user: &User) -> String {
-    get_ou_from_attributes(&user.attributes, DEFAULT_PRIMARY_USER_OU)
+    user_ou(&user.attributes)
 }
 
 pub fn get_group_ou(group: &Group) -> String {

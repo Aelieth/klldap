@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+pub mod enforcement;
 pub mod handler;
 pub mod kerberos;
 pub mod logging;

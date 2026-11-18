@@ -23,6 +23,7 @@ use lldap_auth::{
     login, password_reset, registration,
 };
 use lldap_domain::types::{GroupDetails, GroupName, LoginOutcome, UserId, kerberos_sync_enabled};
+use lldap_domain_handlers::enforcement::{Attempt, Door, admit};
 use lldap_domain_handlers::handler::{
     BackendHandler, BindRequest, LoginHandler, MfaBackendHandler, UserRequestFilter,
 };
@@ -164,6 +165,8 @@ where
     {
         return Err(TcpError::DomainError(DomainError::KdcUnavailable(cause)));
     }
+    let handler = data.backend_handler.unsafe_get_handler();
+    admit_refresh(handler, &user).await?;
     let mfa_enrollment_pending =
         data.get_mfa_handler().mfa_requirement(&user).await? == MfaRequirement::Enrollment;
     let token = create_jwt(data.get_tcp_handler(), jwt_key, &user, groups, false).await;
@@ -972,7 +975,30 @@ pub(crate) async fn check_if_token_is_valid<Backend: BackendHandler + OpaqueHand
     ) {
         return Err(ErrorServiceUnavailable(cause));
     }
+    admit_token_use(state.backend_handler.unsafe_get_handler(), &validation.user).await?;
     Ok(validation)
+}
+
+const ACCESS_REFUSED: &str = "Access refused";
+
+// The reason is only in the row `admit` writes; the web and simple logins admit in the handler.
+async fn admit_refresh<H: BackendHandler + ?Sized>(handler: &H, user: &UserId) -> TcpResult<()> {
+    admit(handler, &Attempt::new(user, Door::Refresh))
+        .await
+        .map_err(|_| {
+            TcpError::DomainError(DomainError::AuthenticationError(format!(
+                r#"for user "{user}""#
+            )))
+        })
+}
+
+async fn admit_token_use<H: BackendHandler + ?Sized>(
+    handler: &H,
+    user: &UserId,
+) -> Result<(), actix_web::Error> {
+    admit(handler, &Attempt::new(user, Door::TokenUse))
+        .await
+        .map_err(|_| ErrorUnauthorized(ACCESS_REFUSED))
 }
 
 const ADMINS_ONLY: &str = "only admins may sign in while Kerberos is unavailable";
@@ -1047,9 +1073,11 @@ pub(crate) mod tests {
     use lldap_auth::opaque;
     use lldap_domain::types::{Attribute, User};
     use lldap_domain_handlers::kerberos::CommitError;
+    use lldap_domain_handlers::logging::{Protocol, RequestMeta, with_request};
     use lldap_domain_handlers::password::PASSWORD_MIN_LENGTH;
     use lldap_domain_model::error::{DomainError, Result as DomainResult};
     use lldap_test_utils::MockTestBackendHandler;
+    use lldap_test_utils::enforcement::{EnforcementGuard, SeenAttempt};
     use lldap_test_utils::recording_kerberos::{KerberosOp, RecordingGuard};
     use mockall::predicate::eq;
     use pretty_assertions::assert_eq;
@@ -1644,10 +1672,10 @@ pub(crate) mod tests {
             unimplemented!()
         }
         async fn register_jwt(&self, _: &UserId, _: u64, _: NaiveDateTime) -> DomainResult<()> {
-            unimplemented!()
+            Ok(())
         }
         async fn check_token(&self, _: u64, _: &UserId) -> DomainResult<bool> {
-            unimplemented!()
+            Ok(true)
         }
         async fn blacklist_jwts(&self, _: &UserId) -> DomainResult<HashSet<u64>> {
             unimplemented!()
@@ -1666,10 +1694,12 @@ pub(crate) mod tests {
         }
     }
 
-    fn app_state(mock: MockTestBackendHandler) -> web::Data<AppState<MockTestBackendHandler>> {
+    fn app_state<B: BackendHandler + lldap_opaque_handler::OpaqueHandler>(
+        backend: B,
+    ) -> web::Data<AppState<B>> {
         use hmac::Mac;
         web::Data::new(AppState {
-            backend_handler: lldap_access_control::AccessControlledBackendHandler::new(mock),
+            backend_handler: lldap_access_control::AccessControlledBackendHandler::new(backend),
             jwt_key: Hmac::new_from_slice(b"a test secret").unwrap(),
             jwt_blacklist: std::sync::RwLock::new(HashSet::new()),
             server_url: url::Url::parse("http://localhost").unwrap(),
@@ -1736,6 +1766,206 @@ pub(crate) mod tests {
                 status,
                 "sealed for {sealed_for}"
             );
+        }
+    }
+
+    /// A directory on SQLite with these users and their passwords, as the server keeps it.
+    pub(crate) async fn sql_handler_with(
+        users: &[(&str, &str)],
+    ) -> lldap_sql_backend_handler::SqlBackendHandler {
+        use lldap_domain_handlers::handler::UserBackendHandler;
+        let mut options = sea_orm::ConnectOptions::new("sqlite::memory:".to_owned());
+        options.max_connections(1);
+        let pool = sea_orm::Database::connect(options).await.unwrap();
+        lldap_sql_backend_handler::sql_tables::init_table(&pool)
+            .await
+            .unwrap();
+        let key = opaque::server::generate_random_private_key();
+        let handler = lldap_sql_backend_handler::SqlBackendHandler::new(key, pool);
+        for (user, password) in users {
+            let request = lldap_domain::requests::CreateUserRequest {
+                user_id: UserId::new(user),
+                email: format!("{user}@example.com").into(),
+                ..Default::default()
+            };
+            handler.create_user(request).await.unwrap();
+            let id = UserId::new(user);
+            lldap_opaque_handler::register_password(&handler, id, password.as_bytes())
+                .await
+                .unwrap();
+        }
+        handler
+    }
+
+    #[tokio::test]
+    async fn test_a_policy_refusal_at_the_web_and_simple_login_routes_is_one_row_with_its_peer() {
+        use lldap_test_utils::recording_log::LogGuard;
+        const PASSWORD: &str = "e0route-pass-1";
+        let _backend = ONE_BACKEND.lock().await;
+        let handler = sql_handler_with(&[("e0route", PASSWORD)]).await;
+        let log = LogGuard::install_on_this_thread();
+        let _guard = EnforcementGuard::refusing(&["e0route"], "login-hours");
+        let state = app_state(handler);
+        let user = UserId::new("e0route");
+        let rows = [
+            ("the simple login", "192.0.2.61", LogKind::Bind),
+            ("the web login", "192.0.2.62", LogKind::Login),
+        ];
+        for (label, peer, kind) in rows {
+            let meta = RequestMeta::http(Some(peer.parse().unwrap()), None);
+            let status = with_request(meta, async {
+                if kind == LogKind::Bind {
+                    let request = login::ClientSimpleLoginRequest {
+                        username: user.clone(),
+                        password: PASSWORD.to_owned(),
+                    };
+                    let response = simple_login_handler(state.clone(), web::Json(request)).await;
+                    return response.status().as_u16();
+                }
+                let mut rng = rand::rngs::OsRng;
+                let start = opaque::client::login::start_login(PASSWORD, &mut rng).unwrap();
+                let started = state
+                    .get_opaque_handler()
+                    .login_start(login::ClientLoginStartRequest {
+                        username: user.clone(),
+                        login_start_request: start.message,
+                    })
+                    .await
+                    .unwrap();
+                let finish = opaque::client::login::finish_login(
+                    start.state,
+                    PASSWORD.as_bytes(),
+                    started.credential_response,
+                    &mut rng,
+                )
+                .unwrap();
+                let request = login::ClientLoginFinishRequest {
+                    server_data: started.server_data,
+                    credential_finalization: finish.message,
+                    totp_code: None,
+                };
+                let response = opaque_login_finish_handler(state.clone(), web::Json(request)).await;
+                response.status().as_u16()
+            })
+            .await;
+            let rows: Vec<_> = log
+                .recorder()
+                .take_events()
+                .into_iter()
+                .filter(|e| e.actor.as_deref() == Some("e0route"))
+                .map(|e| (e.kind, e.success, e.peer, e.detail))
+                .collect();
+            let refused = (
+                kind,
+                false,
+                Some(peer.to_owned()),
+                Some("policy: login-hours".to_owned()),
+            );
+            assert_eq!((status, rows), (401, vec![refused]), "{label}");
+        }
+    }
+
+    fn session_token(key: &Hmac<Sha512>, user: &str) -> String {
+        let claims = JWTClaims {
+            exp: Utc::now() + chrono::Duration::hours(1),
+            iat: Utc::now(),
+            jti: Uuid::new_v4(),
+            user: user.to_owned(),
+            groups: HashSet::new(),
+            password_reset: false,
+        };
+        let header = jwt::Header {
+            algorithm: jwt::AlgorithmType::Hs512,
+            ..Default::default()
+        };
+        let token = jwt::Token::new(header, claims).sign_with_key(key).unwrap();
+        token.as_str().to_owned()
+    }
+
+    #[tokio::test]
+    async fn test_the_refresh_and_token_routes_refuse_by_policy_with_401_and_one_row() {
+        use lldap_test_utils::recording_log::LogGuard;
+        let _backend = ONE_BACKEND.lock().await;
+        let log = LogGuard::install_on_this_thread();
+        let user = UserId::new("e0http");
+        for (n, door) in [Door::Refresh, Door::TokenUse].into_iter().enumerate() {
+            for allow in [None, Some(true), Some(false)] {
+                let guard = match allow {
+                    None => EnforcementGuard::none(),
+                    Some(true) => EnforcementGuard::allowing(&["e0http"], "login-hours"),
+                    Some(false) => EnforcementGuard::refusing(&["e0http"], "login-hours"),
+                };
+                let reads = usize::from(allow.is_some());
+                let mut mock = MockTestBackendHandler::new();
+                mock.expect_get_user_groups()
+                    .returning(|_| Ok(HashSet::new()));
+                mock.expect_get_user_details()
+                    .times(reads)
+                    .returning(|_| Ok(alice(false)));
+                mock.expect_get_policy_levels()
+                    .withf(|ou| ou == "people")
+                    .times(reads)
+                    .returning(|_| Ok(vec![]));
+                mock.expect_mfa_requirement()
+                    .returning(|_| Ok(MfaRequirement::None));
+                let state = app_state(mock);
+                let peer = format!("192.0.2.{}", 40 + n);
+                let meta = RequestMeta::http(Some(peer.parse().unwrap()), None);
+                let status = with_request(meta, async {
+                    if door == Door::Refresh {
+                        let request = actix_web::test::TestRequest::get()
+                            .insert_header(("refresh-token", "e0-refresh+e0http"))
+                            .to_http_request();
+                        return get_refresh_handler(state, request).await.status().as_u16();
+                    }
+                    let token = session_token(&state.jwt_key, "e0http");
+                    match check_if_token_is_valid(&state, &token).await {
+                        Ok(_) => 200,
+                        Err(e) => e.as_response_error().status_code().as_u16(),
+                    }
+                })
+                .await;
+                let label = format!("{door:?} {allow:?}");
+                let refused = allow == Some(false);
+                assert_eq!(status, if refused { 401 } else { 200 }, "{label}");
+                let rows: Vec<_> = log
+                    .recorder()
+                    .take_events()
+                    .into_iter()
+                    .filter(|e| e.peer.as_deref() == Some(peer.as_str()))
+                    .map(|e| (e.kind, e.success, e.protocol, e.target, e.detail))
+                    .collect();
+                let e0http = Some("e0http".to_owned());
+                let expected = match (door, refused) {
+                    (_, true) => vec![(
+                        door.log_kind(),
+                        false,
+                        Protocol::Http,
+                        e0http,
+                        Some("policy: login-hours".to_owned()),
+                    )],
+                    (Door::Refresh, false) => {
+                        vec![(LogKind::TokenRefresh, true, Protocol::Http, None, None)]
+                    }
+                    _ => vec![],
+                };
+                assert_eq!(
+                    rows, expected,
+                    "{label}: one row, never a success beside a refusal"
+                );
+                let seen = allow.map(|_| SeenAttempt {
+                    user: user.clone(),
+                    door,
+                    peer: Some(peer.parse().unwrap()),
+                    second_factor: false,
+                    value: String::new(),
+                });
+                assert_eq!(
+                    guard.seen(),
+                    seen.into_iter().collect::<Vec<_>>(),
+                    "{label}"
+                );
+            }
         }
     }
 

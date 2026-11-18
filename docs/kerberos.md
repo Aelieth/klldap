@@ -150,6 +150,10 @@ ACL text, read at boot.
   LDAP ADD with a password creates the entry, its record and its principal
   together, or nothing. The web pages and `lldap_set_password` take the same
   one transaction (see below).
+- A deleted user's ticket requests are refused for every kind of request,
+  delegation and user-to-user included. Renewals and service tickets keep their
+  answer (code 18, `CLIENT_NOT_FOUND`); the refusal rows are described in
+  [logging.md](logging.md).
 - Users in `lldap_disabled` have their principal disabled (`DISALLOW_ALL_TIX`).
   Leaving the group re-enables it. With the realm ready, the membership of a
   user with `kerberosSync`, its log row and the principal's status are written

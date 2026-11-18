@@ -1618,6 +1618,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_the_kdcs_refusals_coalesce_per_peer_as_token_use_does() {
+        let mut flood = FloodCoalescer::new(FloodClass::AccessDenied, FLOOD_IDLE_SECONDS);
+        let base = at(1, 9, 0);
+        let details = [
+            "policy: login-hours",
+            "policy: login-hours (S4U2Self by HTTP/svc.example.com@EXAMPLE.COM)",
+        ];
+        let kept: Vec<bool> = (0..12)
+            .map(|i| {
+                let refusal = LogEvent {
+                    protocol: Protocol::Kerberos,
+                    detail: Some(details[i % 2].to_owned()),
+                    ..denial(
+                        Some("sable"),
+                        "192.0.2.7",
+                        base + chrono::Duration::seconds(i as i64),
+                    )
+                };
+                flood.keep(&refusal)
+            })
+            .collect();
+        assert_eq!(kept, (0..12).map(|i| i < 8).collect::<Vec<_>>());
+        let rows: Vec<_> = flood
+            .flush(base + chrono::Duration::seconds(60), true)
+            .into_iter()
+            .map(|r| (r.kind, r.protocol, r.peer, r.detail))
+            .collect();
+        let row = |detail: &str| {
+            (
+                LogKind::AccessDeniedFlood,
+                Protocol::Kerberos,
+                Some("192.0.2.7".to_owned()),
+                Some(detail.to_owned()),
+            )
+        };
+        assert_eq!(
+            rows,
+            vec![
+                row("access-denied flood started"),
+                row("access-denied flood resolved: 4 denials, 1 actors, 11s"),
+            ]
+        );
+    }
+
     const ADMIN: &str = "admin/admin@EXAMPLE.COM";
     const K1SYNC: &str = "k1sync@EXAMPLE.COM";
 

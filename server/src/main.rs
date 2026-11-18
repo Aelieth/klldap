@@ -38,6 +38,7 @@ use tracing::{Instrument, Level, debug, error, info, instrument, span, warn};
 
 use lldap_domain::requests::{CreateGroupRequest, CreateUserRequest};
 use lldap_domain::types::{Attribute, BUILTIN_GROUPS, kerberos_sync_enabled};
+use lldap_domain_handlers::enforcement::{CacheFollower, policy_cache, start_policy_cache};
 use lldap_domain_handlers::kerberos::{
     DegradedKerberos, KerberosSync, NoopKerberos, kerberos_backend, kerberos_store,
     set_kerberos_backend,
@@ -483,6 +484,7 @@ async fn set_up_server(
     if restart && deferred.is_none() {
         bail!(RESTART_WITHOUT_FORCE);
     }
+    let _policy_filler = start_policy_cache(&backend_handler).await;
     let (realm_threads, embedded) = match config.kerberos_options.enabled {
         false => (None, None),
         true => {
@@ -502,6 +504,8 @@ async fn set_up_server(
             let mut deferred = deferred;
             let served = match opened {
                 Ok((embedded, opened)) => {
+                    let follower = CacheFollower::new(backend_handler.clone(), policy_cache());
+                    embedded.follow_commits(Arc::new(follower));
                     set_kerberos_backend(embedded.clone());
                     let reconciling =
                         format!("reconciling the principals of the Kerberos realm {realm} failed");
@@ -859,6 +863,23 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn test_the_realm_engine_follows_its_commits_before_it_takes_requests() {
+        let source = include_str!("main.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let at = |needle: &str| {
+            let found = production.find(needle);
+            found.unwrap_or_else(|| panic!("main.rs no longer has `{needle}`"))
+        };
+        let made = at("CacheFollower::new(backend_handler.clone(), policy_cache())");
+        let installed = at("embedded.follow_commits(Arc::new(follower))");
+        let serving = at("set_kerberos_backend(embedded.clone())");
+        assert!(
+            made < installed && installed < serving,
+            "the cache's follower is installed before the realm engine takes requests"
+        );
+    }
 
     #[test]
     fn test_a_forced_reset_is_refused_only_for_its_password() {

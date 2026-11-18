@@ -618,6 +618,27 @@ pub fn kerberos_sync_enabled(attrs: &[Attribute]) -> bool {
         .unwrap_or(false)
 }
 
+pub const DEFAULT_PRIMARY_USER_OU: &str = "people";
+
+pub fn get_ou_from_attributes(attributes: &[Attribute], default: &str) -> String {
+    attributes
+        .iter()
+        .find(|a| a.name.as_str().eq_ignore_ascii_case("ou"))
+        .and_then(|a| match &a.value {
+            AttributeValue::String(Cardinality::Singleton(s)) => Some(s.clone()),
+            AttributeValue::String(Cardinality::Unbounded(list)) if !list.is_empty() => {
+                Some(list[0].clone())
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| default.to_string())
+}
+
+/// The one reading of a user's OU, shared by the LDAP DNs and the policy seam.
+pub fn user_ou(attributes: &[Attribute]) -> String {
+    get_ou_from_attributes(attributes, DEFAULT_PRIMARY_USER_OU)
+}
+
 /// Built-in groups whose exact names are load-bearing; never renamed or deleted.
 pub const BUILTIN_GROUPS: &[&str] = &[
     "lldap_admin",
@@ -635,7 +656,7 @@ pub fn is_builtin_group(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_builtin_group;
+    use super::{Attribute, AttributeValue, Cardinality, is_builtin_group, user_ou};
 
     #[test]
     fn test_is_builtin_group_is_case_insensitive() {
@@ -643,5 +664,46 @@ mod tests {
         assert!(is_builtin_group("LLDAP_ADMIN"));
         assert!(is_builtin_group("Lldap_Disabled"));
         assert!(!is_builtin_group("family"));
+    }
+
+    #[test]
+    fn test_user_ou_table() {
+        let ou = |value: AttributeValue| {
+            vec![Attribute {
+                name: "OU".into(),
+                value,
+            }]
+        };
+        let rows = [
+            ("no ou", vec![], "people"),
+            (
+                "one",
+                ou(AttributeValue::String(Cardinality::Singleton(
+                    "people\\labs".to_owned(),
+                ))),
+                "people\\labs",
+            ),
+            (
+                "first of a list",
+                ou(AttributeValue::String(Cardinality::Unbounded(vec![
+                    "a".to_owned(),
+                    "b".to_owned(),
+                ]))),
+                "a",
+            ),
+            (
+                "empty list",
+                ou(AttributeValue::String(Cardinality::Unbounded(vec![]))),
+                "people",
+            ),
+            (
+                "not a string",
+                ou(AttributeValue::Integer(Cardinality::Singleton(7))),
+                "people",
+            ),
+        ];
+        for (row, attributes, expected) in rows {
+            assert_eq!(user_ou(&attributes), expected, "{row}");
+        }
     }
 }

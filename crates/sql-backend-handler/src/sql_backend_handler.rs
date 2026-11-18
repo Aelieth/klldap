@@ -1,12 +1,14 @@
 use crate::sql_tables::DbConnection;
 use itertools::Itertools;
 use lldap_auth::opaque::server::ServerSetup;
-use lldap_domain::types::{Attribute, AttributeName, AttributeValue};
+use lldap_domain::types::{Attribute, AttributeName, AttributeValue, UserId};
+use lldap_domain_handlers::enforcement::{self, PolicyCache};
 use lldap_domain_handlers::mfa::MfaPolicy;
 use lldap_mfa::{FailedAttempts, UsedCodes};
 use lldap_schema::PublicSchema;
 use sea_orm::sea_query::{Cond, IntoCondition, SimpleExpr};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub(crate) fn bool_to_expr(b: bool) -> Cond {
     SimpleExpr::Value(b.into()).into_condition()
@@ -64,6 +66,8 @@ pub struct SqlBackendHandler {
     // Shared by the per-request clones, so a code is used once and attempts add up.
     pub(crate) used_totp_codes: Arc<UsedCodes>,
     pub(crate) failed_totp_attempts: Arc<FailedAttempts>,
+    policy_cache: &'static PolicyCache,
+    policy_changes: Arc<AtomicU64>,
 }
 
 impl SqlBackendHandler {
@@ -75,7 +79,15 @@ impl SqlBackendHandler {
             mfa_policy: MfaPolicy::default(),
             used_totp_codes: Arc::default(),
             failed_totp_attempts: Arc::default(),
+            policy_cache: enforcement::policy_cache(),
+            policy_changes: Arc::default(),
         }
+    }
+
+    /// The process's cache unless a test gives its own.
+    pub fn with_policy_cache(mut self, policy_cache: &'static PolicyCache) -> Self {
+        self.policy_cache = policy_cache;
+        self
     }
 
     /// The log lookups read on this pool, so a slow summary cannot queue binds behind it.
@@ -91,6 +103,21 @@ impl SqlBackendHandler {
 
     pub fn pool(&self) -> &DbConnection {
         &self.sql_pool
+    }
+
+    pub(crate) async fn policy_changed(&self) {
+        self.policy_changes.fetch_add(1, Ordering::Relaxed);
+        enforcement::policy_changed(self, self.policy_cache).await;
+    }
+
+    pub(crate) async fn user_written(&self, user: &UserId) {
+        self.policy_changes.fetch_add(1, Ordering::Relaxed);
+        enforcement::user_written(self, self.policy_cache, user).await;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn policy_changes(&self) -> u64 {
+        self.policy_changes.load(Ordering::Relaxed)
     }
 
     /// Hardcoded aliases live in the static PublicSchema, not in the DB copy.

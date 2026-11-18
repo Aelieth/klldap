@@ -61,6 +61,7 @@ enum LogProtocol {
   GRAPHQL
   SYSTEM
   KADMIN
+  KERBEROS
 }
 
 enum PolicyScope {

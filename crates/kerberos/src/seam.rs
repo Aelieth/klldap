@@ -2591,6 +2591,135 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    #[serial]
+    fn test_every_committed_user_write_reaches_the_cache_on_sqlite() {
+        let dir = std::env::temp_dir().join(format!("klldap-e0-cache-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.join("cache.db").display());
+        cache_rows_on(&|runtime| sqlite_one_connection(&url, runtime));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn cache_rows_on(connect: Reconnect) {
+        use crate::admission::tests::{kinit, with_verdict};
+        use lldap_domain::requests::{CreateUserRequest, UpdateUserRequest};
+        use lldap_domain::types::Attribute;
+        use lldap_domain_handlers::enforcement::{CacheFollower, policy_cache};
+        use lldap_domain_handlers::handler::UserBackendHandler;
+        use lldap_domain_handlers::kerberos::set_thread_kerberos_backend;
+        use lldap_domain_handlers::password::create_synced_user;
+        use lldap_test_utils::enforcement::EnforcementGuard;
+        const PASSWORD: &str = "E0-Ldap-Add-1";
+        let (ldap_add, synced_create, plain) = ("e0ldapadd", "e0gqlsync", "e0plain");
+        let (runtime, _temp, committer, _pool, handler, host, store, embedded) =
+            wired_realm(connect, &[]);
+        let follower = CacheFollower::new(handler.clone(), policy_cache());
+        embedded.follow_commits(Arc::new(follower));
+        with_verdict(&store);
+        let decides = |value: &str| value != "always";
+        let _guard =
+            EnforcementGuard::deciding(&[ldap_add, synced_create, plain], "require-mfa", decides);
+        set_thread_kerberos_backend(Some(embedded.clone()));
+        let ou = |value: &str| Attribute {
+            name: "ou".into(),
+            value: value.to_owned().into(),
+        };
+        let sync = || Attribute {
+            name: "kerberossync".into(),
+            value: 1_i64.into(),
+        };
+        let create = |user: &str, attributes: Vec<Attribute>| CreateUserRequest {
+            user_id: UserId::new(user),
+            email: format!("{user}@example.com").into(),
+            attributes,
+            ..Default::default()
+        };
+        let cached = |user: &str| {
+            let entries = policy_cache().get();
+            entries.ous_of_users.get(&UserId::new(user)).cloned()
+        };
+        let labs = || Some("people\\labs".to_owned());
+        let people = || Some("people".to_owned());
+        let rows = [
+            (
+                "an LDAP Add with a password, synced: realm commit",
+                ldap_add,
+                labs(),
+            ),
+            (
+                "a GraphQL create, synced: realm commit",
+                synced_create,
+                people(),
+            ),
+            ("a plain create", plain, people()),
+            ("an OU move: plain", plain, labs()),
+            (
+                "an OU move with sync off: realm commit",
+                synced_create,
+                labs(),
+            ),
+            ("a delete: realm commit", synced_create, None),
+        ];
+        for (row, user, expected) in rows {
+            let done = runtime.block_on(async {
+                match row {
+                    "an LDAP Add with a password, synced: realm commit" => {
+                        let request = create(user, vec![ou("people\\labs"), sync()]);
+                        create_synced_user(&handler, request, PASSWORD)
+                            .await
+                            .map_err(|e| e.to_string())
+                    }
+                    "a GraphQL create, synced: realm commit" => {
+                        let request = create(user, vec![ou("people"), sync()]);
+                        handler
+                            .create_user(request)
+                            .await
+                            .map_err(|e| e.to_string())
+                    }
+                    "a plain create" => {
+                        let request = create(user, vec![ou("people")]);
+                        handler
+                            .create_user(request)
+                            .await
+                            .map_err(|e| e.to_string())
+                    }
+                    "a delete: realm commit" => {
+                        let deleted = handler.delete_user(&UserId::new(user)).await;
+                        deleted.map_err(|e| e.to_string())
+                    }
+                    _ => {
+                        let sync_off = user == synced_create;
+                        let request = UpdateUserRequest {
+                            user_id: UserId::new(user),
+                            insert_attributes: vec![ou("people\\labs")],
+                            delete_attributes: sync_off
+                                .then(|| "kerberossync".into())
+                                .into_iter()
+                                .collect(),
+                            ..Default::default()
+                        };
+                        handler
+                            .update_user(request)
+                            .await
+                            .map_err(|e| e.to_string())
+                    }
+                }
+            });
+            assert_eq!((done, cached(user)), (Ok(()), expected), "{row}");
+            if row.starts_with("an LDAP Add") {
+                let first = kinit(&store, user, Some(PASSWORD)).0;
+                assert_eq!(
+                    first, 0,
+                    "the user an LDAP Add made is found by the next kinit"
+                );
+            }
+        }
+        set_thread_kerberos_backend(None);
+        drop((embedded, store, host, handler));
+        runtime.block_on(committer.shutdown());
+    }
+
     type Realm = (
         Runtime,
         TempRealm,
@@ -5061,6 +5190,7 @@ mod tests {
     fn test_klldap_never_holds_the_realm_key() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
         let sources = [
+            ("admission.rs", include_str!("admission.rs")),
             ("admission_test.rs", include_str!("admission_test.rs")),
             ("boot.rs", include_str!("boot.rs")),
             ("embedded.rs", include_str!("embedded.rs")),

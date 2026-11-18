@@ -12,6 +12,7 @@ use lldap_domain::{
         User, UserAndGroups, UserId, Uuid, kerberos_sync_enabled,
     },
 };
+use lldap_domain_handlers::enforcement::moves_ou;
 use lldap_domain_handlers::handler::{
     GroupBackendHandler, ReadSchemaBackendHandler, SubStringFilter, SystemConfigBackendHandler,
     UserBackendHandler, UserListerBackendHandler, UserRequestFilter,
@@ -842,6 +843,7 @@ impl UserBackendHandler for SqlBackendHandler {
                 Box::pin(async move { Self::create_user_in(transaction, request).await })
             })
             .await?;
+        self.user_written(&user_id).await;
         logging::record(LogKind::UserCreate, Some(user_id.as_str()), None);
         Ok(())
     }
@@ -851,6 +853,7 @@ impl UserBackendHandler for SqlBackendHandler {
         let disabled = disabled_now()?;
         let user_id = request.user_id.clone();
         let mut left = false;
+        let moves_ou = moves_ou(&request);
         let changes = describe_changes(
             &request.insert_attributes,
             &request.delete_attributes,
@@ -900,6 +903,9 @@ impl UserBackendHandler for SqlBackendHandler {
                 )
             })
             .await?;
+        if moves_ou {
+            self.user_written(&user_id).await;
+        }
         logging::record(LogKind::UserUpdate, Some(user_id.as_str()), Some(&changes));
         if left {
             left_for_the_start_pass(&user_id, LEFT_FOR_THE_START_PASS);
@@ -952,6 +958,7 @@ impl UserBackendHandler for SqlBackendHandler {
                 "No such user: '{user_id}'"
             )));
         }
+        self.user_written(user_id).await;
         logging::record(LogKind::UserDelete, Some(user_id.as_str()), None);
         if disabled && synced {
             left_for_the_start_pass(user_id, LEFT_FOR_THE_START_PASS);
@@ -2873,5 +2880,70 @@ mod tests {
             })
             .await
             .unwrap_err();
+    }
+
+    #[tokio::test]
+    async fn test_user_writes_that_can_move_an_ou_swap_the_policy_cache() {
+        let fixture = TestFixture::new().await;
+        let handler = &fixture.handler;
+        let bob = UserId::new("bob");
+        let ou = |value: &str| Attribute {
+            name: "ou".into(),
+            value: value.to_owned().into(),
+        };
+        let mut seen = handler.policy_changes();
+        let mut swapped = || {
+            let now = handler.policy_changes();
+            let changed = now - seen;
+            seen = now;
+            changed
+        };
+        let update = |request: UpdateUserRequest| UpdateUserRequest {
+            user_id: bob.clone(),
+            ..request
+        };
+        handler
+            .create_user(CreateUserRequest {
+                user_id: UserId::new("dave"),
+                email: "dave@example.com".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(swapped(), 1, "create");
+        let rows = [
+            (
+                "display name",
+                update(UpdateUserRequest {
+                    display_name: Some("Bob".to_owned()),
+                    ..Default::default()
+                }),
+                0,
+            ),
+            (
+                "ou set",
+                update(UpdateUserRequest {
+                    insert_attributes: vec![ou("people\\labs")],
+                    ..Default::default()
+                }),
+                1,
+            ),
+            (
+                "ou removed",
+                update(UpdateUserRequest {
+                    delete_attributes: vec!["OU".into()],
+                    ..Default::default()
+                }),
+                1,
+            ),
+        ];
+        for (row, request, expected) in rows {
+            handler.update_user(request).await.unwrap();
+            assert_eq!(swapped(), expected, "{row}");
+        }
+        handler.delete_user(&UserId::new("dave")).await.unwrap();
+        assert_eq!(swapped(), 1, "delete");
+        handler.delete_user(&UserId::new("dave")).await.unwrap_err();
+        assert_eq!(swapped(), 0, "no such user");
     }
 }

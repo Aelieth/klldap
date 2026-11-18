@@ -163,6 +163,7 @@ impl PolicyBackendHandler for SqlBackendHandler {
             return Ok(());
         }
         active.update(&self.sql_pool).await?;
+        self.policy_changed().await;
         let name = request.name.as_deref().unwrap_or(existing.name.as_str());
         logging::record(
             LogKind::PolicyChange,
@@ -191,6 +192,7 @@ impl PolicyBackendHandler for SqlBackendHandler {
             .exec(&transaction)
             .await?;
         transaction.commit().await?;
+        self.policy_changed().await;
         logging::record(LogKind::PolicyChange, Some(&existing.name), Some("deleted"));
         Ok(())
     }
@@ -212,6 +214,7 @@ impl PolicyBackendHandler for SqlBackendHandler {
             )
             .exec(&self.sql_pool)
             .await?;
+        self.policy_changed().await;
         logging::record(
             LogKind::PolicyChange,
             Some(ou_display(&ou_key)),
@@ -249,6 +252,7 @@ impl PolicyBackendHandler for SqlBackendHandler {
         active.update(&transaction).await?;
         Self::normalize_empty_ou_rows(&transaction).await?;
         transaction.commit().await?;
+        self.policy_changed().await;
         logging::record(
             LogKind::PolicyChange,
             Some(ou_display(&ou_key)),
@@ -285,6 +289,7 @@ impl PolicyBackendHandler for SqlBackendHandler {
         }
         Self::normalize_empty_ou_rows(&transaction).await?;
         transaction.commit().await?;
+        self.policy_changed().await;
         logging::record(
             LogKind::PolicyChange,
             Some(ou_display(&ou_key)),
@@ -349,6 +354,7 @@ impl PolicyBackendHandler for SqlBackendHandler {
             .exec(&self.sql_pool)
             .await?;
         if result.rows_affected > 0 {
+            self.policy_changed().await;
             logging::record(
                 LogKind::PolicyChange,
                 Some(ou_display(&ou_key)),
@@ -364,11 +370,22 @@ mod tests {
     use super::*;
     use crate::sql_backend_handler::tests::get_initialized_db;
     use lldap_auth::opaque::server::generate_random_private_key;
+    use lldap_domain::requests::{CreateUserRequest, UpdateUserRequest};
+    use lldap_domain::types::{Attribute, UserId};
+    use lldap_domain_handlers::enforcement::{
+        Attempt, Door, PolicyCache, Refusal, UNREADABLE, admit, admit_at_kdc, fill_policy_cache,
+        follow_commit, item_checks, user_written,
+    };
+    use lldap_domain_handlers::handler::UserBackendHandler;
+    use lldap_domain_handlers::kerberos::CommitError;
     use lldap_domain_handlers::logging::{LogKind, RequestMeta, with_request};
+    use lldap_test_utils::enforcement::EnforcementGuard;
     use lldap_test_utils::recording_log::LogGuard;
     use pretty_assertions::assert_eq;
     use serial_test::serial;
     use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn items(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs
@@ -379,6 +396,80 @@ mod tests {
 
     async fn handler() -> SqlBackendHandler {
         SqlBackendHandler::new(generate_random_private_key(), get_initialized_db().await)
+    }
+
+    fn own_cache() -> &'static PolicyCache {
+        Box::leak(Box::new(PolicyCache::new()))
+    }
+
+    fn ou(value: &str) -> Attribute {
+        Attribute {
+            name: "ou".into(),
+            value: value.to_owned().into(),
+        }
+    }
+
+    async fn user_in(handler: &SqlBackendHandler, name: &str, at: &str) {
+        handler
+            .create_user(CreateUserRequest {
+                user_id: UserId::new(name),
+                email: format!("{name}@example.com").into(),
+                attributes: vec![ou(at)],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn move_to(handler: &SqlBackendHandler, name: &str, at: &str) {
+        handler
+            .update_user(UpdateUserRequest {
+                user_id: UserId::new(name),
+                insert_attributes: vec![ou(at)],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+    }
+
+    async fn policy(handler: &SqlBackendHandler, name: &str, pairs: &[(&str, &str)]) -> PolicyId {
+        handler
+            .create_policy(CreatePolicyRequest {
+                name: name.to_owned(),
+                description: String::new(),
+                items: items(pairs),
+            })
+            .await
+            .unwrap()
+    }
+
+    async fn set_items(handler: &SqlBackendHandler, id: PolicyId, pairs: &[(&str, &str)]) {
+        handler
+            .update_policy(UpdatePolicyRequest {
+                id,
+                name: None,
+                description: None,
+                items: Some(items(pairs)),
+            })
+            .await
+            .unwrap();
+    }
+
+    // Behind the handler's back, so no cache follows it.
+    async fn store_items(handler: &SqlBackendHandler, id: PolicyId, raw: &str) {
+        model::Policies::update_many()
+            .col_expr(PoliciesColumn::Items, Expr::value(raw))
+            .filter(PoliciesColumn::Id.eq(id.0))
+            .exec(&handler.sql_pool)
+            .await
+            .unwrap();
+    }
+
+    fn mfa_of(cache: &PolicyCache, user: &str) -> Option<String> {
+        let entries = cache.get();
+        let items = entries.items_of(&UserId::new(user))?;
+        let item = items.iter().find(|item| item.key == "require-mfa")?;
+        Some(item.value.clone())
     }
 
     #[tokio::test]
@@ -542,6 +633,262 @@ mod tests {
                     Some("deleted".into())
                 ),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_each_policy_write_swaps_the_cache() {
+        let handler = handler().await;
+        let mut seen = handler.policy_changes();
+        let mut swapped = |handler: &SqlBackendHandler| {
+            let now = handler.policy_changes();
+            let changed = now - seen;
+            seen = now;
+            changed
+        };
+        let id = policy(&handler, "Hours", &[]).await;
+        assert_eq!(swapped(&handler), 0, "create");
+        set_items(&handler, id, &[("login-hours", "mon 08:00-09:00")]).await;
+        assert_eq!(swapped(&handler), 1, "update");
+        handler.set_ou_policy("people", id).await.unwrap();
+        assert_eq!(swapped(&handler), 1, "set");
+        handler
+            .set_ou_policy_inheritance("people", true)
+            .await
+            .unwrap();
+        assert_eq!(swapped(&handler), 1, "block");
+        handler
+            .set_ou_policy_inheritance("people", true)
+            .await
+            .unwrap();
+        assert_eq!(swapped(&handler), 0, "block again");
+        handler.clear_ou_policy("people").await.unwrap();
+        assert_eq!(swapped(&handler), 1, "clear");
+        handler.delete_ou_policy_state("people").await.unwrap();
+        assert_eq!(swapped(&handler), 1, "ou removed");
+        handler.delete_ou_policy_state("people").await.unwrap();
+        assert_eq!(swapped(&handler), 0, "nothing to remove");
+        handler.delete_policy(id).await.unwrap();
+        assert_eq!(swapped(&handler), 1, "delete");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_an_unreadable_policy_refuses_once_a_check_exists() {
+        let log = LogGuard::install_on_this_thread();
+        let handler = handler().await;
+        user_in(&handler, "e0unreadable", "people").await;
+        let id = policy(&handler, "Hours", &[]).await;
+        handler.set_ou_policy("people", id).await.unwrap();
+        store_items(&handler, id, "not json").await;
+        let user = UserId::new("e0unreadable");
+        let peer = "10.88.0.9";
+        let unreadable = Refusal {
+            item: UNREADABLE,
+            door: Door::WebLogin,
+        };
+        for (row, check, expected) in [
+            ("no check", false, Ok(())),
+            ("a check", true, Err(unreadable)),
+        ] {
+            let _guard = if check {
+                EnforcementGuard::allowing(&["e0unreadable"], "login-hours")
+            } else {
+                EnforcementGuard::none()
+            };
+            let meta = RequestMeta::http(Some(peer.parse().unwrap()), None);
+            let got = with_request(meta, async {
+                admit(&handler, &Attempt::new(&user, Door::WebLogin)).await
+            })
+            .await;
+            assert_eq!(got, expected, "{row}");
+            let rows: Vec<_> = log
+                .recorder()
+                .take_events()
+                .into_iter()
+                .filter(|e| e.peer.as_deref() == Some(peer) && e.kind == LogKind::Login)
+                .map(|e| e.detail)
+                .collect();
+            let want: Vec<_> = expected
+                .err()
+                .map(|refusal| Some(refusal.detail()))
+                .into_iter()
+                .collect();
+            assert_eq!(rows, want, "{row}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_the_cache_is_filled_from_the_directory_and_follows_each_write_at_once() {
+        let cache = own_cache();
+        let handler = handler().await.with_policy_cache(cache);
+        user_in(&handler, "e0rook", "people").await;
+        user_in(&handler, "e0sable", "People\\Labs").await;
+        let root = policy(&handler, "Root", &[("require-mfa", "enrolled")]).await;
+        let labs = policy(&handler, "Labs", &[("require-mfa", "always")]).await;
+        handler.set_ou_policy("", root).await.unwrap();
+        handler.set_ou_policy("people\\labs", labs).await.unwrap();
+        assert_eq!(
+            cache.get().ous_of_users.len(),
+            0,
+            "while no item is enforced the writes fill nothing"
+        );
+
+        let _guard = EnforcementGuard::allowing(&["e0rook", "e0sable", "e0tarn"], "require-mfa");
+        fill_policy_cache(&handler, cache).await.unwrap();
+        let ous: BTreeMap<_, _> = cache
+            .get()
+            .ous_of_users
+            .iter()
+            .map(|(user, ou)| (user.as_str().to_owned(), ou.clone()))
+            .collect();
+        assert_eq!(
+            ous,
+            BTreeMap::from([
+                ("e0rook".to_owned(), "people".to_owned()),
+                ("e0sable".to_owned(), "people\\labs".to_owned()),
+            ])
+        );
+        let mfa = |user| mfa_of(cache, user);
+        assert_eq!(
+            (mfa("e0rook"), mfa("e0sable"), mfa("e0tarn")),
+            (Some("enrolled".to_owned()), Some("always".to_owned()), None),
+            "filled"
+        );
+        let rows = [
+            ("a policy edit", "e0sable", Some("off")),
+            ("a user created here", "e0tarn", Some("off")),
+            ("an OU move", "e0rook", Some("off")),
+            ("an OU's policy cleared", "e0sable", Some("enrolled")),
+            ("a user deleted", "e0tarn", None),
+        ];
+        for (row, user, expected) in rows {
+            match row {
+                "a policy edit" => set_items(&handler, labs, &[("require-mfa", "off")]).await,
+                "a user created here" => user_in(&handler, "e0tarn", "people\\labs").await,
+                "an OU move" => move_to(&handler, "e0rook", "people\\labs").await,
+                "an OU's policy cleared" => handler.clear_ou_policy("people\\labs").await.unwrap(),
+                _ => handler.delete_user(&UserId::new("e0tarn")).await.unwrap(),
+            }
+            assert_eq!(mfa_of(cache, user).as_deref(), expected, "{row}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_edits_and_moves_under_load_never_leave_the_kdc_without_the_user() {
+        let cache = own_cache();
+        let handler = handler().await.with_policy_cache(cache);
+        user_in(&handler, "e0wren", "people").await;
+        let base = policy(&handler, "Base", &[("require-mfa", "off")]).await;
+        handler.set_ou_policy("people", base).await.unwrap();
+        handler.set_ou_policy("people\\labs", base).await.unwrap();
+        let _guard =
+            EnforcementGuard::deciding(&["e0wren"], "require-mfa", |value| value != "always");
+        fill_policy_cache(&handler, cache).await.unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                let user = UserId::new("e0wren");
+                let checks = item_checks();
+                let (mut asked, mut refused) = (0_u64, Vec::new());
+                while !stop.load(Ordering::Relaxed) {
+                    let attempt = Attempt::at_kdc(&user, Door::KerberosAs, None, 1_700_000_000);
+                    if let Err(refusal) = admit_at_kdc(cache, &attempt, &checks) {
+                        refused.push(refusal);
+                    }
+                    asked += 1;
+                }
+                (asked, refused)
+            })
+        };
+        for turn in 0..50 {
+            let (value, at) = match turn % 2 {
+                0 => ("enrolled", "people\\labs"),
+                _ => ("off", "people"),
+            };
+            set_items(&handler, base, &[("require-mfa", value)]).await;
+            move_to(&handler, "e0wren", at).await;
+        }
+        stop.store(true, Ordering::Relaxed);
+        let (asked, refused) = reader.join().unwrap();
+        assert!(asked > 0, "the reader ran");
+        assert_eq!(refused, Vec::<Refusal>::new(), "{asked} verdicts");
+        assert_eq!(mfa_of(cache, "e0wren").as_deref(), Some("off"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_commit_follower_rereads_its_users_and_pokes_on_an_answer_that_may_have_landed()
+    {
+        let cache = own_cache();
+        let handler = handler().await;
+        user_in(&handler, "e0kept", "people\\labs").await;
+        let _guard = EnforcementGuard::allowing(&["e0kept", "e0gone"], "require-mfa");
+        let (kept, gone) = (UserId::new("e0kept"), UserId::new("e0gone"));
+        let held = || {
+            let entries = cache.get();
+            let ou = |user: &UserId| entries.ous_of_users.get(user).cloned();
+            (ou(&kept), ou(&gone))
+        };
+        let stale = || (None, Some("people".to_owned()));
+        let rows = [
+            (
+                "refused",
+                Err(CommitError::Refused("no".to_owned())),
+                stale(),
+                false,
+            ),
+            ("busy", Err(CommitError::Busy), stale(), false),
+            (
+                "unknown",
+                Err(CommitError::Unknown("lost".to_owned())),
+                stale(),
+                true,
+            ),
+            (
+                "unsettled",
+                Err(CommitError::Unsettled("lost".to_owned())),
+                stale(),
+                true,
+            ),
+            (
+                "committed",
+                Ok(()),
+                (Some("people\\labs".to_owned()), None),
+                false,
+            ),
+        ];
+        for (row, answer, expected, poke) in rows {
+            cache.put_user(&gone, "people", Vec::new().into());
+            follow_commit(&handler, cache, &[kept.clone(), gone.clone()], &answer).await;
+            let poked = tokio::time::timeout(std::time::Duration::from_millis(20), cache.poked());
+            assert_eq!((held(), poked.await.is_ok()), (expected, poke), "{row}");
+        }
+        let unknown = Err(CommitError::Unknown("lost".to_owned()));
+        follow_commit(&handler, cache, &[UserId::new("e0other")], &unknown).await;
+        let poked = tokio::time::timeout(std::time::Duration::from_millis(20), cache.poked());
+        assert!(poked.await.is_err(), "a user no check judges pokes nothing");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_late_delete_hook_keeps_a_user_created_again_under_its_name() {
+        let cache = own_cache();
+        let handler = handler().await.with_policy_cache(cache);
+        let _guard = EnforcementGuard::allowing(&["e0again"], "require-mfa");
+        let user = UserId::new("e0again");
+        user_in(&handler, "e0again", "people").await;
+        handler.delete_user(&user).await.unwrap();
+        user_in(&handler, "e0again", "people\\labs").await;
+        user_written(&handler, cache, &user).await;
+        let entries = cache.get();
+        assert_eq!(
+            entries.ous_of_users.get(&user).map(String::as_str),
+            Some("people\\labs"),
+            "the delete's hook, run last, re-reads and keeps the user that exists again"
         );
     }
 }

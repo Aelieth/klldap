@@ -31,6 +31,7 @@ pub enum Protocol {
     #[default]
     System,
     Kadmin,
+    Kerberos,
 }
 
 // Stored as text and append-only; the computer/keytab feature adds its kinds here.

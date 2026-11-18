@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use lldap_auth::opaque;
 use lldap_domain::types::{LoginOutcome, UserId};
+use lldap_domain_handlers::enforcement::{Attempt, Door, admit};
 use lldap_domain_handlers::handler::{BindRequest, LoginHandler, MfaBackendHandler};
 use lldap_domain_handlers::kerberos::require_kdc_ready;
 use lldap_domain_handlers::logging::{self, LogKind};
@@ -160,6 +161,20 @@ fn invalid_credentials(user_id: &UserId) -> DomainError {
     DomainError::AuthenticationError(format!(r#"for user "{}""#, user_id))
 }
 
+impl SqlBackendHandler {
+    /// After the credentials and before the door's row: a refusal is that row, and answers as
+    /// the wrong-credentials error.
+    async fn admit_at(&self, user: &UserId, door: Door, second_factor: bool) -> Result<()> {
+        let attempt = Attempt {
+            second_factor,
+            ..Attempt::new(user, door)
+        };
+        admit(self, &attempt)
+            .await
+            .map_err(|_| invalid_credentials(user))
+    }
+}
+
 #[async_trait]
 impl LoginHandler for SqlBackendHandler {
     #[instrument(skip_all, level = "debug", err(level = "debug"))]
@@ -212,6 +227,7 @@ impl LoginHandler for SqlBackendHandler {
         }
         match (requirement, code) {
             (MfaRequirement::None, _) => {
+                self.admit_at(&name, Door::of_bind(), false).await?;
                 logging::record_as(Some(&name), LogKind::Bind, None, true, None);
                 Ok(())
             }
@@ -242,6 +258,7 @@ impl LoginHandler for SqlBackendHandler {
             }
             (MfaRequirement::Totp, Some(code)) => match self.verify_user_totp(&name, code).await? {
                 Ok(()) => {
+                    self.admit_at(&name, Door::of_bind(), true).await?;
                     logging::record_as(Some(&name), LogKind::Bind, None, true, Some("totp"));
                     Ok(())
                 }
@@ -362,17 +379,9 @@ impl OpaqueHandler for SqlOpaqueHandler {
             );
             return Err(e.into());
         }
-        let authenticated = |detail: Option<&str>, mfa_enrollment_pending: bool| {
-            info!(r#"OPAQUE login successful for "{}""#, &username);
-            logging::record_as(Some(&username), LogKind::Login, None, true, detail);
-            LoginOutcome::Authenticated {
-                user_id: username.clone(),
-                mfa_enrollment_pending,
-            }
-        };
-        match self.mfa_requirement(&username).await? {
-            MfaRequirement::None => Ok(authenticated(None, false)),
-            MfaRequirement::Enrollment => Ok(authenticated(Some("mfa enrollment pending"), true)),
+        let (detail, mfa_enrollment_pending) = match self.mfa_requirement(&username).await? {
+            MfaRequirement::None => (None, false),
+            MfaRequirement::Enrollment => (Some("mfa enrollment pending"), true),
             MfaRequirement::Totp => match totp_code.as_deref() {
                 // A right password with no code is its own failure row, then the code step.
                 None => {
@@ -384,10 +393,10 @@ impl OpaqueHandler for SqlOpaqueHandler {
                         false,
                         Some("totp code required"),
                     );
-                    Ok(LoginOutcome::TotpRequired)
+                    return Ok(LoginOutcome::TotpRequired);
                 }
                 Some(code) => match self.verify_user_totp(&username, code).await? {
-                    Ok(()) => Ok(authenticated(Some("totp"), false)),
+                    Ok(()) => (Some("totp"), false),
                     Err(rejection) => {
                         warn!(
                             r#"TOTP refused for "{}": {}"#,
@@ -401,11 +410,20 @@ impl OpaqueHandler for SqlOpaqueHandler {
                             false,
                             Some(rejection.detail()),
                         );
-                        Err(rejection.into_error(&username))
+                        return Err(rejection.into_error(&username));
                     }
                 },
             },
-        }
+        };
+        let second_factor = detail == Some("totp");
+        self.admit_at(&username, Door::WebLogin, second_factor)
+            .await?;
+        info!(r#"OPAQUE login successful for "{}""#, &username);
+        logging::record_as(Some(&username), LogKind::Login, None, true, detail);
+        Ok(LoginOutcome::Authenticated {
+            user_id: username,
+            mfa_enrollment_pending,
+        })
     }
 
     #[instrument(skip_all, level = "debug", err)]
@@ -1220,5 +1238,103 @@ mod tests {
         attempt_login(&handler, "bob", "bob-new-1", None)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_a_policy_refusal_is_the_doors_one_row_with_no_success_row() {
+        use lldap_domain_handlers::logging::{Protocol, RequestMeta, with_request};
+        use lldap_test_utils::enforcement::EnforcementGuard;
+        use lldap_test_utils::recording_log::LogGuard;
+        let log = LogGuard::install_on_this_thread();
+        let handler =
+            SqlOpaqueHandler::new(generate_random_private_key(), get_initialized_db().await);
+        insert_user(&handler, "e0door", "e0door00").await;
+        let rows = [
+            (
+                "the LDAP bind",
+                Door::LdapBind,
+                LogKind::Bind,
+                Protocol::Ldap,
+            ),
+            (
+                "the simple login",
+                Door::SimpleLogin,
+                LogKind::Bind,
+                Protocol::Http,
+            ),
+            (
+                "the web login",
+                Door::WebLogin,
+                LogKind::Login,
+                Protocol::Http,
+            ),
+        ];
+        for (label, door, kind, protocol) in rows {
+            for refused in [false, true] {
+                let guard = match refused {
+                    true => EnforcementGuard::refusing(&["e0door"], "login-hours"),
+                    false => EnforcementGuard::allowing(&["e0door"], "login-hours"),
+                };
+                let meta = match protocol {
+                    Protocol::Ldap => RequestMeta::ldap(None, None),
+                    _ => RequestMeta::http(None, None),
+                };
+                let answered = with_request(meta, async {
+                    match door {
+                        Door::WebLogin => attempt_login(&handler, "e0door", "e0door00", None)
+                            .await
+                            .map(drop),
+                        _ => handler
+                            .bind(bind_request("e0door", "e0door00"))
+                            .await
+                            .map(drop),
+                    }
+                })
+                .await;
+                let rows: Vec<_> = log
+                    .recorder()
+                    .take_events()
+                    .into_iter()
+                    .filter(|e| e.actor.as_deref() == Some("e0door"))
+                    .map(|e| (e.kind, e.success, e.protocol, e.detail))
+                    .collect();
+                let detail = refused.then(|| "policy: login-hours".to_owned());
+                let doors: Vec<_> = guard.take_seen().into_iter().map(|s| s.door).collect();
+                assert_eq!(
+                    (answered.is_ok(), rows, doors),
+                    (
+                        !refused,
+                        vec![(kind, !refused, protocol, detail)],
+                        vec![door]
+                    ),
+                    "{label}, refused {refused}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_policy_refusal_after_a_right_totp_code_is_the_binds_one_row() {
+        use lldap_test_utils::enforcement::EnforcementGuard;
+        let log = LogGuard::install_on_this_thread();
+        let peer = "10.77.1.9";
+        let handler = mfa_handler(MfaPolicy::Enrolled).await;
+        insert_user(&handler, "e0totp", "e0totp00").await;
+        let seed = enroll(&handler, "e0totp").await;
+        let (fresh, _) = fresh_and_wrong(&seed);
+        let guard = EnforcementGuard::refusing(&["e0totp"], "login-hours");
+        let meta = RequestMeta::ldap(None, Some(peer.parse().unwrap()));
+        let request = bind_request("e0totp", &format!("e0totp00:{fresh}"));
+        let answered = with_request(meta, handler.bind(request)).await;
+        let seen = guard.take_seen().into_iter();
+        let seen: Vec<_> = seen.map(|s| (s.door, s.second_factor)).collect();
+        let refused = (LogKind::Bind, false, Some("policy: login-hours".to_owned()));
+        assert_eq!(
+            (answered.is_ok(), auth_rows(&log, peer), seen),
+            (false, vec![refused], vec![(Door::LdapBind, true)]),
+            "the code was right; the refusal is the one row and no success row"
+        );
     }
 }

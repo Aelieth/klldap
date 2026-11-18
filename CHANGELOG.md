@@ -9,6 +9,9 @@
 
 ### Changed
 
+- A deleted user's Kerberos ticket requests are refused for every kind of request, delegation and
+  user-to-user included; renewals and service tickets keep their answer (code 18,
+  `CLIENT_NOT_FOUND`).
 - The web pages (change password, the e-mail reset, create user) and `lldap_set_password` set
   a `kerberossync` user's password in one request: the register/start answer carries the
   sealing key (`kerberos_envelope_key`) only for such a user, the finish carries the password

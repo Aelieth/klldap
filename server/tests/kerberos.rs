@@ -546,12 +546,18 @@ fn kerberos_disabled_ticket() {
         "{}",
         output_text(&listed)
     );
-    assert_log_line(
-        &realm.fixture,
-        &format!(
-            "Refused a Kerberos ticket request from {principal}: the principal no longer exists"
-        ),
-    );
+    let gone = || {
+        query_i64(
+            realm.fixture.db_url(),
+            "SELECT COUNT(*) FROM logs WHERE kind = 'access_denied' AND target LIKE 'bob%' \
+             AND detail = 'the principal is gone'",
+        )
+    };
+    let landed = (0..50).any(|_| {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        gone() >= 1
+    });
+    assert!(landed, "no access_denied row for the gone principal");
 }
 
 fn login(http: &Client, base: &str, username: &str, password: &str) -> (StatusCode, String) {

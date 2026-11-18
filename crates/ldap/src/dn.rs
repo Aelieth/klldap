@@ -3,7 +3,7 @@ use ldap3_proto::LdapResultCode;
 use lldap_domain::types::{GroupName, UserId};
 use tracing::{debug, warn};
 
-pub const DEFAULT_PRIMARY_USER_OU: &str = "people";
+pub use lldap_domain::types::DEFAULT_PRIMARY_USER_OU;
 pub const DEFAULT_PRIMARY_GROUP_OU: &str = "groups";
 
 /// The internal OU string ("people\\home") from a DN's `ou=` RDNs, in order.

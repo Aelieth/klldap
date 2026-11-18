@@ -51,7 +51,7 @@ path = "../auth"
 
 [dev-dependencies.lldap_domain_handlers]
 path = "../domain-handlers"
-features = ["test-hooks"]
+features = ["test-hooks", "test-backend-scope"]
 
 [dev-dependencies.lldap_sql_backend_handler]
 path = "../sql-backend-handler"

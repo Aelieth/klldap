@@ -1,3 +1,4 @@
+#[cfg(any(test, feature = "test-admission"))]
 use krb5_kdc::admission::{AsNotice, AsQuestion, HostAdmission, KdcRefusal, TgsQuestion};
 use krb5_kdc::{
     Error, KDB_DISALLOW_ALL_TIX, KdcPolicy, PolicyAdjustment, Principal, PrincipalRead,
@@ -6,7 +7,7 @@ use krb5_types::{EncTicketPart, KdcReqBody, PrincipalName, err};
 use tracing::info;
 
 const LOCKED_OUT: &str = "CLIENT LOCKED OUT";
-const NOT_FOUND: &str = "CLIENT_NOT_FOUND";
+pub(crate) const NOT_FOUND: &str = "CLIENT_NOT_FOUND";
 
 // Neither MIT nor kerber-rust looks at the client again once it holds a TGT, so a disabled or
 // deleted user would keep getting service tickets and renewals until the TGT expired.
@@ -66,9 +67,11 @@ impl KdcPolicy for LiveClients {
     }
 }
 
-/// Until the enforcement passes: every marked client may sign in; the KDC's own entry checks run.
+/// Every marked client may sign in; the KDC's own entry checks run.
+#[cfg(any(test, feature = "test-admission"))]
 pub(crate) struct AllowAll;
 
+#[cfg(any(test, feature = "test-admission"))]
 impl HostAdmission for AllowAll {
     fn check_as(&self, _: &AsQuestion<'_>) -> Result<(), KdcRefusal> {
         Ok(())

@@ -17,6 +17,7 @@ use krb5_kdc::{
 };
 use krb5_types::PrincipalName;
 use lldap_domain::types::UserId;
+use lldap_domain_handlers::enforcement::{CommitFollower, touched_users};
 use lldap_domain_handlers::kerberos::{
     CommitError, Held, HostRow, KerberosSync, PasswordCommit, SYNC_CHANGED, UNREAD_AFTER_COMMIT,
     USER_GONE as NO_USER_ROW, UserChange, UserStep, validate_kerberos_username,
@@ -33,7 +34,7 @@ use std::collections::{HashMap, HashSet};
 use std::panic::{self, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock, Weak};
+use std::sync::{Arc, OnceLock, RwLock, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
@@ -110,6 +111,7 @@ pub struct EmbeddedKerberos {
     ready: Arc<AtomicBool>,
     writes: Arc<Mutex<()>>,
     write_wait: Duration,
+    follower: OnceLock<Arc<dyn CommitFollower>>,
 }
 
 /// The KDC and kadmind threads. A thread that stops on its own stops the other one and
@@ -217,9 +219,23 @@ impl EmbeddedKerberos {
             ready,
             writes: Arc::new(Mutex::new(())),
             write_wait: WRITE_WAIT,
+            follower: OnceLock::new(),
         };
         engine.host.follow_with(engine.follow());
         engine
+    }
+
+    /// Told of every directory row this engine commits, after the realm's locks are released.
+    pub fn follow_commits(&self, follower: Arc<dyn CommitFollower>) {
+        if self.follower.set(follower).is_err() {
+            error!("💥 The realm's commits already have a follower");
+        }
+    }
+
+    async fn followed(&self, users: &[UserId], answer: &Result<(), CommitError>) {
+        if let Some(follower) = self.follower.get() {
+            follower.committed(users, answer).await;
+        }
     }
 
     /// Every `every`, each marked principal of a user with sync takes `lldap_disabled` again; a
@@ -442,6 +458,75 @@ impl EmbeddedKerberos {
 }
 
 impl EmbeddedKerberos {
+    async fn password_committed(
+        &self,
+        change: PasswordCommit,
+        password: &str,
+    ) -> Result<(), CommitError> {
+        let (kind, user) = (change.kind, change.user.clone());
+        if let Err(why) = validate_kerberos_username(user.as_str()) {
+            let refused = CommitError::Refused(why);
+            record_commit_failure(kind, &user, &refused);
+            return Err(refused);
+        }
+        let (own, enctypes, ent) = (self.own(), self.enctypes.clone(), self.new_principal());
+        let password = Zeroizing::new(password.as_bytes().to_vec());
+        let serial = tokio::time::timeout(self.write_wait, self.writes.clone().lock_owned())
+            .await
+            .map_err(|_| CommitError::Busy)?;
+        let (span, meta) = (Span::current(), current_request());
+        let worker = user.clone();
+        tokio::task::spawn_blocking(move || {
+            let _serial = serial;
+            span.in_scope(|| {
+                with_request_sync(meta, || {
+                    let printed = logged_rows(&change.rows);
+                    let done = panic::catch_unwind(AssertUnwindSafe(|| {
+                        commit_owned(&own, &password, &enctypes, &ent, change)
+                    }));
+                    match &done {
+                        Ok(Ok(())) => printed.iter().for_each(logging::print),
+                        Ok(Err(e)) => record_commit_failure(kind, &worker, e),
+                        Err(_) => record_unreported(kind, &worker, PANICKED),
+                    }
+                    done.unwrap_or_else(|_| Err(CommitError::Unknown(PANICKED.to_owned())))
+                })
+            })
+        })
+        .await
+        .unwrap_or_else(|e| {
+            let cause = format!("the password change did not run: {e}");
+            record_unreported(kind, &user, &cause);
+            Err(CommitError::Unknown(cause))
+        })
+    }
+
+    async fn user_committed(&self, change: UserChange) -> Result<(), CommitError> {
+        let own = self.own();
+        let waited = tokio::time::timeout(self.write_wait, self.writes.clone().lock_owned()).await;
+        let Ok(serial) = waited else {
+            return Err(CommitError::Busy);
+        };
+        let (span, meta) = (Span::current(), current_request());
+        let done = tokio::task::spawn_blocking(move || {
+            let _serial = serial;
+            span.in_scope(|| {
+                with_request_sync(meta, || {
+                    let printed = logged_rows(&change.rows);
+                    let done = panic::catch_unwind(AssertUnwindSafe(|| user_change(&own, change)));
+                    let done = done
+                        .unwrap_or_else(|_| Err(CommitError::Unknown(CHANGE_PANICKED.to_owned())));
+                    if let Ok(noted) = &done {
+                        printed.iter().chain(noted).for_each(logging::print);
+                    }
+                    done.map(drop)
+                })
+            })
+        })
+        .await;
+        done.unwrap_or_else(|e| Err(CommitError::Unknown(format!("the change did not run: {e}"))))
+    }
+
     /// A user whose principal name is an alias: the store is not touched, and one row says so.
     async fn skipped_as_alias(&self, user: &UserId, op: &str) -> Result<bool, String> {
         let Some(target) = self.alias_target(user).await? else {
@@ -495,42 +580,10 @@ impl KerberosSync for EmbeddedKerberos {
         change: PasswordCommit,
         password: &str,
     ) -> Result<(), CommitError> {
-        let (kind, user) = (change.kind, change.user.clone());
-        if let Err(why) = validate_kerberos_username(user.as_str()) {
-            let refused = CommitError::Refused(why);
-            record_commit_failure(kind, &user, &refused);
-            return Err(refused);
-        }
-        let (own, enctypes, ent) = (self.own(), self.enctypes.clone(), self.new_principal());
-        let password = Zeroizing::new(password.as_bytes().to_vec());
-        let serial = tokio::time::timeout(self.write_wait, self.writes.clone().lock_owned())
-            .await
-            .map_err(|_| CommitError::Busy)?;
-        let (span, meta) = (Span::current(), current_request());
-        let worker = user.clone();
-        tokio::task::spawn_blocking(move || {
-            let _serial = serial;
-            span.in_scope(|| {
-                with_request_sync(meta, || {
-                    let printed = logged_rows(&change.rows);
-                    let done = panic::catch_unwind(AssertUnwindSafe(|| {
-                        commit_owned(&own, &password, &enctypes, &ent, change)
-                    }));
-                    match &done {
-                        Ok(Ok(())) => printed.iter().for_each(logging::print),
-                        Ok(Err(e)) => record_commit_failure(kind, &worker, e),
-                        Err(_) => record_unreported(kind, &worker, PANICKED),
-                    }
-                    done.unwrap_or_else(|_| Err(CommitError::Unknown(PANICKED.to_owned())))
-                })
-            })
-        })
-        .await
-        .unwrap_or_else(|e| {
-            let cause = format!("the password change did not run: {e}");
-            record_unreported(kind, &user, &cause);
-            Err(CommitError::Unknown(cause))
-        })
+        let touched = touched_users(&change.rows);
+        let answer = self.password_committed(change, password).await;
+        self.followed(&touched, &answer).await;
+        answer
     }
     async fn sync_on_refused(&self, user: &UserId) -> Result<(), String> {
         match self.alias_target(user).await? {
@@ -556,33 +609,10 @@ impl KerberosSync for EmbeddedKerberos {
         }
     }
     async fn commit_user(&self, change: UserChange) -> Option<Result<(), CommitError>> {
-        let own = self.own();
-        let waited = tokio::time::timeout(self.write_wait, self.writes.clone().lock_owned()).await;
-        let Ok(serial) = waited else {
-            return Some(Err(CommitError::Busy));
-        };
-        let (span, meta) = (Span::current(), current_request());
-        let done = tokio::task::spawn_blocking(move || {
-            let _serial = serial;
-            span.in_scope(|| {
-                with_request_sync(meta, || {
-                    let printed = logged_rows(&change.rows);
-                    let done = panic::catch_unwind(AssertUnwindSafe(|| user_change(&own, change)));
-                    let done = done
-                        .unwrap_or_else(|_| Err(CommitError::Unknown(CHANGE_PANICKED.to_owned())));
-                    if let Ok(noted) = &done {
-                        printed.iter().chain(noted).for_each(logging::print);
-                    }
-                    done.map(drop)
-                })
-            })
-        })
-        .await;
-        Some(
-            done.unwrap_or_else(|e| {
-                Err(CommitError::Unknown(format!("the change did not run: {e}")))
-            }),
-        )
+        let touched = touched_users(&change.rows);
+        let answer = self.user_committed(change).await;
+        self.followed(&touched, &answer).await;
+        Some(answer)
     }
     async fn delete_principal(&self, user: &UserId) -> Result<(), String> {
         if self.skipped_as_alias(user, "delete").await? {

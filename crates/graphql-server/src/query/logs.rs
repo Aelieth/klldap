@@ -79,6 +79,7 @@ pub enum GraphQLLogProtocol {
     Graphql,
     System,
     Kadmin,
+    Kerberos,
 }
 
 #[derive(
@@ -383,6 +384,11 @@ mod tests {
             GraphQLLogProtocol::iter().count(),
             logging::Protocol::iter().count()
         );
+        assert_eq!(
+            GraphQLLogProtocol::from(logging::Protocol::Kerberos),
+            GraphQLLogProtocol::Kerberos
+        );
+        assert_eq!(logging::Protocol::Kerberos.to_string(), "kerberos");
         for dimension in logging::LogDimension::iter() {
             assert_eq!(
                 logging::LogDimension::from(GraphQLLogDimension::from(dimension)),

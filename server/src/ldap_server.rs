@@ -223,3 +223,103 @@ where
         server_builder
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth_service::tests::{ONE_BACKEND, sql_handler_with};
+    use ldap3_proto::proto::{
+        LdapBindCred, LdapBindRequest, LdapExtendedRequest, LdapResultCode, OID_WHOAMI,
+    };
+    use lldap_domain_handlers::logging::{LogKind, Protocol};
+    use lldap_test_utils::enforcement::EnforcementGuard;
+    use lldap_test_utils::recording_log::LogGuard;
+    use pretty_assertions::assert_eq;
+
+    fn bind(user: &str, password: &str) -> LdapOp {
+        LdapOp::BindRequest(LdapBindRequest {
+            dn: format!("uid={user},ou=people,dc=example,dc=com"),
+            cred: LdapBindCred::Simple(password.to_owned()),
+        })
+    }
+
+    fn answered(ops: Option<Vec<LdapOp>>) -> (LdapResultCode, String) {
+        match ops.as_deref() {
+            Some([LdapOp::BindResponse(r)]) => (r.res.code.clone(), r.res.message.clone()),
+            Some([LdapOp::ExtendedResponse(r)]) => (r.res.code.clone(), r.res.message.clone()),
+            other => panic!("unexpected answer {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_bind_keeps_the_connections_identity_and_its_row_names_the_peer() {
+        let _backend = ONE_BACKEND.lock().await;
+        let users = [("e0first", "e0first-pass-1"), ("e0ldap", "e0ldap-pass-1")];
+        let handler = sql_handler_with(&users).await;
+        let log = LogGuard::install_on_this_thread();
+        let _guard = EnforcementGuard::refusing(&["e0ldap"], "login-hours");
+        let info = LdapInfo::new("dc=example,dc=com", Vec::new(), Vec::new()).unwrap();
+        let peer: IpAddr = "198.51.100.7".parse().unwrap();
+        let backend = AccessControlledBackendHandler::new(handler);
+        let mut session = LdapHandler::new(
+            backend,
+            Box::leak(Box::new(info)),
+            Uuid::new_v4(),
+            Some(peer),
+        );
+        let whoami = LdapOp::ExtendedRequest(LdapExtendedRequest {
+            name: OID_WHOAMI.to_owned(),
+            value: None,
+        });
+        let first = "dn:uid=e0first,ou=people,dc=example,dc=com".to_owned();
+        type Row<'a> = (&'a str, LdapOp, LdapResultCode, Option<(&'a str, &'a str)>);
+        let rows: [Row; 3] = [
+            (
+                "bound",
+                bind("e0first", "e0first-pass-1"),
+                LdapResultCode::Success,
+                None,
+            ),
+            (
+                "a wrong password",
+                bind("e0first", "e0first-wrong-1"),
+                LdapResultCode::InvalidCredentials,
+                Some(("e0first", "invalid credentials")),
+            ),
+            (
+                "a policy refusal",
+                bind("e0ldap", "e0ldap-pass-1"),
+                LdapResultCode::InvalidCredentials,
+                Some(("e0ldap", "policy: login-hours")),
+            ),
+        ];
+        for (label, request, code, failure) in rows {
+            let bound = answered(session.handle_ldap_message(request).await);
+            let identity = answered(session.handle_ldap_message(whoami.clone()).await);
+            let events = log.recorder().take_events().into_iter();
+            let failed: Vec<_> = events
+                .filter(|e| !e.success)
+                .map(|e| (e.kind, e.protocol, e.actor, e.peer, e.detail))
+                .collect();
+            let row = failure.map(|(actor, detail)| {
+                let actor = Some(actor.to_owned());
+                (
+                    LogKind::Bind,
+                    Protocol::Ldap,
+                    actor,
+                    Some(peer.to_string()),
+                    Some(detail.to_owned()),
+                )
+            });
+            assert_eq!(
+                (bound, identity, failed),
+                (
+                    (code, String::new()),
+                    (LdapResultCode::Success, first.clone()),
+                    row.into_iter().collect::<Vec<_>>()
+                ),
+                "{label}: upstream keeps the earlier identity after a failed bind"
+            );
+        }
+    }
+}

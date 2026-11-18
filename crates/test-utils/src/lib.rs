@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+pub mod enforcement;
 pub mod recording_kerberos;
 pub mod recording_log;
 use async_trait::async_trait;

@@ -30,7 +30,7 @@ const COLUMNS: [&str; 4] = ["fail_count", "last_failed", "last_success", "lock_l
 /// The counting period, raised by the change that makes the first threshold effective.
 pub(crate) const PERIOD_KEY: &str = "lockout_period";
 
-fn numbered(backend: DbBackend, sql: &str) -> String {
+pub(crate) fn numbered(backend: DbBackend, sql: &str) -> String {
     if backend != DbBackend::Postgres {
         return sql.to_owned();
     }
@@ -366,6 +366,10 @@ impl LockStore for SqlBackendHandler {
         period_in(&self.sql_pool).await
     }
 
+    async fn prune_codes(&self) -> Result<u64> {
+        self.prune_totp_steps().await
+    }
+
     /// What was stored is told by reading it back: an affected-row count says nothing about a
     /// kept row on every backend.
     async fn write_locks(&self, period: &str, writes: &[LockWrite]) -> Result<Written> {
@@ -542,7 +546,9 @@ pub(crate) mod tests {
     use lldap_domain_handlers::logging::{Protocol, RequestMeta, with_request, without_session};
     use lldap_domain_handlers::mfa::{MFA_DISABLED_GROUP, MfaPolicy, MfaResetReason};
     use lldap_domain_handlers::policies::{CreatePolicyRequest, PolicyId, UpdatePolicyRequest};
-    use lldap_mfa::{TOTP_STEP_SECS, format_code, totp_code};
+    use lldap_mfa::{
+        TOTP_MAX_ATTEMPTS_PER_STEP, TOTP_STEP_SECS, TOTP_TOO_MANY_ATTEMPTS, format_code, totp_code,
+    };
     use lldap_opaque_handler::{OpaqueHandler, register_password};
     use lldap_test_utils::enforcement::EnforcementGuard;
     use lldap_test_utils::recording_log::LogGuard;
@@ -1654,6 +1660,71 @@ pub(crate) mod tests {
             let _ = h.lockout.ticket_issued(h.policy_cache, &lock, lock_clock());
             assert_eq!(viewed(&h, "e1exempt"), count, "{label}");
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_code_refused_as_unreadable_writes_one_row_and_counts_nothing() {
+        let (_clock, at) = pinned();
+        let log = LogGuard::install_on_this_thread();
+        let h = handler().await.with_mfa_policy(MfaPolicy::Enrolled);
+        user_in(&h, "e1bgone", "e1bgoneou").await;
+        threshold(&h, "e1bgoneou", "9").await;
+        let seed = enroll(&h, "e1bgone", at).await;
+        let ([code, _], _) = codes(&seed, at);
+        let backend = h.sql_pool.get_database_backend();
+        let drop = Statement::from_string(backend, "DROP TABLE totp_steps".to_owned());
+        h.sql_pool.execute(drop).await.unwrap();
+        let _ = rows(&log, &[LogKind::Bind]);
+        let refused = bind_as(&h, "e1bgone", &format!("{RIGHT}:{code}")).await;
+        let detail = Some("totp: unreadable".to_owned());
+        assert_eq!(
+            (
+                refused.is_err_and(|e| e.to_string().contains("TOTP state unreadable")),
+                stored(&h, "e1bgone").await,
+                viewed(&h, "e1bgone"),
+                rows(&log, &[LogKind::Bind])
+            ),
+            (
+                true,
+                None,
+                0,
+                vec![(LogKind::Bind, Some("e1bgone".to_owned()), detail)]
+            ),
+            "one row with its own detail, and nothing counted"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_code_refused_for_too_many_attempts_writes_one_row_and_counts_nothing() {
+        let (_clock, at) = pinned();
+        let log = LogGuard::install_on_this_thread();
+        let h = handler().await.with_mfa_policy(MfaPolicy::Enrolled);
+        user_in(&h, "e1bmany", "e1bmanyou").await;
+        threshold(&h, "e1bmanyou", "9").await;
+        let seed = enroll(&h, "e1bmany", at).await;
+        let ([_, right], wrong) = codes(&seed, at);
+        let wrong = format!("{RIGHT}:{wrong}");
+        for _ in 0..TOTP_MAX_ATTEMPTS_PER_STEP {
+            assert!(!bind(&h, "e1bmany", &wrong).await);
+        }
+        let _ = rows(&log, &[LogKind::Bind]);
+        let refused = bind_as(&h, "e1bmany", &format!("{RIGHT}:{right}")).await;
+        let detail = Some("totp attempts exceeded".to_owned());
+        assert_eq!(
+            (
+                refused.is_err_and(|e| e.to_string().contains(TOTP_TOO_MANY_ATTEMPTS)),
+                stored(&h, "e1bmany").await,
+                rows(&log, &[LogKind::Bind])
+            ),
+            (
+                true,
+                Some(5),
+                vec![(LogKind::Bind, Some("e1bmany".to_owned()), detail)]
+            ),
+            "the five wrong codes count; the sixth try writes its one row and counts nothing"
+        );
     }
 
     #[tokio::test]

@@ -4,8 +4,6 @@
 mod encoding;
 mod error;
 #[cfg(feature = "seal")]
-mod failed_attempts;
-#[cfg(feature = "seal")]
 mod proof;
 #[cfg(feature = "seal")]
 mod sealing;
@@ -13,13 +11,9 @@ mod sealing;
 mod secret;
 mod totp;
 mod types;
-#[cfg(feature = "seal")]
-mod used_codes;
 
 pub use encoding::{otpauth_uri, seed_base32, seed_from_base32};
 pub use error::{MfaError, Result};
-#[cfg(feature = "seal")]
-pub use failed_attempts::FailedAttempts;
 #[cfg(feature = "seal")]
 pub use proof::{
     ENROLLMENT_PROOF_CLOCK_TOLERANCE_SECS, ENROLLMENT_PROOF_PURPOSE, ENROLLMENT_PROOF_TTL_SECS,
@@ -29,10 +23,10 @@ pub use proof::{
 pub use sealing::{decode_exact, derive_sealing_key};
 #[cfg(feature = "seal")]
 pub use secret::{
-    EnrollmentState, generate_seed, open_enrollment, open_totp_secret, seal_enrollment,
-    seal_totp_secret,
+    EnrollmentState, FACTOR_DIGEST_LEN, factor_digest, generate_seed, open_enrollment,
+    open_totp_secret, seal_enrollment, seal_totp_secret,
 };
-pub use totp::{format_code, split_totp_suffix, totp_code, totp_verify};
+pub use totp::{format_code, split_totp_suffix, totp_code, totp_matched_step, totp_verify};
 pub use types::{
     ENROLLMENT_PROOF_BUSY, MFA_ENROLLMENT_REQUIRED, PASSWORD_PROOF_REQUIRED,
     TOTP_CODE_ALREADY_USED, TOTP_CODE_REQUIRED, TOTP_CURRENT_CODE_REQUIRED, TOTP_DIGITS,
@@ -41,5 +35,3 @@ pub use types::{
 };
 #[cfg(feature = "seal")]
 pub use types::{SEALED_BLOB_LEN, SEALED_PREFIX, TOTP_MAX_ATTEMPTS_PER_STEP};
-#[cfg(feature = "seal")]
-pub use used_codes::UsedCodes;

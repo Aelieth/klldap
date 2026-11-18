@@ -187,6 +187,15 @@ pub(crate) enum LoginLockouts {
     SplitStart,
 }
 
+#[derive(DeriveIden, Clone, Copy)]
+pub(crate) enum TotpSteps {
+    Table,
+    UserId,
+    Step,
+    Failures,
+    Used,
+}
+
 // Metadata about the SQL DB.
 #[derive(DeriveIden)]
 pub(crate) enum Metadata {
@@ -2023,6 +2032,7 @@ pub(crate) async fn ensure_v13_additions(pool: &DbConnection) -> Result<(), DbEr
     ensure_policies(&transaction, backend).await?;
     ensure_kerberos(&transaction, backend).await?;
     ensure_login_lockouts(&transaction, backend).await?;
+    ensure_totp_steps(&transaction, backend).await?;
     ensure_lockout_period(&transaction, backend).await?;
     transaction.commit().await
 }
@@ -2093,6 +2103,49 @@ async fn ensure_login_lockouts(
                         ForeignKey::create()
                             .name("LoginLockoutsUserForeignKey")
                             .from(LoginLockouts::Table, LoginLockouts::UserId)
+                            .to(Users::Table, Users::UserId)
+                            .on_delete(ForeignKeyAction::Cascade)
+                            .on_update(ForeignKeyAction::Cascade),
+                    ),
+            ),
+        )
+        .await?;
+    Ok(())
+}
+
+/// The second factor's per-step state: the attempts made and whether its code was taken.
+async fn ensure_totp_steps(
+    transaction: &DatabaseTransaction,
+    backend: sea_orm::DbBackend,
+) -> Result<(), DbErr> {
+    if !relation_missing(transaction, backend, TotpSteps::Table.into_iden()).await? {
+        return Ok(());
+    }
+    transaction
+        .execute(
+            backend.build(
+                Table::create()
+                    .table(TotpSteps::Table)
+                    .if_not_exists()
+                    .col(ColumnDef::new(TotpSteps::UserId).string_len(255).not_null())
+                    .col(ColumnDef::new(TotpSteps::Step).big_integer().not_null())
+                    .col(
+                        ColumnDef::new(TotpSteps::Failures)
+                            .small_integer()
+                            .not_null()
+                            .default(0),
+                    )
+                    .col(
+                        ColumnDef::new(TotpSteps::Used)
+                            .boolean()
+                            .not_null()
+                            .default(false),
+                    )
+                    .primary_key(Index::create().col(TotpSteps::UserId).col(TotpSteps::Step))
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("TotpStepsUserForeignKey")
+                            .from(TotpSteps::Table, TotpSteps::UserId)
                             .to(Users::Table, Users::UserId)
                             .on_delete(ForeignKeyAction::Cascade)
                             .on_update(ForeignKeyAction::Cascade),

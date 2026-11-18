@@ -5,11 +5,10 @@ use lldap_domain::types::{Attribute, AttributeName, AttributeValue, UserId};
 use lldap_domain_handlers::enforcement::{self, PolicyCache};
 use lldap_domain_handlers::lockout::{Lockout, lockout};
 use lldap_domain_handlers::mfa::MfaPolicy;
-use lldap_mfa::{FailedAttempts, UsedCodes};
 use lldap_schema::PublicSchema;
 use sea_orm::sea_query::{Cond, IntoCondition, SimpleExpr};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tracing::warn;
 
 pub(crate) fn bool_to_expr(b: bool) -> Cond {
@@ -65,9 +64,8 @@ pub struct SqlBackendHandler {
     pub(crate) sql_pool: DbConnection,
     pub(crate) read_pool: DbConnection,
     pub(crate) mfa_policy: MfaPolicy,
-    // Shared by the per-request clones, so a code is used once and attempts add up.
-    pub(crate) used_totp_codes: Arc<UsedCodes>,
-    pub(crate) failed_totp_attempts: Arc<FailedAttempts>,
+    /// A `totp_steps` row was written since the last prune; true at start, for one prune then.
+    pub(crate) codes_written: Arc<AtomicBool>,
     pub(crate) policy_cache: &'static PolicyCache,
     pub(crate) lockout: &'static Lockout,
     policy_changes: Arc<AtomicU64>,
@@ -80,8 +78,7 @@ impl SqlBackendHandler {
             read_pool: sql_pool.clone(),
             sql_pool,
             mfa_policy: MfaPolicy::default(),
-            used_totp_codes: Arc::default(),
-            failed_totp_attempts: Arc::default(),
+            codes_written: Arc::new(AtomicBool::new(true)),
             policy_cache: enforcement::policy_cache(),
             lockout: lockout(),
             policy_changes: Arc::default(),

@@ -5,8 +5,6 @@ pub const TOTP_SKEW_STEPS: i64 = 1;
 pub const TOTP_SEPARATOR: char = ':';
 pub const TOTP_ENROLLMENT_TTL_SECS: u64 = 5 * 60;
 #[cfg(feature = "seal")]
-pub const TOTP_ACCEPTANCE_WINDOW_SECS: i64 = TOTP_STEP_SECS as i64 * (2 * TOTP_SKEW_STEPS + 1);
-#[cfg(feature = "seal")]
 pub const TOTP_MAX_ATTEMPTS_PER_STEP: u8 = 5;
 
 #[cfg(feature = "seal")]

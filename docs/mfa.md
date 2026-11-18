@@ -100,9 +100,13 @@ used*). An account gets five code attempts per 30-second step; once spent, the n
 attempts fail with *Too many TOTP attempts* until the next step, right code or not. Only
 failed verifications count, a replay costs nothing, and the counter is reached only after
 the password verified, so it cannot lock out someone whose password the attacker lacks.
-Both records live in memory in the running process: they reset on restart and are not
-shared between replicas. Enrollment confirmation is not attempt-limited; it confirms a
-seed the client already holds.
+Both are kept in the database (the table `totp_steps`: one row per account and 30-second
+step, and no code), so every server on one database shares them and a restart keeps them.
+A database that cannot answer refuses the code (`totp: unreadable`). Servers on one database
+need synchronised clocks, as for the enrollment proof: a step's row is kept for ten steps
+after its step, so the *already used* mark holds as long as the servers' clocks differ by
+less than four minutes; the five attempts are counted on each server's own clock. Enrollment
+confirmation is not attempt-limited; it confirms a seed the client already holds.
 
 ## Resetting
 
@@ -134,7 +138,8 @@ One row per ceremony, in the same table as everything else ([logging.md](logging
 `mfa enrollment pending` for a web login admitted under `"always"`; every row of a web finish
 that makes no session adds `no session` (`no session` alone, `totp; no session`,
 `totp code required; no session`). Failures are
-`invalid totp`, `totp replayed`, `totp attempts exceeded`, `totp re-enrollment required`
+`invalid totp`, `totp replayed`, `totp attempts exceeded`, `totp: unreadable` (the database
+could not answer), `totp re-enrollment required`
 (the sealed secret no longer opens) and `mfa enrollment required`. The challenge itself —
 password right, code missing — is the failure row `totp code required`. Enrollment and
 resets are `mfa_enroll` (`started`, `totp`, `replaced`, and the refusals, among them
@@ -161,7 +166,7 @@ enrollment, a 90-second replay window, five attempts per step, issuer `KLLDAP` �
 |---|---|---|
 | HMAC-SHA-1, six digits, 30-second step | RFC 6238 §4–5 | Met; the RFC's Appendix B vectors are unit tests. |
 | Validation window of at most one step either side | RFC 6238 §5.2 | Met: ±1 step, a code is accepted for 90 seconds. |
-| Throttle failed verification attempts | RFC 4226 §7.3 | Met: five attempts per 30-second step, per account. |
+| Throttle failed verification attempts | RFC 4226 §7.3 | Met: five attempts per 30-second step, per account, on every server that shares the database. |
 | Resynchronisation for counter drift | RFC 4226 §7.4 | Not applicable to time-based codes; the ±1 step window absorbs clock drift. |
 | Authenticator secrets stored in encrypted form | NIST SP 800-63B §5.1.4.2 | Met: sealed with AEAD under a key HKDF-derived from the server's private key, a per-enrollment salt and the user UUID as associated data; never returned on any interface. |
 | Replay resistance | NIST SP 800-63B §5.2.8 | Met: a verified code is refused for the rest of its window, at every door. |
@@ -173,7 +178,8 @@ enrollment, a 90-second replay window, five attempts per step, issuer `KLLDAP` �
 - The limiter paces guessing (five per 30-second step, RFC 4226 §7.3's delay scheme). A
   wrong code (`invalid totp`) also counts once toward the OU's `lockout-threshold`, at every
   door, as a wrong password does ([policies.md](policies.md#lockout)); a code used before, a code
-  past the limiter and the right password without a code count nothing. With no threshold set,
+  past the limiter, a code the database could not record (`totp: unreadable`) and the right
+  password without a code count nothing. With no threshold set,
   there is still no ceiling: rate-limit `/auth/*` at the reverse proxy or set the threshold.
 - A first enrollment proves the password with the OPAQUE login finish. The plaintext is
   nowhere on the server for that path. The finish returns a five-minute proof, and only
@@ -191,7 +197,8 @@ enrollment, a 90-second replay window, five attempts per step, issuer `KLLDAP` �
   presented, which works once the oldest expire.
 - Servers that share a database need synchronised clocks. A server accepts a proof whose
   expiry is up to 60 seconds further away than its own clock allows, and no more.
-- The replay and attempt records are per process and in memory.
+- The used codes and the attempts are kept in the database, shared by every server on it;
+  the used proofs are per process and in memory.
 - No recovery codes: recovery is an administrator, the password-reset e-mail, or the exempt
   group.
 - Sessions and refresh tokens minted before an enrollment stay valid until they expire.
@@ -207,6 +214,6 @@ enrollment, a 90-second replay window, five attempts per step, issuer `KLLDAP` �
 
 `MfaBackendHandler::mfa_requirement(user)` is the one place the doors ask what a login must
 present; the group policies plug in there — a requirement per group, the failure tracker at
-the log sink, an `mfa_enrolled_at` check that ends older sessions, a persisted last step for
-replicas, recovery codes. The engine (`crates/mfa`), the handler and the doors are
+the log sink, an `mfa_enrolled_at` check that ends older sessions, recovery codes. The
+engine (`crates/mfa`), the handler and the doors are
 LLDAP-neutral; the exempt group and the Kerberos notes are KLLDAP's.

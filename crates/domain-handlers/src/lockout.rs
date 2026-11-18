@@ -229,6 +229,10 @@ pub trait LockStore: Send + Sync {
     async fn read_period(&self) -> Result<String>;
     /// One transaction: nothing is stored unless the period, read under a lock, is `period`.
     async fn write_locks(&self, period: &str, writes: &[LockWrite]) -> Result<Written>;
+    /// The second factor's spent steps, pruned on this tick.
+    async fn prune_codes(&self) -> Result<u64> {
+        Ok(0)
+    }
 }
 
 /// Whether any OU's policy sets a lockout threshold above 0.
@@ -1465,6 +1469,7 @@ impl Lockout {
                 if let Err(e) = refreshed {
                     warn!("The lockout view was not refreshed: {e}");
                 }
+                prune_spent_steps(&*store).await;
             }
         })
     }
@@ -1518,9 +1523,16 @@ where
             "The lockout's policies were not read at start; the doors refuse until they are: {e}"
         );
     }
+    prune_spent_steps(store).await;
     let store = Arc::new(store.clone());
     lockout.serve_kdc(store.clone(), tokio::runtime::Handle::current());
     lockout.run(store, cache)
+}
+
+async fn prune_spent_steps<S: LockStore + ?Sized>(store: &S) {
+    if let Err(e) = store.prune_codes().await {
+        warn!("The second factor's past steps were not pruned: {e}");
+    }
 }
 
 #[cfg(test)]

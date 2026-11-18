@@ -13,6 +13,7 @@ pub mod memberships;
 pub mod ou_policies;
 pub mod password_reset_tokens;
 pub mod policies;
+pub mod totp_steps;
 pub mod users;
 
 pub mod user_attribute_schema;

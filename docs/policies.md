@@ -71,7 +71,8 @@ admin unlocks) lock a user after that many wrong passwords in a row. One counter
 the table `login_lockouts`, serves every door: LDAP bind, `/auth/simple/login`, the web login,
 kinit and the tickets asked with a user's ticket (renewals and service tickets), token refresh
 and token use. A wrong TOTP code counts once, like a wrong password; a code used before, a code
-past the limiter and the right password without its code count nothing ([mfa.md](mfa.md)). A
+past the limiter, a code refused because the database could not answer (`totp: unreadable`) and
+the right password without its code count nothing ([mfa.md](mfa.md)). A
 success clears the count, and the next failure after an unlock counts from 1. For a user who
 must give a second factor at the directory's doors (enrolled, the second factor on, and not in
 `lldap_mfa_disabled`), a Kerberos ticket (asked with the password alone) does not reset the

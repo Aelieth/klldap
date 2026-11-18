@@ -94,23 +94,37 @@ pub struct EnrollmentState {
     pub seed: [u8; TOTP_SEED_LEN],
     // A state from before enrollment must not be replayed to replace a factor.
     pub replaces_existing: bool,
+    pub factor: Option<[u8; FACTOR_DIGEST_LEN]>,
     expiry_unix: i64,
 }
 
 const STATE_KIND_ENROLLMENT: u8 = 1;
+pub const FACTOR_DIGEST_LEN: usize = 32;
+
+/// What a state is minted against: a digest of the stored sealed factor, or none.
+pub fn factor_digest(stored: Option<&str>) -> Result<Option<[u8; FACTOR_DIGEST_LEN]>> {
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    let digest = orion::hash::digest(stored.as_bytes())?;
+    let digest = <[u8; FACTOR_DIGEST_LEN]>::try_from(digest.as_ref())
+        .map_err(|_| MfaError::InvalidSealedFormat)?;
+    Ok(Some(digest))
+}
 
 pub fn seal_enrollment(
     ikm: &[u8],
     user_id: &str,
     seed: &[u8; TOTP_SEED_LEN],
-    replaces_existing: bool,
+    stored_factor: Option<&str>,
     now_unix: i64,
 ) -> Result<String> {
     let state = EnrollmentState {
         kind: STATE_KIND_ENROLLMENT,
         user_id: user_id.to_owned(),
         seed: *seed,
-        replaces_existing,
+        replaces_existing: stored_factor.is_some(),
+        factor: factor_digest(stored_factor)?,
         expiry_unix: now_unix + TOTP_ENROLLMENT_TTL_SECS as i64,
     };
     let key = derive_enrollment_key(ikm)?;
@@ -196,22 +210,29 @@ mod tests {
     #[test]
     fn test_enrollment_round_trip() {
         let seed = generate_seed();
-        let sealed = seal_enrollment(IKM, "bob", &seed, true, 1000).unwrap();
+        let sealed = seal_enrollment(IKM, "bob", &seed, Some("v1.stored"), 1000).unwrap();
         assert!(!sealed.contains("bob"));
         let state = open_enrollment(IKM, &sealed, 1000).unwrap();
         assert_eq!(state.user_id, "bob");
         assert_eq!(state.seed, seed);
         assert!(state.replaces_existing);
+        let minted = factor_digest(Some("v1.stored")).unwrap();
+        assert_eq!(
+            (state.factor, minted.is_some()),
+            (minted, true),
+            "the state carries the digest of the factor it was minted against"
+        );
+        assert_ne!(minted, factor_digest(Some("v1.other")).unwrap());
 
-        let sealed = seal_enrollment(IKM, "bob", &seed, false, 1000).unwrap();
+        let sealed = seal_enrollment(IKM, "bob", &seed, None, 1000).unwrap();
         let state = open_enrollment(IKM, &sealed, 1000).unwrap();
-        assert!(!state.replaces_existing);
+        assert_eq!((state.replaces_existing, state.factor), (false, None));
     }
 
     #[test]
     fn test_enrollment_rejects_expired_wrong_key_tampered_and_other_kinds() {
         let seed = generate_seed();
-        let sealed = seal_enrollment(IKM, "bob", &seed, false, 1000).unwrap();
+        let sealed = seal_enrollment(IKM, "bob", &seed, None, 1000).unwrap();
         let expired = 1000 + TOTP_ENROLLMENT_TTL_SECS as i64;
         assert!(matches!(
             open_enrollment(IKM, &sealed, expired),
@@ -230,6 +251,7 @@ mod tests {
             user_id: "bob".to_owned(),
             seed: generate_seed(),
             replaces_existing: false,
+            factor: None,
             expiry_unix: 2000,
         };
         let key = derive_enrollment_key(IKM).unwrap();
@@ -248,6 +270,7 @@ mod tests {
             user_id: "bob".to_owned(),
             seed: generate_seed(),
             replaces_existing: false,
+            factor: None,
             expiry_unix: 2000,
         };
         let key = derive_enrollment_key(IKM).unwrap();

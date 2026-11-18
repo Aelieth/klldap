@@ -1815,6 +1815,10 @@ static MYSQL_LANE_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 async fn connect_scratch_postgres() -> Option<DbConnection> {
+    connect_scratch_postgres_sized(2).await
+}
+
+async fn connect_scratch_postgres_sized(connections: u32) -> Option<DbConnection> {
     let Ok(url) = std::env::var("KLLDAP_TEST_DATABASE_URL") else {
         eprintln!("KLLDAP_TEST_DATABASE_URL not set; skipping");
         return None;
@@ -1824,7 +1828,7 @@ async fn connect_scratch_postgres() -> Option<DbConnection> {
         return None;
     }
     let mut opts = sea_orm::ConnectOptions::new(url);
-    opts.max_connections(2).sqlx_logging(false);
+    opts.max_connections(connections).sqlx_logging(false);
     let pool = Database::connect(opts)
         .await
         .expect("connect test postgres");
@@ -2434,12 +2438,14 @@ fn period_key_sql(backend: DbBackend, statement: &str) -> String {
 
 async fn drop_lockout_tables(pool: &DbConnection) {
     let backend = pool.get_database_backend();
-    pool.execute(sea_orm::Statement::from_string(
-        backend,
-        "DROP TABLE login_lockouts".to_owned(),
-    ))
-    .await
-    .expect("drop login_lockouts");
+    for table in ["login_lockouts", "totp_steps"] {
+        pool.execute(sea_orm::Statement::from_string(
+            backend,
+            format!("DROP TABLE {table}"),
+        ))
+        .await
+        .expect("drop a lockout table");
+    }
     pool.execute(sea_orm::Statement::from_string(
         backend,
         period_key_sql(backend, "DELETE"),
@@ -2456,6 +2462,12 @@ async fn expect_lockout_tables(pool: &DbConnection) {
     ))
     .await
     .expect("login_lockouts restored");
+    pool.execute(sea_orm::Statement::from_string(
+        backend,
+        "SELECT user_id, step, failures, used FROM totp_steps LIMIT 1".to_owned(),
+    ))
+    .await
+    .expect("totp_steps restored");
     let period = pool
         .query_one(sea_orm::Statement::from_string(
             backend,
@@ -3368,7 +3380,10 @@ async fn test_sqlite_dump_script_matches_migrated_tables() {
     let text = std::fs::read_to_string(&script).unwrap();
     let left_out = dump_script_names(&text, "# left out:");
     let server_tables = dump_script_names(&text, "# server tables:");
-    assert_eq!(left_out, ["metadata", "sqlite_sequence"].map(str::to_owned));
+    assert_eq!(
+        left_out,
+        ["metadata", "sqlite_sequence", "totp_steps"].map(str::to_owned)
+    );
     let output = std::process::Command::new("bash")
         .arg(&script)
         .output()
@@ -3701,4 +3716,158 @@ async fn test_postgres_lockout_two_zeroings_at_once_take_two_period_numbers() {
         return;
     };
     crate::sql_lockout_handler::tests::period_raise_lane(&pool).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_totp_codes_at_once_spend_five_attempts_and_one_use() {
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres_sized(10).await else {
+        return;
+    };
+    crate::sql_totp_steps::tests::concurrency_lane(&pool).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_totp_codes_at_once_spend_five_attempts_and_one_use() {
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql_sized(10).await else {
+        return;
+    };
+    crate::sql_totp_steps::tests::concurrency_lane(&pool).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_a_key_change_racing_marks_leaves_no_mark_of_the_old_key() {
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres_sized(10).await else {
+        return;
+    };
+    crate::sql_totp_steps::tests::key_change_lane(&pool).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_a_key_change_racing_marks_leaves_no_mark_of_the_old_key() {
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql_sized(10).await else {
+        return;
+    };
+    crate::sql_totp_steps::tests::key_change_lane(&pool).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_totp_codes_checked_at_once_count_exactly() {
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres_sized(10).await else {
+        return;
+    };
+    crate::sql_totp_steps::tests::verify_lane(&pool).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_totp_codes_checked_at_once_count_exactly() {
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql_sized(10).await else {
+        return;
+    };
+    crate::sql_totp_steps::tests::verify_lane(&pool).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_totp_marks_into_one_gap_at_once_are_all_taken() {
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres_sized(10).await else {
+        return;
+    };
+    crate::sql_totp_steps::tests::neighbour_marks_lane(&pool).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_totp_marks_into_one_gap_at_once_are_all_taken() {
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql_sized(10).await else {
+        return;
+    };
+    crate::sql_totp_steps::tests::neighbour_marks_lane(&pool).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_totp_mark_waits_for_a_key_change_held_open() {
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres_sized(4).await else {
+        return;
+    };
+    crate::sql_totp_steps::tests::guard_in_flight_lane(&pool).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_totp_mark_waits_for_a_key_change_held_open() {
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql_sized(4).await else {
+        return;
+    };
+    crate::sql_totp_steps::tests::guard_in_flight_lane(&pool).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_two_finishes_of_one_state_at_once_one_finishes() {
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres_sized(4).await else {
+        return;
+    };
+    crate::sql_mfa_handler::tests::finish_race_lane(&pool).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_two_finishes_of_one_state_at_once_one_finishes() {
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql_sized(4).await else {
+        return;
+    };
+    crate::sql_mfa_handler::tests::finish_race_lane(&pool).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_a_finish_waits_for_one_held_open_then_is_stale() {
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres_sized(4).await else {
+        return;
+    };
+    crate::sql_mfa_handler::tests::finish_held_lane(&pool).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_a_finish_waits_for_one_held_open_then_is_stale() {
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql_sized(4).await else {
+        return;
+    };
+    crate::sql_mfa_handler::tests::finish_held_lane(&pool).await;
 }

@@ -50,20 +50,27 @@ pub fn split_totp_suffix(password: &str) -> Option<(&str, &str)> {
 }
 
 pub fn totp_verify(secret: &[u8], code: &str, unix_secs: u64) -> Result<bool> {
+    Ok(totp_matched_step(secret, code, unix_secs)?.is_some())
+}
+
+/// The step whose code this is, the earliest when two neighbouring steps share the digits.
+pub fn totp_matched_step(secret: &[u8], code: &str, unix_secs: u64) -> Result<Option<u64>> {
     let Some(provided) = parse_code(code) else {
-        return Ok(false);
+        return Ok(None);
     };
     let step = unix_secs / TOTP_STEP_SECS;
-    let mut ok = false;
+    let mut matched = None;
     for delta in -TOTP_SKEW_STEPS..=TOTP_SKEW_STEPS {
         let counter = step as i64 + delta;
         if counter < 0 {
             continue;
         }
         let expected = hotp(secret, counter as u64)?;
-        ok |= barrier_eq_u32(expected, provided);
+        if barrier_eq_u32(expected, provided) && matched.is_none() {
+            matched = Some(counter as u64);
+        }
     }
-    Ok(ok)
+    Ok(matched)
 }
 
 #[cfg(test)]
@@ -103,6 +110,24 @@ mod tests {
             totp_code(&[], t),
             Err(MfaError::InvalidSecretLength)
         ));
+    }
+
+    #[test]
+    fn test_the_step_a_code_matched_is_its_own() {
+        let t = 1_111_111_111u64;
+        let step = t / TOTP_STEP_SECS;
+        let code = format_code(totp_code(RFC_SEED, t).unwrap());
+        let matched = |at| totp_matched_step(RFC_SEED, &code, at).unwrap();
+        assert_eq!(
+            [
+                matched(t - TOTP_STEP_SECS),
+                matched(t),
+                matched(t + TOTP_STEP_SECS),
+                matched(t + 2 * TOTP_STEP_SECS)
+            ],
+            [Some(step), Some(step), Some(step), None]
+        );
+        assert_eq!(totp_matched_step(RFC_SEED, "12345", t).unwrap(), None);
     }
 
     #[test]

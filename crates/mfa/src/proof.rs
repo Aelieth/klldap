@@ -167,7 +167,7 @@ mod tests {
 
         // Each value is re-encoded in the opener's alphabet, so only the key can refuse it.
         let seed = generate_seed();
-        let state = seal_enrollment(IKM, "bob", &seed, false, now).unwrap();
+        let state = seal_enrollment(IKM, "bob", &seed, None, now).unwrap();
         let state_as_proof = STANDARD.encode(URL_SAFE_NO_PAD.decode(&state).unwrap());
         let refused = open_enrollment_proof(IKM, &state_as_proof, now);
         assert!(

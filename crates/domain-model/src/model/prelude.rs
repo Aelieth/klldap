@@ -30,6 +30,8 @@ pub use super::password_reset_tokens::Column as PasswordResetTokensColumn;
 pub use super::password_reset_tokens::Entity as PasswordResetTokens;
 pub use super::policies::Column as PoliciesColumn;
 pub use super::policies::Entity as Policies;
+pub use super::totp_steps::Column as TotpStepsColumn;
+pub use super::totp_steps::Entity as TotpSteps;
 pub use super::user_attribute_schema::Column as UserAttributeSchemaColumn;
 pub use super::user_attribute_schema::Entity as UserAttributeSchema;
 pub use super::user_attributes::Column as UserAttributesColumn;

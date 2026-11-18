@@ -11,6 +11,10 @@
   in the body of `/auth/simple/login` or `/auth/opaque/login/finish` returns `enrollmentProof`
   in the answer, for a user with no factor yet. It is valid for five minutes and used once on
   each server. Replacing a factor still takes `currentCode` and ignores a proof.
+- A second factor's attempts and used codes are kept in the database (the new table
+  `totp_steps`, no code stored): a code is accepted once and five attempts per 30-second step
+  are counted on every server that shares the database, and a restart keeps both. Servers on
+  one database need synchronised clocks for codes.
 
 ### Added
 

@@ -880,7 +880,8 @@ mod tests {
         let wrong = format!("bob00:{wrong}");
         let right = format_code(totp_code(&seed, AT + TOTP_STEP_SECS).unwrap());
         let right = format!("bob00:{right}");
-        let mut answers = Vec::new();
+        let step = (UserId::new("bob"), (AT / TOTP_STEP_SECS) as i64);
+        let (mut answers, mut kept) = (Vec::new(), None);
         with_request(
             RequestMeta::ldap(None, Some(peer.parse().unwrap())),
             async {
@@ -907,6 +908,12 @@ mod tests {
                     .await
                     .unwrap_err();
                 assert!(err.to_string().contains("already used"), "{err}");
+                let row = model::TotpSteps::find_by_id(step.clone());
+                kept = row
+                    .one(&handler.sql_pool)
+                    .await
+                    .unwrap()
+                    .map(|row| row.failures);
                 // The gate runs before verification: even a valid code is refused.
                 for password in [&wrong, &wrong, &wrong, &wrong, &wrong, &right] {
                     let err = handler
@@ -919,8 +926,8 @@ mod tests {
         )
         .await;
         assert_eq!(
-            answers,
-            vec![false, false, false, false, true, true],
+            (kept, answers),
+            (Some(1), vec![false, false, false, false, true, true]),
             "the earlier wrong code is the step's one failure; four more answer invalid, then two \
              are past the limit"
         );
@@ -1319,7 +1326,7 @@ mod tests {
         );
 
         let enrollment =
-            lldap_mfa::seal_enrollment(&key, "bob", &lldap_mfa::generate_seed(), false, now)
+            lldap_mfa::seal_enrollment(&key, "bob", &lldap_mfa::generate_seed(), None, now)
                 .unwrap();
         let enrollment_bytes = URL_SAFE_NO_PAD.decode(&enrollment).unwrap();
         assert!(

@@ -1,9 +1,12 @@
 // Drives the gate's own server through the Chromium baked into the Playwright image.
-// Node's built-in WebSocket speaks CDP. Nothing is installed here.
+// Node's built-in WebSocket speaks CDP. Nothing is installed here. BROWSER_MODE mfa drives the
+// two-factor pages as BROWSER_USER and prints, per row, what the page sent (WIRE lines).
 
 import { spawn } from "node:child_process";
-import { readdirSync } from "node:fs";
+import { createHmac } from "node:crypto";
+import { existsSync, readdirSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
+import { networkInterfaces } from "node:os";
 
 const outDir = process.env.BROWSER_OUT || "/out";
 const mode = process.env.BROWSER_MODE;
@@ -13,7 +16,41 @@ const adminPass = process.env.BROWSER_ADMIN_PASS || "";
 const firstPass = process.env.BROWSER_PASS || "";
 const newPass = process.env.BROWSER_NEW_PASS || "";
 const secrets = [adminPass, firstPass, newPass].filter((s) => s.length > 0);
+const userSecrets = [firstPass, newPass].filter((s) => s.length > 0);
 const WAIT_MS = 30000;
+const LOGIN_START = "/auth/opaque/login/start";
+const LOGIN_FINISH = "/auth/opaque/login/finish";
+const LOGOUT_VISIBLE = `[...document.querySelectorAll("button")].some((b) => b.textContent.includes("Logout"))`;
+const wire = { requests: [], finishStatuses: [], consoleLeaks: 0 };
+const usedCodes = new Set();
+
+// The password as a request or a print could carry it: plain, base64, hex, URL- and
+// JSON-escaped, and as the byte array serde writes.
+function encodings(secret) {
+  const bytes = Buffer.from(secret, "utf8");
+  return [
+    secret,
+    bytes.toString("base64").replace(/=+$/, ""),
+    bytes.toString("base64url"),
+    bytes.toString("hex"),
+    bytes.toString("hex").toUpperCase(),
+    encodeURIComponent(secret),
+    JSON.stringify(secret).slice(1, -1),
+    JSON.stringify([...bytes]),
+  ];
+}
+const needles = [...new Set(userSecrets.flatMap(encodings))];
+
+function carries(text) {
+  const raw = String(text ?? "");
+  return needles.some((needle) => raw.includes(needle));
+}
+
+// Checked before it is redacted: a print of the password fails its row.
+function noteConsole(text) {
+  if (carries(text)) wire.consoleLeaks += 1;
+  consoleLines.push(redact(text));
+}
 
 const consoleLines = [];
 let chrome;
@@ -83,10 +120,25 @@ function onMessage(raw) {
     const args = (msg.params.args || [])
       .map((arg) => arg.value ?? arg.description ?? arg.type)
       .join(" ");
-    consoleLines.push(redact(args));
+    noteConsole(args);
   } else if (msg.method === "Runtime.exceptionThrown") {
-    consoleLines.push(redact(msg.params.exceptionDetails?.text || "exception"));
+    noteConsole(msg.params.exceptionDetails?.text || "exception");
+  } else if (msg.method === "Network.requestWillBeSent") {
+    const request = msg.params.request || {};
+    wire.requests.push({ url: request.url || "", body: postBody(request) });
+  } else if (msg.method === "Network.responseReceived") {
+    const response = msg.params.response || {};
+    if ((response.url || "").includes(LOGIN_FINISH)) wire.finishStatuses.push(String(response.status));
   }
+}
+
+function postBody(request) {
+  if (request.postDataEntries?.length) {
+    return request.postDataEntries
+      .map((entry) => Buffer.from(entry.bytes || "", "base64").toString("utf8"))
+      .join("");
+  }
+  return request.postData || "";
 }
 
 async function evalValue(expression) {
@@ -252,7 +304,7 @@ async function connect() {
     { stdio: ["ignore", "ignore", "pipe"] },
   );
   chrome.stderr.on("data", (chunk) => {
-    consoleLines.push(redact(chunk.toString()));
+    noteConsole(chunk.toString());
   });
   const deadline = Date.now() + WAIT_MS;
   let page;
@@ -278,6 +330,9 @@ async function connect() {
   ws.addEventListener("message", onMessage);
   await send("Page.enable");
   await send("Runtime.enable");
+  if (mode === "mfa" || mode === "pages-one" || mode === "change" || mode === "code-retry") {
+    await send("Network.enable", { maxPostDataSize: 65536 });
+  }
 }
 
 async function recordContext() {
@@ -285,7 +340,8 @@ async function recordContext() {
   say(`CONTEXT secure=${info.secure} url=${info.url}`);
 }
 
-let currentStep = mode === "change" ? "user-login" : "admin-login";
+let currentStep =
+  { change: "user-login", mfa: "mfa-login", "code-retry": "retry-enrol" }[mode] || "admin-login";
 
 async function login(who, password, row) {
   currentStep = row;
@@ -323,12 +379,337 @@ async function changePassword() {
   await fill("#old_password", firstPass);
   await fill("#password", newPass);
   await fill("#confirm_password", newPass);
-  await clickButton("Change Password");
+  beginRow("change");
+  await twoSubmits("Change Password");
   await waitFor(
     `location.pathname === ${JSON.stringify(`/user/${userId}`)}`,
     `path /user/${userId}`,
   );
-  say("ROW change PASS");
+  await endRow("change");
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function waitText(text) {
+  await waitFor(`document.body.innerText.includes(${JSON.stringify(text)})`, `text ${text}`);
+}
+
+function base32Bytes(text) {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  const out = [];
+  let bits = 0;
+  let value = 0;
+  for (const ch of text.replace(/=+$/, "")) {
+    const index = alphabet.indexOf(ch);
+    if (index < 0) throw fail("secret", "the secret is not base32");
+    value = (value << 5) | index;
+    bits += 5;
+    if (bits >= 8) {
+      bits -= 8;
+      out.push((value >> bits) & 0xff);
+      value &= (1 << bits) - 1;
+    }
+  }
+  return Buffer.from(out);
+}
+
+// RFC 6238 as the server computes it: SHA-1, six digits, 30-second steps.
+function totp(secret, offset) {
+  const step = Math.floor(Date.now() / 30000) + offset;
+  const counter = Buffer.alloc(8);
+  counter.writeBigUInt64BE(BigInt(step));
+  const digest = createHmac("sha1", base32Bytes(secret)).update(counter).digest();
+  const at = digest[19] & 0x0f;
+  return String((digest.readUInt32BE(at) & 0x7fffffff) % 1000000).padStart(6, "0");
+}
+
+async function freshCode(secret) {
+  const deadline = Date.now() + 100000;
+  while (Date.now() < deadline) {
+    // Never a past step: it can be two steps old by the time the server checks it.
+    for (const offset of [0, 1]) {
+      const code = totp(secret, offset);
+      if (!usedCodes.has(`${secret}:${code}`)) {
+        usedCodes.add(`${secret}:${code}`);
+        return code;
+      }
+    }
+    await sleep(1000);
+  }
+  throw fail("code", "no unused code in reach");
+}
+
+function wrongCode(secret) {
+  const valid = [-1, 0, 1].map((offset) => totp(secret, offset));
+  for (let n = 0; ; n++) {
+    const code = String(n).padStart(6, "0");
+    if (!valid.includes(code)) return code;
+  }
+}
+
+async function readSecret() {
+  await waitFor(`!!document.querySelector('img[alt="TOTP QR code"]')`, "TOTP QR code");
+  const text = await evalValue(
+    `[...document.querySelectorAll("p.text-center code")].map((c) => c.textContent).join("")`,
+  );
+  const secret = String(text || "").replace(/\s+/g, "");
+  if (!/^[A-Z2-7]+=*$/.test(secret)) throw fail("secret", "no base32 secret on the page");
+  secrets.push(secret);
+  return secret;
+}
+
+async function typeCredentials(who, password) {
+  await waitFor(`!!document.querySelector("#username")`, "#username");
+  await fill("#username", who);
+  await fill("#password", password);
+  await clickButton("Login");
+}
+
+function beginRow(row) {
+  currentStep = row;
+  wire.requests = [];
+  wire.finishStatuses = [];
+  wire.consoleLeaks = 0;
+}
+
+// Two submits in one task. Yew renders the first at once and disables the button, so the
+// second goes through it enabled again: only the page's own in-flight guard can stop it.
+async function twoSubmits(label) {
+  const find = `[...document.querySelectorAll("button")].find((b) =>
+    b.textContent.includes(${JSON.stringify(label)}) && !b.disabled)`;
+  await waitFor(`!!${find}`, `button ${label}`);
+  const clicked = await evalValue(`(() => {
+    const btn = ${find};
+    if (!btn) return false;
+    btn.click();
+    btn.disabled = false;
+    btn.click();
+    return true;
+  })()`);
+  if (!clicked) throw fail(`button ${label}`);
+  await sleep(100);
+}
+
+// What the row sent: the login starts and finishes, what each finish asked for, the finish
+// statuses, whether any request carried the user's password, and whether the page kept it.
+async function endRow(row) {
+  await sleep(500);
+  const finishes = wire.requests.filter((r) => r.url.includes(LOGIN_FINISH));
+  const bodies = finishes.map((r) => {
+    try {
+      return JSON.parse(r.body);
+    } catch {
+      return {};
+    }
+  });
+  const starts = wire.requests.filter((r) => r.url.includes(LOGIN_START)).length;
+  const sent = wire.requests.some((r) => carries(r.url) || carries(r.body));
+  const stored = await evalValue(`(() => {
+    const kept = JSON.stringify(Object.entries(localStorage)) +
+      JSON.stringify(Object.entries(sessionStorage)) + document.cookie;
+    return ${JSON.stringify(userSecrets)}.some((s) => kept.includes(s));
+  })()`);
+  const count = (test) => bodies.filter(test).length;
+  say(
+    [
+      `WIRE ${row}`,
+      `starts=${starts}`,
+      `finishes=${finishes.length}`,
+      `sessionless=${count((b) => b.session === false)}`,
+      `proof-asked=${count((b) => b.enrollmentProof === true)}`,
+      `codes=${count((b) => typeof b.totp_code === "string")}`,
+      `statuses=${wire.finishStatuses.join("/") || "none"}`,
+      `password-sent=${sent ? "yes" : "no"}`,
+      `stored=${stored ? "yes" : "no"}`,
+      `console-leak=${wire.consoleLeaks > 0 ? "yes" : "no"}`,
+    ].join(" "),
+  );
+  say(`ROW ${row} PASS`);
+}
+
+async function mfaPages() {
+  const own = `/user/${userId}`;
+  beginRow("mfa-login");
+  await goto("/login");
+  await recordContext();
+  await waitFor(`!!document.querySelector("#username")`, "#username");
+  await fill("#username", userId);
+  await fill("#password", firstPass);
+  await twoSubmits("Login");
+  await waitFor(LOGOUT_VISIBLE, "button Logout");
+  await endRow("mfa-login");
+
+  beginRow("mfa-enrol");
+  await goto(`${own}/mfa`);
+  await fill("#current_password", firstPass);
+  await twoSubmits("Continue");
+  const first = await readSecret();
+  await fill("#combined", `${firstPass}:${await freshCode(first)}`);
+  await twoSubmits("Enable two-factor");
+  await waitText("Two-factor authentication is enabled.");
+  await endRow("mfa-enrol");
+
+  await clickButton("Logout");
+  beginRow("mfa-old-form");
+  await typeCredentials(userId, `${firstPass}:${totp(first, 0)}`);
+  await waitText("the code is asked in the next step");
+  await waitText("Invalid username or password");
+  await endRow("mfa-old-form");
+
+  beginRow("mfa-wrong-code");
+  await typeCredentials(userId, firstPass);
+  await waitFor(`!!document.querySelector("#totp_code")`, "#totp_code");
+  await fill("#totp_code", wrongCode(first));
+  await clickButton("Verify");
+  await waitText("Invalid code");
+  await waitFor(`!!document.querySelector("#totp_code")`, "#totp_code");
+  await endRow("mfa-wrong-code");
+
+  beginRow("mfa-signin");
+  await fill("#totp_code", await freshCode(first));
+  await twoSubmits("Verify");
+  await waitFor(LOGOUT_VISIBLE, "button Logout");
+  await endRow("mfa-signin");
+
+  beginRow("mfa-replace");
+  await goto(`${own}/mfa`);
+  await fill("#current_code", await freshCode(first));
+  await clickButton("Continue");
+  const second = await readSecret();
+  await fill("#combined", `${firstPass}:${await freshCode(second)}`);
+  await clickButton("Enable two-factor");
+  await waitText("Two-factor authentication is enabled.");
+  await endRow("mfa-replace");
+
+  beginRow("mfa-change");
+  await goto(`${own}/password`);
+  await fill("#old_password", firstPass);
+  await fill("#password", newPass);
+  await fill("#confirm_password", newPass);
+  await twoSubmits("Change Password");
+  await waitFor(`location.pathname === ${JSON.stringify(own)}`, `path ${own}`);
+  await endRow("mfa-change");
+
+  beginRow("mfa-reset");
+  await goto(`${own}/mfa/reset`);
+  await fill("#combined", `${newPass}:${await freshCode(second)}`);
+  await twoSubmits("Reset two-factor");
+  await waitFor(`location.pathname === ${JSON.stringify(own)}`, `path ${own}`);
+  await endRow("mfa-reset");
+}
+
+// A refused user at both login doors, from this container's own address.
+async function refused() {
+  currentStep = "refused-web";
+  await goto("/login");
+  await waitFor(`!!document.querySelector("#username")`, "#username");
+  await fill("#username", userId);
+  await fill("#password", firstPass);
+  await clickButton("Login");
+  await waitFor(
+    `document.body.innerText.includes("Invalid username or password")`,
+    "text Invalid username or password",
+  );
+  say("ROW refused-web PASS");
+  currentStep = "refused-simple";
+  const res = await fetch(`${base}/auth/simple/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username: userId, password: firstPass }),
+  });
+  say(`SIMPLE ${res.status}`);
+  const own = Object.values(networkInterfaces())
+    .flat()
+    .filter((a) => a && (a.family === "IPv4" || a.family === 4) && !a.internal)
+    .map((a) => a.address);
+  say(`ADDR ${own.join(",") || "none"}`);
+}
+
+// Each page with the right password, as a user at threshold 1: every start is finished.
+// A wrong code, then the right one, on the code step. Between them the gate reads the stored
+// count: the page waits for its go file in /out.
+async function codeRetry() {
+  const own = `/user/${userId}`;
+  beginRow("retry-enrol");
+  await goto("/login");
+  await typeCredentials(userId, firstPass);
+  await waitFor(LOGOUT_VISIBLE, "button Logout");
+  await goto(`${own}/mfa`);
+  await fill("#current_password", firstPass);
+  await clickButton("Continue");
+  const secret = await readSecret();
+  await fill("#combined", `${firstPass}:${await freshCode(secret)}`);
+  await clickButton("Enable two-factor");
+  await waitText("Two-factor authentication is enabled.");
+  await endRow("retry-enrol");
+
+  await clickButton("Logout");
+  beginRow("retry-wrong");
+  await typeCredentials(userId, firstPass);
+  await waitFor(`!!document.querySelector("#totp_code")`, "#totp_code");
+  await fill("#totp_code", wrongCode(secret));
+  await clickButton("Verify");
+  await waitText("Invalid code");
+  await waitFor(`!!document.querySelector("#totp_code")`, "#totp_code");
+  await endRow("retry-wrong");
+
+  const go = `${outDir}/code-retry.go`;
+  const deadline = Date.now() + 60000;
+  while (!existsSync(go)) {
+    if (Date.now() > deadline) throw fail("go", "the gate did not read the count");
+    await sleep(250);
+  }
+  beginRow("retry-right");
+  await fill("#totp_code", await freshCode(secret));
+  await clickButton("Verify");
+  await waitFor(LOGOUT_VISIBLE, "button Logout");
+  await endRow("retry-right");
+}
+
+async function pagesAtOne() {
+  const own = `/user/${userId}`;
+  beginRow("one-login");
+  await goto("/login");
+  await typeCredentials(userId, firstPass);
+  await waitFor(LOGOUT_VISIBLE, "button Logout");
+  await endRow("one-login");
+
+  beginRow("one-enrol");
+  await goto(`${own}/mfa`);
+  await fill("#current_password", firstPass);
+  await clickButton("Continue");
+  const secret = await readSecret();
+  await fill("#combined", `${firstPass}:${await freshCode(secret)}`);
+  await clickButton("Enable two-factor");
+  await waitText("Two-factor authentication is enabled.");
+  await endRow("one-enrol");
+
+  await clickButton("Logout");
+  beginRow("one-signin");
+  await typeCredentials(userId, firstPass);
+  await waitFor(`!!document.querySelector("#totp_code")`, "#totp_code");
+  await fill("#totp_code", await freshCode(secret));
+  await clickButton("Verify");
+  await waitFor(LOGOUT_VISIBLE, "button Logout");
+  await endRow("one-signin");
+
+  beginRow("one-change");
+  await goto(`${own}/password`);
+  await fill("#old_password", firstPass);
+  await fill("#password", newPass);
+  await fill("#confirm_password", newPass);
+  await clickButton("Change Password");
+  await waitFor(`location.pathname === ${JSON.stringify(own)}`, `path ${own}`);
+  await endRow("one-change");
+
+  beginRow("one-reset");
+  await goto(`${own}/mfa/reset`);
+  await fill("#combined", `${newPass}:${await freshCode(secret)}`);
+  await clickButton("Reset two-factor");
+  await waitFor(`location.pathname === ${JSON.stringify(own)}`, `path ${own}`);
+  await endRow("one-reset");
 }
 
 async function main() {
@@ -339,6 +720,16 @@ async function main() {
   } else if (mode === "change") {
     await login(userId, firstPass, "user-login");
     await changePassword();
+  } else if (mode === "mfa") {
+    await mfaPages();
+  } else if (mode === "refused") {
+    await refused();
+  } else if (mode === "login") {
+    await login(userId, firstPass, "user-login");
+  } else if (mode === "code-retry") {
+    await codeRetry();
+  } else if (mode === "pages-one") {
+    await pagesAtOne();
   } else {
     throw fail("BROWSER_MODE", mode || "unset");
   }

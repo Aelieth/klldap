@@ -400,7 +400,7 @@ if kadmin_q "modprinc -unlock $SYNC" >"$D/unlock.txt" 2>&1 && ! grep -q " while 
 else
     p_bad "modprinc -unlock failed (see unlock.txt)"
 fi
-UNLOCK="kadmin unlock by $ADMIN (no lockout counter yet)"
+UNLOCK="kadmin unlock by $ADMIN"
 if [ -n "$MARK" ] && log_one KERBEROS_SYNC "$SYNC@$REALM" "$UNLOCK" true unlock "$MARK" "$ADMIN"; then
     p_ok "unlock: exactly one kerberos_sync names the kadmin caller, protocol KADMIN, actor $ADMIN"
 else

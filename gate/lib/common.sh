@@ -78,6 +78,28 @@ except urllib.error.HTTPError as e:
 PY
 }
 
+# gate_enrollment_proof <user> <pass>: prints a first-enrollment proof. The same door as
+# gate_login, asked for one; the token it also returns is not a proof.
+gate_enrollment_proof() {
+    local user="$1" pass="$2"
+    LOGIN_URL="$(http_url)/auth/simple/login" LOGIN_USER="$user" LOGIN_PASS="$pass" \
+        t python3 - <<'PY'
+import json, os, sys, urllib.error, urllib.request
+req = urllib.request.Request(
+    os.environ["LOGIN_URL"],
+    data=json.dumps({"username": os.environ["LOGIN_USER"],
+                     "password": os.environ["LOGIN_PASS"],
+                     "enrollmentProof": True}).encode(),
+    headers={"Content-Type": "application/json"})
+try:
+    print(json.load(urllib.request.urlopen(req))["enrollmentProof"])
+except urllib.error.HTTPError as e:
+    sys.exit("HTTP %d: %s" % (e.code, e.read().decode(errors="replace")[:500]))
+except KeyError:
+    sys.exit("the answer carries no enrollmentProof")
+PY
+}
+
 # graphql <query> <variables-json>: prints the data JSON; fails on transport, HTTP or
 # GraphQL errors (error text, or the HTTP status and body, on stderr). Uses $TOKEN.
 graphql() {

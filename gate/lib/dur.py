@@ -9,11 +9,13 @@ import secrets
 import shlex
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
 import urllib.request
+from contextlib import closing
 
 ENV = os.environ
 RUN_DIR = sys.argv[1]
@@ -28,7 +30,7 @@ OPT, STAGE = "/opt/nitnelave", "/home/lab/klldap-stage"
 DATA = OPT if HOST else "/data"
 KDC_DIR = f"{OPT}/krb5kdc" if HOST else "/var/kerberos/krb5kdc"
 KEYTAB = f"{DATA}/kadm5.keytab"
-SERVICE, WRITER, LOCKED, POLICY, MAX_FAIL = "HTTP/dur.gate.test", "durbob", "durlock", "durpol", 3
+SERVICE, WRITER, LOCKED, LOCK_OU, MAX_FAIL = "HTTP/dur.gate.test", "durbob", "durlock", "durlockou", 3
 SECOND = "HTTP/dur-second.gate.test"
 HEALTH_LIMIT, EXIT_LIMIT, STOPPED_ALONE, WRITE_WITHIN = 90, 30, 25, 10
 REFUSED = "Password incorrect while getting initial credentials"
@@ -41,7 +43,14 @@ SETTLE = int(ENV.get("DUR_SETTLE", "0"))
 KINDS = ENV.get("DUR_KINDS", "abc")
 YOUNG_S = 30
 LOCKOUT = f"{KDC_DIR}/lockout"
-NOISE, NOISE_POLICY = "durnoise", "durnoisepol"
+NOISE, NOISE_OU, NOISE_SVC, NOISE_POLICY = "durnoise", "durnoiseou", "durnoise/gate.test", "durnoisepol"
+NOISE_MAX, NOISE_RESET, NOISE_SVC_EVERY, NOISE_GAP = 100, 50, 4, 0.1
+NOISE_READ_BACK_S = 2.0
+NOISE_SHELL = ('while read -r op; do case "$op" in f) u="$0"; p="$2" ;; s) u="$1"; p="$2" ;; '
+               'c) u="$0"; read -r p ;; *) exit 0 ;; esac; '
+               'if printf "%s\\n" "$p" | KRB5CCNAME=/tmp/dur_noise_cc kinit "$u" >/tmp/dur_noise.out 2>&1; '
+               'then echo S; else case "$(cat /tmp/dur_noise.out)" in *"Password incorrect"*) echo R ;; '
+               '*revoked*) echo V ;; *) echo E ;; esac; fi; done')
 LOCKOUT_CAUSES = ("lockout file", "is not a kerber-rust lockout file")
 CACHE_NOTE = ("guest disk qcow2 with QEMU's default cache (writeback): a cut loses the guest's RAM "
               "and page cache; a device's volatile cache is not tested (O, pwr-lab-readback.md 2)")
@@ -83,6 +92,7 @@ class Record:
         self.degraded = 0
         self.acknowledged = {}
         self.young = []
+        self.noise = None
 
     @staticmethod
     def _sync(handle, text):
@@ -240,6 +250,33 @@ class Server:
         if body.get("errors") or not self.set_password(user, password):
             raise RuntimeError(f"could not create {user}: {body.get('errors')}")
 
+    def lockout_ou(self, ou, threshold, user):
+        items = [{"key": "lockout-threshold", "value": str(threshold)},
+                 {"key": "lockout-duration-seconds", "value": "0"}]
+        bodies = [self.graphql("mutation($n: String!) { createOu(name: $n) { ok } }", {"n": ou}),
+                  self.graphql("mutation($n: String!, $i: [PolicyItemInput!]) "
+                               "{ createPolicy(name: $n, items: $i) { id } }", {"n": f"{ou} lockout", "i": items})]
+        policy = ((bodies[1].get("data") or {}).get("createPolicy") or {}).get("id")
+        bodies += [self.graphql("mutation($o: String!, $p: Int!) { setOuPolicy(ou: $o, policyId: $p) { ok } }",
+                                {"o": ou, "p": policy}),
+                   self.graphql("mutation($ids: [String!]!, $ou: String!) "
+                                "{ changeUserOu(userIds: $ids, newOu: $ou) { ok } }", {"ids": [user], "ou": ou}),
+                   self.graphql("query($o: String!) { effectivePolicyItems(ou: $o) { key value } }", {"o": ou})]
+        errors = [body["errors"] for body in bodies if body.get("errors")]
+        now = {i["key"]: i["value"] for i in (bodies[-1].get("data") or {}).get("effectivePolicyItems") or []}
+        if errors or now.get("lockout-threshold") != str(threshold):
+            raise RuntimeError(f"could not put {user} under lockout-threshold {threshold} in {ou}: {errors or now}")
+
+    def unlock(self, user):
+        try:
+            body = self.graphql("mutation($u: String!) { unlockUser(userId: $u) { ok } }", {"u": user})
+        except Exception:
+            return False
+        return not body.get("errors") and bool(((body.get("data") or {}).get("unlockUser") or {}).get("ok"))
+
+    def copy_db(self, dest):
+        return run("docker", "cp", f"{self.name}:/data/users.db", dest).returncode == 0
+
     def bind(self, user, password):
         result = run("ldapwhoami", "-x", "-H", f"ldap://{ADDR}:{self.ldap}",
                      "-D", f"uid={user},ou=people,{BASE_DN}", "-w", password, timeout=15)
@@ -330,6 +367,15 @@ class HostServer(Server):
     def remove(self):
         pass
 
+    def copy_db(self, dest):
+        with open(dest, "wb") as f:
+            try:
+                done = subprocess.run(self.exec_argv("cat", f"{OPT}/users.db", root=True), stdout=f,
+                                      stderr=subprocess.DEVNULL, timeout=60)
+            except subprocess.TimeoutExpired:
+                return False
+        return done.returncode == 0
+
     def logs(self, since=None):
         window = ["--since", since.replace("T", " ").rstrip("Z") + " UTC"] if since else []
         result = run("ssh", ADDR, "sudo", "-n", "journalctl", "-u", "klldap", "--no-pager",
@@ -361,6 +407,52 @@ def release(killer, go):
 def refused(result):
     signed, text = result
     return not signed and REFUSED in text
+
+
+def end(process):
+    if process is None:
+        return
+    process.kill()
+    try:
+        process.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def db_number(server, sql):
+    out = ""
+    if DB == "postgres":
+        out = run("docker", "exec", PG, "psql", "-U", "klldap", "-d", "klldap", "-tAc", sql).stdout
+    elif MYSQL:
+        out = run("docker", "exec", MY, "sh", "-c",
+                  f'exec {DB} -h 127.0.0.1 -uroot -p"${DB.upper()}_ROOT_PASSWORD" -N -B -D klldap -e "$0"', sql).stdout
+    else:
+        copy = os.path.join(RUN_DIR, "db-copy.db")
+        for _ in range(3):
+            try:
+                if server.copy_db(copy):
+                    with closing(sqlite3.connect(copy)) as con:
+                        out = str(con.execute(sql).fetchone()[0])
+                    break
+            except sqlite3.Error:
+                pass
+            time.sleep(1)
+    out = out.strip()
+    return int(out) if out.lstrip("-").isdigit() else None
+
+
+def lockout_count(server, user):
+    return db_number(server, f"SELECT COALESCE(MAX(fail_count), 0) FROM login_lockouts WHERE user_id = '{user}'")
+
+
+def count_stored(server, user, want, wait_s=5.0):
+    """Whether the table holds `want` for the user within `wait_s`: a kill aims at a stored count."""
+    deadline = time.monotonic() + wait_s
+    while lockout_count(server, user) != want:
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.2)
+    return True
 
 
 def virsh(*args):
@@ -454,19 +546,115 @@ def recover(record, server, n):
     return back
 
 
-class Noise(threading.Thread):
-    """Failed logins for NOISE once a second, so the lockout file is being written at the cut."""
+def noise_step(possible, op, answer):
+    if answer == "S":
+        return {0}
+    if answer == "R":
+        return {x + 1 for x in possible}
+    if answer == "V":
+        return set(possible)
+    return set(possible) | ({0} if op == "c" else {x + 1 for x in possible})
 
-    def __init__(self, server):
+
+class Noise(threading.Thread):
+    """Wrong kinits back to back for NOISE, so its bounded write is in flight at many cuts, and for
+    NOISE_SVC, which keeps the lockout file written; `possible` holds the counts NOISE can have."""
+
+    def __init__(self, server, password):
         super().__init__(daemon=True)
-        self.server, self.stopped = server, threading.Event()
-        self.tries = self.refused = 0
+        self.server, self.password = server, password
+        self.stopped, self.paused, self.lock = threading.Event(), threading.Event(), threading.Lock()
+        self.tries = self.refused = self.sent = self.cuts = self.in_window = 0
+        self.possible, self.outstanding, self.shell = {0}, None, None
+        self.open()
+
+    def open(self):
+        argv = self.server.exec_argv("sh", "-c", NOISE_SHELL, NOISE, NOISE_SVC, test_password(0), interactive=True)
+        self.shell = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                      stderr=subprocess.DEVNULL, text=True)
+
+    def ask(self, shell, op):
+        try:
+            shell.stdin.write(op + "\n" + (self.password + "\n" if op == "c" else ""))
+            shell.stdin.flush()
+            return shell.stdout.readline().strip()
+        except (OSError, ValueError):
+            return ""
 
     def run(self):
         while not self.stopped.is_set():
-            self.tries += 1
-            self.refused += refused(self.server.kinit(NOISE, test_password(0)))
-            self.stopped.wait(1)
+            shell = self.shell
+            if self.paused.is_set() or shell is None:
+                self.stopped.wait(0.2)
+                continue
+            with self.lock:
+                if len(self.possible) > 1 or max(self.possible) >= NOISE_RESET:
+                    op = "c"
+                else:
+                    op = "s" if self.sent % NOISE_SVC_EVERY == NOISE_SVC_EVERY - 1 else "f"
+                self.sent += 1
+                self.outstanding = None if op == "s" else op
+            answer = self.ask(shell, op)
+            after = None
+            with self.lock:
+                if op != "s" and not self.paused.is_set():
+                    after = noise_step(self.possible, op, answer)
+                    # An answered count may still be owed past the 250 ms bound: a cut can lose it.
+                    self.possible = after | (self.possible if answer == "R" else set())
+                self.outstanding = None
+                self.tries += 1
+                self.refused += answer == "R"
+            if answer == "R" and after is not None:
+                self.read_back(after)
+            if not answer and not self.paused.is_set():
+                end(shell)
+                self.stopped.wait(1)
+                if not self.paused.is_set():
+                    self.open()
+                continue
+            self.stopped.wait(NOISE_GAP)
+
+    def read_back(self, after):
+        """Once the table holds the answered count, a cut keeps it: `possible` is `after` again."""
+        deadline = time.monotonic() + NOISE_READ_BACK_S
+        while time.monotonic() < deadline and not self.paused.is_set():
+            if lockout_count(self.server, NOISE) in after:
+                with self.lock:
+                    if not self.paused.is_set():
+                        self.possible = set(after)
+                return
+            time.sleep(0.1)
+
+    def cut(self):
+        with self.lock:
+            op = self.outstanding
+            possible = self.possible | (noise_step(self.possible, op, "") if op else set())
+            self.paused.set()
+            self.cuts += 1
+            self.in_window += op is not None
+        end(self.shell)
+        return possible, op
+
+    def resume(self, possible):
+        with self.lock:
+            self.possible, self.outstanding = set(possible), None
+        self.open()
+        self.paused.clear()
+
+    def finish(self):
+        self.stopped.set()
+        end(self.shell)
+        self.join(timeout=90)
+
+
+def noise_check(record, server, noise, n, possible, op):
+    got = lockout_count(server, NOISE)
+    signed, why = server.kinit(NOISE, noise.password)
+    locked = not signed and "revoked" in why
+    ok = got is not None and got in possible and locked == (got >= NOISE_MAX)
+    record.line("noise", ok, f"NOISE n={n} db={DB} in_window={'yes' if op else 'no'} op_at_cut={op or 'none'} "
+                             f"possible={','.join(str(x) for x in sorted(possible))} got={got},locked={locked}")
+    noise.resume({0} if signed else {0, NOISE_RESET if got is None else got})
 
 
 def volume(label):
@@ -512,26 +700,28 @@ def set_up(row):
     if server.wait_healthy(BOOT_LIMIT if POWER else HEALTH_LIMIT) is None:
         server.keep_logs("start")
         raise RuntimeError("the server did not become healthy")
-    lock_password = test_password(0)
+    lock_password, noise_password = test_password(0), None
     server.create_user(WRITER, test_password(0))
     server.create_user(LOCKED, lock_password)
-    queries = [f"addprinc -randkey {SERVICE}",
-               f"addpol -maxfailure {MAX_FAIL} -failurecountinterval 0 -lockoutduration 0 {POLICY}",
-               f"modprinc -policy {POLICY} {LOCKED}"]
+    server.lockout_ou(LOCK_OU, MAX_FAIL, LOCKED)
+    queries = [f"addprinc -randkey {SERVICE}"]
     if POWER:
-        server.create_user(NOISE, test_password(0))
-        queries += [f"addpol -maxfailure 1000000 -failurecountinterval 0 {NOISE_POLICY}",
-                    f"modprinc -policy {NOISE_POLICY} {NOISE}"]
+        noise_password = test_password(0)
+        server.create_user(NOISE, noise_password)
+        server.lockout_ou(NOISE_OU, NOISE_MAX, NOISE)
+        queries += [f"addprinc -randkey {NOISE_SVC}",
+                    f"addpol -maxfailure 1000000 -failurecountinterval 0 {NOISE_POLICY}",
+                    f"modprinc -policy {NOISE_POLICY} {NOISE_SVC}"]
     if "d" in KINDS:
         queries.append(f"addprinc -randkey {SECOND}")
     for query in queries:
         if not server.kadmin(query)[1]:
             raise RuntimeError(f"kadmin {query} failed")
-    return server, lock_password
+    return server, lock_password, noise_password
 
 
 def acc3(record, kills):
-    server, lock_password = set_up("acc3")
+    server, lock_password, _ = set_up("acc3")
     n = 0
     for kind in KINDS:
         for i in range(kills):
@@ -541,23 +731,25 @@ def acc3(record, kills):
 
 
 def acc8(record, cuts):
-    server, lock_password = set_up("acc8")
-    noise = Noise(server)
+    server, lock_password, noise_password = set_up("acc8")
+    noise = Noise(server, noise_password)
     noise.start()
     time.sleep(SETTLE)
     try:
         for n in range(1, cuts + 1):
             kind, i = KINDS[(n - 1) % len(KINDS)], (n - 1) // len(KINDS)
-            if not one_kill(record, server, n, kind, i, lock_password):
+            if not one_kill(record, server, n, kind, i, lock_password, noise):
                 raise RuntimeError(f"the server did not come back after cut {n}")
     finally:
-        noise.stopped.set()
-        noise.join(timeout=90)
-        record.note(f"NOISE user={NOISE} tries={noise.tries} refused={noise.refused} (recorded, not judged)")
+        noise.finish()
+        record.noise = {"user": NOISE, "service": NOISE_SVC, "tries": noise.tries, "refused": noise.refused,
+                        "cuts": noise.cuts, "in_window": noise.in_window}
+        record.note(f"NOISE user={NOISE} service={NOISE_SVC} tries={noise.tries} refused={noise.refused} "
+                    f"cuts={noise.cuts} in_window={noise.in_window} (tries and refused recorded, not judged)")
 
 
-def one_kill(record, server, n, kind, i, lock_password):
-    head = f"KILL n={n} db={DB} kind={kind}"
+def one_kill(record, server, n, kind, i, lock_password, noise=None):
+    head, at_cut = f"KILL n={n} db={DB} kind={kind}", None
     if POWER:
         with open(os.path.join(RUN_DIR, f"pre-cut-{n}.log"), "w", encoding="utf-8") as f:
             f.write(server.logs())
@@ -586,8 +778,6 @@ def one_kill(record, server, n, kind, i, lock_password):
         else:
             target, count = LOCKED, i % MAX_FAIL + 1
             expect = f"{count},locked={count == MAX_FAIL}"
-            # A failure in the same whole second as the last unlock resets the count (MIT's audit).
-            time.sleep(2)
             refused_before = all(refused(server.kinit(LOCKED, test_password(n)))
                                  for _ in range(count - 1))
             command = ("sh", "-c", 'printf "%s\\n" "$0" | KRB5CCNAME=/tmp/dur_cc kinit "$1"',
@@ -600,11 +790,12 @@ def one_kill(record, server, n, kind, i, lock_password):
                 acked = acked and all(f'"{p}@{REALM}" randomized' in out for p in (SERVICE, SECOND))
         else:
             acked = killer is not None and refused_before and rc != 0 and REFUSED in out
+            acked = acked and count_stored(server, LOCKED, count)
     if not acked:
         if killer is not None:
             release(killer, False)
-        if kind == "c":
-            server.kadmin(f"modprinc -unlock {LOCKED}")
+        if kind == "c" and not server.unlock(LOCKED):
+            record.note(f"UNLOCK n={n} unlockUser {LOCKED} failed")
         record.line(kind, False, f"{head} target={target} the write was not acknowledged")
         return server.healthy()
     entry = {"n": n, "db": DB, "kind": kind, "target": target, "expect": expect}
@@ -619,6 +810,7 @@ def one_kill(record, server, n, kind, i, lock_password):
     if POWER:
         destroy_ms = cut_guest()
         cut_at = time.perf_counter_ns()
+        at_cut = noise.cut() if noise else None
         gap_ms = (cut_at - read_at) / 1e6
         killer.kill()
         try:
@@ -677,6 +869,8 @@ def one_kill(record, server, n, kind, i, lock_password):
         if POWER:
             save_evidence(server, n)
         return not_back(record, server, kind, f"{head} target={target} {timing}".rstrip(), n)
+    if at_cut is not None:
+        noise_check(record, server, noise, n, *at_cut)
     if not POWER:
         client_return, kill_stamp = server.killed_at()
         start_ns = returned if kind == "b" else client_return
@@ -697,19 +891,19 @@ def one_kill(record, server, n, kind, i, lock_password):
         bound, (signed, _) = server.bind(WRITER, password), server.kinit(WRITER, password)
         got, ok = f"bind={bound},kinit={signed}", bound and signed
     else:
-        failures = server.field(LOCKED, "Failed password attempts:")
+        failures = lockout_count(server, LOCKED)
         signed, why = server.kinit(LOCKED, lock_password)
         locked = not signed and "revoked" in why
         got = f"{failures},locked={locked}"
         ok = got == expect
         if POWER:
-            # A cut may forget recent counts (no fsync), never mix them: any value it had since the unlock.
-            had = int(failures) if failures and failures.isdigit() else None
-            ok = had is not None and had <= count and locked == (had >= MAX_FAIL)
-            got += f",lost={count - had if had is not None else 'unknown'}"
-            if had is not None and had < count:
-                record.losses.append(count - had)
-        server.kadmin(f"modprinc -unlock {LOCKED}")
+            # The count was read back from the table before the cut, so it survives whole.
+            ok = failures == count and locked == (failures >= MAX_FAIL)
+            got += f",lost={count - failures if failures is not None else 'unknown'}"
+            if failures is not None and failures < count:
+                record.losses.append(count - failures)
+        if not server.unlock(LOCKED):
+            record.note(f"UNLOCK n={n} unlockUser {LOCKED} failed")
     if not ok or finding:
         server.keep_logs(f"kill-{n}")
     found = f"FINDING degraded start ({finding!r}), evidence-{n}/, recovered; " if finding else ""
@@ -872,6 +1066,10 @@ def main():
         record.note(f"ROW install={install} db={DB} lockout_young cuts={len(record.young)} "
                     f"kept_and_opened={sum(record.young)} (a cut under {YOUNG_S} s after the "
                     "file's last write)")
+        if record.noise:
+            passed, fails = record.counts.get("noise", (0, 0))
+            record.note(f"ROW install={install} db={DB} noise cuts={record.noise['cuts']} "
+                        f"in_window={record.noise['in_window']} pass={passed} fail={fails}")
     summary = {"row": ROW, "db": DB, "image": IMAGE, "image_id": ENV.get("DUR_IMAGE_ID", ""),
                "driver": ENV.get("DUR_REV", ""), "seconds": round(time.time() - started),
                "kinds": KINDS, "counts": {k: {"pass": p, "fail": f} for k, (p, f) in record.counts.items()},
@@ -879,7 +1077,8 @@ def main():
                "lockout_lost_cuts": len(record.losses), "lockout_lost_sum": sum(record.losses),
                "degraded_starts": record.degraded, "findings": record.degraded,
                "install": install, "acknowledged": record.acknowledged,
-               "lockout_young": {"cuts": len(record.young), "kept_and_opened": sum(record.young)}}
+               "lockout_young": {"cuts": len(record.young), "kept_and_opened": sum(record.young)},
+               "noise": record.noise}
     with open(os.path.join(RUN_DIR, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, sort_keys=True)
     failed = sum(f for _, f in record.counts.values())

@@ -1,7 +1,7 @@
 # shellcheck shell=bash
 # Phase: TOTP second factor — the exempt group exists, enrollment over GraphQL, the
 # password:code format at the LDAP and simple-login doors, replay refusal, the
-# administrative reset, and the log rows.
+# administrative reset, the log rows, and the two-factor pages driven in a browser.
 
 D="$(phase_dir)"
 MFA_USER="gatemfa"
@@ -64,7 +64,11 @@ else
     p_bad "plain simple login failed before enrollment"
 fi
 
-TOKEN="$USER_TOKEN" graphql 'mutation { startMfaEnrollment { secretBase32 state } }' '{}' \
+PROOF="$(gate_enrollment_proof "$MFA_USER" "$MFA_PASS" 2>"$D/proof.err")" \
+    || p_bad "enrollment proof failed (see proof.err)"
+# shellcheck disable=SC2016
+TOKEN="$USER_TOKEN" graphql 'mutation($p: String) { startMfaEnrollment(enrollmentProof: $p) { secretBase32 state } }' \
+    '{"p": "'"$PROOF"'"}' \
     >"$D/start.json" 2>"$D/start.err" || p_bad "startMfaEnrollment failed (see start.err)"
 SECRET="$(json_get startMfaEnrollment.secretBase32 <"$D/start.json" 2>/dev/null)"
 STATE="$(json_get startMfaEnrollment.state <"$D/start.json" 2>/dev/null)"
@@ -148,4 +152,98 @@ if log_query_has_row '{ logs(filter: {kinds: [MFA_RESET], actor: "admin"}) { kin
     p_ok "mfa_reset row is in the log"
 else
     p_bad "no mfa_reset row"
+fi
+
+# The pages, as the user: a first enrollment, the old one-field form, a wrong code, sign-in in
+# two steps, a replacement, the change page and the own reset; each page's submit is sent
+# twice in one tick, the second past the disabled button, so the page's own guard must stop
+# it. Each WIRE line is what that row sent; no request may carry the password in any
+# encoding, the page may not keep it, and nothing the page prints may show it.
+MFA_BROWSER_IMAGE="mcr.microsoft.com/playwright@sha256:766137e2d9caad4744187e53cdc89320ba6f2eb57cff097374020944b44dd0a9"
+MFA_BROWSER_CTN="klldap-mfa-pages-${RUNID}"
+MFA_NEW_PASS="$(python3 -c 'import secrets; print("Gm" + secrets.token_hex(8))')"
+MFA_TAIL="password-sent=no stored=no console-leak=no"
+MFA_ROWS=(
+    "mfa-login|two submits of Login in one tick sign in once with the password alone before enrolling|starts=1 finishes=1 sessionless=0 proof-asked=0 codes=0 statuses=200"
+    "mfa-enrol|the enrollment page asks the password, has the server check it without a session, and enrolls; two submits in one tick start once, at each step|starts=2 finishes=2 sessionless=2 proof-asked=1 codes=0 statuses=200/200"
+    "mfa-old-form|password:code in the password field fails as a wrong password, with the next-step hint, and sends no finish|starts=1 finishes=0 sessionless=0 proof-asked=0 codes=0 statuses=none"
+    "mfa-wrong-code|a wrong code stays on the code step|starts=2 finishes=2 sessionless=0 proof-asked=0 codes=1 statuses=200/401"
+    "mfa-signin|the code step signs in with a fresh start and the code; two submits of Verify in one tick start once|starts=1 finishes=1 sessionless=0 proof-asked=0 codes=1 statuses=200"
+    "mfa-replace|replacing the factor takes the current code and checks the password without a session|starts=1 finishes=1 sessionless=1 proof-asked=0 codes=0 statuses=200"
+    "mfa-change|the change page starts once with the whole old password, without a session, when submitted twice in one tick|starts=1 finishes=1 sessionless=1 proof-asked=0 codes=0 statuses=200"
+    "mfa-reset|the reset page checks the password without a session, once when submitted twice in one tick|starts=1 finishes=1 sessionless=1 proof-asked=0 codes=0 statuses=200"
+)
+
+mfa_pages_run() {
+    docker rm -f -v "$MFA_BROWSER_CTN" >/dev/null 2>&1 || true
+    # -e NAME, not -e NAME=value, so the passwords are not on the host's command line.
+    (
+        export BROWSER_PASS="$MFA_PASS" BROWSER_NEW_PASS="$MFA_NEW_PASS"
+        timeout 300 docker run --rm --name "$MFA_BROWSER_CTN" --network "$NET" --init --shm-size=1g \
+            --user "$(id -u):$(id -g)" --entrypoint node \
+            -v "$GATE_ROOT/lib/browser.mjs:/work/browser.mjs:ro" -v "$D:/out" \
+            -e HOME=/tmp/home -e BROWSER_OUT=/out -e BROWSER_MODE=mfa \
+            -e BROWSER_URL="http://${CONTAINER}:17170" -e BROWSER_USER="$MFA_USER" \
+            -e BROWSER_PASS -e BROWSER_NEW_PASS \
+            "$MFA_BROWSER_IMAGE" /work/browser.mjs >"$D/mfa-pages.out" 2>"$D/mfa-pages.err"
+    )
+    docker rm -f -v "$MFA_BROWSER_CTN" >/dev/null 2>&1 || true
+}
+
+# mfa_rows_with <detail>: the user's login rows with that detail, polled while the writer lingers.
+mfa_rows_with() {
+    local want="$1" got=-1
+    for _ in $(seq 1 20); do
+        got="$(log_rows "kind = 'login' AND actor = '$MFA_USER' AND detail = '$want'")"
+        [ "$got" = "$2" ] && break
+        sleep 0.5
+    done
+    printf '%s\n' "$got"
+}
+
+mfa_pages_rows() {
+    local entry name label want row wire reached=yes
+    for entry in "${MFA_ROWS[@]}"; do
+        IFS='|' read -r name label want <<<"$entry"
+        if [ "$reached" = no ]; then
+            p_bad "[M1.$name] $label: not reached"
+            continue
+        fi
+        row="$(grep -m1 "^ROW $name " "$D/mfa-pages.out" 2>/dev/null)"
+        wire="$(grep -m1 "^WIRE $name " "$D/mfa-pages.out" 2>/dev/null)"
+        if [ "$row" = "ROW $name PASS" ] && [ "$wire" = "WIRE $name $want $MFA_TAIL" ]; then
+            p_ok "[M1.$name] $label; nothing sent or kept carries the password"
+        elif [ "$row" = "ROW $name PASS" ]; then
+            p_bad "[M1.$name] $label: ${wire:-no WIRE line}; want WIRE $name $want $MFA_TAIL"
+        else
+            p_bad "[M1.$name] $label: ${row:-not reached} (see mfa-pages.out, $name.png)"
+            reached=no
+        fi
+    done
+}
+
+if ! docker image inspect "$MFA_BROWSER_IMAGE" >/dev/null 2>&1; then
+    p_skip "[M1.browser] browser image absent: ${MFA_BROWSER_IMAGE}; the page rows did not run"
+elif [ -z "$MFA_NEW_PASS" ]; then
+    p_bad "[M1.browser] could not make a per-run password"
+else
+    EXTRA_CONTAINERS+=("$MFA_BROWSER_CTN")
+    mfa_pages_run || true
+    grep '^CONTEXT \|^FINDING ' "$D/mfa-pages.out" 2>/dev/null | while IFS= read -r line; do note "$line"; done
+    mfa_pages_rows
+    if grep -q '^ROW mfa-reset PASS' "$D/mfa-pages.out" 2>/dev/null; then
+        if t ldapwhoami -x -H "$(ldap_url)" -D "$MFA_DN" -w "$MFA_NEW_PASS" >"$D/bind-pages.out" 2>&1; then
+            p_ok "[M1.pages-bind] after the pages' change and reset, the new password binds alone"
+        else
+            p_bad "[M1.pages-bind] the new password does not bind after the pages (see bind-pages.out)"
+        fi
+        nosession="$(mfa_rows_with 'no session' 2)"
+        challenged="$(mfa_rows_with 'totp code required; no session' 3)"
+        if [ "$nosession $challenged" = "2 3" ]; then
+            p_ok "[M1.pages-rows] every row of a password check says 'no session': the enrollment page's two, and 'totp code required; no session' for the replacement, change and reset"
+        else
+            p_bad "[M1.pages-rows] login rows for $MFA_USER: 'no session' $nosession (want 2), 'totp code required; no session' $challenged (want 3)"
+        fi
+    fi
+    docker rm -f -v "$MFA_BROWSER_CTN" >/dev/null 2>&1 || true
 fi

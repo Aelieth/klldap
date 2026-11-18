@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# Phase: "nothing is enforced": each policy item set and shown effective, then simple login, LDAP bind, kinit; rows say today | when enforced.
+# Phase: each policy item set and shown effective, then simple login, LDAP bind, kinit; lockout-threshold locks, the other rows say today | when enforced.
 
 NE_D="$(phase_dir)"
 NE_N=0 NE_P=0 NE_F=0 NE_K=0 NE_FIND=()
@@ -31,7 +31,7 @@ ne_bind() {
 }
 ne_kinit() {
     kinit_pw "$NE_USER@$REALM" "$1" >"$NE_D/kinit.out" 2>&1 && echo ok && return
-    grep -q "Password incorrect" "$NE_D/kinit.out" && echo incorrect || echo other
+    if grep -q "credentials have been revoked" "$NE_D/kinit.out"; then echo revoked; elif grep -q "Password incorrect" "$NE_D/kinit.out"; then echo incorrect; else echo other; fi
 }
 ne_right() {
     case "$1" in
@@ -44,8 +44,31 @@ ne_wrong_refused() {
     case "$1" in
     simple-login) [ "$(ne_simple "$NE_USER" "$2")" = 401 ] ;;
     ldap-bind) [ "$(ne_bind "$2")" = 49 ] ;;
-    kinit) [ "$(ne_kinit "$2")" = incorrect ] ;;
+    kinit) [ "$(ne_kinit "$2")" = "${3:-incorrect}" ] ;;
     esac
+}
+ne_locked() {
+    case "$1" in
+    simple-login) [ "$(ne_simple "$NE_USER" "$NE_PASS")" = 401 ] ;;
+    ldap-bind) [ "$(ne_bind "$NE_PASS")" = 49 ] ;;
+    kinit) [ "$(ne_kinit "$NE_PASS")" = revoked ] ;;
+    esac
+}
+ne_unlock() {
+    local out
+    out="$(ne_gql 'mutation($u: String!) { unlockUser(userId: $u) { ok } }' '{"u": "'"$NE_USER"'"}')" &&
+        [ "$(json_get unlockUser.ok <<<"$out" 2>/dev/null)" = True ]
+}
+
+# The threshold sits on the test OU alone: the root takes back its own policy meanwhile.
+ne_root() {
+    local p="${NE_ROOT_BEFORE:-}"
+    [ "$1" = ours ] && p="$NE_POLICY"
+    if [ -n "$p" ]; then
+        ne_gql 'mutation($p: Int!) { setOuPolicy(ou: "", policyId: $p) { ok } }' '{"p": '"$p"'}' >/dev/null
+    else
+        ne_gql 'mutation { clearOuPolicy(ou: "") { ok } }' '{}' >/dev/null
+    fi
 }
 
 ne_door() {
@@ -124,25 +147,40 @@ print(next((str(x["policyId"] or "") for x in json.load(sys.stdin)["ouPolicyStat
 }
 
 ne_today() {
-    local day i bad
+    local day i bad want
     ne_case require-mfa always &&
         for door in simple-login ldap-bind kinit; do
             ne_door "P2.1-$door" "require-mfa=always, user without MFA" "$door" \
                 "refused until the user enrols a second factor$([ "$door" = kinit ] && echo '; kinit has no code today, so enforcement needs a Kerberos-side answer')"
         done
-    ne_case lockout-threshold 3 &&
+    ne_root before && ne_case lockout-threshold 3 &&
         for door in simple-login ldap-bind kinit; do
             bad=0
-            for i in $(seq 1 10); do ne_wrong_refused "$door" "wrong-$i-$NE_RUN" || bad=$((bad + 1)); done
-            [ "$bad" = 0 ] || ne_finding "[P2.2-$door-wrong] $bad of 10 wrong passwords at $door were not refused as wrong (want HTTP 401, LDAP 49, 'Password incorrect')"
-            ne_door "P2.2-$door" "lockout-threshold=3 after ten wrong passwords" "$door" \
-                "refused: locked after 3 failures for lockout-duration-seconds (default 900)"
+            for i in $(seq 1 10); do
+                want=incorrect
+                [ "$i" -gt 3 ] && want=revoked
+                ne_wrong_refused "$door" "wrong-$i-$NE_RUN" "$want" || bad=$((bad + 1))
+            done
+            [ "$bad" = 0 ] || ne_finding "[P2.2-$door-wrong] $bad of 10 wrong passwords at $door were not refused as wrong (want HTTP 401, LDAP 49, kinit 'Password incorrect' for the first 3, then 'credentials have been revoked')"
+            if ne_locked "$door"; then
+                ne_pass "[P2.2-$door] lockout-threshold=3 after ten wrong passwords, $door with the right password: refused as locked (HTTP 401, LDAP 49, kinit revoked), for lockout-duration-seconds (default 900)"
+            else
+                ne_finding "[P2.2-$door] lockout-threshold=3 after ten wrong passwords, $door with the right password was not refused as locked"
+            fi
+            if ne_unlock && ne_right "$door"; then
+                ne_pass "[P2.2-$door-unlock] unlockUser $NE_USER, then the right password at $door: allowed"
+            else
+                ne_finding "[P2.2-$door-unlock] unlockUser $NE_USER failed, or the right password at $door was still refused after it: $(head -c 200 "$NE_D/last.err")"
+            fi
         done
     day="$(LC_ALL=C date -d '+2 days' +%a | tr 'A-Z' 'a-z')"
-    ne_case login-hours "$day 03:00-03:01" &&
+    # The root takes the test policy again only once its items no longer hold the threshold.
+    ne_case login-hours "$day 03:00-03:01" && {
+        ne_root ours || ne_finding "[P2.2-root] the test policy could not be set on the root again"
         for door in simple-login ldap-bind kinit; do
             ne_door "P2.3-$door" "login-hours='$day 03:00-03:01' (now is outside it)" "$door" "refused outside the window"
         done
+    }
     ne_case allowed-networks "192.0.2.0/24" &&
         for door in simple-login ldap-bind kinit; do
             ne_door "P2.4-$door" "allowed-networks=192.0.2.0/24 (TEST-NET-1, RFC 5737; the client is not in it)" "$door" \
@@ -178,8 +216,17 @@ print(next((str(x["policyId"] or "") for x in json.loads(os.environ["NEL"])["ouP
         p_bad "the root's policy was not restored to '${NE_ROOT_BEFORE:-none}'"
 }
 
+# On any exit the root and the test OU are unlinked first, then the gate's own exit runs.
+ne_trap_command() {
+    eval "set -- $1"
+    printf '%s' "${3:-}"
+}
+NE_TRAP="$(trap -p EXIT)"
+# shellcheck disable=SC2064
+trap "ne_cleanup; $(ne_trap_command "$NE_TRAP")" EXIT
 if ne_setup; then ne_today; fi
 ne_cleanup
+if [ -n "$NE_TRAP" ]; then eval "$NE_TRAP"; else trap - EXIT; fi
 note "--- policy-not-enforced FINDING rows ---"
 for f in "${NE_FIND[@]}"; do note "[FINDING] ${PHASE}: $f"; done
 note "policy-not-enforced: $NE_N rows, $NE_P pass, $NE_F FINDING, $NE_K NOTE"

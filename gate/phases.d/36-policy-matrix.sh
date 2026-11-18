@@ -190,8 +190,9 @@ pm_catalog() {
     got="$(PMA="$a" python3 -c '
 import json, os
 c = json.loads(os.environ["PMA"])["data"]["policyItemCatalog"]
-print(len(c), all(i["enforced"] is False for i in c))')"
-    pm_row "$([ "$got" = "6 True" ] && echo 0 || echo 1)" "catalog lists six items, none enforced" "got $got"
+print(len(c), ",".join(sorted(i["key"] for i in c if i["enforced"] is True)), all(isinstance(i["enforced"], bool) for i in c))')"
+    pm_row "$([ "$got" = "6 lockout-duration-seconds,lockout-threshold True" ] && echo 0 || echo 1)" \
+        "catalog lists six items, exactly lockout-threshold and lockout-duration-seconds enforced" "got $got"
     for want in "require-mfa=off" "lockout-threshold=0" "lockout-duration-seconds=900" "login-hours=" "allowed-networks=" "inactivity-days=0"; do
         got="$(PMA="$a" PMK="${want%%=*}" python3 -c '
 import json, os

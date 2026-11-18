@@ -301,6 +301,7 @@ pub(crate) fn profile(settings: &RealmSettings) -> ProfileSet {
         .map(|etype| etype.to_mit_name().to_owned())
         .collect();
     let krb5 = Krb5Conf {
+        default_realm: Some(settings.realm.clone()),
         ticket_lifetime: Some(settings.ticket_lifetime),
         renew_lifetime: Some(settings.renew_lifetime),
         forwardable: settings.forwardable,
@@ -823,6 +824,16 @@ mod tests {
         let kdc = profile.kdc.as_ref().expect("a KDC profile");
         let rows = [
             ("realm", profile.realm.clone(), "EXAMPLE.COM".to_owned()),
+            (
+                "default_realm",
+                format!("{:?}", profile.krb5.default_realm),
+                "Some(\"EXAMPLE.COM\")".to_owned(),
+            ),
+            (
+                "kdc_context default_realm",
+                format!("{:?}", profile.kdc_context.default_realm),
+                "Some(\"EXAMPLE.COM\")".to_owned(),
+            ),
             (
                 "ticket_lifetime",
                 format!("{:?}", profile.krb5.ticket_lifetime),

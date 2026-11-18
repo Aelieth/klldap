@@ -18,8 +18,11 @@ use lldap_domain::{
     requests::{CreateGroupRequest, CreateUserRequest},
     types::{Attribute, AttributeType, Email, GroupName, UserId},
 };
+use lldap_domain_handlers::kerberos::{KerberosState, settled_state};
+use lldap_domain_handlers::logging::LogKind;
 use lldap_domain_handlers::password::{
-    PasswordSync, change_password_everywhere, create_synced_user,
+    PasswordSync, change_password_everywhere, create_synced_user, password_rules, realm_not_ready,
+    record_failed,
 };
 use lldap_schema::{AttributeList, KERBEROS_SYNC, PublicSchema};
 use std::collections::HashMap;
@@ -286,6 +289,17 @@ async fn create_user(
             LdapResultCode::Success,
             String::new(),
         )]);
+    }
+    if plain_password.is_some()
+        && let KerberosState::NotReady(cause) = settled_state()
+    {
+        let refused = realm_not_ready(&cause);
+        record_failed(LogKind::UserCreate, &user_id, &refused);
+        return Err(password_change_error(refused));
+    }
+    if let Some(Err(e)) = plain_password.map(password_rules) {
+        record_failed(LogKind::UserCreate, &user_id, &e);
+        return Err(password_change_error(e));
     }
     backend_handler
         .create_user(request)
@@ -907,6 +921,7 @@ mod tests {
         vec![
             format!("create {user}"),
             format!("password {user}"),
+            format!("synced {user}"),
             "log user_create".to_owned(),
             "log password_change".to_owned(),
         ]
@@ -920,7 +935,7 @@ mod tests {
             },
             LdapPartialAttribute {
                 atype: "userPassword".to_owned(),
-                vals: vec![b"s3cret".to_vec()],
+                vals: vec![b"s3cret-pw".to_vec()],
             },
         ]
     }
@@ -959,7 +974,7 @@ mod tests {
             if with_password {
                 extra.push(LdapPartialAttribute {
                     atype: "userPassword".to_owned(),
-                    vals: vec![b"s3cret".to_vec()],
+                    vals: vec![b"s3cret-pw".to_vec()],
                 });
             }
             let ldap_handler = setup_bound_admin_handler(mock).await;
@@ -976,7 +991,7 @@ mod tests {
             let expected = if one_transaction {
                 vec![KerberosOp::CommitPassword {
                     username: "bob".into(),
-                    password: "s3cret".into(),
+                    password: "s3cret-pw".into(),
                     rows: add_rows("bob"),
                 }]
             } else {
@@ -1028,6 +1043,119 @@ mod tests {
             };
             assert_eq!(rows, expected, "{kdc:?}");
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_an_add_with_a_short_password_makes_nothing() {
+        use lldap_domain_handlers::password::{PASSWORD_HAS_NUL, PASSWORD_TOO_SHORT};
+        let refusals = [
+            ("pässwör", PASSWORD_TOO_SHORT),
+            ("a\0aaaaaaa", PASSWORD_HAS_NUL),
+        ];
+        for (synced, (password, refusal)) in [false, true]
+            .into_iter()
+            .flat_map(|synced| refusals.map(|row| (synced, row)))
+        {
+            let guard = RecordingGuard::install();
+            let mut mock = MockTestBackendHandler::new();
+            mock.expect_get_user_details()
+                .returning(|u| Err(DomainError::EntityNotFound(u.to_string())));
+            mock.expect_create_user().times(0);
+            mock.expect_registration_start().times(0);
+            mock.expect_registration_finish().times(0);
+            let mut extra = vec![LdapPartialAttribute {
+                atype: "userPassword".to_owned(),
+                vals: vec![password.as_bytes().to_vec()],
+            }];
+            if synced {
+                extra.push(LdapPartialAttribute {
+                    atype: "kerberossync".to_owned(),
+                    vals: vec![b"1".to_vec()],
+                });
+            }
+            let ldap_handler = setup_bound_admin_handler(mock).await;
+            assert_eq!(
+                (
+                    ldap_handler
+                        .create_user_or_group(&mut add_user_request(extra))
+                        .await,
+                    guard.recorder().take_ops()
+                ),
+                (
+                    Err(LdapError {
+                        code: LdapResultCode::UnwillingToPerform,
+                        message: refusal.to_owned(),
+                    }),
+                    vec![]
+                ),
+                "synced {synced}, {password:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_plain_add_with_a_password_while_not_ready_makes_nothing() {
+        use lldap_domain_handlers::password::realm_not_ready;
+        use lldap_test_utils::recording_kerberos::{DEGRADED_CAUSE, DegradedGuard};
+        use lldap_test_utils::recording_log::LogGuard;
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_get_user_details()
+            .returning(|u| Err(DomainError::EntityNotFound(u.to_string())));
+        mock.expect_create_user().times(0);
+        mock.expect_registration_start().times(0);
+        mock.expect_registration_finish().times(0);
+        let ldap_handler = setup_bound_admin_handler(mock).await;
+        let _degraded = DegradedGuard::install();
+        let log = LogGuard::install_on_this_thread();
+        let password = vec![LdapPartialAttribute {
+            atype: "userPassword".to_owned(),
+            vals: vec![b"Bob-Pass-1".to_vec()],
+        }];
+        let got = ldap_handler
+            .create_user_or_group(&mut add_user_request(password))
+            .await;
+        let rows: Vec<_> = log
+            .recorder()
+            .take_events()
+            .into_iter()
+            .filter(|e| e.target.as_deref() == Some("bob"))
+            .map(|e| (e.kind, e.success, e.detail))
+            .collect();
+        let refused = realm_not_ready(DEGRADED_CAUSE).to_string();
+        assert_eq!(
+            (got, rows),
+            (
+                Err(LdapError {
+                    code: LdapResultCode::Unavailable,
+                    message: refused.clone(),
+                }),
+                vec![(LogKind::UserCreate, false, Some(refused))]
+            )
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_synced_add_with_kerberos_disabled_makes_nothing() {
+        use lldap_domain_handlers::kerberos::CREATE_WITHOUT_SYNC;
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_get_user_details()
+            .returning(|u| Err(DomainError::EntityNotFound(u.to_string())));
+        mock.expect_create_user().times(0);
+        mock.expect_registration_start().times(0);
+        mock.expect_registration_finish().times(0);
+        let ldap_handler = setup_bound_admin_handler(mock).await;
+        assert_eq!(
+            ldap_handler
+                .create_user_or_group(&mut add_user_request(synced_with_password()))
+                .await,
+            Err(LdapError {
+                code: LdapResultCode::UnwillingToPerform,
+                message: CREATE_WITHOUT_SYNC.to_owned(),
+            })
+        );
     }
 
     #[tokio::test]

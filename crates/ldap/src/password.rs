@@ -89,7 +89,11 @@ fn totp_diagnostic(message: &str) -> String {
 
 pub(crate) fn password_change_error(e: PasswordChangeError) -> LdapError {
     let code = match &e {
-        PasswordChangeError::Refused(_) => LdapResultCode::UnwillingToPerform,
+        PasswordChangeError::TooShort
+        | PasswordChangeError::HasNul
+        | PasswordChangeError::Refused(_)
+        | PasswordChangeError::SyncChanged
+        | PasswordChangeError::KerberosDisabled(_) => LdapResultCode::UnwillingToPerform,
         PasswordChangeError::InProgress => LdapResultCode::Busy,
         PasswordChangeError::Unavailable(_) => LdapResultCode::Unavailable,
         PasswordChangeError::NoSuchUser => LdapResultCode::NoSuchObject,
@@ -233,8 +237,10 @@ pub mod tests {
         LdapBindCred, LdapBindResponse, LdapExtendedRequest, LdapOp, LdapResult as LdapResultOp,
     };
     use lldap_domain::types::{GroupDetails, GroupId, UserId, Uuid};
-    use lldap_domain_handlers::kerberos::CommitError;
-    use lldap_domain_handlers::password::{PASSWORD_CHANGE_IN_PROGRESS, RESULT_UNKNOWN};
+    use lldap_domain_handlers::kerberos::{CommitError, SYNC_CHANGED};
+    use lldap_domain_handlers::password::{
+        PASSWORD_CHANGE_IN_PROGRESS, RESULT_UNKNOWN, realm_not_ready,
+    };
     use lldap_test_utils::recording_kerberos::{
         DEGRADED_CAUSE, DegradedGuard, KerberosOp, RecordingGuard,
     };
@@ -522,7 +528,11 @@ pub mod tests {
         KerberosOp::CommitPassword {
             username: user.into(),
             password: password.into(),
-            rows: vec![format!("password {user}"), "log password_change".into()],
+            rows: vec![
+                format!("password {user}"),
+                format!("synced {user}"),
+                "log password_change".into(),
+            ],
         }
     }
 
@@ -687,7 +697,7 @@ pub mod tests {
             (
                 Kdc::Offline,
                 LdapResultCode::Unavailable,
-                format!("Kerberos KDC unavailable: {DEGRADED_CAUSE}"),
+                realm_not_ready(DEGRADED_CAUSE).to_string(),
             ),
             (
                 failed(CommitError::Busy),
@@ -698,6 +708,11 @@ pub mod tests {
                 failed(CommitError::Failed("late".to_owned())),
                 LdapResultCode::Other,
                 "password change failed: late".to_owned(),
+            ),
+            (
+                failed(CommitError::Refused(SYNC_CHANGED.to_owned())),
+                LdapResultCode::UnwillingToPerform,
+                "the user's Kerberos sync changed; try again".to_owned(),
             ),
             (
                 failed(CommitError::UserGone),
@@ -777,6 +792,70 @@ pub mod tests {
             )])
         );
         assert_eq!(guard.recorder().take_ops(), vec![]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_password_modify_without_sync_is_refused_where_the_realm_is_not_ready() {
+        let mut mock = MockTestBackendHandler::new();
+        setup_default_ldap_mock(&mut mock);
+        mock.expect_registration_start().times(0);
+        mock.expect_registration_finish().times(0);
+        mock.expect_ensure_kerberos_principal_consistency().times(0);
+        let mut ldap_handler = setup_bound_admin_handler(mock).await;
+        let _offline = DegradedGuard::install();
+        assert_eq!(
+            ldap_handler
+                .handle_ldap_message(password_modify_request("bob"))
+                .await,
+            Some(vec![make_extended_response(
+                LdapResultCode::Unavailable,
+                realm_not_ready(DEGRADED_CAUSE).to_string(),
+            )])
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_password_modify_without_sync_is_refused_when_the_switch_turned_on() {
+        let changed = Err(CommitError::Refused(SYNC_CHANGED.to_owned()));
+        let _guard = RecordingGuard::install_holding(changed);
+        let mut mock = MockTestBackendHandler::new();
+        setup_default_ldap_mock(&mut mock);
+        expect_registration_start(&mut mock, "bob");
+        mock.expect_registration_finish().times(0);
+        let mut ldap_handler = setup_bound_admin_handler(mock).await;
+        assert_eq!(
+            ldap_handler
+                .handle_ldap_message(password_modify_request("bob"))
+                .await,
+            Some(vec![make_extended_response(
+                LdapResultCode::UnwillingToPerform,
+                SYNC_CHANGED.to_owned(),
+            )])
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_password_modify_of_a_synced_user_with_kerberos_disabled_names_both_ways_on() {
+        use lldap_domain_handlers::kerberos::{SYNC_OFF_FIRST, while_disabled};
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_get_user_details()
+            .returning(|uid| Ok(synced_user(uid)));
+        setup_default_ldap_mock(&mut mock);
+        mock.expect_registration_start().times(0);
+        mock.expect_registration_finish().times(0);
+        let mut ldap_handler = setup_bound_admin_handler(mock).await;
+        assert_eq!(
+            ldap_handler
+                .handle_ldap_message(password_modify_request("bob"))
+                .await,
+            Some(vec![make_extended_response(
+                LdapResultCode::UnwillingToPerform,
+                while_disabled(SYNC_OFF_FIRST),
+            )])
+        );
     }
 
     #[tokio::test]

@@ -122,3 +122,52 @@ pub fn register_password_over_http(
         .error_for_status()
         .expect("register finish status");
 }
+
+// The pages' ceremony: `seal` makes the finish's envelope from the start answer's key.
+pub fn register_sealed(
+    client: &Client,
+    base_url: &str,
+    bearer: &str,
+    username: &str,
+    password: &str,
+    seal: impl FnOnce(Option<&str>) -> Option<String>,
+) -> (Option<String>, StatusCode, String) {
+    let mut rng = rand::rngs::OsRng;
+    let start = opaque::client::registration::start_registration(password.as_bytes(), &mut rng)
+        .expect("registration start");
+    let answer: registration::ServerRegistrationStart = client
+        .post(format!("{base_url}/auth/opaque/register/start"))
+        .bearer_auth(bearer)
+        .json(&registration::ClientRegistrationStartRequest {
+            username: UserId::new(username),
+            registration_start_request: start.message,
+        })
+        .send()
+        .expect("register start send")
+        .error_for_status()
+        .expect("register start status")
+        .json()
+        .expect("register start json");
+    let finish = opaque::client::registration::finish_registration(
+        start.state,
+        password.as_bytes(),
+        answer.response.registration_response,
+        &mut rng,
+    )
+    .expect("registration finish");
+    let key = answer.kerberos_envelope_key;
+    let response = client
+        .post(format!("{base_url}/auth/opaque/register/finish"))
+        .bearer_auth(bearer)
+        .json(&registration::ClientRegistrationFinish {
+            request: registration::ClientRegistrationFinishRequest {
+                server_data: answer.response.server_data,
+                registration_upload: finish.message,
+            },
+            kerberos_password_envelope: seal(key.as_deref()),
+        })
+        .send()
+        .expect("register finish send");
+    let status = response.status();
+    (key, status, response.text().expect("register finish body"))
+}

@@ -173,7 +173,7 @@ fn peer_text(peer: &HostAddress) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::embedded::tests::TempRealm;
+    use crate::embedded::tests::{TempRealm, synced};
     use crate::policy::tests::{tgs_body, ticket};
     use crate::seam::committing;
     use krb5_asn1::{decode, encode};
@@ -394,8 +394,7 @@ mod tests {
     async fn test_a_listed_client_is_refused_before_preauth_and_each_outcome_is_noted() {
         let temp = TempRealm::new();
         let (embedded, store) = temp.embedded();
-        embedded
-            .sync_principal(&UserId::new("bob"), PASSWORD)
+        synced(&embedded, &UserId::new("bob"), PASSWORD)
             .await
             .unwrap();
         let scratch = Scratch::new("as");
@@ -495,8 +494,7 @@ mod tests {
     async fn test_check_tgs_refuses_a_deleted_or_listed_subject() {
         let temp = TempRealm::new();
         let (embedded, store) = temp.embedded();
-        embedded
-            .sync_principal(&UserId::new("bob"), PASSWORD)
+        synced(&embedded, &UserId::new("bob"), PASSWORD)
             .await
             .unwrap();
         let scratch = Scratch::new("tgs");
@@ -611,8 +609,7 @@ mod tests {
     async fn child_signs_in_bob_through_install_plugins() {
         let temp = TempRealm::new();
         let (embedded, store) = temp.embedded();
-        embedded
-            .sync_principal(&UserId::new("bob"), PASSWORD)
+        synced(&embedded, &UserId::new("bob"), PASSWORD)
             .await
             .unwrap();
         crate::boot::install_plugins(&mut store.write().unwrap());
@@ -678,8 +675,7 @@ mod tests {
         let temp = TempRealm::new();
         let (embedded, store) = temp.embedded();
         for user in ["bob", "carol", "dave", "erin"] {
-            embedded
-                .sync_principal(&UserId::new(user), PASSWORD)
+            synced(&embedded, &UserId::new(user), PASSWORD)
                 .await
                 .unwrap();
         }
@@ -764,8 +760,7 @@ mod tests {
     async fn test_s4u2self_asks_about_the_impersonated_user_as_its_subject() {
         let temp = TempRealm::new();
         let (embedded, store) = temp.embedded();
-        embedded
-            .sync_principal(&UserId::new("bob"), PASSWORD)
+        synced(&embedded, &UserId::new("bob"), PASSWORD)
             .await
             .unwrap();
         let svc = service(&temp, &store);

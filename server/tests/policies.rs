@@ -81,10 +81,10 @@ fn test_policy_lifecycle_over_graphql() {
         &url,
         &admin,
         r#"mutation($id: String!, $password: String!) { setUserPassword(userId: $id, password: $password) { ok } }"#,
-        json!({"id": "bob", "password": "bobpass"}),
+        json!({"id": "bob", "password": "bobpass1"}),
     );
     assert_eq!(set_pw["data"]["setUserPassword"]["ok"], true, "{set_pw}");
-    let bob = get_token_for(&client, &url, "bob", "bobpass");
+    let bob = get_token_for(&client, &url, "bob", "bobpass1");
 
     let catalog = gql(&client, &url, &admin, CATALOG, json!({}));
     let items = catalog["data"]["policyItemCatalog"]

@@ -71,6 +71,7 @@ tracing-log = { workspace = true }
 tracing-subscriber = { workspace = true }
 url = { version = "2", features = ["serde"] }
 uuid = { workspace = true, features = ["v1", "v3", "v4", "serde"] }
+zeroize = "1"
 
 [dependencies.lldap_access_control]
 path = "../crates/access-control"
@@ -115,11 +116,13 @@ path = "../crates/validation"
 [dev-dependencies]
 assert_cmd = "2"
 base64 = { workspace = true }
+getrandom = { version = "0.4", features = ["sys_rng"] }
 graphql_client = { workspace = true, features = ["graphql_query_derive", "reqwest"] }
 ldap3 = { workspace = true }
 mockall = { workspace = true }
 nix = { version = "0.31", features = ["process", "signal"] }
 pretty_assertions = { workspace = true }
+rsa = "0.10.0"
 tempfile = "3"
 uuid = { workspace = true }
 

@@ -1,9 +1,6 @@
 use crate::infra::opaque::{
     LoginState, begin_login, begin_registration, finish_login, finish_registration,
 };
-use crate::infra::queries::{
-    GetKerberosInfo, SyncKerberosPassword, get_kerberos_info, sync_kerberos_password,
-};
 use crate::{
     components::{
         form::{field::Field, submit::Submit},
@@ -12,7 +9,6 @@ use crate::{
     infra::{
         api::{HostService, LoginOutcome},
         common_component::{CommonComponent, CommonComponentParts},
-        encrypt::encrypt_kerberos_password,
     },
 };
 use anyhow::{Result, anyhow, bail};
@@ -63,8 +59,6 @@ pub struct ChangePasswordForm {
     common: CommonComponentParts<Self>,
     form: Form<FormModel>,
     opaque_data: OpaqueData,
-    kerberos_info: Option<get_kerberos_info::GetKerberosInfoKerberosInfo>,
-    encrypted_password: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq, Properties)]
@@ -79,10 +73,8 @@ pub enum Msg {
     Submit,
     LoginStartResponse(Result<Box<login::ServerLoginStartResponse>>),
     LoginFinishResponse(Result<LoginOutcome>),
-    RegistrationStartResponse(Result<Box<registration::ServerRegistrationStartResponse>>),
+    RegistrationStartResponse(Result<Box<registration::ServerRegistrationStart>>),
     RegistrationFinishResponse(Result<()>),
-    KerberosInfoResponse(Result<get_kerberos_info::ResponseData>),
-    SyncKerberosResponse(Result<sync_kerberos_password::ResponseData>),
     SubmitNewPassword,
 }
 
@@ -95,10 +87,6 @@ impl CommonComponent<ChangePasswordForm> for ChangePasswordForm {
         use anyhow::Context;
         match msg {
             Msg::FormUpdate => Ok(true),
-            Msg::KerberosInfoResponse(res) => {
-                self.kerberos_info = Some(res?.kerberos_info);
-                Ok(true)
-            }
             Msg::Submit => {
                 if !self.form.validate() {
                     bail!("Check the form for errors");
@@ -168,15 +156,6 @@ impl CommonComponent<ChangePasswordForm> for ChangePasswordForm {
             }
             Msg::SubmitNewPassword => {
                 let new_password = self.form.model().password.clone();
-
-                // Kerberos encryption (strict, same pattern as create_user.rs)
-                self.encrypted_password = Some(encrypt_kerberos_password(
-                    self.kerberos_info
-                        .as_ref()
-                        .and_then(|i| i.public_key_der_base64.as_deref()),
-                    &new_password,
-                )?);
-
                 let (state, req) = begin_registration(&ctx.props().username, &new_password)?;
                 self.opaque_data = OpaqueData::Registration(Box::new(state));
                 self.common.call_backend(
@@ -192,7 +171,12 @@ impl CommonComponent<ChangePasswordForm> for ChangePasswordForm {
                     OpaqueData::Registration(r) => *r,
                     _ => bail!("Invalid state"),
                 };
-                let req = finish_registration(registration, &self.form.model().password, *res)?;
+                let req = finish_registration(
+                    registration,
+                    &ctx.props().username,
+                    &self.form.model().password,
+                    *res,
+                )?;
                 self.common.call_backend(
                     ctx,
                     HostService::register_finish(req),
@@ -202,25 +186,6 @@ impl CommonComponent<ChangePasswordForm> for ChangePasswordForm {
             }
             Msg::RegistrationFinishResponse(response) => {
                 response.map_err(|e| anyhow!("Failed to set new password: {e:#}"))?;
-                if let Some(enc_pw) = &self.encrypted_password {
-                    let variables = sync_kerberos_password::Variables {
-                        user_id: ctx.props().username.clone(),
-                        encrypted_password: enc_pw.clone(),
-                    };
-                    self.common.call_graphql::<SyncKerberosPassword, _>(
-                        ctx,
-                        variables,
-                        Msg::SyncKerberosResponse,
-                        "Error syncing Kerberos password",
-                    );
-                    Ok(false)
-                } else {
-                    self.navigate_to_user_details(ctx);
-                    Ok(true)
-                }
-            }
-            Msg::SyncKerberosResponse(response) => {
-                response?;
                 self.navigate_to_user_details(ctx);
                 Ok(true)
             }
@@ -249,8 +214,6 @@ impl Component for ChangePasswordForm {
             common: CommonComponentParts::<Self>::create(),
             form: Form::<FormModel>::new(FormModel::default()),
             opaque_data: OpaqueData::None,
-            kerberos_info: None,
-            encrypted_password: None,
         }
     }
 
@@ -261,18 +224,6 @@ impl Component for ChangePasswordForm {
     fn view(&self, ctx: &Context<Self>) -> Html {
         let link = ctx.link();
         let is_admin = ctx.props().is_admin;
-
-        if self.kerberos_info.is_none() {
-            return html! {
-              <>
-              { if let Some(e) = &self.common.error {
-                  html! { <div class="alert alert-danger">{e.to_string()}</div> }
-              } else { html! {} }}
-              <div>{"Loading Kerberos configuration..."}</div>
-              </>
-            };
-        }
-
         html! {
             <>
             <div class="mb-2 mt-2">
@@ -322,17 +273,6 @@ impl Component for ChangePasswordForm {
             </Submit>
             </form>
             </>
-        }
-    }
-
-    fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
-        if first_render {
-            self.common.call_graphql::<GetKerberosInfo, _>(
-                ctx,
-                get_kerberos_info::Variables {},
-                Msg::KerberosInfoResponse,
-                "Failed to load Kerberos info",
-            );
         }
     }
 }

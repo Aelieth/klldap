@@ -1,9 +1,10 @@
 use crate::common::{
-    auth::{get_token, get_token_for},
+    auth::{get_token, get_token_for, register_sealed},
     env,
-    fixture::{LLDAPFixture, free_port, query_i64},
+    fixture::{LLDAPFixture, exec_sql, free_port, query_i64},
 };
 use ldap3::LdapConn;
+use lldap_auth::kerberos_envelope::seal_kerberos_envelope;
 use reqwest::StatusCode;
 use reqwest::blocking::{Client, ClientBuilder};
 use serde_json::{Value, json};
@@ -354,6 +355,42 @@ fn kerberos_lifecycle() {
         "admin keytab was not rewritten"
     );
 
+    let off = gql(
+        &http,
+        &base,
+        &token,
+        "mutation($user: UpdateUserInput!) { updateUser(user: $user) { ok } }",
+        json!({"user": {"id": USER, "insertAttributes": [{"name": "kerberossync", "value": ["0"]}]}}),
+    );
+    assert_eq!(off["data"]["updateUser"]["ok"], true, "{off}");
+    let not_found = kinit(&krb, SECOND);
+    expect_fail(&not_found, "kinit after sync off");
+    assert!(
+        output_text(&not_found).contains("not found"),
+        "{}",
+        output_text(&not_found)
+    );
+    let on = gql(
+        &http,
+        &base,
+        &token,
+        "mutation($user: UpdateUserInput!) { updateUser(user: $user) { ok } }",
+        json!({"user": {"id": USER, "insertAttributes": [{"name": "kerberossync", "value": ["1"]}]}}),
+    );
+    assert_eq!(on["data"]["updateUser"]["ok"], true, "{on}");
+    let again = gql(
+        &http,
+        &base,
+        &token,
+        "mutation($id: String!, $password: String!) { setUserPassword(userId: $id, password: $password) { ok } }",
+        json!({"id": USER, "password": SECOND}),
+    );
+    assert_eq!(again["data"]["setUserPassword"]["ok"], true, "{again}");
+    expect_ok(
+        &kinit(&krb, SECOND),
+        "kinit after sync on and a new password",
+    );
+
     let deleted = gql(
         &http,
         &base,
@@ -688,13 +725,26 @@ fn kerberos_migrates_a_dump() {
         &base,
         &get_token(&http, &base),
         "mutation($u: CreateUserInput!) { createUser(user: $u) { id } }",
-        json!({"u": {
-            "id": USER,
-            "email": "livebob@example.com",
-            "attributes": [{"name": "kerberossync", "value": ["1"]}]
-        }}),
+        json!({"u": {"id": USER, "email": "livebob@example.com"}}),
     );
     assert_eq!(created["data"]["createUser"]["id"], USER, "{created}");
+    let db_url = realm.fixture.db_url().to_owned();
+    realm.fixture.restart_after(|| {
+        let user = format!("user_attribute_user_id = '{USER}'");
+        exec_sql(
+            &db_url,
+            &format!(
+                "DELETE FROM user_attributes WHERE {user} AND user_attribute_name = 'kerberossync'"
+            ),
+        );
+        exec_sql(
+            &db_url,
+            &format!(
+                "INSERT INTO user_attributes (user_attribute_user_id, user_attribute_name, \
+                 user_attribute_value) VALUES ('{USER}', 'kerberossync', X'31')"
+            ),
+        );
+    });
     realm
         .fixture
         .restart_with_env("LLDAP_KERBEROS_OPTIONS__ENABLED", "true");
@@ -703,7 +753,6 @@ fn kerberos_migrates_a_dump() {
         "kinit livebob on the migrated realm",
     );
     assert!(realm.data_dir.join("mit-db2.bak/principal.dump").is_file());
-    let db_url = realm.fixture.db_url().to_owned();
     let marked_rows = |detail: &str| {
         query_i64(
             &db_url,
@@ -806,8 +855,56 @@ fn kerberos_migrates_a_dump_for_a_user_without_sync() {
         json!({"user": {"id": USER, "insertAttributes": [{"name": "kerberossync", "value": ["1"]}]}}),
     );
     assert_eq!(updated["data"]["updateUser"]["ok"], true, "{updated}");
-    // U1′ adopts the principal at sync on; its row `sync-on-adopts` then changes the password
-    // and expects kinit to work again.
+    expect_revoked(
+        &kinit(&realm.krb, FIRST),
+        "kinit livebob right after sync on: adopted, still disabled",
+    );
+    let adopted_rows = query_i64(
+        &db_url,
+        "SELECT COUNT(*) FROM logs WHERE kind = 'kerberos_sync' AND target LIKE 'livebob%' \
+         AND detail LIKE 'adopted:%'",
+    );
+    assert_eq!(adopted_rows, 1, "one row names the adopted principal");
+    let token = get_token(&http, &base);
+    let disabled = group_id(&http, &base, &token, "lldap_disabled");
+    for mutation in ["addUserToGroup", "removeUserFromGroup"] {
+        let toggled = gql(
+            &http,
+            &base,
+            &token,
+            &format!(
+                "mutation($u: String!, $g: Int!) {{ {mutation}(userId: $u, groupId: $g) {{ ok }} }}"
+            ),
+            json!({"u": USER, "g": disabled}),
+        );
+        assert_eq!(toggled["data"][mutation]["ok"], true, "{toggled}");
+    }
+    let old = kinit(&realm.krb, FIRST);
+    expect_fail(
+        &old,
+        "kinit livebob with the dump's password once the group enabled it",
+    );
+    assert!(
+        !output_text(&old).contains("credentials have been revoked"),
+        "enabled, and the dump's password still fails: {}",
+        output_text(&old)
+    );
+    let set = gql(
+        &http,
+        &base,
+        &get_token(&http, &base),
+        "mutation($id: String!, $password: String!) { setUserPassword(userId: $id, password: $password) { ok } }",
+        json!({"id": USER, "password": SECOND}),
+    );
+    assert_eq!(set["data"]["setUserPassword"]["ok"], true, "{set}");
+    expect_ok(
+        &kinit(&realm.krb, SECOND),
+        "kinit livebob with the first password the directory set",
+    );
+    expect_fail(
+        &kinit(&realm.krb, FIRST),
+        "kinit livebob with the dump's password",
+    );
 }
 
 #[test]
@@ -1011,4 +1108,803 @@ fn kerberos_client_case_fold() {
     let refused = output_text(&refused);
     assert!(refused.contains("not found"), "{refused}");
     expect_ok(&kinit(&realm.krb, FIRST), "kinit livebob, fold off");
+}
+
+fn seal_for(key: &str, user: &str, password: &str) -> String {
+    seal_kerberos_envelope(key, user, password).expect("seal")
+}
+
+#[test]
+fn kerberos_web_password_path() {
+    const SYNCED: &str = "webbob";
+    const PLAIN: &str = "webeve";
+    const FIRST: &str = "WebbobPass2026!";
+    const SECOND: &str = "WebbobNext2026!";
+    const DECOY: &str = "WebbobDecoy2026!";
+    const WRONG: &str = "WebbobWrong2026!";
+    const EVE_FIRST: &str = "WebevePass2026!";
+    const EVE_SECOND: &str = "WebeveNext2026!";
+    const NUL: &str = "a\0aaaaaaa";
+    let realm = start_realm(true);
+    let http = client();
+    let base = realm.fixture.http_url();
+    let ldap = realm.fixture.ldap_url();
+    let token = get_token(&http, &base);
+
+    let unknown = login(&http, &base, SYNCED, WRONG);
+    for (user, sync, password) in [(SYNCED, "1", FIRST), (PLAIN, "0", EVE_FIRST)] {
+        let created = gql(
+            &http,
+            &base,
+            &token,
+            "mutation($u: CreateUserInput!) { createUser(user: $u) { id } }",
+            json!({"u": {
+                "id": user,
+                "email": format!("{user}@example.com"),
+                "attributes": [{"name": "kerberossync", "value": [sync]}]
+            }}),
+        );
+        assert_eq!(created["data"]["createUser"]["id"], user, "{created}");
+        let set = gql(
+            &http,
+            &base,
+            &token,
+            "mutation($id: String!, $password: String!) { setUserPassword(userId: $id, password: $password) { ok } }",
+            json!({"id": user, "password": password}),
+        );
+        assert_eq!(set["data"]["setUserPassword"]["ok"], true, "{set}");
+    }
+    let wrong = login(&http, &base, SYNCED, WRONG);
+    assert_eq!(unknown.0, StatusCode::UNAUTHORIZED, "{unknown:?}");
+    assert_eq!(
+        wrong, unknown,
+        "M: a wrong password answers as an unknown user does"
+    );
+
+    let info = gql(
+        &http,
+        &base,
+        &token,
+        "{ kerberosInfo { publicKeyDerBase64 } }",
+        json!({}),
+    );
+    let any_key = info["data"]["kerberosInfo"]["publicKeyDerBase64"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{info}"))
+        .to_owned();
+    type Row = (
+        &'static str,
+        &'static str,
+        &'static str,
+        Option<(&'static str, &'static str)>,
+        u16,
+        &'static str,
+        &'static str,
+        &'static [&'static str],
+    );
+    let rows: [Row; 7] = [
+        (
+            "an envelope for a user without sync",
+            PLAIN,
+            EVE_SECOND,
+            Some((PLAIN, EVE_SECOND)),
+            400,
+            "only for a user with Kerberos sync",
+            EVE_FIRST,
+            &[EVE_SECOND],
+        ),
+        (
+            "a user without sync, upstream's finish",
+            PLAIN,
+            EVE_SECOND,
+            None,
+            200,
+            "",
+            EVE_SECOND,
+            &[EVE_FIRST],
+        ),
+        (
+            "a synced user without an envelope",
+            SYNCED,
+            SECOND,
+            None,
+            400,
+            "needs the Kerberos password envelope",
+            FIRST,
+            &[SECOND],
+        ),
+        (
+            "sealed for another user",
+            SYNCED,
+            SECOND,
+            Some((PLAIN, SECOND)),
+            400,
+            "did not open",
+            FIRST,
+            &[SECOND],
+        ),
+        (
+            "too short",
+            SYNCED,
+            "Short-7",
+            Some((SYNCED, "Short-7")),
+            400,
+            "at least 8 characters",
+            FIRST,
+            &["Short-7"],
+        ),
+        (
+            "a NUL in nine characters",
+            SYNCED,
+            NUL,
+            Some((SYNCED, NUL)),
+            400,
+            "must not contain a NUL character",
+            FIRST,
+            &["a"],
+        ),
+        (
+            "sealed for the user beside a decoy upload",
+            SYNCED,
+            DECOY,
+            Some((SYNCED, SECOND)),
+            200,
+            "",
+            SECOND,
+            &[FIRST, DECOY],
+        ),
+    ];
+    for (row, user, upload, envelope, status, says, now, refused) in rows {
+        let (key, got, body) = register_sealed(&http, &base, &token, user, upload, |key| {
+            envelope.map(|(sealed_for, password)| {
+                seal_for(key.unwrap_or(any_key.as_str()), sealed_for, password)
+            })
+        });
+        assert_eq!(key.is_some(), user == SYNCED, "{row}: the start's key");
+        assert_eq!(got.as_u16(), status, "{row}: {body}");
+        assert!(body.contains(says), "{row}: {body}");
+        assert_eq!(bind_rc(&ldap, user, now), 0, "{row}: bind with {now}");
+        for password in refused {
+            assert_ne!(
+                bind_rc(&ldap, user, password),
+                0,
+                "{row}: bind with {password}"
+            );
+        }
+        if user == SYNCED {
+            expect_ok(&kinit_user(&realm.krb, user, now), row);
+            for password in refused {
+                expect_fail(&kinit_user(&realm.krb, user, password), row);
+            }
+        }
+    }
+    let log = realm.fixture.server_log();
+    let plaintexts = [
+        FIRST, SECOND, DECOY, WRONG, EVE_FIRST, EVE_SECOND, "Short-7", NUL,
+    ];
+    let found: Vec<_> = plaintexts.iter().filter(|p| log.contains(**p)).collect();
+    assert!(
+        found.is_empty() && log.contains("Kerberos principal synced for user webbob"),
+        "the server's log holds a password ({found:?}), or the capture is empty"
+    );
+}
+
+#[test]
+fn kerberos_forced_reset_of_a_synced_admin() {
+    const NEXT: &str = "AdminNext-2026!";
+    let mut realm = start_realm(true);
+    let http = client();
+    let base = realm.fixture.http_url();
+    let token = get_token(&http, &base);
+    let admin = env::admin_dn();
+    let configured = env::admin_password();
+    let synced = gql(
+        &http,
+        &base,
+        &token,
+        "mutation($user: UpdateUserInput!) { updateUser(user: $user) { ok } }",
+        json!({"user": {"id": admin, "insertAttributes": [{"name": "kerberossync", "value": ["1"]}]}}),
+    );
+    assert_eq!(synced["data"]["updateUser"]["ok"], true, "{synced}");
+    let set = gql(
+        &http,
+        &base,
+        &token,
+        "mutation($id: String!, $password: String!) { setUserPassword(userId: $id, password: $password) { ok } }",
+        json!({"id": admin, "password": NEXT}),
+    );
+    assert_eq!(set["data"]["setUserPassword"]["ok"], true, "{set}");
+    expect_ok(
+        &kinit_user(&realm.krb, &admin, NEXT),
+        "kinit admin before the reset",
+    );
+
+    realm
+        .fixture
+        .restart_with_env("LLDAP_FORCE_LDAP_USER_PASS_RESET", "always");
+    let ldap_url = realm.fixture.ldap_url();
+    expect_ok(
+        &kinit_user(&realm.krb, &admin, &configured),
+        "kinit admin with the configured password",
+    );
+    expect_fail(
+        &kinit_user(&realm.krb, &admin, NEXT),
+        "kinit admin with the password before the reset",
+    );
+    assert_eq!(bind_rc(&ldap_url, &admin, &configured), 0);
+    assert_eq!(bind_rc(&ldap_url, &admin, NEXT), 49);
+    let log = realm.fixture.server_log();
+    // A span's lines are written when it closes, so the order is the lines' times, not places.
+    let stamps = |needle: &str| -> Vec<String> {
+        log.lines()
+            .filter(|line| line.contains(needle))
+            .filter_map(|line| line.get(..35).map(str::to_owned))
+            .collect()
+    };
+    let waited = stamps("password waits for the Kerberos realm")
+        .pop()
+        .unwrap_or_else(|| panic!("the deferral is not logged\n{log}"));
+    let after = |needle: &str| {
+        stamps(needle)
+            .into_iter()
+            .find(|stamp| *stamp > waited)
+            .unwrap_or_else(|| panic!("{needle}: not logged after the deferral\n{log}"))
+    };
+    let opened = after("Kerberos realm EXAMPLE.COM opened");
+    let reset = after("Reset the password and the Kerberos keys of admin");
+    let serving = after("Kerberos realm EXAMPLE.COM serving");
+    let ldap_listens = after("Starting the LDAP server on port");
+    let http_listens = after("Starting the API/web server on port");
+    assert!(
+        opened < reset && reset < serving && serving < ldap_listens && serving < http_listens,
+        "the realm opens, the reset runs, the KDC serves, then LDAP and HTTP take connections\n{log}"
+    );
+    let rows = query_i64(
+        realm.fixture.db_url(),
+        "SELECT COUNT(*) FROM logs WHERE kind = 'admin_bootstrap' \
+         AND detail = 'admin password and Kerberos keys reset from the configuration'",
+    );
+    assert_eq!(rows, 1, "one row for the reset");
+
+    let ((), status, output) = realm
+        .fixture
+        .refused_start(|| (), &[("LLDAP_LDAP_USER_PASS", "Short7!")]);
+    assert!(status.is_some_and(|s| !s.success()), "{status:?}\n{output}");
+    assert!(
+        output.contains("needs at least 8 characters in ldap_user_pass"),
+        "{output}"
+    );
+    assert!(!output.contains("Short7!"), "the password is never printed");
+
+    realm.fixture.restart();
+    let token = get_token(&http, &base);
+    let set = gql(
+        &http,
+        &base,
+        &token,
+        "mutation($id: String!, $password: String!) { setUserPassword(userId: $id, password: $password) { ok } }",
+        json!({"id": admin, "password": NEXT}),
+    );
+    assert_eq!(set["data"]["setUserPassword"]["ok"], true, "{set}");
+    let ((), status, output) = realm
+        .fixture
+        .refused_start(|| (), &[("LLDAP_FORCE_LDAP_USER_PASS_RESET", "true")]);
+    assert!(
+        status.is_some_and(|s| !s.success()) && output.contains("Restart the server without"),
+        "mode true: the reset runs, then the start stops\n{output}"
+    );
+    realm
+        .fixture
+        .restart_with_env("LLDAP_FORCE_LDAP_USER_PASS_RESET", "false");
+    let ldap_url = realm.fixture.ldap_url();
+    expect_ok(
+        &kinit_user(&realm.krb, &admin, &configured),
+        "kinit admin with the password mode true set",
+    );
+    expect_fail(
+        &kinit_user(&realm.krb, &admin, NEXT),
+        "kinit admin with the password before mode true",
+    );
+    assert_eq!(
+        (
+            bind_rc(&ldap_url, &admin, &configured),
+            bind_rc(&ldap_url, &admin, NEXT)
+        ),
+        (0, 49)
+    );
+
+    let db_url = realm.fixture.db_url().to_owned();
+    let count = |sql: String| query_i64(&db_url, &sql);
+    let synced = || {
+        count(format!(
+            "SELECT COUNT(*) FROM user_attributes WHERE user_attribute_user_id = '{admin}' \
+             AND user_attribute_name = 'kerberossync'"
+        ))
+    };
+    let turned_off = || {
+        count(format!(
+            "SELECT COUNT(*) FROM logs WHERE kind = 'kerberos_sync' AND target = '{admin}' \
+             AND detail LIKE 'Kerberos sync turned off by the forced reset%'"
+        ))
+    };
+    let principals = || {
+        count(format!(
+            "SELECT COUNT(*) FROM kerberos_principals WHERE name = '{admin}'"
+        ))
+    };
+    let removed = || {
+        count(format!(
+            "SELECT COUNT(*) FROM logs WHERE kind = 'kerberos_sync' AND target = '{admin}' \
+             AND detail = 'removed at start: no sync'"
+        ))
+    };
+    let warned = |log: String| log.matches("turned its Kerberos sync off").count();
+    let set_next = |token: &str| {
+        let set = gql(
+            &http,
+            &base,
+            token,
+            "mutation($id: String!, $password: String!) { setUserPassword(userId: $id, password: $password) { ok } }",
+            json!({"id": admin, "password": NEXT}),
+        );
+        assert_eq!(set["data"]["setUserPassword"]["ok"], true, "{set}");
+    };
+
+    set_next(&get_token(&http, &base));
+    let kdc_port = realm.kdc_port;
+    realm
+        .fixture
+        .set_env("LLDAP_FORCE_LDAP_USER_PASS_RESET", "always");
+    let holder = realm.fixture.restart_after(|| hold_kdc(kdc_port));
+    let (status, body) = health(&http, &realm.fixture.http_url());
+    let realm_closed = (
+        status,
+        bind_rc(&ldap_url, &admin, &configured),
+        bind_rc(&ldap_url, &admin, NEXT),
+        synced(),
+        turned_off(),
+        warned(realm.fixture.server_log()),
+    );
+    assert_eq!(
+        realm_closed,
+        (StatusCode::SERVICE_UNAVAILABLE, 0, 49, 0, 1, 1),
+        "the realm cannot open: the reset, sync off, one row, the warning, and it serves: {body}"
+    );
+    drop(holder);
+    realm
+        .fixture
+        .restart_with_env("LLDAP_FORCE_LDAP_USER_PASS_RESET", "false");
+    expect_fail(
+        &kinit_user(&realm.krb, &admin, NEXT),
+        "kinit admin once the start pass removed the principal",
+    );
+    assert_eq!(
+        (principals(), removed()),
+        (0, 1),
+        "Kerberos back: the start pass removes the principal left behind"
+    );
+
+    let token = get_token(&http, &base);
+    let synced_again = gql(
+        &http,
+        &base,
+        &token,
+        "mutation($user: UpdateUserInput!) { updateUser(user: $user) { ok } }",
+        json!({"user": {"id": admin, "insertAttributes": [{"name": "kerberossync", "value": ["1"]}]}}),
+    );
+    assert_eq!(
+        synced_again["data"]["updateUser"]["ok"], true,
+        "{synced_again}"
+    );
+    set_next(&token);
+    expect_ok(
+        &kinit_user(&realm.krb, &admin, NEXT),
+        "kinit admin synced again",
+    );
+    realm
+        .fixture
+        .set_env("LLDAP_KERBEROS_OPTIONS__ENABLED", "false");
+    realm
+        .fixture
+        .restart_with_env("LLDAP_FORCE_LDAP_USER_PASS_RESET", "always");
+    let kerberos_off = (
+        bind_rc(&ldap_url, &admin, &configured),
+        bind_rc(&ldap_url, &admin, NEXT),
+        synced(),
+        turned_off(),
+        warned(realm.fixture.server_log()),
+    );
+    assert_eq!(
+        kerberos_off,
+        (0, 49, 0, 2, 2),
+        "Kerberos disabled: the reset, sync off, one row, the warning, and it serves"
+    );
+    realm
+        .fixture
+        .set_env("LLDAP_KERBEROS_OPTIONS__ENABLED", "true");
+    realm
+        .fixture
+        .restart_with_env("LLDAP_FORCE_LDAP_USER_PASS_RESET", "false");
+    assert_eq!(
+        (principals(), removed()),
+        (0, 2),
+        "Kerberos back: the start pass removes the principal left behind"
+    );
+}
+
+fn toggle_disabled(http: &Client, base: &str, mutation: &str) {
+    let token = get_token(http, base);
+    let disabled = group_id(http, base, &token, "lldap_disabled");
+    let toggled = gql(
+        http,
+        base,
+        &token,
+        &format!(
+            "mutation($u: String!, $g: Int!) {{ {mutation}(userId: $u, groupId: $g) {{ ok }} }}"
+        ),
+        json!({"u": USER, "g": disabled}),
+    );
+    assert_eq!(toggled["data"][mutation]["ok"], true, "{toggled}");
+}
+
+#[test]
+fn lldap_disabled_changed_without_the_realm_is_followed_when_it_opens() {
+    const ENABLED: &str = "LLDAP_KERBEROS_OPTIONS__ENABLED";
+    let mut realm = start_realm(false);
+    let http = client();
+    let base = realm.fixture.http_url();
+    let token = get_token(&http, &base);
+    let created = gql(
+        &http,
+        &base,
+        &token,
+        "mutation($u: CreateUserInput!) { createUser(user: $u) { id } }",
+        json!({"u": {
+            "id": USER,
+            "email": "livebob@example.com",
+            "attributes": [{"name": "kerberossync", "value": ["1"]}]
+        }}),
+    );
+    assert_eq!(created["data"]["createUser"]["id"], USER, "{created}");
+    let set = gql(
+        &http,
+        &base,
+        &token,
+        "mutation($id: String!, $password: String!) { setUserPassword(userId: $id, password: $password) { ok } }",
+        json!({"id": USER, "password": FIRST}),
+    );
+    assert_eq!(set["data"]["setUserPassword"]["ok"], true, "{set}");
+    expect_ok(&kinit(&realm.krb, FIRST), "kinit before any change");
+
+    for (mutation, enabled) in [("addUserToGroup", false), ("removeUserFromGroup", true)] {
+        realm.fixture.restart_with_env(ENABLED, "false");
+        toggle_disabled(&http, &realm.fixture.http_url(), mutation);
+        realm.fixture.restart_with_env(ENABLED, "true");
+        let after = kinit(&realm.krb, FIRST);
+        match enabled {
+            true => expect_ok(&after, "kinit once the start enabled it"),
+            false => expect_revoked(&after, "kinit once the start disabled it"),
+        }
+    }
+
+    let kdc_port = realm.kdc_port;
+    for (mutation, enabled) in [("addUserToGroup", false), ("removeUserFromGroup", true)] {
+        let holder = realm.fixture.restart_after(|| hold_kdc(kdc_port));
+        toggle_disabled(&http, &realm.fixture.http_url(), mutation);
+        drop(holder);
+        realm.fixture.restart();
+        let after = kinit(&realm.krb, FIRST);
+        match enabled {
+            true => expect_ok(&after, "kinit once the repaired realm enabled it"),
+            false => expect_revoked(&after, "kinit once the repaired realm disabled it"),
+        }
+    }
+
+    let db_url = realm.fixture.db_url().to_owned();
+    let rows = |detail: &str| {
+        query_i64(
+            &db_url,
+            &format!(
+                "SELECT COUNT(*) FROM logs WHERE kind = 'kerberos_sync' AND target LIKE \
+                 'livebob%' AND detail LIKE '{detail}%'"
+            ),
+        )
+    };
+    assert_eq!(
+        [
+            rows("Kerberos is disabled: the status of a principal, if there is one,"),
+            rows("the Kerberos realm is not ready: the status of a principal, if there is one,"),
+            rows("disabled as the realm opened: the user is in lldap_disabled"),
+            rows("enabled as the realm opened: the user is not in lldap_disabled"),
+        ],
+        [2, 2, 2, 2],
+        "one row for each change left, and one for each status the opening set"
+    );
+}
+
+#[test]
+fn kerberos_forced_reset_of_an_admin_without_sync_waits_for_the_realm() {
+    const NEXT: &str = "AdminNext-2026!";
+    let mut realm = start_realm(true);
+    let http = client();
+    let base = realm.fixture.http_url();
+    let admin = env::admin_dn();
+    let configured = env::admin_password();
+    let set = gql(
+        &http,
+        &base,
+        &get_token(&http, &base),
+        "mutation($id: String!, $password: String!) { setUserPassword(userId: $id, password: $password) { ok } }",
+        json!({"id": admin, "password": NEXT}),
+    );
+    assert_eq!(set["data"]["setUserPassword"]["ok"], true, "{set}");
+
+    realm
+        .fixture
+        .restart_with_env("LLDAP_FORCE_LDAP_USER_PASS_RESET", "always");
+    let ldap_url = realm.fixture.ldap_url();
+    assert_eq!(
+        (
+            bind_rc(&ldap_url, &admin, &configured),
+            bind_rc(&ldap_url, &admin, NEXT)
+        ),
+        (0, 49)
+    );
+    let log = realm.fixture.server_log();
+    let stamps = |needle: &str| -> Vec<String> {
+        log.lines()
+            .filter(|line| line.contains(needle))
+            .filter_map(|line| line.get(..35).map(str::to_owned))
+            .collect()
+    };
+    let waited = stamps("password waits for the Kerberos realm: Kerberos is enabled")
+        .pop()
+        .unwrap_or_else(|| panic!("the deferral is not logged\n{log}"));
+    let after = |needle: &str| {
+        stamps(needle)
+            .into_iter()
+            .find(|stamp| *stamp > waited)
+            .unwrap_or_else(|| panic!("{needle}: not logged after the deferral\n{log}"))
+    };
+    let opened = after("Kerberos realm EXAMPLE.COM opened");
+    let reset = after("Reset the password of admin from the configuration");
+    let serving = after("Kerberos realm EXAMPLE.COM serving");
+    let ldap_listens = after("Starting the LDAP server on port");
+    assert!(
+        opened < reset && reset < serving && serving < ldap_listens,
+        "the realm opens, the reset runs, the KDC serves, then LDAP takes connections\n{log}"
+    );
+
+    let set = gql(
+        &http,
+        &base,
+        &get_token(&http, &base),
+        "mutation($id: String!, $password: String!) { setUserPassword(userId: $id, password: $password) { ok } }",
+        json!({"id": admin, "password": NEXT}),
+    );
+    assert_eq!(set["data"]["setUserPassword"]["ok"], true, "{set}");
+    let db_url = realm.fixture.db_url().to_owned();
+    let resets = || {
+        query_i64(
+            &db_url,
+            "SELECT COUNT(*) FROM logs WHERE kind = 'admin_bootstrap' \
+             AND detail = 'admin password reset from the configuration'",
+        )
+    };
+    let before = resets();
+    let kdc_port = realm.kdc_port;
+    let holder = realm.fixture.restart_after(|| hold_kdc(kdc_port));
+    let (status, body) = health(&http, &realm.fixture.http_url());
+    let ldap_url = realm.fixture.ldap_url();
+    assert_eq!(
+        (
+            status,
+            bind_rc(&ldap_url, &admin, &configured),
+            bind_rc(&ldap_url, &admin, NEXT),
+            resets() - before
+        ),
+        (StatusCode::SERVICE_UNAVAILABLE, 0, 49, 1),
+        "the realm cannot open: the reset runs as upstream's and the server serves: {body}"
+    );
+    drop(holder);
+}
+
+#[test]
+fn a_nul_in_the_admin_password_refuses_the_first_start_and_a_forced_reset() {
+    const NUL: &str = "ldap_user_pass = \"a\\u0000aaaaaaa\"\n";
+    let mut fixture = LLDAPFixture::new();
+    let (status, output, fresh) = fixture.refused_start_with_config(NUL, true);
+    assert!(status.is_some_and(|s| !s.success()), "{status:?}\n{output}");
+    assert!(
+        output.contains(
+            "The admin password in ldap_user_pass is refused: the password must not contain a \
+             NUL character (U+0000)"
+        ),
+        "{output}"
+    );
+    assert_eq!(
+        query_i64(&fresh, "SELECT COUNT(*) FROM users"),
+        0,
+        "no admin is made"
+    );
+
+    let reset = format!("{NUL}force_ldap_user_pass_reset = \"always\"\n");
+    let (status, output, _) = fixture.refused_start_with_config(&reset, false);
+    assert!(status.is_some_and(|s| !s.success()), "{status:?}\n{output}");
+    assert!(
+        output.contains("cannot take a NUL character (U+0000) in ldap_user_pass"),
+        "{output}"
+    );
+    fixture.restart();
+    let configured = bind_rc(
+        &fixture.ldap_url(),
+        &env::admin_dn(),
+        &env::admin_password(),
+    );
+    assert_eq!(configured, 0, "the configured password still binds");
+}
+
+fn gql_status(
+    client: &Client,
+    base: &str,
+    token: &str,
+    query: &str,
+    variables: Value,
+) -> (StatusCode, String) {
+    let response = client
+        .post(format!("{base}/api/graphql"))
+        .bearer_auth(token)
+        .json(&json!({"query": query, "variables": variables}))
+        .send()
+        .expect("graphql send");
+    let status = response.status();
+    (status, response.text().expect("graphql body"))
+}
+
+#[test]
+fn the_server_refuses_what_kerberos_could_never_take() {
+    use ldap3::Mod;
+    use ldap3::exop::PasswordModify;
+    use std::collections::HashSet;
+    const SHORT: &str = "Short-7";
+    const SET: &str = "mutation($id: String!, $password: String!) { setUserPassword(userId: $id, password: $password) { ok } }";
+    const CREATE: &str = "mutation($u: CreateUserInput!) { createUser(user: $u) { id } }";
+    const UPDATE: &str = "mutation($user: UpdateUserInput!) { updateUser(user: $user) { ok } }";
+    const FLOOR: &str = "the password must be at least 8 characters";
+    const NUL: &str = "a\0aaaaaaa";
+    const NUL_REFUSAL: &str = "the password must not contain a NUL character (U+0000)";
+    let fixture = common::fixture::LLDAPFixture::new();
+    let http = client();
+    let base = fixture.http_url();
+    let token = get_token(&http, &base);
+    let created = gql(
+        &http,
+        &base,
+        &token,
+        CREATE,
+        json!({"u": {"id": "flooruser", "email": "flooruser@example.com"}}),
+    );
+    assert_eq!(
+        created["data"]["createUser"]["id"], "flooruser",
+        "{created}"
+    );
+
+    let base_dn = env::base_dn();
+    let dn = format!("uid=flooruser,ou=people,{base_dn}");
+    let add_dn = format!("uid=flooradd,ou=people,{base_dn}");
+    let admin_dn = format!("uid={},ou=people,{base_dn}", env::admin_dn());
+    for (password, refusal) in [(SHORT, FLOOR), (NUL, NUL_REFUSAL)] {
+        let (status, body) = gql_status(
+            &http,
+            &base,
+            &token,
+            SET,
+            json!({"id": "flooruser", "password": password}),
+        );
+        assert_eq!(
+            (status, body.contains(refusal)),
+            (StatusCode::OK, true),
+            "{body}"
+        );
+
+        let mut ldap = LdapConn::new(&fixture.ldap_url()).expect("ldap connection");
+        ldap.simple_bind(&admin_dn, &env::admin_password())
+            .expect("bind send")
+            .success()
+            .expect("admin bind");
+        let modified = ldap
+            .extended(PasswordModify {
+                user_id: Some(&dn),
+                old_pass: None,
+                new_pass: Some(password),
+            })
+            .expect("password modify send");
+        let replaced = ldap
+            .modify(
+                &dn,
+                vec![Mod::Replace("userPassword", HashSet::from([password]))],
+            )
+            .expect("modify send");
+        let added = ldap
+            .add(
+                &add_dn,
+                vec![
+                    ("objectClass", HashSet::from(["inetOrgPerson", "person"])),
+                    ("uid", HashSet::from(["flooradd"])),
+                    ("cn", HashSet::from(["flooradd"])),
+                    ("sn", HashSet::from(["flooradd"])),
+                    ("mail", HashSet::from(["flooradd@example.com"])),
+                    ("userPassword", HashSet::from([password])),
+                ],
+            )
+            .expect("add send");
+        let _ = ldap.unbind();
+        assert_eq!(
+            (modified.1.rc, replaced.rc, added.rc),
+            (53, 53, 53),
+            "{modified:?} {replaced:?} {added:?}"
+        );
+        assert_eq!(
+            (modified.1.text, replaced.text, added.text),
+            (refusal.to_owned(), refusal.to_owned(), refusal.to_owned())
+        );
+        let (_, body) = gql_status(
+            &http,
+            &base,
+            &token,
+            "{ user(userId: \"flooradd\") { id } }",
+            json!({}),
+        );
+        assert!(
+            !body.contains("\"id\":\"flooradd\""),
+            "the Add made nothing: {body}"
+        );
+    }
+    let refusals = || {
+        query_i64(
+            fixture.db_url(),
+            "SELECT COUNT(*) FROM logs WHERE success = 0 AND target IN ('flooruser', 'flooradd') \
+             AND kind IN ('password_change', 'user_create')",
+        )
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while refusals() < 8 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(refusals(), 8, "one failure row for each refused change");
+
+    let rule = "Kerberos sync cannot be turned on for user jürgen: Kerberos username must be ASCII alphanumeric plus '.', '_' or '-'";
+    let (status, body) = gql_status(
+        &http,
+        &base,
+        &token,
+        CREATE,
+        json!({"u": {"id": "jürgen", "email": "j@example.com", "attributes": [{"name": "kerberossync", "value": ["1"]}]}}),
+    );
+    assert_eq!(
+        (status, body.contains(rule)),
+        (StatusCode::OK, true),
+        "{body}"
+    );
+    let created = gql(
+        &http,
+        &base,
+        &token,
+        CREATE,
+        json!({"u": {"id": "jürgen", "email": "j@example.com"}}),
+    );
+    assert_eq!(created["data"]["createUser"]["id"], "jürgen", "{created}");
+    let (status, body) = gql_status(
+        &http,
+        &base,
+        &token,
+        UPDATE,
+        json!({"user": {"id": "jürgen", "insertAttributes": [{"name": "kerberossync", "value": ["1"]}]}}),
+    );
+    assert_eq!(
+        (status, body.contains(rule)),
+        (StatusCode::OK, true),
+        "{body}"
+    );
 }

@@ -57,6 +57,9 @@ async fn passwords_match(
 
 const LOGIN_STATE_KEY_INFO: &[u8] = b"lldap-opaque-login-state-v1";
 const REGISTRATION_STATE_KEY_INFO: &[u8] = b"lldap-opaque-registration-state-v1";
+/// A finish must follow its start within ten minutes.
+const REGISTRATION_MAX_AGE: i64 = 600;
+const REGISTRATION_TOO_LONG: &str = "the registration took too long; start again";
 
 /// bincode as `bincode::serialize` writes it, refusing trailing bytes.
 fn decode_exact<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> bincode::Result<T> {
@@ -78,6 +81,25 @@ impl SqlBackendHandler {
             &mut key,
         )?;
         Ok(orion::aead::SecretKey::from_slice(&key)?)
+    }
+
+    fn registration_within_age(&self, server_data: &str, now: i64) -> Result<UserId> {
+        let secret_key = self.get_orion_secret_key(REGISTRATION_STATE_KEY_INFO)?;
+        let registration::ServerData {
+            username,
+            issued_at,
+        } = decode_exact(&orion::aead::open(
+            &secret_key,
+            &base64::engine::general_purpose::STANDARD.decode(server_data)?,
+        )?)?;
+        if now - issued_at > REGISTRATION_MAX_AGE {
+            let target = Some(username.as_str());
+            logging::record_failure(LogKind::PasswordChange, target, REGISTRATION_TOO_LONG);
+            return Err(DomainError::AuthenticationError(
+                REGISTRATION_TOO_LONG.to_owned(),
+            ));
+        }
+        Ok(username)
     }
 
     #[instrument(skip(self), level = "debug", err)]
@@ -399,6 +421,7 @@ impl OpaqueHandler for SqlOpaqueHandler {
         let secret_key = self.get_orion_secret_key(REGISTRATION_STATE_KEY_INFO)?;
         let server_data = registration::ServerData {
             username: request.username,
+            issued_at: chrono::Utc::now().timestamp(),
         };
         let encrypted_state = orion::aead::seal(&secret_key, &bincode::serialize(&server_data)?)?;
         Ok(registration::ServerRegistrationStartResponse {
@@ -414,7 +437,7 @@ impl OpaqueHandler for SqlOpaqueHandler {
     ) -> Result<UserId> {
         require_kdc_ready()?;
         let secret_key = self.get_orion_secret_key(REGISTRATION_STATE_KEY_INFO)?;
-        let registration::ServerData { username } = decode_exact(&orion::aead::open(
+        let registration::ServerData { username, .. } = decode_exact(&orion::aead::open(
             &secret_key,
             &base64::engine::general_purpose::STANDARD.decode(&request.server_data)?,
         )?)?;
@@ -440,12 +463,7 @@ impl OpaqueHandler for SqlOpaqueHandler {
         &self,
         request: &registration::ClientRegistrationFinishRequest,
     ) -> Result<UserId> {
-        let secret_key = self.get_orion_secret_key(REGISTRATION_STATE_KEY_INFO)?;
-        let registration::ServerData { username } = decode_exact(&orion::aead::open(
-            &secret_key,
-            &base64::engine::general_purpose::STANDARD.decode(&request.server_data)?,
-        )?)?;
-        Ok(username)
+        self.registration_within_age(&request.server_data, chrono::Utc::now().timestamp())
     }
 }
 
@@ -1133,5 +1151,74 @@ mod tests {
             lldap_mfa::open_enrollment(&key, &URL_SAFE_NO_PAD.encode(registration_bytes), now)
                 .is_err()
         );
+    }
+
+    fn sealed_at(handler: &SqlOpaqueHandler, user: &UserId, issued_at: i64) -> String {
+        let key = handler
+            .get_orion_secret_key(REGISTRATION_STATE_KEY_INFO)
+            .unwrap();
+        let data = registration::ServerData {
+            username: user.clone(),
+            issued_at,
+        };
+        let sealed = orion::aead::seal(&key, &bincode::serialize(&data).unwrap()).unwrap();
+        base64::engine::general_purpose::STANDARD.encode(sealed)
+    }
+
+    // A finish must follow its start within ten minutes, checked by KLLDAP's `registration_user`.
+    #[tokio::test]
+    #[serial]
+    async fn test_a_finish_must_follow_its_start_within_ten_minutes() {
+        let handler =
+            SqlOpaqueHandler::new(generate_random_private_key(), get_initialized_db().await);
+        insert_user(&handler, "bob", "bob00").await;
+        let bob = UserId::new("bob");
+        let now = chrono::Utc::now().timestamp();
+        let request = client_registration(&handler, "bob", "bob-new-1").await;
+        let issued = |age: i64| registration::ClientRegistrationFinishRequest {
+            server_data: sealed_at(&handler, &bob, now - age),
+            ..request.clone()
+        };
+        let rows = [
+            ("just started", 0, true),
+            ("nine minutes", 540, true),
+            ("eleven minutes", 660, false),
+            ("a day", 86_400, false),
+        ];
+        let log = LogGuard::install();
+        for (label, age, opens) in rows {
+            let got = handler.registration_user(&issued(age)).await;
+            let refused = got
+                .as_ref()
+                .err()
+                .map(|e| e.to_string().contains(REGISTRATION_TOO_LONG));
+            let failures: Vec<_> = log
+                .recorder()
+                .take_events()
+                .into_iter()
+                .filter(|e| !e.success)
+                .map(|e| (e.kind, e.target, e.detail))
+                .collect();
+            let row = (
+                LogKind::PasswordChange,
+                Some("bob".to_owned()),
+                Some(REGISTRATION_TOO_LONG.to_owned()),
+            );
+            assert_eq!(
+                (got.is_ok(), refused, failures),
+                (
+                    opens,
+                    (!opens).then_some(true),
+                    (!opens).then_some(row).into_iter().collect::<Vec<_>>()
+                ),
+                "{label}"
+            );
+        }
+        drop(log);
+        attempt_login(&handler, "bob", "bob00", None).await.unwrap();
+        handler.registration_finish(issued(0)).await.unwrap();
+        attempt_login(&handler, "bob", "bob-new-1", None)
+            .await
+            .unwrap();
     }
 }

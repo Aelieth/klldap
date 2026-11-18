@@ -4,6 +4,7 @@ use std::env;
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
+use lldap_auth::kerberos_envelope::seal_kerberos_envelope;
 use lldap_auth::{opaque, registration};
 use reqwest::Url;
 use serde::Serialize;
@@ -70,15 +71,20 @@ fn call_server(url: Url, token: &str, body: impl Serialize) -> Result<String> {
         .header("Content-Type", "application/json")
         .bearer_auth(token)
         .body(serde_json::to_string(&body)?);
-    let response = request.send()?.error_for_status()?;
-    Ok(response.text()?)
+    let response = request.send()?;
+    let status = response.status();
+    let text = response.text()?;
+    if !status.is_success() {
+        bail!("{status}: {text}");
+    }
+    Ok(text)
 }
 
 pub fn register_start(
     base_url: &Url,
     token: &str,
     request: registration::ClientRegistrationStartRequest,
-) -> Result<registration::ServerRegistrationStartResponse> {
+) -> Result<registration::ServerRegistrationStart> {
     let request = Some(request);
     let data = call_server(
         append_to_url(base_url, "auth/opaque/register/start"),
@@ -91,7 +97,7 @@ pub fn register_start(
 pub fn register_finish(
     base_url: &Url,
     token: &str,
-    request: registration::ClientRegistrationFinishRequest,
+    request: registration::ClientRegistrationFinish,
 ) -> Result<()> {
     let request = Some(request);
     call_server(
@@ -111,7 +117,7 @@ fn main() -> Result<()> {
     };
 
     ensure!(
-        opts.bypass_password_policy || password.len() >= 8,
+        opts.bypass_password_policy || password.chars().count() >= 8,
         "New password is too short, expected at least 8 characters"
     );
     ensure!(
@@ -134,7 +140,10 @@ fn main() -> Result<()> {
         username: opts.username.clone().into(),
         registration_start_request: registration_start_request.message,
     };
-    let res = register_start(&opts.base_url, &token, start_request)?;
+    let registration::ServerRegistrationStart {
+        response: res,
+        kerberos_envelope_key,
+    } = register_start(&opts.base_url, &token, start_request)?;
 
     let registration_finish = opaque::client::registration::finish_registration(
         registration_start_request.state,
@@ -143,9 +152,15 @@ fn main() -> Result<()> {
         &mut rng,
     )
     .context("Error during password change")?;
-    let req = registration::ClientRegistrationFinishRequest {
-        server_data: res.server_data,
-        registration_upload: registration_finish.message,
+    let kerberos_password_envelope = kerberos_envelope_key
+        .map(|key| seal_kerberos_envelope(&key, &opts.username, &password))
+        .transpose()?;
+    let req = registration::ClientRegistrationFinish {
+        request: registration::ClientRegistrationFinishRequest {
+            server_data: res.server_data,
+            registration_upload: registration_finish.message,
+        },
+        kerberos_password_envelope,
     };
 
     register_finish(&opts.base_url, &token, req)?;

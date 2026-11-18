@@ -2,6 +2,7 @@ use crate::components::fragments::attribute_order::attribute_priority;
 use crate::{
     components::{
         avatar::Avatar,
+        create_user::{GetKerberosInfo, get_kerberos_info},
         form::{
             attribute_input::{ListAttributeInput, SingleAttributeInput},
             static_value::StaticValue,
@@ -41,12 +42,14 @@ pub struct UserDetailsForm {
     kerberossync_enabled: bool,
     original_kerberossync_enabled: bool,
     show_kerberos_banner: bool,
+    kerberos_enabled: Option<bool>,
 }
 
 pub enum Msg {
     SubmitClicked,
     UserUpdated(Result<update_user::ResponseData>),
     ToggleKerberosSync(bool),
+    KerberosInfoResponse(Result<get_kerberos_info::ResponseData>),
 }
 
 #[derive(yew::Properties, Clone, PartialEq)]
@@ -83,6 +86,11 @@ impl CommonComponent<UserDetailsForm> for UserDetailsForm {
                 self.show_kerberos_banner = value;
                 Ok(true)
             }
+            Msg::KerberosInfoResponse(info) => {
+                let enabled = info.map(|data| data.kerberos_info.enabled);
+                self.kerberos_enabled = Some(enabled.unwrap_or(true));
+                Ok(true)
+            }
         }
     }
 
@@ -107,11 +115,23 @@ impl Component for UserDetailsForm {
             kerberossync_enabled,
             original_kerberossync_enabled: kerberossync_enabled,
             show_kerberos_banner: false,
+            kerberos_enabled: None,
         }
     }
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         CommonComponentParts::<Self>::update(self, ctx, msg)
+    }
+
+    fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
+        if first_render && ctx.props().is_admin {
+            self.common.call_graphql::<GetKerberosInfo, _>(
+                ctx,
+                get_kerberos_info::Variables {},
+                Msg::KerberosInfoResponse,
+                "Error trying to fetch the Kerberos configuration",
+            );
+        }
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
@@ -147,13 +167,14 @@ impl Component for UserDetailsForm {
 
             { all_attrs.iter().map(|&a| display_field(a)).collect::<Vec<_>>() }
 
-            { if is_admin {
+            { if is_admin && shows_sync_switch(self.kerberos_enabled, self.original_kerberossync_enabled) {
                 html! {
                     <KerberosSwitch
                     enabled={self.kerberossync_enabled}
                     on_toggle={link.callback(Msg::ToggleKerberosSync)}
                     show_banner={self.show_kerberos_banner}
                     username={Some(self.user.id.clone())}
+                    kerberos_disabled={self.kerberos_enabled == Some(false)}
                     />
                 }
             } else { html! {} }}
@@ -174,6 +195,11 @@ impl Component for UserDetailsForm {
             </div>
         }
     }
+}
+
+/// With Kerberos disabled, the switch shows only for a user whose sync is on, to turn it off.
+fn shows_sync_switch(kerberos_enabled: Option<bool>, synced: bool) -> bool {
+    kerberos_enabled != Some(false) || synced
 }
 
 impl UserDetailsForm {
@@ -379,5 +405,28 @@ fn get_custom_attribute_static(
         <StaticValue label={attribute_schema.name.clone()} id={attribute_schema.name.clone()}>
         {values.into_iter().map(|x| html!{<div>{value_to_str(x)}</div>}).collect::<Vec<_>>()}
         </StaticValue>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_with_kerberos_disabled_the_switch_shows_only_to_turn_sync_off() {
+        let rows = [
+            (Some(true), false, true),
+            (Some(true), true, true),
+            (None, false, true),
+            (Some(false), true, true),
+            (Some(false), false, false),
+        ];
+        for (kerberos, synced, shown) in rows {
+            assert_eq!(
+                shows_sync_switch(kerberos, synced),
+                shown,
+                "Kerberos {kerberos:?}, sync {synced}"
+            );
+        }
     }
 }

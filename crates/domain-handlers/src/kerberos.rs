@@ -1,10 +1,9 @@
 use crate::logging::{LogEvent, LogKind};
 use async_trait::async_trait;
-use lldap_domain::requests::CreateUserRequest;
-use lldap_domain::types::UserId;
+use lldap_domain::requests::{CreateUserRequest, UpdateUserRequest};
+use lldap_domain::types::{GroupId, UserId};
 use lldap_domain_model::error::DomainError;
 use std::sync::{Arc, LazyLock, RwLock};
-use tracing::warn;
 
 pub fn domain_from_base_dn(base_dn: &str) -> String {
     base_dn
@@ -120,11 +119,18 @@ pub trait KerberosSync: Send + Sync {
     fn unavailable(&self) -> Option<String> {
         None
     }
+    /// Why a held realm still refuses a change to both stores: its last write is unsettled.
+    fn unsettled(&self) -> Option<String> {
+        None
+    }
+    /// False when the configuration disables Kerberos: no realm runs, and none will.
+    fn enabled(&self) -> bool {
+        true
+    }
     fn realm(&self) -> &str;
     fn principal_name(&self, user: &UserId) -> String {
         format!("{}@{}", user.as_str(), self.realm())
     }
-    async fn sync_principal(&self, user: &UserId, password: &str) -> Result<(), String>;
     /// Kerberos's own check of a new password, before anything is locked or written.
     async fn check_password(&self, _user: &UserId, _password: &str) -> Result<(), String> {
         Ok(())
@@ -139,13 +145,20 @@ pub trait KerberosSync: Send + Sync {
         crate::password::record_commit_failure(change.kind, &change.user, &failed);
         Err(failed)
     }
+    /// A user's delete or sync change and its principal's, in one transaction; None: no realm.
+    async fn commit_user(&self, _change: UserChange) -> Option<Result<(), CommitError>> {
+        None
+    }
+    /// Why the realm refuses sync on for `user`, if it does: its name is an alias.
+    async fn sync_on_refused(&self, _user: &UserId) -> Result<(), String> {
+        Ok(())
+    }
+    /// Held around a plain password write while the switch stays off; None: no realm.
+    async fn hold_plain(&self, _user: &UserId) -> Result<Option<Held>, CommitError> {
+        Ok(None)
+    }
     async fn delete_principal(&self, user: &UserId) -> Result<(), String>;
     async fn set_principal_enabled(&self, user: &UserId, enabled: bool) -> Result<(), String>;
-    async fn reassert_disabled(&self, user: &UserId) {
-        if let Err(e) = self.set_principal_enabled(user, false).await {
-            warn!("Failed to re-assert Kerberos disable for {user} after password set: {e}");
-        }
-    }
     async fn export_keytab_for_keycloak(&self, hostname: &str) -> Result<String, String>;
 }
 
@@ -154,11 +167,28 @@ const NO_COMMIT: &str = "this Kerberos backend cannot commit a password";
 const NO_HOST_ROWS: &str = "this Kerberos store writes no directory rows";
 
 pub const USER_GONE: &str = "the user is gone";
+pub const KERBEROS_DISABLED: &str =
+    "Kerberos is disabled on this server (kerberos_options.enabled is false)";
+pub const SYNC_CHANGED: &str = "the user's Kerberos sync changed; try again";
+pub const CREATE_WITHOUT_SYNC: &str = "Kerberos is disabled; create the user without Kerberos sync";
+pub const SYNC_ON_NEEDS_KERBEROS: &str = "Kerberos sync is turned on only with Kerberos enabled";
+pub const SYNC_OFF_FIRST: &str = "enable Kerberos, or turn the user's Kerberos sync off first";
+pub const LEFT_FOR_THE_START_PASS: &str = "Kerberos is disabled: a principal, if there is one, is \
+     left for the start pass, which removes it at the next start with Kerberos enabled";
+pub const STATUS_LEFT_DISABLED: &str = "Kerberos is disabled: the status of a principal, if there \
+     is one, is left for the start pass, which sets it from lldap_disabled at the next start with \
+     Kerberos enabled";
+pub const STATUS_LEFT_NOT_READY: &str = "the Kerberos realm is not ready: the status of a \
+     principal, if there is one, is left for the server that holds the realm, which sets it from \
+     lldap_disabled at its next status pass, within a minute, or when the realm opens";
+pub const CREATED_FIRST: &str = "another server created the realm first";
 /// A new principal name is a directory user's, or a case twin of one.
 pub const DIRECTORY_USER: &str = "the name belongs to a directory user";
 pub const DIRECTORY_TARGET: &str = "the alias's target belongs to a directory user";
 /// Starts the Failed answer of a commit whose outcome could not be read back.
 pub const UNREAD_AFTER_COMMIT: &str = "the result is unknown: the commit could not be read back";
+pub const ANSWER_UNSETTLED: &str =
+    "the answer to this server's last Kerberos write was lost and is not yet settled";
 
 /// A directory row that commits in the transaction of a Kerberos change.
 #[derive(Clone)]
@@ -175,9 +205,21 @@ pub enum HostRow {
     NoUser(Vec<UserId>),
     /// No name on these targets' chains may be a user's, or it rolls back with `DIRECTORY_TARGET`.
     NoAliasOnto(AliasOnto),
+    /// Exactly one user row must go, with its memberships and attributes, or it rolls back.
+    DeleteUser(UserId),
+    UpdateUser(UpdateUserRequest),
+    /// The user's sync must still be as the door read it, or it rolls back (`SYNC_CHANGED`).
+    SyncIs(UserId, bool),
+    /// The user and the group must exist and one membership row must change, or it rolls back.
+    Membership {
+        user: UserId,
+        group: GroupId,
+        add: bool,
+    },
 }
 
 pub type UserOf = Arc<dyn Fn(&str) -> Option<UserId> + Send + Sync>;
+pub type Held = Box<dyn std::any::Any + Send>;
 
 /// The targets of new alias rows, followed through the principals' `alias_target` column.
 #[derive(Clone)]
@@ -192,6 +234,13 @@ impl HostRow {
         matches!(self, Self::SetPassword { .. })
     }
 
+    pub fn has_kill_points(&self) -> bool {
+        matches!(
+            self,
+            Self::SetPassword { .. } | Self::DeleteUser(_) | Self::UpdateUser(_)
+        )
+    }
+
     pub fn label(&self) -> String {
         match self {
             Self::SetPassword { user, .. } => format!("password {user}"),
@@ -199,6 +248,16 @@ impl HostRow {
             Self::Log(event) => format!("log {}", event.kind),
             Self::NoUser(users) => format!("no user {}", names(users)),
             Self::NoAliasOnto(onto) => format!("no alias onto {}", onto.targets.join(", ")),
+            Self::DeleteUser(user) => format!("delete {user}"),
+            Self::UpdateUser(request) => format!("update {}", request.user_id),
+            Self::SyncIs(user, true) => format!("synced {user}"),
+            Self::SyncIs(user, false) => format!("unsynced {user}"),
+            Self::Membership {
+                user,
+                group,
+                add: true,
+            } => format!("add {user} to group {}", group.0),
+            Self::Membership { user, group, .. } => format!("remove {user} from group {}", group.0),
         }
     }
 }
@@ -221,6 +280,64 @@ pub struct PasswordCommit {
     pub kind: LogKind,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UserStep {
+    Delete,
+    SyncOff,
+    SyncOn,
+    DeleteWithoutSync,
+    SyncUnchanged,
+    Create,
+    Disable,
+    Enable,
+}
+
+impl UserStep {
+    pub fn op(self) -> &'static str {
+        match self {
+            Self::Delete | Self::DeleteWithoutSync => "delete",
+            Self::SyncOff => "sync off",
+            Self::SyncOn => "sync on",
+            Self::SyncUnchanged => "update",
+            Self::Create => "create",
+            Self::Disable => "disable",
+            Self::Enable => "enable",
+        }
+    }
+
+    pub fn touches_principal(self) -> bool {
+        matches!(
+            self,
+            Self::Delete
+                | Self::SyncOff
+                | Self::SyncOn
+                | Self::Create
+                | Self::Disable
+                | Self::Enable
+        )
+    }
+
+    pub fn turns_sync_on(self) -> bool {
+        matches!(self, Self::SyncOn | Self::Create)
+    }
+}
+
+/// Delete and sync off remove the principal of the user's name; sync on adopts any principal of
+/// it (random keys, disabled until its status is next set); disable and enable set its status.
+pub struct UserChange {
+    pub user: UserId,
+    pub step: UserStep,
+    pub rows: Vec<HostRow>,
+}
+
+pub fn sync_refused(user: &UserId, why: &str) -> String {
+    format!("Kerberos sync cannot be turned on for user {user}: {why}")
+}
+
+pub fn while_disabled(way_on: &str) -> String {
+    format!("{KERBEROS_DISABLED}: {way_on}")
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CommitError {
     Busy,
@@ -228,6 +345,7 @@ pub enum CommitError {
     UserGone,
     Failed(String),
     Unknown(String),
+    Unsettled(String),
 }
 
 // Stands in when no realm is registered: idempotent cleanups succeed, operations that
@@ -245,11 +363,14 @@ impl NoopKerberos {
 
 #[async_trait]
 impl KerberosSync for NoopKerberos {
+    fn ready(&self) -> bool {
+        false
+    }
+    fn enabled(&self) -> bool {
+        false
+    }
     fn realm(&self) -> &str {
         &self.realm
-    }
-    async fn sync_principal(&self, _: &UserId, _: &str) -> Result<(), String> {
-        Err(NOT_REGISTERED.to_owned())
     }
     async fn delete_principal(&self, _: &UserId) -> Result<(), String> {
         Ok(())
@@ -283,9 +404,6 @@ impl KerberosSync for DegradedKerberos {
     }
     fn realm(&self) -> &str {
         &self.realm
-    }
-    async fn sync_principal(&self, _: &UserId, _: &str) -> Result<(), String> {
-        Err(self.cause.clone())
     }
     async fn delete_principal(&self, _: &UserId) -> Result<(), String> {
         Err(self.cause.clone())
@@ -405,6 +523,14 @@ pub trait KerberosStore: Send + Sync {
     fn user_disabled(&self, _user: &UserId) -> Result<bool, KerberosStoreError> {
         Err(KerberosStoreError::NotReady(NO_HOST_ROWS.to_owned()))
     }
+    /// Whether `user` has Kerberos sync, read outside any transaction; false for no user.
+    fn user_synced(&self, _user: &UserId) -> Result<bool, KerberosStoreError> {
+        Err(KerberosStoreError::NotReady(NO_HOST_ROWS.to_owned()))
+    }
+    /// Each user with Kerberos sync and whether it is in `lldap_disabled`, in one read.
+    fn synced_statuses(&self) -> Result<Vec<(UserId, bool)>, KerberosStoreError> {
+        Err(KerberosStoreError::NotReady(NO_HOST_ROWS.to_owned()))
+    }
     /// `start`, then each row name its alias rows lead to, at most `hops` further.
     fn alias_chain(&self, _start: &str, _hops: usize) -> Result<Vec<String>, KerberosStoreError> {
         Err(KerberosStoreError::NotReady(NO_HOST_ROWS.to_owned()))
@@ -412,6 +538,14 @@ pub trait KerberosStore: Send + Sync {
     /// Sets `alias_target` where it is empty, by (row name, target); the records stay as they are.
     fn fill_alias_targets(&self, _rows: &[(String, String)]) -> Result<u64, KerberosStoreError> {
         Err(KerberosStoreError::NotReady(NO_HOST_ROWS.to_owned()))
+    }
+    /// Why this server does not hold the realm now: it lost it.
+    fn realm_not_held(&self) -> Option<String> {
+        None
+    }
+    /// Why this server's last write is unknown while it still holds the realm.
+    fn realm_unsettled(&self) -> Option<String> {
+        None
     }
 }
 
@@ -447,15 +581,64 @@ pub fn set_kerberos_store(store: Arc<dyn KerberosStore>) {
 /// Directory writes are refused until the KDC has come up, so nothing changes that the
 /// KDC could not follow.
 pub fn require_kdc_ready() -> Result<(), DomainError> {
-    let backend = kerberos_backend();
-    if backend.ready() {
-        return Ok(());
+    match kerberos_state() {
+        KerberosState::NotReady(cause) => Err(DomainError::KdcUnavailable(cause)),
+        KerberosState::Disabled | KerberosState::Ready => Ok(()),
     }
-    Err(DomainError::KdcUnavailable(
+}
+
+/// Disabled by the configuration is never "not ready": the directory goes on as plain LLDAP.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KerberosState {
+    Disabled,
+    NotReady(String),
+    Ready,
+}
+
+pub fn state_of(backend: &dyn KerberosSync) -> KerberosState {
+    if !backend.enabled() {
+        return KerberosState::Disabled;
+    }
+    if backend.ready() {
+        return KerberosState::Ready;
+    }
+    KerberosState::NotReady(
         backend
             .unavailable()
             .unwrap_or_else(|| "the Kerberos KDC is still starting; retry shortly".to_owned()),
-    ))
+    )
+}
+
+pub fn kerberos_state() -> KerberosState {
+    state_of(&*kerberos_backend())
+}
+
+/// What a password, or a change to both stores, needs: `state_of`, and the last write settled.
+pub fn settled_state_of(backend: &dyn KerberosSync) -> KerberosState {
+    match state_of(backend) {
+        KerberosState::Ready => backend
+            .unsettled()
+            .map_or(KerberosState::Ready, KerberosState::NotReady),
+        state => state,
+    }
+}
+
+pub fn settled_state() -> KerberosState {
+    settled_state_of(&*kerberos_backend())
+}
+
+/// A user change that writes both stores: refused with one row until the realm is settled.
+pub fn require_settled(kind: LogKind, user: &UserId) -> Result<(), DomainError> {
+    let KerberosState::NotReady(cause) = settled_state() else {
+        return Ok(());
+    };
+    let refused = unsettled_answer(&cause);
+    crate::logging::record_failure(kind, Some(user.as_str()), &refused.to_string());
+    Err(refused)
+}
+
+pub fn unsettled_answer(cause: &str) -> DomainError {
+    DomainError::KdcUnavailable(format!("{cause}; try again"))
 }
 
 #[cfg(test)]
@@ -552,7 +735,7 @@ mod tests {
         use crate::logging::{LogKind, event};
         let now = chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc();
         let bob = UserId::new("bob");
-        let rows: [(HostRow, &str, bool); 5] = [
+        let rows: [(HostRow, &str, bool, bool); 11] = [
             (
                 HostRow::SetPassword {
                     user: bob.clone(),
@@ -561,23 +744,27 @@ mod tests {
                 },
                 "password bob",
                 true,
+                true,
             ),
             (
                 HostRow::CreateUser(CreateUserRequest {
-                    user_id: bob,
+                    user_id: bob.clone(),
                     ..Default::default()
                 }),
                 "create bob",
+                false,
                 false,
             ),
             (
                 HostRow::Log(event(LogKind::PasswordChange, Some("bob"), true, None)),
                 "log password_change",
                 false,
+                false,
             ),
             (
                 HostRow::NoUser(vec![UserId::new("Alice"), UserId::new("carol")]),
                 "no user alice, carol",
+                false,
                 false,
             ),
             (
@@ -588,12 +775,55 @@ mod tests {
                 }),
                 "no alias onto Bob, svc/a",
                 false,
+                false,
+            ),
+            (HostRow::DeleteUser(bob.clone()), "delete bob", false, true),
+            (
+                HostRow::SyncIs(UserId::new("Bob"), true),
+                "synced bob",
+                false,
+                false,
+            ),
+            (
+                HostRow::SyncIs(UserId::new("bob"), false),
+                "unsynced bob",
+                false,
+                false,
+            ),
+            (
+                HostRow::Membership {
+                    user: bob.clone(),
+                    group: GroupId(7),
+                    add: true,
+                },
+                "add bob to group 7",
+                false,
+                false,
+            ),
+            (
+                HostRow::Membership {
+                    user: bob.clone(),
+                    group: GroupId(7),
+                    add: false,
+                },
+                "remove bob from group 7",
+                false,
+                false,
+            ),
+            (
+                HostRow::UpdateUser(UpdateUserRequest {
+                    user_id: bob,
+                    ..Default::default()
+                }),
+                "update bob",
+                false,
+                true,
             ),
         ];
-        for (row, label, password) in rows {
+        for (row, label, password, points) in rows {
             assert_eq!(
-                (format!("{row:?}"), row.is_password()),
-                (label.to_owned(), password)
+                (format!("{row:?}"), row.is_password(), row.has_kill_points()),
+                (label.to_owned(), password, points)
             );
         }
         let refused = MockStore {
@@ -657,6 +887,219 @@ mod tests {
                     Some(format!("password change failed: {NO_COMMIT}"))
                 )]
             )
+        );
+    }
+
+    #[tokio::test]
+    async fn test_without_a_realm_a_user_change_is_the_directory_write_alone() {
+        let change = || UserChange {
+            user: UserId::new("bob"),
+            step: UserStep::Delete,
+            rows: vec![HostRow::DeleteUser(UserId::new("bob"))],
+        };
+        let realm = "EXAMPLE.COM".to_owned();
+        let answers = [
+            NoopKerberos::new(realm.clone()).commit_user(change()).await,
+            DegradedKerberos::new(realm, "down".to_owned())
+                .commit_user(change())
+                .await,
+        ];
+        assert_eq!(answers, [None, None]);
+        let enabled = [
+            NoopKerberos::new("EXAMPLE.COM".to_owned()).enabled(),
+            DegradedKerberos::new("EXAMPLE.COM".to_owned(), "down".to_owned()).enabled(),
+        ];
+        assert_eq!(
+            enabled,
+            [false, true],
+            "only a disabled Kerberos is not enabled"
+        );
+        let steps = [
+            UserStep::Delete,
+            UserStep::SyncOff,
+            UserStep::SyncOn,
+            UserStep::DeleteWithoutSync,
+            UserStep::SyncUnchanged,
+            UserStep::Create,
+            UserStep::Disable,
+            UserStep::Enable,
+        ];
+        let ops: Vec<_> = steps
+            .iter()
+            .map(|step| (step.op(), step.touches_principal(), step.turns_sync_on()))
+            .collect();
+        assert_eq!(
+            ops,
+            [
+                ("delete", true, false),
+                ("sync off", true, false),
+                ("sync on", true, true),
+                ("delete", false, false),
+                ("update", false, false),
+                ("create", true, true),
+                ("disable", true, false),
+                ("enable", true, false)
+            ]
+        );
+    }
+
+    struct Up(bool);
+
+    #[async_trait]
+    impl KerberosSync for Up {
+        fn ready(&self) -> bool {
+            self.0
+        }
+        fn realm(&self) -> &str {
+            "EXAMPLE.COM"
+        }
+        async fn delete_principal(&self, _: &UserId) -> Result<(), String> {
+            unreachable!()
+        }
+        async fn set_principal_enabled(&self, _: &UserId, _: bool) -> Result<(), String> {
+            unreachable!()
+        }
+        async fn export_keytab_for_keycloak(&self, _: &str) -> Result<String, String> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_disabled_is_its_own_state_and_never_not_ready() {
+        let starting = "the Kerberos KDC is still starting; retry shortly";
+        let rows: [(Arc<dyn KerberosSync>, KerberosState, bool); 4] = [
+            (
+                Arc::new(NoopKerberos::new("EXAMPLE.COM".to_owned())),
+                KerberosState::Disabled,
+                true,
+            ),
+            (
+                Arc::new(DegradedKerberos::new(
+                    "EXAMPLE.COM".to_owned(),
+                    "down".to_owned(),
+                )),
+                KerberosState::NotReady("down".to_owned()),
+                false,
+            ),
+            (
+                Arc::new(Up(false)),
+                KerberosState::NotReady(starting.to_owned()),
+                false,
+            ),
+            (Arc::new(Up(true)), KerberosState::Ready, true),
+        ];
+        let mut got = Vec::new();
+        for (backend, _, _) in &rows {
+            set_kerberos_backend(backend.clone());
+            got.push((kerberos_state(), require_kdc_ready().is_ok()));
+        }
+        set_kerberos_backend(Arc::new(NoopKerberos::default()));
+        let want: Vec<_> = rows.into_iter().map(|(_, state, ok)| (state, ok)).collect();
+        assert_eq!(got, want);
+        assert_eq!(
+            (
+                NoopKerberos::default().ready(),
+                while_disabled(SYNC_OFF_FIRST)
+            ),
+            (
+                false,
+                "Kerberos is disabled on this server (kerberos_options.enabled is false): enable \
+                 Kerberos, or turn the user's Kerberos sync off first"
+                    .to_owned()
+            )
+        );
+    }
+
+    struct Unsettled;
+
+    #[async_trait]
+    impl KerberosSync for Unsettled {
+        fn unsettled(&self) -> Option<String> {
+            Some(ANSWER_UNSETTLED.to_owned())
+        }
+        fn realm(&self) -> &str {
+            "EXAMPLE.COM"
+        }
+        async fn delete_principal(&self, _: &UserId) -> Result<(), String> {
+            unreachable!()
+        }
+        async fn set_principal_enabled(&self, _: &UserId, _: bool) -> Result<(), String> {
+            unreachable!()
+        }
+        async fn export_keytab_for_keycloak(&self, _: &str) -> Result<String, String> {
+            unreachable!()
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_an_unsettled_realm_is_held_and_refuses_only_a_change_to_both_stores() {
+        let down = || KerberosState::NotReady("down".to_owned());
+        let rows: [(Arc<dyn KerberosSync>, KerberosState, KerberosState, bool); 4] = [
+            (
+                Arc::new(NoopKerberos::new("EXAMPLE.COM".to_owned())),
+                KerberosState::Disabled,
+                KerberosState::Disabled,
+                true,
+            ),
+            (
+                Arc::new(DegradedKerberos::new(
+                    "EXAMPLE.COM".to_owned(),
+                    "down".to_owned(),
+                )),
+                down(),
+                down(),
+                false,
+            ),
+            (
+                Arc::new(Up(true)),
+                KerberosState::Ready,
+                KerberosState::Ready,
+                true,
+            ),
+            (
+                Arc::new(Unsettled),
+                KerberosState::Ready,
+                KerberosState::NotReady(ANSWER_UNSETTLED.to_owned()),
+                true,
+            ),
+        ];
+        let mut got = Vec::new();
+        for (backend, _, _, _) in &rows {
+            set_kerberos_backend(backend.clone());
+            got.push((
+                kerberos_state(),
+                settled_state(),
+                require_kdc_ready().is_ok(),
+            ));
+        }
+        let bob = UserId::new("bob");
+        let refused = require_settled(LogKind::UserCreate, &bob).map_err(|e| e.to_string());
+        set_kerberos_backend(Arc::new(NoopKerberos::default()));
+        let want: Vec<_> = rows
+            .into_iter()
+            .map(|(_, held, settled, plain)| (held, settled, plain))
+            .collect();
+        assert_eq!(
+            (got, refused),
+            (
+                want,
+                Err(format!(
+                    "Kerberos KDC unavailable: {ANSWER_UNSETTLED}; try again"
+                ))
+            ),
+            "unsettled: held for directory writes, not settled for a change to both stores"
+        );
+    }
+
+    #[test]
+    fn test_turning_sync_on_names_the_rule() {
+        let why = validate_kerberos_username("jürgen").unwrap_err();
+        assert_eq!(
+            sync_refused(&UserId::new("jürgen"), &why),
+            "Kerberos sync cannot be turned on for user jürgen: Kerberos username must be \
+             ASCII alphanumeric plus '.', '_' or '-'"
         );
     }
 

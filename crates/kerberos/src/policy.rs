@@ -86,7 +86,7 @@ impl HostAdmission for AllowAll {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::embedded::tests::TempRealm;
+    use crate::embedded::tests::{TempRealm, synced};
     use krb5_types::{
         EncryptionKey, KdcOptions, KerberosTime, TicketFlags, TransitedEncoding, try_ascii,
     };
@@ -154,10 +154,7 @@ pub(crate) mod tests {
         let temp = TempRealm::new();
         let (embedded, store) = temp.embedded();
         let bob = UserId::new("bob");
-        embedded
-            .sync_principal(&bob, "Bob-Password-1")
-            .await
-            .unwrap();
+        synced(&embedded, &bob, "Bob-Password-1").await.unwrap();
         let revoked = |word: &str| Err((err::CLIENT_REVOKED, word.to_owned()));
         let steps = [
             ("enabled", Ok(())),
@@ -186,8 +183,7 @@ pub(crate) mod tests {
     async fn test_a_folded_client_keeps_its_service_tickets() {
         let temp = TempRealm::new();
         let (embedded, store) = temp.embedded();
-        embedded
-            .sync_principal(&UserId::new("bob"), "Bob-Password-1")
+        synced(&embedded, &UserId::new("bob"), "Bob-Password-1")
             .await
             .unwrap();
         let not_found = Err((err::CLIENT_REVOKED, NOT_FOUND.to_owned()));
@@ -208,8 +204,7 @@ pub(crate) mod tests {
         use krb5_asn1::{decode, encode};
         let temp = TempRealm::new();
         let (embedded, store) = temp.embedded();
-        embedded
-            .sync_principal(&UserId::new("bob"), "bob-pass-1")
+        synced(&embedded, &UserId::new("bob"), "bob-pass-1")
             .await
             .unwrap();
         let first_as = |store: &krb5_kdc::SharedDump| {

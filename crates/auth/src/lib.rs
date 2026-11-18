@@ -8,6 +8,7 @@ use std::fmt;
 use uuid::Uuid;
 
 pub mod access_control;
+pub mod kerberos_envelope;
 pub mod opaque;
 
 pub mod login {
@@ -82,6 +83,8 @@ pub mod registration {
     #[derive(Serialize, Deserialize, Clone)]
     pub struct ServerData {
         pub username: UserId,
+        /// The start, in seconds since the Unix epoch: a finish must follow it within ten minutes.
+        pub issued_at: i64,
     }
 
     #[derive(Serialize, Deserialize, Clone)]
@@ -101,6 +104,37 @@ pub mod registration {
     pub struct ClientRegistrationFinishRequest {
         pub server_data: String,
         pub registration_upload: opaque::server::registration::RegistrationUpload,
+    }
+
+    pub const KERBEROS_ENVELOPE_LABEL_PREFIX: &str = "klldap-kerberos-envelope-v1:";
+    /// RSA-3072 with OAEP-SHA-256 seals at most 384 - 2 * 32 - 2 bytes.
+    pub const KERBEROS_ENVELOPE_MAX_BYTES: usize = 318;
+
+    /// The OAEP label of a password envelope: one key, one purpose, one user.
+    pub fn kerberos_envelope_label(user: &UserId) -> String {
+        format!("{KERBEROS_ENVELOPE_LABEL_PREFIX}{}", user.as_str())
+    }
+
+    pub fn fits_kerberos_envelope(password: &str) -> bool {
+        password.len() <= KERBEROS_ENVELOPE_MAX_BYTES
+    }
+
+    /// register/start's answer: upstream's, plus the sealing key for a user with Kerberos sync.
+    #[derive(Serialize, Deserialize, Clone)]
+    pub struct ServerRegistrationStart {
+        #[serde(flatten)]
+        pub response: ServerRegistrationStartResponse,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub kerberos_envelope_key: Option<String>,
+    }
+
+    /// register/finish's body: upstream's, and for a user with Kerberos sync the sealed password.
+    #[derive(Serialize, Deserialize, Clone)]
+    pub struct ClientRegistrationFinish {
+        #[serde(flatten)]
+        pub request: ClientRegistrationFinishRequest,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub kerberos_password_envelope: Option<String>,
     }
 }
 

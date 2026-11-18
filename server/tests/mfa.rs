@@ -281,8 +281,8 @@ fn test_mfa_disabled_keeps_plain_binds() {
     let client = client();
     let url = fixture.http_url();
     let admin = get_token(&client, &url);
-    set_password(&client, &url, &admin, "bob", "bobpass");
-    let bob = get_token_for(&client, &url, "bob", "bobpass");
+    set_password(&client, &url, &admin, "bob", "bobpass1");
+    let bob = get_token_for(&client, &url, "bob", "bobpass1");
 
     let settings = settings(&client, &url);
     assert_eq!(settings["mfa_enabled"], false, "{settings}");
@@ -308,10 +308,10 @@ fn test_mfa_disabled_keeps_plain_binds() {
     assert_eq!(body["data"]["resetUserMfa"]["ok"], true, "{body}");
 
     // The suffix is never split: a trailing :digits is part of the password.
-    assert_eq!(ldap_bind(&fixture.ldap_url(), "bob", "bobpass").0, 0);
-    let (rc, text) = ldap_bind(&fixture.ldap_url(), "bob", "bobpass:123456");
+    assert_eq!(ldap_bind(&fixture.ldap_url(), "bob", "bobpass1").0, 0);
+    let (rc, text) = ldap_bind(&fixture.ldap_url(), "bob", "bobpass1:123456");
     assert_eq!((rc, text.as_str()), (49, ""));
-    let (status, body) = opaque_login(&client, &url, "bob", "bobpass", Some("123456"));
+    let (status, body) = opaque_login(&client, &url, "bob", "bobpass1", Some("123456"));
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body["token"].is_string(), "{body}");
 }
@@ -334,12 +334,12 @@ fn test_mfa_enrollment_over_graphql() {
     let admin = get_token(&client, &url);
     for user in ["bob", "eve", "kim"] {
         create_user(&client, &url, &admin, user);
-        set_password(&client, &url, &admin, user, &format!("{user}pass"));
+        set_password(&client, &url, &admin, user, &format!("{user}pass1"));
     }
     add_to_group(&client, &url, &admin, "eve", "lldap_strict_readonly");
-    let bob = get_token_for(&client, &url, "bob", "bobpass");
-    let eve = get_token_for(&client, &url, "eve", "evepass");
-    let kim = get_token_for(&client, &url, "kim", "kimpass");
+    let bob = get_token_for(&client, &url, "bob", "bobpass1");
+    let eve = get_token_for(&client, &url, "eve", "evepass1");
+    let kim = get_token_for(&client, &url, "kim", "kimpass1");
 
     let settings = settings(&client, &url);
     assert_eq!(settings["mfa_enabled"], true, "{settings}");
@@ -442,13 +442,13 @@ fn test_mfa_enrollment_and_doors() {
     let ldap_url = fixture.ldap_url();
     let admin = get_token(&client, &url);
     for user in users {
-        set_password(&client, &url, &admin, user, &format!("{user}pass"));
+        set_password(&client, &url, &admin, user, &format!("{user}pass1"));
     }
     add_to_group(&client, &url, &admin, "sam", "lldap_mfa_disabled");
     let exempt = group_id(&client, &url, &admin, "lldap_mfa_disabled").expect("exempt group");
     let body = delete_group(&client, &url, &admin, exempt);
     assert!(has_error(&body, "Cannot delete built-in group"), "{body}");
-    let token_for = |user: &str| get_token_for(&client, &url, user, &format!("{user}pass"));
+    let token_for = |user: &str| get_token_for(&client, &url, user, &format!("{user}pass1"));
     let (bob, eve, kim, sam) = (
         token_for("bob"),
         token_for("eve"),
@@ -458,7 +458,7 @@ fn test_mfa_enrollment_and_doors() {
 
     // LDAP simple bind: the diagnostic only after the password verified.
     let secret = enroll(&client, &url, &bob);
-    let (rc, text) = ldap_bind(&ldap_url, "bob", "bobpass");
+    let (rc, text) = ldap_bind(&ldap_url, "bob", "bobpass1");
     assert_eq!(
         (rc, text.as_str()),
         (49, "TOTP code required: append ':' and the code")
@@ -466,7 +466,7 @@ fn test_mfa_enrollment_and_doors() {
     let (rc, text) = ldap_bind(
         &ldap_url,
         "bob",
-        &format!("bobpass:{}", wrong_code(&secret)),
+        &format!("bobpass1:{}", wrong_code(&secret)),
     );
     assert_eq!((rc, text.as_str()), (49, ""));
     let (rc, text) = ldap_bind(
@@ -476,8 +476,11 @@ fn test_mfa_enrollment_and_doors() {
     );
     assert_eq!((rc, text.as_str()), (49, ""));
     let (_, next) = fresh_codes(&secret);
-    assert_eq!(ldap_bind(&ldap_url, "bob", &format!("bobpass:{next}")).0, 0);
-    let (rc, text) = ldap_bind(&ldap_url, "bob", &format!("bobpass:{next}"));
+    assert_eq!(
+        ldap_bind(&ldap_url, "bob", &format!("bobpass1:{next}")).0,
+        0
+    );
+    let (rc, text) = ldap_bind(&ldap_url, "bob", &format!("bobpass1:{next}"));
     assert_eq!(
         (rc, text.as_str()),
         (49, "TOTP code already used, wait for the next one")
@@ -485,22 +488,22 @@ fn test_mfa_enrollment_and_doors() {
 
     // Simple login: the same combined format.
     let secret = enroll(&client, &url, &eve);
-    let (status, text) = simple_login(&client, &url, "eve", "evepass");
+    let (status, text) = simple_login(&client, &url, "eve", "evepass1");
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{text}");
     assert!(text.contains("TOTP code required"), "{text}");
     let (_, next) = fresh_codes(&secret);
-    let (status, text) = simple_login(&client, &url, "eve", &format!("evepass:{next}"));
+    let (status, text) = simple_login(&client, &url, "eve", &format!("evepass1:{next}"));
     assert_eq!(status, StatusCode::OK, "{text}");
 
     // Web login: the code rides the OPAQUE finish; without it the server challenges.
     let secret = enroll(&client, &url, &kim);
-    let (status, body) = opaque_login(&client, &url, "kim", "kimpass", None);
+    let (status, body) = opaque_login(&client, &url, "kim", "kimpass1", None);
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body, json!({"mfaRequired": true}));
-    let (status, body) = opaque_login(&client, &url, "kim", "kimpass", Some(&wrong_code(&secret)));
+    let (status, body) = opaque_login(&client, &url, "kim", "kimpass1", Some(&wrong_code(&secret)));
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
     let (_, next) = fresh_codes(&secret);
-    let (status, body) = opaque_login(&client, &url, "kim", "kimpass", Some(&next));
+    let (status, body) = opaque_login(&client, &url, "kim", "kimpass1", Some(&next));
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(
         body["token"].is_string() && body["refreshToken"].is_string(),
@@ -510,8 +513,8 @@ fn test_mfa_enrollment_and_doors() {
 
     // An exempt member binds with the password alone even when enrolled.
     enroll(&client, &url, &sam);
-    assert_eq!(ldap_bind(&ldap_url, "sam", "sampass").0, 0);
-    let (status, _) = simple_login(&client, &url, "sam", "sampass");
+    assert_eq!(ldap_bind(&ldap_url, "sam", "sampass1").0, 0);
+    let (status, _) = simple_login(&client, &url, "sam", "sampass1");
     assert_eq!(status, StatusCode::OK);
 
     wait_for_rows(

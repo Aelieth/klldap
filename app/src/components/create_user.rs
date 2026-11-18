@@ -1,9 +1,8 @@
 use crate::components::fragments::attribute_order::attribute_priority;
 use crate::infra::opaque::{begin_registration, finish_registration};
 use crate::infra::queries::{
-    GetKerberosInfo, GetPosixConfig, GetUserAttributesSchema, ListOusQuery, SyncKerberosPassword,
-    get_kerberos_info, get_posix_config, get_user_attributes_schema, list_ous_query,
-    sync_kerberos_password,
+    GetPosixConfig, GetUserAttributesSchema, ListOusQuery, get_posix_config,
+    get_user_attributes_schema, list_ous_query,
 };
 use crate::{
     components::{
@@ -19,7 +18,7 @@ use crate::{
     infra::{
         api::HostService,
         common_component::{CommonComponent, CommonComponentParts},
-        encrypt::encrypt_kerberos_password,
+        encrypt::check_kerberos_envelope,
         form_utils::{EmailIsRequired, GraphQlAttributeSchema, IsAdmin, read_all_form_attributes},
     },
 };
@@ -41,6 +40,15 @@ use yew_router::{prelude::History, scope_ext::RouterScopeExt};
 )]
 pub struct CreateUser;
 
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "../schema.graphql",
+    query_path = "queries/get_kerberos_info.graphql",
+    response_derives = "Debug",
+    custom_scalars_module = "crate::infra::graphql"
+)]
+pub struct GetKerberosInfo;
+
 use create_user::AttributeValueInput as GraphQLAttributeValue;
 
 pub type Attribute = get_user_attributes_schema::GetUserAttributesSchemaSchemaUserSchemaAttributes;
@@ -61,11 +69,10 @@ pub struct CreateUserForm {
     form: yew_form::Form<CreateUserModel>,
     attributes_schema: Option<Vec<Attribute>>,
     form_ref: NodeRef,
-    encrypted_password: Option<String>,
     user_id: Option<String>,
     opaque_data: Option<opaque::client::registration::ClientRegistration>,
-    kerberos_info: Option<get_kerberos_info::GetKerberosInfoKerberosInfo>,
     kerberossync_enabled: bool,
+    kerberos_enabled: Option<bool>,
     selected_ou: String,
     ous: Vec<String>,
     // POSIX auto-assign flags
@@ -90,14 +97,13 @@ pub enum Msg {
     Update,
     ListAttributesResponse(Result<get_user_attributes_schema::ResponseData>),
     ListOusResponse(Result<list_ous_query::ResponseData>),
-    KerberosInfoResponse(Result<get_kerberos_info::ResponseData>),
     PosixConfigResponse(Result<get_posix_config::ResponseData>),
+    KerberosInfoResponse(Result<get_kerberos_info::ResponseData>),
     SubmitForm,
     CreateUserResponse(Result<create_user::ResponseData>),
     SuccessfulCreation,
-    RegistrationStartResponse(Result<Box<registration::ServerRegistrationStartResponse>>),
+    RegistrationStartResponse(Result<Box<registration::ServerRegistrationStart>>),
     RegistrationFinishResponse(Result<()>),
-    SyncKerberosResponse(Result<sync_kerberos_password::ResponseData>),
     ToggleKerberosSync(bool),
     OuChanged(String),
 }
@@ -113,12 +119,6 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
             Msg::Update => Ok(true),
             Msg::ListAttributesResponse(schema) => {
                 self.attributes_schema = Some(schema?.schema.user_schema.attributes);
-                self.common.call_graphql::<GetKerberosInfo, _>(
-                    ctx,
-                    get_kerberos_info::Variables {},
-                    Msg::KerberosInfoResponse,
-                    "Error trying to fetch Kerberos info",
-                );
                 self.common.call_graphql::<GetPosixConfig, _>(
                     ctx,
                     get_posix_config::Variables {},
@@ -129,10 +129,6 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
             }
             Msg::ListOusResponse(ous) => {
                 self.ous = ous?.list_ous;
-                Ok(true)
-            }
-            Msg::KerberosInfoResponse(res) => {
-                self.kerberos_info = Some(res?.kerberos_info);
                 Ok(true)
             }
             Msg::PosixConfigResponse(Ok(data)) => {
@@ -149,6 +145,11 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
                 self.posix_config_loaded = true;
                 Ok(true)
             }
+            Msg::KerberosInfoResponse(info) => {
+                let enabled = info.map(|data| data.kerberos_info.enabled);
+                self.kerberos_enabled = Some(enabled.unwrap_or(true));
+                Ok(true)
+            }
             Msg::ToggleKerberosSync(enabled) => {
                 self.kerberossync_enabled = enabled;
                 Ok(true)
@@ -162,17 +163,10 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
                     bail!("Check the form for errors");
                 }
 
-                self.encrypted_password = None;
                 let model = self.form.model();
-                let new_password = model.password.clone();
-
-                if self.kerberos_info.is_some() {
-                    self.encrypted_password = Some(encrypt_kerberos_password(
-                        self.kerberos_info
-                            .as_ref()
-                            .and_then(|i| i.public_key_der_base64.as_deref()),
-                        &new_password,
-                    )?);
+                let sync = sent_sync(self.kerberos_enabled, self.kerberossync_enabled);
+                if sync == Some(true) {
+                    check_kerberos_envelope(&model.password)?;
                 }
 
                 let all_values = read_all_form_attributes(
@@ -216,27 +210,13 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
                                 avatar = Some(v.clone());
                             }
                         }
-                        _ => {
-                            if !attr.values.is_empty() && attr.name != "kerberossync" {
-                                attributes.push(GraphQLAttributeValue {
-                                    name: attr.name,
-                                    value: attr.values,
-                                });
-                            }
-                        }
+                        _ => attributes.push(GraphQLAttributeValue {
+                            name: attr.name,
+                            value: attr.values,
+                        }),
                     }
                 }
-
-                attributes.push(GraphQLAttributeValue {
-                    name: "ou".to_string(),
-                    value: vec![self.selected_ou.clone()],
-                });
-
-                let kerb_value = if self.kerberossync_enabled { "1" } else { "0" };
-                attributes.push(GraphQLAttributeValue {
-                    name: "kerberossync".to_string(),
-                    value: vec![kerb_value.to_string()],
-                });
+                let attributes = create_attributes(attributes, &self.selected_ou, sync);
 
                 let user = create_user::CreateUserInput {
                     id: model.username,
@@ -274,7 +254,11 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
                     .opaque_data
                     .take()
                     .context("Missing registration data")?;
-                let req = finish_registration(state, &self.form.model().password, *res)?;
+                let user_id = self
+                    .user_id
+                    .as_deref()
+                    .context("Missing registration data")?;
+                let req = finish_registration(state, user_id, &self.form.model().password, *res)?;
                 self.common.call_backend(
                     ctx,
                     HostService::register_finish(req),
@@ -284,28 +268,6 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
             }
             Msg::RegistrationFinishResponse(response) => {
                 response.map_err(|e| anyhow!("Failed to set new password: {e:#}"))?;
-                if self.kerberossync_enabled {
-                    if let Some(enc_pw) = &self.encrypted_password {
-                        let variables = sync_kerberos_password::Variables {
-                            user_id: self.user_id.clone().unwrap(),
-                            encrypted_password: enc_pw.clone(),
-                        };
-                        self.common.call_graphql::<SyncKerberosPassword, _>(
-                            ctx,
-                            variables,
-                            Msg::SyncKerberosResponse,
-                            "Error syncing Kerberos password",
-                        );
-                        Ok(false)
-                    } else {
-                        self.handle_msg(ctx, Msg::SuccessfulCreation)
-                    }
-                } else {
-                    self.handle_msg(ctx, Msg::SuccessfulCreation)
-                }
-            }
-            Msg::SyncKerberosResponse(response) => {
-                response?.sync_kerberos_password;
                 self.handle_msg(ctx, Msg::SuccessfulCreation)
             }
             Msg::SuccessfulCreation => {
@@ -330,11 +292,10 @@ impl Component for CreateUserForm {
             form: yew_form::Form::<CreateUserModel>::new(CreateUserModel::default()),
             attributes_schema: None,
             form_ref: NodeRef::default(),
-            encrypted_password: None,
             user_id: None,
             opaque_data: None,
-            kerberos_info: None,
             kerberossync_enabled: true,
+            kerberos_enabled: None,
             selected_ou: "people".to_string(),
             ous: vec!["people".to_string()],
             posix_config_loaded: false,
@@ -354,9 +315,9 @@ impl Component for CreateUserForm {
         let Some(attrs) = self
             .attributes_schema
             .as_ref()
-            .filter(|_| self.kerberos_info.is_some() && self.posix_config_loaded)
+            .filter(|_| self.posix_config_loaded && self.kerberos_enabled.is_some())
         else {
-            return html! { <div>{"Loading schema, Kerberos info and POSIX config..."}</div> };
+            return html! { <div>{"Loading schema and POSIX config..."}</div> };
         };
 
         let should_show = |a: &Attribute| !a.is_readonly && a.name != "kerberossync";
@@ -384,11 +345,15 @@ impl Component for CreateUserForm {
                 ))
                 .collect::<Vec<Html>>() }
 
-                <KerberosSwitch
-                enabled={self.kerberossync_enabled}
-                on_toggle={link.callback(Msg::ToggleKerberosSync)}
-                show_banner={false}
-                />
+                { if self.kerberos_enabled == Some(true) {
+                    html! {
+                        <KerberosSwitch
+                        enabled={self.kerberossync_enabled}
+                        on_toggle={link.callback(Msg::ToggleKerberosSync)}
+                        show_banner={false}
+                        />
+                    }
+                } else { html! {} }}
 
                 <div class="mb-3 row">
                 <label class="form-label col-4 col-form-label">{"Organizational Unit :"}
@@ -447,8 +412,39 @@ impl Component for CreateUserForm {
                 Msg::ListOusResponse,
                 "Error trying to fetch OUs",
             );
+
+            self.common.call_graphql::<GetKerberosInfo, _>(
+                ctx,
+                get_kerberos_info::Variables {},
+                Msg::KerberosInfoResponse,
+                "Error trying to fetch the Kerberos configuration",
+            );
         }
     }
+}
+
+fn sent_sync(kerberos_enabled: Option<bool>, switch: bool) -> Option<bool> {
+    (kerberos_enabled != Some(false)).then_some(switch)
+}
+
+fn create_attributes(
+    form: Vec<GraphQLAttributeValue>,
+    ou: &str,
+    sync: Option<bool>,
+) -> Vec<GraphQLAttributeValue> {
+    let mut attributes: Vec<_> = form
+        .into_iter()
+        .filter(|attr| !attr.value.is_empty() && attr.name != "kerberossync")
+        .collect();
+    attributes.push(GraphQLAttributeValue {
+        name: "ou".to_string(),
+        value: vec![ou.to_owned()],
+    });
+    attributes.extend(sync.map(|on| GraphQLAttributeValue {
+        name: "kerberossync".to_string(),
+        value: vec![if on { "1" } else { "0" }.to_string()],
+    }));
+    attributes
 }
 
 fn get_custom_attribute_input(
@@ -486,6 +482,47 @@ fn get_custom_attribute_input(
             required={mail_is_required}
             auto_assign={auto_assign}
             />
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_the_request_carries_kerberossync_only_where_kerberos_runs() {
+        let form = || {
+            let attribute = |name: &str, value: &[&str]| GraphQLAttributeValue {
+                name: name.to_owned(),
+                value: value.iter().map(|v| (*v).to_owned()).collect(),
+            };
+            vec![
+                attribute("uidnumber", &["1001"]),
+                attribute("kerberossync", &["1"]),
+                attribute("empty", &[]),
+            ]
+        };
+        let rows = [
+            (Some(true), true, Some("1")),
+            (Some(true), false, Some("0")),
+            (Some(false), true, None),
+            (Some(false), false, None),
+            (None, true, Some("1")),
+        ];
+        for (kerberos, switch, sent) in rows {
+            let sync = sent_sync(kerberos, switch);
+            let attributes = create_attributes(form(), "people", sync);
+            let got: Vec<_> = attributes
+                .iter()
+                .map(|a| (a.name.as_str(), a.value.join(",")))
+                .collect();
+            let mut want = vec![
+                ("uidnumber", "1001".to_owned()),
+                ("ou", "people".to_owned()),
+            ];
+            want.extend(sent.map(|value| ("kerberossync", value.to_owned())));
+            assert_eq!(got, want, "Kerberos {kerberos:?}, switch {switch}");
         }
     }
 }

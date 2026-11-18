@@ -661,6 +661,53 @@ pub mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn test_an_ordinary_user_binds_while_the_last_write_is_unsettled() {
+        use ldap3_proto::proto::LdapBindCred;
+        use lldap_domain_handlers::kerberos::ANSWER_UNSETTLED;
+        use lldap_test_utils::recording_kerberos::RecordingGuard;
+        let guard = LogGuard::install_on_this_thread();
+        let _kdc = RecordingGuard::install_unsettled(ANSWER_UNSETTLED);
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_bind().times(1).returning(|_| Ok(()));
+        mock.expect_get_user_groups().returning(|_| {
+            let date = chrono::DateTime::UNIX_EPOCH.naive_utc();
+            Ok([GroupDetails {
+                group_id: GroupId(1),
+                display_name: "regular".into(),
+                creation_date: date,
+                uuid: Uuid::from_name_and_date("regular", &date),
+                attributes: vec![],
+                modified_date: date,
+            }]
+            .into())
+        });
+        setup_default_ldap_mock(&mut mock);
+        let mut handler = LdapHandler::new_for_tests(mock, "dc=example,dc=com");
+        let response = handler
+            .handle_ldap_message(LdapOp::BindRequest(LdapBindRequest {
+                dn: "uid=bob,ou=people,dc=example,dc=com".to_string(),
+                cred: LdapBindCred::Simple("pass".to_string()),
+            }))
+            .await
+            .unwrap();
+        let Some(LdapOp::BindResponse(LdapBindResponse { res, .. })) = response.first() else {
+            panic!("{response:?}");
+        };
+        let denied = guard
+            .recorder()
+            .take_events()
+            .into_iter()
+            .filter(|e| e.kind == LogKind::AccessDenied)
+            .count();
+        assert_eq!(
+            (&res.code, handler.user_info.is_some(), denied),
+            (&LdapResultCode::Success, true, 0),
+            "the realm is held: every user binds while its last write is unsettled"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_access_denied_events() {
         let guard = LogGuard::install();
         let mut mock = MockTestBackendHandler::new();

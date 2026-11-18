@@ -2,6 +2,7 @@ use crate::sql_backend_handler::{
     SqlBackendHandler, attribute_value_to_db_bytes, bool_to_expr, describe_changes,
     get_repeated_filter, is_backend_writable_readonly_attribute,
 };
+use crate::sql_log_handler::to_active_model;
 use async_trait::async_trait;
 use itertools::Itertools;
 use lldap_domain::{
@@ -16,7 +17,10 @@ use lldap_domain_handlers::handler::{
     UserBackendHandler, UserListerBackendHandler, UserRequestFilter,
 };
 use lldap_domain_handlers::kerberos::{
-    kerberos_backend, require_kdc_ready, validate_directory_username,
+    CREATE_WITHOUT_SYNC, CommitError, HostRow, KerberosState, LEFT_FOR_THE_START_PASS,
+    STATUS_LEFT_DISABLED, STATUS_LEFT_NOT_READY, SYNC_CHANGED, SYNC_ON_NEEDS_KERBEROS, UserChange,
+    UserStep, kerberos_backend, kerberos_state, require_kdc_ready, require_settled, sync_refused,
+    unsettled_answer, validate_directory_username, validate_kerberos_username, while_disabled,
 };
 use lldap_domain_handlers::logging::{self, LogKind};
 use lldap_domain_model::{
@@ -317,12 +321,11 @@ impl SqlBackendHandler {
         ))
     }
 
-    /// Returns whether the caller must delete the user's KDC principal once the
-    /// transaction has committed.
-    async fn update_user_with_transaction(
+    /// `update_user` on the caller's transaction, which the Kerberos committer also runs.
+    pub(crate) async fn update_user_with_transaction(
         transaction: &DatabaseTransaction,
         request: UpdateUserRequest,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         let schema = Self::get_schema_with_transaction(transaction).await?;
         let (update_user_attributes, remove_user_attributes, kerb_sync_enabled) =
             Self::compute_user_attribute_changes(
@@ -380,8 +383,7 @@ impl SqlBackendHandler {
                 .await?;
         }
 
-        let delete_principal = matches!(kerb_sync_enabled, Some(false));
-        if delete_principal {
+        if matches!(kerb_sync_enabled, Some(false)) {
             let update = model::users::ActiveModel {
                 user_id: ActiveValue::Set(request.user_id.clone()),
                 krb_principal_name: ActiveValue::Set(None),
@@ -391,7 +393,7 @@ impl SqlBackendHandler {
             update.update(transaction).await?;
         }
 
-        Ok(delete_principal)
+        Ok(())
     }
 
     /// `create_user` on the caller's transaction, which the Kerberos committer also runs.
@@ -401,6 +403,10 @@ impl SqlBackendHandler {
     ) -> Result<()> {
         validate_directory_username(request.user_id.as_str())
             .map_err(DomainError::InternalError)?;
+        if kerberos_sync_enabled(&request.attributes) {
+            validate_kerberos_username(request.user_id.as_str())
+                .map_err(|why| DomainError::InternalError(sync_refused(&request.user_id, &why)))?;
+        }
         let now = chrono::Utc::now().naive_utc();
         let uuid = Uuid::from_name_and_date(request.user_id.as_str(), &now);
         let lower_email = request.email.as_str().to_lowercase();
@@ -487,6 +493,87 @@ impl SqlBackendHandler {
     }
 }
 
+/// The sync an update asks for: its `kerberossync` value, or off when it removes the attribute.
+fn requested_sync(request: &UpdateUserRequest) -> Option<bool> {
+    let schema = PublicSchema::shared();
+    let is_sync = |name: &str| schema.resolve_user_canonical_name(name) == Some(KERBEROS_SYNC);
+    let inserted = request
+        .insert_attributes
+        .iter()
+        .rfind(|a| is_sync(a.name.as_str()));
+    match inserted {
+        Some(attribute) => Some(kerberos_sync_enabled(std::slice::from_ref(attribute))),
+        None => request
+            .delete_attributes
+            .iter()
+            .any(|name| is_sync(name.as_str()))
+            .then_some(false),
+    }
+}
+
+/// One failure row for a refused user change, and its answer.
+fn refused(kind: LogKind, user: &UserId, why: String) -> DomainError {
+    logging::record_failure(kind, Some(user.as_str()), &why);
+    DomainError::InternalError(why)
+}
+
+fn disabled_now() -> Result<bool> {
+    require_kdc_ready()?;
+    Ok(kerberos_state() == KerberosState::Disabled)
+}
+
+fn left_for_the_start_pass(user: &UserId, detail: &str) {
+    logging::record(LogKind::KerberosSync, Some(user.as_str()), Some(detail));
+}
+
+async fn commit_life_step(
+    user: &UserId,
+    step: UserStep,
+    mut rows: Vec<HostRow>,
+    log: logging::LogEvent,
+) -> Option<Result<()>> {
+    let kind = log.kind;
+    rows.push(HostRow::Log(log));
+    let change = UserChange {
+        user: user.clone(),
+        step,
+        rows,
+    };
+    let done = kerberos_backend().commit_user(change).await?;
+    Some(done.map_err(|e| match user_change_error(step, user, e) {
+        Ok(why) => refused(kind, user, why),
+        Err(gone) => {
+            logging::record_failure(kind, Some(user.as_str()), &gone.to_string());
+            gone
+        }
+    }))
+}
+
+fn user_change_error(
+    step: UserStep,
+    user: &UserId,
+    e: CommitError,
+) -> std::result::Result<String, DomainError> {
+    let op = step.op();
+    Ok(match e {
+        CommitError::UserGone => {
+            return Err(DomainError::EntityNotFound(format!(
+                "No such user: '{user}'"
+            )));
+        }
+        CommitError::Refused(why) if why == SYNC_CHANGED => why,
+        CommitError::Refused(why) if step == UserStep::SyncOn => sync_refused(user, &why),
+        CommitError::Busy => "a Kerberos change is in progress, try again".to_owned(),
+        CommitError::Unsettled(cause) => return Err(unsettled_answer(&cause)),
+        CommitError::Refused(why) | CommitError::Failed(why) => {
+            format!("the {op} of user {user} failed: {why}")
+        }
+        CommitError::Unknown(why) => {
+            format!("the result of the {op} of user {user} is unknown: {why}")
+        }
+    })
+}
+
 async fn allowed_ous_in(db: &impl ConnectionTrait) -> Result<Vec<String>> {
     let config = system_config::Entity::find()
         .filter(system_config::Column::Key.eq("allowedous"))
@@ -529,35 +616,147 @@ impl SystemConfigBackendHandler for SqlBackendHandler {
     }
 }
 
+/// An `lldap_disabled` membership in READY, under the realm's write lock, which reads the user's
+/// sync again: the membership, its row and a synced user's status in one change. None: the
+/// membership commits alone.
+async fn commit_status(
+    state: &KerberosState,
+    user: &UserId,
+    group: GroupId,
+    add: bool,
+    (name, synced): (&str, bool),
+) -> Option<Result<()>> {
+    if *state != KerberosState::Ready {
+        return None;
+    }
+    let (step, kind) = match add {
+        true => (UserStep::Disable, LogKind::MembershipAdd),
+        false => (UserStep::Enable, LogKind::MembershipRemove),
+    };
+    if synced && let Err(refused) = require_settled(kind, user) {
+        return Some(Err(refused));
+    }
+    let log = logging::event(kind, Some(user.as_str()), true, Some(name));
+    let membership = HostRow::Membership {
+        user: user.clone(),
+        group,
+        add,
+    };
+    commit_life_step(user, step, vec![membership], log).await
+}
+
+fn status_left(state: &KerberosState, user: &UserId) {
+    match state {
+        KerberosState::Disabled => left_for_the_start_pass(user, STATUS_LEFT_DISABLED),
+        KerberosState::NotReady(_) => left_for_the_start_pass(user, STATUS_LEFT_NOT_READY),
+        KerberosState::Ready => {}
+    }
+}
+
 impl SqlBackendHandler {
-    /// Best-effort: mirror `lldap_disabled` membership onto the principal's DISALLOW_ALL_TIX,
-    /// only for kerberossync-managed users. Kerberos is advisory here, like `delete_user`.
-    async fn reflect_kerberos_disabled(&self, user_id: &UserId, disabled: bool) {
-        let synced = match self.get_user_details(user_id).await {
-            Ok(u) => kerberos_sync_enabled(&u.attributes),
-            Err(e) => {
-                tracing::warn!(
-                    "Kerberos disable-sync: could not load user {} ({}); skipping",
-                    user_id,
-                    e
-                );
-                return;
+    /// Whether `user_id` has sync, read for an `lldap_disabled` change only.
+    async fn synced_for_status(&self, user_id: &UserId, group: Option<&str>) -> Result<bool> {
+        if group != Some("lldap_disabled") {
+            return Ok(false);
+        }
+        let user = self.get_user_details(user_id).await?;
+        Ok(kerberos_sync_enabled(&user.attributes))
+    }
+
+    /// The forced reset of an admin whose Kerberos cannot take part: the password, the sync turned
+    /// off and `row`, in one transaction.
+    pub async fn reset_password_without_sync(
+        &self,
+        user_id: &UserId,
+        password: &[u8],
+        row: logging::LogEvent,
+    ) -> Result<()> {
+        let (record, _) =
+            lldap_opaque_handler::prepare_registration(self, user_id.clone(), password).await?;
+        let (user, printed) = (user_id.clone(), row.clone());
+        self.sql_pool
+            .transaction::<_, (), DomainError>(|transaction| {
+                Box::pin(async move {
+                    let now = chrono::Utc::now().naive_utc();
+                    let update = model::users::ActiveModel {
+                        user_id: ActiveValue::Set(user.clone()),
+                        password_hash: ActiveValue::Set(Some(record)),
+                        password_modified_date: ActiveValue::Set(now),
+                        modified_date: ActiveValue::Set(now),
+                        krb_principal_name: ActiveValue::Set(None),
+                        ..Default::default()
+                    };
+                    update.update(transaction).await.map_err(|e| match e {
+                        sea_orm::DbErr::RecordNotUpdated => {
+                            DomainError::EntityNotFound(format!("No such user: '{user}'"))
+                        }
+                        e => DomainError::DatabaseError(e),
+                    })?;
+                    model::UserAttributes::delete_many()
+                        .filter(model::UserAttributesColumn::UserId.eq(&user))
+                        .filter(
+                            model::UserAttributesColumn::AttributeName
+                                .eq(AttributeName::new(KERBEROS_SYNC)),
+                        )
+                        .exec(transaction)
+                        .await?;
+                    model::Logs::insert(to_active_model(row))
+                        .exec_without_returning(transaction)
+                        .await?;
+                    Ok(())
+                })
+            })
+            .await?;
+        logging::print(&printed);
+        Ok(())
+    }
+
+    /// A membership change on the caller's transaction, which the Kerberos committer also runs.
+    pub(crate) async fn change_membership_in(
+        transaction: &DatabaseTransaction,
+        user_id: UserId,
+        group_id: GroupId,
+        add: bool,
+    ) -> std::result::Result<(), sea_orm::DbErr> {
+        if add {
+            let new_membership = model::memberships::ActiveModel {
+                user_id: ActiveValue::Set(user_id),
+                group_id: ActiveValue::Set(group_id),
+            };
+            new_membership.insert(transaction).await?;
+        } else {
+            // The last member of lldap_admin cannot be removed, whoever asks.
+            let group_details = model::Group::find_by_id(group_id).one(transaction).await?;
+            if let Some(g) = &group_details
+                && g.display_name.as_str() == "lldap_admin"
+            {
+                let current_count = model::Membership::find()
+                    .filter(model::MembershipColumn::GroupId.eq(group_id))
+                    .count(transaction)
+                    .await?;
+                if current_count <= 1 {
+                    return Err(sea_orm::DbErr::Custom(
+                        "Cannot remove the last member of lldap_admin".to_string(),
+                    ));
+                }
             }
+            let res = model::Membership::delete_by_id((user_id.clone(), group_id))
+                .exec(transaction)
+                .await?;
+            if res.rows_affected == 0 {
+                return Err(sea_orm::DbErr::Custom(format!(
+                    "No such membership: '{user_id}' -> {group_id:?}"
+                )));
+            }
+        }
+        let now = chrono::Utc::now().naive_utc();
+        let update_group = model::groups::ActiveModel {
+            group_id: Set(group_id),
+            modified_date: Set(now),
+            ..Default::default()
         };
-        if !synced {
-            return; // no KLLDAP-managed principal to touch
-        }
-        if let Err(e) = kerberos_backend()
-            .set_principal_enabled(user_id, !disabled)
-            .await
-        {
-            tracing::warn!(
-                "Failed to {} Kerberos principal for {} (non-fatal): {}",
-                if disabled { "disable" } else { "enable" },
-                user_id,
-                e
-            );
-        }
+        update_group.update(transaction).await?;
+        Ok(())
     }
 }
 
@@ -616,8 +815,28 @@ impl UserBackendHandler for SqlBackendHandler {
 
     #[instrument(skip(self), level = "debug", err, fields(user_id = ?request.user_id.as_str()))]
     async fn create_user(&self, request: CreateUserRequest) -> Result<()> {
-        require_kdc_ready()?;
+        let disabled = disabled_now()?;
         let user_id = request.user_id.clone();
+        if kerberos_sync_enabled(&request.attributes) {
+            require_settled(LogKind::UserCreate, &user_id)?;
+            let refusal = match validate_kerberos_username(user_id.as_str()) {
+                Ok(()) if disabled => {
+                    let why = CREATE_WITHOUT_SYNC.to_owned();
+                    return Err(refused(LogKind::UserCreate, &user_id, why));
+                }
+                Ok(()) => kerberos_backend().sync_on_refused(&user_id).await,
+                named => named,
+            };
+            if let Err(why) = refusal {
+                let why = sync_refused(&user_id, &why);
+                return Err(refused(LogKind::UserCreate, &user_id, why));
+            }
+            let log = logging::event(LogKind::UserCreate, Some(user_id.as_str()), true, None);
+            let rows = vec![HostRow::CreateUser(request.clone())];
+            if let Some(done) = commit_life_step(&user_id, UserStep::Create, rows, log).await {
+                return done;
+            }
+        }
         self.sql_pool
             .transaction::<_, (), DomainError>(|transaction| {
                 Box::pin(async move { Self::create_user_in(transaction, request).await })
@@ -629,8 +848,9 @@ impl UserBackendHandler for SqlBackendHandler {
 
     #[instrument(skip(self), level = "debug", err, fields(user_id = ?request.user_id.as_str()))]
     async fn update_user(&self, request: UpdateUserRequest) -> Result<()> {
-        require_kdc_ready()?;
+        let disabled = disabled_now()?;
         let user_id = request.user_id.clone();
+        let mut left = false;
         let changes = describe_changes(
             &request.insert_attributes,
             &request.delete_attributes,
@@ -639,29 +859,57 @@ impl UserBackendHandler for SqlBackendHandler {
                 ("display_name", request.display_name.is_some()),
             ],
         );
-        let delete_principal = self
-            .sql_pool
-            .transaction::<_, bool, DomainError>(|transaction| {
+        if let Some(on) = requested_sync(&request) {
+            let was = kerberos_sync_enabled(&self.get_user_details(&user_id).await?.attributes);
+            if on != was {
+                require_settled(LogKind::UserUpdate, &user_id)?;
+            }
+            if on && !was {
+                validate_kerberos_username(user_id.as_str()).map_err(|why| {
+                    refused(LogKind::UserUpdate, &user_id, sync_refused(&user_id, &why))
+                })?;
+            }
+            if on && !was && disabled {
+                let why = while_disabled(SYNC_ON_NEEDS_KERBEROS);
+                return Err(refused(LogKind::UserUpdate, &user_id, why));
+            }
+            left = disabled && was && !on;
+            let step = match (was, on) {
+                (false, true) => UserStep::SyncOn,
+                (true, false) => UserStep::SyncOff,
+                _ => UserStep::SyncUnchanged,
+            };
+            let log = logging::event(
+                LogKind::UserUpdate,
+                Some(user_id.as_str()),
+                true,
+                Some(&changes),
+            );
+            let rows = vec![
+                HostRow::SyncIs(user_id.clone(), was),
+                HostRow::UpdateUser(request.clone()),
+            ];
+            if !disabled && let Some(done) = commit_life_step(&user_id, step, rows, log).await {
+                return done;
+            }
+        }
+        self.sql_pool
+            .transaction::<_, (), DomainError>(|transaction| {
                 Box::pin(
                     async move { Self::update_user_with_transaction(transaction, request).await },
                 )
             })
             .await?;
         logging::record(LogKind::UserUpdate, Some(user_id.as_str()), Some(&changes));
-        // KDC side effects run after commit so a rollback cannot orphan a deleted principal.
-        if delete_principal && let Err(e) = kerberos_backend().delete_principal(&user_id).await {
-            tracing::warn!(
-                "Failed to delete Kerberos principal for user {} when disabling sync: {}",
-                user_id,
-                e
-            );
+        if left {
+            left_for_the_start_pass(&user_id, LEFT_FOR_THE_START_PASS);
         }
         Ok(())
     }
 
     #[instrument(skip_all, level = "debug", err, fields(user_id = ?user_id.as_str()))]
     async fn delete_user(&self, user_id: &UserId) -> Result<()> {
-        require_kdc_ready()?;
+        let disabled = disabled_now()?;
         let groups = self.get_user_groups(user_id).await?;
         if groups
             .iter()
@@ -679,13 +927,21 @@ impl UserBackendHandler for SqlBackendHandler {
                 ));
             }
         }
-        // Removed before the row delete, and idempotent, so a missing principal is fine.
-        if let Err(e) = kerberos_backend().delete_principal(user_id).await {
-            tracing::warn!(
-                "Failed to delete Kerberos principal for user {} during deletion (non-fatal): {}",
-                user_id,
-                e
-            );
+        let synced = kerberos_sync_enabled(&self.get_user_details(user_id).await?.attributes);
+        if synced {
+            require_settled(LogKind::UserDelete, user_id)?;
+        }
+        let step = match synced {
+            true => UserStep::Delete,
+            false => UserStep::DeleteWithoutSync,
+        };
+        let log = logging::event(LogKind::UserDelete, Some(user_id.as_str()), true, None);
+        let rows = vec![
+            HostRow::SyncIs(user_id.clone(), synced),
+            HostRow::DeleteUser(user_id.clone()),
+        ];
+        if !disabled && let Some(done) = commit_life_step(user_id, step, rows, log).await {
+            return done;
         }
 
         let res = model::User::delete_by_id(user_id.clone())
@@ -697,16 +953,21 @@ impl UserBackendHandler for SqlBackendHandler {
             )));
         }
         logging::record(LogKind::UserDelete, Some(user_id.as_str()), None);
+        if disabled && synced {
+            left_for_the_start_pass(user_id, LEFT_FOR_THE_START_PASS);
+        }
         Ok(())
     }
 
     #[instrument(skip_all, level = "debug", err, fields(user_id = ?user_id.as_str(), group_id))]
     async fn add_user_to_group(&self, user_id: &UserId, group_id: GroupId) -> Result<()> {
-        require_kdc_ready()?;
         let user_groups = self.get_user_groups(user_id).await?;
         let target_group_details = self.get_group_details(group_id).await?;
 
         let target_name = target_group_details.display_name.as_str();
+        if target_name != "lldap_disabled" {
+            require_kdc_ready()?;
+        }
         let has_admin = user_groups
             .iter()
             .any(|g| g.display_name == "lldap_admin".into());
@@ -722,93 +983,61 @@ impl UserBackendHandler for SqlBackendHandler {
             ));
         }
 
-        // Captured before the user_id shadow so the post-commit reflect keeps the original id.
-        let disabled_target = target_name == "lldap_disabled";
-        let kerb_uid = user_id.clone();
+        let state = kerberos_state();
+        let synced = self.synced_for_status(user_id, Some(target_name)).await?;
+        if target_name == "lldap_disabled"
+            && let Some(done) =
+                commit_status(&state, user_id, group_id, true, (target_name, synced)).await
+        {
+            return done;
+        }
 
-        let user_id = user_id.clone();
+        let member = user_id.clone();
         self.sql_pool
             .transaction::<_, _, sea_orm::DbErr>(|transaction| {
                 Box::pin(async move {
-                    let new_membership = model::memberships::ActiveModel {
-                        user_id: ActiveValue::Set(user_id),
-                        group_id: ActiveValue::Set(group_id),
-                    };
-                    new_membership.insert(transaction).await?;
-
-                    let now = chrono::Utc::now().naive_utc();
-                    let update_group = model::groups::ActiveModel {
-                        group_id: Set(group_id),
-                        modified_date: Set(now),
-                        ..Default::default()
-                    };
-                    update_group.update(transaction).await?;
-                    Ok(())
+                    Self::change_membership_in(transaction, member, group_id, true).await
                 })
             })
             .await?;
         logging::record(
             LogKind::MembershipAdd,
-            Some(kerb_uid.as_str()),
+            Some(user_id.as_str()),
             Some(target_name),
         );
-
-        // On disable, revoke KDC ticket issuance for kerberossync-managed users (best-effort).
-        if disabled_target {
-            self.reflect_kerberos_disabled(&kerb_uid, true).await;
+        if synced {
+            status_left(&state, user_id);
         }
         Ok(())
     }
 
     #[instrument(skip_all, level = "debug", err, fields(user_id = ?user_id.as_str(), group_id))]
     async fn remove_user_from_group(&self, user_id: &UserId, group_id: GroupId) -> Result<()> {
-        require_kdc_ready()?;
-        // Resolved before the user_id shadow; a lookup failure skips the best-effort reflect.
         let group_name = self
             .get_group_details(group_id)
             .await
             .ok()
             .map(|g| g.display_name.as_str().to_owned());
-        let disabled_target = group_name.as_deref() == Some("lldap_disabled");
-        let kerb_uid = user_id.clone();
+        if group_name.as_deref() != Some("lldap_disabled") {
+            require_kdc_ready()?;
+        }
+        let state = kerberos_state();
+        let synced = self
+            .synced_for_status(user_id, group_name.as_deref())
+            .await?;
+        let name = group_name.as_deref().unwrap_or_default();
+        if name == "lldap_disabled"
+            && let Some(done) =
+                commit_status(&state, user_id, group_id, false, (name, synced)).await
+        {
+            return done;
+        }
 
-        let user_id = user_id.clone();
+        let member = user_id.clone();
         self.sql_pool
             .transaction::<_, _, sea_orm::DbErr>(|transaction| {
                 Box::pin(async move {
-                    // The last member of lldap_admin cannot be removed, whoever asks.
-                    let group_details = model::Group::find_by_id(group_id).one(transaction).await?;
-                    if let Some(g) = &group_details
-                        && g.display_name.as_str() == "lldap_admin"
-                    {
-                        let current_count = model::Membership::find()
-                            .filter(model::MembershipColumn::GroupId.eq(group_id))
-                            .count(transaction)
-                            .await?;
-                        if current_count <= 1 {
-                            return Err(sea_orm::DbErr::Custom(
-                                "Cannot remove the last member of lldap_admin".to_string(),
-                            ));
-                        }
-                    }
-
-                    let res = model::Membership::delete_by_id((user_id.clone(), group_id))
-                        .exec(transaction)
-                        .await?;
-                    if res.rows_affected == 0 {
-                        return Err(sea_orm::DbErr::Custom(format!(
-                            "No such membership: '{user_id}' -> {group_id:?}"
-                        )));
-                    }
-
-                    let now = chrono::Utc::now().naive_utc();
-                    let update_group = model::groups::ActiveModel {
-                        group_id: Set(group_id),
-                        modified_date: Set(now),
-                        ..Default::default()
-                    };
-                    update_group.update(transaction).await?;
-                    Ok(())
+                    Self::change_membership_in(transaction, member, group_id, false).await
                 })
             })
             .await
@@ -824,13 +1053,11 @@ impl UserBackendHandler for SqlBackendHandler {
             })?;
         logging::record(
             LogKind::MembershipRemove,
-            Some(kerb_uid.as_str()),
+            Some(user_id.as_str()),
             group_name.as_deref(),
         );
-
-        // On re-enable, restore KDC ticket issuance for kerberossync-managed users (best-effort).
-        if disabled_target {
-            self.reflect_kerberos_disabled(&kerb_uid, false).await;
+        if synced {
+            status_left(&state, user_id);
         }
         Ok(())
     }
@@ -1650,8 +1877,8 @@ mod tests {
     }
 
     // Directory writes drive the KDC through the seam: a reserved name is refused before
-    // any call, toggling lldap_disabled is a best-effort enable/disable, and dropping the
-    // sync flag or the user deletes the principal after the commit.
+    // any call, and a synced user's lldap_disabled membership, sync change or delete is one
+    // change with its principal's.
     #[tokio::test]
     #[serial]
     async fn test_kerberos_hooks_on_directory_writes() {
@@ -1687,6 +1914,15 @@ mod tests {
             })
             .await
             .unwrap();
+        assert_eq!(
+            guard.recorder().take_ops(),
+            vec![KerberosOp::CommitUser {
+                username: "ksync".into(),
+                step: "create",
+                rows: vec!["create ksync".to_owned(), "log user_create".to_owned()],
+            }],
+            "a create with sync takes the sync-on step in its own change"
+        );
         fixture
             .handler
             .ensure_kerberos_principal_consistency(&UserId::new("ksync"), true)
@@ -1723,12 +1959,19 @@ mod tests {
             .await,
             vec!["ksync"]
         );
+        let status = |step: &'static str, membership: String, log: &str| KerberosOp::CommitUser {
+            username: "ksync".into(),
+            step,
+            rows: vec![membership, log.to_owned()],
+        };
+        let group = disabled_gid.0;
         assert_eq!(
             guard.recorder().take_ops(),
-            vec![KerberosOp::SetEnabled {
-                username: "ksync".into(),
-                enabled: false,
-            }]
+            vec![status(
+                "disable",
+                format!("add ksync to group {group}"),
+                "log membership_add"
+            )]
         );
         fixture
             .handler
@@ -1745,44 +1988,788 @@ mod tests {
         );
         assert_eq!(
             guard.recorder().take_ops(),
-            vec![KerberosOp::SetEnabled {
-                username: "ksync".into(),
-                enabled: true,
-            }]
+            vec![status(
+                "enable",
+                format!("remove ksync from group {group}"),
+                "log membership_remove"
+            )]
         );
 
+        let sync = |user: &str, value: Option<i64>| UpdateUserRequest {
+            user_id: UserId::new(user),
+            insert_attributes: value
+                .map(|value| Attribute {
+                    name: "kerberossync".into(),
+                    value: value.into(),
+                })
+                .into_iter()
+                .collect(),
+            delete_attributes: match value {
+                Some(_) => Vec::new(),
+                None => vec!["kerberossync".into()],
+            },
+            ..Default::default()
+        };
+        let committed = |user: &str, step: &'static str, rows: [&str; 3]| KerberosOp::CommitUser {
+            username: user.into(),
+            step,
+            rows: rows.iter().map(|row| (*row).to_owned()).collect(),
+        };
+        let synced = async |user: &str| {
+            let details = fixture.handler.get_user_details(&UserId::new(user)).await;
+            details.map(|u| kerberos_sync_enabled(&u.attributes)).ok()
+        };
+        let update_rows = |was: &'static str| [was, "update ksync", "log user_update"];
+        type Step = (
+            &'static str,
+            UpdateUserRequest,
+            Vec<KerberosOp>,
+            Option<bool>,
+        );
+        let steps: [Step; 5] = [
+            (
+                "sync off",
+                sync("ksync", Some(0)),
+                vec![committed("ksync", "sync off", update_rows("synced ksync"))],
+                Some(false),
+            ),
+            (
+                "sync off again: the principal is not touched, the sync is checked",
+                sync("ksync", Some(0)),
+                vec![committed("ksync", "update", update_rows("unsynced ksync"))],
+                Some(false),
+            ),
+            (
+                "sync on",
+                sync("ksync", Some(1)),
+                vec![committed("ksync", "sync on", update_rows("unsynced ksync"))],
+                Some(true),
+            ),
+            (
+                "sync off by removing the attribute",
+                sync("ksync", None),
+                vec![committed("ksync", "sync off", update_rows("synced ksync"))],
+                Some(false),
+            ),
+            (
+                "bob was never synced",
+                sync("bob", Some(0)),
+                vec![committed(
+                    "bob",
+                    "update",
+                    ["unsynced bob", "update bob", "log user_update"],
+                )],
+                Some(false),
+            ),
+        ];
+        for (label, request, ops, after) in steps {
+            let user = request.user_id.clone();
+            fixture.handler.update_user(request).await.unwrap();
+            assert_eq!(
+                (guard.recorder().take_ops(), synced(user.as_str()).await),
+                (ops, after),
+                "{label}"
+            );
+        }
+
+        fixture
+            .handler
+            .update_user(sync("ksync", Some(1)))
+            .await
+            .unwrap();
+        guard.recorder().take_ops();
+        for (user, ops) in [
+            (
+                "ksync",
+                vec![committed(
+                    "ksync",
+                    "delete",
+                    ["synced ksync", "delete ksync", "log user_delete"],
+                )],
+            ),
+            (
+                "bob",
+                vec![committed(
+                    "bob",
+                    "delete",
+                    ["unsynced bob", "delete bob", "log user_delete"],
+                )],
+            ),
+        ] {
+            fixture
+                .handler
+                .delete_user(&UserId::new(user))
+                .await
+                .unwrap();
+            assert_eq!(
+                (guard.recorder().take_ops(), synced(user).await),
+                (ops, None),
+                "delete {user}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_refused_user_change_writes_nothing() {
+        use lldap_domain_handlers::kerberos::CommitError;
+        use lldap_test_utils::recording_log::LogGuard;
+        let fixture = TestFixture::new().await;
+        let accepting = RecordingGuard::install();
         fixture
             .handler
             .update_user(UpdateUserRequest {
                 user_id: UserId::new("bob"),
-                email: None,
-                display_name: None,
-                delete_attributes: Vec::new(),
                 insert_attributes: vec![Attribute {
                     name: "kerberossync".into(),
-                    value: 0i64.into(),
+                    value: 1i64.into(),
                 }],
+                ..Default::default()
             })
             .await
             .unwrap();
-        assert_eq!(
-            guard.recorder().take_ops(),
-            vec![KerberosOp::DeletePrincipal {
-                username: "bob".into(),
-            }]
-        );
+        drop(accepting);
+        let rows = [
+            (
+                CommitError::Busy,
+                "a Kerberos change is in progress, try again",
+            ),
+            (CommitError::UserGone, "No such user: 'bob'"),
+            (
+                CommitError::Refused(SYNC_CHANGED.to_owned()),
+                "the user's Kerberos sync changed; try again",
+            ),
+            (
+                CommitError::Refused("a row".to_owned()),
+                "the delete of user bob failed: a row",
+            ),
+            (
+                CommitError::Failed("the generation moved".to_owned()),
+                "the delete of user bob failed: the generation moved",
+            ),
+            (
+                CommitError::Unknown("late".to_owned()),
+                "the result of the delete of user bob is unknown: late",
+            ),
+        ];
+        for (answer, text) in rows {
+            let log = LogGuard::install_on_this_thread();
+            let guard = RecordingGuard::install_answering(Err(answer.clone()));
+            let err = fixture
+                .handler
+                .delete_user(&UserId::new("bob"))
+                .await
+                .unwrap_err();
+            let still = fixture.handler.get_user_details(&UserId::new("bob")).await;
+            let failures: Vec<_> = log
+                .recorder()
+                .take_events()
+                .into_iter()
+                .filter(|e| e.target.as_deref() == Some("bob"))
+                .map(|e| {
+                    (
+                        e.kind,
+                        e.success,
+                        e.detail.is_some_and(|d| d.contains(text)),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                (
+                    err.to_string().contains(text),
+                    still.is_ok(),
+                    guard.recorder().take_ops().len(),
+                    failures
+                ),
+                (true, true, 1, vec![(LogKind::UserDelete, false, true)]),
+                "{answer:?}: {err}"
+            );
+        }
+    }
 
+    #[derive(Clone, Copy, Debug)]
+    enum Life {
+        CreateSynced,
+        CreateUnsynced,
+        SyncOn,
+        SyncOff,
+        SyncOffAgain,
+        SyncedPassword,
+        DeleteSynced,
+        DeleteUnsynced,
+        Disable,
+        Enable,
+        PlainPassword,
+    }
+
+    fn sync_request(user: &str, on: i64) -> UpdateUserRequest {
+        UpdateUserRequest {
+            user_id: UserId::new(user),
+            insert_attributes: vec![Attribute {
+                name: "kerberossync".into(),
+                value: on.into(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    async fn live(
+        handler: &SqlBackendHandler,
+        step: Life,
+        disabled: GroupId,
+    ) -> (UserId, std::result::Result<(), String>) {
+        use lldap_domain_handlers::password::{PasswordSync, change_password_everywhere};
+        let create = |on: i64| CreateUserRequest {
+            user_id: UserId::new("erin"),
+            email: "erin@example.com".into(),
+            attributes: vec![Attribute {
+                name: "kerberossync".into(),
+                value: on.into(),
+            }],
+            ..Default::default()
+        };
+        let (user, done) = match step {
+            Life::CreateSynced => ("erin", handler.create_user(create(1)).await),
+            Life::CreateUnsynced => ("erin", handler.create_user(create(0)).await),
+            Life::SyncOn => ("John", handler.update_user(sync_request("John", 1)).await),
+            Life::SyncOff | Life::SyncOffAgain => {
+                ("bob", handler.update_user(sync_request("bob", 0)).await)
+            }
+            Life::SyncedPassword => {
+                let patrick = UserId::new("patrick");
+                let done =
+                    change_password_everywhere(handler, &patrick, "Patrick-1", PasswordSync::On);
+                let done = done.await.map_err(|e| e.to_string());
+                return (patrick, done);
+            }
+            Life::DeleteSynced => ("patrick", handler.delete_user(&"patrick".into()).await),
+            Life::DeleteUnsynced => ("John", handler.delete_user(&"John".into()).await),
+            Life::Disable => {
+                let patrick = UserId::new("patrick");
+                (
+                    "patrick",
+                    handler.add_user_to_group(&patrick, disabled).await,
+                )
+            }
+            Life::Enable => {
+                let patrick = UserId::new("patrick");
+                let done = handler.remove_user_from_group(&patrick, disabled).await;
+                ("patrick", done)
+            }
+            Life::PlainPassword => {
+                let john = UserId::new("John");
+                let done =
+                    change_password_everywhere(handler, &john, "John-Pass-1", PasswordSync::Off);
+                let done = done.await.map_err(|e| e.to_string());
+                return (john, done);
+            }
+        };
+        (UserId::new(user), done.map_err(|e| e.to_string()))
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_each_life_step_with_kerberos_disabled_not_ready_or_unsettled() {
+        use lldap_domain_handlers::kerberos::{ANSWER_UNSETTLED, SYNC_OFF_FIRST};
+        use lldap_domain_handlers::password::realm_not_ready;
+        use lldap_test_utils::recording_kerberos::{DEGRADED_CAUSE, DegradedGuard, NotReadyGuard};
+        use lldap_test_utils::recording_log::LogGuard;
+        type Logged = (LogKind, bool, Option<String>);
+        type Row = (Life, Option<String>, Option<bool>, Vec<Logged>);
+        let left_as = |detail: &str| (LogKind::KerberosSync, true, Some(detail.to_owned()));
+        let left = || left_as(LEFT_FOR_THE_START_PASS);
+        let done = |kind| (kind, true, None);
+        let failed = |kind, why: &str| (kind, false, Some(why.to_owned()));
+        let (both_ways, sync_on) = (
+            while_disabled(SYNC_OFF_FIRST),
+            while_disabled(SYNC_ON_NEEDS_KERBEROS),
+        );
+        let create = CREATE_WITHOUT_SYNC.to_owned();
+        let disabled: Vec<Row> = vec![
+            (
+                Life::CreateSynced,
+                Some(create.clone()),
+                None,
+                vec![failed(LogKind::UserCreate, &create)],
+            ),
+            (
+                Life::CreateUnsynced,
+                None,
+                Some(false),
+                vec![done(LogKind::UserCreate)],
+            ),
+            (
+                Life::SyncOn,
+                Some(sync_on.clone()),
+                Some(false),
+                vec![failed(LogKind::UserUpdate, &sync_on)],
+            ),
+            (
+                Life::SyncOff,
+                None,
+                Some(false),
+                vec![done(LogKind::UserUpdate), left()],
+            ),
+            (
+                Life::SyncOffAgain,
+                None,
+                Some(false),
+                vec![done(LogKind::UserUpdate)],
+            ),
+            (
+                Life::SyncedPassword,
+                Some(both_ways.clone()),
+                Some(true),
+                vec![failed(LogKind::PasswordChange, &both_ways)],
+            ),
+            (
+                Life::Disable,
+                None,
+                Some(true),
+                vec![done(LogKind::MembershipAdd), left_as(STATUS_LEFT_DISABLED)],
+            ),
+            (
+                Life::Enable,
+                None,
+                Some(true),
+                vec![
+                    done(LogKind::MembershipRemove),
+                    left_as(STATUS_LEFT_DISABLED),
+                ],
+            ),
+            (
+                Life::PlainPassword,
+                None,
+                Some(false),
+                vec![done(LogKind::PasswordChange)],
+            ),
+            (
+                Life::DeleteSynced,
+                None,
+                None,
+                vec![done(LogKind::UserDelete), left()],
+            ),
+            (
+                Life::DeleteUnsynced,
+                None,
+                None,
+                vec![done(LogKind::UserDelete)],
+            ),
+        ];
+        let not_ready = |cause: &str| -> Vec<Row> {
+            let password = realm_not_ready(cause).to_string();
+            let refused = |step, after| (step, Some(cause.to_owned()), after, Vec::new());
+            let membership = |step, kind| {
+                let logged = vec![done(kind), left_as(STATUS_LEFT_NOT_READY)];
+                (step, None, Some(true), logged)
+            };
+            let password_row = |step, after| {
+                let logged = vec![failed(LogKind::PasswordChange, &password)];
+                (step, Some(password.clone()), after, logged)
+            };
+            vec![
+                refused(Life::CreateSynced, None),
+                refused(Life::SyncOn, Some(false)),
+                refused(Life::SyncOff, Some(true)),
+                password_row(Life::SyncedPassword, Some(true)),
+                membership(Life::Disable, LogKind::MembershipAdd),
+                membership(Life::Enable, LogKind::MembershipRemove),
+                password_row(Life::PlainPassword, Some(false)),
+                refused(Life::DeleteSynced, Some(true)),
+            ]
+        };
+        let unsettled = {
+            let password = realm_not_ready(ANSWER_UNSETTLED).to_string();
+            let again = format!("Kerberos KDC unavailable: {ANSWER_UNSETTLED}; try again");
+            let refused = |step, kind, after| {
+                let logged = vec![failed(kind, &again)];
+                (step, Some(again.clone()), after, logged)
+            };
+            let password_row = |step, after| {
+                let logged = vec![failed(LogKind::PasswordChange, &password)];
+                (step, Some(password.clone()), after, logged)
+            };
+            let plain = |step, kind, after| (step, None, after, vec![done(kind)]);
+            vec![
+                refused(Life::CreateSynced, LogKind::UserCreate, None),
+                plain(Life::CreateUnsynced, LogKind::UserCreate, Some(false)),
+                refused(Life::SyncOn, LogKind::UserUpdate, Some(false)),
+                refused(Life::SyncOff, LogKind::UserUpdate, Some(true)),
+                password_row(Life::SyncedPassword, Some(true)),
+                refused(Life::Disable, LogKind::MembershipAdd, Some(true)),
+                refused(Life::Enable, LogKind::MembershipRemove, Some(true)),
+                password_row(Life::PlainPassword, Some(false)),
+                refused(Life::DeleteSynced, LogKind::UserDelete, Some(true)),
+                plain(Life::DeleteUnsynced, LogKind::UserDelete, None),
+            ]
+        };
+        let starting = "the Kerberos KDC is still starting; retry shortly";
+        let states = [
+            ("disabled", disabled),
+            ("starting", not_ready(starting)),
+            ("degraded", not_ready(DEGRADED_CAUSE)),
+            ("unsettled", unsettled),
+        ];
+        for (state, rows) in states {
+            let fixture = TestFixture::new().await;
+            let accepting = RecordingGuard::install();
+            for user in ["bob", "patrick"] {
+                let on = sync_request(user, 1);
+                fixture.handler.update_user(on).await.unwrap();
+            }
+            let disabled_group = insert_group(&fixture.handler, "lldap_disabled").await;
+            drop(accepting);
+            let _guards = (
+                (state == "starting").then(NotReadyGuard::install),
+                (state == "degraded").then(DegradedGuard::install),
+                (state == "unsettled").then(|| RecordingGuard::install_unsettled(ANSWER_UNSETTLED)),
+            );
+            let log = LogGuard::install_on_this_thread();
+            for (step, answer, after, logged) in rows {
+                let (user, got) = live(&fixture.handler, step, disabled_group).await;
+                let details = fixture.handler.get_user_details(&user).await;
+                let synced = details.ok().map(|u| kerberos_sync_enabled(&u.attributes));
+                let events: Vec<Logged> = log
+                    .recorder()
+                    .take_events()
+                    .into_iter()
+                    .filter(|e| e.target.as_deref() == Some(user.as_str()))
+                    .map(|e| {
+                        let shown = !e.success || e.kind == LogKind::KerberosSync;
+                        (e.kind, e.success, e.detail.filter(|_| shown))
+                    })
+                    .collect();
+                let answered = match (&got, &answer) {
+                    (Ok(()), None) => true,
+                    (Err(e), Some(text)) => e.contains(text.as_str()),
+                    _ => false,
+                };
+                assert_eq!(
+                    (answered, synced, events),
+                    (true, after, logged),
+                    "{state}, {step:?}: {got:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_in_ready_lldap_disabled_and_the_principal_change_together_or_not_at_all() {
+        use lldap_domain_handlers::kerberos::ANSWER_UNSETTLED;
+        use lldap_test_utils::recording_log::LogGuard;
+        type Logged = (LogKind, bool, Option<String>);
+        type Row = (
+            Life,
+            bool,
+            Option<CommitError>,
+            Option<String>,
+            bool,
+            Vec<Logged>,
+        );
+        let lost = || {
+            Some(CommitError::Failed(
+                "the database did not answer".to_owned(),
+            ))
+        };
+        let why =
+            |op: &str| format!("the {op} of user patrick failed: the database did not answer");
+        let done = |kind| vec![(kind, true, None)];
+        let failed = |kind, op| vec![(kind, false, Some(why(op)))];
+        let again = format!("Kerberos KDC unavailable: {ANSWER_UNSETTLED}; try again");
+        let rows: Vec<Row> = vec![
+            (
+                Life::Disable,
+                true,
+                None,
+                None,
+                true,
+                done(LogKind::MembershipAdd),
+            ),
+            (
+                Life::Enable,
+                true,
+                None,
+                None,
+                false,
+                done(LogKind::MembershipRemove),
+            ),
+            (
+                Life::Disable,
+                true,
+                lost(),
+                Some(why("disable")),
+                false,
+                failed(LogKind::MembershipAdd, "disable"),
+            ),
+            (
+                Life::Enable,
+                true,
+                lost(),
+                Some(why("enable")),
+                true,
+                failed(LogKind::MembershipRemove, "enable"),
+            ),
+            (
+                Life::Disable,
+                false,
+                None,
+                None,
+                true,
+                done(LogKind::MembershipAdd),
+            ),
+            (
+                Life::Disable,
+                false,
+                lost(),
+                Some(why("disable")),
+                false,
+                failed(LogKind::MembershipAdd, "disable"),
+            ),
+            (
+                Life::Disable,
+                false,
+                Some(CommitError::Unsettled(ANSWER_UNSETTLED.to_owned())),
+                Some(again.clone()),
+                false,
+                vec![(LogKind::MembershipAdd, false, Some(again.clone()))],
+            ),
+        ];
+        for (step, synced, answer, refusal, member, logged) in rows {
+            let fixture = TestFixture::new().await;
+            let accepting = RecordingGuard::install();
+            if synced {
+                let on = sync_request("patrick", 1);
+                fixture.handler.update_user(on).await.unwrap();
+            }
+            let group = insert_group(&fixture.handler, "lldap_disabled").await;
+            if matches!(step, Life::Enable) {
+                let patrick = UserId::new("patrick");
+                fixture
+                    .handler
+                    .add_user_to_group(&patrick, group)
+                    .await
+                    .unwrap();
+            }
+            drop(accepting);
+            let guard = match answer {
+                Some(e) => RecordingGuard::install_answering(Err(e)),
+                None => RecordingGuard::install(),
+            };
+            let log = LogGuard::install_on_this_thread();
+            let (_, got) = live(&fixture.handler, step, group).await;
+            let filter = Some(UserRequestFilter::MemberOfId(group));
+            let members = get_user_names(&fixture.handler, filter).await;
+            let steps: Vec<_> = guard
+                .recorder()
+                .take_ops()
+                .into_iter()
+                .map(|op| match op {
+                    KerberosOp::CommitUser { step, rows, .. } => (step, rows.len()),
+                    _ => ("another call", 0),
+                })
+                .collect();
+            let events: Vec<Logged> = log
+                .recorder()
+                .take_events()
+                .into_iter()
+                .filter(|e| e.target.as_deref() == Some("patrick"))
+                .map(|e| {
+                    let shown = !e.success;
+                    (e.kind, e.success, e.detail.filter(|_| shown))
+                })
+                .collect();
+            let answered = match (&got, &refusal) {
+                (Ok(()), None) => true,
+                (Err(e), Some(text)) => e.contains(text.as_str()),
+                _ => false,
+            };
+            let op = match step {
+                Life::Disable => "disable",
+                _ => "enable",
+            };
+            let one_change = vec![(op, 2)];
+            assert_eq!(
+                (
+                    answered,
+                    members.contains(&"patrick".to_owned()),
+                    steps,
+                    events
+                ),
+                (true, member, one_change, logged),
+                "{step:?}, synced {synced}: {got:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_reset_without_kerberos_sets_the_password_and_turns_sync_off_together() {
+        use lldap_domain_handlers::handler::{BindRequest, LoginHandler};
+        let fixture = TestFixture::new().await;
+        let bob = UserId::new("bob");
+        let accepting = RecordingGuard::install();
         fixture
             .handler
-            .delete_user(&UserId::new("bob"))
+            .update_user(sync_request("bob", 1))
+            .await
+            .unwrap();
+        fixture
+            .handler
+            .ensure_kerberos_principal_consistency(&bob, true)
+            .await
+            .unwrap();
+        drop(accepting);
+        let row =
+            |user: &str| logging::event(LogKind::KerberosSync, Some(user), true, Some("sync off"));
+        let reset = fixture
+            .handler
+            .reset_password_without_sync(&bob, b"Bob-Reset-1", row("bob"))
+            .await;
+        let nobody = UserId::new("nobody");
+        let gone = fixture
+            .handler
+            .reset_password_without_sync(&nobody, b"Nobody-Reset-1", row("nobody"))
+            .await;
+        let details = fixture.handler.get_user_details(&bob).await.unwrap();
+        let bound = fixture
+            .handler
+            .bind(BindRequest {
+                name: bob.clone(),
+                password: "Bob-Reset-1".to_owned(),
+            })
+            .await;
+        let rows = model::Logs::find()
+            .count(&fixture.handler.sql_pool)
             .await
             .unwrap();
         assert_eq!(
-            guard.recorder().take_ops(),
-            vec![KerberosOp::DeletePrincipal {
-                username: "bob".into(),
-            }]
+            (
+                reset.is_ok(),
+                bound.is_ok(),
+                kerberos_sync_enabled(&details.attributes),
+                details.krb_principal_name,
+                gone.is_err(),
+                rows
+            ),
+            (true, true, false, None, true, 1),
+            "the password, sync off and the row in one transaction; a user gone writes nothing"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_sync_on_is_refused_for_a_name_kerberos_refuses() {
+        use lldap_test_utils::recording_log::LogGuard;
+        let _guard = RecordingGuard::install();
+        let fixture = TestFixture::new().await;
+        let log = LogGuard::install();
+        let sync_on = || Attribute {
+            name: "kerberossync".into(),
+            value: 1i64.into(),
+        };
+        let rule = "Kerberos sync cannot be turned on for user jürgen: Kerberos username must \
+                    be ASCII alphanumeric plus '.', '_' or '-'";
+        let created = fixture
+            .handler
+            .create_user(CreateUserRequest {
+                user_id: UserId::new("jürgen"),
+                email: "j@example.com".into(),
+                attributes: vec![sync_on()],
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        let absent = fixture
+            .handler
+            .get_user_details(&UserId::new("jürgen"))
+            .await
+            .is_err();
+        assert_eq!(
+            (created.to_string().contains(rule), absent),
+            (true, true),
+            "{created}"
+        );
+
+        insert_user_no_password(&fixture.handler, "jürgen").await;
+        let updated = fixture
+            .handler
+            .update_user(UpdateUserRequest {
+                user_id: UserId::new("jürgen"),
+                insert_attributes: vec![sync_on()],
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        let user = fixture
+            .handler
+            .get_user_details(&UserId::new("jürgen"))
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                updated.to_string().contains(rule),
+                kerberos_sync_enabled(&user.attributes)
+            ),
+            (true, false),
+            "{updated}"
+        );
+        let rows: Vec<_> = log
+            .recorder()
+            .take_events()
+            .into_iter()
+            .filter(|e| e.target.as_deref() == Some("jürgen") && !e.success)
+            .map(|e| (e.kind, e.detail.as_deref() == Some(rule)))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(LogKind::UserCreate, true), (LogKind::UserUpdate, true)],
+            "one failure row for each refusal"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_sync_on_at_create_is_refused_for_an_alias_name() {
+        use lldap_test_utils::recording_log::LogGuard;
+        let why = "the principal name of user carl is an alias of svc@RECORDER.TEST; remove \
+                   that alias first (kadmin delprinc carl@RECORDER.TEST)";
+        let _guard = RecordingGuard::install_aliased(why);
+        let fixture = TestFixture::new().await;
+        let log = LogGuard::install();
+        let request = |sync: i64| CreateUserRequest {
+            user_id: UserId::new("carl"),
+            email: "carl@example.com".into(),
+            attributes: vec![Attribute {
+                name: "kerberossync".into(),
+                value: sync.into(),
+            }],
+            ..Default::default()
+        };
+        let created = fixture.handler.create_user(request(1)).await.unwrap_err();
+        let absent = fixture
+            .handler
+            .get_user_details(&UserId::new("carl"))
+            .await
+            .is_err();
+        let rows: Vec<_> = log
+            .recorder()
+            .take_events()
+            .into_iter()
+            .filter(|e| e.target.as_deref() == Some("carl"))
+            .map(|e| (e.kind, e.success, e.detail))
+            .collect();
+        let sentence = format!("Kerberos sync cannot be turned on for user carl: {why}");
+        assert_eq!(
+            (created.to_string().contains(&sentence), absent, rows),
+            (
+                true,
+                true,
+                vec![(LogKind::UserCreate, false, Some(sentence.clone()))]
+            ),
+            "{created}"
+        );
+        fixture.handler.create_user(request(0)).await.unwrap();
     }
 
     #[tokio::test]

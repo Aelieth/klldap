@@ -12,6 +12,8 @@ rust-version.workspace = true
 [features]
 # A test hook that aborts a password change at a named step; never in a release build.
 kill-points = []
+# A test hook that pauses a password change after its door's read of the switch.
+test-hooks = []
 
 [dependencies]
 async-trait = { workspace = true }

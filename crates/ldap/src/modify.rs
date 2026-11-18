@@ -1295,6 +1295,65 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn test_a_short_password_is_refused_at_modify_and_password_modify() {
+        use lldap_domain_handlers::password::{PASSWORD_HAS_NUL, PASSWORD_TOO_SHORT};
+        let dn = "uid=bob,ou=people,dc=example,dc=com";
+        let refusals = [
+            ("Short-7", "pässwör", PASSWORD_TOO_SHORT),
+            ("a\0aaaaaaa", "b\0bbbbbbb", PASSWORD_HAS_NUL),
+        ];
+        for (synced, (replaced, sent, refusal)) in [false, true]
+            .into_iter()
+            .flat_map(|synced| refusals.map(|row| (synced, row)))
+        {
+            let guard = RecordingGuard::install();
+            let mut mock = MockTestBackendHandler::new();
+            if synced {
+                mock.expect_get_user_details()
+                    .returning(|uid| Ok(synced_user(uid)));
+            }
+            setup_default_ldap_mock(&mut mock);
+            mock.expect_registration_start().times(0);
+            mock.expect_registration_finish().times(0);
+            mock.expect_ensure_kerberos_principal_consistency().times(0);
+            let mut ldap_handler = setup_bound_admin_handler(mock).await;
+            let modify = LdapModifyRequest {
+                dn: dn.to_owned(),
+                changes: vec![LdapModify {
+                    operation: LdapModifyType::Replace,
+                    modification: ldap3_proto::LdapPartialAttribute {
+                        atype: "userPassword".to_string(),
+                        vals: vec![replaced.as_bytes().to_vec()],
+                    },
+                }],
+            };
+            let modified = ldap_handler.do_modify_request(&modify).await;
+            let extended = LdapOp::ExtendedRequest(
+                ldap3_proto::proto::LdapPasswordModifyRequest {
+                    user_identity: Some(dn.to_owned()),
+                    old_password: None,
+                    new_password: Some(sent.to_string()),
+                }
+                .into(),
+            );
+            let extended = ldap_handler.handle_ldap_message(extended).await;
+            assert_eq!(
+                (modified, extended, guard.recorder().take_ops()),
+                (
+                    make_modify_failure_response(LdapResultCode::UnwillingToPerform, refusal),
+                    Some(vec![make_extended_response(
+                        LdapResultCode::UnwillingToPerform,
+                        refusal.to_owned()
+                    )]),
+                    vec![]
+                ),
+                "synced {synced}, {sent:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_modify_password_answers_each_outcome_of_a_synced_change() {
         for (kdc, code, message) in kdc_rows() {
             let (guard, _offline, reached) = install(kdc.clone());

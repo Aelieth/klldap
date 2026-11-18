@@ -676,14 +676,6 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         Ok(Success::new())
     }
 
-    async fn sync_kerberos_password(
-        context: &Context<Handler>,
-        user_id: String,
-        encrypted_password: String,
-    ) -> FieldResult<bool> {
-        kerberos::sync_kerberos_password(context, user_id, encrypted_password).await
-    }
-
     async fn export_keytab_for_keycloak(
         context: &Context<Handler>,
         hostname: String,
@@ -1632,13 +1624,28 @@ mod tests {
     fn alice_committed() -> KerberosOp {
         KerberosOp::CommitPassword {
             username: "alice".into(),
-            password: "s3cret".into(),
-            rows: vec!["password alice".into(), "log password_change".into()],
+            password: "s3cret-pw".into(),
+            rows: vec![
+                "password alice".into(),
+                "synced alice".into(),
+                "log password_change".into(),
+            ],
         }
     }
 
     async fn set_password(
         id: &str,
+        mock: MockTestBackendHandler,
+    ) -> (
+        juniper::Value,
+        Vec<juniper::ExecutionError<DefaultScalarValue>>,
+    ) {
+        set_password_to(id, "s3cret-pw", mock).await
+    }
+
+    async fn set_password_to(
+        id: &str,
+        password: &str,
         mock: MockTestBackendHandler,
     ) -> (
         juniper::Value,
@@ -1650,7 +1657,7 @@ mod tests {
             &root_schema(),
             &Variables::from([
                 ("id".to_string(), InputValue::scalar(id)),
-                ("password".to_string(), InputValue::scalar("s3cret")),
+                ("password".to_string(), InputValue::scalar(password)),
             ]),
             &admin_context(mock),
         )
@@ -1710,8 +1717,10 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_set_user_password_answers_each_outcome_of_a_synced_change() {
-        use lldap_domain_handlers::kerberos::CommitError;
-        use lldap_domain_handlers::password::{PASSWORD_CHANGE_IN_PROGRESS, RESULT_UNKNOWN};
+        use lldap_domain_handlers::kerberos::{CommitError, SYNC_CHANGED};
+        use lldap_domain_handlers::password::{
+            PASSWORD_CHANGE_IN_PROGRESS, RESULT_UNKNOWN, realm_not_ready,
+        };
         use lldap_test_utils::recording_kerberos::{DEGRADED_CAUSE, DegradedGuard};
         const REFUSAL: &str = "password policy: min_length 40";
         #[derive(Debug)]
@@ -1728,7 +1737,7 @@ mod tests {
             ),
             (
                 Kdc::Offline,
-                Some(format!("Kerberos KDC unavailable: {DEGRADED_CAUSE}")),
+                Some(realm_not_ready(DEGRADED_CAUSE).to_string()),
             ),
             (
                 failed(CommitError::Busy),
@@ -1737,6 +1746,10 @@ mod tests {
             (
                 failed(CommitError::UserGone),
                 Some("password change failed: no such user".to_owned()),
+            ),
+            (
+                failed(CommitError::Refused(SYNC_CHANGED.to_owned())),
+                Some("the user's Kerberos sync changed; try again".to_owned()),
             ),
             (
                 failed(CommitError::Unknown("late".to_owned())),
@@ -1781,6 +1794,47 @@ mod tests {
                 false => vec![],
             };
             assert_eq!(ops, expected, "{kdc:?}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_set_user_password_refuses_a_short_password() {
+        use lldap_domain_handlers::password::{PASSWORD_HAS_NUL, PASSWORD_TOO_SHORT};
+        let refusals = [
+            ("pässwör", PASSWORD_TOO_SHORT),
+            ("a\0aaaaaaa", PASSWORD_HAS_NUL),
+        ];
+        for (synced, (password, refusal)) in [false, true]
+            .into_iter()
+            .flat_map(|synced| refusals.map(|row| (synced, row)))
+        {
+            let mut mock = MockTestBackendHandler::new();
+            if synced {
+                synced_alice(&mut mock, std::collections::HashSet::new());
+            } else {
+                mock.expect_get_user_details()
+                    .with(eq(UserId::new("alice")))
+                    .returning(|uid| Ok(sample_user(uid.as_str(), vec![])));
+                mock.expect_get_user_groups()
+                    .with(eq(UserId::new("alice")))
+                    .returning(|_| Ok(std::collections::HashSet::new()));
+            }
+            mock.expect_registration_start().times(0);
+            mock.expect_registration_finish().times(0);
+            mock.expect_ensure_kerberos_principal_consistency().times(0);
+            let guard = RecordingGuard::install();
+            let (value, errors) = set_password_to("alice", password, mock).await;
+            let messages: Vec<_> = errors
+                .iter()
+                .map(|e| e.error().message().to_owned())
+                .collect();
+            assert_ne!(value, graphql_value!({"setUserPassword": {"ok": true}}));
+            assert_eq!(
+                (messages, guard.recorder().take_ops()),
+                (vec![refusal.to_owned()], vec![]),
+                "synced {synced}, {password:?}"
+            );
         }
     }
 
@@ -1855,7 +1909,7 @@ mod tests {
             &root_schema(),
             &Variables::from([
                 ("id".to_string(), InputValue::scalar("bob")),
-                ("password".to_string(), InputValue::scalar("s3cret")),
+                ("password".to_string(), InputValue::scalar("s3cret-pw")),
             ]),
             &password_manager_context(mock),
         )

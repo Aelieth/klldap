@@ -18,9 +18,11 @@ use actix_web::{
 };
 use anyhow::{Context, Result};
 use hmac::Hmac;
-use lldap_access_control::{AccessControlledBackendHandler, ReadonlyBackendHandler};
+use lldap_access_control::{
+    AccessControlledBackendHandler, ReadonlyBackendHandler, UserReadableBackendHandler,
+};
 use lldap_domain_handlers::handler::{BackendHandler, LoginHandler, MfaBackendHandler};
-use lldap_domain_handlers::kerberos::{domain_from_base_dn, kerberos_backend};
+use lldap_domain_handlers::kerberos::{KerberosSync, domain_from_base_dn, kerberos_backend};
 use lldap_domain_handlers::logging::{RequestMeta, with_request};
 use lldap_domain_handlers::mfa::MfaPolicy;
 use lldap_domain_model::error::DomainError;
@@ -77,9 +79,16 @@ pub enum TcpError {
     NotFoundError(String),
     #[error("Unauthorized: `{0}`")]
     UnauthorizedError(String),
+    #[error("Conflict: `{0}`")]
+    Conflict(String),
 }
 
 pub type TcpResult<T> = std::result::Result<T, TcpError>;
+
+/// Not held, or held while its last write is unsettled.
+fn health_cause(kerberos: &dyn KerberosSync) -> Option<String> {
+    kerberos.unavailable().or_else(|| kerberos.unsettled())
+}
 
 fn health(unavailable: Option<String>) -> HttpResponse {
     match unavailable {
@@ -107,6 +116,7 @@ pub(crate) fn error_to_http_response(error: TcpError) -> HttpResponse {
         TcpError::NotFoundError(_) => HttpResponse::NotFound(),
         TcpError::InternalServerError(_) => HttpResponse::InternalServerError(),
         TcpError::UnauthorizedError(_) => HttpResponse::Unauthorized(),
+        TcpError::Conflict(_) => HttpResponse::Conflict(),
     }
     .body(error.to_string())
 }
@@ -195,7 +205,7 @@ fn http_config<Backend>(
     }))
     .route(
         "/health",
-        web::get().to(async || health(kerberos_backend().unavailable())),
+        web::get().to(async || health(health_cause(&*kerberos_backend()))),
     )
     .route("/settings", web::get().to(get_settings::<Backend>))
     .service(
@@ -253,6 +263,14 @@ impl<Backend: TcpBackendHandler> AppState<Backend> {
 }
 impl<Backend: OpaqueHandler> AppState<Backend> {
     pub fn get_opaque_handler(&self) -> &(impl OpaqueHandler + use<Backend>) {
+        self.backend_handler.unsafe_get_handler()
+    }
+}
+/// KLLDAP's password path; `get_opaque_handler` stays upstream's.
+impl<Backend: BackendHandler + OpaqueHandler> AppState<Backend> {
+    pub fn get_password_handler(
+        &self,
+    ) -> &(impl OpaqueHandler + UserReadableBackendHandler + use<Backend>) {
         self.backend_handler.unsafe_get_handler()
     }
 }
@@ -351,6 +369,33 @@ mod tests {
         let cause = "the Kerberos realm did not open";
         for (unavailable, status, body) in [(None, 200, ""), (Some(cause.to_owned()), 503, cause)] {
             let response = health(unavailable);
+            let got_status = response.status().as_u16();
+            let got_body = to_bytes(response.into_body()).await.unwrap();
+            assert_eq!((got_status, &got_body[..]), (status, body.as_bytes()));
+        }
+    }
+
+    #[actix_web::test]
+    async fn test_health_names_an_unsettled_write_too() {
+        use lldap_domain_handlers::kerberos::{ANSWER_UNSETTLED, DegradedKerberos, NoopKerberos};
+        use lldap_test_utils::recording_kerberos::RecordingKerberos;
+        let realm = || "EXAMPLE.COM".to_owned();
+        let backends: [(Arc<dyn KerberosSync>, u16, &str); 4] = [
+            (Arc::new(NoopKerberos::default()), 200, ""),
+            (RecordingKerberos::new(), 200, ""),
+            (
+                Arc::new(DegradedKerberos::new(realm(), "down".to_owned())),
+                503,
+                "down",
+            ),
+            (
+                RecordingKerberos::unsettled(ANSWER_UNSETTLED),
+                503,
+                ANSWER_UNSETTLED,
+            ),
+        ];
+        for (backend, status, body) in backends {
+            let response = health(health_cause(&*backend));
             let got_status = response.status().as_u16();
             let got_body = to_bytes(response.into_body()).await.unwrap();
             assert_eq!((got_status, &got_body[..]), (status, body.as_bytes()));

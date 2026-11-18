@@ -159,9 +159,13 @@ impl LLDAPFixture {
         self.token = get_token(&self.client, &self.http_url());
     }
 
-    pub fn restart_with_env(&mut self, key: &str, value: &str) {
+    pub fn set_env(&mut self, key: &str, value: &str) {
         self.extra_env.retain(|(name, _)| name != key);
         self.extra_env.push((key.to_owned(), value.to_owned()));
+    }
+
+    pub fn restart_with_env(&mut self, key: &str, value: &str) {
+        self.set_env(key, value);
         self.restart();
     }
 
@@ -178,6 +182,82 @@ impl LLDAPFixture {
         wait_until_answering(self.http_port);
         self.token = get_token(&self.client, &self.http_url());
         value
+    }
+
+    /// Stops the server, runs `between`, then starts it with `extra_env` on top, for a start that
+    /// must refuse: `between`'s value, the exit status (None: still running after 60 s, then
+    /// stopped) and the output.
+    pub fn refused_start<T>(
+        &mut self,
+        between: impl FnOnce() -> T,
+        extra_env: &[(&str, &str)],
+    ) -> (T, Option<std::process::ExitStatus>, String) {
+        stop_child(&mut self.child);
+        let value = between();
+        let mut env = self.extra_env.clone();
+        env.extend(
+            extra_env
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned())),
+        );
+        let command = server_command("run", &self.db_url, self.ldap_port, self.http_port, &env);
+        let (status, output) = self.refused_with(command);
+        (value, status, output)
+    }
+
+    /// As `refused_start`, configured by `config` alone, on this database or a fresh one.
+    pub fn refused_start_with_config(
+        &mut self,
+        config: &str,
+        fresh: bool,
+    ) -> (Option<std::process::ExitStatus>, String, String) {
+        stop_child(&mut self.child);
+        let file = self._dir.path().join("refused.toml");
+        std::fs::write(&file, config).expect("config file");
+        let db_url = match fresh {
+            true => format!("sqlite://{}/fresh.db?mode=rwc", self._dir.path().display()),
+            false => self.db_url.clone(),
+        };
+        let mut command = Command::new(cargo_bin!());
+        command
+            .current_dir(canonicalize("..").expect("canonical path to repo root"))
+            .env(env::DB_KEY, &db_url)
+            .env(env::PRIVATE_KEY_SEED, "Random value for test")
+            .env(env::JWT_SECRET, "Random JWT secret for test")
+            .env(KERBEROS_ENABLED, "false")
+            .env_remove(env::LDAP_USER_PASSWORD)
+            .env("LLDAP_LDAP_PORT", self.ldap_port.to_string())
+            .env("LLDAP_HTTP_PORT", self.http_port.to_string())
+            .envs(self.extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
+            .arg("run")
+            .arg(format!("--config-file={}", file.display()))
+            .arg("--server-key-file=''");
+        let (status, output) = self.refused_with(command);
+        (status, output, db_url)
+    }
+
+    fn refused_with(&mut self, mut command: Command) -> (Option<std::process::ExitStatus>, String) {
+        let path = self._dir.path().join("refused.log");
+        let file = std::fs::File::create(&path).expect("refused log");
+        let err = file.try_clone().expect("refused log");
+        let mut child = command
+            .stdout(Stdio::from(file))
+            .stderr(Stdio::from(err))
+            .spawn()
+            .expect("Unable to start server");
+        let mut status = None;
+        for _ in 0..60 {
+            status = child.try_wait().expect("server status");
+            if status.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1000));
+        }
+        if status.is_none() {
+            stop_child(&mut child);
+        }
+        self.child = child;
+        (status, std::fs::read_to_string(&path).unwrap_or_default())
     }
 
     pub fn healthcheck_output(&self) -> std::process::Output {

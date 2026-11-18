@@ -43,6 +43,7 @@ pub struct Query<Handler: FullHandler + OpaqueHandler> {
 #[derive(GraphQLObject)]
 pub struct KerberosInfo {
     pub public_key_der_base64: Option<String>,
+    pub enabled: bool,
 }
 
 #[derive(GraphQLObject)]
@@ -212,6 +213,7 @@ impl<Handler: FullHandler + OpaqueHandler> Query<Handler> {
     fn kerberos_info(&self, _context: &Context<Handler>) -> FieldResult<KerberosInfo> {
         Ok(KerberosInfo {
             public_key_der_base64: Some(public_key_der_base64()),
+            enabled: kerberos_backend().enabled(),
         })
     }
 
@@ -1277,6 +1279,43 @@ mod tests {
                 vec![]
             ))
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn kerberos_info_says_whether_the_configuration_enables_kerberos() {
+        use lldap_domain_handlers::kerberos::{
+            DegradedKerberos, KerberosSync, NoopKerberos, set_kerberos_backend,
+        };
+        const QUERY: &str = r#"{ kerberosInfo { enabled } }"#;
+        let schema = schema(Query::<MockTestBackendHandler>::new());
+        let context = Context::<MockTestBackendHandler>::new_for_tests(
+            MockTestBackendHandler::new(),
+            ValidationResults {
+                user: UserId::new("admin"),
+                permission: Permission::Admin,
+            },
+        );
+        let realm = || "EXAMPLE.COM".to_owned();
+        let rows: [(Arc<dyn KerberosSync>, bool); 2] = [
+            (Arc::new(NoopKerberos::new(realm())), false),
+            (
+                Arc::new(DegradedKerberos::new(realm(), "down".into())),
+                true,
+            ),
+        ];
+        let mut got = Vec::new();
+        for (backend, _) in &rows {
+            set_kerberos_backend(backend.clone());
+            let answer = execute(QUERY, None, &schema, &Variables::new(), &context).await;
+            got.push(answer.ok().map(|(value, errors)| (value, errors.len())));
+        }
+        set_kerberos_backend(Arc::new(NoopKerberos::default()));
+        let want: Vec<_> = rows
+            .iter()
+            .map(|&(_, enabled)| Some((graphql_value!({"kerberosInfo": {"enabled": enabled}}), 0)))
+            .collect();
+        assert_eq!(got, want);
     }
 
     #[tokio::test]

@@ -60,6 +60,7 @@ path = "../keycloak"
 workspace = true
 
 [dev-dependencies]
+getrandom = { version = "0.4", features = ["sys_rng"] }
 mockall = { workspace = true }
 pretty_assertions = { workspace = true }
 serial_test = { workspace = true }

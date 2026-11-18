@@ -89,6 +89,11 @@
 ## can set this to true to force a reset of the admin password to the value
 ## of ldap_user_pass above.
 ## Alternatively, you can set it to "always" to reset every time the server starts.
+## If the admin has Kerberos sync and Kerberos cannot take part (disabled, the
+## realm does not open, a start pass fails, or the reset with the realm fails),
+## the reset turns the admin's Kerberos sync off, with a warning and one log row.
+## Stop every other server that uses the database first, as for an upgrade. See
+## docs/kerberos.md.
 # force_ldap_user_pass_reset = false
 
 ## Accept a private key (key_file / key_seed) that differs from the one the database

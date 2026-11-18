@@ -186,7 +186,7 @@ impl HostService {
 
     pub async fn register_start(
         request: registration::ClientRegistrationStartRequest,
-    ) -> Result<Box<registration::ServerRegistrationStartResponse>> {
+    ) -> Result<Box<registration::ServerRegistrationStart>> {
         call_server_json_with_error_message(
             &(base_url() + "/auth/opaque/register/start"),
             RequestType::Post(request),
@@ -195,9 +195,7 @@ impl HostService {
         .await
     }
 
-    pub async fn register_finish(
-        request: registration::ClientRegistrationFinishRequest,
-    ) -> Result<()> {
+    pub async fn register_finish(request: registration::ClientRegistrationFinish) -> Result<()> {
         call_server_empty_response_with_error_message(
             &(base_url() + "/auth/opaque/register/finish"),
             RequestType::Post(request),

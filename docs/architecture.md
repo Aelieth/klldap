@@ -97,10 +97,13 @@ shouldn't change (it would invalidate all passwords). Note that even if it was
 compromised, the attacker wouldn't be able to decrypt the passwords without
 running an expensive brute-force search independently for each password.
 
-The KDC needs the plaintext once, to set the principal's key: the web UI encrypts
-the password with RSA-OAEP for the `syncKerberosPassword` mutation, the LDAP and
-GraphQL password paths already hold it, and after the `kadmin` call it is dropped.
-KLLDAP keeps no copy; the KDC stores its own keys in its own database.
+The KDC needs the plaintext once, to set the principal's key, and only for a user
+with Kerberos sync. For such a user the web UI and `lldap_set_password` seal the
+password with RSA-OAEP inside the OPAQUE registration finish, labelled for that
+user; the LDAP and GraphQL password paths already hold it. The server derives the
+OPAQUE record and the keys from it in one transaction and drops it when the request
+ends. For any other user the web UI sends no seal, so the server never sees the
+password. KLLDAP keeps no copy; the KDC stores its own keys in its own database.
 
 The optional TOTP second factor ([mfa.md](mfa.md)) is checked by the same login handler
 that checks the password: `SqlBackendHandler::bind` and `login_finish` split

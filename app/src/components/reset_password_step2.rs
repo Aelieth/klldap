@@ -1,7 +1,4 @@
 use crate::infra::opaque::{begin_registration, finish_registration};
-use crate::infra::queries::{
-    GetKerberosInfo, SyncKerberosPassword, get_kerberos_info, sync_kerberos_password,
-};
 use crate::{
     components::{
         form::{field::Field, submit::Submit},
@@ -10,7 +7,6 @@ use crate::{
     infra::{
         api::HostService,
         common_component::{CommonComponent, CommonComponentParts},
-        encrypt::encrypt_kerberos_password,
     },
 };
 use anyhow::{Result, anyhow, bail};
@@ -35,8 +31,6 @@ pub struct ResetPasswordStep2Form {
     form: Form<FormModel>,
     username: Option<String>,
     opaque_data: Option<opaque::client::registration::ClientRegistration>,
-    kerberos_info: Option<get_kerberos_info::GetKerberosInfoKerberosInfo>,
-    encrypted_password: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq, Properties)]
@@ -47,12 +41,10 @@ pub struct Props {
 
 pub enum Msg {
     ValidateTokenResponse(Result<ServerPasswordResetResponse>),
-    KerberosInfoResponse(Result<get_kerberos_info::ResponseData>),
     FormUpdate,
     Submit,
-    RegistrationStartResponse(Result<Box<registration::ServerRegistrationStartResponse>>),
+    RegistrationStartResponse(Result<Box<registration::ServerRegistrationStart>>),
     RegistrationFinishResponse(Result<()>),
-    SyncKerberosResponse(Result<sync_kerberos_password::ResponseData>),
 }
 
 impl CommonComponent<ResetPasswordStep2Form> for ResetPasswordStep2Form {
@@ -67,28 +59,12 @@ impl CommonComponent<ResetPasswordStep2Form> for ResetPasswordStep2Form {
                 self.username = Some(response?.user_id);
                 Ok(true)
             }
-            Msg::KerberosInfoResponse(res) => {
-                self.kerberos_info = Some(res?.kerberos_info);
-                Ok(true)
-            }
             Msg::FormUpdate => Ok(true),
             Msg::Submit => {
                 if !self.form.validate() {
                     bail!("Check the form for errors");
                 }
-                if self.username.is_none() {
-                    bail!("Username not available");
-                }
-
                 let new_password = self.form.model().password.clone();
-
-                self.encrypted_password = Some(encrypt_kerberos_password(
-                    self.kerberos_info
-                        .as_ref()
-                        .and_then(|i| i.public_key_der_base64.as_deref()),
-                    &new_password,
-                )?);
-
                 let Some(username) = self.username.clone() else {
                     bail!("Username not available");
                 };
@@ -107,7 +83,11 @@ impl CommonComponent<ResetPasswordStep2Form> for ResetPasswordStep2Form {
                     Some(r) => r,
                     None => bail!("Invalid state"),
                 };
-                let req = finish_registration(registration, &self.form.model().password, *res)?;
+                let Some(username) = self.username.as_deref() else {
+                    bail!("Username not available");
+                };
+                let req =
+                    finish_registration(registration, username, &self.form.model().password, *res)?;
                 self.common.call_backend(
                     ctx,
                     HostService::register_finish(req),
@@ -117,28 +97,6 @@ impl CommonComponent<ResetPasswordStep2Form> for ResetPasswordStep2Form {
             }
             Msg::RegistrationFinishResponse(response) => {
                 response.map_err(|e| anyhow!("Failed to set new password: {e:#}"))?;
-                if let Some(enc_pw) = &self.encrypted_password {
-                    let Some(user_id) = self.username.clone() else {
-                        bail!("Username not available");
-                    };
-                    let variables = sync_kerberos_password::Variables {
-                        user_id,
-                        encrypted_password: enc_pw.clone(),
-                    };
-                    self.common.call_graphql::<SyncKerberosPassword, _>(
-                        ctx,
-                        variables,
-                        Msg::SyncKerberosResponse,
-                        "Error syncing Kerberos password",
-                    );
-                    Ok(false)
-                } else {
-                    ctx.link().history().unwrap().push(AppRoute::Login);
-                    Ok(true)
-                }
-            }
-            Msg::SyncKerberosResponse(response) => {
-                response?;
                 ctx.link().history().unwrap().push(AppRoute::Login);
                 Ok(true)
             }
@@ -160,8 +118,6 @@ impl Component for ResetPasswordStep2Form {
             form: yew_form::Form::<FormModel>::new(FormModel::default()),
             username: None,
             opaque_data: None,
-            kerberos_info: None,
-            encrypted_password: None,
         };
         let token = ctx.props().token.clone();
         form.common.call_backend(
@@ -187,66 +143,42 @@ impl Component for ResetPasswordStep2Form {
                 <Link classes="btn-link btn" to={AppRoute::Login}>{"Back to Login"}</Link>
                 </>
             },
-            _ => {
-                if self.kerberos_info.is_none() {
+            _ => html! {
+                <>
+                <h2>{"Reset your password"}</h2>
+                { if ctx.props().mfa_enabled {
                     html! {
-                      <>
-                      { if let Some(e) = &self.common.error {
-                          html! { <div class="alert alert-danger">{e.to_string()}</div> }
-                      } else { html! {} }}
-                      <div>{"Loading Kerberos configuration..."}</div>
-                      </>
+                      <p class="text-muted">
+                        {"Resetting your password also removes any two-factor authentication on this account; you can set it up again afterwards from your profile."}
+                      </p>
                     }
-                } else {
-                    html! {
-                        <>
-                        <h2>{"Reset your password"}</h2>
-                        { if ctx.props().mfa_enabled {
-                            html! {
-                              <p class="text-muted">
-                                {"Resetting your password also removes any two-factor authentication on this account; you can set it up again afterwards from your profile."}
-                              </p>
-                            }
-                        } else { html! {} }}
-                        <form class="form">
-                        <Field<FormModel>
-                        label="New password"
-                        required=true
-                        form={&self.form}
-                        field_name="password"
-                        autocomplete="new-password"
-                        input_type="password"
-                        oninput={link.callback(|_| Msg::FormUpdate)} />
-                        <Field<FormModel>
-                        label="Confirm password"
-                        required=true
-                        form={&self.form}
-                        field_name="confirm_password"
-                        autocomplete="new-password"
-                        input_type="password"
-                        oninput={link.callback(|_| Msg::FormUpdate)} />
-                        <Submit
-                        disabled={self.common.is_task_running()}
-                        onclick={link.callback(|e: MouseEvent| {e.prevent_default(); Msg::Submit})} />
-                        </form>
-                        { if let Some(e) = &self.common.error {
-                            html! { <div class="alert alert-danger">{e.to_string()}</div> }
-                        } else { html! {} }}
-                        </>
-                    }
-                }
-            }
-        }
-    }
-
-    fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
-        if first_render {
-            self.common.call_graphql::<GetKerberosInfo, _>(
-                ctx,
-                get_kerberos_info::Variables {},
-                Msg::KerberosInfoResponse,
-                "Error fetching Kerberos info",
-            );
+                } else { html! {} }}
+                <form class="form">
+                <Field<FormModel>
+                label="New password"
+                required=true
+                form={&self.form}
+                field_name="password"
+                autocomplete="new-password"
+                input_type="password"
+                oninput={link.callback(|_| Msg::FormUpdate)} />
+                <Field<FormModel>
+                label="Confirm password"
+                required=true
+                form={&self.form}
+                field_name="confirm_password"
+                autocomplete="new-password"
+                input_type="password"
+                oninput={link.callback(|_| Msg::FormUpdate)} />
+                <Submit
+                disabled={self.common.is_task_running()}
+                onclick={link.callback(|e: MouseEvent| {e.prevent_default(); Msg::Submit})} />
+                </form>
+                { if let Some(e) = &self.common.error {
+                    html! { <div class="alert alert-danger">{e.to_string()}</div> }
+                } else { html! {} }}
+                </>
+            },
         }
     }
 }

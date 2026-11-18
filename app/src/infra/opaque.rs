@@ -3,6 +3,7 @@
 //! proof and the two-factor pages. Each caller stashes the returned state in its own
 //! component field between the start and finish steps.
 
+use crate::infra::encrypt::seal_kerberos_envelope;
 use anyhow::{Context, Result};
 use lldap_auth::{login, opaque, registration};
 
@@ -32,9 +33,14 @@ pub fn begin_registration(
 /// response, producing the finish request to POST.
 pub fn finish_registration(
     state: RegistrationState,
+    username: &str,
     password: &str,
-    response: registration::ServerRegistrationStartResponse,
-) -> Result<registration::ClientRegistrationFinishRequest> {
+    start: registration::ServerRegistrationStart,
+) -> Result<registration::ClientRegistrationFinish> {
+    let registration::ServerRegistrationStart {
+        response,
+        kerberos_envelope_key,
+    } = start;
     let mut rng = rand::rngs::OsRng;
     let finish = opaque::client::registration::finish_registration(
         state,
@@ -43,9 +49,15 @@ pub fn finish_registration(
         &mut rng,
     )
     .context("Error during registration")?;
-    Ok(registration::ClientRegistrationFinishRequest {
-        server_data: response.server_data,
-        registration_upload: finish.message,
+    let kerberos_password_envelope = kerberos_envelope_key
+        .map(|key| seal_kerberos_envelope(&key, username, password))
+        .transpose()?;
+    Ok(registration::ClientRegistrationFinish {
+        request: registration::ClientRegistrationFinishRequest {
+            server_data: response.server_data,
+            registration_upload: finish.message,
+        },
+        kerberos_password_envelope,
     })
 }
 

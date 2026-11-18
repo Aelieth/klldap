@@ -312,6 +312,7 @@ type Group {
 
 type KerberosInfo {
   publicKeyDerBase64: String
+  enabled: Boolean!
 }
 
 type KeycloakConfigResponse {
@@ -408,7 +409,6 @@ type Mutation {
   addGroupObjectClass(name: String!): Success!
   deleteUserObjectClass(name: String!): Success!
   deleteGroupObjectClass(name: String!): Success!
-  syncKerberosPassword(userId: String!, encryptedPassword: String!): Boolean!
   exportKeytabForKeycloak(hostname: String!): ExportKeytabForKeycloakResponse!
   testKeycloakConnection(input: TestKeycloakConnectionInput!): TestKeycloakConnectionResponse!
   saveKeycloakConfig(input: SaveKeycloakConfigInput!): SaveKeycloakConfigResponse!

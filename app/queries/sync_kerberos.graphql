@@ -1,3 +1,0 @@
-mutation SyncKerberosPassword($userId: String!, $encryptedPassword: String!) {
-  syncKerberosPassword(userId: $userId, encryptedPassword: $encryptedPassword)
-}

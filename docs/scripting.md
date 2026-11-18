@@ -47,8 +47,8 @@ Beyond LLDAP's users, groups, attributes and object classes, the schema exposes:
 - POSIX: `posixSettings`, `setPosixSettings`, and the bulk re-assignment mutations
   (`reassignUserUidNumbers`, `reassignUserGidNumbers`, `reassignUserHomedirectories`,
   `reassignUserLoginshells`, `reassignGidNumbers`).
-- Kerberos: `kerberosInfo` (the RSA public key the web UI encrypts passwords with),
-  `syncKerberosPassword`, `exportKeytabForKeycloak`.
+- Kerberos: `kerberosInfo` (the RSA public key a synced user's password is sealed
+  to; see [kerberos.md](kerberos.md)), `exportKeytabForKeycloak`.
 - Keycloak: `keycloakSuggestedConfig`, `keycloakConfig`, `testKeycloakConnection`,
   `saveKeycloakConfig`, `pushRealmToKeycloak`.
 - Event log (admin-only): `logs(filter, limit, beforeId, afterId)` for rows,
@@ -58,9 +58,16 @@ Beyond LLDAP's users, groups, attributes and object classes, the schema exposes:
 `setUserPassword(userId, password)` sets a password over the API. An admin may set
 anyone's, a password manager may set a non-admin's, and a user may set their own.
 The server runs the OPAQUE registration itself, so nothing but the OPAQUE record is
-stored, and the KDC principal is updated when the user has `kerberosSync` on. Send
+stored, and the KDC principal is updated when the user has `kerberosSync` on. A
+password shorter than 8 characters is refused. Send
 mutations by POST: a mutation sent by GET is refused. Queries may use GET. Use the
 API over HTTPS only.
+
+A new password must be at least 8 characters, with no NUL character (U+0000),
+wherever the server sees its text:
+`setUserPassword`, the LDAP password doors, and a synced user's web pages and
+`lldap_set_password`. A shorter one is refused and nothing is written. For a user
+without sync, the web pages and `lldap_set_password` check 8 themselves.
 
 ### Getting a token
 

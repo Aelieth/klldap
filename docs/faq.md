@@ -14,7 +14,12 @@ set isn't working, try the following:
 
 - If you have changed the admin password in the config after the first run, it
   won't be used (unless you force its use with `force_ldap_user_pass_reset`).
-  The config password is only for the initial admin creation.
+  The config password is only for the initial admin creation. If the admin has
+  Kerberos sync and Kerberos cannot take part (disabled, the realm does not
+  open, a start pass fails, or the reset with the realm fails), the forced
+  reset turns the admin's Kerberos sync off, with a warning and one log row
+  (see [kerberos.md](kerberos.md)). Stop every other server
+  that uses the database before a forced reset.
 - Make sure that the `/data` folder is persistent, either to a docker volume or
   mounted from the host filesystem.
 - Check if there is a `lldap_config.toml` file in `/data`. If there isn't, the

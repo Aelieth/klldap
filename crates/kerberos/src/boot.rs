@@ -715,10 +715,15 @@ mod tests {
     #[test]
     fn test_a_first_start_that_lost_the_realm_to_another_server_stops_with_its_sentence() {
         use crate::embedded::tests::FirstCommit;
+        use lldap_domain_handlers::kerberos::CREATED_FIRST;
         let (winner, loser) = (TempRealm::new(), TempRealm::new());
         let shared = winner.host();
-        winner.host.set_first_commit(Some(FirstCommit::Refused));
-        let lost = open_store(&loser.settings, &profile(&loser.settings), shared.clone());
+        winner
+            .host
+            .set_first_commit(Some(FirstCommit::CreatedFirst));
+        let lost = open_store(&loser.settings, &profile(&loser.settings), shared.clone())
+            .map(drop)
+            .map_err(|e| format!("{e:#}"));
         open_store(&winner.settings, &profile(&winner.settings), shared.clone()).unwrap();
         let stash = loser.settings.data_dir.join(".k5.EXAMPLE.COM");
         let marker = loser.settings.data_dir.join(".k5.EXAMPLE.COM.bootstrap");
@@ -734,9 +739,15 @@ mod tests {
             "{:#}",
             open_store(&loser.settings, &profile(&loser.settings), shared).unwrap_err()
         );
+        let first = lost.unwrap_err();
         assert!(
-            lost.is_err()
-                && before.0.is_some()
+            first
+                .contains("the database refused or did not answer the realm's first read or write")
+                && first.contains(CREATED_FIRST),
+            "the loser's first open names its cause: {first}"
+        );
+        assert!(
+            before.0.is_some()
                 && before.1.is_some()
                 && error.contains("another server created the realm")
                 && error.contains("copy that server's stash here in place of this one"),

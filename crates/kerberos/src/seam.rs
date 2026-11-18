@@ -1,3 +1,4 @@
+use crate::embedded::Follow;
 use krb5_kdc::host::{
     Caller, Denial, HostChange, HostPrepared, KerberosStore, KerberosStoreError, LoadedPrincipal,
     LoadedRealm, Operation, PolicyRow, PrincipalRow, RealmBatch, RealmState, RowChange, TargetPeek,
@@ -12,10 +13,10 @@ use lldap_domain_handlers::kerberos::{
     self as directory, AliasOnto, DIRECTORY_TARGET, DIRECTORY_USER, HostRow,
 };
 use lldap_domain_handlers::logging::{self, LogKind};
-use lldap_domain_handlers::password::{PASSWORD_MIN_LENGTH, long_enough};
+use lldap_domain_handlers::password::{PASSWORD_MIN_LENGTH, PasswordChangeError, password_rules};
 use lldap_opaque_handler::{OpaqueHandler, prepare_registration};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::warn;
 use zeroize::Zeroizing;
@@ -26,6 +27,8 @@ pub(crate) const KADM5_PASS_Q_TOOSHORT: u32 = 43_787_542;
 pub(crate) const KADM5_AUTH_ADD: u32 = 43_787_522;
 pub(crate) const KADM5_PASS_Q_GENERIC: u32 = 43_787_577;
 const DERIVE_WAIT: Duration = Duration::from_secs(30);
+const NO_FOLLOW: &str = "after kadmin change_password the status was not set from \
+     lldap_disabled and stays as it was: no realm engine is wired to this host";
 const UNLOCK_ROW_BITS: u32 = kadm5_mask::TL_DATA | kadm5_mask::MOD_TIME | kadm5_mask::MOD_NAME;
 
 /// What derives a kadmin `cpw`'s OPAQUE record: the server's handler, on the server's runtime.
@@ -61,6 +64,8 @@ pub(crate) struct SqlRealm {
     started: AtomicBool,
     realm: String,
     records: Option<Records>,
+    follow: Mutex<Option<Follow>>,
+    following: Arc<AtomicBool>,
 }
 
 impl SqlRealm {
@@ -70,6 +75,8 @@ impl SqlRealm {
             started: AtomicBool::new(false),
             realm: String::new(),
             records: None,
+            follow: Mutex::new(None),
+            following: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -86,9 +93,19 @@ impl SqlRealm {
 pub(crate) trait Host: KerberosStore {
     fn write_own(&self, change: HostChange, rows: Vec<HostRow>) -> Result<(), KerberosStoreError>;
     fn user_disabled(&self, user: &UserId) -> Result<bool, KerberosStoreError>;
+    fn user_synced(&self, user: &UserId) -> Result<bool, KerberosStoreError>;
+    fn synced_statuses(&self) -> Result<Vec<(UserId, bool)>, KerberosStoreError>;
+    fn directory_users(&self, users: &[UserId]) -> Result<Vec<UserId>, KerberosStoreError>;
     /// Until the start pass has committed, only the bootstrap may come from outside.
     fn start_pass_committed(&self);
     fn fill_alias_targets(&self, rows: &[(String, String)]) -> Result<u64, KerberosStoreError>;
+    fn follow_with(&self, _follow: Follow) {}
+    fn realm_not_held(&self) -> Option<String> {
+        None
+    }
+    fn realm_unsettled(&self) -> Option<String> {
+        None
+    }
 }
 
 pub(crate) fn committing(
@@ -351,10 +368,10 @@ fn password_verdict(intent: &WriteIntent, named: Named) -> Verdict {
     let keepold = intent.keepold.is_some_and(|keepold| keepold != 0);
     let code = match &intent.password {
         _ if keepold || named.user.is_none() => KADM5_PROTECT_PRINCIPAL,
-        Some(password) => match std::str::from_utf8(password.as_slice()) {
-            Ok(text) if long_enough(text) => return Verdict::Password(named),
-            Ok(_) => KADM5_PASS_Q_TOOSHORT,
-            Err(_) => KADM5_PASS_Q_GENERIC,
+        Some(password) => match std::str::from_utf8(password.as_slice()).map(password_rules) {
+            Ok(Ok(())) => return Verdict::Password(named),
+            Ok(Err(PasswordChangeError::TooShort)) => KADM5_PASS_Q_TOOSHORT,
+            Ok(Err(_)) | Err(_) => KADM5_PASS_Q_GENERIC,
         },
         None => KADM5_PROTECT_PRINCIPAL,
     };
@@ -433,7 +450,9 @@ fn denied(intent: &WriteIntent, code: u32, named: &Named) -> KerberosStoreError 
         KADM5_PASS_Q_TOOSHORT => {
             format!("the password is shorter than {PASSWORD_MIN_LENGTH} characters")
         }
-        KADM5_PASS_Q_GENERIC => "the password is not valid UTF-8".to_owned(),
+        KADM5_PASS_Q_GENERIC => {
+            "the password must be valid UTF-8 without a NUL character (U+0000)".to_owned()
+        }
         KADM5_AUTH_ADD => format!(
             "{} is a directory user's name; turn on Kerberos for the user in KLLDAP",
             named.principal
@@ -457,6 +476,9 @@ struct PreparedRecord {
 impl KerberosStore for SqlRealm {
     fn load(&self) -> Result<LoadedRealm, KerberosStoreError> {
         let loaded = self.store.load().map_err(store_error)?;
+        if self.started.load(Ordering::Acquire) {
+            self.queue_statuses();
+        }
         Ok(LoadedRealm {
             principals: loaded
                 .principals
@@ -543,6 +565,18 @@ impl Host for SqlRealm {
         self.store.user_disabled(user).map_err(store_error)
     }
 
+    fn user_synced(&self, user: &UserId) -> Result<bool, KerberosStoreError> {
+        self.store.user_synced(user).map_err(store_error)
+    }
+
+    fn synced_statuses(&self) -> Result<Vec<(UserId, bool)>, KerberosStoreError> {
+        self.store.synced_statuses().map_err(store_error)
+    }
+
+    fn directory_users(&self, users: &[UserId]) -> Result<Vec<UserId>, KerberosStoreError> {
+        self.store.directory_users(users).map_err(store_error)
+    }
+
     fn start_pass_committed(&self) {
         self.started.store(true, Ordering::Release);
     }
@@ -550,9 +584,59 @@ impl Host for SqlRealm {
     fn fill_alias_targets(&self, rows: &[(String, String)]) -> Result<u64, KerberosStoreError> {
         self.store.fill_alias_targets(rows).map_err(store_error)
     }
+
+    fn follow_with(&self, follow: Follow) {
+        *self.follow.lock().unwrap_or_else(|e| e.into_inner()) = Some(follow);
+    }
+
+    fn realm_not_held(&self) -> Option<String> {
+        self.store.realm_not_held()
+    }
+
+    fn realm_unsettled(&self) -> Option<String> {
+        self.store.realm_unsettled()
+    }
 }
 
 impl SqlRealm {
+    /// Off kadmind's thread: the change waits for the store lock kadmind holds until it returns.
+    fn queue_follow(&self, user: UserId, client: &str) {
+        let follow = self
+            .follow
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        match (follow, &self.records) {
+            (Some(follow), Some(records)) => {
+                records.runtime.spawn(follow.run(user, client.to_owned()));
+            }
+            _ => logging::record_kadmin(
+                client,
+                LogKind::KerberosSync,
+                Some(user.as_str()),
+                false,
+                Some(NO_FOLLOW),
+            ),
+        }
+    }
+
+    /// A reload opens the realm again; once it has, the marked principals follow the directory.
+    fn queue_statuses(&self) {
+        let follow = self
+            .follow
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let (Some(follow), Some(records)) = (follow, &self.records) else {
+            return;
+        };
+        if !self.following.swap(true, Ordering::AcqRel) {
+            records
+                .runtime
+                .spawn(follow.statuses(self.following.clone()));
+        }
+    }
+
     fn records(&self) -> Result<&Records, KerberosStoreError> {
         self.records.as_ref().ok_or_else(|| {
             KerberosStoreError::Refused("no password records are wired to this realm".to_owned())
@@ -666,7 +750,7 @@ impl SqlRealm {
         );
         let rows = vec![
             HostRow::SetPassword {
-                user,
+                user: user.clone(),
                 record,
                 now: chrono::Utc::now().naive_utc(),
             },
@@ -674,6 +758,7 @@ impl SqlRealm {
         ];
         self.write(rows, batch)?;
         logging::print(&row);
+        self.queue_follow(user, client(&intent.caller));
         Ok(())
     }
 
@@ -848,7 +933,7 @@ mod tests {
     use super::*;
     use crate::boot;
     use crate::embedded::EmbeddedKerberos;
-    use crate::embedded::tests::{TempRealm, unmarked};
+    use crate::embedded::tests::{TempRealm, synced, unmarked};
     use krb5_kdc::Error as StoreError;
     use krb5_kdc::ModifyPrincipal;
     use krb5_kdc::host::{Caller, RowChange, WriteIntent, conformance};
@@ -1049,7 +1134,7 @@ mod tests {
         let embedded = EmbeddedKerberos::new(store.clone(), &temp.settings, ready, host.clone());
         for user in ["bob", "gone", "carol"] {
             runtime
-                .block_on(embedded.sync_principal(&UserId::new(user), "A-Password-1"))
+                .block_on(synced(&embedded, &UserId::new(user), "A-Password-1"))
                 .unwrap();
         }
         unmarked(&embedded, "dave", false);
@@ -1141,6 +1226,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_a_held_connection_fails_a_change_within_one_step_on_sqlite() {
+        use lldap_domain_handlers::kerberos::CommitError;
         let dir = std::env::temp_dir().join(format!("klldap-stall-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.join("stall.db").display());
@@ -1158,7 +1244,7 @@ mod tests {
         let ready = Arc::new(AtomicBool::new(true));
         let embedded = EmbeddedKerberos::new(store.clone(), &temp.settings, ready, host.clone());
         let bob = UserId::new("bob");
-        let sync = |password| runtime.block_on(embedded.sync_principal(&bob, password));
+        let sync = |password| runtime.block_on(synced(&embedded, &bob, password));
         let kvno = || {
             let name = PrincipalName::new(PrincipalName::NT_PRINCIPAL, ["bob"]);
             let guard = store.read().unwrap();
@@ -1179,7 +1265,10 @@ mod tests {
             }
         });
         held.recv().unwrap();
-        let stalled = sync("A-Password-2").unwrap_err();
+        let stalled = match sync("A-Password-2") {
+            Err(CommitError::Failed(why)) => why,
+            other => panic!("{other:?}"),
+        };
         runtime.block_on(holder).unwrap();
         assert_eq!(
             (
@@ -1279,7 +1368,6 @@ mod tests {
         store.get_name(&name).and_then(|p| p.top_kvno())
     }
 
-    // X1: a synced user's change, its record and its row in one transaction, or none of them.
     fn one_transaction_on(connect: Reconnect) {
         use lldap_domain_handlers::kerberos::CommitError;
         let runtime = runtime();
@@ -1391,7 +1479,6 @@ mod tests {
         fn exit(&self, _: &tracing::span::Id) {}
     }
 
-    // X1 grade 4: the answer to COMMIT is lost after the database took it, on a real database.
     fn lost_answer_on(connect: Reconnect) {
         use lldap_domain_handlers::password::ANSWER_LOST;
         use lldap_sql_backend_handler::start_committer_losing_an_answer;
@@ -1546,6 +1633,424 @@ mod tests {
         });
     }
 
+    fn life_cycle_on(connect: Reconnect) {
+        use crate::embedded::ADOPTED;
+        use crate::embedded::tests::kinit_code;
+        use krb5_types::err::{C_PRINCIPAL_UNKNOWN, CLIENT_REVOKED};
+        use lldap_domain::requests::UpdateUserRequest;
+        use lldap_domain::types::Attribute;
+        use lldap_domain_handlers::kerberos::{CommitError, UserChange, UserStep};
+        let runtime = runtime();
+        let temp = TempRealm::new();
+        let profile = boot::profile(&temp.settings);
+        let (committer, pool) = committer_on(connect, &runtime);
+        for user in ["bob", "carol", "dave", "erin"] {
+            add_user(&pool, &runtime, user);
+        }
+        sql(
+            &pool,
+            &runtime,
+            "INSERT INTO groups (group_id, display_name, lowercase_display_name, creation_date, \
+             uuid, modified_date) VALUES (7, 'grp', 'grp', '2026-01-01 00:00:00', 'uuid-grp', \
+             '2026-01-01 00:00:00')",
+        );
+        for user in ["bob", "dave"] {
+            let statement =
+                format!("INSERT INTO memberships (user_id, group_id) VALUES ('{user}', 7)");
+            sql(&pool, &runtime, &statement);
+        }
+        let host = Arc::new(SqlRealm::new(committer.store()));
+        host.start_pass_committed();
+        let store = krb5_kdc::shared_dump(
+            boot::open_store(&temp.settings, &profile, host.clone()).unwrap(),
+        );
+        let ready = Arc::new(AtomicBool::new(true));
+        let embedded = EmbeddedKerberos::new(store.clone(), &temp.settings, ready, host.clone());
+        for user in ["bob", "carol", "dave"] {
+            runtime
+                .block_on(synced(&embedded, &UserId::new(user), "A-Password-1"))
+                .unwrap();
+        }
+        unmarked(&embedded, "erin", false);
+        let change = |user: &str, step: UserStep| {
+            let id = UserId::new(user);
+            let (row, kind) = match step {
+                UserStep::Delete => (HostRow::DeleteUser(id.clone()), LogKind::UserDelete),
+                _ => {
+                    let sync = Attribute {
+                        name: "kerberossync".into(),
+                        value: 1i64.into(),
+                    };
+                    let request = UpdateUserRequest {
+                        user_id: id.clone(),
+                        insert_attributes: match step {
+                            UserStep::SyncOn => vec![sync],
+                            _ => Vec::new(),
+                        },
+                        delete_attributes: match step {
+                            UserStep::SyncOn => Vec::new(),
+                            _ => vec!["kerberossync".into()],
+                        },
+                        ..Default::default()
+                    };
+                    (HostRow::UpdateUser(request), LogKind::UserUpdate)
+                }
+            };
+            let log = logging::event(kind, Some(user), true, None);
+            UserChange {
+                user: id,
+                step,
+                rows: vec![row, HostRow::Log(log)],
+            }
+        };
+        let n = |query: String| count(&pool, &runtime, &query);
+        let user_rows = |user: &str| {
+            n(format!(
+                "SELECT COUNT(*) AS n FROM users WHERE user_id = '{user}'"
+            ))
+        };
+        let synced = |user: &str| {
+            n(format!(
+                "SELECT COUNT(*) AS n FROM user_attributes WHERE user_attribute_user_id = \
+                 '{user}' AND user_attribute_name = 'kerberossync'"
+            ))
+        };
+        let joined = |user: &str| {
+            n(format!(
+                "SELECT COUNT(*) AS n FROM memberships WHERE user_id = '{user}'"
+            ))
+        };
+        let logs = |kind: &str| {
+            n(format!(
+                "SELECT COUNT(*) AS n FROM logs WHERE kind = '{kind}'"
+            ))
+        };
+        let both = |user: &str| {
+            let reopened = boot::open_store(&temp.settings, &profile, host.clone()).unwrap();
+            let name = PrincipalName::new(PrincipalName::NT_PRINCIPAL, [user]);
+            let kept = reopened
+                .get_name(&name)
+                .map(|p| (p.host_owned(), p.locked()));
+            (state(&store, user), kept)
+        };
+        let commit = |user: &str, step| runtime.block_on(embedded.commit_user(change(user, step)));
+
+        let marked = commit("carol", UserStep::SyncOn);
+        assert_eq!(
+            (
+                marked,
+                synced("carol"),
+                both("carol"),
+                logs("kerberos_sync")
+            ),
+            (Some(Ok(())), 1, (Some((true, true)), Some((true, true))), 1),
+            "sync on, a marked principal left behind: adopted and disabled, one row"
+        );
+
+        let (held_tx, held) = std::sync::mpsc::channel();
+        let holder = runtime.spawn({
+            let pool = pool.clone();
+            async move {
+                let txn = pool.begin().await.unwrap();
+                let statement = "UPDATE users SET display_name = 'held' WHERE user_id = 'carol'";
+                txn.execute_unprepared(statement).await.unwrap();
+                held_tx.send(()).unwrap();
+                tokio::time::sleep(Duration::from_secs(6)).await;
+                txn.rollback().await.unwrap();
+            }
+        });
+        held.recv().unwrap();
+        let stalled = commit("carol", UserStep::SyncOff);
+        runtime.block_on(holder).unwrap();
+        assert_eq!(
+            (
+                matches!(stalled, Some(Err(CommitError::Failed(_)))),
+                synced("carol"),
+                both("carol"),
+                kinit_code(&store, "carol", "A-Password-1")
+            ),
+            (
+                true,
+                1,
+                (Some((true, true)), Some((true, true))),
+                CLIENT_REVOKED
+            ),
+            "sync off that fails: the attribute and the adopted principal stay"
+        );
+
+        let off = commit("carol", UserStep::SyncOff);
+        assert_eq!(
+            (
+                off,
+                synced("carol"),
+                both("carol"),
+                kinit_code(&store, "carol", "A-Password-1"),
+                logs("user_update")
+            ),
+            (Some(Ok(())), 0, (None, None), C_PRINCIPAL_UNKNOWN, 2),
+            "sync off: the attribute and the principal go together"
+        );
+
+        let adopted = commit("erin", UserStep::SyncOn);
+        let adoption_rows = n(format!(
+            "SELECT COUNT(*) AS n FROM logs WHERE kind = 'kerberos_sync' AND detail = '{ADOPTED}'"
+        ));
+        assert_eq!(
+            (
+                adopted,
+                synced("erin"),
+                both("erin"),
+                adoption_rows,
+                kinit_code(&store, "erin", "Erin-Pass-1")
+            ),
+            (
+                Some(Ok(())),
+                1,
+                (Some((true, true)), Some((true, true))),
+                2,
+                CLIENT_REVOKED
+            ),
+            "sync on, an unmarked principal: adopted and disabled, one row"
+        );
+        let next = runtime
+            .block_on(embedded.commit_password(password_commit("erin", b"e1"), "Erin-Pass-1"));
+        assert_eq!(
+            (
+                next,
+                record_of(&pool, &runtime, "erin") == Some(b"e1".to_vec()),
+                both("erin"),
+                kinit_code(&store, "erin", "Erin-Pass-1")
+            ),
+            (Ok(()), true, (Some((true, false)), Some((true, false))), 0),
+            "the next password change enables it with both forms"
+        );
+
+        let deleted = commit("dave", UserStep::Delete);
+        assert_eq!(
+            (
+                deleted,
+                user_rows("dave"),
+                joined("dave"),
+                both("dave"),
+                logs("user_delete")
+            ),
+            (Some(Ok(())), 0, 0, (None, None), 1),
+            "delete: the user, its memberships and its principal go together"
+        );
+
+        sql(
+            &pool,
+            &runtime,
+            "UPDATE kerberos_realm SET generation = generation + 1",
+        );
+        let moved = commit("bob", UserStep::Delete);
+        let principal_rows =
+            n("SELECT COUNT(*) AS n FROM kerberos_principals WHERE name = 'bob'".to_owned());
+        assert_eq!(
+            (
+                matches!(moved, Some(Err(CommitError::Failed(_)))),
+                user_rows("bob"),
+                joined("bob"),
+                (state(&store, "bob"), principal_rows),
+                kinit_code(&store, "bob", "A-Password-1"),
+                logs("user_delete")
+            ),
+            (true, 1, 1, (Some((true, false)), 1), 0, 1),
+            "a delete whose closure fails: the user stays, with a working kinit"
+        );
+        drop((embedded, store, host));
+        runtime.block_on(committer.shutdown());
+    }
+
+    fn sync_races_on(connect: Reconnect) {
+        use lldap_domain::requests::UpdateUserRequest;
+        use lldap_domain::types::Attribute;
+        use lldap_domain_handlers::kerberos::{CommitError, SYNC_CHANGED, UserChange, UserStep};
+        let runtime = runtime();
+        let temp = TempRealm::new();
+        let profile = boot::profile(&temp.settings);
+        let (committer, pool) = committer_on(connect, &runtime);
+        for user in ["bob", "carl"] {
+            add_user(&pool, &runtime, user);
+        }
+        let host = Arc::new(SqlRealm::new(committer.store()));
+        host.start_pass_committed();
+        let store = krb5_kdc::shared_dump(
+            boot::open_store(&temp.settings, &profile, host.clone()).unwrap(),
+        );
+        let ready = Arc::new(AtomicBool::new(true));
+        let embedded = EmbeddedKerberos::new(store.clone(), &temp.settings, ready, host.clone());
+        let sync_rows = |user: &str, was: bool, on: Option<bool>| {
+            let id = UserId::new(user);
+            let attribute = Attribute {
+                name: "kerberossync".into(),
+                value: 1i64.into(),
+            };
+            let (insert_attributes, delete_attributes, kind) = match on {
+                Some(true) => (vec![attribute], Vec::new(), LogKind::UserUpdate),
+                Some(false) => (Vec::new(), vec!["kerberossync".into()], LogKind::UserUpdate),
+                None => (Vec::new(), Vec::new(), LogKind::UserDelete),
+            };
+            let row = match on {
+                Some(_) => HostRow::UpdateUser(UpdateUserRequest {
+                    user_id: id.clone(),
+                    insert_attributes,
+                    delete_attributes,
+                    ..Default::default()
+                }),
+                None => HostRow::DeleteUser(id.clone()),
+            };
+            let log = logging::event(kind, Some(user), true, None);
+            vec![HostRow::SyncIs(id, was), row, HostRow::Log(log)]
+        };
+        let life = |user: &str, step, rows| {
+            let change = UserChange {
+                user: UserId::new(user),
+                step,
+                rows,
+            };
+            runtime.block_on(embedded.commit_user(change))
+        };
+        let password = |user: &str, record: &[u8], text: &str| {
+            let mut change = password_commit(user, record);
+            change
+                .rows
+                .insert(1, HostRow::SyncIs(UserId::new(user), true));
+            runtime.block_on(embedded.commit_password(change, text))
+        };
+        let n = |query: &str| count(&pool, &runtime, query);
+        let both = |user: &str| {
+            let reopened = boot::open_store(&temp.settings, &profile, host.clone()).unwrap();
+            let name = PrincipalName::new(PrincipalName::NT_PRINCIPAL, [user]);
+            (state(&store, user), reopened.get_name(&name).is_some())
+        };
+        let changed = || Some(Err(CommitError::Refused(SYNC_CHANGED.to_owned())));
+
+        let on = life("bob", UserStep::SyncOn, sync_rows("bob", false, Some(true)));
+        let first = password("bob", b"r1", "Bob-Pass-1");
+        let off = life(
+            "bob",
+            UserStep::SyncOff,
+            sync_rows("bob", true, Some(false)),
+        );
+        assert_eq!(
+            (on, first, off, both("bob")),
+            (Some(Ok(())), Ok(()), Some(Ok(())), (None, false)),
+            "the change before the sync off: both written, and the sync off takes the principal"
+        );
+
+        let logs = n("SELECT COUNT(*) AS n FROM logs WHERE kind = 'password_change'");
+        let late = password("bob", b"r2", "Bob-Pass-2");
+        assert_eq!(
+            (
+                late,
+                both("bob"),
+                record_of(&pool, &runtime, "bob"),
+                n("SELECT COUNT(*) AS n FROM logs WHERE kind = 'password_change'")
+            ),
+            (
+                Err(CommitError::Refused(SYNC_CHANGED.to_owned())),
+                (None, false),
+                Some(b"r1".to_vec()),
+                logs
+            ),
+            "the change read sync on before the sync off: refused, no principal, the record kept"
+        );
+
+        let synced_attribute = || {
+            n(
+                "SELECT COUNT(*) AS n FROM user_attributes WHERE user_attribute_user_id = 'bob' \
+               AND user_attribute_name = 'kerberossync'",
+            )
+        };
+        let stale = [
+            (UserStep::SyncUnchanged, sync_rows("bob", true, Some(true))),
+            (UserStep::SyncOff, sync_rows("bob", true, Some(false))),
+            (UserStep::Delete, sync_rows("bob", true, None)),
+        ];
+        for (step, rows) in stale {
+            let got = life("bob", step, rows);
+            let users = n("SELECT COUNT(*) AS n FROM users WHERE user_id = 'bob'");
+            assert_eq!(
+                (got, synced_attribute(), users),
+                (changed(), 0, 1),
+                "{step:?} read sync on before the sync off: refused, nothing written"
+            );
+        }
+
+        unmarked(&embedded, "carl", false);
+        let gone = life(
+            "carl",
+            UserStep::DeleteWithoutSync,
+            sync_rows("carl", false, None),
+        );
+        assert_eq!(
+            (
+                gone,
+                n("SELECT COUNT(*) AS n FROM users WHERE user_id = 'carl'"),
+                state(&store, "carl")
+            ),
+            (Some(Ok(())), 0, Some((false, false))),
+            "a user without sync goes alone: the unmarked principal of its name is not ours"
+        );
+        drop((embedded, store, host));
+        runtime.block_on(committer.shutdown());
+    }
+
+    #[test]
+    #[serial]
+    fn test_sync_races_on_sqlite() {
+        let dir = std::env::temp_dir().join(format!("klldap-races-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.join("races.db").display());
+        sync_races_on(&|runtime| sqlite_one_connection(&url, runtime));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial]
+    fn test_the_life_cycle_on_sqlite() {
+        let dir = std::env::temp_dir().join(format!("klldap-life-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.join("life.db").display());
+        life_cycle_on(&|runtime| sqlite_one_connection(&url, runtime));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial]
+    #[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+    fn test_the_life_cycle_on_postgres() {
+        let Ok(url) = std::env::var("KLLDAP_TEST_DATABASE_URL") else {
+            eprintln!("KLLDAP_TEST_DATABASE_URL not set; skipping");
+            return;
+        };
+        if !url.starts_with("postgres://") && !url.starts_with("postgresql://") {
+            eprintln!("KLLDAP_TEST_DATABASE_URL is not a postgres URL; skipping");
+            return;
+        }
+        let schema = format!("klldap_life_{}", std::process::id());
+        let made = AtomicBool::new(false);
+        life_cycle_on(&|runtime| {
+            runtime.block_on(async {
+                if !made.swap(true, Ordering::Relaxed) {
+                    let admin = Database::connect(url.as_str()).await.unwrap();
+                    for sql in [
+                        format!("DROP SCHEMA IF EXISTS {schema} CASCADE"),
+                        format!("CREATE SCHEMA {schema}"),
+                    ] {
+                        admin.execute_unprepared(&sql).await.unwrap();
+                    }
+                }
+                let mut opts = ConnectOptions::new(url.clone());
+                opts.set_schema_search_path(schema.clone())
+                    .max_connections(2)
+                    .sqlx_logging(false);
+                Database::connect(opts).await.unwrap()
+            })
+        });
+    }
+
     // The principal takes lldap_disabled as read once the change holds the write lock.
     fn status_rows_on(connect: Reconnect) {
         let runtime = runtime();
@@ -1575,7 +2080,7 @@ mod tests {
         let (bob, carol) = (UserId::new("bob"), UserId::new("carol"));
         for user in [&bob, &carol] {
             runtime
-                .block_on(embedded.sync_principal(user, "A-Password-1"))
+                .block_on(synced(&embedded, user, "A-Password-1"))
                 .unwrap();
         }
         runtime
@@ -1639,6 +2144,950 @@ mod tests {
         let url = format!("sqlite://{}?mode=rwc", dir.join("status.db").display());
         status_rows_on(&|runtime| sqlite_one_connection(&url, runtime));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn membership_rows_on(connect: Reconnect) {
+        use crate::embedded::tests::kinit_code;
+        use krb5_types::err::CLIENT_REVOKED;
+        use lldap_domain::types::GroupId;
+        use lldap_domain_handlers::handler::UserBackendHandler;
+        use lldap_domain_handlers::kerberos::{NoopKerberos, set_kerberos_backend};
+        use lldap_domain_handlers::password::{PasswordSync, change_password_everywhere};
+        use lldap_test_utils::recording_log::LogGuard;
+        let (runtime, temp, committer, pool, handler, host, store, embedded) =
+            wired_realm(connect, &["kim"]);
+        sql(
+            &pool,
+            &runtime,
+            "INSERT INTO groups (group_id, display_name, lowercase_display_name, creation_date, \
+             uuid, modified_date) VALUES (7, 'lldap_disabled', 'lldap_disabled', \
+             '2026-01-01 00:00:00', 'uuid-disabled', '2026-01-01 00:00:00')",
+        );
+        set_kerberos_backend(embedded.clone());
+        let (kim, group) = (UserId::new("kim"), GroupId(7));
+        runtime.block_on(async {
+            handler.update_user(sync_request("kim", 1)).await.unwrap();
+            change_password_everywhere(&handler, &kim, "Kim-Pass-1", PasswordSync::On)
+                .await
+                .unwrap();
+        });
+        let log = LogGuard::install_on_this_thread();
+        let n = |query: &str| count(&pool, &runtime, query);
+        let seen = || {
+            (
+                n("SELECT COUNT(*) AS n FROM memberships WHERE user_id = 'kim'"),
+                state(&store, "kim"),
+                n("SELECT COUNT(*) AS n FROM kerberos_principals WHERE name = 'kim' AND disabled"),
+                kinit_code(&store, "kim", "Kim-Pass-1"),
+            )
+        };
+        let rows = |kind: &str| {
+            n(&format!(
+                "SELECT COUNT(*) AS n FROM logs WHERE kind = '{kind}'"
+            ))
+        };
+        let failures = || {
+            let events = log.recorder().take_events().into_iter();
+            let failed = events.filter(|e| !e.success);
+            failed
+                .map(|e| (e.kind, e.detail.unwrap_or_default()))
+                .collect::<Vec<_>>()
+        };
+        let added = runtime.block_on(handler.add_user_to_group(&kim, group));
+        let after_add = (added.is_ok(), seen(), rows("membership_add"), failures());
+        let removed = runtime.block_on(handler.remove_user_from_group(&kim, group));
+        let after_remove = (
+            removed.is_ok(),
+            seen(),
+            rows("membership_remove"),
+            failures(),
+        );
+        runtime
+            .block_on(handler.add_user_to_group(&kim, group))
+            .unwrap();
+        let mut interleaved = Vec::new();
+        for remove_first in [true, false] {
+            let held = runtime.block_on(embedded.hold_writes());
+            let later = Duration::from_millis(50);
+            let (removed, added) = runtime.block_on(async {
+                let remove = async {
+                    tokio::time::sleep(if remove_first { Duration::ZERO } else { later }).await;
+                    handler.remove_user_from_group(&kim, group).await
+                };
+                let add = async {
+                    tokio::time::sleep(if remove_first { later } else { Duration::ZERO }).await;
+                    handler.add_user_to_group(&kim, group).await
+                };
+                let release = async move {
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    drop(held);
+                };
+                let (removed, added, ()) = tokio::join!(remove, add, release);
+                (removed, added)
+            });
+            let after = (removed.is_ok(), added.is_ok(), seen(), failures().len());
+            interleaved.push(after);
+        }
+        sql(
+            &pool,
+            &runtime,
+            "UPDATE kerberos_realm SET generation = generation + 1",
+        );
+        let refused = runtime.block_on(handler.add_user_to_group(&kim, group));
+        let refusals: Vec<_> = failures()
+            .into_iter()
+            .map(|(kind, detail)| (kind, detail.starts_with("the disable of user kim failed: ")))
+            .collect();
+        let after_refusal = (refused.is_err(), seen(), rows("membership_add"), refusals);
+        set_kerberos_backend(Arc::new(NoopKerberos::default()));
+        assert_eq!(
+            (after_add, after_remove),
+            (
+                (
+                    true,
+                    (1, Some((true, true)), 1, CLIENT_REVOKED),
+                    1,
+                    Vec::new()
+                ),
+                (true, (0, Some((true, false)), 0, 0), 1, Vec::new())
+            ),
+            "the membership, its row and the principal's status commit together"
+        );
+        assert_eq!(
+            interleaved,
+            vec![
+                (true, true, (1, Some((true, true)), 1, CLIENT_REVOKED), 0),
+                (true, false, (0, Some((true, false)), 0, 0), 1),
+            ],
+            "a remove and an add queued behind each other, in both orders: the status is the \
+             group's as each change commits"
+        );
+        assert_eq!(
+            after_refusal,
+            (
+                true,
+                (0, Some((true, false)), 0, 0),
+                3,
+                vec![(LogKind::MembershipAdd, true)]
+            ),
+            "a change whose commit fails leaves both as they were, with one failure row"
+        );
+        drop((embedded, store, host, temp, handler, log));
+        runtime.block_on(committer.shutdown());
+    }
+
+    fn sync_window_on(connect: Reconnect) {
+        use crate::embedded::tests::kinit_code;
+        use krb5_types::err::CLIENT_REVOKED;
+        use lldap_domain::types::GroupId;
+        use lldap_domain_handlers::handler::UserBackendHandler;
+        use lldap_domain_handlers::kerberos::{NoopKerberos, set_kerberos_backend};
+        use lldap_domain_handlers::password::{PasswordSync, change_password_everywhere};
+        let (runtime, temp, committer, pool, handler, host, store, embedded) =
+            wired_realm(connect, &["lee"]);
+        sql(&pool, &runtime, DISABLED_GROUP);
+        set_kerberos_backend(embedded.clone());
+        let lee = UserId::new("lee");
+        runtime.block_on(async {
+            handler.update_user(sync_request("lee", 1)).await.unwrap();
+            change_password_everywhere(&handler, &lee, "Lee-Pass-1", PasswordSync::On)
+                .await
+                .unwrap();
+        });
+        let attribute = "FROM user_attributes WHERE user_attribute_user_id = 'lee' AND \
+                         user_attribute_name = 'kerberossync'";
+        sql(
+            &pool,
+            &runtime,
+            &format!("CREATE TABLE saved_sync AS SELECT * {attribute}"),
+        );
+        sql(&pool, &runtime, &format!("DELETE {attribute}"));
+        let before = state(&store, "lee");
+        let held = runtime.block_on(embedded.hold_writes());
+        let window = {
+            let pool = pool.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let statement = "INSERT INTO user_attributes SELECT * FROM saved_sync";
+                pool.execute_unprepared(statement).await.unwrap();
+                drop(held);
+            }
+        };
+        let (added, ()) = runtime
+            .block_on(async { tokio::join!(handler.add_user_to_group(&lee, GroupId(7)), window) });
+        let n = |query: &str| count(&pool, &runtime, query);
+        let after = (
+            added.is_ok(),
+            n("SELECT COUNT(*) AS n FROM memberships WHERE user_id = 'lee'"),
+            state(&store, "lee"),
+            n("SELECT COUNT(*) AS n FROM kerberos_principals WHERE name = 'lee' AND disabled"),
+            kinit_code(&store, "lee", "Lee-Pass-1"),
+            n("SELECT COUNT(*) AS n FROM logs WHERE kind = 'membership_add'"),
+        );
+        set_kerberos_backend(Arc::new(NoopKerberos::default()));
+        assert_eq!(
+            (before, after),
+            (
+                Some((true, false)),
+                (true, 1, Some((true, true)), 1, CLIENT_REVOKED, 1)
+            ),
+            "the door read the user without sync; sync turned on while it waited for the lock: \
+             the sync read under the lock disables the principal with the membership"
+        );
+        drop((embedded, store, host, temp, handler));
+        runtime.block_on(committer.shutdown());
+    }
+
+    #[test]
+    #[serial]
+    fn test_a_sync_turned_on_while_a_disable_waits_disables_the_principal_on_sqlite() {
+        let dir = std::env::temp_dir().join(format!("klldap-window-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.join("window.db").display());
+        sync_window_on(&|runtime| sqlite_one_connection(&url, runtime));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const DISABLED_GROUP: &str = "INSERT INTO groups (group_id, display_name, \
+         lowercase_display_name, creation_date, uuid, modified_date) VALUES (7, 'lldap_disabled', \
+         'lldap_disabled', '2026-01-01 00:00:00', 'uuid-disabled', '2026-01-01 00:00:00')";
+
+    fn taken_over_rows_on(connect: Reconnect) {
+        use crate::embedded::DISABLED_AT_OPEN;
+        use crate::embedded::tests::ask;
+        use krb5_types::err::CLIENT_REVOKED;
+        use lldap_domain_handlers::handler::UserBackendHandler;
+        use lldap_domain_handlers::kerberos::{NoopKerberos, set_kerberos_backend};
+        use lldap_domain_handlers::password::{PasswordSync, change_password_everywhere};
+        use lldap_sql_backend_handler::start_committer_watching_for;
+        let (runtime, temp, committer, pool, handler, host, store, embedded) =
+            wired_realm(connect, &["kim"]);
+        set_kerberos_backend(embedded.clone());
+        let kim = UserId::new("kim");
+        runtime.block_on(async {
+            handler.update_user(sync_request("kim", 1)).await.unwrap();
+            change_password_everywhere(&handler, &kim, "Kim-Pass-1", PasswordSync::On)
+                .await
+                .unwrap();
+        });
+        set_kerberos_backend(Arc::new(NoopKerberos::default()));
+        drop((embedded, store, host));
+        runtime.block_on(committer.shutdown());
+        for statement in [
+            "UPDATE kerberos_realm SET open = true",
+            DISABLED_GROUP,
+            "INSERT INTO memberships (user_id, group_id) VALUES ('kim', 7)",
+        ] {
+            sql(&pool, &runtime, statement);
+        }
+        let earlier = sync_details(&pool, &runtime, "kim").len();
+        let watch = Duration::from_millis(500);
+        let watching =
+            runtime.block_on(async { start_committer_watching_for(pool.clone(), watch) });
+        let records = Records {
+            handler: Arc::new(handler.clone()),
+            runtime: runtime.handle().clone(),
+        };
+        let started = std::time::Instant::now();
+        let (embedded, opened) =
+            EmbeddedKerberos::open(&temp.settings, watching.store(), records).unwrap();
+        let watched = started.elapsed() >= watch;
+        let disabled = count(
+            &pool,
+            &runtime,
+            "SELECT COUNT(*) AS n FROM kerberos_principals WHERE name = 'kim' AND disabled",
+        );
+        let rows = sync_details(&pool, &runtime, "kim").split_off(earlier);
+        let asked = ask(opened.kdc_udp(), "kim", "Kim-Pass-1");
+        let served = std::time::Instant::now();
+        let threads = opened.serve().unwrap();
+        let (answered, code) = asked.join().unwrap();
+        threads.stop();
+        assert_eq!(
+            (watched, disabled, rows, answered > served, code),
+            (
+                true,
+                1,
+                vec![DISABLED_AT_OPEN.to_owned()],
+                true,
+                CLIENT_REVOKED
+            ),
+            "the server that takes the realm over sets the status before its KDC answers"
+        );
+        drop((embedded, temp, handler));
+        runtime.block_on(watching.shutdown());
+    }
+
+    #[test]
+    #[serial]
+    fn test_a_server_that_takes_the_realm_over_sets_each_status_before_it_serves_on_sqlite() {
+        let dir = std::env::temp_dir().join(format!("klldap-taken-over-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.join("taken-over.db").display());
+        taken_over_rows_on(&|runtime| sqlite_one_connection(&url, runtime));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn turn_rows_on(connect: Reconnect) {
+        use crate::embedded::{DISABLED_AT_TURN, ENABLED_AT_TURN};
+        use lldap_domain_handlers::handler::UserBackendHandler;
+        use lldap_domain_handlers::kerberos::{NoopKerberos, set_kerberos_backend};
+        use lldap_domain_handlers::password::{PasswordSync, change_password_everywhere};
+        let (runtime, temp, committer, pool, handler, host, store, embedded) =
+            wired_realm(connect, &["hal"]);
+        set_kerberos_backend(embedded.clone());
+        let hal = UserId::new("hal");
+        runtime.block_on(async {
+            handler.update_user(sync_request("hal", 1)).await.unwrap();
+            change_password_everywhere(&handler, &hal, "Hal-Pass-1", PasswordSync::On)
+                .await
+                .unwrap();
+        });
+        set_kerberos_backend(Arc::new(NoopKerberos::default()));
+        sql(&pool, &runtime, DISABLED_GROUP);
+        let earlier = sync_details(&pool, &runtime, "hal").len();
+        let turns = {
+            let _entered = runtime.enter();
+            embedded.follow_every(Duration::from_millis(200))
+        };
+        let followed = |locked: bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while state(&store, "hal") != Some((true, locked))
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            std::thread::sleep(Duration::from_millis(600));
+            let rows = sync_details(&pool, &runtime, "hal").split_off(earlier);
+            (rows, state(&store, "hal"))
+        };
+        sql(
+            &pool,
+            &runtime,
+            "INSERT INTO memberships (user_id, group_id) VALUES ('hal', 7)",
+        );
+        let disabled = followed(true);
+        sql(
+            &pool,
+            &runtime,
+            "DELETE FROM memberships WHERE user_id = 'hal'",
+        );
+        let enabled = followed(false);
+        turns.abort();
+        let (disabled_row, enabled_row) = (DISABLED_AT_TURN.to_owned(), ENABLED_AT_TURN.to_owned());
+        assert_eq!(
+            (disabled, enabled),
+            (
+                (vec![disabled_row.clone()], Some((true, true))),
+                (vec![disabled_row, enabled_row], Some((true, false)))
+            ),
+            "a membership changed in the database reaches the principal at the next turn, once, \
+             with its row in the same transaction"
+        );
+        drop((embedded, store, host, temp, handler));
+        runtime.block_on(committer.shutdown());
+    }
+
+    fn leftover_rows_on(connect: Reconnect) {
+        use crate::embedded::REMOVED_AT_TURN;
+        use crate::embedded::tests::kinit_code;
+        use krb5_types::err::C_PRINCIPAL_UNKNOWN;
+        use lldap_domain_handlers::handler::UserBackendHandler;
+        use lldap_domain_handlers::kerberos::{NoopKerberos, set_kerberos_backend};
+        use lldap_domain_handlers::password::{PasswordSync, change_password_everywhere};
+        let (runtime, temp, committer, pool, handler, host, store, embedded) =
+            wired_realm(connect, &["gus", "ida"]);
+        set_kerberos_backend(embedded.clone());
+        runtime.block_on(async {
+            for user in ["gus", "ida"] {
+                handler.update_user(sync_request(user, 1)).await.unwrap();
+                let password = format!("{user}-Pass-1");
+                let id = UserId::new(user);
+                change_password_everywhere(&handler, &id, &password, PasswordSync::On)
+                    .await
+                    .unwrap();
+            }
+        });
+        set_kerberos_backend(Arc::new(NoopKerberos::default()));
+        for statement in [
+            "DELETE FROM user_attributes WHERE user_attribute_user_id IN ('gus', 'ida')",
+            "DELETE FROM users WHERE user_id = 'gus'",
+        ] {
+            sql(&pool, &runtime, statement);
+        }
+        let tickets = || {
+            (
+                kinit_code(&store, "gus", "gus-Pass-1"),
+                kinit_code(&store, "ida", "ida-Pass-1"),
+            )
+        };
+        let before = tickets();
+        let turns = {
+            let _entered = runtime.enter();
+            embedded.follow_every(Duration::from_millis(200))
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while (state(&store, "gus").is_some() || state(&store, "ida").is_some())
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(600));
+        turns.abort();
+        let principals = count(
+            &pool,
+            &runtime,
+            "SELECT COUNT(*) AS n FROM kerberos_principals WHERE name IN ('gus', 'ida')",
+        );
+        let rows = (
+            sync_details(&pool, &runtime, "gus"),
+            sync_details(&pool, &runtime, "ida"),
+        );
+        assert_eq!(
+            (before, tickets(), principals, rows),
+            (
+                (0, 0),
+                (C_PRINCIPAL_UNKNOWN, C_PRINCIPAL_UNKNOWN),
+                0,
+                (
+                    vec![format!("{REMOVED_AT_TURN}: user gone")],
+                    vec![format!("{REMOVED_AT_TURN}: no sync")]
+                )
+            ),
+            "a user deleted, and a sync turned off, where the realm could not follow: the \
+             holder's next turn removes the principal, once, with its row"
+        );
+        drop((embedded, store, host, temp, handler));
+        runtime.block_on(committer.shutdown());
+    }
+
+    #[test]
+    #[serial]
+    fn test_the_holder_removes_a_principal_left_behind_at_its_turn_on_sqlite() {
+        let dir = std::env::temp_dir().join(format!("klldap-leftover-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.join("leftover.db").display());
+        leftover_rows_on(&|runtime| sqlite_one_connection(&url, runtime));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial]
+    fn test_the_holder_follows_lldap_disabled_at_each_turn_on_sqlite() {
+        let dir = std::env::temp_dir().join(format!("klldap-turns-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.join("turns.db").display());
+        turn_rows_on(&|runtime| sqlite_one_connection(&url, runtime));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial]
+    fn test_lldap_disabled_and_the_principal_commit_together_on_sqlite() {
+        let dir = std::env::temp_dir().join(format!("klldap-disabled-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.join("disabled.db").display());
+        membership_rows_on(&|runtime| sqlite_one_connection(&url, runtime));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    type Realm = (
+        Runtime,
+        TempRealm,
+        KerberosCommitterHandle,
+        DatabaseConnection,
+        lldap_sql_backend_handler::SqlBackendHandler,
+        Arc<SqlRealm>,
+        krb5_kdc::SharedDump,
+        Arc<EmbeddedKerberos>,
+    );
+
+    fn wired_realm(connect: Reconnect, users: &[&str]) -> Realm {
+        use lldap_auth::opaque::server::generate_random_private_key;
+        use lldap_sql_backend_handler::SqlBackendHandler;
+        let runtime = runtime();
+        let temp = TempRealm::new();
+        let profile = boot::profile(&temp.settings);
+        let (committer, pool) = committer_on(connect, &runtime);
+        for user in users {
+            add_user(&pool, &runtime, user);
+        }
+        let handler = SqlBackendHandler::new(generate_random_private_key(), pool.clone());
+        let records = Records {
+            handler: Arc::new(handler.clone()),
+            runtime: runtime.handle().clone(),
+        };
+        let host = Arc::new(SqlRealm::new(committer.store()).serving("EXAMPLE.COM", Some(records)));
+        host.start_pass_committed();
+        let store = krb5_kdc::shared_dump(
+            boot::open_store(&temp.settings, &profile, host.clone()).unwrap(),
+        );
+        let ready = Arc::new(AtomicBool::new(true));
+        let embedded = EmbeddedKerberos::new(store.clone(), &temp.settings, ready, host.clone());
+        (
+            runtime,
+            temp,
+            committer,
+            pool,
+            handler,
+            host,
+            store,
+            Arc::new(embedded),
+        )
+    }
+
+    fn sync_request(user: &str, on: i64) -> lldap_domain::requests::UpdateUserRequest {
+        lldap_domain::requests::UpdateUserRequest {
+            user_id: UserId::new(user),
+            insert_attributes: vec![lldap_domain::types::Attribute {
+                name: "kerberossync".into(),
+                value: on.into(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn adopted_cpw_on(connect: Reconnect) {
+        use crate::embedded::ENABLED_AFTER_CPW;
+        use crate::embedded::tests::kinit_code;
+        use krb5_types::err::CLIENT_REVOKED;
+        use lldap_domain_handlers::handler::{BindRequest, LoginHandler};
+        use lldap_domain_handlers::kerberos::{UserChange, UserStep};
+        use lldap_test_utils::recording_log::LogGuard;
+        const OLD: &str = "Dora-Old-Pass-1";
+        const CPW: &str = "Dora-Cpw-Pass-2";
+        let log = LogGuard::install();
+        let (runtime, temp, committer, pool, handler, host, store, embedded) =
+            wired_realm(connect, &["dora"]);
+        sql(
+            &pool,
+            &runtime,
+            "INSERT INTO groups (group_id, display_name, lowercase_display_name, creation_date, \
+             uuid, modified_date) VALUES (7, 'lldap_disabled', 'lldap_disabled', \
+             '2026-01-01 00:00:00', 'uuid-disabled', '2026-01-01 00:00:00')",
+        );
+        let dora = name("dora");
+        let etypes: Vec<krb5_crypto::KeySalt> = temp
+            .settings
+            .supported_enctypes
+            .iter()
+            .map(|&e| e.into())
+            .collect();
+        unmarked(&embedded, "dora", false);
+        store
+            .write()
+            .unwrap()
+            .change_committing(committing(&*host), |s| {
+                let password = OLD.as_bytes();
+                s.set_password_etypes_keepold_n_in(
+                    &dora,
+                    "EXAMPLE.COM",
+                    password,
+                    0,
+                    "test",
+                    &etypes,
+                )
+            })
+            .unwrap()
+            .unwrap();
+        let adopt = UserChange {
+            user: UserId::new("dora"),
+            step: UserStep::SyncOn,
+            rows: vec![HostRow::UpdateUser(sync_request("dora", 1))],
+        };
+        let adopted = runtime.block_on(embedded.commit_user(adopt));
+        let while_adopted = (state(&store, "dora"), kinit_code(&store, "dora", OLD));
+        log.recorder().take_events();
+        let fill = with_password(CPW, 0);
+        let intent = intent_of(Operation::ChangePassword, kadmin(false), &["dora"], &fill);
+        let edit = |s: &mut krb5_kdc::PrincipalStore| {
+            let password = CPW.as_bytes();
+            s.set_password_etypes_keepold_n_in(&dora, "EXAMPLE.COM", password, 0, ADMIN, &etypes)
+        };
+        let cpw = kadmin_write(&store, true, intent, &dora, &edit);
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut followed = Vec::new();
+        while followed.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            let events = log.recorder().take_events().into_iter();
+            followed.extend(
+                events
+                    .filter(|e| e.kind == LogKind::KerberosSync)
+                    .map(|e| (e.protocol, e.actor, e.target, e.success, e.detail)),
+            );
+        }
+        let binds = |password: &str| {
+            let request = BindRequest {
+                name: UserId::new("dora"),
+                password: password.to_owned(),
+            };
+            runtime.block_on(handler.bind(request)).is_ok()
+        };
+        assert_eq!(
+            (
+                adopted,
+                while_adopted,
+                cpw,
+                state(&store, "dora"),
+                kinit_code(&store, "dora", CPW),
+                (binds(CPW), binds(OLD)),
+                followed
+            ),
+            (
+                Some(Ok(())),
+                (Some((true, true)), CLIENT_REVOKED),
+                "written".to_owned(),
+                Some((true, false)),
+                0,
+                (true, false),
+                vec![(
+                    logging::Protocol::Kadmin,
+                    Some(ADMIN.to_owned()),
+                    Some("dora".to_owned()),
+                    true,
+                    Some(ENABLED_AFTER_CPW.to_owned())
+                )]
+            ),
+            "adopt, kadmin cpw, then enabled with both forms"
+        );
+        drop((embedded, store, host, temp));
+        runtime.block_on(committer.shutdown());
+    }
+
+    #[test]
+    #[serial]
+    fn test_kadmin_cpw_on_an_adopted_principal_enables_it_on_sqlite() {
+        let dir = std::env::temp_dir().join(format!("klldap-cpw-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.join("cpw.db").display());
+        adopted_cpw_on(&|runtime| sqlite_one_connection(&url, runtime));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn door_races_on(connect: Reconnect) {
+        use crate::embedded::tests::kinit_code;
+        use lldap_domain_handlers::handler::{BindRequest, LoginHandler, UserBackendHandler};
+        use lldap_domain_handlers::kerberos::{NoopKerberos, set_kerberos_backend};
+        use lldap_domain_handlers::password::{
+            PasswordChangeError, PasswordSync, change_password_everywhere, finish_plain, pause,
+        };
+        let (runtime, temp, committer, _pool, handler, host, store, embedded) =
+            wired_realm(connect, &["carl", "dave", "erin"]);
+        set_kerberos_backend(embedded.clone());
+        let (carl, dave) = (UserId::new("carl"), UserId::new("dave"));
+        runtime.block_on(async {
+            handler.update_user(sync_request("dave", 1)).await.unwrap();
+            change_password_everywhere(&handler, &dave, "Dave-Pass-1", PasswordSync::On)
+                .await
+                .unwrap();
+        });
+        let binds = |user: &str, password: &str| {
+            let request = BindRequest {
+                name: UserId::new(user),
+                password: password.to_owned(),
+            };
+            runtime.block_on(handler.bind(request)).is_ok()
+        };
+
+        let pause::Paused { reached, resume } = pause::arm(&carl);
+        let (plain, ()) = runtime.block_on(async {
+            tokio::join!(
+                change_password_everywhere(&handler, &carl, "Carl-Plain-1", PasswordSync::Off),
+                async {
+                    reached.await.unwrap();
+                    handler.update_user(sync_request("carl", 1)).await.unwrap();
+                    let synced = PasswordSync::On;
+                    change_password_everywhere(&handler, &carl, "Carl-Synced-1", synced)
+                        .await
+                        .unwrap();
+                    resume.send(()).unwrap();
+                }
+            )
+        });
+        let carl_after = (
+            plain,
+            (
+                binds("carl", "Carl-Synced-1"),
+                binds("carl", "Carl-Plain-1"),
+            ),
+            kinit_code(&store, "carl", "Carl-Synced-1"),
+            state(&store, "carl"),
+        );
+
+        let pause::Paused { reached, resume } = pause::arm(&dave);
+        let (synced, ()) = runtime.block_on(async {
+            tokio::join!(
+                change_password_everywhere(&handler, &dave, "Dave-Pass-2", PasswordSync::On),
+                async {
+                    reached.await.unwrap();
+                    handler.update_user(sync_request("dave", 0)).await.unwrap();
+                    resume.send(()).unwrap();
+                }
+            )
+        });
+        let dave_after = (
+            synced,
+            (binds("dave", "Dave-Pass-1"), binds("dave", "Dave-Pass-2")),
+            state(&store, "dave"),
+        );
+
+        let erin = UserId::new("erin");
+        let upload =
+            lldap_opaque_handler::prepare_registration(&handler, erin.clone(), b"Erin-Web-1");
+        let (_, upload) = runtime.block_on(upload).unwrap();
+        let pause::Paused { reached, resume } = pause::arm(&erin);
+        let (web, ()) = runtime.block_on(async {
+            tokio::join!(finish_plain(&handler, &erin, upload), async {
+                reached.await.unwrap();
+                handler.update_user(sync_request("erin", 1)).await.unwrap();
+                let synced = PasswordSync::On;
+                change_password_everywhere(&handler, &erin, "Erin-Synced-1", synced)
+                    .await
+                    .unwrap();
+                resume.send(()).unwrap();
+            })
+        });
+        let erin_after = (
+            web.map(drop),
+            (binds("erin", "Erin-Synced-1"), binds("erin", "Erin-Web-1")),
+            kinit_code(&store, "erin", "Erin-Synced-1"),
+            state(&store, "erin"),
+        );
+        set_kerberos_backend(Arc::new(NoopKerberos::default()));
+        let changed = || Err(PasswordChangeError::SyncChanged);
+        assert_eq!(
+            (carl_after, dave_after),
+            (
+                (changed(), (true, false), 0, Some((true, false))),
+                (changed(), (true, false), None)
+            ),
+            "plain read first: refused, one password in both stores; synced read first: \
+             refused, the directory keeps its password and no principal is made"
+        );
+        assert_eq!(
+            erin_after,
+            (changed(), (true, false), 0, Some((true, false))),
+            "the web finish's upload, held: refused once the switch is on, nothing stored"
+        );
+        drop((embedded, store, host, temp));
+        runtime.block_on(committer.shutdown());
+    }
+
+    fn reload_follows_on(connect: Reconnect) {
+        use crate::embedded::DISABLED_AT_OPEN;
+        use lldap_domain_handlers::handler::UserBackendHandler;
+        use lldap_domain_handlers::kerberos::{NoopKerberos, set_kerberos_backend};
+        use lldap_domain_handlers::password::{PasswordSync, change_password_everywhere};
+        let (runtime, temp, committer, pool, handler, host, store, embedded) =
+            wired_realm(connect, &["hal"]);
+        set_kerberos_backend(embedded.clone());
+        let hal = UserId::new("hal");
+        runtime.block_on(async {
+            handler.update_user(sync_request("hal", 1)).await.unwrap();
+            change_password_everywhere(&handler, &hal, "Hal-Pass-1", PasswordSync::On)
+                .await
+                .unwrap();
+        });
+        set_kerberos_backend(Arc::new(NoopKerberos::default()));
+        sql(
+            &pool,
+            &runtime,
+            "INSERT INTO groups (group_id, display_name, lowercase_display_name, creation_date, \
+             uuid, modified_date) VALUES (7, 'lldap_disabled', 'lldap_disabled', \
+             '2026-01-01 00:00:00', 'uuid-disabled', '2026-01-01 00:00:00')",
+        );
+        sql(
+            &pool,
+            &runtime,
+            "INSERT INTO memberships (user_id, group_id) VALUES ('hal', 7)",
+        );
+        let before = state(&store, "hal");
+        let earlier = sync_details(&pool, &runtime, "hal").len();
+        let settled = || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while host.following.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            sync_details(&pool, &runtime, "hal").split_off(earlier)
+        };
+        assert!(host.load().is_ok());
+        let first = settled();
+        let after = state(&store, "hal");
+        assert!(host.load().is_ok());
+        let second = settled();
+        assert_eq!(
+            (before, after, first, second, state(&store, "hal")),
+            (
+                Some((true, false)),
+                Some((true, true)),
+                vec![DISABLED_AT_OPEN.to_owned()],
+                vec![DISABLED_AT_OPEN.to_owned()],
+                Some((true, true))
+            ),
+            "a reload is an opening: the marked principal follows lldap_disabled, once"
+        );
+        drop((embedded, store, host, temp, handler));
+        runtime.block_on(committer.shutdown());
+    }
+
+    #[test]
+    #[serial]
+    fn test_a_reload_sets_each_marked_principals_status_on_sqlite() {
+        let dir = std::env::temp_dir().join(format!("klldap-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.join("reload.db").display());
+        reload_follows_on(&|runtime| sqlite_one_connection(&url, runtime));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn only_the_holder_on(connect: Reconnect) {
+        use lldap_domain_handlers::handler::{BindRequest, LoginHandler, UserBackendHandler};
+        use lldap_domain_handlers::kerberos::{
+            DegradedKerberos, NoopKerberos, set_kerberos_backend,
+        };
+        use lldap_domain_handlers::password::{
+            PasswordChangeError, PasswordSync, change_password_everywhere, realm_not_ready,
+        };
+        use lldap_test_utils::recording_log::LogGuard;
+        const DEGRADED: &str = "the Kerberos realm EXAMPLE.COM did not open: test";
+        let log = LogGuard::install();
+        let (runtime, temp, committer, pool, handler, host, store, embedded) =
+            wired_realm(connect, &["ivy", "jon"]);
+        let ivy = UserId::new("ivy");
+        let change = |password: &str| {
+            let plain = PasswordSync::Off;
+            runtime.block_on(change_password_everywhere(&handler, &ivy, password, plain))
+        };
+        let refusals = || {
+            log.recorder()
+                .take_events()
+                .into_iter()
+                .filter(|e| !e.success && e.target.as_deref() == Some("ivy"))
+                .map(|e| e.detail.unwrap_or_default())
+                .collect::<Vec<_>>()
+        };
+        set_kerberos_backend(embedded.clone());
+        let holder = (change("Ivy-Holder-1"), refusals());
+
+        let degraded = DegradedKerberos::new("EXAMPLE.COM".to_owned(), DEGRADED.to_owned());
+        set_kerberos_backend(Arc::new(degraded));
+        let degraded = (change("Ivy-Degraded-1"), refusals());
+
+        set_kerberos_backend(embedded.clone());
+        sql(
+            &pool,
+            &runtime,
+            "UPDATE kerberos_realm SET generation = generation + 1",
+        );
+        let taken = runtime.block_on(handler.update_user(sync_request("jon", 1)));
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while embedded.ready() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let lost = (change("Ivy-Lost-1"), refusals());
+        set_kerberos_backend(Arc::new(NoopKerberos::default()));
+        let binds = |password: &str| {
+            let request = BindRequest {
+                name: ivy.clone(),
+                password: password.to_owned(),
+            };
+            runtime.block_on(handler.bind(request)).is_ok()
+        };
+        let lost_cause = match &lost.0 {
+            Err(PasswordChangeError::Unavailable(text)) => text.clone(),
+            other => panic!("not refused as unavailable: {other:?}"),
+        };
+        let refused = realm_not_ready(DEGRADED);
+        assert_eq!(
+            (
+                holder,
+                degraded,
+                taken.is_err(),
+                lost_cause.starts_with("the Kerberos realm was lost: the realm's generation moved"),
+                lost.1.len(),
+                (
+                    binds("Ivy-Holder-1"),
+                    binds("Ivy-Degraded-1"),
+                    binds("Ivy-Lost-1")
+                )
+            ),
+            (
+                (Ok(()), Vec::new()),
+                (Err(refused.clone()), vec![refused.to_string()]),
+                true,
+                true,
+                1,
+                (true, false, false)
+            ),
+            "the holder changes it; a degraded server and one that lost the realm write nothing"
+        );
+        drop((embedded, store, host, temp));
+        runtime.block_on(committer.shutdown());
+    }
+
+    #[test]
+    #[serial]
+    fn test_only_the_server_holding_the_realm_changes_a_password_on_sqlite() {
+        let dir = std::env::temp_dir().join(format!("klldap-holder-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.join("holder.db").display());
+        only_the_holder_on(&|runtime| sqlite_one_connection(&url, runtime));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial]
+    fn test_a_door_and_a_sync_change_race_in_both_orders_on_sqlite() {
+        let dir = std::env::temp_dir().join(format!("klldap-doors-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.join("doors.db").display());
+        door_races_on(&|runtime| sqlite_one_connection(&url, runtime));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn on_scratch_postgres(prefix: &str, rows: fn(Reconnect)) {
+        let Ok(url) = std::env::var("KLLDAP_TEST_DATABASE_URL") else {
+            eprintln!("KLLDAP_TEST_DATABASE_URL not set; skipping");
+            return;
+        };
+        if !url.starts_with("postgres://") && !url.starts_with("postgresql://") {
+            eprintln!("KLLDAP_TEST_DATABASE_URL is not a postgres URL; skipping");
+            return;
+        }
+        let schema = format!("{prefix}_{}", std::process::id());
+        let made = AtomicBool::new(false);
+        rows(&|runtime| {
+            runtime.block_on(async {
+                if !made.swap(true, Ordering::Relaxed) {
+                    let admin = Database::connect(url.as_str()).await.unwrap();
+                    for sql in [
+                        format!("DROP SCHEMA IF EXISTS {schema} CASCADE"),
+                        format!("CREATE SCHEMA {schema}"),
+                    ] {
+                        admin.execute_unprepared(&sql).await.unwrap();
+                    }
+                }
+                let mut opts = ConnectOptions::new(url.clone());
+                opts.set_schema_search_path(schema.clone())
+                    .max_connections(2)
+                    .sqlx_logging(false);
+                Database::connect(opts).await.unwrap()
+            })
+        });
+    }
+
+    #[test]
+    #[serial]
+    #[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+    fn test_a_door_and_a_sync_change_race_in_both_orders_on_postgres() {
+        on_scratch_postgres("klldap_doors", door_races_on);
+    }
+
+    #[test]
+    #[serial]
+    #[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+    fn test_sync_races_on_postgres() {
+        on_scratch_postgres("klldap_races", sync_races_on);
     }
 
     const ADMIN: &str = "admin/admin@EXAMPLE.COM";
@@ -1771,6 +3220,19 @@ mod tests {
         }
     }
 
+    fn sync_details(pool: &DatabaseConnection, runtime: &Runtime, user: &str) -> Vec<String> {
+        let query = format!(
+            "SELECT detail FROM logs WHERE kind = 'kerberos_sync' AND target = '{user}' ORDER BY id"
+        );
+        let statement = sea_orm::Statement::from_string(pool.get_database_backend(), query);
+        runtime
+            .block_on(pool.query_all(statement))
+            .unwrap()
+            .iter()
+            .map(|row| row.try_get::<String>("", "detail").unwrap())
+            .collect()
+    }
+
     fn details(pool: &DatabaseConnection, runtime: &Runtime, kind: &str) -> Vec<String> {
         let query = format!("SELECT detail FROM logs WHERE kind = '{kind}' ORDER BY id");
         let statement = sea_orm::Statement::from_string(pool.get_database_backend(), query);
@@ -1847,7 +3309,7 @@ mod tests {
         let ready = Arc::new(AtomicBool::new(true));
         let embedded = EmbeddedKerberos::new(store.clone(), &temp.settings, ready, host.clone());
         runtime
-            .block_on(embedded.sync_principal(&UserId::new("bob"), "Bob-Password-1"))
+            .block_on(synced(&embedded, &UserId::new("bob"), "Bob-Password-1"))
             .unwrap();
         let (bob, svc, robert) = (name("bob"), name("HTTP/web.example.com"), name("robert"));
         let (alice, twin, web, moved) = (
@@ -1912,7 +3374,7 @@ mod tests {
         rows();
 
         let held = (host.load().unwrap(), record());
-        let on_bob: [Case; 12] = [
+        let on_bob: [Case; 13] = [
             (
                 "randkey",
                 Operation::Randkey,
@@ -2036,6 +3498,23 @@ mod tests {
                         &bob,
                         "EXAMPLE.COM",
                         NOT_UTF8,
+                        0,
+                        ADMIN,
+                        &etypes,
+                    )
+                }),
+                "change_password: PASS_Q_GENERIC",
+            ),
+            (
+                "cpw with a NUL, 9 characters",
+                Operation::ChangePassword,
+                &["bob"],
+                with_password("a\0aaaaaaa", 0),
+                Box::new(|s: &mut PrincipalStore| {
+                    s.set_password_etypes_keepold_n_in(
+                        &bob,
+                        "EXAMPLE.COM",
+                        b"a\0aaaaaaa",
                         0,
                         ADMIN,
                         &etypes,
@@ -3195,7 +4674,7 @@ mod tests {
             intent.password = Some(Zeroizing::new(text.as_bytes().to_vec()));
             intent.keepold = Some(keepold);
         }
-        let rows: [Row; 15] = [
+        let rows: [Row; 16] = [
             (Operation::Unspecified, false, |_| {}, "written"),
             (Operation::Modify, false, |_| {}, "written"),
             (Operation::Embedded, false, |_| {}, "refused"),
@@ -3239,6 +4718,12 @@ mod tests {
                 true,
                 |i| password(i, "pässwör", 0),
                 "PASS_Q_TOOSHORT",
+            ),
+            (
+                Operation::ChangePassword,
+                true,
+                |i| password(i, "a\0aaaaaaa", 0),
+                "PASS_Q_GENERIC",
             ),
             (
                 Operation::ChangePassword,
@@ -3660,7 +5145,7 @@ mod tests {
             Some(("bob@EXAMPLE.COM", true)),
             Some(("svc@EXAMPLE.COM", false)),
         );
-        let rows: [Row; 31] = [
+        let rows: [Row; 32] = [
             (
                 "create, no record",
                 Operation::Create,
@@ -3807,6 +5292,14 @@ mod tests {
                 ["bob@EXAMPLE.COM", ""],
                 |i| password(i, "pässwör", 0),
                 "PASS_Q_TOOSHORT bob@EXAMPLE.COM",
+            ),
+            (
+                "cpw with a NUL, 9 characters",
+                Operation::ChangePassword,
+                bob,
+                ["bob@EXAMPLE.COM", ""],
+                |i| password(i, "a\0aaaaaaa", 0),
+                "PASS_Q_GENERIC bob@EXAMPLE.COM",
             ),
             (
                 "cpw of 8 characters",

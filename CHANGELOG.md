@@ -2,7 +2,102 @@
 
 ## [0.8.1] - Unreleased
 
+### Removed
+
+- The `syncKerberosPassword` mutation. A synced user's password now travels sealed inside
+  `/auth/opaque/register/finish`. The `kerberosInfo` query stays.
+
 ### Changed
+
+- The web pages (change password, the e-mail reset, create user) and `lldap_set_password` set
+  a `kerberossync` user's password in one request: the register/start answer carries the
+  sealing key (`kerberos_envelope_key`) only for such a user, the finish carries the password
+  sealed with RSA-OAEP-SHA-256 under the label `klldap-kerberos-envelope-v1:<user id>`
+  (`kerberos_password_envelope`), and the server registers it itself, changing the directory
+  record and the Kerberos keys in one transaction. An envelope sealed for another user, or
+  sent for a user without sync, is refused (400) and nothing is written. Every other user's
+  register calls are LLDAP's, and their pages send no password to the server.
+- A synced user's password from the web pages or `lldap_set_password` must be at least 8
+  characters (400). The pages and the tool check 8 for every user, counting characters.
+- The create-user page refuses a password longer than 318 bytes for a user with Kerberos sync
+  before it creates the user.
+- `lldap_set_password` prints the server's answer when a call fails.
+- A password with a NUL character (U+0000) is refused at every door that checks the floor of 8:
+  GraphQL, LDAP (53), the web finish and `lldap_set_password` (400), kadmin `cpw`
+  (`PASS_Q_GENERIC`), the forced reset and the first start's admin password. Each refused
+  change writes one failure row, the web finish's envelope refusals included.
+- A `kerberossync` change, a delete and a synced user's password change check the switch in the
+  transaction that writes; one that finds it changed writes nothing and answers "the user's
+  Kerberos sync changed; try again". A password change of a user without sync waits for the
+  realm's other writes, reads the switch again, and answers the same if it is on now.
+- Kerberos disabled in the configuration is its own state: turning the switch off and deleting
+  a user change the directory alone (a `kerberos_sync` row says a principal, if there is one, is
+  left for the start pass, which removes it at the next start with Kerberos); turning it on,
+  creating a user with it on ("Kerberos is disabled; create the user without Kerberos sync")
+  and a synced user's password change ("enable Kerberos, or turn the user's Kerberos sync off
+  first") are refused. With the realm not ready, every change that needs it answers "retry
+  shortly", and the web finish refuses before it opens the envelope.
+- The create-user page shows no Kerberos switch and sends no `kerberossync` when the server has
+  Kerberos disabled (`kerberosInfo { enabled }`, new).
+- An adopted principal keeps its fields; its keys are replaced with random ones, the old ones
+  dropped, and it is marked and disabled. A create with the switch on adopts the principal of
+  its name too; an LDAP ADD with a password sets both forms and marks it. Right after a kadmin
+  `cpw`, a change of its own sets the principal's status from `lldap_disabled`: an adopted
+  principal is enabled then, unless its user is in `lldap_disabled`. Deleting a user without
+  sync touches no principal. Sync on at `createUser` is refused for a name that is an alias, as
+  at `updateUser`.
+- A change of `lldap_disabled` membership is never refused because Kerberos is disabled or not
+  ready. With Kerberos disabled in the configuration, or the realm not ready, it changes the
+  directory alone with a `kerberos_sync` row saying the principal's status is left for the start
+  pass. Whenever the realm opens (each start, before the KDC serves, and a reload after a failed
+  write), every marked principal of a user with sync takes its status from `lldap_disabled`,
+  with one `kerberos_sync` row for each principal changed. With the realm ready, a user with
+  sync has the membership, its log row and the principal's status written in one transaction:
+  all of them, or none and one failure row. On the holder every such change waits for the
+  realm's other writes and reads the user's sync again first.
+- With Kerberos enabled, only the server that holds the realm changes a password, with or
+  without sync: a degraded server, or one that lost the realm, answers "try again" (LDAP 52,
+  HTTP 503, a GraphQL error) with one failure row, before it derives, opens or writes anything;
+  a server still watching beside a holder answers nothing, and exits after the watch. The holder
+  answers "try again" too while the answer to its last write is lost and not yet settled by the
+  read-back, a reload or the next heartbeat; in that window it also answers "try again" to a sync
+  change and to a synced user's create, delete and `lldap_disabled` change, while every user
+  still binds and signs in and other directory changes go on. A plain change whose derive or
+  store fails writes one failure row too. An LDAP ADD with a password for a user without sync
+  answers the same (52) while the realm is not ready.
+- `force_ldap_user_pass_reset` is upstream's break-glass again and runs whatever Kerberos does:
+  with the realm open it waits for it, and sets a synced admin's keys in the same transaction;
+  when Kerberos cannot take part (disabled, the realm does not open, reconcile or the start
+  pass fails, or the reset with the realm fails), it resets the directory password and turns a
+  synced admin's Kerberos sync off in the same transaction, with one `kerberos_sync` row and a
+  warning at start, and the server starts, degraded if the realm is not usable. When the realm
+  is usable the start pass runs again before the KDC serves, so the admin's old Kerberos
+  password gets no ticket from it. A server that finds another one holding the realm runs it
+  so, then exits. Only a configured password under 8 characters or with a NUL refuses the start.
+- A failed reconcile or start pass leaves the server degraded and still holding the realm, and
+  is named as such in the log, `/health`, the forced reset's warning and its row; "did not
+  open" stays for a realm that did not open. A realm found lost before its KDC starts never
+  serves.
+- At a start the KDC and kadmind bind their ports when the realm opens, but answer only after
+  the status pass, reconcile, the start pass and a forced reset: a request that arrives
+  meanwhile waits, and is answered from the new state. A server that takes the realm over
+  starts the same way.
+- The server that holds the realm sets each marked principal's status from `lldap_disabled`
+  every 60 seconds too, from one read of the group's members with sync; only differences are
+  written, one `kerberos_sync` row each, in the transaction of its status, and a pass that fails
+  is tried again at the next. It also removes a marked principal whose user is gone or no
+  longer has sync, one row each, so its old password stops working within a minute. The start
+  pass writes each chunk's rows in that chunk's transaction too.
+- Turning sync from off to on adopts any principal of the user's name, one the directory made
+  included: random keys, disabled until its status is set from `lldap_disabled` by the holder's
+  next status pass (within a minute), the next password change, a kadmin `cpw` or the next
+  opening of the realm; its random keys take no password. Turning it on when it is already on
+  changes nothing.
+- Every server on one database has the same `kerberos_options.enabled`; a server started with
+  Kerberos disabled beside a realm marked open logs one warning saying what that means, and that
+  it is harmless on a lone server.
+- The user details page shows the Kerberos switch, while the server has Kerberos disabled, only
+  for a user whose sync is on, so that it can be turned off.
 
 - A `kerberossync` user's password change through GraphQL `setUserPassword`, LDAP Modify
   `userPassword`, `ldappasswd` or LDAP ADD writes the directory record, the Kerberos keys and

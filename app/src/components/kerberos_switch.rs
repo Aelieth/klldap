@@ -9,6 +9,8 @@ pub struct KerberosSwitchProps {
     pub show_banner: bool,
     #[prop_or_default]
     pub username: Option<String>,
+    #[prop_or_default]
+    pub kerberos_disabled: bool,
 }
 
 #[function_component(KerberosSwitch)]
@@ -42,7 +44,11 @@ pub fn kerberos_switch(props: &KerberosSwitchProps) -> Html {
                     </button>
                 </div>
                 <div class="form-text text-muted ms-3">
-                    {"ON = sync principal on next password change. OFF = delete principal immediately."}
+                    { if props.kerberos_disabled {
+                        "Kerberos is disabled: OFF turns sync off; the next start with Kerberos removes the principal."
+                    } else {
+                        "ON = sync principal on next password change. OFF = delete principal immediately."
+                    } }
                 </div>
             </div>
 

@@ -22,14 +22,20 @@ use lldap_auth::{
     access_control::{Permission, ValidationResults},
     login, password_reset, registration,
 };
-use lldap_domain::types::{GroupDetails, GroupName, LoginOutcome, UserId};
+use lldap_domain::types::{GroupDetails, GroupName, LoginOutcome, UserId, kerberos_sync_enabled};
 use lldap_domain_handlers::handler::{
     BackendHandler, BindRequest, LoginHandler, MfaBackendHandler, UserRequestFilter,
 };
-use lldap_domain_handlers::kerberos::kerberos_backend;
+use lldap_domain_handlers::kerberos::{
+    KerberosState, SYNC_OFF_FIRST, kerberos_backend, settled_state, while_disabled,
+};
 use lldap_domain_handlers::logging::{self, LogKind, with_actor};
 use lldap_domain_handlers::mfa::{MfaRequirement, MfaResetReason};
+use lldap_domain_handlers::password::{
+    PasswordChangeError, finish_plain, finish_synced_registration, realm_not_ready, record_failed,
+};
 use lldap_domain_model::{error::DomainError, model::UserColumn};
+use lldap_graphql_server::{open_password_envelope, public_key_der_base64};
 use lldap_opaque_handler::OpaqueHandler;
 use sha2::Sha512;
 use std::{
@@ -39,8 +45,9 @@ use std::{
     task::{Context, Poll},
 };
 use time::ext::NumericalDuration;
-use tracing::{debug, instrument, warn};
+use tracing::{debug, info, instrument, warn};
 use uuid::Uuid;
+use zeroize::Zeroizing;
 
 type Token<S> = jwt::Token<jwt::Header, JWTClaims, S>;
 type SignedToken = Token<jwt::token::Signed>;
@@ -571,7 +578,7 @@ async fn opaque_register_start<Backend>(
     request: actix_web::HttpRequest,
     payload: actix_web::web::Payload,
     data: web::Data<AppState<Backend>>,
-) -> TcpResult<registration::ServerRegistrationStartResponse>
+) -> TcpResult<registration::ServerRegistrationStart>
 where
     Backend: BackendHandler + OpaqueHandler + 'static,
 {
@@ -620,17 +627,63 @@ where
             "Not authorized to change the user's password".to_string(),
         ));
     }
-    Ok(data
+    let kerberos_envelope_key = envelope_key_for(
+        data.get_readonly_handler(),
+        user_id,
+        settled_state(),
+        public_key_der_base64,
+    )
+    .await?;
+    let response = data
         .get_opaque_handler()
         .registration_start(registration_start_request)
-        .await?)
+        .await?;
+    Ok(registration::ServerRegistrationStart {
+        response,
+        kerberos_envelope_key,
+    })
+}
+
+/// Only a user with Kerberos sync gets the key; anyone else's start answer is upstream's.
+async fn envelope_key_for(
+    handler: &impl UserReadableBackendHandler,
+    user_id: &UserId,
+    state: KerberosState,
+    key: impl FnOnce() -> String,
+) -> TcpResult<Option<String>> {
+    match handler.get_user_details(user_id).await {
+        Ok(user) if !kerberos_sync_enabled(&user.attributes) => Ok(None),
+        Ok(_) => match state {
+            KerberosState::Ready => Ok(Some(key())),
+            KerberosState::Disabled => Err(refused_change(user_id, synced_without_kerberos())),
+            KerberosState::NotReady(cause) => Err(not_ready(user_id, cause)),
+        },
+        Err(DomainError::EntityNotFound(_)) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn synced_without_kerberos() -> String {
+    while_disabled(SYNC_OFF_FIRST)
+}
+
+fn not_ready(user: &UserId, cause: String) -> TcpError {
+    let refused = realm_not_ready(&cause);
+    record_failed(LogKind::PasswordChange, user, &refused);
+    password_change_error(refused)
+}
+
+/// One failure row for a refused change of `user`'s password, and its 400.
+fn refused_change(user: &UserId, why: String) -> TcpError {
+    logging::record_failure(LogKind::PasswordChange, Some(user.as_str()), &why);
+    TcpError::BadRequest(why)
 }
 
 async fn opaque_register_start_handler<Backend>(
     request: actix_web::HttpRequest,
     payload: actix_web::web::Payload,
     data: web::Data<AppState<Backend>>,
-) -> ApiResult<registration::ServerRegistrationStartResponse>
+) -> ApiResult<registration::ServerRegistrationStart>
 where
     Backend: BackendHandler + OpaqueHandler + 'static,
 {
@@ -640,26 +693,95 @@ where
         .unwrap_or_else(error_to_api_response)
 }
 
-async fn finish_registration<Handler: OpaqueHandler>(
+const ENVELOPE_WITHOUT_SYNC: &str =
+    "a Kerberos password envelope is taken only for a user with Kerberos sync";
+const ENVELOPE_MISSING: &str =
+    "a user with Kerberos sync needs the Kerberos password envelope; reload the page and retry";
+const ENVELOPE_UNOPENED: &str = "the Kerberos password envelope did not open";
+const RESET_FOR_ANOTHER: &str = "Password reset token does not match the registered user";
+
+/// A synced user's sealed password is registered by the server, in one transaction with the keys.
+async fn finish_registration<Handler>(
     handler: &Handler,
     reset_user: Option<&UserId>,
-    request: registration::ClientRegistrationFinishRequest,
-) -> TcpResult<UserId> {
-    if let Some(user_id) = reset_user
-        && handler.registration_user(&request).await? != *user_id
-    {
-        return Err(TcpError::UnauthorizedError(
-            "Password reset token does not match the registered user".to_string(),
-        ));
+    body: registration::ClientRegistrationFinish,
+    open: impl FnOnce(&str, &UserId) -> anyhow::Result<Zeroizing<String>>,
+) -> TcpResult<UserId>
+where
+    Handler: OpaqueHandler + UserReadableBackendHandler,
+{
+    let registration::ClientRegistrationFinish {
+        request,
+        kerberos_password_envelope,
+    } = body;
+    let user_id = handler.registration_user(&request).await?;
+    if reset_user.is_some_and(|reset_user| *reset_user != user_id) {
+        logging::record_failure(
+            LogKind::AccessDenied,
+            Some(user_id.as_str()),
+            RESET_FOR_ANOTHER,
+        );
+        return Err(TcpError::UnauthorizedError(RESET_FOR_ANOTHER.to_string()));
     }
-    Ok(handler.registration_finish(request).await?)
+    let user = handler.get_user_details(&user_id).await?;
+    let envelope = match (
+        kerberos_sync_enabled(&user.attributes),
+        kerberos_password_envelope,
+    ) {
+        (false, None) => {
+            let done = finish_plain(handler, &user_id, request).await;
+            return done.map_err(password_change_error);
+        }
+        (false, Some(_)) => {
+            warn!("Refused a Kerberos password envelope for {user_id}, who has no Kerberos sync");
+            return Err(refused_change(&user_id, ENVELOPE_WITHOUT_SYNC.to_owned()));
+        }
+        (true, None) => return Err(refused_change(&user_id, ENVELOPE_MISSING.to_owned())),
+        (true, Some(envelope)) => match settled_state() {
+            KerberosState::Ready => envelope,
+            KerberosState::Disabled => {
+                return Err(refused_change(&user_id, synced_without_kerberos()));
+            }
+            KerberosState::NotReady(cause) => return Err(not_ready(&user_id, cause)),
+        },
+    };
+    let password = open(&envelope, &user_id).map_err(|e| {
+        warn!("A Kerberos password envelope for {user_id} did not open: {e}");
+        refused_change(&user_id, format!("{ENVELOPE_UNOPENED}: {e}"))
+    })?;
+    match finish_synced_registration(handler, &user_id, &password).await {
+        Ok(()) => {
+            info!("Kerberos principal synced for user {user_id}");
+            Ok(user_id)
+        }
+        Err(e) => {
+            warn!("Password set for {user_id} failed: {e}");
+            Err(password_change_error(e))
+        }
+    }
+}
+
+fn password_change_error(e: PasswordChangeError) -> TcpError {
+    match e {
+        PasswordChangeError::Refused(_)
+        | PasswordChangeError::TooShort
+        | PasswordChangeError::HasNul
+        | PasswordChangeError::SyncChanged
+        | PasswordChangeError::KerberosDisabled(_) => TcpError::BadRequest(e.to_string()),
+        PasswordChangeError::InProgress => TcpError::Conflict(e.to_string()),
+        PasswordChangeError::Unavailable(cause) => DomainError::KdcUnavailable(cause).into(),
+        PasswordChangeError::NoSuchUser => TcpError::NotFoundError(e.to_string()),
+        PasswordChangeError::Failed(_) | PasswordChangeError::Unknown => {
+            TcpError::InternalServerError(e.to_string())
+        }
+    }
 }
 
 #[instrument(skip_all, level = "debug")]
 async fn opaque_register_finish<Backend>(
     http_request: HttpRequest,
     data: web::Data<AppState<Backend>>,
-    request: web::Json<registration::ClientRegistrationFinishRequest>,
+    request: web::Json<registration::ClientRegistrationFinish>,
 ) -> TcpResult<HttpResponse>
 where
     Backend: TcpBackendHandler + BackendHandler + OpaqueHandler + 'static,
@@ -678,9 +800,10 @@ where
     with_actor(
         actor.clone(),
         finish_registration(
-            data.get_opaque_handler(),
+            data.get_password_handler(),
             reset_user.as_ref(),
             request.into_inner(),
+            open_password_envelope,
         ),
     )
     .await?;
@@ -699,7 +822,7 @@ where
 async fn opaque_register_finish_handler<Backend>(
     http_request: HttpRequest,
     data: web::Data<AppState<Backend>>,
-    request: web::Json<registration::ClientRegistrationFinishRequest>,
+    request: web::Json<registration::ClientRegistrationFinish>,
 ) -> HttpResponse
 where
     Backend: TcpBackendHandler + BackendHandler + OpaqueHandler + 'static,
@@ -919,12 +1042,174 @@ where
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use lldap_auth::opaque;
+    use lldap_domain::types::{Attribute, User};
+    use lldap_domain_handlers::kerberos::CommitError;
+    use lldap_domain_handlers::password::PASSWORD_MIN_LENGTH;
     use lldap_domain_model::error::{DomainError, Result as DomainResult};
     use lldap_test_utils::MockTestBackendHandler;
+    use lldap_test_utils::recording_kerberos::{KerberosOp, RecordingGuard};
+    use mockall::predicate::eq;
     use pretty_assertions::assert_eq;
+    use std::cell::Cell;
+
+    pub(crate) static ONE_BACKEND: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+    fn alice(sync: bool) -> User {
+        let attributes = sync.then(|| Attribute {
+            name: "kerberossync".into(),
+            value: 1i64.into(),
+        });
+        User {
+            user_id: UserId::new("alice"),
+            attributes: attributes.into_iter().collect(),
+            ..User::default()
+        }
+    }
+
+    fn start_response() -> registration::ServerRegistrationStartResponse {
+        let mut rng = rand::rngs::OsRng;
+        let start =
+            opaque::client::registration::start_registration(b"s3cret-pass", &mut rng).unwrap();
+        let response = opaque::server::registration::start_registration(
+            &opaque::server::ServerSetup::new(&mut rng),
+            start.message,
+            &UserId::new("alice"),
+        )
+        .unwrap()
+        .message;
+        registration::ServerRegistrationStartResponse {
+            server_data: "sealed".to_owned(),
+            registration_response: response,
+        }
+    }
+
+    fn finish_body(envelope: Option<&str>) -> registration::ClientRegistrationFinish {
+        registration::ClientRegistrationFinish {
+            request: finish_request(),
+            kerberos_password_envelope: envelope.map(str::to_owned),
+        }
+    }
+
+    fn never_opened(_: &str, _: &UserId) -> anyhow::Result<Zeroizing<String>> {
+        unreachable!("no envelope was sent")
+    }
+
+    // Stands in for the RSA envelope: "for:<user>" opens only for that user.
+    fn open_as(
+        password: &'static str,
+    ) -> impl Fn(&str, &UserId) -> anyhow::Result<Zeroizing<String>> {
+        move |envelope, user| match envelope.strip_prefix("for:") {
+            Some(sealed_for) if sealed_for == user.as_str() => {
+                Ok(Zeroizing::new(password.to_owned()))
+            }
+            _ => anyhow::bail!("Decryption failed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_only_a_synced_user_gets_the_envelope_key() {
+        use KerberosState as K;
+        let starting = || K::NotReady("starting".to_owned());
+        let rows = [
+            ("with sync", Ok(true), K::Ready, Ok(Some("the key"))),
+            (
+                "with sync, Kerberos disabled",
+                Ok(true),
+                K::Disabled,
+                Err(400),
+            ),
+            (
+                "with sync, Kerberos not ready",
+                Ok(true),
+                starting(),
+                Err(503),
+            ),
+            ("without sync", Ok(false), K::Ready, Ok(None)),
+            (
+                "without sync, Kerberos disabled",
+                Ok(false),
+                K::Disabled,
+                Ok(None),
+            ),
+            (
+                "without sync, Kerberos not ready",
+                Ok(false),
+                starting(),
+                Ok(None),
+            ),
+            ("no such user", Err(false), K::Ready, Ok(None)),
+            ("the read fails", Err(true), K::Ready, Err(500)),
+        ];
+        for (row, found, state, expected) in rows {
+            let mut mock = MockTestBackendHandler::new();
+            mock.expect_get_user_details()
+                .with(eq(UserId::new("alice")))
+                .times(1)
+                .returning(move |_| match found {
+                    Ok(sync) => Ok(alice(sync)),
+                    Err(false) => Err(DomainError::EntityNotFound("alice".to_owned())),
+                    Err(true) => Err(DomainError::InternalError("down".to_owned())),
+                });
+            let given = Cell::new(false);
+            let key = || {
+                given.set(true);
+                "the key".to_owned()
+            };
+            let got = envelope_key_for(&mock, &UserId::new("alice"), state, key)
+                .await
+                .map_err(|e| error_to_http_response(e).status().as_u16());
+            assert_eq!(
+                given.get(),
+                expected == Ok(Some("the key")),
+                "{row}: the key made"
+            );
+            let expected = expected.map(|key| key.map(str::to_owned));
+            assert_eq!(got, expected, "{row}");
+        }
+    }
+
+    #[test]
+    fn test_without_a_key_or_an_envelope_the_wire_is_upstreams() {
+        let start = start_response();
+        let plain = serde_json::to_value(&start).unwrap();
+        let mut keyed = plain.clone();
+        keyed["kerberos_envelope_key"] = "the key".into();
+        for (key, wire) in [(None, plain.clone()), (Some("the key"), keyed)] {
+            let answer = registration::ServerRegistrationStart {
+                response: start.clone(),
+                kerberos_envelope_key: key.map(str::to_owned),
+            };
+            assert_eq!(serde_json::to_value(&answer).unwrap(), wire, "{key:?}");
+            let read: registration::ServerRegistrationStart =
+                serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(read.kerberos_envelope_key.as_deref(), key, "{key:?}");
+            let upstream: registration::ServerRegistrationStartResponse =
+                serde_json::from_value(wire).unwrap();
+            assert_eq!(serde_json::to_value(&upstream).unwrap(), plain, "{key:?}");
+        }
+        let request = finish_request();
+        let plain = serde_json::to_value(&request).unwrap();
+        let mut sealed = plain.clone();
+        sealed["kerberos_password_envelope"] = "sealed".into();
+        for (envelope, wire) in [(None, plain.clone()), (Some("sealed"), sealed)] {
+            let body = registration::ClientRegistrationFinish {
+                request: request.clone(),
+                kerberos_password_envelope: envelope.map(str::to_owned),
+            };
+            assert_eq!(serde_json::to_value(&body).unwrap(), wire, "{envelope:?}");
+            let read: registration::ClientRegistrationFinish =
+                serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(read.kerberos_password_envelope.as_deref(), envelope);
+            assert_eq!(serde_json::to_value(read.request).unwrap(), plain);
+            let upstream: registration::ClientRegistrationFinishRequest =
+                serde_json::from_value(wire).unwrap();
+            assert_eq!(serde_json::to_value(upstream).unwrap(), plain);
+        }
+    }
 
     fn finish_request() -> registration::ClientRegistrationFinishRequest {
         let mut rng = rand::rngs::OsRng;
@@ -952,30 +1237,399 @@ mod tests {
 
     #[tokio::test]
     async fn test_a_reset_for_another_user_is_refused_before_any_write() {
-        let alice = UserId::new("alice");
+        let _backend = ONE_BACKEND.lock().await;
+        let alice_id = UserId::new("alice");
         let rows = [
-            ("no reset token", None, None, Ok(())),
-            ("the token's user", Some("alice"), Some(Ok("alice")), Ok(())),
-            ("another user", Some("alice"), Some(Ok("bob")), Err(401)),
-            ("unsealable", Some("alice"), Some(Err(())), Err(500)),
+            ("no reset token", None, Ok("alice"), Ok(())),
+            ("the token's user", Some("alice"), Ok("alice"), Ok(())),
+            ("another user", Some("alice"), Ok("bob"), Err(401)),
+            ("unsealable", Some("alice"), Err(()), Err(500)),
         ];
         for (row, reset, target, expected) in rows {
             let mut mock = MockTestBackendHandler::new();
             mock.expect_registration_user()
-                .times(usize::from(target.is_some()))
-                .returning(move |_| match target.unwrap() {
+                .times(1)
+                .returning(move |_| match target {
                     Ok(user) => Ok(UserId::new(user)),
                     Err(()) => Err(DomainError::InternalError("not sealed".to_owned())),
                 });
+            let written = usize::from(expected.is_ok());
+            mock.expect_get_user_details()
+                .times(written)
+                .returning(|_| Ok(alice(false)));
             mock.expect_registration_finish()
-                .times(usize::from(expected.is_ok()))
+                .times(written)
                 .returning(|_| Ok(UserId::new("alice")));
             let reset = reset.map(UserId::new);
-            let got = finish_registration(&mock, reset.as_ref(), finish_request())
+            let got = finish_registration(&mock, reset.as_ref(), finish_body(None), never_opened)
                 .await
                 .map_err(|e| error_to_http_response(e).status().as_u16());
-            assert_eq!(got, expected.map(|()| alice.clone()), "{row}");
+            assert_eq!(got, expected.map(|()| alice_id.clone()), "{row}");
         }
+    }
+
+    // One test, so no other row swaps the process-wide Kerberos backend under it.
+    #[tokio::test]
+    async fn test_a_synced_users_finish_is_one_transaction_and_takes_only_its_own_envelope() {
+        let _backend = ONE_BACKEND.lock().await;
+        use lldap_domain_handlers::kerberos::{ANSWER_UNSETTLED, SYNC_CHANGED};
+        use lldap_domain_handlers::password::{PASSWORD_HAS_NUL, PASSWORD_TOO_SHORT};
+        use lldap_test_utils::recording_log::LogGuard;
+        const OPENED: &str = "Opened-pass-1";
+        const REFUSAL: &str = "password policy: min_length 40";
+        use lldap_test_utils::recording_kerberos::NotReadyGuard;
+        enum Kdc {
+            Ready,
+            Disabled,
+            NotReady,
+            Unsettled,
+            Refusing,
+            Answering(Result<(), CommitError>),
+            Holding(CommitError),
+        }
+        let starting = realm_not_ready("the Kerberos KDC is still starting; retry shortly");
+        let starting = starting.to_string();
+        let starting = starting.as_str();
+        let unsettled = realm_not_ready(ANSWER_UNSETTLED).to_string();
+        let refused = Kdc::Answering(Err(CommitError::Refused(REFUSAL.to_owned())));
+        let changed = Kdc::Answering(Err(CommitError::Refused(SYNC_CHANGED.to_owned())));
+        let failed = Kdc::Answering(Err(CommitError::Failed("the batch".to_owned())));
+        let by_kerberos = format!("refused by Kerberos: {REFUSAL}");
+        let disabled = synced_without_kerberos();
+        type Row<'a> = (
+            &'static str,
+            bool,
+            Option<&'static str>,
+            &'static str,
+            Kdc,
+            u16,
+            bool,
+            Option<&'a str>,
+        );
+        let rows: Vec<Row> = vec![
+            (
+                "no sync, no envelope",
+                false,
+                None,
+                OPENED,
+                Kdc::Ready,
+                200,
+                false,
+                None,
+            ),
+            (
+                "no sync, an envelope",
+                false,
+                Some("for:alice"),
+                OPENED,
+                Kdc::Ready,
+                400,
+                false,
+                Some(ENVELOPE_WITHOUT_SYNC),
+            ),
+            (
+                "sync, no envelope",
+                true,
+                None,
+                OPENED,
+                Kdc::Ready,
+                400,
+                false,
+                Some(ENVELOPE_MISSING),
+            ),
+            (
+                "sync, sealed for bob",
+                true,
+                Some("for:bob"),
+                OPENED,
+                Kdc::Ready,
+                400,
+                false,
+                Some("the Kerberos password envelope did not open: Decryption failed"),
+            ),
+            (
+                "sync, Kerberos disabled: never opened",
+                true,
+                Some("for:alice"),
+                OPENED,
+                Kdc::Disabled,
+                400,
+                false,
+                Some(disabled.as_str()),
+            ),
+            (
+                "sync, the KDC not ready: never opened",
+                true,
+                Some("for:alice"),
+                OPENED,
+                Kdc::NotReady,
+                503,
+                false,
+                Some(starting),
+            ),
+            (
+                "no sync, the KDC not ready: nothing written",
+                false,
+                None,
+                OPENED,
+                Kdc::NotReady,
+                503,
+                false,
+                Some(starting),
+            ),
+            (
+                "sync, the last write unsettled: never opened",
+                true,
+                Some("for:alice"),
+                OPENED,
+                Kdc::Unsettled,
+                503,
+                false,
+                Some(unsettled.as_str()),
+            ),
+            (
+                "no sync, the last write unsettled: nothing written",
+                false,
+                None,
+                OPENED,
+                Kdc::Unsettled,
+                503,
+                false,
+                Some(unsettled.as_str()),
+            ),
+            (
+                "no sync, the switch turned on meanwhile: nothing written",
+                false,
+                None,
+                OPENED,
+                Kdc::Holding(CommitError::Refused(SYNC_CHANGED.to_owned())),
+                400,
+                false,
+                Some(SYNC_CHANGED),
+            ),
+            (
+                "sync, too short",
+                true,
+                Some("for:alice"),
+                "Short-7",
+                Kdc::Ready,
+                400,
+                false,
+                Some(PASSWORD_TOO_SHORT),
+            ),
+            (
+                "sync, a NUL in nine characters",
+                true,
+                Some("for:alice"),
+                "a\0aaaaaaa",
+                Kdc::Ready,
+                400,
+                false,
+                Some(PASSWORD_HAS_NUL),
+            ),
+            (
+                "sync, Kerberos's check refuses",
+                true,
+                Some("for:alice"),
+                OPENED,
+                Kdc::Refusing,
+                400,
+                false,
+                Some(by_kerberos.as_str()),
+            ),
+            (
+                "sync, the commit is refused",
+                true,
+                Some("for:alice"),
+                OPENED,
+                refused,
+                400,
+                true,
+                Some(by_kerberos.as_str()),
+            ),
+            (
+                "sync, the sync changed before the commit",
+                true,
+                Some("for:alice"),
+                OPENED,
+                changed,
+                400,
+                true,
+                Some(SYNC_CHANGED),
+            ),
+            (
+                "sync, the commit fails",
+                true,
+                Some("for:alice"),
+                OPENED,
+                failed,
+                500,
+                true,
+                Some("password change failed: the batch"),
+            ),
+            (
+                "sync, committed",
+                true,
+                Some("for:alice"),
+                OPENED,
+                Kdc::Ready,
+                200,
+                true,
+                None,
+            ),
+        ];
+        let log = LogGuard::install();
+        let reader = || Some(UserId::new("row-reader"));
+        let failures = || -> Vec<(LogKind, Option<String>, Option<String>)> {
+            log.recorder()
+                .take_events()
+                .into_iter()
+                .filter(|e| !e.success && e.actor.as_deref() == Some("row-reader"))
+                .map(|e| (e.kind, e.target, e.detail))
+                .collect()
+        };
+        let one_row =
+            |kind, detail: &str| vec![(kind, Some("alice".to_owned()), Some(detail.to_owned()))];
+        for (row, sync, envelope, password, kdc, status, committed, refusal) in rows {
+            let opens = !matches!(kdc, Kdc::Disabled | Kdc::NotReady | Kdc::Unsettled);
+            let _not_ready = matches!(kdc, Kdc::NotReady).then(NotReadyGuard::install);
+            let guard = match &kdc {
+                Kdc::Ready => Some(RecordingGuard::install()),
+                Kdc::Disabled | Kdc::NotReady => None,
+                Kdc::Unsettled => Some(RecordingGuard::install_unsettled(ANSWER_UNSETTLED)),
+                Kdc::Refusing => Some(RecordingGuard::install_refusing(REFUSAL)),
+                Kdc::Answering(answer) => Some(RecordingGuard::install_answering(answer.clone())),
+                Kdc::Holding(held) => Some(RecordingGuard::install_holding(Err(held.clone()))),
+            };
+            let upstream = !sync && envelope.is_none() && matches!(kdc, Kdc::Ready);
+            let mut mock = MockTestBackendHandler::new();
+            mock.expect_registration_user()
+                .times(1)
+                .returning(|_| Ok(UserId::new("alice")));
+            mock.expect_get_user_details()
+                .with(eq(UserId::new("alice")))
+                .times(1)
+                .returning(move |_| Ok(alice(sync)));
+            mock.expect_registration_finish()
+                .times(usize::from(upstream))
+                .returning(|_| Ok(UserId::new("alice")));
+            let start = start_response();
+            mock.expect_registration_start()
+                .times(usize::from(committed))
+                .returning(move |_| Ok(start.clone()));
+            let opened = Cell::new(false);
+            let finish = finish_registration(&mock, None, finish_body(envelope), |sealed, user| {
+                opened.set(true);
+                open_as(password)(sealed, user)
+            });
+            let got = with_actor(reader(), finish)
+                .await
+                .map_err(|e| error_to_http_response(e).status().as_u16());
+            let expected = match status {
+                200 => Ok(UserId::new("alice")),
+                status => Err(status),
+            };
+            assert_eq!(got, expected, "{row}");
+            assert_eq!(
+                opened.get(),
+                sync && envelope.is_some() && opens,
+                "{row}: opened"
+            );
+            let commit = KerberosOp::CommitPassword {
+                username: "alice".into(),
+                password: password.into(),
+                rows: vec![
+                    "password alice".into(),
+                    "synced alice".into(),
+                    "log password_change".into(),
+                ],
+            };
+            let expected_ops = if committed { vec![commit] } else { vec![] };
+            let ops = guard.map(|g| g.recorder().take_ops()).unwrap_or_default();
+            assert_eq!(ops, expected_ops, "{row}");
+            let expected_rows = refusal
+                .map(|detail| one_row(LogKind::PasswordChange, detail))
+                .unwrap_or_default();
+            assert_eq!(failures(), expected_rows, "{row}: one failure row");
+        }
+
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_get_user_details()
+            .returning(|_| Ok(alice(true)));
+        let alice_id = UserId::new("alice");
+        let start = envelope_key_for(&mock, &alice_id, KerberosState::Disabled, || unreachable!());
+        let start = with_actor(reader(), start)
+            .await
+            .map_err(|e| error_to_http_response(e).status().as_u16());
+        assert_eq!(
+            (start, failures()),
+            (
+                Err(400),
+                one_row(LogKind::PasswordChange, disabled.as_str())
+            ),
+            "the start with Kerberos disabled: refused, no key, one row"
+        );
+
+        let ready = RecordingGuard::install();
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_registration_user()
+            .returning(|_| Ok(UserId::new("alice")));
+        mock.expect_get_user_details()
+            .returning(|_| Ok(alice(false)));
+        mock.expect_registration_finish()
+            .times(1)
+            .returning(|_| Err(DomainError::InternalError("the disk is full".to_owned())));
+        let stored = finish_registration(&mock, None, finish_body(None), never_opened);
+        let stored = with_actor(reader(), stored)
+            .await
+            .map_err(|e| error_to_http_response(e).status().as_u16());
+        let full = "password change failed: Internal error: `the disk is full`";
+        assert_eq!(
+            (stored, failures()),
+            (Err(500), one_row(LogKind::PasswordChange, full)),
+            "the plain store fails: one row"
+        );
+        drop(ready);
+
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_registration_user()
+            .returning(|_| Ok(UserId::new("alice")));
+        mock.expect_get_user_details().times(0);
+        let bob = UserId::new("bob");
+        let reset = finish_registration(&mock, Some(&bob), finish_body(None), never_opened);
+        let reset = with_actor(reader(), reset)
+            .await
+            .map_err(|e| error_to_http_response(e).status().as_u16());
+        assert_eq!(
+            (reset, failures()),
+            (Err(401), one_row(LogKind::AccessDenied, RESET_FOR_ANOTHER)),
+            "a reset for another user: refused, one row"
+        );
+    }
+
+    #[test]
+    fn test_a_password_change_error_answers_its_status() {
+        let rows = [
+            (PasswordChangeError::Refused("policy".to_owned()), 400),
+            (PasswordChangeError::TooShort, 400),
+            (PasswordChangeError::HasNul, 400),
+            (PasswordChangeError::SyncChanged, 400),
+            (PasswordChangeError::KerberosDisabled("off".to_owned()), 400),
+            (PasswordChangeError::InProgress, 409),
+            (PasswordChangeError::Unavailable("down".to_owned()), 503),
+            (PasswordChangeError::NoSuchUser, 404),
+            (PasswordChangeError::Failed("the batch".to_owned()), 500),
+            (PasswordChangeError::Unknown, 500),
+        ];
+        for (error, status) in rows {
+            let text = error.to_string();
+            let response = error_to_http_response(password_change_error(error));
+            assert_eq!(response.status().as_u16(), status, "{text}");
+        }
+        assert_eq!(
+            PasswordChangeError::TooShort.to_string(),
+            format!("the password must be at least {PASSWORD_MIN_LENGTH} characters")
+        );
     }
 
     #[async_trait::async_trait]
@@ -1055,11 +1709,15 @@ mod tests {
 
     #[actix_web::test]
     async fn test_the_finish_route_refuses_a_reset_for_another_user_before_any_write() {
+        let _backend = ONE_BACKEND.lock().await;
         for (sealed_for, status, writes) in [("alice", 200, 1), ("bob", 401, 0)] {
             let mut mock = MockTestBackendHandler::new();
             mock.expect_registration_user()
                 .times(1)
                 .returning(move |_| Ok(UserId::new(sealed_for)));
+            mock.expect_get_user_details()
+                .times(writes)
+                .returning(|_| Ok(alice(false)));
             mock.expect_registration_finish()
                 .times(writes)
                 .returning(|_| Ok(UserId::new("alice")));
@@ -1072,7 +1730,7 @@ mod tests {
                 .insert_header(("Authorization", format!("Bearer {token}")))
                 .to_http_request();
             let response =
-                opaque_register_finish_handler(request, state, web::Json(finish_request())).await;
+                opaque_register_finish_handler(request, state, web::Json(finish_body(None))).await;
             assert_eq!(
                 response.status().as_u16(),
                 status,
@@ -1094,5 +1752,28 @@ mod tests {
             let got = refusal_while_degraded(&UserId::new("bob"), admin, unavailable.clone());
             assert_eq!(got, expected, "admin {admin}, unavailable {unavailable:?}");
         }
+    }
+
+    #[test]
+    fn test_every_user_signs_in_while_the_last_write_is_unsettled() {
+        use lldap_domain_handlers::kerberos::{ANSWER_UNSETTLED, DegradedKerberos, KerberosSync};
+        use lldap_test_utils::recording_kerberos::RecordingKerberos;
+        let degraded = DegradedKerberos::new("EXAMPLE.COM".to_owned(), "down".to_owned());
+        let unsettled = RecordingKerberos::unsettled(ANSWER_UNSETTLED);
+        let bob = UserId::new("bob");
+        assert_eq!(
+            (
+                refusal_while_degraded(&bob, false, degraded.unavailable()),
+                refusal_while_degraded(&bob, false, unsettled.unavailable()),
+                unsettled.unsettled(),
+            ),
+            (
+                Some("down".to_owned()),
+                None,
+                Some(ANSWER_UNSETTLED.to_owned())
+            ),
+            "a degraded realm keeps out all but admins; a held one whose last write is \
+             unsettled keeps no one out"
+        );
     }
 }

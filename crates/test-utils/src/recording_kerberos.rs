@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use lldap_domain::types::UserId;
 use lldap_domain_handlers::kerberos::{
-    CommitError, DegradedKerberos, HostRow, KerberosSync, NoopKerberos, PasswordCommit,
-    set_kerberos_backend,
+    CommitError, DegradedKerberos, Held, HostRow, KerberosSync, NoopKerberos, PasswordCommit,
+    UserChange, set_kerberos_backend,
 };
 use lldap_domain_handlers::password::record_commit_failure;
 use std::sync::{Arc, Mutex};
@@ -11,13 +11,14 @@ pub const RECORDER_REALM: &str = "RECORDER.TEST";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KerberosOp {
-    SyncPrincipal {
-        username: String,
-        password: String,
-    },
     CommitPassword {
         username: String,
         password: String,
+        rows: Vec<String>,
+    },
+    CommitUser {
+        username: String,
+        step: &'static str,
         rows: Vec<String>,
     },
     DeletePrincipal {
@@ -34,18 +35,22 @@ pub enum KerberosOp {
 
 pub struct RecordingKerberos {
     ops: Mutex<Vec<KerberosOp>>,
-    sync_error: Option<String>,
     check_error: Option<String>,
+    alias_error: Option<String>,
     commit: Result<(), CommitError>,
+    hold: Result<(), CommitError>,
+    unsettled: Option<String>,
 }
 
 impl Default for RecordingKerberos {
     fn default() -> Self {
         Self {
             ops: Mutex::new(Vec::new()),
-            sync_error: None,
             check_error: None,
+            alias_error: None,
             commit: Ok(()),
+            hold: Ok(()),
+            unsettled: None,
         }
     }
 }
@@ -55,10 +60,9 @@ impl RecordingKerberos {
         Arc::new(Self::default())
     }
 
-    // Records each sync and refuses it with `cause`, as a KDC refusal would.
+    // Records each commit and fails it with `cause`.
     pub fn failing(cause: &str) -> Arc<Self> {
         Arc::new(Self {
-            sync_error: Some(cause.to_owned()),
             commit: Err(CommitError::Failed(cause.to_owned())),
             ..Self::default()
         })
@@ -72,9 +76,30 @@ impl RecordingKerberos {
         })
     }
 
+    pub fn aliased(why: &str) -> Arc<Self> {
+        Arc::new(Self {
+            alias_error: Some(why.to_owned()),
+            ..Self::default()
+        })
+    }
+
     pub fn answering(commit: Result<(), CommitError>) -> Arc<Self> {
         Arc::new(Self {
             commit,
+            ..Self::default()
+        })
+    }
+
+    pub fn holding(hold: Result<(), CommitError>) -> Arc<Self> {
+        Arc::new(Self {
+            hold,
+            ..Self::default()
+        })
+    }
+
+    pub fn unsettled(cause: &str) -> Arc<Self> {
+        Arc::new(Self {
+            unsettled: Some(cause.to_owned()),
             ..Self::default()
         })
     }
@@ -86,21 +111,20 @@ impl RecordingKerberos {
 
 #[async_trait]
 impl KerberosSync for RecordingKerberos {
+    fn unsettled(&self) -> Option<String> {
+        self.unsettled.clone()
+    }
     fn realm(&self) -> &str {
         RECORDER_REALM
     }
-    async fn sync_principal(&self, user: &UserId, password: &str) -> Result<(), String> {
-        self.ops
-            .lock()
-            .expect("ops")
-            .push(KerberosOp::SyncPrincipal {
-                username: user.as_str().to_owned(),
-                password: password.to_owned(),
-            });
-        self.sync_error.clone().map_or(Ok(()), Err)
-    }
     async fn check_password(&self, _: &UserId, _: &str) -> Result<(), String> {
         self.check_error.clone().map_or(Ok(()), Err)
+    }
+    async fn sync_on_refused(&self, _: &UserId) -> Result<(), String> {
+        self.alias_error.clone().map_or(Ok(()), Err)
+    }
+    async fn hold_plain(&self, _: &UserId) -> Result<Option<Held>, CommitError> {
+        self.hold.clone().map(|()| None)
     }
     async fn commit_password(
         &self,
@@ -121,6 +145,15 @@ impl KerberosSync for RecordingKerberos {
             record_commit_failure(change.kind, &change.user, e);
         }
         self.commit.clone()
+    }
+    // An accepted change leaves the directory write to its caller, as no realm would.
+    async fn commit_user(&self, change: UserChange) -> Option<Result<(), CommitError>> {
+        self.ops.lock().expect("ops").push(KerberosOp::CommitUser {
+            username: change.user.as_str().to_owned(),
+            step: change.step.op(),
+            rows: change.rows.iter().map(HostRow::label).collect(),
+        });
+        self.commit.clone().err().map(Err)
     }
     async fn delete_principal(&self, user: &UserId) -> Result<(), String> {
         self.ops
@@ -168,8 +201,20 @@ impl RecordingGuard {
         Self::installed(RecordingKerberos::refusing(cause))
     }
 
+    pub fn install_aliased(why: &str) -> Self {
+        Self::installed(RecordingKerberos::aliased(why))
+    }
+
     pub fn install_answering(commit: Result<(), CommitError>) -> Self {
         Self::installed(RecordingKerberos::answering(commit))
+    }
+
+    pub fn install_holding(hold: Result<(), CommitError>) -> Self {
+        Self::installed(RecordingKerberos::holding(hold))
+    }
+
+    pub fn install_unsettled(cause: &str) -> Self {
+        Self::installed(RecordingKerberos::unsettled(cause))
     }
 
     fn installed(rec: Arc<RecordingKerberos>) -> Self {
@@ -198,9 +243,6 @@ impl KerberosSync for NotReadyKerberos {
     }
     fn realm(&self) -> &str {
         RECORDER_REALM
-    }
-    async fn sync_principal(&self, _: &UserId, _: &str) -> Result<(), String> {
-        Err("KDC not ready".to_owned())
     }
     async fn delete_principal(&self, _: &UserId) -> Result<(), String> {
         Err("KDC not ready".to_owned())

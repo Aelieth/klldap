@@ -28,7 +28,7 @@ use actix_server::ServerBuilder;
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::TryFutureExt;
 use lldap_sql_backend_handler::{
-    KerberosLost, LogRetention, SqlBackendHandler, register_password,
+    KerberosLost, LogRetention, SqlBackendHandler, realm_marked_open, register_password,
     sql_tables::{self, get_private_key_info, set_private_key_info},
     sqlite_extra_synchronous, start_kerberos_committer, start_log_writer, warn_database_durability,
 };
@@ -39,11 +39,15 @@ use tracing::{Instrument, Level, debug, error, info, instrument, span, warn};
 use lldap_domain::requests::{CreateGroupRequest, CreateUserRequest};
 use lldap_domain::types::{Attribute, BUILTIN_GROUPS, kerberos_sync_enabled};
 use lldap_domain_handlers::kerberos::{
-    DegradedKerberos, NoopKerberos, kerberos_store, set_kerberos_backend,
+    DegradedKerberos, KerberosSync, NoopKerberos, kerberos_backend, kerberos_store,
+    set_kerberos_backend,
 };
-use lldap_domain_handlers::logging::{LogKind, record};
+use lldap_domain_handlers::logging::{LogKind, event, record};
+use lldap_domain_handlers::password::{
+    PasswordChangeError, PasswordSync, change_password_everywhere, password_rules,
+};
 use lldap_kerberos::boot::{RealmSettings, client_address};
-use lldap_kerberos::embedded::{EmbeddedKerberos, RealmThreads, Records};
+use lldap_kerberos::embedded::{EmbeddedKerberos, FOLLOW_EVERY, Opened, RealmThreads, Records};
 
 use lldap_domain_handlers::handler::{
     GroupBackendHandler, GroupListerBackendHandler, GroupRequestFilter, MfaBackendHandler,
@@ -54,6 +58,203 @@ use lldap_domain_handlers::mfa::{MFA_DISABLED_GROUP, MfaResetReason};
 const ADMIN_PASSWORD_MISSING_ERROR: &str = "The LDAP admin password must be initialized. \
             Either set the `ldap_user_pass` config value or the `LLDAP_LDAP_USER_PASS` environment variable. \
             A minimum of 8 characters is recommended.";
+
+const RESTART_WITHOUT_FORCE: &str = "Restart the server without --force-update-private-key or \
+                                     --force-ldap-user-pass-reset to continue.";
+
+const RESET_TOO_SHORT: &str = "The forced reset of the admin's password \
+    (force_ldap_user_pass_reset) needs at least 8 characters in ldap_user_pass. Set a longer \
+    password, or take the forced reset out of the configuration.";
+
+const RESET_HAS_NUL: &str = "The forced reset of the admin's password \
+    (force_ldap_user_pass_reset) cannot take a NUL character (U+0000) in ldap_user_pass. Set \
+    another password, or take the forced reset out of the configuration.";
+
+const KERBEROS_OFF: &str = "Kerberos is not enabled (kerberos_options.enabled is false)";
+
+fn sync_turned_off(cause: &str) -> String {
+    format!(
+        "Kerberos sync turned off by the forced reset of the admin's password, because {cause}: \
+         a principal, if there is one, is removed by the holder's next status pass, within a \
+         minute, or at the next start with Kerberos enabled"
+    )
+}
+
+/// The forced reset when Kerberos cannot take part, as upstream's; an admin with sync has it
+/// turned off in the same transaction as the password.
+async fn reset_without_realm(
+    handler: &SqlBackendHandler,
+    config: &Configuration,
+    sync: PasswordSync,
+    cause: &str,
+) -> Result<()> {
+    let admin = &config.ldap_user_dn;
+    let password = admin_password(config).as_bytes();
+    let reset = match sync {
+        PasswordSync::Off => {
+            register_password(handler, admin.clone(), password)
+                .instrument(reset_span(config))
+                .await
+        }
+        PasswordSync::On => {
+            let detail = sync_turned_off(cause);
+            let row = event(
+                LogKind::KerberosSync,
+                Some(admin.as_str()),
+                true,
+                Some(&detail),
+            );
+            handler
+                .reset_password_without_sync(admin, password, row)
+                .instrument(reset_span(config))
+                .await
+        }
+    };
+    reset.with_context(|| format!("while resetting admin password for {admin}"))?;
+    info!("Reset the password of {admin} from the configuration");
+    match sync {
+        PasswordSync::On => warn!(
+            "The forced reset of {admin}'s password ran without the Kerberos realm and turned its \
+             Kerberos sync off, because {cause}: the directory password is the configured one. \
+             Turn the sync on again once Kerberos runs; the next password change then makes the \
+             principal. The holder's status pass removes the one left behind within a minute, \
+             or the next start with Kerberos does."
+        ),
+        PasswordSync::Off if cause != KERBEROS_OFF => warn!(
+            "The forced reset of {admin}'s password ran without the Kerberos realm, because \
+             {cause}: the directory password is the configured one."
+        ),
+        PasswordSync::Off => {}
+    }
+    finish_reset(
+        handler,
+        config,
+        "admin password reset from the configuration",
+    )
+    .await
+}
+
+struct SetAside(Arc<dyn KerberosSync>);
+
+impl SetAside {
+    fn new(realm: String) -> Self {
+        let kerberos = kerberos_backend();
+        set_kerberos_backend(Arc::new(NoopKerberos::new(realm)));
+        Self(kerberos)
+    }
+}
+
+impl Drop for SetAside {
+    fn drop(&mut self) {
+        set_kerberos_backend(self.0.clone());
+    }
+}
+
+/// `reset_without_realm` with a realm already installed: the realm takes no part meanwhile.
+async fn reset_aside(
+    handler: &SqlBackendHandler,
+    config: &Configuration,
+    sync: PasswordSync,
+    cause: &str,
+) -> Result<()> {
+    let _aside = SetAside::new(config.kerberos_realm());
+    reset_without_realm(handler, config, sync, cause).await
+}
+
+/// The start's passes, then the deferred reset. Some: the realm is not usable and the reset is
+/// still deferred; a failed reset with the realm runs at once without it, and the passes again.
+async fn before_serve(
+    mut passes: impl AsyncFnMut() -> Result<()>,
+    deferred: &mut Option<PasswordSync>,
+    with_realm: impl AsyncFnOnce(PasswordSync) -> Result<()>,
+    aside: impl AsyncFnOnce(PasswordSync, String) -> Result<()>,
+    realm: &str,
+) -> Result<Option<anyhow::Error>> {
+    if let Err(e) = passes().await {
+        return Ok(Some(e));
+    }
+    let Some(sync) = deferred.take() else {
+        return Ok(None);
+    };
+    if let Err(e) = with_realm(sync).await {
+        let cause = format!("the forced reset with the Kerberos realm {realm} failed: {e:#}");
+        error!("{cause}");
+        aside(sync, cause).await?;
+        if let Err(e) = passes().await {
+            return Ok(Some(e));
+        }
+    }
+    Ok(None)
+}
+
+fn reset_refused(e: PasswordChangeError) -> &'static str {
+    match e {
+        PasswordChangeError::HasNul => RESET_HAS_NUL,
+        _ => RESET_TOO_SHORT,
+    }
+}
+
+fn admin_password(config: &Configuration) -> &str {
+    config
+        .ldap_user_pass
+        .as_ref()
+        .expect(ADMIN_PASSWORD_MISSING_ERROR)
+        .unsecure()
+}
+
+fn reset_span(config: &Configuration) -> tracing::Span {
+    if config.force_ldap_user_pass_reset.is_yes() {
+        span!(
+            Level::WARN,
+            "Forcing admin password reset to the config-provided password"
+        )
+    } else {
+        span!(Level::INFO, "Resetting admin password")
+    }
+}
+
+// The one-shot reset is the break-glass: it also clears the admin's second factor.
+async fn finish_reset(
+    handler: &SqlBackendHandler,
+    config: &Configuration,
+    detail: &str,
+) -> Result<()> {
+    if config.force_ldap_user_pass_reset.is_yes() {
+        handler
+            .reset_user_mfa(&config.ldap_user_dn, MfaResetReason::ForcedAdminReset)
+            .await?;
+    }
+    record(
+        LogKind::AdminBootstrap,
+        Some(config.ldap_user_dn.as_str()),
+        Some(detail),
+    );
+    Ok(())
+}
+
+async fn reset_with_realm(
+    handler: &SqlBackendHandler,
+    config: &Configuration,
+    sync: PasswordSync,
+) -> Result<()> {
+    let admin = &config.ldap_user_dn;
+    change_password_everywhere(handler, admin, admin_password(config), sync)
+        .instrument(reset_span(config))
+        .await
+        .map_err(|e| anyhow!("{e}"))
+        .with_context(|| format!("while resetting admin password for {admin}"))?;
+    let detail = match sync {
+        PasswordSync::On => {
+            info!("Reset the password and the Kerberos keys of {admin} from the configuration");
+            "admin password and Kerberos keys reset from the configuration"
+        }
+        PasswordSync::Off => {
+            info!("Reset the password of {admin} from the configuration");
+            "admin password reset from the configuration"
+        }
+    };
+    finish_reset(handler, config, detail).await
+}
 
 async fn create_admin_user(handler: &SqlBackendHandler, config: &Configuration) -> Result<()> {
     let pass_length = config
@@ -66,6 +267,9 @@ async fn create_admin_user(handler: &SqlBackendHandler, config: &Configuration) 
         pass_length >= 8,
         "Minimum password length is 8 characters, got {pass_length} characters"
     );
+    if let Err(e) = password_rules(admin_password(config)) {
+        bail!("The admin password in ldap_user_pass is refused: {e}");
+    }
     handler
         .create_user(CreateUserRequest {
             user_id: config.ldap_user_dn.clone(),
@@ -225,6 +429,7 @@ async fn set_up_server(
     if config.enable_mfa.is_positive() {
         ensure_group_exists(&backend_handler, MFA_DISABLED_GROUP).await?;
     }
+    let mut deferred = None;
     let admin_present = if let Ok(admins) = backend_handler
         .list_users(
             Some(UserRequestFilter::MemberOf("lldap_admin".into())),
@@ -250,46 +455,33 @@ async fn set_up_server(
             Some("admin user created"),
         );
     } else if config.force_ldap_user_pass_reset.is_positive() {
-        let span = if config.force_ldap_user_pass_reset.is_yes() {
-            span!(
-                Level::WARN,
-                "Forcing admin password reset to the config-provided password"
-            )
-        } else {
-            span!(Level::INFO, "Resetting admin password")
-        };
-        register_password(
-            &backend_handler,
-            config.ldap_user_dn.clone(),
-            config
-                .ldap_user_pass
-                .as_ref()
-                .expect(ADMIN_PASSWORD_MISSING_ERROR)
-                .unsecure()
-                .as_bytes(),
-        )
-        .instrument(span)
-        .await
-        .context(format!(
-            "while resetting admin password for {}",
-            config.ldap_user_dn
-        ))?;
-        // The one-shot reset is the break-glass: it also clears the admin's second factor.
-        if config.force_ldap_user_pass_reset.is_yes() {
-            backend_handler
-                .reset_user_mfa(&config.ldap_user_dn, MfaResetReason::ForcedAdminReset)
-                .await?;
+        if let Err(e) = password_rules(admin_password(&config)) {
+            bail!(reset_refused(e));
         }
-        record(
-            LogKind::AdminBootstrap,
-            Some(config.ldap_user_dn.as_str()),
-            Some("admin password reset from the configuration"),
-        );
+        let admin = backend_handler
+            .get_user_details(&config.ldap_user_dn)
+            .await
+            .with_context(|| {
+                format!("while resetting admin password for {}", config.ldap_user_dn)
+            })?;
+        let sync = PasswordSync::of(kerberos_sync_enabled(&admin.attributes));
+        let why = match sync {
+            PasswordSync::On => "the admin has Kerberos sync",
+            PasswordSync::Off => "Kerberos is enabled",
+        };
+        if config.kerberos_options.enabled {
+            deferred = Some(sync);
+            info!(
+                "The forced reset of {}'s password waits for the Kerberos realm: {why}",
+                config.ldap_user_dn
+            );
+        } else {
+            reset_without_realm(&backend_handler, &config, sync, KERBEROS_OFF).await?;
+        }
     }
-    if config.force_update_private_key || config.force_ldap_user_pass_reset.is_yes() {
-        bail!(
-            "Restart the server without --force-update-private-key or --force-ldap-user-pass-reset to continue."
-        );
+    let restart = config.force_update_private_key || config.force_ldap_user_pass_reset.is_yes();
+    if restart && deferred.is_none() {
+        bail!(RESTART_WITHOUT_FORCE);
     }
     let (realm_threads, embedded) = match config.kerberos_options.enabled {
         false => (None, None),
@@ -302,20 +494,64 @@ async fn set_up_server(
                 handler: Arc::new(backend_handler.clone()),
                 runtime: tokio::runtime::Handle::current(),
             };
-            let started = match durable {
-                Ok(()) => start_realm(settings, records).await,
+            let opened = match durable {
+                Ok(()) => open_realm(settings, records).await,
+                Err(e) => Err(e),
+            }
+            .with_context(|| format!("the Kerberos realm {realm} did not open"));
+            let mut deferred = deferred;
+            let served = match opened {
+                Ok((embedded, opened)) => {
+                    set_kerberos_backend(embedded.clone());
+                    let reconciling =
+                        format!("reconciling the principals of the Kerberos realm {realm} failed");
+                    let passing = format!("the start pass of the Kerberos realm {realm} failed");
+                    let passes = async || {
+                        let reconciled = reconcile_principals(&backend_handler, &embedded).await;
+                        reconciled.context(reconciling.clone())?;
+                        let passed = start_pass(&backend_handler, &embedded).await;
+                        passed.context(passing.clone())
+                    };
+                    let with_realm = async |sync: PasswordSync| {
+                        reset_with_realm(&backend_handler, &config, sync).await
+                    };
+                    let aside = async |sync: PasswordSync, cause: String| {
+                        reset_aside(&backend_handler, &config, sync, &cause).await
+                    };
+                    match before_serve(passes, &mut deferred, with_realm, aside, &realm).await? {
+                        Some(e) => Err(e),
+                        None if restart => {
+                            drop(opened);
+                            bail!(RESTART_WITHOUT_FORCE);
+                        }
+                        None => match embedded.unavailable() {
+                            Some(lost) => Err(anyhow!("{lost}").context(format!(
+                                "the KDC of the Kerberos realm {realm} was not started"
+                            ))),
+                            None => serve_realm(opened)
+                                .await
+                                .with_context(|| format!("the Kerberos realm {realm} did not open"))
+                                .map(|threads| {
+                                    let turns = embedded.follow_every(FOLLOW_EVERY);
+                                    (threads.following(turns), embedded)
+                                }),
+                        },
+                    }
+                }
                 Err(e) => Err(e),
             };
-            match started {
-                Ok((embedded, threads)) => {
-                    set_kerberos_backend(embedded.clone());
-                    reconcile_principals(&backend_handler, &embedded).await?;
-                    start_pass(&backend_handler, &embedded).await?;
-                    (Some(threads), Some(embedded))
-                }
+            match served {
+                Ok((threads, embedded)) => (Some(threads), Some(embedded)),
                 Err(e) => {
-                    let cause = format!("the Kerberos realm {realm} did not open: {e:#}");
+                    let cause = format!("{e:#}");
                     error!("{cause}");
+                    if let Some(sync) = deferred {
+                        let failed = e.to_string();
+                        reset_aside(&backend_handler, &config, sync, &failed).await?;
+                        if restart {
+                            bail!(RESTART_WITHOUT_FORCE);
+                        }
+                    }
                     set_kerberos_backend(Arc::new(DegradedKerberos::new(realm.clone(), cause)));
                     config.ldap_host = loopback(&config.ldap_host);
                     config.http_host = loopback(&config.http_host);
@@ -343,15 +579,21 @@ async fn set_up_server(
     Ok((server_builder, realm_threads))
 }
 
-async fn start_realm(
+async fn open_realm(
     settings: RealmSettings,
     records: Records,
-) -> Result<(Arc<EmbeddedKerberos>, RealmThreads)> {
+) -> Result<(Arc<EmbeddedKerberos>, Opened)> {
     tokio::task::spawn_blocking(move || {
-        EmbeddedKerberos::start(&settings, kerberos_store(), records)
+        EmbeddedKerberos::open(&settings, kerberos_store(), records)
     })
     .await
-    .context("while starting the Kerberos realm")?
+    .context("while opening the Kerberos realm")?
+}
+
+async fn serve_realm(opened: Opened) -> Result<RealmThreads> {
+    tokio::task::spawn_blocking(move || opened.serve())
+        .await
+        .context("while starting the KDC and kadmind")?
 }
 
 async fn stop_realm(realm: RealmThreads) -> Result<()> {
@@ -406,8 +648,9 @@ async fn start_pass(handler: &SqlBackendHandler, embedded: &EmbeddedKerberos) ->
         .collect();
     let pass = embedded.start_pass(users).await?;
     info!(
-        "🎟️ Kerberos start pass: {} principals marked, {} removed, {} disabled",
-        pass.marked, pass.removed, pass.disabled
+        "🎟️ Kerberos start pass: {} principals marked, {} removed, {} disabled, {} set from \
+         lldap_disabled",
+        pass.marked, pass.removed, pass.disabled, pass.followed
     );
     Ok(())
 }
@@ -487,6 +730,17 @@ async fn run_server_command(opts: RunOpts) -> Result<()> {
     info!("Starting LLDAP version {}", env!("CARGO_PKG_VERSION"));
 
     let sql_pool = setup_sql_tables(&config.database_url).await?;
+    if !config.kerberos_options.enabled && realm_marked_open(&sql_pool).await {
+        warn!(
+            "Kerberos is disabled on this server, but this database's Kerberos realm is marked \
+             open: another server holds it, or the last server with Kerberos stopped without \
+             closing it. On a lone server this is harmless; to close the realm, start once with \
+             Kerberos enabled, wait out its thirty-five-second watch and stop cleanly. Beside a \
+             holder, every server on one database needs the same kerberos_options.enabled: this \
+             server's deletes, sync changes and lldap_disabled changes reach the realm's \
+             principals through the holder's status pass, within a minute"
+        );
+    }
     let committer = config
         .kerberos_options
         .enabled
@@ -605,6 +859,190 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn test_a_forced_reset_is_refused_only_for_its_password() {
+        let floor = reset_refused(PasswordChangeError::TooShort);
+        let nul = reset_refused(PasswordChangeError::HasNul);
+        let off = sync_turned_off(KERBEROS_OFF);
+        let rows = [
+            (floor, "at least 8 characters"),
+            (floor, "take the forced reset out of the configuration"),
+            (nul, "cannot take a NUL character (U+0000)"),
+            (nul, "take the forced reset out of the configuration"),
+            (
+                off.as_str(),
+                "Kerberos sync turned off by the forced reset of the admin's password",
+            ),
+            (
+                off.as_str(),
+                "Kerberos is not enabled (kerberos_options.enabled is false)",
+            ),
+            (
+                off.as_str(),
+                "a principal, if there is one, is removed by the holder's next status pass, \
+                 within a minute, or at the next start with Kerberos enabled",
+            ),
+        ];
+        for (sentence, part) in rows {
+            assert!(sentence.contains(part), "{part}: {sentence}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_each_kerberos_failure_before_serve_leaves_the_reset_to_the_directory() {
+        use PasswordSync::{Off, On};
+        let failed = |why: &str| Err(anyhow!("{}", why.to_owned()));
+        let aside = |sync: &str, why: &str| {
+            format!(
+                "aside {sync}: the forced reset with the Kerberos realm EXAMPLE.COM failed: {why}"
+            )
+        };
+        let calls = |list: &[&str]| list.iter().map(|call| (*call).to_owned()).collect();
+        type Row = (
+            &'static str,
+            Vec<Result<()>>,
+            Option<PasswordSync>,
+            Result<()>,
+            Option<String>,
+            Vec<String>,
+            Option<PasswordSync>,
+        );
+        let rows: Vec<Row> = vec![
+            (
+                "reconcile or the start pass fails: not usable, the reset still deferred",
+                vec![failed("the start pass failed")],
+                Some(On),
+                Ok(()),
+                Some("the start pass failed".to_owned()),
+                calls(&["passes"]),
+                Some(On),
+            ),
+            (
+                "the reset with the realm fails: it runs without the realm, then the passes again",
+                vec![Ok(()), Ok(())],
+                Some(On),
+                failed("a password change is in progress, try again"),
+                None,
+                calls(&[
+                    "passes",
+                    "with the realm On",
+                    &aside("On", "a password change is in progress, try again"),
+                    "passes",
+                ]),
+                None,
+            ),
+            (
+                "the same for an admin without sync",
+                vec![Ok(()), Ok(())],
+                Some(Off),
+                failed("the realm was lost"),
+                None,
+                calls(&[
+                    "passes",
+                    "with the realm Off",
+                    &aside("Off", "the realm was lost"),
+                    "passes",
+                ]),
+                None,
+            ),
+            (
+                "the passes after the reset without the realm fail: not usable, no second reset",
+                vec![Ok(()), failed("the start pass failed")],
+                Some(On),
+                failed("refused by Kerberos: password policy: min_length 20"),
+                Some("the start pass failed".to_owned()),
+                calls(&[
+                    "passes",
+                    "with the realm On",
+                    &aside("On", "refused by Kerberos: password policy: min_length 20"),
+                    "passes",
+                ]),
+                None,
+            ),
+            (
+                "the reset with the realm commits: nothing else",
+                vec![Ok(())],
+                Some(On),
+                Ok(()),
+                None,
+                calls(&["passes", "with the realm On"]),
+                None,
+            ),
+            (
+                "no reset",
+                vec![Ok(())],
+                None,
+                Ok(()),
+                None,
+                calls(&["passes"]),
+                None,
+            ),
+        ];
+        for (label, passes, deferred, answer, unusable, called, left) in rows {
+            let calls = std::cell::RefCell::new(Vec::new());
+            let answers = std::cell::RefCell::new(passes.into_iter());
+            let (log, answers) = (&calls, &answers);
+            let mut deferred = deferred;
+            let got = before_serve(
+                async || {
+                    log.borrow_mut().push("passes".to_owned());
+                    let next = answers.borrow_mut().next();
+                    next.unwrap_or_else(|| failed("the passes ran once too often"))
+                },
+                &mut deferred,
+                async move |sync: PasswordSync| {
+                    log.borrow_mut().push(format!("with the realm {sync:?}"));
+                    answer
+                },
+                async move |sync: PasswordSync, cause: String| {
+                    log.borrow_mut().push(format!("aside {sync:?}: {cause}"));
+                    Ok(())
+                },
+                "EXAMPLE.COM",
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                (got.map(|e| e.to_string()), calls.into_inner(), deferred),
+                (unusable, called, left),
+                "{label}"
+            );
+        }
+        let stopped = before_serve(
+            async || Ok(()),
+            &mut Some(On),
+            async |_: PasswordSync| failed("busy"),
+            async |_: PasswordSync, _: String| failed("the database is gone"),
+            "EXAMPLE.COM",
+        )
+        .await;
+        assert_eq!(
+            stopped.map_err(|e| e.to_string()).map(|e| e.is_none()),
+            Err("the database is gone".to_owned()),
+            "only the directory's own failure stops the start"
+        );
+    }
+
+    #[test]
+    fn test_the_realm_set_aside_comes_back_after_a_panic() {
+        let _one = crate::auth_service::tests::ONE_BACKEND.blocking_lock();
+        let held = DegradedKerberos::new("EXAMPLE.COM".to_owned(), "held".to_owned());
+        set_kerberos_backend(Arc::new(held));
+        let inside = std::panic::catch_unwind(|| {
+            let _aside = SetAside::new("EXAMPLE.COM".to_owned());
+            let enabled = kerberos_backend().enabled();
+            assert!(!enabled, "set aside: no realm takes part");
+            panic!("the reset panicked");
+        });
+        let back = kerberos_backend().unavailable();
+        set_kerberos_backend(Arc::new(NoopKerberos::default()));
+        assert_eq!(
+            (inside.is_err(), back),
+            (true, Some("held".to_owned())),
+            "the realm's backend is back after a panic inside the reset"
+        );
+    }
 
     #[test]
     fn test_loopback_for_the_degraded_listeners() {

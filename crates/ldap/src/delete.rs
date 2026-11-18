@@ -7,7 +7,6 @@ use ldap3_proto::proto::{LdapOp, LdapResult as LdapResultOp, LdapResultCode};
 use lldap_access_control::AdminBackendHandler;
 use lldap_domain::types::{GroupName, UserId};
 use lldap_domain_handlers::handler::GroupRequestFilter;
-use lldap_domain_handlers::kerberos::kerberos_backend;
 use lldap_domain_model::error::DomainError;
 use tracing::instrument;
 
@@ -62,13 +61,6 @@ async fn delete_user(
             code: LdapResultCode::OperationsError,
             message: format!("Error while deleting user: {e:?}"),
         })?;
-    if let Err(e) = kerberos_backend().delete_principal(&user_id).await {
-        tracing::warn!(
-            "Failed to delete Kerberos principal for deleted user {}: {}",
-            user_id,
-            e
-        );
-    }
     Ok(vec![make_del_response(
         LdapResultCode::Success,
         String::new(),
@@ -116,7 +108,7 @@ mod tests {
     use lldap_domain::types::{Group, GroupId, User, Uuid};
     use lldap_domain_model::error::DomainError;
     use lldap_test_utils::MockTestBackendHandler;
-    use lldap_test_utils::recording_kerberos::{KerberosOp, RecordingGuard};
+    use lldap_test_utils::recording_kerberos::RecordingGuard;
     use mockall::predicate::eq;
     use pretty_assertions::assert_eq;
     use serial_test::serial;
@@ -149,9 +141,8 @@ mod tests {
         );
         assert_eq!(
             guard.recorder().take_ops(),
-            vec![KerberosOp::DeletePrincipal {
-                username: "bob".into(),
-            }]
+            vec![],
+            "the backend's delete owns the principal; the door adds no second delete"
         );
     }
 

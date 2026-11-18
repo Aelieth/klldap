@@ -84,6 +84,23 @@ else
     p_bad "logActivity failed: $(cat "$D/activity.json" "$D/activity.err" 2>/dev/null)"
 fi
 
+# An access-denied flood an earlier phase left open on this server (GraphQL, the gate's address)
+# coalesces these refusals into it, and no row is stored: wait until it has resolved (20 s idle).
+lg_flood_open() {
+    graphql '{ logs(filter: {kinds: [ACCESS_DENIED_FLOOD]}, limit: 20) { detail protocol } }' 2>/dev/null |
+        python3 -c '
+import json, sys
+rows = [r for r in json.load(sys.stdin)["logs"] if r.get("protocol") == "GRAPHQL"]
+print("open" if rows and (rows[0].get("detail") or "").startswith("access-denied flood started") else "closed")' 2>/dev/null
+}
+flood_wait=0
+while [ "$flood_wait" -lt 45 ] && [ "$(lg_flood_open)" = open ]; do
+    sleep 1
+    flood_wait=$((flood_wait + 1))
+done
+FLOOD_NOTE="no access-denied flood was open"
+[ "$flood_wait" -gt 0 ] && FLOOD_NOTE="waited ${flood_wait}s for an open access-denied flood to resolve"
+
 saved_token="$TOKEN"
 if TOKEN="$(gate_login "$LOG_USER" "$LOG_PASS")"; then
     if graphql '{ logs(limit: 1) { id } }' >"$D/denied.json" 2>"$D/denied.err"; then
@@ -103,9 +120,9 @@ TOKEN="$saved_token"
 
 if log_query_has_row '{ logs(filter: {kinds: [ACCESS_DENIED], actor: "'"$LOG_USER"'"}) { kind detail } }' denied-row \
     && grep -q "Unauthorized to read the logs" "$D/denied-row.json"; then
-    p_ok "the refusal itself is logged for $LOG_USER"
+    p_ok "the refusal itself is logged for $LOG_USER ($FLOOD_NOTE)"
 else
-    p_bad "access_denied row for $LOG_USER missing"
+    p_bad "access_denied row for $LOG_USER missing ($FLOOD_NOTE)"
 fi
 
 if gexec /app/lldap run --help >"$D/run-help.txt" 2>/dev/null \

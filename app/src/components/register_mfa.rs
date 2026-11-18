@@ -18,8 +18,8 @@ use gloo_timers::callback::Timeout;
 use graphql_client::GraphQLQuery;
 use lldap_auth::login;
 use lldap_mfa::{
-    ENROLLMENT_PROOF_BUSY, PASSWORD_PROOF_REQUIRED, TOTP_CURRENT_CODE_REQUIRED, TOTP_DIGITS,
-    TOTP_ENROLLMENT_EXPIRED, TOTP_ENROLLMENT_TTL_SECS, split_totp_suffix,
+    PASSWORD_PROOF_REQUIRED, TOTP_CURRENT_CODE_REQUIRED, TOTP_DIGITS, TOTP_ENROLLMENT_EXPIRED,
+    TOTP_ENROLLMENT_TTL_SECS, split_totp_suffix,
 };
 use validator_derive::Validate;
 use yew::prelude::*;
@@ -216,13 +216,6 @@ impl CommonComponent<RegisterMfa> for RegisterMfa {
                     self.phase = Phase::Password;
                     self.common.error = Some(anyhow!(
                         "The password check expired or was already used. Enter your password again."
-                    ));
-                    Ok(true)
-                }
-                Err(e) if e.to_string().contains(ENROLLMENT_PROOF_BUSY) => {
-                    self.phase = Phase::Password;
-                    self.common.error = Some(anyhow!(
-                        "Too many enrollments are in progress. Try again shortly."
                     ));
                     Ok(true)
                 }

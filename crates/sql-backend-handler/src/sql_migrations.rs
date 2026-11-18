@@ -196,6 +196,13 @@ pub(crate) enum TotpSteps {
     Used,
 }
 
+#[derive(DeriveIden, Clone, Copy)]
+pub(crate) enum MfaUsedProofs {
+    Table,
+    ProofId,
+    ExpiresAt,
+}
+
 // Metadata about the SQL DB.
 #[derive(DeriveIden)]
 pub(crate) enum Metadata {
@@ -2033,6 +2040,7 @@ pub(crate) async fn ensure_v13_additions(pool: &DbConnection) -> Result<(), DbEr
     ensure_kerberos(&transaction, backend).await?;
     ensure_login_lockouts(&transaction, backend).await?;
     ensure_totp_steps(&transaction, backend).await?;
+    ensure_mfa_used_proofs(&transaction, backend).await?;
     ensure_lockout_period(&transaction, backend).await?;
     transaction.commit().await
 }
@@ -2149,6 +2157,37 @@ async fn ensure_totp_steps(
                             .to(Users::Table, Users::UserId)
                             .on_delete(ForeignKeyAction::Cascade)
                             .on_update(ForeignKeyAction::Cascade),
+                    ),
+            ),
+        )
+        .await?;
+    Ok(())
+}
+
+/// The used enrollment proofs: a random id and its expiry, for no user in particular.
+async fn ensure_mfa_used_proofs(
+    transaction: &DatabaseTransaction,
+    backend: sea_orm::DbBackend,
+) -> Result<(), DbErr> {
+    if !relation_missing(transaction, backend, MfaUsedProofs::Table.into_iden()).await? {
+        return Ok(());
+    }
+    transaction
+        .execute(
+            backend.build(
+                Table::create()
+                    .table(MfaUsedProofs::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(MfaUsedProofs::ProofId)
+                            .string_len(32)
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(MfaUsedProofs::ExpiresAt)
+                            .big_integer()
+                            .not_null(),
                     ),
             ),
         )

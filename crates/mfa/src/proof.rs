@@ -1,6 +1,3 @@
-use std::collections::HashMap;
-use std::sync::{Mutex, PoisonError};
-
 use base64::{Engine, engine::general_purpose::STANDARD};
 use orion::aead;
 use rand::RngCore;
@@ -15,7 +12,6 @@ pub const ENROLLMENT_PROOF_TTL_SECS: i64 = 5 * 60;
 /// Servers that share a database may disagree on the time by this much.
 pub const ENROLLMENT_PROOF_CLOCK_TOLERANCE_SECS: i64 = 60;
 const PROOF_KIND: u8 = 2;
-const MAX_USED_PROOFS: usize = 1024;
 
 #[derive(Serialize, Deserialize)]
 pub struct EnrollmentProof {
@@ -61,47 +57,6 @@ pub fn open_enrollment_proof(ikm: &[u8], sealed: &str, now_unix: i64) -> Result<
         return Err(MfaError::InvalidSealedFormat);
     }
     Ok(proof)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ProofUse {
-    Accepted,
-    /// Used before, or an expiry outside the lifetime.
-    Refused,
-    /// Every slot holds a live id: the proof is not marked, so it stays usable.
-    Full,
-}
-
-/// Used proof ids for this process, each until its expiry, at most `MAX_USED_PROOFS` of them.
-pub struct UsedProofs(Mutex<HashMap<[u8; 16], i64>>);
-
-impl UsedProofs {
-    pub fn new() -> Self {
-        Self(Mutex::new(HashMap::new()))
-    }
-
-    pub fn mark_used(&self, id: [u8; 16], expiry_unix: i64, now_unix: i64) -> ProofUse {
-        let latest = latest_expiry(now_unix);
-        if expiry_unix <= now_unix || expiry_unix > latest {
-            return ProofUse::Refused;
-        }
-        let mut used = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        used.retain(|_, expiry| *expiry > now_unix && *expiry <= latest);
-        if used.contains_key(&id) {
-            return ProofUse::Refused;
-        }
-        if used.len() >= MAX_USED_PROOFS {
-            return ProofUse::Full;
-        }
-        used.insert(id, expiry_unix);
-        ProofUse::Accepted
-    }
-}
-
-impl Default for UsedProofs {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 #[cfg(test)]
@@ -212,58 +167,5 @@ mod tests {
         for (label, expiry, expected) in rows {
             assert_eq!(opens(expiry), expected, "{label}");
         }
-    }
-
-    fn id_of(n: u16) -> [u8; 16] {
-        let mut id = [0u8; 16];
-        id[14..].copy_from_slice(&n.to_be_bytes());
-        id
-    }
-
-    #[test]
-    fn test_used_ids_are_bounded_by_time() {
-        let used = UsedProofs::new();
-        let now = 1_700_000_000;
-        let id = id_of(1);
-        assert_eq!(used.mark_used(id, now, now), ProofUse::Refused);
-        assert_eq!(used.mark_used(id, now + LATEST + 1, now), ProofUse::Refused);
-        assert_eq!(used.mark_used(id, now + LATEST, now), ProofUse::Accepted);
-        assert_eq!(used.mark_used(id, now + LATEST, now), ProofUse::Refused);
-        let short = id_of(2);
-        assert_eq!(used.mark_used(short, now + 10, now), ProofUse::Accepted);
-        assert_eq!(used.mark_used(short, now + 40, now), ProofUse::Refused);
-        assert_eq!(
-            used.mark_used(short, now + 40, now + 10),
-            ProofUse::Accepted
-        );
-    }
-
-    #[test]
-    fn test_a_full_set_refuses_a_new_id_without_marking_it_or_dropping_one() {
-        let used = UsedProofs::new();
-        let now = 1_700_000_000;
-        for n in 0..MAX_USED_PROOFS as u16 {
-            assert_eq!(
-                used.mark_used(id_of(n), now + 100, now),
-                ProofUse::Accepted,
-                "{n}"
-            );
-        }
-        let new = id_of(MAX_USED_PROOFS as u16);
-        assert_eq!(used.mark_used(id_of(1), now + 100, now), ProofUse::Refused);
-        assert_eq!(used.mark_used(new, now + 200, now), ProofUse::Full);
-        assert_eq!(used.mark_used(new, now + 200, now), ProofUse::Full);
-        for n in [0, 1, MAX_USED_PROOFS as u16 - 1] {
-            assert_eq!(
-                used.mark_used(id_of(n), now + 100, now),
-                ProofUse::Refused,
-                "{n} stays used while the set is full"
-            );
-        }
-        assert_eq!(
-            used.mark_used(new, now + 200, now + 100),
-            ProofUse::Accepted
-        );
-        assert_eq!(used.mark_used(new, now + 200, now + 100), ProofUse::Refused);
     }
 }

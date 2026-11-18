@@ -143,7 +143,7 @@ could not answer), `totp re-enrollment required`
 (the sealed secret no longer opens) and `mfa enrollment required`. The challenge itself —
 password right, code missing — is the failure row `totp code required`. Enrollment and
 resets are `mfa_enroll` (`started`, `totp`, `replaced`, and the refusals, among them
-`password proof required` and `enrollment busy`) and `mfa_reset` (`self`,
+`password proof required` and `proof: unreadable`) and `mfa_reset` (`self`,
 `password reset`, `forced admin reset`, `private key changed`; an administrative reset has
 no detail — the actor says who). A reset that finds no factor to clear records nothing.
 
@@ -189,16 +189,15 @@ enrollment, a 90-second replay window, five attempts per step, issuer `KLLDAP` �
   that makes no session. A user with no factor can also ask `/auth/simple/login` for the
   same proof. Under `"always"` that door refuses a user who has not enrolled, and the proof
   comes from the OPAQUE finish, which is the door that admits them.
-- A proof is used once on each server: the server that accepts it remembers it until it
-  expires, and another server with the same key can accept the same proof once within
-  those five minutes. A server remembers at most 1024 live proofs. While all 1024 are
-  live, it refuses a first enrollment with *Too many enrollments in progress: try again
-  shortly*, logs a warning and an `enrollment busy` row, and does not use up the proof
-  presented, which works once the oldest expire.
+- A proof is used once, on every server that shares the database: its random id is kept in
+  the table `mfa_used_proofs` with its expiry (no user, nothing else) until a minute after it
+  expires, so a restart or another server refuses it too. There is no cap. When that table
+  cannot be read or written, a first enrollment is refused (*Password proof unreadable*, an
+  `mfa_enroll` row `proof: unreadable`) and the proof is not used up.
 - Servers that share a database need synchronised clocks. A server accepts a proof whose
   expiry is up to 60 seconds further away than its own clock allows, and no more.
-- The used codes and the attempts are kept in the database, shared by every server on it;
-  the used proofs are per process and in memory.
+- The used codes, the attempts and the used proofs are kept in the database, shared by
+  every server on it.
 - No recovery codes: recovery is an administrator, the password-reset e-mail, or the exempt
   group.
 - Sessions and refresh tokens minted before an enrollment stay valid until they expire.

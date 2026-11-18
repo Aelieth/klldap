@@ -1,6 +1,7 @@
 use crate::SqlBackendHandler;
 use crate::sql_lockout_handler::numbered;
 use crate::sql_totp_steps::{Mark, clear_used, mark_in, mark_used, refund, reserve};
+use crate::sql_used_proofs::take_proof_id;
 use async_trait::async_trait;
 use lldap_domain::types::{MFA_TYPE_TOTP, TotpEnrollmentStart, UserId};
 use lldap_domain_handlers::handler::MfaBackendHandler;
@@ -14,9 +15,9 @@ use lldap_domain_model::{
     model::{self, UserColumn},
 };
 use lldap_mfa::{
-    ENROLLMENT_PROOF_BUSY, MfaError, PASSWORD_PROOF_REQUIRED, ProofUse, TOTP_CODE_ALREADY_USED,
-    TOTP_CURRENT_CODE_REQUIRED, TOTP_ENROLLMENT_EXPIRED, TOTP_STEP_SECS, TOTP_TOO_MANY_ATTEMPTS,
-    UsedProofs, open_enrollment_proof, seal_enrollment_proof,
+    MfaError, PASSWORD_PROOF_REQUIRED, TOTP_CODE_ALREADY_USED, TOTP_CURRENT_CODE_REQUIRED,
+    TOTP_ENROLLMENT_EXPIRED, TOTP_STEP_SECS, TOTP_TOO_MANY_ATTEMPTS, open_enrollment_proof,
+    seal_enrollment_proof,
 };
 use sea_orm::{
     ActiveModelTrait, ActiveValue, ColumnTrait, ConnectionTrait, DbBackend, EntityTrait,
@@ -24,7 +25,6 @@ use sea_orm::{
 };
 #[cfg(any(test, feature = "test-clock"))]
 use std::cell::Cell;
-use std::sync::OnceLock;
 use tracing::{info, instrument, warn};
 
 const TOTP_ISSUER: &str = "KLLDAP";
@@ -64,11 +64,6 @@ pub(crate) fn now_unix() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-fn used_proofs() -> &'static UsedProofs {
-    static USED: OnceLock<UsedProofs> = OnceLock::new();
-    USED.get_or_init(UsedProofs::new)
-}
-
 fn refuse_proof(user_id: &UserId) -> DomainError {
     logging::record_failure(
         LogKind::MfaEnroll,
@@ -78,38 +73,32 @@ fn refuse_proof(user_id: &UserId) -> DomainError {
     DomainError::AuthenticationError(PASSWORD_PROOF_REQUIRED.to_string())
 }
 
-fn take_proof(
-    used: &UsedProofs,
-    key: &[u8],
-    user_id: &UserId,
-    token: Option<&str>,
-    now: i64,
-) -> Result<()> {
-    let Some(token) = token.filter(|token| !token.is_empty()) else {
-        return Err(refuse_proof(user_id));
-    };
-    let Ok(proof) = open_enrollment_proof(key, token, now) else {
-        return Err(refuse_proof(user_id));
-    };
-    if proof.user_id != user_id.as_str() {
-        return Err(refuse_proof(user_id));
-    }
-    match used.mark_used(proof.id, proof.expiry_unix, now) {
-        ProofUse::Accepted => Ok(()),
-        ProofUse::Refused => Err(refuse_proof(user_id)),
-        ProofUse::Full => {
-            warn!(
-                r#"First enrollment for "{}" refused: every used-proof slot holds a live proof"#,
-                user_id
-            );
-            logging::record_failure(
-                LogKind::MfaEnroll,
-                Some(user_id.as_str()),
-                "enrollment busy",
-            );
-            Err(DomainError::AuthenticationError(
-                ENROLLMENT_PROOF_BUSY.to_owned(),
-            ))
+impl SqlBackendHandler {
+    /// A first enrollment's proof: it opens, names this user, and was never used on any server.
+    async fn take_proof(&self, user_id: &UserId, token: Option<&str>, now: i64) -> Result<()> {
+        let Some(token) = token.filter(|token| !token.is_empty()) else {
+            return Err(refuse_proof(user_id));
+        };
+        let Ok(proof) = open_enrollment_proof(&self.sealing_key(), token, now) else {
+            return Err(refuse_proof(user_id));
+        };
+        if proof.user_id != user_id.as_str() {
+            return Err(refuse_proof(user_id));
+        }
+        match take_proof_id(&self.sql_pool, &proof.id, proof.expiry_unix).await {
+            Ok(true) => {
+                self.note_codes_written();
+                Ok(())
+            }
+            Ok(false) => Err(refuse_proof(user_id)),
+            Err(e) => {
+                warn!("The used enrollment proofs could not be read or written for {user_id}: {e}");
+                let target = Some(user_id.as_str());
+                logging::record_failure(LogKind::MfaEnroll, target, "proof: unreadable");
+                Err(DomainError::AuthenticationError(format!(
+                    "Password proof unreadable for {user_id}"
+                )))
+            }
         }
     }
 }
@@ -366,13 +355,7 @@ impl MfaBackendHandler for SqlBackendHandler {
         let stored = stored.totp_secret.filter(|_| replaces_existing);
         if !replaces_existing {
             let token = enrollment_proof.as_deref();
-            take_proof(
-                used_proofs(),
-                &self.sealing_key(),
-                user_id,
-                token,
-                now_unix(),
-            )?;
+            self.take_proof(user_id, token, now_unix()).await?;
         }
         // Replacing a factor needs the old one, so a stolen session cannot rebind it.
         if replaces_existing {
@@ -509,7 +492,7 @@ pub(crate) mod tests {
     use crate::sql_backend_handler::tests::{get_initialized_db, insert_user_no_password};
     use crate::sql_tables::{DbConnection, init_table};
     use lldap_auth::opaque::server::{ServerSetup, generate_random_private_key};
-    use lldap_domain_handlers::logging::{RequestMeta, with_request, with_request_sync};
+    use lldap_domain_handlers::logging::{RequestMeta, with_request};
     use lldap_mfa::{
         EnrollmentState, SEALED_BLOB_LEN, SEALED_PREFIX, TOTP_CURRENT_CODE_REQUIRED,
         TOTP_ENROLLMENT_TTL_SECS, TOTP_MAX_ATTEMPTS_PER_STEP, TOTP_SEED_LEN, format_code,
@@ -753,13 +736,67 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn test_proof_opens_on_a_second_handler_with_the_same_key() {
-        let (setup, handler) = setup_handler().await;
+    async fn test_a_proof_is_used_once_on_every_server_and_after_a_restart() {
+        let (setup, a) = setup_handler().await;
+        insert_user_no_password(&a, "bob").await;
+        let bob = UserId::new("bob");
+        let proof = fresh_proof(&a, &bob).await;
+        let b = SqlBackendHandler::new(setup.clone(), a.sql_pool.clone());
+        b.start_totp_enrollment(&bob, None, Some(proof.clone()))
+            .await
+            .unwrap();
+        let restarted = SqlBackendHandler::new(setup, a.sql_pool.clone());
+        for (label, server) in [("the first server", &a), ("a restart", &restarted)] {
+            let err = server
+                .start_totp_enrollment(&bob, None, Some(proof.clone()))
+                .await
+                .unwrap_err();
+            assert!(
+                err.to_string().contains(PASSWORD_PROOF_REQUIRED),
+                "{label}: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_proof_is_refused_and_kept_when_its_table_cannot_answer() {
+        let log = LogGuard::install_on_this_thread();
+        let (_setup, handler) = setup_handler().await;
         insert_user_no_password(&handler, "bob").await;
         let bob = UserId::new("bob");
         let proof = fresh_proof(&handler, &bob).await;
-        let other = SqlBackendHandler::new(setup, handler.sql_pool.clone());
-        other
+        let rename = |from: &str, to: &str| {
+            let sql = format!("ALTER TABLE {from} RENAME TO {to}");
+            Statement::from_string(DbBackend::Sqlite, sql)
+        };
+        handler
+            .sql_pool
+            .execute(rename("mfa_used_proofs", "mfa_used_proofs_away"))
+            .await
+            .unwrap();
+        let err = handler
+            .start_totp_enrollment(&bob, None, Some(proof.clone()))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Password proof unreadable"),
+            "{err}"
+        );
+        let rows: Vec<_> = log
+            .recorder()
+            .take_events()
+            .into_iter()
+            .filter(|e| e.kind == LogKind::MfaEnroll)
+            .map(|e| (e.success, e.detail))
+            .collect();
+        assert_eq!(rows, vec![(false, Some("proof: unreadable".to_owned()))]);
+        handler
+            .sql_pool
+            .execute(rename("mfa_used_proofs_away", "mfa_used_proofs"))
+            .await
+            .unwrap();
+        handler
             .start_totp_enrollment(&bob, None, Some(proof))
             .await
             .unwrap();
@@ -800,91 +837,6 @@ pub(crate) mod tests {
             .start_totp_enrollment(&bob, None, Some(proof))
             .await
             .unwrap();
-    }
-
-    #[derive(Clone, Default)]
-    struct Warnings(std::sync::Arc<std::sync::Mutex<usize>>);
-
-    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
-        fn on_event(
-            &self,
-            event: &tracing::Event<'_>,
-            _: tracing_subscriber::layer::Context<'_, S>,
-        ) {
-            let meta = event.metadata();
-            if *meta.level() == tracing::Level::WARN
-                && meta.target() == "lldap_sql_backend_handler::sql_mfa_handler"
-            {
-                *self.0.lock().unwrap() += 1;
-            }
-        }
-    }
-
-    fn filler_id(n: u32) -> [u8; 16] {
-        let mut id = [0xffu8; 16];
-        id[12..].copy_from_slice(&n.to_be_bytes());
-        id
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_a_full_used_proof_set_refuses_a_first_enrollment_and_keeps_its_proof() {
-        use tracing_subscriber::layer::SubscriberExt;
-        let guard = LogGuard::install();
-        let peer = "10.77.0.2";
-        let (setup, _handler) = setup_handler().await;
-        let key = ikm(&setup);
-        let bob = UserId::new("bob");
-        let now = 1_700_000_000;
-        let used = UsedProofs::new();
-        let mut fillers = 0u32;
-        while used.mark_used(filler_id(fillers), now + 10, now) == ProofUse::Accepted {
-            fillers += 1;
-            assert!(fillers < 100_000, "the used-proof set never filled");
-        }
-        let proof = seal_enrollment_proof(&key, "bob", now).unwrap();
-        let warnings = Warnings::default();
-        let subscriber = tracing_subscriber::registry().with(warnings.clone());
-        let meta = RequestMeta::http(Some(peer.parse().unwrap()), None);
-        let answers = with_request_sync(meta, || {
-            tracing::subscriber::with_default(subscriber, || {
-                [now, now + 11, now + 11].map(|at| {
-                    take_proof(&used, &key, &bob, Some(&proof), at).map_err(|e| e.to_string())
-                })
-            })
-        });
-        let [busy, accepted, again] = answers;
-        assert!(
-            busy.as_ref().unwrap_err().contains(ENROLLMENT_PROOF_BUSY),
-            "{busy:?}"
-        );
-        assert_eq!(
-            accepted,
-            Ok(()),
-            "the refused start did not spend the proof"
-        );
-        assert!(
-            again
-                .as_ref()
-                .unwrap_err()
-                .contains(PASSWORD_PROOF_REQUIRED),
-            "{again:?}"
-        );
-        assert_eq!(*warnings.0.lock().unwrap(), 1);
-        let rows: Vec<(bool, Option<String>)> = guard
-            .recorder()
-            .take_events()
-            .into_iter()
-            .filter(|e| e.peer.as_deref() == Some(peer) && e.kind == LogKind::MfaEnroll)
-            .map(|e| (e.success, e.detail))
-            .collect();
-        assert_eq!(
-            rows,
-            vec![
-                (false, Some("enrollment busy".to_owned())),
-                (false, Some("password proof required".to_owned())),
-            ]
-        );
     }
 
     #[tokio::test]

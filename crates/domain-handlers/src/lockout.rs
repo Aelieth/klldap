@@ -229,7 +229,7 @@ pub trait LockStore: Send + Sync {
     async fn read_period(&self) -> Result<String>;
     /// One transaction: nothing is stored unless the period, read under a lock, is `period`.
     async fn write_locks(&self, period: &str, writes: &[LockWrite]) -> Result<Written>;
-    /// The second factor's spent steps, pruned on this tick.
+    /// The second factor's spent steps and used enrollment proofs, pruned on this tick.
     async fn prune_codes(&self) -> Result<u64> {
         Ok(0)
     }

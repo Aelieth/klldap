@@ -10,7 +10,9 @@
   enough. A script obtains the proof from a login that asks for it: `"enrollmentProof": true`
   in the body of `/auth/simple/login` or `/auth/opaque/login/finish` returns `enrollmentProof`
   in the answer, for a user with no factor yet. It is valid for five minutes and used once on
-  each server. Replacing a factor still takes `currentCode` and ignores a proof.
+  every server that shares the database (its random id is kept in the new table
+  `mfa_used_proofs` until a minute past its expiry). Replacing a factor still takes `currentCode`
+  and ignores a proof.
 - A second factor's attempts and used codes are kept in the database (the new table
   `totp_steps`, no code stored): a code is accepted once and five attempts per 30-second step
   are counted on every server that shares the database, and a restart keeps both. Servers on

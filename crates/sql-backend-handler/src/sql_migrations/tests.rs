@@ -2438,7 +2438,7 @@ fn period_key_sql(backend: DbBackend, statement: &str) -> String {
 
 async fn drop_lockout_tables(pool: &DbConnection) {
     let backend = pool.get_database_backend();
-    for table in ["login_lockouts", "totp_steps"] {
+    for table in ["login_lockouts", "totp_steps", "mfa_used_proofs"] {
         pool.execute(sea_orm::Statement::from_string(
             backend,
             format!("DROP TABLE {table}"),
@@ -2468,6 +2468,12 @@ async fn expect_lockout_tables(pool: &DbConnection) {
     ))
     .await
     .expect("totp_steps restored");
+    pool.execute(sea_orm::Statement::from_string(
+        backend,
+        "SELECT proof_id, expires_at FROM mfa_used_proofs LIMIT 1".to_owned(),
+    ))
+    .await
+    .expect("mfa_used_proofs restored");
     let period = pool
         .query_one(sea_orm::Statement::from_string(
             backend,
@@ -3382,7 +3388,13 @@ async fn test_sqlite_dump_script_matches_migrated_tables() {
     let server_tables = dump_script_names(&text, "# server tables:");
     assert_eq!(
         left_out,
-        ["metadata", "sqlite_sequence", "totp_steps"].map(str::to_owned)
+        [
+            "metadata",
+            "sqlite_sequence",
+            "totp_steps",
+            "mfa_used_proofs"
+        ]
+        .map(str::to_owned)
     );
     let output = std::process::Command::new("bash")
         .arg(&script)
@@ -3738,6 +3750,28 @@ async fn test_mysql_totp_codes_at_once_spend_five_attempts_and_one_use() {
         return;
     };
     crate::sql_totp_steps::tests::concurrency_lane(&pool).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_one_proof_used_at_once_is_taken_once() {
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres_sized(10).await else {
+        return;
+    };
+    crate::sql_used_proofs::tests::used_proofs_lane(&pool).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_one_proof_used_at_once_is_taken_once() {
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql_sized(10).await else {
+        return;
+    };
+    crate::sql_used_proofs::tests::used_proofs_lane(&pool).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -101,7 +101,7 @@ impl LLDAPFixture {
             server_log.as_deref(),
         );
         if answering {
-            wait_until_answering(http_port);
+            wait_until_answering(http_port, &extra_env);
         } else {
             wait_until_healthy(&db_url, ldap_port, http_port, &extra_env);
         }
@@ -179,7 +179,7 @@ impl LLDAPFixture {
             &self.extra_env,
             self.server_log.as_deref(),
         );
-        wait_until_answering(self.http_port);
+        wait_until_answering(self.http_port, &self.extra_env);
         self.token = get_token(&self.client, &self.http_url());
         value
     }
@@ -445,6 +445,21 @@ fn spawn_server(
     cmd.spawn().expect("Unable to start server")
 }
 
+// With Kerberos the listeners bind after the start sequence, whose first commit may wait 60 s.
+fn start_attempts(extra_env: &[(String, String)]) -> u8 {
+    let kerberos = extra_env
+        .iter()
+        .any(|(key, _)| key.starts_with("LLDAP_KERBEROS_OPTIONS__"))
+        && !extra_env
+            .iter()
+            .any(|(key, value)| key == KERBEROS_ENABLED && value == "false");
+    if kerberos {
+        90
+    } else {
+        MAX_HEALTHCHECK_ATTEMPS
+    }
+}
+
 fn wait_until_healthy(
     db_url: &str,
     ldap_port: u16,
@@ -452,7 +467,8 @@ fn wait_until_healthy(
     extra_env: &[(String, String)],
 ) {
     let mut started = false;
-    for attempt in 0..MAX_HEALTHCHECK_ATTEMPS {
+    let attempts = start_attempts(extra_env);
+    for attempt in 0..attempts {
         let status = server_command("healthcheck", db_url, ldap_port, http_port, extra_env)
             .status()
             .expect("healthcheck command failed to execute");
@@ -460,10 +476,9 @@ fn wait_until_healthy(
             started = true;
             break;
         }
-        if attempt == MAX_HEALTHCHECK_ATTEMPS - 1 {
+        if attempt == attempts - 1 {
             panic!(
-                "LLDAP failed to start after {} attempts. Check lldap_test_*.log if logs were captured.",
-                MAX_HEALTHCHECK_ATTEMPS
+                "LLDAP failed to start after {attempts} attempts. Check lldap_test_*.log if logs were captured."
             );
         }
         thread::sleep(Duration::from_millis(800));
@@ -471,7 +486,7 @@ fn wait_until_healthy(
     assert!(started, "Server did not become healthy");
 }
 
-fn wait_until_answering(http_port: u16) {
+fn wait_until_answering(http_port: u16, extra_env: &[(String, String)]) {
     let client = ClientBuilder::new()
         .connect_timeout(Duration::from_secs(3))
         .timeout(Duration::from_secs(8))
@@ -479,12 +494,13 @@ fn wait_until_answering(http_port: u16) {
         .build()
         .expect("failed to make http client");
     let url = format!("{}/health", http_url(http_port));
-    for attempt in 0..MAX_HEALTHCHECK_ATTEMPS {
+    let attempts = start_attempts(extra_env);
+    for attempt in 0..attempts {
         if client.get(&url).send().is_ok() {
             return;
         }
-        if attempt == MAX_HEALTHCHECK_ATTEMPS - 1 {
-            panic!("LLDAP did not answer /health after {MAX_HEALTHCHECK_ATTEMPS} attempts");
+        if attempt == attempts - 1 {
+            panic!("LLDAP did not answer /health after {attempts} attempts");
         }
         thread::sleep(Duration::from_millis(800));
     }

@@ -1,6 +1,6 @@
 //! Client half of the OPAQUE ceremonies: registration for the create-user,
 //! change-password and reset-password flows, login for the login form, the old-password
-//! proof and the two-factor pages. Each caller stashes the returned state in its own
+//! check and the two-factor pages. Each caller stashes the returned state in its own
 //! component field between the start and finish steps.
 
 use crate::infra::encrypt::seal_kerberos_envelope;
@@ -76,13 +76,34 @@ pub fn begin_login(
     Ok((start.state, request))
 }
 
+/// What a login finish asks the server for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FinishFor {
+    /// A session, with the second factor's code once the server asked for one.
+    SignIn(Option<String>),
+    /// The server's check of the password, and no session.
+    PasswordCheck,
+    /// The same check, answered with a first-enrollment proof.
+    EnrollmentProof,
+}
+
+impl FinishFor {
+    fn fields(self) -> (Option<String>, Option<bool>, Option<bool>) {
+        match self {
+            FinishFor::SignIn(totp_code) => (totp_code, None, None),
+            FinishFor::PasswordCheck => (None, None, Some(false)),
+            FinishFor::EnrollmentProof => (None, Some(true), Some(false)),
+        }
+    }
+}
+
 /// Completes the login proof from the stashed state and the server's start response,
 /// producing the finish request to POST; a wrong password fails here, client-side.
 pub fn finish_login(
     state: LoginState,
     password: &str,
     response: login::ServerLoginStartResponse,
-    totp_code: Option<String>,
+    finish_for: FinishFor,
 ) -> Result<login::ClientLoginFinishRequest> {
     let mut rng = rand::rngs::OsRng;
     let finish = opaque::client::login::finish_login(
@@ -92,9 +113,32 @@ pub fn finish_login(
         &mut rng,
     )
     .context("Invalid username or password")?;
+    let (totp_code, enrollment_proof, session) = finish_for.fields();
     Ok(login::ClientLoginFinishRequest {
         server_data: response.server_data,
         credential_finalization: finish.message,
         totp_code,
+        enrollment_proof,
+        session,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_only_a_sign_in_asks_for_a_session() {
+        let code = || Some("123456".to_owned());
+        let rows = [
+            (FinishFor::SignIn(None), (None, None, None)),
+            (FinishFor::SignIn(code()), (code(), None, None)),
+            (FinishFor::PasswordCheck, (None, None, Some(false))),
+            (FinishFor::EnrollmentProof, (None, Some(true), Some(false))),
+        ];
+        for (finish_for, expected) in rows {
+            let label = format!("{finish_for:?}");
+            assert_eq!(finish_for.fields(), expected, "{label}");
+        }
+    }
 }

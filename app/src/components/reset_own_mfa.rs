@@ -5,9 +5,9 @@ use crate::{
         router::{AppRoute, Link},
     },
     infra::{
-        api::HostService,
+        api::{HostService, LoginOutcome},
         common_component::{CommonComponent, CommonComponentParts},
-        opaque::{LoginState, begin_login, finish_login},
+        opaque::{FinishFor, LoginState, begin_login, finish_login},
     },
 };
 use anyhow::{Result, anyhow, bail};
@@ -43,6 +43,7 @@ pub struct ResetOwnMfaForm {
     common: CommonComponentParts<Self>,
     form: Form<FormModel>,
     opaque_data: Option<(Box<LoginState>, String, String)>,
+    pending_code: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq, Properties)]
@@ -54,6 +55,7 @@ pub enum Msg {
     FormUpdate,
     Submit,
     AuthenticationStartResponse(Result<Box<login::ServerLoginStartResponse>>),
+    LoginFinishResponse(Result<LoginOutcome>),
     ResetResponse(Result<reset_own_mfa::ResponseData>),
 }
 
@@ -63,6 +65,7 @@ impl CommonComponent<ResetOwnMfaForm> for ResetOwnMfaForm {
         ctx: &Context<Self>,
         msg: <Self as Component>::Message,
     ) -> Result<bool> {
+        use anyhow::Context;
         match msg {
             Msg::FormUpdate => Ok(true),
             Msg::Submit => {
@@ -88,10 +91,25 @@ impl CommonComponent<ResetOwnMfaForm> for ResetOwnMfaForm {
                 let Some((state, password, code)) = self.opaque_data.take() else {
                     bail!("Invalid state");
                 };
-                finish_login(*state, &password, *res, None).map_err(|e| {
-                    error!(&format!("Invalid password: {:#}", e));
-                    anyhow!("Invalid password")
-                })?;
+                let request = finish_login(*state, &password, *res, FinishFor::PasswordCheck)
+                    .map_err(|e| {
+                        error!(&format!("Invalid password: {:#}", e));
+                        anyhow!("Invalid password")
+                    })?;
+                self.pending_code = Some(code);
+                self.common.call_backend(
+                    ctx,
+                    HostService::login_finish(request),
+                    Msg::LoginFinishResponse,
+                );
+                Ok(true)
+            }
+            Msg::LoginFinishResponse(res) => {
+                // Verified, or verified with a code asked for: the code goes to resetOwnMfa.
+                let _ = res.context("Password verification failed")?;
+                let Some(code) = self.pending_code.take() else {
+                    bail!("Invalid state");
+                };
                 self.common.call_graphql::<ResetOwnMfa, _>(
                     ctx,
                     reset_own_mfa::Variables { code },
@@ -124,6 +142,7 @@ impl Component for ResetOwnMfaForm {
             common: CommonComponentParts::<Self>::create(),
             form: Form::<FormModel>::new(FormModel::default()),
             opaque_data: None,
+            pending_code: None,
         }
     }
 

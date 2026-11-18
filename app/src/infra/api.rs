@@ -17,16 +17,20 @@ pub enum LoginOutcome {
         is_admin: bool,
         mfa_enrollment_required: bool,
     },
+    Verified {
+        enrollment_proof: Option<String>,
+    },
     MfaRequired,
 }
 
-// The two success bodies of the login finish endpoint. `MfaRequired` comes first: its
-// required `mfaRequired` key is absent from a token response.
+// The success bodies of the login finish endpoint, told apart by a key only each one has:
+// `mfaRequired`, `token`, `verified`.
 #[derive(Deserialize)]
 #[serde(untagged)]
 enum LoginServerResponse {
     MfaRequired(login::ServerMfaRequiredResponse),
     Success(login::ServerLoginResponse),
+    Verified(login::ServerLoginVerifiedResponse),
 }
 
 fn get_claims_from_jwt(jwt: &str) -> Result<JWTClaims> {
@@ -163,7 +167,14 @@ impl HostService {
             LoginServerResponse::MfaRequired(response) if response.mfa_required => {
                 Ok(LoginOutcome::MfaRequired)
             }
-            LoginServerResponse::MfaRequired(_) => Err(anyhow!("Invalid response to login finish")),
+            LoginServerResponse::Verified(response) if response.verified => {
+                Ok(LoginOutcome::Verified {
+                    enrollment_proof: response.enrollment_proof,
+                })
+            }
+            LoginServerResponse::MfaRequired(_) | LoginServerResponse::Verified(_) => {
+                Err(anyhow!("Invalid response to login finish"))
+            }
             LoginServerResponse::Success(response) => {
                 let (user_id, is_admin, mfa_enrollment_required) = set_cookies_from_jwt(response)?;
                 Ok(LoginOutcome::Success {
@@ -271,6 +282,18 @@ mod tests {
         let plain: LoginServerResponse = serde_json::from_str(r#"{"token": "t"}"#).unwrap();
         assert!(
             matches!(plain, LoginServerResponse::Success(r) if r.mfa_enrollment_required.is_none())
+        );
+        let checked: LoginServerResponse = serde_json::from_str(r#"{"verified": true}"#).unwrap();
+        assert!(
+            matches!(checked, LoginServerResponse::Verified(r) if r.verified && r.enrollment_proof.is_none())
+        );
+        let proof: LoginServerResponse =
+            serde_json::from_str(r#"{"verified": true, "enrollmentProof": "p"}"#).unwrap();
+        assert!(
+            matches!(proof, LoginServerResponse::Verified(r) if r.enrollment_proof.as_deref() == Some("p"))
+        );
+        assert!(
+            serde_json::from_str::<LoginServerResponse>(r#"{"enrollmentProof": "p"}"#).is_err()
         );
     }
 }

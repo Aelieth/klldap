@@ -1,5 +1,8 @@
 use crate::common::{
-    auth::{get_token, get_token_for, opaque_login, register_password_over_http},
+    auth::{
+        get_token, get_token_for, opaque_check, opaque_login, opaque_login_for_proof,
+        register_password_over_http,
+    },
     env,
     fixture::{LLDAPFixture, User, create_lldap_command, exec_sql, spawn_and_wait_healthy},
 };
@@ -10,7 +13,7 @@ use reqwest::blocking::{Client, ClientBuilder};
 use serde_json::{Value, json};
 mod common;
 
-const START: &str = "mutation($c: String) { startMfaEnrollment(currentCode: $c) { otpauthUri secretBase32 state } }";
+const START: &str = "mutation($c: String, $p: String) { startMfaEnrollment(currentCode: $c, enrollmentProof: $p) { otpauthUri secretBase32 state } }";
 const FINISH: &str =
     "mutation($s: String!, $c: String!) { finishMfaEnrollment(state: $s, code: $c) { ok } }";
 const RESET_OWN: &str = "mutation($c: String!) { resetOwnMfa(code: $c) { ok } }";
@@ -197,14 +200,44 @@ fn start_enrollment(
     base_url: &str,
     token: &str,
     current_code: Option<&str>,
+    enrollment_proof: Option<&str>,
 ) -> Value {
-    gql(client, base_url, token, START, json!({"c": current_code}))
+    gql(
+        client,
+        base_url,
+        token,
+        START,
+        json!({"c": current_code, "p": enrollment_proof}),
+    )
+}
+
+fn login_body(client: &Client, base_url: &str, user: &str, password: &str, ask: bool) -> Value {
+    let mut body = json!({"username": user, "password": password});
+    if ask {
+        body["enrollmentProof"] = json!(true);
+    }
+    client
+        .post(format!("{base_url}/auth/simple/login"))
+        .json(&body)
+        .send()
+        .expect("simple login")
+        .json()
+        .expect("simple login json")
 }
 
 // Enrolls with the current step's code and returns the secret; the neighbouring step's
 // code is the first one the doors accept afterwards.
-fn enroll(client: &Client, base_url: &str, token: &str) -> String {
-    let body = start_enrollment(client, base_url, token, None);
+fn enroll(client: &Client, base_url: &str, token: &str, user: &str, password: &str) -> String {
+    let login = login_body(client, base_url, user, password, true);
+    let proof = login["enrollmentProof"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{login}"))
+        .to_owned();
+    enroll_with_proof(client, base_url, token, &proof)
+}
+
+fn enroll_with_proof(client: &Client, base_url: &str, token: &str, proof: &str) -> String {
+    let body = start_enrollment(client, base_url, token, None, Some(proof));
     let start = &body["data"]["startMfaEnrollment"];
     let secret = start["secretBase32"]
         .as_str()
@@ -302,7 +335,7 @@ fn test_mfa_disabled_keeps_plain_binds() {
     let body = delete_group(&client, &url, &admin, id);
     assert_eq!(body["data"]["deleteGroup"]["ok"], true, "{body}");
 
-    let body = start_enrollment(&client, &url, &bob, None);
+    let body = start_enrollment(&client, &url, &bob, None, None);
     assert!(has_error(&body, "MFA is disabled"), "{body}");
     let body = gql(&client, &url, &admin, RESET_USER, json!({"u": "bob"}));
     assert_eq!(body["data"]["resetUserMfa"]["ok"], true, "{body}");
@@ -345,8 +378,28 @@ fn test_mfa_enrollment_over_graphql() {
     assert_eq!(settings["mfa_enabled"], true, "{settings}");
     assert_eq!(settings["mfa_required"], false, "{settings}");
 
-    let body = start_enrollment(&client, &url, &bob, None);
+    let plain = login_body(&client, &url, "bob", "bobpass1", false);
+    assert!(plain.get("enrollmentProof").is_none(), "{plain}");
+    let (status, finish) = opaque_login(&client, &url, "bob", "bobpass1", None);
+    assert_eq!(status, StatusCode::OK, "{finish}");
+    assert!(finish.get("enrollmentProof").is_none(), "{finish}");
+    let body = start_enrollment(&client, &url, &bob, None, None);
+    assert!(has_error(&body, "Password proof required"), "{body}");
+    let asked = login_body(&client, &url, "bob", "bobpass1", true);
+    let proof = asked["enrollmentProof"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{asked}"))
+        .to_owned();
+    let eve_proof = login_body(&client, &url, "eve", "evepass1", true)["enrollmentProof"]
+        .as_str()
+        .unwrap_or_else(|| panic!("eve proof"))
+        .to_owned();
+    let body = start_enrollment(&client, &url, &bob, None, Some(&eve_proof));
+    assert!(has_error(&body, "Password proof required"), "{body}");
+    let body = start_enrollment(&client, &url, &bob, None, Some(&proof));
     let start = body["data"]["startMfaEnrollment"].clone();
+    let again = start_enrollment(&client, &url, &bob, None, Some(&proof));
+    assert!(has_error(&again, "Password proof required"), "{again}");
     let uri = start["otpauthUri"]
         .as_str()
         .unwrap_or_else(|| panic!("{body}"));
@@ -378,14 +431,23 @@ fn test_mfa_enrollment_over_graphql() {
     assert_eq!(mfa_enrolled(&client, &url, &admin, "bob"), true);
     assert_eq!(mfa_enrolled(&client, &url, &eve, "bob"), Value::Null);
 
-    let body = start_enrollment(&client, &url, &bob, None);
+    let body = start_enrollment(&client, &url, &bob, None, None);
     assert!(has_error(&body, "Current TOTP code required"), "{body}");
 
     let body = gql(&client, &url, &bob, RESET_OWN, json!({"c": next}));
     assert_eq!(body["data"]["resetOwnMfa"]["ok"], true, "{body}");
     assert_eq!(mfa_enrolled(&client, &url, &bob, "bob"), false);
 
-    enroll(&client, &url, &bob);
+    // The page's path: a finish that makes no session answers with the proof.
+    let (status, checked) = opaque_check(&client, &url, "bob", "bobpass1", true);
+    assert_eq!(status, StatusCode::OK, "{checked}");
+    assert_eq!(checked["verified"], true, "{checked}");
+    assert!(checked.get("token").is_none(), "{checked}");
+    let page_proof = checked["enrollmentProof"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{checked}"))
+        .to_owned();
+    enroll_with_proof(&client, &url, &bob, &page_proof);
     assert_eq!(mfa_enrolled(&client, &url, &admin, "bob"), true);
     let body = gql(&client, &url, &admin, RESET_USER, json!({"u": "bob"}));
     assert_eq!(body["data"]["resetUserMfa"]["ok"], true, "{body}");
@@ -393,7 +455,7 @@ fn test_mfa_enrollment_over_graphql() {
 
     // An ordinary password change is not a recovery: the factor stays. A consumed reset
     // link then a committed new password clears it.
-    enroll(&client, &url, &kim);
+    enroll(&client, &url, &kim, "kim", "kimpass1");
     set_password(&client, &url, &admin, "kim", "kimpass2");
     assert_eq!(mfa_enrolled(&client, &url, &admin, "kim"), true);
     exec_sql(
@@ -457,7 +519,7 @@ fn test_mfa_enrollment_and_doors() {
     );
 
     // LDAP simple bind: the diagnostic only after the password verified.
-    let secret = enroll(&client, &url, &bob);
+    let secret = enroll(&client, &url, &bob, "bob", "bobpass1");
     let (rc, text) = ldap_bind(&ldap_url, "bob", "bobpass1");
     assert_eq!(
         (rc, text.as_str()),
@@ -487,7 +549,7 @@ fn test_mfa_enrollment_and_doors() {
     );
 
     // Simple login: the same combined format.
-    let secret = enroll(&client, &url, &eve);
+    let secret = enroll(&client, &url, &eve, "eve", "evepass1");
     let (status, text) = simple_login(&client, &url, "eve", "evepass1");
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{text}");
     assert!(text.contains("TOTP code required"), "{text}");
@@ -496,23 +558,27 @@ fn test_mfa_enrollment_and_doors() {
     assert_eq!(status, StatusCode::OK, "{text}");
 
     // Web login: the code rides the OPAQUE finish; without it the server challenges.
-    let secret = enroll(&client, &url, &kim);
+    let secret = enroll(&client, &url, &kim, "kim", "kimpass1");
     let (status, body) = opaque_login(&client, &url, "kim", "kimpass1", None);
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body, json!({"mfaRequired": true}));
     let (status, body) = opaque_login(&client, &url, "kim", "kimpass1", Some(&wrong_code(&secret)));
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
     let (_, next) = fresh_codes(&secret);
-    let (status, body) = opaque_login(&client, &url, "kim", "kimpass1", Some(&next));
+    let (status, body) = opaque_login_for_proof(&client, &url, "kim", "kimpass1", Some(&next));
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(
         body["token"].is_string() && body["refreshToken"].is_string(),
         "{body}"
     );
     assert!(body.get("mfaEnrollmentRequired").is_none(), "{body}");
+    assert!(
+        body.get("enrollmentProof").is_none(),
+        "an enrolled user gets no proof: {body}"
+    );
 
     // An exempt member binds with the password alone even when enrolled.
-    enroll(&client, &url, &sam);
+    enroll(&client, &url, &sam, "sam", "sampass1");
     assert_eq!(ldap_bind(&ldap_url, "sam", "sampass1").0, 0);
     let (status, _) = simple_login(&client, &url, "sam", "sampass1");
     assert_eq!(status, StatusCode::OK);
@@ -577,7 +643,18 @@ fn test_mfa_always_gates_api_and_doors() {
     let body = gql(&client, &url, &admin, SCHEMA, json!({}));
     assert!(has_error(&body, "Unauthorized"), "{body}");
     assert_eq!(mfa_enrolled(&client, &url, &admin, &admin_name), false);
-    let secret = enroll(&client, &url, &admin);
+    let (status, login) = opaque_check(&client, &url, &admin_name, &admin_pass, true);
+    assert_eq!(status, StatusCode::OK, "{login}");
+    assert_eq!(
+        (login.get("token"), &login["mfaEnrollmentRequired"]),
+        (None, &json!(true)),
+        "{login}"
+    );
+    let proof = login["enrollmentProof"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{login}"))
+        .to_owned();
+    let secret = enroll_with_proof(&client, &url, &admin, &proof);
     let body = gql(&client, &url, &admin, USERS, json!({}));
     assert!(body["errors"].is_null(), "{body}");
     assert!(

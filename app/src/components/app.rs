@@ -313,7 +313,7 @@ impl App {
                     mfa_required={mfa_required} />
             },
             AppRoute::ChangePassword { user_id } => html! {
-                <ChangePasswordForm username={user_id.clone()} is_admin={is_admin} mfa_enabled={mfa_enabled != Some(false)} />
+                <ChangePasswordForm username={user_id.clone()} is_admin={is_admin} />
             },
             AppRoute::RegisterMfa { user_id } => match mfa_enabled {
                 None => html! {},

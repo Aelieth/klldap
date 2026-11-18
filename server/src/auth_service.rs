@@ -28,7 +28,8 @@ use lldap_domain_handlers::handler::{
     BackendHandler, BindRequest, LoginHandler, MfaBackendHandler, UserRequestFilter,
 };
 use lldap_domain_handlers::kerberos::{
-    KerberosState, SYNC_OFF_FIRST, kerberos_backend, settled_state, while_disabled,
+    KerberosState, SYNC_OFF_FIRST, kerberos_backend, refusal_while_degraded, settled_state,
+    while_disabled,
 };
 use lldap_domain_handlers::logging::{self, LogKind, with_actor};
 use lldap_domain_handlers::mfa::{MfaRequirement, MfaResetReason};
@@ -184,6 +185,7 @@ where
             token: token.as_str().to_owned(),
             refresh_token: None,
             mfa_enrollment_required: mfa_enrollment_pending.then_some(true),
+            enrollment_proof: None,
         }))
 }
 
@@ -468,6 +470,7 @@ async fn get_login_successful_response<Backend>(
     data: &web::Data<AppState<Backend>>,
     name: &UserId,
     mfa_enrollment_pending: bool,
+    enrollment_proof: Option<String>,
 ) -> TcpResult<HttpResponse>
 where
     Backend: TcpBackendHandler + BackendHandler,
@@ -508,6 +511,7 @@ where
             token: token.as_str().to_owned(),
             refresh_token: Some(refresh_token_plus_name),
             mfa_enrollment_required: mfa_enrollment_pending.then_some(true),
+            enrollment_proof,
         }))
 }
 
@@ -519,15 +523,33 @@ async fn opaque_login_finish<Backend>(
 where
     Backend: TcpBackendHandler + BackendHandler + OpaqueHandler + 'static,
 {
-    match data
-        .get_opaque_handler()
-        .login_finish(request.into_inner())
-        .await?
-    {
+    let request = request.into_inner();
+    let ask = request.enrollment_proof == Some(true);
+    let session = request.session != Some(false);
+    match data.get_opaque_handler().login_finish(request).await? {
         LoginOutcome::Authenticated {
             user_id,
             mfa_enrollment_pending,
-        } => get_login_successful_response(&data, &user_id, mfa_enrollment_pending).await,
+        } => {
+            let enrollment_proof = if ask {
+                data.get_mfa_handler()
+                    .seal_enrollment_proof(&user_id)
+                    .await?
+            } else {
+                None
+            };
+            if !session {
+                return Ok(
+                    HttpResponse::Ok().json(&login::ServerLoginVerifiedResponse {
+                        verified: true,
+                        mfa_enrollment_required: mfa_enrollment_pending.then_some(true),
+                        enrollment_proof,
+                    }),
+                );
+            }
+            get_login_successful_response(&data, &user_id, mfa_enrollment_pending, enrollment_proof)
+                .await
+        }
         // The password verified; the client retries with password:code.
         LoginOutcome::TotpRequired => {
             Ok(HttpResponse::Ok().json(&login::ServerMfaRequiredResponse { mfa_required: true }))
@@ -555,13 +577,24 @@ async fn simple_login<Backend>(
 where
     Backend: TcpBackendHandler + BackendHandler + OpaqueHandler + LoginHandler + 'static,
 {
-    let login::ClientSimpleLoginRequest { username, password } = request.into_inner();
+    let login::ClientSimpleLoginRequest {
+        username,
+        password,
+        enrollment_proof,
+    } = request.into_inner();
     let bind_request = BindRequest {
         name: username.clone(),
         password,
     };
     data.get_login_handler().bind(bind_request).await?;
-    get_login_successful_response(&data, &username, false).await
+    let enrollment_proof = if enrollment_proof == Some(true) {
+        data.get_mfa_handler()
+            .seal_enrollment_proof(&username)
+            .await?
+    } else {
+        None
+    };
+    get_login_successful_response(&data, &username, false, enrollment_proof).await
 }
 
 async fn simple_login_handler<Backend>(
@@ -1001,28 +1034,10 @@ async fn admit_token_use<H: BackendHandler + ?Sized>(
         .map_err(|_| ErrorUnauthorized(ACCESS_REFUSED))
 }
 
-const ADMINS_ONLY: &str = "only admins may sign in while Kerberos is unavailable";
-
 fn is_admin(groups: &HashSet<GroupDetails>) -> bool {
     groups
         .iter()
         .any(|g| g.display_name == "lldap_admin".into())
-}
-
-fn refusal_while_degraded(
-    user: &UserId,
-    is_admin: bool,
-    unavailable: Option<String>,
-) -> Option<String> {
-    let cause = unavailable.filter(|_| !is_admin)?;
-    logging::record_as(
-        Some(user),
-        LogKind::AccessDenied,
-        None,
-        false,
-        Some(ADMINS_ONLY),
-    );
-    Some(cause)
 }
 
 pub fn configure_server<Backend>(cfg: &mut web::ServiceConfig, enable_password_reset: bool)
@@ -1780,6 +1795,7 @@ pub(crate) mod tests {
         lldap_sql_backend_handler::sql_tables::init_table(&pool)
             .await
             .unwrap();
+        crate::jwt_sql_tables::init_table(&pool).await.unwrap();
         let key = opaque::server::generate_random_private_key();
         let handler = lldap_sql_backend_handler::SqlBackendHandler::new(key, pool);
         for (user, password) in users {
@@ -1818,6 +1834,7 @@ pub(crate) mod tests {
                     let request = login::ClientSimpleLoginRequest {
                         username: user.clone(),
                         password: PASSWORD.to_owned(),
+                        enrollment_proof: None,
                     };
                     let response = simple_login_handler(state.clone(), web::Json(request)).await;
                     return response.status().as_u16();
@@ -1843,6 +1860,8 @@ pub(crate) mod tests {
                     server_data: started.server_data,
                     credential_finalization: finish.message,
                     totp_code: None,
+                    enrollment_proof: None,
+                    session: None,
                 };
                 let response = opaque_login_finish_handler(state.clone(), web::Json(request)).await;
                 response.status().as_u16()
@@ -1863,6 +1882,278 @@ pub(crate) mod tests {
             );
             assert_eq!((status, rows), (401, vec![refused]), "{label}");
         }
+    }
+
+    async fn login_started<B: BackendHandler + OpaqueHandler>(
+        state: &web::Data<AppState<B>>,
+        user: &str,
+        password: &str,
+    ) -> (
+        opaque::client::login::ClientLogin,
+        login::ServerLoginStartResponse,
+    ) {
+        let mut rng = rand::rngs::OsRng;
+        let start = opaque::client::login::start_login(password, &mut rng).unwrap();
+        let started = state
+            .get_opaque_handler()
+            .login_start(login::ClientLoginStartRequest {
+                username: UserId::new(user),
+                login_start_request: start.message,
+            })
+            .await
+            .unwrap();
+        (start.state, started)
+    }
+
+    async fn login_finish_request<B: BackendHandler + OpaqueHandler>(
+        state: &web::Data<AppState<B>>,
+        user: &str,
+        password: &str,
+    ) -> login::ClientLoginFinishRequest {
+        let (client, started) = login_started(state, user, password).await;
+        let finish = opaque::client::login::finish_login(
+            client,
+            password.as_bytes(),
+            started.credential_response,
+            &mut rand::rngs::OsRng,
+        )
+        .unwrap();
+        login::ClientLoginFinishRequest {
+            server_data: started.server_data,
+            credential_finalization: finish.message,
+            totp_code: None,
+            enrollment_proof: None,
+            session: None,
+        }
+    }
+
+    /// Refresh-token rows and registered JWTs.
+    async fn minted(pool: &sea_orm::DatabaseConnection) -> (u64, u64) {
+        use lldap_domain_model::model::{JwtRefreshStorage, JwtStorage};
+        use sea_orm::{EntityTrait, PaginatorTrait};
+        (
+            JwtRefreshStorage::find().count(pool).await.unwrap(),
+            JwtStorage::find().count(pool).await.unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_a_finish_without_a_session_mints_nothing_in_any_outcome() {
+        use lldap_test_utils::recording_log::LogGuard;
+        use serde_json::json;
+        const BOB_PASS: &str = "q1bob-pass-1";
+        const KIM_PASS: &str = "q1kim-pass-1";
+        let _backend = ONE_BACKEND.lock().await;
+        let _guard = EnforcementGuard::none();
+        let handler = sql_handler_with(&[("q1bob", BOB_PASS), ("q1kim", KIM_PASS)])
+            .await
+            .with_mfa_policy(lldap_domain_handlers::mfa::MfaPolicy::Enrolled);
+        let kim = UserId::new("q1kim");
+        let proof = handler.seal_enrollment_proof(&kim).await.unwrap().unwrap();
+        let start = handler
+            .start_totp_enrollment(&kim, None, Some(proof))
+            .await
+            .unwrap();
+        let seed = lldap_mfa::seed_from_base32(&start.secret_base32).unwrap();
+        let now = Utc::now().timestamp() as u64;
+        let code_at = |t: u64| lldap_mfa::format_code(lldap_mfa::totp_code(&seed, t).unwrap());
+        let spent = code_at(now);
+        handler
+            .finish_totp_enrollment(&kim, &start.state, &spent)
+            .await
+            .unwrap();
+        let valid = [code_at(now - 30), spent.clone(), code_at(now + 30)];
+        let fresh = valid.iter().find(|c| **c != spent).unwrap().clone();
+        let wrong = (0..)
+            .map(|c| format!("{c:06}"))
+            .find(|c| !valid.contains(c))
+            .unwrap();
+        let pool = handler.pool().clone();
+        let state = app_state(handler);
+        let log = LogGuard::install_on_this_thread();
+
+        let (first, first_started) = login_started(&state, "q1bob", BOB_PASS).await;
+        let crossed = opaque::client::login::finish_login(
+            first,
+            BOB_PASS.as_bytes(),
+            first_started.credential_response,
+            &mut rand::rngs::OsRng,
+        )
+        .unwrap()
+        .message;
+        let check = |request: login::ClientLoginFinishRequest| login::ClientLoginFinishRequest {
+            session: Some(false),
+            ..request
+        };
+        let rows = [
+            (
+                "verified",
+                check(login_finish_request(&state, "q1bob", BOB_PASS).await),
+                200,
+                json!({"verified": true}),
+            ),
+            (
+                "verified, a proof asked",
+                login::ClientLoginFinishRequest {
+                    enrollment_proof: Some(true),
+                    ..check(login_finish_request(&state, "q1bob", BOB_PASS).await)
+                },
+                200,
+                json!({"verified": true, "enrollmentProof": "<proof>"}),
+            ),
+            (
+                "second factor required",
+                check(login_finish_request(&state, "q1kim", KIM_PASS).await),
+                200,
+                json!({"mfaRequired": true}),
+            ),
+            (
+                "refused at the second factor",
+                login::ClientLoginFinishRequest {
+                    totp_code: Some(wrong),
+                    ..check(login_finish_request(&state, "q1kim", KIM_PASS).await)
+                },
+                401,
+                json!(null),
+            ),
+            (
+                "refused at the password",
+                login::ClientLoginFinishRequest {
+                    credential_finalization: crossed,
+                    ..check(login_finish_request(&state, "q1bob", BOB_PASS).await)
+                },
+                401,
+                json!(null),
+            ),
+            (
+                "an enrolled user's code verified, a proof asked",
+                login::ClientLoginFinishRequest {
+                    totp_code: Some(fresh),
+                    enrollment_proof: Some(true),
+                    ..check(login_finish_request(&state, "q1kim", KIM_PASS).await)
+                },
+                200,
+                json!({"verified": true}),
+            ),
+        ];
+        for (label, request, status, expected) in rows {
+            let before = minted(&pool).await;
+            let response = opaque_login_finish_handler(state.clone(), web::Json(request)).await;
+            let got_status = response.status().as_u16();
+            let cookies = response.cookies().count();
+            let bytes = actix_web::body::to_bytes(response.into_body())
+                .await
+                .unwrap();
+            let mut body: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_default();
+            if body["enrollmentProof"].is_string() {
+                body["enrollmentProof"] = json!("<proof>");
+            }
+            assert_eq!(
+                (got_status, cookies, minted(&pool).await),
+                (status, 0, before),
+                "{label}: no cookie, no refresh-token row, no JWT row"
+            );
+            if status == 200 {
+                assert_eq!(body, expected, "{label}");
+            }
+        }
+
+        let before = minted(&pool).await;
+        let response = opaque_login_finish_handler(
+            state.clone(),
+            web::Json(login_finish_request(&state, "q1bob", BOB_PASS).await),
+        )
+        .await;
+        assert_eq!(
+            (response.status().as_u16(), response.cookies().count()),
+            (200, 2),
+            "the same finish with a session"
+        );
+        assert_eq!(minted(&pool).await, (before.0 + 1, before.1 + 1));
+
+        let rows: Vec<_> = log
+            .recorder()
+            .take_events()
+            .into_iter()
+            .filter(|e| e.kind == LogKind::Login)
+            .map(|e| (e.actor, e.success, e.detail))
+            .collect();
+        let row = |user: &str, success, detail: Option<&str>| {
+            (Some(user.to_owned()), success, detail.map(str::to_owned))
+        };
+        assert_eq!(
+            rows,
+            vec![
+                row("q1bob", true, Some("no session")),
+                row("q1bob", true, Some("no session")),
+                row("q1kim", false, Some("totp code required")),
+                row("q1kim", false, Some("invalid totp")),
+                row("q1bob", false, Some("invalid credentials")),
+                row("q1kim", true, Some("totp; no session")),
+                row("q1bob", true, None),
+            ],
+            "one row per finish, each sessionless success saying so"
+        );
+    }
+
+    struct DegradedOnThisThread;
+
+    impl Drop for DegradedOnThisThread {
+        fn drop(&mut self) {
+            lldap_domain_handlers::kerberos::set_thread_kerberos_backend(None);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_finish_without_a_session_refused_while_kerberos_is_down_mints_nothing() {
+        use lldap_domain_handlers::kerberos::{
+            ADMINS_ONLY, DegradedKerberos, set_thread_kerberos_backend,
+        };
+        use lldap_test_utils::recording_log::LogGuard;
+        const PASS: &str = "q1down-pass-1";
+        let _backend = ONE_BACKEND.lock().await;
+        let _guard = EnforcementGuard::none();
+        let handler = sql_handler_with(&[("q1down", PASS)]).await;
+        let pool = handler.pool().clone();
+        let state = app_state(handler);
+        let log = LogGuard::install_on_this_thread();
+        let request = login::ClientLoginFinishRequest {
+            enrollment_proof: Some(true),
+            session: Some(false),
+            ..login_finish_request(&state, "q1down", PASS).await
+        };
+        let degraded = DegradedKerberos::new("EXAMPLE.COM".to_owned(), "down".to_owned());
+        set_thread_kerberos_backend(Some(std::sync::Arc::new(degraded)));
+        let _restore = DegradedOnThisThread;
+        let before = minted(&pool).await;
+        let response = opaque_login_finish_handler(state.clone(), web::Json(request)).await;
+        let status = response.status().as_u16();
+        let cookies = response.cookies().count();
+        let bytes = actix_web::body::to_bytes(response.into_body())
+            .await
+            .unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert_eq!(
+            (status, cookies, minted(&pool).await),
+            (503, 0, before),
+            "{body}"
+        );
+        assert!(
+            !body.contains("enrollmentProof") && !body.contains("verified"),
+            "{body}"
+        );
+        let rows: Vec<_> = log
+            .recorder()
+            .take_events()
+            .into_iter()
+            .filter(|e| e.actor.as_deref() == Some("q1down"))
+            .map(|e| (e.kind, e.success, e.detail))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![(LogKind::AccessDenied, false, Some(ADMINS_ONLY.to_owned()))],
+            "the refusal is the finish's one row: no login success row"
+        );
     }
 
     fn session_token(key: &Hmac<Sha512>, user: &str) -> String {

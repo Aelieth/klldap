@@ -18,6 +18,7 @@ pub fn get_token_for(client: &Client, base_url: &str, username: &str, password: 
             serde_json::to_string(&login::ClientSimpleLoginRequest {
                 username: UserId::new(username),
                 password: password.to_owned(),
+                enrollment_proof: None,
             })
             .expect("Failed to encode the username/password as json to log in"),
         )
@@ -40,6 +41,48 @@ pub fn opaque_login(
     username: &str,
     password: &str,
     totp_code: Option<&str>,
+) -> (StatusCode, Value) {
+    opaque_login_finish(client, base_url, username, password, totp_code, false, None)
+}
+
+// The same ceremony, asking the finish for an enrollment proof.
+pub fn opaque_login_for_proof(
+    client: &Client,
+    base_url: &str,
+    username: &str,
+    password: &str,
+    totp_code: Option<&str>,
+) -> (StatusCode, Value) {
+    opaque_login_finish(client, base_url, username, password, totp_code, true, None)
+}
+
+// A page's password check: the finish asks for no session.
+pub fn opaque_check(
+    client: &Client,
+    base_url: &str,
+    username: &str,
+    password: &str,
+    enrollment_proof: bool,
+) -> (StatusCode, Value) {
+    opaque_login_finish(
+        client,
+        base_url,
+        username,
+        password,
+        None,
+        enrollment_proof,
+        Some(false),
+    )
+}
+
+fn opaque_login_finish(
+    client: &Client,
+    base_url: &str,
+    username: &str,
+    password: &str,
+    totp_code: Option<&str>,
+    enrollment_proof: bool,
+    session: Option<bool>,
 ) -> (StatusCode, Value) {
     let mut rng = rand::rngs::OsRng;
     let start = opaque::client::login::start_login(password, &mut rng).expect("login start");
@@ -68,6 +111,8 @@ pub fn opaque_login(
             server_data: start_response.server_data,
             credential_finalization: finish.message,
             totp_code: totp_code.map(str::to_owned),
+            enrollment_proof: enrollment_proof.then_some(true),
+            session,
         })
         .send()
         .expect("login finish send");

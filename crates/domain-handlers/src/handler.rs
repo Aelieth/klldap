@@ -224,7 +224,10 @@ pub trait MfaBackendHandler: Send + Sync {
         &self,
         user_id: &UserId,
         current_code: Option<String>,
+        enrollment_proof: Option<String>,
     ) -> Result<TotpEnrollmentStart>;
+    /// Seals a first-enrollment proof. `None` when the user already has a factor.
+    async fn seal_enrollment_proof(&self, user_id: &UserId) -> Result<Option<String>>;
     async fn finish_totp_enrollment(&self, user_id: &UserId, state: &str, code: &str)
     -> Result<()>;
     async fn reset_user_mfa(&self, user_id: &UserId, reason: MfaResetReason) -> Result<()>;

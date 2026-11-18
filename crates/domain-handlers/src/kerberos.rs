@@ -421,6 +421,25 @@ impl KerberosSync for DegradedKerberos {
 static BACKEND: LazyLock<RwLock<Arc<dyn KerberosSync>>> =
     LazyLock::new(|| RwLock::new(Arc::new(NoopKerberos::default())));
 
+pub const ADMINS_ONLY: &str = "only admins may sign in while Kerberos is unavailable";
+
+/// While the realm is unavailable only admins get in; a refusal writes its row and gives the cause.
+pub fn refusal_while_degraded(
+    user: &UserId,
+    is_admin: bool,
+    unavailable: Option<String>,
+) -> Option<String> {
+    let cause = unavailable.filter(|_| !is_admin)?;
+    crate::logging::record_as(
+        Some(user),
+        LogKind::AccessDenied,
+        None,
+        false,
+        Some(ADMINS_ONLY),
+    );
+    Some(cause)
+}
+
 pub fn kerberos_backend() -> Arc<dyn KerberosSync> {
     #[cfg(feature = "test-backend-scope")]
     if let Some(backend) = THREAD_BACKEND.with(|scoped| scoped.borrow().clone()) {

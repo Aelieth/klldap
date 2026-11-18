@@ -56,6 +56,7 @@ fn get_token(base_url: &Url, username: &str, password: &str) -> Result<String> {
             serde_json::to_string(&lldap_auth::login::ClientSimpleLoginRequest {
                 username: username.into(),
                 password: password.to_string(),
+                enrollment_proof: None,
             })
             .expect("Failed to encode the username/password as json to log in"),
         )

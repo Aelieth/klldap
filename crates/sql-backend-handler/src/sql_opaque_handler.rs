@@ -6,7 +6,9 @@ use lldap_auth::opaque;
 use lldap_domain::types::{LoginOutcome, UserId};
 use lldap_domain_handlers::enforcement::{Attempt, Door, admit};
 use lldap_domain_handlers::handler::{BindRequest, LoginHandler, MfaBackendHandler};
-use lldap_domain_handlers::kerberos::require_kdc_ready;
+use lldap_domain_handlers::kerberos::{
+    kerberos_backend, refusal_while_degraded, require_kdc_ready,
+};
 use lldap_domain_handlers::logging::{self, LogKind};
 use lldap_domain_handlers::mfa::MfaRequirement;
 use lldap_domain_model::{
@@ -159,6 +161,17 @@ async fn member_of(
 
 fn invalid_credentials(user_id: &UserId) -> DomainError {
     DomainError::AuthenticationError(format!(r#"for user "{}""#, user_id))
+}
+
+pub(crate) const NO_SESSION: &str = "no session";
+
+/// A finish that mints no session says so on its success row, which is then no sign-in.
+fn login_row_detail(detail: Option<&str>, session: bool) -> Option<String> {
+    match (detail, session) {
+        (detail, true) => detail.map(str::to_owned),
+        (None, false) => Some(NO_SESSION.to_owned()),
+        (Some(detail), false) => Some(format!("{detail}; {NO_SESSION}")),
+    }
 }
 
 impl SqlBackendHandler {
@@ -342,6 +355,8 @@ impl OpaqueHandler for SqlOpaqueHandler {
             server_data,
             credential_finalization,
             totp_code,
+            enrollment_proof: _,
+            session,
         } = request;
         let secret_key = self.get_orion_secret_key(LOGIN_STATE_KEY_INFO)?;
         let login::ServerData {
@@ -418,8 +433,23 @@ impl OpaqueHandler for SqlOpaqueHandler {
         let second_factor = detail == Some("totp");
         self.admit_at(&username, Door::WebLogin, second_factor)
             .await?;
+        let session = session != Some(false);
+        let unavailable = kerberos_backend().unavailable().filter(|_| !session);
+        if unavailable.is_some() {
+            let admin = self.is_member_of(&username, "lldap_admin").await?;
+            if let Some(cause) = refusal_while_degraded(&username, admin, unavailable) {
+                return Err(DomainError::KdcUnavailable(cause));
+            }
+        }
         info!(r#"OPAQUE login successful for "{}""#, &username);
-        logging::record_as(Some(&username), LogKind::Login, None, true, detail);
+        let detail = login_row_detail(detail, session);
+        logging::record_as(
+            Some(&username),
+            LogKind::Login,
+            None,
+            true,
+            detail.as_deref(),
+        );
         Ok(LoginOutcome::Authenticated {
             user_id: username,
             mfa_enrollment_pending,
@@ -501,6 +531,16 @@ mod tests {
         password: &str,
         totp_code: Option<&str>,
     ) -> Result<LoginOutcome> {
+        attempt_login_with(opaque_handler, username, password, totp_code, None).await
+    }
+
+    async fn attempt_login_with(
+        opaque_handler: &SqlOpaqueHandler,
+        username: &str,
+        password: &str,
+        totp_code: Option<&str>,
+        session: Option<bool>,
+    ) -> Result<LoginOutcome> {
         let mut rng = rand::rngs::OsRng;
         use login::*;
         let login_start = opaque::client::login::start_login(password, &mut rng)?;
@@ -521,6 +561,8 @@ mod tests {
                 server_data: start_response.server_data,
                 credential_finalization: login_finish.message,
                 totp_code: totp_code.map(str::to_owned),
+                enrollment_proof: None,
+                session,
             })
             .await
     }
@@ -694,7 +736,15 @@ mod tests {
     // Enrolls through the engine; the current step's code is spent on the confirmation.
     async fn enroll(handler: &SqlBackendHandler, user: &str) -> Vec<u8> {
         let user_id = UserId::new(user);
-        let start = handler.start_totp_enrollment(&user_id, None).await.unwrap();
+        let proof = handler
+            .seal_enrollment_proof(&user_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let start = handler
+            .start_totp_enrollment(&user_id, None, Some(proof))
+            .await
+            .unwrap();
         let seed = lldap_mfa::seed_from_base32(&start.secret_base32).unwrap();
         let now = chrono::Utc::now().timestamp() as u64;
         handler
@@ -925,6 +975,66 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn test_a_sessionless_finish_writes_the_doors_one_row_saying_no_session() {
+        let guard = LogGuard::install();
+        let peer = "10.77.1.3";
+        let handler = mfa_handler(MfaPolicy::Always).await;
+        insert_user(&handler, "bob", "bob00").await;
+        let bob = UserId::new("bob");
+        let check = Some(false);
+        with_request(
+            RequestMeta::http(Some(peer.parse().unwrap()), None),
+            async {
+                assert_eq!(
+                    attempt_login_with(&handler, "bob", "bob00", None, check)
+                        .await
+                        .unwrap(),
+                    LoginOutcome::Authenticated {
+                        user_id: bob.clone(),
+                        mfa_enrollment_pending: true,
+                    }
+                );
+                let seed = enroll(&handler, "bob").await;
+                let (fresh, wrong) = fresh_and_wrong(&seed);
+                assert_eq!(
+                    attempt_login_with(&handler, "bob", "bob00", None, check)
+                        .await
+                        .unwrap(),
+                    LoginOutcome::TotpRequired
+                );
+                attempt_login_with(&handler, "bob", "bob00", Some(&wrong), check)
+                    .await
+                    .unwrap_err();
+                attempt_login_with(&handler, "bob", "bob00", Some(&fresh), check)
+                    .await
+                    .unwrap();
+                let plain = handler.clone().with_mfa_policy(MfaPolicy::Disabled);
+                for session in [Some(false), Some(true), None] {
+                    attempt_login_with(&plain, "bob", "bob00", None, session)
+                        .await
+                        .unwrap();
+                }
+            },
+        )
+        .await;
+        let row =
+            |success, detail: Option<&str>| (LogKind::Login, success, detail.map(str::to_owned));
+        assert_eq!(
+            auth_rows(&guard, peer),
+            vec![
+                row(true, Some("mfa enrollment pending; no session")),
+                row(false, Some("totp code required")),
+                row(false, Some("invalid totp")),
+                row(true, Some("totp; no session")),
+                row(true, Some(NO_SESSION)),
+                row(true, None),
+                row(true, None),
+            ]
+        );
+    }
+
     async fn client_registration(
         handler: &SqlOpaqueHandler,
         user: &str,
@@ -1094,6 +1204,8 @@ mod tests {
                     server_data: registration_state,
                     credential_finalization: finish.message,
                     totp_code: None,
+                    enrollment_proof: None,
+                    session: None,
                 })
                 .await
                 .is_err()
@@ -1168,6 +1280,73 @@ mod tests {
         assert!(
             lldap_mfa::open_enrollment(&key, &URL_SAFE_NO_PAD.encode(registration_bytes), now)
                 .is_err()
+        );
+
+        // Proofs share the login and registration states' alphabet: only the key refuses them.
+        for (label, sealed) in [
+            ("a long name's login", &login),
+            ("a registration", &registration),
+        ] {
+            let opened = lldap_mfa::open_enrollment_proof(&key, sealed, now);
+            assert!(
+                matches!(opened, Err(lldap_mfa::MfaError::Crypto(_))),
+                "{label} state as a proof: {:?}",
+                opened.err()
+            );
+        }
+        let proof = lldap_mfa::seal_enrollment_proof(&key, "bob", now).unwrap();
+        let refused = handler
+            .registration_user(&finish_with(proof.clone()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(refused, DomainError::UnknownCryptoError(_)),
+            "{refused}"
+        );
+        let bob = UserId::new("bob");
+        let before = handler
+            .get_password_file_for_user(bob.clone())
+            .await
+            .unwrap();
+        assert!(
+            handler
+                .registration_finish(finish_with(proof.clone()))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            handler.get_password_file_for_user(bob).await.unwrap(),
+            before
+        );
+        let mut rng = rand::rngs::OsRng;
+        let start = opaque::client::login::start_login("bob00", &mut rng).unwrap();
+        let answer = handler
+            .login_start(login::ClientLoginStartRequest {
+                username: UserId::new("bob"),
+                login_start_request: start.message,
+            })
+            .await
+            .unwrap();
+        let finish = opaque::client::login::finish_login(
+            start.state,
+            b"bob00",
+            answer.credential_response,
+            &mut rng,
+        )
+        .unwrap();
+        let refused = handler
+            .login_finish(login::ClientLoginFinishRequest {
+                server_data: proof,
+                credential_finalization: finish.message,
+                totp_code: None,
+                enrollment_proof: None,
+                session: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(refused, DomainError::UnknownCryptoError(_)),
+            "{refused}"
         );
     }
 

@@ -39,12 +39,29 @@ pub mod login {
         pub credential_finalization: opaque::client::login::CredentialFinalization,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub totp_code: Option<String>,
+        /// Present only when this finish should mint a first-enrollment proof.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            rename = "enrollmentProof"
+        )]
+        pub enrollment_proof: Option<bool>,
+        /// `false`: check the password and mint no session. Absent: a session, as before.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub session: Option<bool>,
     }
 
     #[derive(Serialize, Deserialize, Clone)]
     pub struct ClientSimpleLoginRequest {
         pub username: UserId,
         pub password: String,
+        /// Present only when this login should mint a first-enrollment proof.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            rename = "enrollmentProof"
+        )]
+        pub enrollment_proof: Option<bool>,
     }
 
     impl fmt::Debug for ClientSimpleLoginRequest {
@@ -67,6 +84,31 @@ pub mod login {
             skip_serializing_if = "Option::is_none"
         )]
         pub mfa_enrollment_required: Option<bool>,
+        /// A first-enrollment proof. Absent unless this login asked for one.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            rename = "enrollmentProof"
+        )]
+        pub enrollment_proof: Option<String>,
+    }
+
+    /// The answer to a finish with `"session": false` whose password verified.
+    #[derive(Serialize, Deserialize, Clone)]
+    pub struct ServerLoginVerifiedResponse {
+        pub verified: bool,
+        #[serde(
+            rename = "mfaEnrollmentRequired",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        pub mfa_enrollment_required: Option<bool>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            rename = "enrollmentProof"
+        )]
+        pub enrollment_proof: Option<String>,
     }
 
     /// Missing TOTP after a right password: retry with `password:123456`.

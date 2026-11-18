@@ -25,6 +25,8 @@ pub const TOTP_ENROLLMENT_EXPIRED: &str = "Expired TOTP enrollment";
 pub const TOTP_TOO_MANY_ATTEMPTS: &str = "Too many TOTP attempts";
 pub const TOTP_CURRENT_CODE_REQUIRED: &str = "Current TOTP code required";
 pub const TOTP_CODE_REQUIRED: &str = "TOTP code required";
+pub const PASSWORD_PROOF_REQUIRED: &str = "Password proof required";
+pub const ENROLLMENT_PROOF_BUSY: &str = "Too many enrollments in progress: try again shortly";
 pub const MFA_ENROLLMENT_REQUIRED: &str =
     "MFA enrollment required: enroll through the web interface or contact an administrator";
 
@@ -59,6 +61,8 @@ pub fn totp_failure(message: &str) -> TotpFailure {
 pub(crate) const STORAGE_KEY_INFO: &[u8] = b"lldap-totp-storage-key-v1";
 #[cfg(feature = "seal")]
 pub(crate) const ENROLLMENT_KEY_INFO: &[u8] = b"lldap-totp-enrollment-key-v1";
+#[cfg(feature = "seal")]
+pub(crate) const ENROLLMENT_PROOF_KEY_INFO: &[u8] = b"lldap-mfa-enrollment-proof-v1";
 #[cfg(feature = "seal")]
 const NONCE_INFO_PREFIX: &[u8] = b"lldap-totp-nonce-v1";
 
@@ -102,9 +106,12 @@ mod tests {
                 TotpFailure::EnrollmentRequired,
             ),
             ("Invalid TOTP code for bob".to_owned(), TotpFailure::Other),
+            (PASSWORD_PROOF_REQUIRED.to_owned(), TotpFailure::Other),
+            (ENROLLMENT_PROOF_BUSY.to_owned(), TotpFailure::Other),
             (String::new(), TotpFailure::Other),
         ] {
             assert_eq!(totp_failure(&message), expected, "{message}");
         }
+        assert!(!PASSWORD_PROOF_REQUIRED.contains(TOTP_CODE_REQUIRED));
     }
 }

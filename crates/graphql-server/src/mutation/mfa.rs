@@ -56,6 +56,7 @@ pub(super) async fn reset_own_mfa<Handler: FullHandler + OpaqueHandler>(
 pub(super) async fn start_mfa_enrollment<Handler: FullHandler + OpaqueHandler>(
     context: &Context<Handler>,
     current_code: Option<String>,
+    enrollment_proof: Option<String>,
 ) -> FieldResult<MfaEnrollmentStart> {
     let span = debug_span!("[GraphQL mutation] start_mfa_enrollment");
     let user_id = &context.validation_result.user;
@@ -63,7 +64,7 @@ pub(super) async fn start_mfa_enrollment<Handler: FullHandler + OpaqueHandler>(
     context.reject_if_mfa_disabled(&span)?;
     Ok(context
         .get_mfa_self_handler()
-        .start_totp_enrollment(user_id, current_code)
+        .start_totp_enrollment(user_id, current_code, enrollment_proof)
         .await?
         .into())
 }

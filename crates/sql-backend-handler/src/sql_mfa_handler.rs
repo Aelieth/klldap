@@ -12,15 +12,87 @@ use lldap_domain_model::{
     model::{self, UserColumn},
 };
 use lldap_mfa::{
-    MfaError, TOTP_CODE_ALREADY_USED, TOTP_CURRENT_CODE_REQUIRED, TOTP_ENROLLMENT_EXPIRED,
-    TOTP_TOO_MANY_ATTEMPTS,
+    ENROLLMENT_PROOF_BUSY, MfaError, PASSWORD_PROOF_REQUIRED, ProofUse, TOTP_CODE_ALREADY_USED,
+    TOTP_CURRENT_CODE_REQUIRED, TOTP_ENROLLMENT_EXPIRED, TOTP_TOO_MANY_ATTEMPTS, UsedProofs,
+    open_enrollment_proof, seal_enrollment_proof,
 };
 use sea_orm::{
     ActiveModelTrait, ActiveValue, ColumnTrait, EntityTrait, QueryFilter, sea_query::Expr,
 };
-use tracing::{info, instrument};
+#[cfg(test)]
+use std::cell::Cell;
+use std::sync::OnceLock;
+use tracing::{info, instrument, warn};
 
 const TOTP_ISSUER: &str = "KLLDAP";
+
+#[cfg(test)]
+thread_local! {
+    static TEST_NOW: Cell<Option<i64>> = const { Cell::new(None) };
+}
+
+#[cfg(test)]
+fn set_enrollment_clock(now: Option<i64>) {
+    TEST_NOW.with(|clock| clock.set(now));
+}
+
+fn now_unix() -> i64 {
+    #[cfg(test)]
+    if let Some(now) = TEST_NOW.with(|clock| clock.get()) {
+        return now;
+    }
+    chrono::Utc::now().timestamp()
+}
+
+fn used_proofs() -> &'static UsedProofs {
+    static USED: OnceLock<UsedProofs> = OnceLock::new();
+    USED.get_or_init(UsedProofs::new)
+}
+
+fn refuse_proof(user_id: &UserId) -> DomainError {
+    logging::record_failure(
+        LogKind::MfaEnroll,
+        Some(user_id.as_str()),
+        "password proof required",
+    );
+    DomainError::AuthenticationError(PASSWORD_PROOF_REQUIRED.to_string())
+}
+
+fn take_proof(
+    used: &UsedProofs,
+    key: &[u8],
+    user_id: &UserId,
+    token: Option<&str>,
+    now: i64,
+) -> Result<()> {
+    let Some(token) = token.filter(|token| !token.is_empty()) else {
+        return Err(refuse_proof(user_id));
+    };
+    let Ok(proof) = open_enrollment_proof(key, token, now) else {
+        return Err(refuse_proof(user_id));
+    };
+    if proof.user_id != user_id.as_str() {
+        return Err(refuse_proof(user_id));
+    }
+    match used.mark_used(proof.id, proof.expiry_unix, now) {
+        ProofUse::Accepted => Ok(()),
+        ProofUse::Refused => Err(refuse_proof(user_id)),
+        ProofUse::Full => {
+            warn!(
+                r#"First enrollment for "{}" refused: every used-proof slot holds a live proof"#,
+                user_id
+            );
+            logging::record_failure(
+                LogKind::MfaEnroll,
+                Some(user_id.as_str()),
+                "enrollment busy",
+            );
+            Err(DomainError::AuthenticationError(
+                ENROLLMENT_PROOF_BUSY.to_owned(),
+            ))
+        }
+    }
+}
 
 /// Why a code was refused: one log detail and one error message each.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,10 +128,6 @@ impl TotpRejection {
     }
 }
 
-fn now_unix() -> i64 {
-    chrono::Utc::now().timestamp()
-}
-
 impl SqlBackendHandler {
     async fn get_user_model(&self, user_id: &UserId) -> Result<model::users::Model> {
         model::User::find_by_id(user_id.clone())
@@ -86,7 +154,7 @@ impl SqlBackendHandler {
         Ok(())
     }
 
-    // Both sealing purposes derive from the server key, HKDF-separated.
+    // The TOTP secret, the enrollment state and the proof each derive their own key from it.
     fn sealing_key(&self) -> Vec<u8> {
         self.opaque_setup.keypair().private().serialize().to_vec()
     }
@@ -175,6 +243,18 @@ impl MfaBackendHandler for SqlBackendHandler {
         Ok(mfa_requirement(self.mfa_policy, status.as_ref()))
     }
 
+    async fn seal_enrollment_proof(&self, user_id: &UserId) -> Result<Option<String>> {
+        let status = self.mfa_enrollment_status(user_id).await?;
+        if status.as_ref().is_some_and(|status| status.enrolled) {
+            return Ok(None);
+        }
+        Ok(Some(
+            seal_enrollment_proof(&self.sealing_key(), user_id.as_str(), now_unix()).map_err(
+                |e| DomainError::InternalError(format!("Could not seal enrollment proof: {e}")),
+            )?,
+        ))
+    }
+
     #[instrument(skip_all, level = "debug", err(level = "debug"))]
     async fn reset_user_mfa(&self, user_id: &UserId, reason: MfaResetReason) -> Result<()> {
         if self.get_user_model(user_id).await?.mfa_type.is_none() {
@@ -204,9 +284,20 @@ impl MfaBackendHandler for SqlBackendHandler {
         &self,
         user_id: &UserId,
         current_code: Option<String>,
+        enrollment_proof: Option<String>,
     ) -> Result<TotpEnrollmentStart> {
         let target = Some(user_id.as_str());
         let replaces_existing = self.get_user_model(user_id).await?.mfa_type.is_some();
+        if !replaces_existing {
+            let token = enrollment_proof.as_deref();
+            take_proof(
+                used_proofs(),
+                &self.sealing_key(),
+                user_id,
+                token,
+                now_unix(),
+            )?;
+        }
         // Replacing a factor needs the old one, so a stolen session cannot rebind it.
         if replaces_existing {
             let current = current_code.ok_or_else(|| {
@@ -330,7 +421,7 @@ mod tests {
     use super::*;
     use crate::sql_backend_handler::tests::{get_initialized_db, insert_user_no_password};
     use lldap_auth::opaque::server::{ServerSetup, generate_random_private_key};
-    use lldap_domain_handlers::logging::{RequestMeta, with_request};
+    use lldap_domain_handlers::logging::{RequestMeta, with_request, with_request_sync};
     use lldap_mfa::{
         EnrollmentState, SEALED_BLOB_LEN, SEALED_PREFIX, TOTP_CURRENT_CODE_REQUIRED,
         TOTP_ENROLLMENT_TTL_SECS, TOTP_MAX_ATTEMPTS_PER_STEP, TOTP_SEED_LEN, TOTP_STEP_SECS,
@@ -380,6 +471,14 @@ mod tests {
         format_code((0..).find(|c| !valid.contains(c)).unwrap())
     }
 
+    async fn fresh_proof(handler: &SqlBackendHandler, user_id: &UserId) -> String {
+        handler
+            .seal_enrollment_proof(user_id)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
     // Returns the code spent by enrolling and an unused one from the neighbouring step.
     async fn enroll_user(
         handler: &SqlBackendHandler,
@@ -388,7 +487,11 @@ mod tests {
     ) -> (UserId, [u8; TOTP_SEED_LEN], String, String) {
         insert_user_no_password(handler, user).await;
         let user_id = UserId::new(user);
-        let start = handler.start_totp_enrollment(&user_id, None).await.unwrap();
+        let proof = fresh_proof(handler, &user_id).await;
+        let start = handler
+            .start_totp_enrollment(&user_id, None, Some(proof))
+            .await
+            .unwrap();
         let state = open_state(setup, &start.state);
         let (now, code) = current_code(&state.seed);
         handler
@@ -409,7 +512,11 @@ mod tests {
         insert_user_no_password(&handler, "bob").await;
         let user_id = UserId::new("bob");
 
-        let start = handler.start_totp_enrollment(&user_id, None).await.unwrap();
+        let proof = fresh_proof(&handler, &user_id).await;
+        let start = handler
+            .start_totp_enrollment(&user_id, None, Some(proof))
+            .await
+            .unwrap();
         assert!(start.otpauth_uri.starts_with("otpauth://totp/KLLDAP:bob?"));
         assert!(start.otpauth_uri.contains(&start.secret_base32));
         assert!(!format!("{start:?}").contains(&start.secret_base32));
@@ -441,7 +548,11 @@ mod tests {
         insert_user_no_password(&handler, "john").await;
         let user_id = UserId::new("bob");
 
-        let start = handler.start_totp_enrollment(&user_id, None).await.unwrap();
+        let proof = fresh_proof(&handler, &user_id).await;
+        let start = handler
+            .start_totp_enrollment(&user_id, None, Some(proof))
+            .await
+            .unwrap();
         let state = open_state(&setup, &start.state);
         let (now, code) = current_code(&state.seed);
 
@@ -485,19 +596,211 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_first_enrollment_requires_a_proof() {
+        let (_setup, handler) = setup_handler().await;
+        insert_user_no_password(&handler, "bob").await;
+        insert_user_no_password(&handler, "eve").await;
+        let bob = UserId::new("bob");
+        let eve = UserId::new("eve");
+        let same = |err: &DomainError| err.to_string().contains(PASSWORD_PROOF_REQUIRED);
+
+        let err = handler
+            .start_totp_enrollment(&bob, None, None)
+            .await
+            .unwrap_err();
+        assert!(same(&err), "{err}");
+        let err = handler
+            .start_totp_enrollment(&bob, None, Some("not-a-proof".to_owned()))
+            .await
+            .unwrap_err();
+        assert!(same(&err), "{err}");
+
+        let foreign = fresh_proof(&handler, &eve).await;
+        let err = handler
+            .start_totp_enrollment(&bob, None, Some(foreign))
+            .await
+            .unwrap_err();
+        assert!(same(&err), "{err}");
+
+        set_enrollment_clock(Some(1_700_000_000));
+        let expired = fresh_proof(&handler, &bob).await;
+        set_enrollment_clock(Some(1_700_000_000 + 301));
+        let err = handler
+            .start_totp_enrollment(&bob, None, Some(expired))
+            .await
+            .unwrap_err();
+        set_enrollment_clock(None);
+        assert!(same(&err), "{err}");
+
+        set_enrollment_clock(Some(1_700_000_100));
+        let still_good = fresh_proof(&handler, &bob).await;
+        set_enrollment_clock(Some(1_700_000_100 + 299));
+        handler
+            .start_totp_enrollment(&bob, None, Some(still_good))
+            .await
+            .unwrap();
+        set_enrollment_clock(None);
+
+        let proof = fresh_proof(&handler, &bob).await;
+        handler
+            .start_totp_enrollment(&bob, None, Some(proof.clone()))
+            .await
+            .unwrap();
+        let err = handler
+            .start_totp_enrollment(&bob, None, Some(proof))
+            .await
+            .unwrap_err();
+        assert!(same(&err), "{err}");
+    }
+
+    #[tokio::test]
+    async fn test_proof_opens_on_a_second_handler_with_the_same_key() {
+        let (setup, handler) = setup_handler().await;
+        insert_user_no_password(&handler, "bob").await;
+        let bob = UserId::new("bob");
+        let proof = fresh_proof(&handler, &bob).await;
+        let other = SqlBackendHandler::new(setup, handler.sql_pool.clone());
+        other
+            .start_totp_enrollment(&bob, None, Some(proof))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_an_enrolled_user_gets_no_proof_and_a_replacement_ignores_one() {
+        let (setup, handler) = setup_handler().await;
+        let (bob, seed, _, current) = enroll_user(&handler, &setup, "bob").await;
+        assert_eq!(handler.seal_enrollment_proof(&bob).await.unwrap(), None);
+
+        let proof = seal_enrollment_proof(&ikm(&setup), "bob", now_unix()).unwrap();
+        let err = handler
+            .start_totp_enrollment(&bob, None, Some(proof.clone()))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains(TOTP_CURRENT_CODE_REQUIRED),
+            "{err}"
+        );
+        let err = handler
+            .start_totp_enrollment(&bob, Some(wrong_code(&seed)), Some(proof.clone()))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Invalid TOTP code"), "{err}");
+        let restart = handler
+            .start_totp_enrollment(&bob, Some(current), Some(proof.clone()))
+            .await
+            .unwrap();
+        assert!(open_state(&setup, &restart.state).replaces_existing);
+
+        handler
+            .reset_user_mfa(&bob, MfaResetReason::Administrative)
+            .await
+            .unwrap();
+        handler
+            .start_totp_enrollment(&bob, None, Some(proof))
+            .await
+            .unwrap();
+    }
+
+    #[derive(Clone, Default)]
+    struct Warnings(std::sync::Arc<std::sync::Mutex<usize>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warnings {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let meta = event.metadata();
+            if *meta.level() == tracing::Level::WARN
+                && meta.target() == "lldap_sql_backend_handler::sql_mfa_handler"
+            {
+                *self.0.lock().unwrap() += 1;
+            }
+        }
+    }
+
+    fn filler_id(n: u32) -> [u8; 16] {
+        let mut id = [0xffu8; 16];
+        id[12..].copy_from_slice(&n.to_be_bytes());
+        id
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_full_used_proof_set_refuses_a_first_enrollment_and_keeps_its_proof() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let guard = LogGuard::install();
+        let peer = "10.77.0.2";
+        let (setup, _handler) = setup_handler().await;
+        let key = ikm(&setup);
+        let bob = UserId::new("bob");
+        let now = 1_700_000_000;
+        let used = UsedProofs::new();
+        let mut fillers = 0u32;
+        while used.mark_used(filler_id(fillers), now + 10, now) == ProofUse::Accepted {
+            fillers += 1;
+            assert!(fillers < 100_000, "the used-proof set never filled");
+        }
+        let proof = seal_enrollment_proof(&key, "bob", now).unwrap();
+        let warnings = Warnings::default();
+        let subscriber = tracing_subscriber::registry().with(warnings.clone());
+        let meta = RequestMeta::http(Some(peer.parse().unwrap()), None);
+        let answers = with_request_sync(meta, || {
+            tracing::subscriber::with_default(subscriber, || {
+                [now, now + 11, now + 11].map(|at| {
+                    take_proof(&used, &key, &bob, Some(&proof), at).map_err(|e| e.to_string())
+                })
+            })
+        });
+        let [busy, accepted, again] = answers;
+        assert!(
+            busy.as_ref().unwrap_err().contains(ENROLLMENT_PROOF_BUSY),
+            "{busy:?}"
+        );
+        assert_eq!(
+            accepted,
+            Ok(()),
+            "the refused start did not spend the proof"
+        );
+        assert!(
+            again
+                .as_ref()
+                .unwrap_err()
+                .contains(PASSWORD_PROOF_REQUIRED),
+            "{again:?}"
+        );
+        assert_eq!(*warnings.0.lock().unwrap(), 1);
+        let rows: Vec<(bool, Option<String>)> = guard
+            .recorder()
+            .take_events()
+            .into_iter()
+            .filter(|e| e.peer.as_deref() == Some(peer) && e.kind == LogKind::MfaEnroll)
+            .map(|e| (e.success, e.detail))
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                (false, Some("enrollment busy".to_owned())),
+                (false, Some("password proof required".to_owned())),
+            ]
+        );
+    }
+
+    #[tokio::test]
     async fn test_start_totp_enrollment_requires_current_code() {
         let (setup, handler) = setup_handler().await;
         let (user_id, seed, _, current) = enroll_user(&handler, &setup, "bob").await;
         let sealed_before = get_mfa_columns(&handler, "bob").await.0.unwrap();
 
         let err = handler
-            .start_totp_enrollment(&user_id, None)
+            .start_totp_enrollment(&user_id, None, None)
             .await
             .unwrap_err();
         assert!(err.to_string().contains(TOTP_CURRENT_CODE_REQUIRED));
 
         let err = handler
-            .start_totp_enrollment(&user_id, Some(wrong_code(&seed)))
+            .start_totp_enrollment(&user_id, Some(wrong_code(&seed)), None)
             .await
             .unwrap_err();
         assert!(matches!(err, DomainError::AuthenticationError(_)));
@@ -507,7 +810,7 @@ mod tests {
         );
 
         let restart = handler
-            .start_totp_enrollment(&user_id, Some(current))
+            .start_totp_enrollment(&user_id, Some(current), None)
             .await
             .unwrap();
         let new_state = open_state(&setup, &restart.state);
@@ -698,7 +1001,12 @@ mod tests {
             insert_user_no_password(&handler, "bob").await;
             insert_user_no_password(&handler, "john").await;
             let bob = UserId::new("bob");
-            let start = handler.start_totp_enrollment(&bob, None).await.unwrap();
+            let _ = handler.start_totp_enrollment(&bob, None, None).await;
+            let proof = fresh_proof(&handler, &bob).await;
+            let start = handler
+                .start_totp_enrollment(&bob, None, Some(proof))
+                .await
+                .unwrap();
             let state = open_state(&setup, &start.state);
             let (now, code) = current_code(&state.seed);
             let _ = handler
@@ -729,10 +1037,13 @@ mod tests {
                 .finish_totp_enrollment(&bob, &start.state, &code)
                 .await
                 .unwrap();
-            let err = handler.start_totp_enrollment(&bob, None).await.unwrap_err();
+            let err = handler
+                .start_totp_enrollment(&bob, None, None)
+                .await
+                .unwrap_err();
             assert!(err.to_string().contains(TOTP_CURRENT_CODE_REQUIRED));
             let _ = handler
-                .start_totp_enrollment(&bob, Some(wrong_code(&state.seed)))
+                .start_totp_enrollment(&bob, Some(wrong_code(&state.seed)), None)
                 .await;
         })
         .await;
@@ -771,6 +1082,7 @@ mod tests {
                     None,
                     Some("private key changed".to_owned())
                 ),
+                row(LogKind::MfaEnroll, false, "bob", "password proof required"),
                 row(LogKind::MfaEnroll, true, "bob", "started"),
                 row(LogKind::MfaEnroll, false, "bob", "invalid code"),
                 row(LogKind::MfaEnroll, false, "bob", "expired enrollment"),

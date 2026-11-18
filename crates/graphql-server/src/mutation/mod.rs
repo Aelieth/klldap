@@ -752,8 +752,9 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
     async fn start_mfa_enrollment(
         context: &Context<Handler>,
         current_code: Option<String>,
+        enrollment_proof: Option<String>,
     ) -> FieldResult<MfaEnrollmentStart> {
-        mfa::start_mfa_enrollment(context, current_code).await
+        mfa::start_mfa_enrollment(context, current_code, enrollment_proof).await
     }
 
     async fn finish_mfa_enrollment(
@@ -2156,9 +2157,13 @@ mod tests {
 
         let mut mock = MockTestBackendHandler::new();
         mock.expect_start_totp_enrollment()
-            .with(eq(UserId::new("bob")), eq(None::<String>))
+            .with(
+                eq(UserId::new("bob")),
+                eq(None::<String>),
+                eq(None::<String>),
+            )
             .times(1)
-            .returning(|_, _| Ok(enrollment_start()));
+            .returning(|_, _, _| Ok(enrollment_start()));
         mock.expect_finish_totp_enrollment()
             .withf(|user, state, code| {
                 user == &UserId::new("bob") && state == "sealed" && code == "123456"
@@ -2226,7 +2231,7 @@ mod tests {
             .with(eq(UserId::new("admin")))
             .returning(|_| Ok(sample_user("admin", vec![])));
         mock.expect_start_totp_enrollment()
-            .returning(|_, _| Ok(enrollment_start()));
+            .returning(|_, _, _| Ok(enrollment_start()));
         let context = policy_context(mock, "admin", Permission::Admin, MfaPolicy::Always, true);
         for query in [
             r#"{ users { id } }"#,

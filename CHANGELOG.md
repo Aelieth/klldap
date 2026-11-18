@@ -2,6 +2,25 @@
 
 ## [0.8.1] - Unreleased
 
+### Security
+
+- A first two-factor enrollment proves the password to the server. **API change for
+  scripts:** `startMfaEnrollment` takes a new argument, `enrollmentProof`, and refuses a
+  first enrollment without a valid one (*Password proof required*); a session alone is not
+  enough. A script obtains the proof from a login that asks for it: `"enrollmentProof": true`
+  in the body of `/auth/simple/login` or `/auth/opaque/login/finish` returns `enrollmentProof`
+  in the answer, for a user with no factor yet. It is valid for five minutes and used once on
+  each server. Replacing a factor still takes `currentCode` and ignores a proof.
+
+### Added
+
+- `/auth/opaque/login/finish` takes an optional `"session": false`: the finish verifies the
+  password (and a code sent with it), admits or refuses the user as any finish does, and
+  makes no session: no token, no refresh token, no cookie. A verified one answers
+  `{"verified": true}`, with `enrollmentProof` when one was asked for. Its `login` row's
+  detail says `no session`. Without the field a finish is unchanged. `/auth/simple/login`
+  is unchanged.
+
 ### Removed
 
 - The `syncKerberosPassword` mutation. A synced user's password now travels sealed inside
@@ -9,6 +28,15 @@
 
 ### Changed
 
+- The web login asks for the code in a second step: the password alone first, then, when
+  the account has a factor, a code field; a wrong code keeps that step open. The password
+  field no longer takes `password:code` (that text fails as a wrong password, and the page
+  says the code is asked next). LDAP binds and `/auth/simple/login` still take
+  `password:code`.
+- The enrollment, reset-two-factor and change-password pages have the server check the
+  password with a finish that makes no session, and each finishes every login it starts.
+  The change-password page checks the current password as typed, once: it no longer splits
+  off a trailing `:` and six digits as a code.
 - A deleted user's Kerberos ticket requests are refused for every kind of request, delegation and
   user-to-user included; renewals and service tickets keep their answer (code 18,
   `CLIENT_NOT_FOUND`).

@@ -84,7 +84,8 @@ mockall::mock! {
     #[async_trait]
     impl MfaBackendHandler for TestBackendHandler {
         async fn mfa_requirement(&self, user_id: &UserId) -> Result<MfaRequirement>;
-        async fn start_totp_enrollment(&self, user_id: &UserId, current_code: Option<String>) -> Result<TotpEnrollmentStart>;
+        async fn start_totp_enrollment(&self, user_id: &UserId, current_code: Option<String>, enrollment_proof: Option<String>) -> Result<TotpEnrollmentStart>;
+        async fn seal_enrollment_proof(&self, user_id: &UserId) -> Result<Option<String>>;
         async fn finish_totp_enrollment(&self, user_id: &UserId, state: &str, code: &str) -> Result<()>;
         async fn reset_user_mfa(&self, user_id: &UserId, reason: MfaResetReason) -> Result<()>;
         async fn reset_own_mfa(&self, user_id: &UserId, code: &str) -> Result<()>;

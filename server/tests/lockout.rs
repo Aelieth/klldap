@@ -107,6 +107,8 @@ fn failing_finish(client: &Client, base_url: &str) -> reqwest::StatusCode {
             server_data: second_response.server_data,
             credential_finalization: finalization,
             totp_code: None,
+            enrollment_proof: None,
+            session: None,
         })
         .send()
         .expect("login finish send")

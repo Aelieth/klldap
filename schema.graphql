@@ -422,7 +422,7 @@ type Mutation {
   reassignGidNumbers: PosixSettingsResponse!
   resetUserMfa(userId: String!): Success!
   resetOwnMfa(code: String!): Success!
-  startMfaEnrollment(currentCode: String): MfaEnrollmentStart!
+  startMfaEnrollment(currentCode: String, enrollmentProof: String): MfaEnrollmentStart!
   finishMfaEnrollment(state: String!, code: String!): Success!
 }
 

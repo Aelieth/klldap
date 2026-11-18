@@ -10,10 +10,11 @@ case $- in *x*) LK_XT=1 ;; esac
 { set +x; } 2>/dev/null
 LK_PASS="$(python3 -c 'import secrets; print("Lk" + secrets.token_hex(10) + "!")')"
 [ "$LK_XT" = 1 ] && set -x
+LK_ONE="${CONTAINER}-one" LK_ONE_VOL="${CONTAINER}-one-data"
 LK_TWO="${CONTAINER}-two" LK_TWO_VOL="${CONTAINER}-two-data"
 LK_SECRET="" LK_MADE=0
-EXTRA_CONTAINERS+=("$LK_TWO")
-EXTRA_VOLUMES+=("$LK_TWO_VOL")
+EXTRA_CONTAINERS+=("$LK_ONE" "$LK_TWO")
+EXTRA_VOLUMES+=("$LK_ONE_VOL" "$LK_TWO_VOL")
 
 lk_pass() { LK_N=$((LK_N + 1)) LK_P=$((LK_P + 1)); p_ok "$1"; }
 lk_note() { LK_N=$((LK_N + 1)) LK_K=$((LK_K + 1)); note "[NOTE] ${PHASE}: $1"; }
@@ -165,30 +166,45 @@ lk_fifty() {
     fi
 }
 
-lk_two_server() {
-    local two_port i healthy=0 out ctl n many step
-    docker rm -fv "$LK_TWO" >/dev/null 2>&1
+# lk_plain_up <name> <volume>: a server with Kerberos disabled on the gate's database.
+lk_plain_up() {
     LLDAP_JWT_SECRET="$JWT_SECRET" LLDAP_KEY_SEED="$KEY_SEED" LLDAP_LDAP_USER_PASS="$ADMIN_PASS" \
-        LLDAP_DATABASE_URL="$GATE_DATABASE_URL" t docker run -d --name "$LK_TWO" --network "$NET" -p "127.0.0.1::17170" \
-        -v "$LK_TWO_VOL:/data" -e LLDAP_JWT_SECRET -e LLDAP_KEY_SEED -e LLDAP_LDAP_USER_PASS -e LLDAP_DATABASE_URL \
+        LLDAP_DATABASE_URL="$GATE_DATABASE_URL" t docker run -d --name "$1" --network "$NET" -p "127.0.0.1::17170" \
+        -v "$2:/data" -e LLDAP_JWT_SECRET -e LLDAP_KEY_SEED -e LLDAP_LDAP_USER_PASS -e LLDAP_DATABASE_URL \
         -e LLDAP_LDAP_BASE_DN="$BASE_DN" -e LLDAP_ENABLE_MFA=true -e LLDAP_KERBEROS_OPTIONS__ENABLED=false \
-        "$GATE_IMAGE" >/dev/null 2>"$LK_D/two.err" || {
-        lk_note "[L1.totp-two-servers] the second server could not start ($(head -c 200 "$LK_D/two.err")); not run"
-        return 0
-    }
+        "$GATE_IMAGE" >/dev/null 2>>"$LK_D/two.err"
+}
+lk_plain_port() {
+    local i
     for i in $(seq 1 60); do
-        gexec_in "$LK_TWO" /app/lldap healthcheck --config-file /data/lldap_config.toml >/dev/null 2>&1 && healthy=1 && break
+        gexec_in "$1" /app/lldap healthcheck --config-file /data/lldap_config.toml >/dev/null 2>&1 &&
+            docker port "$1" 17170/tcp | head -1 | sed 's/.*://' && return 0
         sleep 2
     done
-    two_port="$(docker port "$LK_TWO" 17170/tcp | head -1 | sed 's/.*://')"
-    if [ "$healthy" != 1 ] || [ -z "$two_port" ]; then
-        lk_note "[L1.totp-two-servers] the second server never became healthy; not run"
+    return 1
+}
+
+# Servers that share a database share the Kerberos setting: the gate's own server (Kerberos on)
+# stops for this row, and two servers with Kerberos disabled run on its database.
+lk_two_server() {
+    local one_port="" two_port="" out ctl n many step
+    docker rm -fv "$LK_ONE" "$LK_TWO" >/dev/null 2>&1
+    : >"$LK_D/two.err"
+    if ! t docker stop "$CONTAINER" >/dev/null 2>&1; then
+        lk_note "[L1.totp-two-servers] the gate's server could not be stopped for this row; not run"
+        return 0
+    fi
+    if lk_plain_up "$LK_ONE" "$LK_ONE_VOL" && lk_plain_up "$LK_TWO" "$LK_TWO_VOL"; then
+        one_port="$(lk_plain_port "$LK_ONE")" && two_port="$(lk_plain_port "$LK_TWO")"
+    fi
+    if [ -z "$one_port" ] || [ -z "$two_port" ]; then
+        lk_note "[L1.totp-two-servers] the two servers with Kerberos disabled did not both become healthy ($(head -c 200 "$LK_D/two.err")); not run"
     else
         lk_step_start
         step="$(lk_step)"
-        read -r n many <<<"$(lk_five_wrong "$HTTP_PORT")"
+        read -r n many <<<"$(lk_five_wrong "$one_port")"
         out="$(lk_simple_at "$two_port" "$LK_MFA" pass:code)"
-        ctl="$(lk_simple_at "$HTTP_PORT" "$LK_MFA" pass:code)"
+        ctl="$(lk_simple_at "$one_port" "$LK_MFA" pass:code)"
         if [ "$n" != 5 ]; then
             lk_note "[L1.totp-two-servers] only $n of 5 wrong codes were answered 'Invalid TOTP code' on server one ($many 'Too many'); this run cannot tell"
         elif [ "$(lk_step)" != "$step" ]; then
@@ -203,8 +219,10 @@ lk_two_server() {
             lk_note "[L1.totp-two-servers] the healthy second server answered '$out'; this run cannot tell"
         fi
     fi
-    docker rm -fv "$LK_TWO" >/dev/null 2>&1
-    docker volume rm "$LK_TWO_VOL" >/dev/null 2>&1
+    docker rm -fv "$LK_ONE" "$LK_TWO" >/dev/null 2>&1
+    docker volume rm "$LK_ONE_VOL" "$LK_TWO_VOL" >/dev/null 2>&1
+    t docker start "$CONTAINER" >/dev/null 2>&1 && lk_back_up ||
+        lk_fail "[L1.totp-two-servers-back] the gate's server did not come back after the row"
     return 0
 }
 
@@ -289,8 +307,8 @@ lk_kerberos() {
 
 lk_cleanup() {
     local u out gone=0 deleted=0
-    docker rm -fv "$LK_TWO" >/dev/null 2>&1
-    docker volume rm "$LK_TWO_VOL" >/dev/null 2>&1
+    docker rm -fv "$LK_ONE" "$LK_TWO" >/dev/null 2>&1
+    docker volume rm "$LK_ONE_VOL" "$LK_TWO_VOL" >/dev/null 2>&1
     lk_policy_gone && gone=1
     for u in "$LK_USER" "$LK_MFA"; do
         out="$(lk_gql 'mutation($u: String!) { deleteUser(userId: $u) { ok } }' '{"u": "'"$u"'"}')" &&

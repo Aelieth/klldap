@@ -2,7 +2,7 @@
 # Phase: KDC verdict and notice. Every wrong answer is FAIL.
 # This phase's server is SQLite, not the main container's database.
 # The corrections against rows.md are logs/PROPER/K1/note-phases-6.md and PH/note-phases-7.md.
-# The S4U2Self rows are logs/PROPER/S4U/note.md.
+# The S4U2Self rows are logs/PROPER/S4U/note.md. The KRB5_TRACE rows are logs/PROPER/R5L/note.md.
 # This phase's server is GATE_KILL_IMAGE. The release image is GATE_IMAGE.
 
 D="$(phase_dir)"
@@ -52,6 +52,17 @@ kdc_kinit_fast() {
     # shellcheck disable=SC2016
     gexec_in "$KDC_C" sh -c 'printf "%s\n" "$1" | KRB5CCNAME="$2" kinit -T /tmp/k1armor "$0"' \
         "$1" "$2" "$3"
+}
+kdc_kinit_traced() {
+    # shellcheck disable=SC2016
+    gexec_in "$KDC_C" sh -c 'printf "%s\n" "$1" | KRB5_TRACE="$3" KRB5CCNAME="$2" kinit "$0"' \
+        "$1" "$2" "$3" "$4"
+}
+kdc_kinit_fast_traced() {
+    # shellcheck disable=SC2016
+    gexec_in "$KDC_C" sh -c \
+        'printf "%s\n" "$1" | KRB5_TRACE="$3" KRB5CCNAME="$2" kinit -T /tmp/k1armor "$0"' \
+        "$1" "$2" "$3" "$4"
 }
 notice_lines() {
     local n
@@ -354,6 +365,31 @@ else
 fi
 no_prompt host-fast "$D/kinit-host-fast.log"
 expect_one host-fast HostRefused null 18 "$before" "$AS"
+for mech in trace-enc-ts trace-fast; do
+    before="$(notice_lines)" || before=""
+    if [ "$mech" = trace-fast ]; then
+        kdc_kinit_fast_traced "$AS@$REALM" "$PASS" "/tmp/k1$mech" "/tmp/k1$mech.trace" \
+            >"$D/kinit-$mech.log" 2>&1
+    else
+        kdc_kinit_traced "$AS@$REALM" "$PASS" "/tmp/k1$mech" "/tmp/k1$mech.trace" \
+            >"$D/kinit-$mech.log" 2>&1
+    fi
+    if grep -qF "Client's credentials have been revoked" "$D/kinit-$mech.log"; then
+        p_ok "$mech: kinit reports Client's credentials have been revoked"
+    else
+        p_bad "$mech: kinit did not report Client's credentials have been revoked (see kinit-$mech.log)"
+    fi
+    if ! gexec_in "$KDC_C" cat "/tmp/k1$mech.trace" >"$D/$mech.trace" 2>&1; then
+        p_bad "$mech: could not read the KRB5_TRACE file (see $mech.trace)"
+    elif ! grep -F 'Received error from KDC' "$D/$mech.trace" | grep -qF "Client's credentials have been revoked"; then
+        p_bad "$mech: no 'Received error from KDC' line with the revoked code in the trace (see $mech.trace)"
+    elif grep -iE 'skew|malformed|decode|asn\.1' "$D/$mech.trace" >"$D/$mech-bad.txt"; then
+        p_bad "$mech: the trace has a skew, malformed, decode or ASN.1 line (see $mech-bad.txt)"
+    else
+        p_ok "$mech: the trace has the KDC's error and no skew, malformed, decode or ASN.1 line"
+    fi
+    expect_one "$mech" HostRefused null 18 "$before" "$AS"
+done
 
 if kdc_kinit_renew "$HOLD@$REALM" "$PASS" /tmp/k1hold >"$D/kinit-hold.log" 2>&1; then
     p_ok "$HOLD has a renewable ticket"

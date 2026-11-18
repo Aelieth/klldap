@@ -3,6 +3,7 @@
 # kadmin -q exits 0 on a refused query, so a refusal is judged on its text
 # and on the record being unchanged. add_alias is not in this image's kadmin.
 # The corrections against rows.md are logs/PROPER/K1/note-phases-6.md and PH/note-phases-7.md.
+# The OTHER.TEST rows are logs/PROPER/R5L/note.md.
 
 D="$(phase_dir)"
 SYNC=k1sync
@@ -500,6 +501,93 @@ if [ -n "$flood_ok" ]; then
     p_ok "flood: one 'access-denied flood resolved: 2 denials, 1 actors' for $FLOOD@$REALM, and no admin refusal coalesced"
 else
     p_bad "flood: $(cat "$D/flood-end.out" 2>/dev/null || echo 'no rows read (see mark.err, flood-end.err)')"
+fi
+
+# The server's KRB5_CONFIG names OTHER.TEST; the clients keep the client_config, /data/krb5.conf.
+OTHER_CONF=/data/other-krb5.conf
+OTHER_NEW=K1otherPass2026!
+D2_ARGS=(${GATE_EXTRA_RUN_ARGS[@]+"${GATE_EXTRA_RUN_ARGS[@]}"})
+# shellcheck disable=SC2034
+d2_swap() {
+    local label="$1"
+    shift
+    local -a GATE_EXTRA_RUN_ARGS=(${D2_ARGS[@]+"${D2_ARGS[@]}"} "$@")
+    t docker stop "$CONTAINER" >/dev/null 2>&1
+    docker logs "$CONTAINER" >"$D/d2-$label.log" 2>&1
+    docker rm -v "$CONTAINER" >/dev/null 2>&1 || return 1
+    start_main_container && wait_healthy 120 && discover_ports && TOKEN="$(gate_login)"
+}
+d2_exec() { t docker exec -e KRB5_CONFIG=/data/krb5.conf "$CONTAINER" "$@"; }
+d2_kadmin() { d2_exec kadmin -k -t /data/kadm5.keytab -p "$ADMIN" -q "$1"; }
+d2_kvno() { d2_kadmin "getprinc $SYNC" 2>/dev/null | awk '/Key: vno/ {print $3; exit}' | tr -d ','; }
+d2_kinit() {
+    # shellcheck disable=SC2016
+    d2_exec sh -c 'printf "%s\n" "$1" | KRB5CCNAME=/tmp/gate_d2_$$ kinit "$0"' "$SYNC@$REALM" "$1"
+}
+
+if gexec sh -c 'printf "[libdefaults]\n default_realm = OTHER.TEST\n" >"$0"' "$OTHER_CONF" \
+    && d2_swap before-other -e "KRB5_CONFIG=$OTHER_CONF"; then
+    p_ok "d2: the server restarted with KRB5_CONFIG=$OTHER_CONF"
+else
+    p_bad "d2: the server did not restart with KRB5_CONFIG=$OTHER_CONF"
+fi
+if [ "$(gexec printenv KRB5_CONFIG 2>/dev/null)" = "$OTHER_CONF" ] \
+    && file_contains "$OTHER_CONF" "default_realm = OTHER.TEST" \
+    && file_contains /data/krb5.conf "default_realm = $REALM"; then
+    p_ok "d2: KRB5_CONFIG names OTHER.TEST; the client_config written at boot names $REALM"
+else
+    p_bad "d2: KRB5_CONFIG and the client_config are not the two realms this case needs"
+fi
+
+KV="$(d2_kvno)"
+MARK="$(log_mark)" || MARK=""
+if d2_kadmin "cpw -pw $OTHER_NEW $SYNC" >"$D/d2-cpw.txt" 2>&1 && ! grep -q " while " "$D/d2-cpw.txt"; then
+    p_ok "d2: cpw of $SYNC produced no error text"
+else
+    p_bad "d2: cpw of $SYNC failed (see d2-cpw.txt)"
+fi
+now="$(d2_kvno)"
+if [ -n "$KV" ] && [ "$now" = "$((KV + 1))" ] \
+    && bind_ok "$SYNC" "$OTHER_NEW" && ! bind_ok "$SYNC" "$CUR" \
+    && d2_kinit "$OTHER_NEW" >"$D/d2-kinit-new.log" 2>&1 \
+    && ! d2_kinit "$CUR" >"$D/d2-kinit-old.log" 2>&1; then
+    p_ok "d2: bind and kinit in $REALM take the new password and the key version increased by one"
+else
+    p_bad "d2: the doors did not follow the new password (kvno '${now:-empty}')"
+fi
+if [ -n "$MARK" ] && log_one PASSWORD_CHANGE "$SYNC@$REALM" "$CPW_DETAIL" true d2-cpw "$MARK" "$ADMIN"; then
+    p_ok "d2: exactly one password_change names $SYNC@$REALM, protocol KADMIN, actor $ADMIN"
+else
+    p_bad "d2: password_change '$CPW_DETAIL' on $SYNC@$REALM is not exactly one"
+fi
+CUR="$OTHER_NEW"
+KV="$now"
+
+MARK="$(log_mark)" || MARK=""
+d2_kadmin "cpw -keepold -pw K1otherKeepPass2026! $SYNC" >"$D/d2-keepold.txt" 2>&1 || true
+if grep -qF "Cannot change protected principal" "$D/d2-keepold.txt"; then
+    p_ok "d2-keepold: Cannot change protected principal"
+else
+    p_bad "d2-keepold: expected 'Cannot change protected principal' (see d2-keepold.txt)"
+fi
+detail="kadmin change_password on $SYNC@$REALM by $ADMIN: PROTECT_PRINCIPAL"
+if [ -n "$MARK" ] && log_one ACCESS_DENIED "$SYNC@$REALM" "$detail" false d2-keepold "$MARK" "$ADMIN"; then
+    p_ok "d2-keepold: one access_denied names $SYNC@$REALM and PROTECT_PRINCIPAL"
+else
+    p_bad "d2-keepold: access_denied '$detail' is not exactly one (see d2-keepold-log.json)"
+fi
+if [ -n "$KV" ] && [ "$(d2_kvno)" = "$KV" ] && bind_ok "$SYNC" "$CUR" \
+    && d2_kinit "$CUR" >"$D/d2-kinit-kept.log" 2>&1; then
+    p_ok "d2-keepold: the key version, the bind and kinit are unchanged"
+else
+    p_bad "d2-keepold: the record moved (see d2-kinit-kept.log)"
+fi
+
+if d2_swap with-other && gexec rm -f "$OTHER_CONF" \
+    && [ "$(gexec printenv KRB5_CONFIG 2>/dev/null)" = /data/krb5.conf ]; then
+    p_ok "d2: the server is back on the image's KRB5_CONFIG"
+else
+    p_bad "d2: the server did not come back on the image's KRB5_CONFIG"
 fi
 
 # shellcheck disable=SC2016

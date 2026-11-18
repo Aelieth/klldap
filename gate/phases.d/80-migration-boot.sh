@@ -74,13 +74,29 @@ mig_healthy() {
     [ -n "$healthy" ] && grep -q "Kerberos realm LIVEBOB.TEST serving" "$D/$tag-docker.log"
 }
 mig_run "$MIG_A" "$A" -e LLDAP_KERBEROS_OPTIONS__ENABLED=false
-if mig_user "$MIG_A" branch-a '{"id": "livebob", "email": "livebob@livebob.test",
-        "attributes": [{"name": "kerberossync", "value": ["1"]}]}'; then
-    p_ok "livebob is created in the directory, with kerberosSync on, before the import"
+# Kerberos disabled refuses a create with sync, so the sync goes into the database between the
+# starts, as 0.7.2 set it (as the server test kerberos_migrates_a_dump does).
+if mig_user "$MIG_A" branch-a '{"id": "livebob", "email": "livebob@livebob.test"}'; then
+    p_ok "livebob is created in the directory before the import"
 else
     p_bad "could not create livebob before the import (see branch-a-user.json)"
 fi
-docker rm -f "$MIG_A" >/dev/null 2>&1
+mig_stop "$MIG_A"
+if A_DB="$A/data/users.db" python3 - <<'PY'
+import os, sqlite3
+con = sqlite3.connect(os.environ["A_DB"])
+with con:
+    con.execute("DELETE FROM user_attributes WHERE user_attribute_user_id = 'livebob' "
+                "AND user_attribute_name = 'kerberossync'")
+    con.execute("INSERT INTO user_attributes (user_attribute_user_id, user_attribute_name, "
+                "user_attribute_value) VALUES ('livebob', 'kerberossync', X'31')")
+con.close()
+PY
+then
+    p_ok "livebob has kerberosSync on in the database before the import, as 0.7.2 set it"
+else
+    p_bad "could not write livebob's kerberossync into $A/data/users.db"
+fi
 mig_run "$MIG_A" "$A"
 if mig_healthy "$MIG_A" branch-a; then
     p_ok "the dump boots to healthy, realm LIVEBOB.TEST serving"

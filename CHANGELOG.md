@@ -17,9 +17,56 @@
 - `/auth/opaque/login/finish` takes an optional `"session": false`: the finish verifies the
   password (and a code sent with it), admits or refuses the user as any finish does, and
   makes no session: no token, no refresh token, no cookie. A verified one answers
-  `{"verified": true}`, with `enrollmentProof` when one was asked for. Its `login` row's
-  detail says `no session`. Without the field a finish is unchanged. `/auth/simple/login`
-  is unchanged.
+  `{"verified": true}`, with `enrollmentProof` when one was asked for. Every row it writes
+  says `no session` in its detail, whatever the outcome: its one row at the door, and the
+  `account_lock` row when a wrong code it carries locks the user. Without the field a finish
+  is unchanged. `/auth/simple/login` is unchanged.
+- The account lockout is enforced: `lockout-threshold` and `lockout-duration-seconds` from the
+  user's OU policy lock a user after that many wrong passwords in a row, at every door (LDAP
+  bind, `/auth/simple/login`, the web login, kinit, renewals and service tickets, token refresh
+  and use, S4U2Self). One counter per user, in the new table `login_lockouts` (made at start,
+  removed with its user), serves them all; kinit's failures are counted there too. A wrong TOTP
+  code counts once. A success clears the count; a Kerberos ticket on the password alone does so
+  only for a user who need not give a second factor at the directory's doors. An administrator's
+  unlock wins over every failure counted before it. A locked user's bind and simple login are
+  answered as for a wrong password, at once; the web login's first step as for a name with no
+  password; kinit, renewals and service tickets with error 18 before any password is looked at,
+  which is not the wrong-password answer and which anyone can ask for. Nothing a locked user
+  sends is counted. Counting starts, for all users and from zero, when the first OU policy
+  with a threshold takes effect: that change clears every stored count and logged lock in its
+  own transaction and starts a new counting period. From then on users with no threshold are
+  counted too, so a threshold added to another OU, or a move under one, applies at once to the
+  failures already counted; the lock is computed, so lowering or raising it applies at once.
+- A web start counts at once at every door, beside the stored count, so unfinished starts lock
+  as they come; a verified finish, with a session or without, removes its own start's count
+  once and changes nothing else, a completed sign-in drops the user's earlier starts on that
+  server, and a start no finish removes within 10 seconds joins the stored count, unless its
+  id, or the id of a later start made on the same server whose sign-in completed, was stored
+  by a finish on another server; with two servers a sign-in whose steps start and finish on
+  either never counts against the user. At most 32 starts per user are held; one beyond
+  joins the count at once.
+- Unlocking: GraphQL `unlockUser(userId)` (admins), the host tool `lldap unlock <user>`, and
+  kadmin `modprinc -unlock` on a directory user's principal, which now clears the directory's
+  lock at the server's clock. Each writes an `account_unlock` row; a lock writes one
+  `account_lock` row, and each refusal a `locked out` row. An unlock by the host tool or by
+  another server takes effect at a server's next sign-in attempt at the directory's doors, and
+  for Kerberos within a moment of the next attempt.
+- Under a threshold a count is written before the door answers; the door, and the KDC, wait at
+  most 250 ms for it in all, and a slower write is owed and tried again. Other counts, and a
+  web start's after its 10 seconds, are owed and written within about a second. A clean stop
+  writes what is owed, so a sign-in in progress then counts once (the next sign-in clears it);
+  a crash or a power cut can lose the last second or so of counts and the
+  last 10 seconds of web starts. Each write carries the user's state as it stands, never an
+  increment; it stores nothing for a user who is gone or replaced under the same name, or
+  from an earlier counting period, and
+  a write the database refuses is retried until it is taken. With several servers on one
+  database each counts what it sees exactly, they agree within 30 seconds, and a guesser
+  spread over N servers gets at most N times the threshold.
+- With no threshold set in any OU, the lockout costs nothing at any door: no read, no write and
+  no cache fill. The first threshold set loads what the doors need before it takes effect.
+  Until a starting server has read the policies once, the doors refuse (`policy: unreadable`).
+- When lockout count writes start failing, the server log says so once at WARN, with the cause;
+  when they are stored again, once at INFO, with how many users' rows waited.
 
 ### Removed
 
@@ -37,6 +84,8 @@
   password with a finish that makes no session, and each finishes every login it starts.
   The change-password page checks the current password as typed, once: it no longer splits
   off a trailing `:` and six digits as a code.
+- A web login in flight across the upgrade fails once; the retry works.
+- kadmin's unlock row reads `kadmin unlock by <client>`.
 - A deleted user's Kerberos ticket requests are refused for every kind of request, delegation and
   user-to-user included; renewals and service tickets keep their answer (code 18,
   `CLIENT_NOT_FOUND`).

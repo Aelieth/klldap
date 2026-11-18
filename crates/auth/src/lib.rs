@@ -18,6 +18,24 @@ pub mod login {
     pub struct ServerData {
         pub username: UserId,
         pub server_login: opaque::server::login::ServerLogin,
+        /// The start's own +1 beside the user's row; only its verified finish removes it.
+        #[serde(with = "fixed_width_overlay")]
+        pub overlay: Option<u64>,
+    }
+
+    /// One flag and one id whether or not the start counted, so its length tells nothing.
+    mod fixed_width_overlay {
+        use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+        pub fn serialize<S: Serializer>(overlay: &Option<u64>, to: S) -> Result<S::Ok, S::Error> {
+            let id = overlay.unwrap_or_else(|| rand::RngCore::next_u64(&mut rand::rngs::OsRng));
+            (overlay.is_some(), id).serialize(to)
+        }
+
+        pub fn deserialize<'de, D: Deserializer<'de>>(from: D) -> Result<Option<u64>, D::Error> {
+            let (counted, id) = <(bool, u64)>::deserialize(from)?;
+            Ok(counted.then_some(id))
+        }
     }
 
     #[derive(Serialize, Deserialize, Clone)]

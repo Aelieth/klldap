@@ -2423,6 +2423,51 @@ async fn expect_logs_and_policy_index(pool: &DbConnection) {
     );
 }
 
+fn period_key_sql(backend: DbBackend, statement: &str) -> String {
+    let key = match backend {
+        DbBackend::MySql => "`key`",
+        DbBackend::Postgres => "\"key\"",
+        other => panic!("repair lane has no key quoting for {other:?}"),
+    };
+    format!("{statement} FROM system_config WHERE {key} = 'lockout_period'")
+}
+
+async fn drop_lockout_tables(pool: &DbConnection) {
+    let backend = pool.get_database_backend();
+    pool.execute(sea_orm::Statement::from_string(
+        backend,
+        "DROP TABLE login_lockouts".to_owned(),
+    ))
+    .await
+    .expect("drop login_lockouts");
+    pool.execute(sea_orm::Statement::from_string(
+        backend,
+        period_key_sql(backend, "DELETE"),
+    ))
+    .await
+    .expect("delete the period row");
+}
+
+async fn expect_lockout_tables(pool: &DbConnection) {
+    let backend = pool.get_database_backend();
+    pool.execute(sea_orm::Statement::from_string(
+        backend,
+        "SELECT fail_count, lock_logged, split_start FROM login_lockouts LIMIT 1".to_owned(),
+    ))
+    .await
+    .expect("login_lockouts restored");
+    let period = pool
+        .query_one(sea_orm::Statement::from_string(
+            backend,
+            period_key_sql(backend, "SELECT value"),
+        ))
+        .await
+        .expect("period query")
+        .expect("the period row restored");
+    let value: String = period.try_get_by_index(0).expect("value");
+    assert_eq!(value, "0");
+}
+
 async fn expect_kept_user(pool: &DbConnection) {
     let backend = pool.get_database_backend();
     let kept = pool
@@ -2455,6 +2500,7 @@ async fn repair_lane(pool: &DbConnection) {
     .await
     .expect("drop v13 column");
     drop_logs_and_policy_index(pool).await;
+    drop_lockout_tables(pool).await;
     migrate_from_version(pool, SchemaVersion(12), LAST_SCHEMA_VERSION)
         .await
         .expect("v13 from version 12");
@@ -2467,10 +2513,17 @@ async fn repair_lane(pool: &DbConnection) {
     expect_logs_and_policy_index(pool).await;
     assert_eq!(get_schema_version(pool).await, Some(LAST_SCHEMA_VERSION));
     expect_kept_user(pool).await;
+    // The lockout's tables come from the additions, the boot's next step (init_table).
+    ensure_v13_additions(pool)
+        .await
+        .expect("v13 additions after the step");
+    expect_lockout_tables(pool).await;
 
     drop_logs_and_policy_index(pool).await;
+    drop_lockout_tables(pool).await;
     ensure_v13_additions(pool).await.expect("v13 additions");
     expect_logs_and_policy_index(pool).await;
+    expect_lockout_tables(pool).await;
     expect_kept_user(pool).await;
 }
 
@@ -3550,4 +3603,102 @@ async fn test_mysql_policy_store() {
         return;
     };
     policy_store_lane(&pool).await;
+}
+
+#[tokio::test]
+async fn test_init_repairs_the_login_lockouts_table_and_keeps_its_rows() {
+    let pool = get_in_memory_db().await;
+    init_table(&pool).await.unwrap();
+    insert_directory_user(&pool, "kept", "33333333-3333-3333-3333-333333333333").await;
+    pool.execute(raw_statement(
+        "INSERT INTO login_lockouts (user_id, fail_count) VALUES ('kept', 2)",
+    ))
+    .await
+    .unwrap();
+    init_table(&pool).await.unwrap();
+    let kept = r#"SELECT COUNT(*) as c FROM login_lockouts WHERE fail_count = 2"#;
+    assert_eq!(count(&pool, kept).await, 1, "re-init keeps the rows");
+    #[derive(FromQueryResult)]
+    struct FkRow {
+        dest: String,
+        on_delete: String,
+    }
+    let fks = FkRow::find_by_statement(raw_statement(
+        r#"SELECT "table" as dest, on_delete FROM pragma_foreign_key_list('login_lockouts')"#,
+    ))
+    .all(&pool)
+    .await
+    .unwrap();
+    let fks: Vec<_> = fks.into_iter().map(|fk| (fk.dest, fk.on_delete)).collect();
+    assert_eq!(fks, vec![("users".to_owned(), "CASCADE".to_owned())]);
+    pool.execute(raw_statement("DROP TABLE login_lockouts"))
+        .await
+        .unwrap();
+    ensure_v13_additions(&pool).await.unwrap();
+    let all = r#"SELECT COUNT(*) as c FROM login_lockouts"#;
+    assert_eq!(count(&pool, all).await, 0, "a missing table is made again");
+}
+
+#[tokio::test]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_lockout_statements() {
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres().await else {
+        return;
+    };
+    crate::sql_lockout_handler::tests::lockout_lane(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_lockout_statements() {
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql().await else {
+        return;
+    };
+    crate::sql_lockout_handler::tests::lockout_lane(&pool).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_lockout_user_deleted_on_one_server_while_another_owes_it() {
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres().await else {
+        return;
+    };
+    crate::sql_lockout_handler::tests::gone_user_lane(&pool).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_lockout_start_on_one_server_finish_on_another() {
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres().await else {
+        return;
+    };
+    crate::sql_lockout_handler::tests::split_login_lane(&pool, true).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_lockout_count_write_waits_on_the_period_lock_and_stores_nothing() {
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres().await else {
+        return;
+    };
+    crate::sql_lockout_handler::tests::period_overlap_lane(&pool).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_lockout_two_zeroings_at_once_take_two_period_numbers() {
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres().await else {
+        return;
+    };
+    crate::sql_lockout_handler::tests::period_raise_lane(&pool).await;
 }

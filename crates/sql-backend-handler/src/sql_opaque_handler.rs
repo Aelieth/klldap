@@ -1,5 +1,6 @@
 use crate::SqlBackendHandler;
 use crate::sql_log_handler::UNKNOWN_USER_DETAIL;
+use crate::sql_mfa_handler::TotpRejection;
 use async_trait::async_trait;
 use base64::Engine;
 use lldap_auth::opaque;
@@ -7,8 +8,9 @@ use lldap_domain::types::{LoginOutcome, UserId};
 use lldap_domain_handlers::enforcement::{Attempt, Door, admit};
 use lldap_domain_handlers::handler::{BindRequest, LoginHandler, MfaBackendHandler};
 use lldap_domain_handlers::kerberos::{
-    kerberos_backend, refusal_while_degraded, require_kdc_ready,
+    LDAP_ADMINS_ONLY, kerberos_backend, refusal_while_degraded, require_kdc_ready,
 };
+use lldap_domain_handlers::lockout::{Step, lock_clock};
 use lldap_domain_handlers::logging::{self, LogKind};
 use lldap_domain_handlers::mfa::MfaRequirement;
 use lldap_domain_model::{
@@ -159,19 +161,8 @@ async fn member_of(
         .is_some())
 }
 
-fn invalid_credentials(user_id: &UserId) -> DomainError {
+pub(crate) fn invalid_credentials(user_id: &UserId) -> DomainError {
     DomainError::AuthenticationError(format!(r#"for user "{}""#, user_id))
-}
-
-pub(crate) const NO_SESSION: &str = "no session";
-
-/// A finish that mints no session says so on its success row, which is then no sign-in.
-fn login_row_detail(detail: Option<&str>, session: bool) -> Option<String> {
-    match (detail, session) {
-        (detail, true) => detail.map(str::to_owned),
-        (None, false) => Some(NO_SESSION.to_owned()),
-        (Some(detail), false) => Some(format!("{detail}; {NO_SESSION}")),
-    }
 }
 
 impl SqlBackendHandler {
@@ -185,6 +176,28 @@ impl SqlBackendHandler {
         admit(self, &attempt)
             .await
             .map_err(|_| invalid_credentials(user))
+    }
+
+    /// While the realm is unavailable only admins get in; a refusal is the door's one row.
+    async fn admit_while_degraded(&self, user: &UserId, door: Door) -> Result<()> {
+        let unavailable = kerberos_backend().unavailable();
+        if unavailable.is_none() || self.is_member_of(user, "lldap_admin").await? {
+            return Ok(());
+        }
+        let cause = match door {
+            Door::LdapBind => {
+                logging::record_as(
+                    Some(user),
+                    LogKind::AccessDenied,
+                    Some(user.as_str()),
+                    false,
+                    Some(LDAP_ADMINS_ONLY),
+                );
+                unavailable
+            }
+            _ => refusal_while_degraded(user, false, unavailable),
+        };
+        cause.map_or(Ok(()), |cause| Err(DomainError::KdcUnavailable(cause)))
     }
 }
 
@@ -224,6 +237,15 @@ impl LoginHandler for SqlBackendHandler {
             );
             return Err(invalid_credentials(&name));
         };
+        let (now, door) = (lock_clock(), Door::of_bind());
+        let lock = self
+            .lock_state(&name)
+            .await
+            .map_err(|e| Self::lock_unreadable(&name, LogKind::Bind, e))?;
+        if lock.as_ref().is_some_and(|lock| lock.locked(now)) {
+            self.refuse_locked(&name, LogKind::Bind);
+            return Err(invalid_credentials(&name));
+        }
         debug!(r#"Login attempt for "{}""#, &name);
         if passwords_match(&password_hash, password, &self.opaque_setup, &name)
             .await
@@ -236,12 +258,15 @@ impl LoginHandler for SqlBackendHandler {
                 false,
                 Some("invalid credentials"),
             );
+            self.count_failure(lock.as_ref(), door, now).await;
             return Err(invalid_credentials(&name));
         }
         match (requirement, code) {
             (MfaRequirement::None, _) => {
-                self.admit_at(&name, Door::of_bind(), false).await?;
+                self.admit_at(&name, door, false).await?;
+                self.admit_while_degraded(&name, door).await?;
                 logging::record_as(Some(&name), LogKind::Bind, None, true, None);
+                self.count_success(lock.as_ref(), door, now).await;
                 Ok(())
             }
             (MfaRequirement::Enrollment, _) => {
@@ -271,8 +296,10 @@ impl LoginHandler for SqlBackendHandler {
             }
             (MfaRequirement::Totp, Some(code)) => match self.verify_user_totp(&name, code).await? {
                 Ok(()) => {
-                    self.admit_at(&name, Door::of_bind(), true).await?;
+                    self.admit_at(&name, door, true).await?;
+                    self.admit_while_degraded(&name, door).await?;
                     logging::record_as(Some(&name), LogKind::Bind, None, true, Some("totp"));
+                    self.count_success(lock.as_ref(), door, now).await;
                     Ok(())
                 }
                 Err(rejection) => {
@@ -283,6 +310,9 @@ impl LoginHandler for SqlBackendHandler {
                         false,
                         Some(rejection.detail()),
                     );
+                    if rejection == TotpRejection::Invalid {
+                        self.count_failure(lock.as_ref(), door, now).await;
+                    }
                     Err(rejection.into_error(&name))
                 }
             },
@@ -327,8 +357,31 @@ impl OpaqueHandler for SqlOpaqueHandler {
                 })
             })
             .transpose()?;
-
+        let now = lock_clock();
         let mut rng = rand::rngs::OsRng;
+        let mut overlay = None;
+        let lock = match maybe_password_file {
+            Some(_) => self
+                .lock_state(&user_id)
+                .await
+                .map_err(|e| Self::lock_unreadable(&user_id, LogKind::Login, e))?,
+            None => None,
+        };
+        // A locked user is answered as a name with no password file is.
+        let maybe_password_file = match lock {
+            Some(lock) => {
+                let id = rand::RngCore::next_u64(&mut rng);
+                if lock.locked(now) || !self.lockout.start(&lock, id, now) {
+                    self.refuse_locked(&user_id, LogKind::Login);
+                    None
+                } else {
+                    overlay = Some(id);
+                    maybe_password_file
+                }
+            }
+            None => maybe_password_file,
+        };
+
         let start_response = opaque::server::login::start_login(
             &mut rng,
             &self.opaque_setup,
@@ -340,6 +393,7 @@ impl OpaqueHandler for SqlOpaqueHandler {
         let server_data = login::ServerData {
             username: user_id,
             server_login: start_response.state,
+            overlay,
         };
         let encrypted_state = orion::aead::seal(&secret_key, &bincode::serialize(&server_data)?)?;
 
@@ -356,12 +410,13 @@ impl OpaqueHandler for SqlOpaqueHandler {
             credential_finalization,
             totp_code,
             enrollment_proof: _,
-            session,
+            session: _,
         } = request;
         let secret_key = self.get_orion_secret_key(LOGIN_STATE_KEY_INFO)?;
         let login::ServerData {
             username,
             server_login,
+            overlay,
         } = decode_exact(&orion::aead::open(
             &secret_key,
             &base64::engine::general_purpose::STANDARD.decode(&server_data)?,
@@ -383,7 +438,22 @@ impl OpaqueHandler for SqlOpaqueHandler {
             return Err(invalid_credentials(&username));
         }
 
-        if let Err(e) = opaque::server::login::finish_login(server_login, credential_finalization) {
+        let verified = opaque::server::login::finish_login(server_login, credential_finalization);
+        let found = match overlay {
+            Some(id) if verified.is_ok() => self.lockout.finish(&username, id),
+            _ => false,
+        };
+        let now = lock_clock();
+        let lock = self
+            .lock_state(&username)
+            .await
+            .map_err(|e| Self::lock_unreadable(&username, LogKind::Login, e))?;
+        // Judged before the proof's result shows: a locked user gets the failed proof's answer.
+        if lock.as_ref().is_some_and(|lock| lock.locked(now)) {
+            self.refuse_locked(&username, LogKind::Login);
+            return Err(opaque::AuthenticationError::failed_proof().into());
+        }
+        if let Err(e) = verified {
             warn!(r#"OPAQUE login attempt failed for "{}""#, &username);
             logging::record_as(
                 Some(&username),
@@ -394,6 +464,11 @@ impl OpaqueHandler for SqlOpaqueHandler {
             );
             return Err(e.into());
         }
+        let foreign = overlay.filter(|_| !found);
+        let split = match foreign {
+            Some(id) => self.lockout.split(&username, id, false),
+            None => Step::default(),
+        };
         let (detail, mfa_enrollment_pending) = match self.mfa_requirement(&username).await? {
             MfaRequirement::None => (None, false),
             MfaRequirement::Enrollment => (Some("mfa enrollment pending"), true),
@@ -408,6 +483,7 @@ impl OpaqueHandler for SqlOpaqueHandler {
                         false,
                         Some("totp code required"),
                     );
+                    self.lockout.carry(self, &username, split).await;
                     return Ok(LoginOutcome::TotpRequired);
                 }
                 Some(code) => match self.verify_user_totp(&username, code).await? {
@@ -425,6 +501,9 @@ impl OpaqueHandler for SqlOpaqueHandler {
                             false,
                             Some(rejection.detail()),
                         );
+                        if rejection == TotpRejection::Invalid {
+                            self.count_failure(lock.as_ref(), Door::WebLogin, now).await;
+                        }
                         return Err(rejection.into_error(&username));
                     }
                 },
@@ -433,23 +512,14 @@ impl OpaqueHandler for SqlOpaqueHandler {
         let second_factor = detail == Some("totp");
         self.admit_at(&username, Door::WebLogin, second_factor)
             .await?;
-        let session = session != Some(false);
-        let unavailable = kerberos_backend().unavailable().filter(|_| !session);
-        if unavailable.is_some() {
-            let admin = self.is_member_of(&username, "lldap_admin").await?;
-            if let Some(cause) = refusal_while_degraded(&username, admin, unavailable) {
-                return Err(DomainError::KdcUnavailable(cause));
-            }
-        }
+        self.admit_while_degraded(&username, Door::WebLogin).await?;
         info!(r#"OPAQUE login successful for "{}""#, &username);
-        let detail = login_row_detail(detail, session);
-        logging::record_as(
-            Some(&username),
-            LogKind::Login,
-            None,
-            true,
-            detail.as_deref(),
-        );
+        logging::record_as(Some(&username), LogKind::Login, None, true, detail);
+        self.count_success(lock.as_ref(), Door::WebLogin, now).await;
+        if let Some(id) = foreign {
+            let step = self.lockout.split(&username, id, true);
+            self.lockout.carry(self, &username, step).await;
+        }
         Ok(LoginOutcome::Authenticated {
             user_id: username,
             mfa_enrollment_pending,
@@ -556,15 +626,17 @@ mod tests {
             start_response.credential_response,
             &mut rng,
         )?;
-        opaque_handler
-            .login_finish(ClientLoginFinishRequest {
-                server_data: start_response.server_data,
-                credential_finalization: login_finish.message,
-                totp_code: totp_code.map(str::to_owned),
-                enrollment_proof: None,
-                session,
-            })
-            .await
+        let finish = opaque_handler.login_finish(ClientLoginFinishRequest {
+            server_data: start_response.server_data,
+            credential_finalization: login_finish.message,
+            totp_code: totp_code.map(str::to_owned),
+            enrollment_proof: None,
+            session,
+        });
+        match session {
+            Some(false) => logging::without_session(finish).await,
+            _ => finish.await,
+        }
     }
 
     #[tokio::test]
@@ -722,9 +794,12 @@ mod tests {
         );
     }
 
+    use crate::sql_mfa_handler::pin_clock;
     use lldap_domain_handlers::logging::{RequestMeta, with_request};
     use lldap_domain_handlers::mfa::{MFA_DISABLED_GROUP, MfaPolicy};
-    use lldap_mfa::{TOTP_MAX_ATTEMPTS_PER_STEP, TOTP_STEP_SECS, format_code, totp_code};
+    use lldap_mfa::{TOTP_STEP_SECS, format_code, totp_code};
+
+    const AT: u64 = 1_770_000_015;
     use lldap_test_utils::recording_log::LogGuard;
     use serial_test::serial;
 
@@ -734,7 +809,7 @@ mod tests {
     }
 
     // Enrolls through the engine; the current step's code is spent on the confirmation.
-    async fn enroll(handler: &SqlBackendHandler, user: &str) -> Vec<u8> {
+    async fn enroll(handler: &SqlBackendHandler, user: &str, now: u64) -> Vec<u8> {
         let user_id = UserId::new(user);
         let proof = handler
             .seal_enrollment_proof(&user_id)
@@ -746,7 +821,6 @@ mod tests {
             .await
             .unwrap();
         let seed = lldap_mfa::seed_from_base32(&start.secret_base32).unwrap();
-        let now = chrono::Utc::now().timestamp() as u64;
         handler
             .finish_totp_enrollment(
                 &user_id,
@@ -759,8 +833,7 @@ mod tests {
     }
 
     // A fresh code from the neighbouring step and one invalid at every accepted step.
-    fn fresh_and_wrong(seed: &[u8]) -> (String, String) {
-        let now = chrono::Utc::now().timestamp() as u64;
+    fn fresh_and_wrong(seed: &[u8], now: u64) -> (String, String) {
         let at = |t: u64| format_code(totp_code(seed, t).unwrap());
         let current = at(now);
         let fresh = [now + TOTP_STEP_SECS, now - TOTP_STEP_SECS]
@@ -797,12 +870,17 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_bind_enforces_totp() {
+        let _clock = pin_clock(AT as i64);
         let guard = LogGuard::install();
         let peer = "10.77.1.1";
         let handler = mfa_handler(MfaPolicy::Enrolled).await;
         insert_user(&handler, "bob", "bob00").await;
-        let seed = enroll(&handler, "bob").await;
-        let (fresh, wrong) = fresh_and_wrong(&seed);
+        let seed = enroll(&handler, "bob", AT).await;
+        let (fresh, wrong) = fresh_and_wrong(&seed, AT);
+        let wrong = format!("bob00:{wrong}");
+        let right = format_code(totp_code(&seed, AT + TOTP_STEP_SECS).unwrap());
+        let right = format!("bob00:{right}");
+        let mut answers = Vec::new();
         with_request(
             RequestMeta::ldap(None, Some(peer.parse().unwrap())),
             async {
@@ -812,10 +890,7 @@ mod tests {
                     .await
                     .unwrap_err();
                 assert!(err.to_string().contains(TOTP_CODE_REQUIRED), "{err}");
-                let err = handler
-                    .bind(bind_request("bob", &format!("bob00:{wrong}")))
-                    .await
-                    .unwrap_err();
+                let err = handler.bind(bind_request("bob", &wrong)).await.unwrap_err();
                 assert!(err.to_string().contains("Invalid TOTP code"), "{err}");
                 // A wrong password is refused before the code is looked at.
                 let err = handler
@@ -832,46 +907,23 @@ mod tests {
                     .await
                     .unwrap_err();
                 assert!(err.to_string().contains("already used"), "{err}");
-
-                // Spend the next step too, or a boundary crossed mid-test refills the
-                // allowance; reserving it first prunes the older steps' counts. The
-                // wrong binds must then all land in the current step, or the tail of
-                // the loop hits that reserved step: wait out a near boundary first.
-                let remaining =
-                    TOTP_STEP_SECS - (chrono::Utc::now().timestamp() as u64 % TOTP_STEP_SECS);
-                if remaining < u64::from(TOTP_MAX_ATTEMPTS_PER_STEP) * 3 {
-                    tokio::time::sleep(std::time::Duration::from_secs(remaining)).await;
-                }
-                let uuid = model::User::find_by_id(UserId::new("bob"))
-                    .one(&handler.sql_pool)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .uuid;
-                let next_step = chrono::Utc::now().timestamp() as u64 + TOTP_STEP_SECS;
-                for _ in 0..TOTP_MAX_ATTEMPTS_PER_STEP {
-                    assert!(
-                        handler
-                            .failed_totp_attempts
-                            .reserve(uuid.as_str(), next_step)
-                    );
-                }
-                for _ in 0..TOTP_MAX_ATTEMPTS_PER_STEP {
-                    let (_, wrong) = fresh_and_wrong(&seed);
-                    let _ = handler
-                        .bind(bind_request("bob", &format!("bob00:{wrong}")))
-                        .await;
-                }
                 // The gate runs before verification: even a valid code is refused.
-                let (fresh, _) = fresh_and_wrong(&seed);
-                let err = handler
-                    .bind(bind_request("bob", &format!("bob00:{fresh}")))
-                    .await
-                    .unwrap_err();
-                assert!(err.to_string().contains("Too many TOTP attempts"), "{err}");
+                for password in [&wrong, &wrong, &wrong, &wrong, &wrong, &right] {
+                    let err = handler
+                        .bind(bind_request("bob", password))
+                        .await
+                        .unwrap_err();
+                    answers.push(err.to_string().contains("Too many TOTP attempts"));
+                }
             },
         )
         .await;
+        assert_eq!(
+            answers,
+            vec![false, false, false, false, true, true],
+            "the earlier wrong code is the step's one failure; four more answer invalid, then two \
+             are past the limit"
+        );
         let row =
             |success, detail: Option<&str>| (LogKind::Bind, success, detail.map(str::to_owned));
         let mut expected = vec![
@@ -881,13 +933,14 @@ mod tests {
             row(true, Some("totp")),
             row(false, Some("totp replayed")),
         ];
-        expected.extend((0..TOTP_MAX_ATTEMPTS_PER_STEP).map(|_| row(false, Some("invalid totp"))));
-        expected.push(row(false, Some("totp attempts exceeded")));
+        expected.extend((0..4).map(|_| row(false, Some("invalid totp"))));
+        expected.extend((0..2).map(|_| row(false, Some("totp attempts exceeded"))));
         assert_eq!(auth_rows(&guard, peer), expected);
     }
 
     #[tokio::test]
     async fn test_bind_exempt_unenrolled_and_disabled_policy() {
+        let _clock = pin_clock(AT as i64);
         let handler = mfa_handler(MfaPolicy::Always).await;
         insert_user(&handler, "bob", "bob00").await;
         insert_user(&handler, "eve", "eve00").await;
@@ -906,14 +959,14 @@ mod tests {
         assert!(err.to_string().contains(MFA_ENROLLMENT_REQUIRED), "{err}");
         handler.bind(bind_request("eve", "eve00")).await.unwrap();
         // Exemption beats enrollment under both positive modes.
-        enroll(&handler, "eve").await;
+        enroll(&handler, "eve", AT).await;
         handler.bind(bind_request("eve", "eve00")).await.unwrap();
         let handler = handler.with_mfa_policy(MfaPolicy::Enrolled);
         handler.bind(bind_request("eve", "eve00")).await.unwrap();
         handler.bind(bind_request("bob", "bob00")).await.unwrap();
         // Disabled never splits: a password that ends in :digits is the whole password.
         insert_user(&handler, "kim", "kim:123456").await;
-        enroll(&handler, "kim").await;
+        enroll(&handler, "kim", AT).await;
         let handler = handler.with_mfa_policy(MfaPolicy::Disabled);
         handler
             .bind(bind_request("kim", "kim:123456"))
@@ -925,6 +978,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_login_finish_enforces_totp() {
+        let _clock = pin_clock(AT as i64);
         let guard = LogGuard::install();
         let peer = "10.77.1.2";
         let handler = mfa_handler(MfaPolicy::Always).await;
@@ -940,8 +994,8 @@ mod tests {
                         mfa_enrollment_pending: true,
                     }
                 );
-                let seed = enroll(&handler, "bob").await;
-                let (fresh, wrong) = fresh_and_wrong(&seed);
+                let seed = enroll(&handler, "bob", AT).await;
+                let (fresh, wrong) = fresh_and_wrong(&seed, AT);
                 assert_eq!(
                     attempt_login(&handler, "bob", "bob00", None).await.unwrap(),
                     LoginOutcome::TotpRequired
@@ -978,6 +1032,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_a_sessionless_finish_writes_the_doors_one_row_saying_no_session() {
+        let _clock = pin_clock(AT as i64);
         let guard = LogGuard::install();
         let peer = "10.77.1.3";
         let handler = mfa_handler(MfaPolicy::Always).await;
@@ -996,8 +1051,8 @@ mod tests {
                         mfa_enrollment_pending: true,
                     }
                 );
-                let seed = enroll(&handler, "bob").await;
-                let (fresh, wrong) = fresh_and_wrong(&seed);
+                let seed = enroll(&handler, "bob", AT).await;
+                let (fresh, wrong) = fresh_and_wrong(&seed, AT);
                 assert_eq!(
                     attempt_login_with(&handler, "bob", "bob00", None, check)
                         .await
@@ -1025,10 +1080,10 @@ mod tests {
             auth_rows(&guard, peer),
             vec![
                 row(true, Some("mfa enrollment pending; no session")),
-                row(false, Some("totp code required")),
-                row(false, Some("invalid totp")),
+                row(false, Some("totp code required; no session")),
+                row(false, Some("invalid totp; no session")),
                 row(true, Some("totp; no session")),
-                row(true, Some(NO_SESSION)),
+                row(true, Some(logging::NO_SESSION)),
                 row(true, None),
                 row(true, None),
             ]
@@ -1495,14 +1550,110 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn test_a_degraded_realm_refusal_is_the_doors_one_row_with_no_success_row() {
+        use lldap_domain_handlers::kerberos::{ADMINS_ONLY, LDAP_ADMINS_ONLY};
+        use lldap_domain_handlers::logging::Protocol;
+        use lldap_test_utils::enforcement::EnforcementGuard;
+        use lldap_test_utils::recording_kerberos::{DEGRADED_CAUSE, DegradedGuard};
+        let log = LogGuard::install_on_this_thread();
+        let _guard = EnforcementGuard::none();
+        let handler =
+            SqlOpaqueHandler::new(generate_random_private_key(), get_initialized_db().await);
+        insert_user(&handler, "e1down", "e1down00").await;
+        insert_user(&handler, "e1admin", "e1admin00").await;
+        let admins = insert_group(&handler, "lldap_admin").await;
+        insert_membership(&handler, admins, "e1admin").await;
+        let _kdc = DegradedGuard::install();
+        let rows = [
+            (
+                "the LDAP bind",
+                Door::LdapBind,
+                LogKind::Bind,
+                Protocol::Ldap,
+            ),
+            (
+                "the simple login",
+                Door::SimpleLogin,
+                LogKind::Bind,
+                Protocol::Http,
+            ),
+            (
+                "the web login",
+                Door::WebLogin,
+                LogKind::Login,
+                Protocol::Http,
+            ),
+        ];
+        for (label, door, kind, protocol) in rows {
+            for user in ["e1down", "e1admin"] {
+                let password = format!("{user}00");
+                let meta = match protocol {
+                    Protocol::Ldap => RequestMeta::ldap(None, None),
+                    _ => RequestMeta::http(None, None),
+                };
+                let answered = with_request(meta, async {
+                    match door {
+                        Door::WebLogin => attempt_login(&handler, user, &password, None)
+                            .await
+                            .map(drop),
+                        _ => handler.bind(bind_request(user, &password)).await,
+                    }
+                })
+                .await;
+                let rows: Vec<_> = log
+                    .recorder()
+                    .take_events()
+                    .into_iter()
+                    .filter(|e| e.actor.as_deref() == Some(user))
+                    .map(|e| (e.kind, e.success, e.protocol, e.target, e.detail))
+                    .collect();
+                let (answer, expected) = match (user, door) {
+                    ("e1admin", _) => (Ok(()), (kind, true, protocol, None, None)),
+                    (_, Door::LdapBind) => (
+                        Err(DEGRADED_CAUSE.to_owned()),
+                        (
+                            LogKind::AccessDenied,
+                            false,
+                            protocol,
+                            Some(user.to_owned()),
+                            Some(LDAP_ADMINS_ONLY.to_owned()),
+                        ),
+                    ),
+                    _ => (
+                        Err(DEGRADED_CAUSE.to_owned()),
+                        (
+                            LogKind::AccessDenied,
+                            false,
+                            protocol,
+                            None,
+                            Some(ADMINS_ONLY.to_owned()),
+                        ),
+                    ),
+                };
+                let answered = answered.map_err(|e| match e {
+                    DomainError::KdcUnavailable(cause) => cause,
+                    other => format!("not KdcUnavailable: {other}"),
+                });
+                assert_eq!(
+                    (answered, rows),
+                    (answer, vec![expected]),
+                    "{label}, {user}: one row, and no success row for a refusal"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_a_policy_refusal_after_a_right_totp_code_is_the_binds_one_row() {
+        let _clock = pin_clock(AT as i64);
         use lldap_test_utils::enforcement::EnforcementGuard;
         let log = LogGuard::install_on_this_thread();
         let peer = "10.77.1.9";
         let handler = mfa_handler(MfaPolicy::Enrolled).await;
         insert_user(&handler, "e0totp", "e0totp00").await;
-        let seed = enroll(&handler, "e0totp").await;
-        let (fresh, _) = fresh_and_wrong(&seed);
+        let seed = enroll(&handler, "e0totp", AT).await;
+        let (fresh, _) = fresh_and_wrong(&seed, AT);
         let guard = EnforcementGuard::refusing(&["e0totp"], "login-hours");
         let meta = RequestMeta::ldap(None, Some(peer.parse().unwrap()));
         let request = bind_request("e0totp", &format!("e0totp00:{fresh}"));

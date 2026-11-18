@@ -1,6 +1,6 @@
 use crate::common::{
     auth::{get_token, opaque_login},
-    fixture::{LLDAPFixture, User, query_i64},
+    fixture::{LLDAPFixture, User, create_lldap_command, query_i64},
 };
 use lldap_auth::{login, opaque, types::UserId};
 use reqwest::blocking::{Client, ClientBuilder};
@@ -188,4 +188,146 @@ fn test_lockout_facts_at_web_login() {
         allowed,
         "today the right password still logs in after 60 failures: {status} {body}"
     );
+}
+
+const LOCKED: &str = "e1lock";
+
+fn simple_status(client: &Client, base_url: &str, password: &str) -> u16 {
+    client
+        .post(format!("{base_url}/auth/simple/login"))
+        .json(&login::ClientSimpleLoginRequest {
+            username: UserId::new(LOCKED),
+            password: password.to_owned(),
+            enrollment_proof: None,
+        })
+        .send()
+        .expect("simple login send")
+        .status()
+        .as_u16()
+}
+
+// The start is answered either way; a locked user's, like a wrong password's, cannot finish.
+fn web_finishes_in_the_client(client: &Client, base_url: &str, password: &str) -> bool {
+    let mut rng = rand::rngs::OsRng;
+    let start = opaque::client::login::start_login(password, &mut rng).expect("login start");
+    let response: login::ServerLoginStartResponse = client
+        .post(format!("{base_url}/auth/opaque/login/start"))
+        .json(&login::ClientLoginStartRequest {
+            username: UserId::new(LOCKED),
+            login_start_request: start.message,
+        })
+        .send()
+        .expect("login start send")
+        .error_for_status()
+        .expect("login start status")
+        .json()
+        .expect("login start json");
+    opaque::client::login::finish_login(
+        start.state,
+        password.as_bytes(),
+        response.credential_response,
+        &mut rng,
+    )
+    .is_ok()
+}
+
+#[test]
+fn test_a_threshold_locks_each_directory_door_and_each_unlock_releases() {
+    let fixture = LLDAPFixture::new();
+    let client = client();
+    let url = fixture.http_url();
+    let admin = get_token(&client, &url);
+    let ok = |query: &str, variables: Value, field: &str| {
+        let answer = gql(&client, &url, &admin, query, variables);
+        assert!(answer["errors"].is_null(), "{field}: {answer}");
+        answer["data"][field].clone()
+    };
+    ok(
+        "mutation($n: String!) { createOu(name: $n) { ok } }",
+        json!({"n": LOCKED}),
+        "createOu",
+    );
+    ok(
+        "mutation($u: CreateUserInput!) { createUser(user: $u) { id } }",
+        json!({"u": {"id": LOCKED, "email": "e1lock@example.com"}}),
+        "createUser",
+    );
+    ok(
+        "mutation($id: String!, $pw: String!) { setUserPassword(userId: $id, password: $pw) { ok } }",
+        json!({"id": LOCKED, "pw": RIGHT}),
+        "setUserPassword",
+    );
+    ok(
+        "mutation($ids: [String!]!, $ou: String!) { changeUserOu(userIds: $ids, newOu: $ou) { ok } }",
+        json!({"ids": [LOCKED], "ou": LOCKED}),
+        "changeUserOu",
+    );
+    let policy = ok(
+        "mutation($n: String!, $i: [PolicyItemInput!]) { createPolicy(name: $n, items: $i) { id } }",
+        json!({"n": "e1 lock", "i": [
+            {"key": "lockout-threshold", "value": "3"},
+            {"key": "lockout-duration-seconds", "value": "0"},
+        ]}),
+        "createPolicy",
+    );
+    ok(
+        "mutation($o: String!, $p: Int!) { setOuPolicy(ou: $o, policyId: $p) { ok } }",
+        json!({"o": LOCKED, "p": policy["id"]}),
+        "setOuPolicy",
+    );
+
+    let wrong: Vec<u16> = (0..3)
+        .map(|i| simple_status(&client, &url, &format!("wrong-{i}")))
+        .collect();
+    assert_eq!(wrong, [401; 3]);
+    assert_eq!(simple_status(&client, &url, RIGHT), 401, "locked at 3");
+    let tool = create_lldap_command("unlock", fixture.db_url())
+        .arg(LOCKED)
+        .output()
+        .expect("lldap unlock");
+    let said = String::from_utf8_lossy(&tool.stdout);
+    assert!(
+        tool.status.success() && said.contains("Unlocked e1lock"),
+        "{said}"
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while simple_status(&client, &url, RIGHT) != 200 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a bind reads the row the tool wrote"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+
+    for i in 0..3 {
+        assert!(!web_finishes_in_the_client(
+            &client,
+            &url,
+            &format!("wrong-{i}")
+        ));
+    }
+    assert!(
+        !web_finishes_in_the_client(&client, &url, RIGHT),
+        "a locked user's start is answered as an unknown name's"
+    );
+    ok(
+        "mutation($u: String!) { unlockUser(userId: $u) { ok } }",
+        json!({"u": LOCKED}),
+        "unlockUser",
+    );
+    let (status, body) = opaque_login(&client, &url, LOCKED, RIGHT, None);
+    assert!(
+        status.is_success() && body["token"].is_string(),
+        "{status} {body}"
+    );
+    let unlocks = |detail: &str| {
+        query_i64(
+            fixture.db_url(),
+            &format!(
+                "SELECT COUNT(*) FROM logs WHERE kind = 'account_unlock' \
+                 AND target = '{LOCKED}' AND detail = '{detail}'"
+            ),
+        )
+    };
+    assert_eq!((unlocks("lldap unlock"), unlocks("unlockUser")), (1, 1));
 }

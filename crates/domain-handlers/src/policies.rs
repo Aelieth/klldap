@@ -66,8 +66,8 @@ pub static POLICY_ITEM_CATALOG: &[PolicyItemSpec] = &[
         scope: PolicyScope::User,
         value_type: PolicyValueType::Int { min: 0, max: 100 },
         default_value: "0",
-        enforced: false,
-        description: "Failed logins before lockout; 0 disables. Not yet enforced.",
+        enforced: true,
+        description: "Failed logins in a row before the account locks, at every door; 0 disables.",
     },
     PolicyItemSpec {
         key: "lockout-duration-seconds",
@@ -77,8 +77,8 @@ pub static POLICY_ITEM_CATALOG: &[PolicyItemSpec] = &[
             max: 604800,
         },
         default_value: "900",
-        enforced: false,
-        description: "How long a lockout lasts, in seconds. Not yet enforced.",
+        enforced: true,
+        description: "How long a lockout lasts, in seconds; 0 holds it until an admin unlocks.",
     },
     PolicyItemSpec {
         key: "login-hours",
@@ -684,7 +684,17 @@ mod tests {
         assert!(
             POLICY_ITEM_CATALOG
                 .iter()
-                .all(|s| s.scope == PolicyScope::User && !s.enforced)
+                .all(|s| s.scope == PolicyScope::User)
         );
+        let enforced: Vec<&str> = POLICY_ITEM_CATALOG
+            .iter()
+            .filter(|s| s.enforced)
+            .map(|s| s.key)
+            .collect();
+        assert_eq!(enforced, ["lockout-threshold", "lockout-duration-seconds"]);
+        for spec in POLICY_ITEM_CATALOG {
+            let says_not_yet = spec.description.contains("Not yet enforced");
+            assert_eq!(says_not_yet, !spec.enforced, "{}", spec.key);
+        }
     }
 }

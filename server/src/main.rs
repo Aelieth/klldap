@@ -18,7 +18,7 @@ mod tcp_server;
 mod tls;
 
 use crate::{
-    cli::{Command, RunOpts, TestEmailOpts},
+    cli::{Command, RunOpts, TestEmailOpts, UnlockOpts},
     configuration::{Configuration, compare_private_key_hashes},
     database_string::DatabaseUrl,
     db_cleaner::Scheduler,
@@ -30,20 +30,22 @@ use futures_util::TryFutureExt;
 use lldap_sql_backend_handler::{
     KerberosLost, LogRetention, SqlBackendHandler, realm_marked_open, register_password,
     sql_tables::{self, get_private_key_info, set_private_key_info},
-    sqlite_extra_synchronous, start_kerberos_committer, start_log_writer, warn_database_durability,
+    sqlite_extra_synchronous, start_kerberos_committer, start_log_writer, unlock_login_on,
+    warn_database_durability,
 };
 use sea_orm::{Database, DatabaseConnection};
 use std::{net::IpAddr, sync::Arc, time::Duration};
 use tracing::{Instrument, Level, debug, error, info, instrument, span, warn};
 
 use lldap_domain::requests::{CreateGroupRequest, CreateUserRequest};
-use lldap_domain::types::{Attribute, BUILTIN_GROUPS, kerberos_sync_enabled};
+use lldap_domain::types::{Attribute, BUILTIN_GROUPS, UserId, kerberos_sync_enabled};
 use lldap_domain_handlers::enforcement::{CacheFollower, policy_cache, start_policy_cache};
 use lldap_domain_handlers::kerberos::{
     DegradedKerberos, KerberosSync, NoopKerberos, kerberos_backend, kerberos_store,
     set_kerberos_backend,
 };
-use lldap_domain_handlers::logging::{LogKind, event, record};
+use lldap_domain_handlers::lockout::{UNLOCKED_BY_TOOL, lock_clock, lockout, start_lockout};
+use lldap_domain_handlers::logging::{self as rows, LogKind, event, record};
 use lldap_domain_handlers::password::{
     PasswordChangeError, PasswordSync, change_password_everywhere, password_rules,
 };
@@ -485,6 +487,7 @@ async fn set_up_server(
         bail!(RESTART_WITHOUT_FORCE);
     }
     let _policy_filler = start_policy_cache(&backend_handler).await;
+    let _lockout = start_lockout(&backend_handler, policy_cache()).await;
     let (realm_threads, embedded) = match config.kerberos_options.enabled {
         false => (None, None),
         true => {
@@ -766,6 +769,7 @@ async fn run_server_command(opts: RunOpts) -> Result<()> {
         }
         Err(e) => Err(e),
     };
+    lockout().stop().await;
     if let Some(committer) = committer {
         committer.shutdown().await;
     }
@@ -845,6 +849,28 @@ async fn create_schema_command(opts: RunOpts) -> Result<()> {
     Ok(())
 }
 
+async fn unlock_command(opts: UnlockOpts) -> Result<()> {
+    debug!("CLI: {:#?}", &opts);
+    let user = UserId::new(&opts.user);
+    let config = configuration::init(opts)?;
+    logging::init(&config)?;
+    let sql_pool = setup_sql_tables(&config.database_url).await?;
+    let row = event(
+        LogKind::AccountUnlock,
+        Some(user.as_str()),
+        true,
+        Some(UNLOCKED_BY_TOOL),
+    );
+    let unlocked = unlock_login_on(&sql_pool, &user, lock_clock(), row.clone()).await;
+    if let Err(e) = sql_pool.close().await {
+        error!("Error closing database connection pool: {}", e);
+    }
+    unlocked.with_context(|| format!("while unlocking {user}"))?;
+    rows::print(&row);
+    println!("Unlocked {user}; a running server sees it within 30 seconds.");
+    Ok(())
+}
+
 #[actix::main]
 async fn main() -> Result<()> {
     let cli_opts = cli::init();
@@ -856,6 +882,7 @@ async fn main() -> Result<()> {
         Command::HealthCheck(opts) => run_healthcheck(opts).await,
         Command::SendTestEmail(opts) => send_test_email_command(opts).await,
         Command::CreateSchema(opts) => create_schema_command(opts).await,
+        Command::Unlock(opts) => unlock_command(opts).await,
     }
 }
 

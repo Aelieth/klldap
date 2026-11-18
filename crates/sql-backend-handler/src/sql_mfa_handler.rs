@@ -19,25 +19,42 @@ use lldap_mfa::{
 use sea_orm::{
     ActiveModelTrait, ActiveValue, ColumnTrait, EntityTrait, QueryFilter, sea_query::Expr,
 };
-#[cfg(test)]
+#[cfg(any(test, feature = "test-clock"))]
 use std::cell::Cell;
 use std::sync::OnceLock;
 use tracing::{info, instrument, warn};
 
 const TOTP_ISSUER: &str = "KLLDAP";
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-clock"))]
 thread_local! {
     static TEST_NOW: Cell<Option<i64>> = const { Cell::new(None) };
 }
 
-#[cfg(test)]
-fn set_enrollment_clock(now: Option<i64>) {
+#[cfg(any(test, feature = "test-clock"))]
+pub fn set_enrollment_clock(now: Option<i64>) {
     TEST_NOW.with(|clock| clock.set(now));
 }
 
+/// The injected clock for one test row; reset when the row ends, by a panic too.
+#[cfg(test)]
+pub(crate) struct PinnedClock;
+
+#[cfg(test)]
+impl Drop for PinnedClock {
+    fn drop(&mut self) {
+        set_enrollment_clock(None);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn pin_clock(at: i64) -> PinnedClock {
+    set_enrollment_clock(Some(at));
+    PinnedClock
+}
+
 fn now_unix() -> i64 {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-clock"))]
     if let Some(now) = TEST_NOW.with(|clock| clock.get()) {
         return now;
     }
@@ -228,6 +245,7 @@ impl SqlBackendHandler {
             .rows_affected;
         if cleared > 0 {
             logging::record(LogKind::MfaReset, None, Some("private key changed"));
+            self.policy_cache.poke_fill();
         }
         Ok(cleared)
     }
@@ -261,6 +279,7 @@ impl MfaBackendHandler for SqlBackendHandler {
             return Ok(());
         }
         self.write_mfa_columns(user_id, None, None).await?;
+        self.user_written(user_id).await;
         info!(r#"Cleared MFA state for "{}""#, user_id);
         logging::record(LogKind::MfaReset, Some(user_id.as_str()), reason.detail());
         Ok(())
@@ -274,6 +293,7 @@ impl MfaBackendHandler for SqlBackendHandler {
             return Err(rejection.into_error(user_id));
         }
         self.write_mfa_columns(user_id, None, None).await?;
+        self.user_written(user_id).await;
         info!(r#"Cleared own MFA state for "{}""#, user_id);
         logging::record(LogKind::MfaReset, target, Some("self"));
         Ok(())
@@ -405,6 +425,7 @@ impl MfaBackendHandler for SqlBackendHandler {
                 })?;
         self.write_mfa_columns(user_id, Some(sealed), Some(MFA_TYPE_TOTP.to_owned()))
             .await?;
+        self.user_written(user_id).await;
         info!(r#"TOTP enrollment completed for "{}""#, user_id);
         let detail = if state.replaces_existing {
             "replaced"

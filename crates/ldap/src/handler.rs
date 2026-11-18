@@ -20,10 +20,9 @@ use ldap3_proto::proto::{
     OID_PASSWORD_MODIFY, OID_WHOAMI,
 };
 use lldap_access_control::AccessControlledBackendHandler;
-use lldap_auth::access_control::{Permission, ValidationResults};
+use lldap_auth::access_control::ValidationResults;
 use lldap_domain::types::UserId;
 use lldap_domain_handlers::handler::{BackendHandler, LoginHandler};
-use lldap_domain_handlers::kerberos::kerberos_backend;
 use lldap_domain_handlers::logging::{self, LogKind, RequestMeta, with_request};
 use lldap_opaque_handler::OpaqueHandler;
 use lldap_schema::PublicSchema;
@@ -186,15 +185,17 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
             Ok(user_id) => {
                 self.user_info = self
                     .backend_handler
-                    .get_permissions_for_user(user_id.clone())
+                    .get_permissions_for_user(user_id)
                     .await
                     .ok();
-                match self.refuse_unless_admin(&user_id) {
-                    Some(cause) => (LdapResultCode::Unavailable, cause),
-                    None => (LdapResultCode::Success, "".to_string()),
-                }
+                (LdapResultCode::Success, "".to_string())
             }
-            Err(err) => (err.code, err.message),
+            Err(err) => {
+                if err.code == LdapResultCode::Unavailable {
+                    self.user_info = None;
+                }
+                (err.code, err.message)
+            }
         };
         vec![LdapOp::BindResponse(LdapBindResponse {
             res: LdapResultOp {
@@ -205,22 +206,6 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
             },
             saslcreds: None,
         })]
-    }
-
-    fn refuse_unless_admin(&mut self, user_id: &UserId) -> Option<String> {
-        let cause = kerberos_backend().unavailable()?;
-        if (self.user_info.as_ref()).is_some_and(|info| info.permission == Permission::Admin) {
-            return None;
-        }
-        self.user_info = None;
-        logging::record_as(
-            Some(user_id),
-            LogKind::AccessDenied,
-            Some(user_id.as_str()),
-            false,
-            Some("only admins may bind while Kerberos is unavailable"),
-        );
-        Some(cause)
     }
 
     // A known user bound under the wrong OU is refused before any password work, so the
@@ -605,12 +590,13 @@ pub mod tests {
         for (n, (group, password, code)) in rows.into_iter().enumerate() {
             let refused = code == LdapResultCode::Unavailable;
             let mut mock = MockTestBackendHandler::new();
-            mock.expect_bind()
-                .times(1)
-                .returning(|request| match request.password.as_str() {
-                    "pass" => Ok(()),
+            mock.expect_bind().times(1).returning(move |request| {
+                match (request.password.as_str(), group) {
+                    ("pass", "lldap_admin") => Ok(()),
+                    ("pass", _) => Err(DomainError::KdcUnavailable(DEGRADED_CAUSE.to_owned())),
                     _ => Err(DomainError::AuthenticationError("bad".to_owned())),
-                });
+                }
+            });
             mock.expect_get_user_groups().returning(move |_| {
                 let date = chrono::DateTime::UNIX_EPOCH.naive_utc();
                 Ok([GroupDetails {
@@ -652,9 +638,9 @@ pub mod tests {
                     &code,
                     if refused { DEGRADED_CAUSE } else { "" },
                     code == LdapResultCode::Success,
-                    usize::from(refused),
+                    0,
                 ),
-                "{group} {password}"
+                "{group} {password}: the bind's row is the login handler's, none here"
             );
         }
     }

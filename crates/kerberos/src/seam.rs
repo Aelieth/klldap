@@ -12,6 +12,7 @@ use lldap_domain::types::UserId;
 use lldap_domain_handlers::kerberos::{
     self as directory, AliasOnto, DIRECTORY_TARGET, DIRECTORY_USER, HostRow,
 };
+use lldap_domain_handlers::lockout::{UNLOCKED_BY_KADMIN, lock_clock, lockout};
 use lldap_domain_handlers::logging::{self, LogKind};
 use lldap_domain_handlers::password::{PASSWORD_MIN_LENGTH, PasswordChangeError, password_rules};
 use lldap_opaque_handler::{OpaqueHandler, prepare_registration};
@@ -515,12 +516,30 @@ impl KerberosStore for SqlRealm {
                 self.write_new(change, &new, &onto)
             }
             Verdict::Unlock(named) => {
-                self.write(Vec::new(), change.batch)?;
-                let detail = format!(
-                    "kadmin unlock by {} (no lockout counter yet){}",
-                    client(&change.intent.caller),
-                    named.requested_as()
-                );
+                let at = lock_clock();
+                let by = client(&change.intent.caller);
+                let rows = named.user.iter().flat_map(|user| {
+                    let target = Some(user.as_str());
+                    let detail = Some(UNLOCKED_BY_KADMIN);
+                    [
+                        HostRow::Unlock {
+                            user: user.clone(),
+                            at,
+                        },
+                        HostRow::Log(logging::kadmin_event(
+                            by,
+                            LogKind::AccountUnlock,
+                            target,
+                            true,
+                            detail,
+                        )),
+                    ]
+                });
+                self.write(rows.collect(), change.batch)?;
+                if let Some(user) = &named.user {
+                    lockout().unlocked(user, at);
+                }
+                let detail = format!("kadmin unlock by {by}{}", named.requested_as());
                 logging::record_kadmin(
                     client(&change.intent.caller),
                     LogKind::KerberosSync,
@@ -940,6 +959,7 @@ mod tests {
     use krb5_types::PrincipalName;
     use lldap_domain::types::UserId;
     use lldap_domain_handlers::kerberos::KerberosSync;
+    use lldap_domain_handlers::lockout::LockWrite;
     use lldap_sql_backend_handler::{
         KerberosCommitterHandle, sql_tables::init_table, start_unregistered_committer,
     };
@@ -4090,7 +4110,7 @@ mod tests {
         let edit = |s: &mut PrincipalStore| s.clear_fail_auth_count_in(&bob, "EXAMPLE.COM", ADMIN);
         let (keys_unlocked, stored) = (key_bytes(&bob), record());
         let unlocked = kadmin_write(&store, true, unlock, &bob, &edit);
-        let unlock_row = format!("kadmin unlock by {ADMIN} (no lockout counter yet)");
+        let unlock_row = format!("kadmin unlock by {ADMIN}");
         assert_eq!(
             (
                 unlocked,
@@ -4167,7 +4187,7 @@ mod tests {
             let protocol = logging::Protocol::Kadmin;
             (kind, protocol, admin, target, Some(detail.to_owned()))
         };
-        let unlocked_row = format!("kadmin unlock by {ADMIN} (no lockout counter yet)");
+        let unlocked_row = format!("kadmin unlock by {ADMIN}");
         let refused_row = format!("kadmin modify on bob@EXAMPLE.COM by {ADMIN}: PROTECT_PRINCIPAL");
         let (mut got, mut want) = (Vec::new(), Vec::new());
         for (label, client_mask, modify, carried) in &unlocks {
@@ -4912,6 +4932,85 @@ mod tests {
             "{stdout}{}",
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    #[test]
+    #[serial]
+    fn test_a_kadmin_unlock_is_the_directorys_at_the_servers_clock_whatever_time_it_carries() {
+        use krb5_kdc::PrincipalStore;
+        use lldap_auth::opaque::server::generate_random_private_key;
+        use lldap_domain_handlers::lockout::LockStore;
+        use lldap_sql_backend_handler::SqlBackendHandler;
+
+        let runtime = runtime();
+        let temp = TempRealm::new();
+        let profile = boot::profile(&temp.settings);
+        let memory = |runtime: &Runtime| sqlite_one_connection("sqlite::memory:", runtime);
+        let (committer, pool) = committer_on(&memory, &runtime);
+        add_user(&pool, &runtime, "e1kadmin");
+        let handler = SqlBackendHandler::new(generate_random_private_key(), pool.clone());
+        let records = Records {
+            handler: Arc::new(handler.clone()),
+            runtime: runtime.handle().clone(),
+        };
+        let host = Arc::new(SqlRealm::new(committer.store()).serving("EXAMPLE.COM", Some(records)));
+        host.start_pass_committed();
+        let store = krb5_kdc::shared_dump(
+            boot::open_store(&temp.settings, &profile, host.clone()).unwrap(),
+        );
+        let ready = Arc::new(AtomicBool::new(true));
+        let embedded = EmbeddedKerberos::new(store.clone(), &temp.settings, ready, host.clone());
+        let user = UserId::new("e1kadmin");
+        runtime
+            .block_on(synced(&embedded, &user, "E1-Kadmin-Pass-1"))
+            .unwrap();
+        let principal = name("e1kadmin");
+        let fail = || {
+            let stored = runtime.block_on(handler.read_lock(&user)).unwrap();
+            let row = stored.unwrap_or_default().failed(lock_clock());
+            let rows = [LockWrite {
+                user: user.clone(),
+                uuid: None,
+                row: Some(row),
+                split: None,
+            }];
+            runtime.block_on(handler.write_locks("0", &rows)).unwrap();
+        };
+        let count = || runtime.block_on(handler.read_lock(&user)).unwrap().unwrap();
+        let mit = kadm5_mask::FAIL_AUTH_COUNT | kadm5_mask::TL_DATA;
+        for (label, carried, counted) in [("1970", 0_u32, 3), ("a time to come", u32::MAX, 4)] {
+            (0..3).for_each(|_| fail());
+            assert_eq!(count().fail_count, counted, "{label}: counted first");
+            let mut unlock = modify_of(mit, &[UNLOCKED], None);
+            unlock.tl_data[0].contents = carried.to_le_bytes().to_vec();
+            let intent = intent_of(Operation::Modify, kadmin(false), &["e1kadmin"], &mask(mit));
+            let edit = |s: &mut PrincipalStore| {
+                s.modify_principal_in(&principal, "EXAMPLE.COM", unlock.clone(), ADMIN)
+            };
+            let before = lock_clock();
+            let answer = kadmin_write(&store, true, intent, &principal, &edit);
+            let after = lock_clock();
+            let row = count();
+            let at = row.last_admin_unlock.unwrap();
+            assert_eq!((answer.as_str(), row.fail_count), ("written", 0), "{label}");
+            assert!(
+                before <= at && at <= after,
+                "{label}: {before} {at} {after}"
+            );
+            fail();
+            assert_eq!(
+                count().fail_count,
+                1,
+                "{label}: the next failure counts from 1"
+            );
+        }
+        let unlocks = details(&pool, &runtime, "account_unlock");
+        let by = sources(&pool, &runtime, "account_unlock");
+        assert_eq!(unlocks, vec![UNLOCKED_BY_KADMIN.to_owned(); 2]);
+        assert_eq!(by, vec![("kadmin".to_owned(), Some(ADMIN.to_owned())); 2]);
+        lockout().forget(&user);
+        drop((embedded, store, host));
+        runtime.block_on(committer.shutdown());
     }
 
     fn alias_targets(pool: &DatabaseConnection, runtime: &Runtime) -> Vec<(String, String)> {

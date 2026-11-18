@@ -69,6 +69,9 @@ impl CommonComponent<ResetOwnMfaForm> for ResetOwnMfaForm {
         match msg {
             Msg::FormUpdate => Ok(true),
             Msg::Submit => {
+                if self.opaque_data.is_some() || self.common.is_task_running() {
+                    return Ok(false);
+                }
                 if !self.form.validate() {
                     bail!("Check the form for errors");
                 }
@@ -87,8 +90,9 @@ impl CommonComponent<ResetOwnMfaForm> for ResetOwnMfaForm {
                 Ok(true)
             }
             Msg::AuthenticationStartResponse(res) => {
+                let held = self.opaque_data.take();
                 let res = res.map_err(|e| anyhow!("Could not initiate login: {}", e))?;
-                let Some((state, password, code)) = self.opaque_data.take() else {
+                let Some((state, password, code)) = held else {
                     bail!("Invalid state");
                 };
                 let request = finish_login(*state, &password, *res, FinishFor::PasswordCheck)
@@ -106,8 +110,9 @@ impl CommonComponent<ResetOwnMfaForm> for ResetOwnMfaForm {
             }
             Msg::LoginFinishResponse(res) => {
                 // Verified, or verified with a code asked for: the code goes to resetOwnMfa.
+                let pending_code = self.pending_code.take();
                 let _ = res.context("Password verification failed")?;
-                let Some(code) = self.pending_code.take() else {
+                let Some(code) = pending_code else {
                     bail!("Invalid state");
                 };
                 self.common.call_graphql::<ResetOwnMfa, _>(

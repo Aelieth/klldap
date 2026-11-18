@@ -52,15 +52,18 @@ the dump (`DELETE FROM system_config;`), or the insert stops on the duplicate
 `allowedous` key.
 
 The script also dumps `policies`, `ou_policies`, `kerberos_policies`,
-`kerberos_realm` and `kerberos_principals`. The last three are the Kerberos
-realm. **The master-key file `.k5.<REALM>` in `kerberos_options.data_dir` must
+`kerberos_realm`, `kerberos_principals` and `login_lockouts`. The three `kerberos_*`
+tables are the Kerberos realm. **The master-key file `.k5.<REALM>` in `kerberos_options.data_dir` must
 travel with the database.** Every realm record is sealed under it. If the
 database holds the realm and that file is missing, the realm does not open.
 The server comes up in the degraded state, and the cause says to restore the
 stash from the backup taken with the database. See
 [When the realm cannot open](kerberos.md#when-the-realm-cannot-open).
 
-The failed-login counts live in the file `lockout` in that same directory.
+The directory's failed-login counts are the table `login_lockouts` (a lock is computed from a
+count and the OU's policy), which the
+script dumps; it follows `users`. The other principals' failed-login counts live in the file
+`lockout` in that same directory.
 Copy it with the database. If the moved database holds the realm and the file
 is absent, the realm does not open. The server comes up in the degraded
 state, and the cause says the lockout file is missing; restore it, or create

@@ -99,6 +99,20 @@ pub enum Command {
     SendTestEmail(TestEmailOpts),
     #[clap(name = "create_schema", about = "Create database schema")]
     CreateSchema(RunOpts),
+    #[clap(
+        name = "unlock",
+        about = "Clear a user's failed logins and lock; a running server sees it within 30 seconds"
+    )]
+    Unlock(UnlockOpts),
+}
+
+#[derive(Debug, Parser, Clone)]
+pub struct UnlockOpts {
+    #[clap(flatten)]
+    pub run: RunOpts,
+
+    #[clap(help = "The user to unlock")]
+    pub user: String,
 }
 
 #[derive(Debug, Parser, Clone)]

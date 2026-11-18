@@ -142,6 +142,7 @@ path = "../crates/opaque-handler"
 
 [dev-dependencies.lldap_sql_backend_handler]
 path = "../crates/sql-backend-handler"
+features = ["test-clock"]
 
 [dev-dependencies.lldap_test_utils]
 path = "../crates/test-utils"

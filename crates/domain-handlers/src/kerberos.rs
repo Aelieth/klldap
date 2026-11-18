@@ -216,6 +216,10 @@ pub enum HostRow {
         group: GroupId,
         add: bool,
     },
+    Unlock {
+        user: UserId,
+        at: chrono::NaiveDateTime,
+    },
 }
 
 pub type UserOf = Arc<dyn Fn(&str) -> Option<UserId> + Send + Sync>;
@@ -258,6 +262,7 @@ impl HostRow {
                 add: true,
             } => format!("add {user} to group {}", group.0),
             Self::Membership { user, group, .. } => format!("remove {user} from group {}", group.0),
+            Self::Unlock { user, .. } => format!("unlock {user}"),
         }
     }
 }
@@ -422,6 +427,7 @@ static BACKEND: LazyLock<RwLock<Arc<dyn KerberosSync>>> =
     LazyLock::new(|| RwLock::new(Arc::new(NoopKerberos::default())));
 
 pub const ADMINS_ONLY: &str = "only admins may sign in while Kerberos is unavailable";
+pub const LDAP_ADMINS_ONLY: &str = "only admins may bind while Kerberos is unavailable";
 
 /// While the realm is unavailable only admins get in; a refusal writes its row and gives the cause.
 pub fn refusal_while_degraded(
@@ -769,7 +775,16 @@ mod tests {
         use crate::logging::{LogKind, event};
         let now = chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc();
         let bob = UserId::new("bob");
-        let rows: [(HostRow, &str, bool, bool); 11] = [
+        let rows: [(HostRow, &str, bool, bool); 12] = [
+            (
+                HostRow::Unlock {
+                    user: bob.clone(),
+                    at: now,
+                },
+                "unlock bob",
+                false,
+                false,
+            ),
             (
                 HostRow::SetPassword {
                     user: bob.clone(),

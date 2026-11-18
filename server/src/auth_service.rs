@@ -478,11 +478,6 @@ where
     // The authentication was successful, we need to fetch the groups to create the JWT
     // token.
     let groups = data.get_readonly_handler().get_user_groups(name).await?;
-    if let Some(cause) =
-        refusal_while_degraded(name, is_admin(&groups), kerberos_backend().unavailable())
-    {
-        return Err(TcpError::DomainError(DomainError::KdcUnavailable(cause)));
-    }
     let (refresh_token, max_age) = data.get_tcp_handler().create_refresh_token(name).await?;
     let token = create_jwt(data.get_tcp_handler(), &data.jwt_key, name, groups, false).await;
     let refresh_token_plus_name = refresh_token + "+" + name.as_str();
@@ -526,7 +521,12 @@ where
     let request = request.into_inner();
     let ask = request.enrollment_proof == Some(true);
     let session = request.session != Some(false);
-    match data.get_opaque_handler().login_finish(request).await? {
+    let finish = data.get_opaque_handler().login_finish(request);
+    let outcome = match session {
+        true => finish.await?,
+        false => logging::without_session(finish).await?,
+    };
+    match outcome {
         LoginOutcome::Authenticated {
             user_id,
             mfa_enrollment_pending,
@@ -550,7 +550,7 @@ where
             get_login_successful_response(&data, &user_id, mfa_enrollment_pending, enrollment_proof)
                 .await
         }
-        // The password verified; the client retries with password:code.
+        // The password verified; the client sends the code with a new login.
         LoginOutcome::TotpRequired => {
             Ok(HttpResponse::Ok().json(&login::ServerMfaRequiredResponse { mfa_required: true }))
         }
@@ -1948,6 +1948,16 @@ pub(crate) mod tests {
         let handler = sql_handler_with(&[("q1bob", BOB_PASS), ("q1kim", KIM_PASS)])
             .await
             .with_mfa_policy(lldap_domain_handlers::mfa::MfaPolicy::Enrolled);
+        struct ClockOnThisThread;
+        impl Drop for ClockOnThisThread {
+            fn drop(&mut self) {
+                lldap_sql_backend_handler::set_enrollment_clock(None);
+            }
+        }
+        let now = Utc::now().timestamp();
+        lldap_sql_backend_handler::set_enrollment_clock(Some(now));
+        let _clock = ClockOnThisThread;
+        let now = now as u64;
         let kim = UserId::new("q1kim");
         let proof = handler.seal_enrollment_proof(&kim).await.unwrap().unwrap();
         let start = handler
@@ -1955,7 +1965,6 @@ pub(crate) mod tests {
             .await
             .unwrap();
         let seed = lldap_mfa::seed_from_base32(&start.secret_base32).unwrap();
-        let now = Utc::now().timestamp() as u64;
         let code_at = |t: u64| lldap_mfa::format_code(lldap_mfa::totp_code(&seed, t).unwrap());
         let spent = code_at(now);
         handler
@@ -2086,13 +2095,13 @@ pub(crate) mod tests {
             vec![
                 row("q1bob", true, Some("no session")),
                 row("q1bob", true, Some("no session")),
-                row("q1kim", false, Some("totp code required")),
-                row("q1kim", false, Some("invalid totp")),
-                row("q1bob", false, Some("invalid credentials")),
+                row("q1kim", false, Some("totp code required; no session")),
+                row("q1kim", false, Some("invalid totp; no session")),
+                row("q1bob", false, Some("invalid credentials; no session")),
                 row("q1kim", true, Some("totp; no session")),
                 row("q1bob", true, None),
             ],
-            "one row per finish, each sessionless success saying so"
+            "one row per finish, each sessionless one saying so"
         );
     }
 
@@ -2151,9 +2160,92 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(
             rows,
-            vec![(LogKind::AccessDenied, false, Some(ADMINS_ONLY.to_owned()))],
+            vec![(
+                LogKind::AccessDenied,
+                false,
+                Some(format!("{ADMINS_ONLY}; no session"))
+            )],
             "the refusal is the finish's one row: no login success row"
         );
+    }
+
+    #[tokio::test]
+    async fn test_the_session_doors_refuse_a_non_admin_while_kerberos_is_down_with_one_row() {
+        use lldap_domain_handlers::handler::{GroupBackendHandler, UserBackendHandler};
+        use lldap_domain_handlers::kerberos::{
+            ADMINS_ONLY, DegradedKerberos, set_thread_kerberos_backend,
+        };
+        use lldap_test_utils::recording_log::LogGuard;
+        const PASS: &str = "b2down-pass-1";
+        const ADMIN_PASS: &str = "b2admin-pass-1";
+        let _backend = ONE_BACKEND.lock().await;
+        let _guard = EnforcementGuard::none();
+        let handler = sql_handler_with(&[("b2down", PASS), ("b2admin", ADMIN_PASS)]).await;
+        let admins = handler
+            .create_group(lldap_domain::requests::CreateGroupRequest {
+                display_name: "lldap_admin".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        handler
+            .add_user_to_group(&UserId::new("b2admin"), admins)
+            .await
+            .unwrap();
+        let pool = handler.pool().clone();
+        let state = app_state(handler);
+        let log = LogGuard::install_on_this_thread();
+        let degraded = DegradedKerberos::new("EXAMPLE.COM".to_owned(), "down".to_owned());
+        set_thread_kerberos_backend(Some(std::sync::Arc::new(degraded)));
+        let _restore = DegradedOnThisThread;
+        for (user, password) in [("b2down", PASS), ("b2admin", ADMIN_PASS)] {
+            for door in [LogKind::Login, LogKind::Bind] {
+                let before = minted(&pool).await;
+                let response = match door {
+                    LogKind::Login => {
+                        let request = login_finish_request(&state, user, password).await;
+                        opaque_login_finish_handler(state.clone(), web::Json(request)).await
+                    }
+                    _ => {
+                        let request = login::ClientSimpleLoginRequest {
+                            username: UserId::new(user),
+                            password: password.to_owned(),
+                            enrollment_proof: None,
+                        };
+                        simple_login_handler(state.clone(), web::Json(request)).await
+                    }
+                };
+                let status = response.status().as_u16();
+                let got = (status, response.cookies().count(), minted(&pool).await);
+                let rows: Vec<_> = log
+                    .recorder()
+                    .take_events()
+                    .into_iter()
+                    .filter(|e| e.actor.as_deref() == Some(user))
+                    .map(|e| (e.kind, e.success, e.target, e.detail))
+                    .collect();
+                let (want, row) = match user {
+                    "b2admin" => (
+                        (200, 2, (before.0 + 1, before.1 + 1)),
+                        (door, true, None, None),
+                    ),
+                    _ => (
+                        (503, 0, before),
+                        (
+                            LogKind::AccessDenied,
+                            false,
+                            None,
+                            Some(ADMINS_ONLY.to_owned()),
+                        ),
+                    ),
+                };
+                assert_eq!(
+                    (got, rows),
+                    (want, vec![row]),
+                    "{door:?} {user}: one row, and no success row for a refusal"
+                );
+            }
+        }
     }
 
     fn session_token(key: &Hmac<Sha512>, user: &str) -> String {

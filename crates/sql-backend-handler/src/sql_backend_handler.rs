@@ -3,12 +3,14 @@ use itertools::Itertools;
 use lldap_auth::opaque::server::ServerSetup;
 use lldap_domain::types::{Attribute, AttributeName, AttributeValue, UserId};
 use lldap_domain_handlers::enforcement::{self, PolicyCache};
+use lldap_domain_handlers::lockout::{Lockout, lockout};
 use lldap_domain_handlers::mfa::MfaPolicy;
 use lldap_mfa::{FailedAttempts, UsedCodes};
 use lldap_schema::PublicSchema;
 use sea_orm::sea_query::{Cond, IntoCondition, SimpleExpr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tracing::warn;
 
 pub(crate) fn bool_to_expr(b: bool) -> Cond {
     SimpleExpr::Value(b.into()).into_condition()
@@ -66,7 +68,8 @@ pub struct SqlBackendHandler {
     // Shared by the per-request clones, so a code is used once and attempts add up.
     pub(crate) used_totp_codes: Arc<UsedCodes>,
     pub(crate) failed_totp_attempts: Arc<FailedAttempts>,
-    policy_cache: &'static PolicyCache,
+    pub(crate) policy_cache: &'static PolicyCache,
+    pub(crate) lockout: &'static Lockout,
     policy_changes: Arc<AtomicU64>,
 }
 
@@ -80,12 +83,20 @@ impl SqlBackendHandler {
             used_totp_codes: Arc::default(),
             failed_totp_attempts: Arc::default(),
             policy_cache: enforcement::policy_cache(),
+            lockout: lockout(),
             policy_changes: Arc::default(),
         }
     }
 
+    /// The process's view and queue unless a test gives its own.
+    pub fn with_lockout(mut self, lockout: &'static Lockout) -> Self {
+        self.lockout = lockout;
+        self
+    }
+
     /// The process's cache unless a test gives its own.
     pub fn with_policy_cache(mut self, policy_cache: &'static PolicyCache) -> Self {
+        policy_cache.set_mfa_policy(self.mfa_policy);
         self.policy_cache = policy_cache;
         self
     }
@@ -97,6 +108,7 @@ impl SqlBackendHandler {
     }
 
     pub fn with_mfa_policy(mut self, mfa_policy: MfaPolicy) -> Self {
+        self.policy_cache.set_mfa_policy(mfa_policy);
         self.mfa_policy = mfa_policy;
         self
     }
@@ -107,6 +119,11 @@ impl SqlBackendHandler {
 
     pub(crate) async fn policy_changed(&self) {
         self.policy_changes.fetch_add(1, Ordering::Relaxed);
+        match self.lockout.follow_policies(self, self.policy_cache).await {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(e) => warn!("The lockout did not follow a policy change: {e}"),
+        }
         enforcement::policy_changed(self, self.policy_cache).await;
     }
 

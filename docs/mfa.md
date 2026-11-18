@@ -79,8 +79,9 @@ Every diagnostic comes after the password verified; a wrong password stays a pla
 `"session": false`. That finish does what any finish does: it verifies the password, checks
 a code sent in `totp_code`, admits or refuses the user (while Kerberos is unavailable only
 admins are admitted, answered `503`), and mints a proof when asked. It makes no session: no
-token, no refresh token, no cookie, and it writes one row: the `login` success row, or the
-refusal's. A verified finish answers
+token, no refresh token, no cookie. It writes one row at the door, the `login` success row
+or the refusal's, and an `account_lock` row when a wrong code it carries locks the user;
+every row it writes says `no session`, whatever the outcome. A verified finish answers
 `200 {"verified": true}`, with `enrollmentProof` when one was asked for and
 `mfaEnrollmentRequired` as a session finish would have it; the other answers are those of
 the table above. Without the field a finish makes a session, as before. The enrollment,
@@ -130,8 +131,9 @@ out of scope.
 
 One row per ceremony, in the same table as everything else ([logging.md](logging.md)): a
 `bind` / `login` success carries detail `totp` when a code was verified, or
-`mfa enrollment pending` for a web login admitted under `"always"`; a web finish that makes
-no session adds `no session` (`no session` alone, or `totp; no session`). Failures are
+`mfa enrollment pending` for a web login admitted under `"always"`; every row of a web finish
+that makes no session adds `no session` (`no session` alone, `totp; no session`,
+`totp code required; no session`). Failures are
 `invalid totp`, `totp replayed`, `totp attempts exceeded`, `totp re-enrollment required`
 (the sealed secret no longer opens) and `mfa enrollment required`. The challenge itself —
 password right, code missing — is the failure row `totp code required`. Enrollment and
@@ -163,16 +165,16 @@ enrollment, a 90-second replay window, five attempts per step, issuer `KLLDAP` �
 | Resynchronisation for counter drift | RFC 4226 §7.4 | Not applicable to time-based codes; the ±1 step window absorbs clock drift. |
 | Authenticator secrets stored in encrypted form | NIST SP 800-63B §5.1.4.2 | Met: sealed with AEAD under a key HKDF-derived from the server's private key, a per-enrollment salt and the user UUID as associated data; never returned on any interface. |
 | Replay resistance | NIST SP 800-63B §5.2.8 | Met: a verified code is refused for the rest of its window, at every door. |
-| No more than 100 consecutive failed attempts | NIST SP 800-63B §5.2.2 | **Not met** — see below. |
+| No more than 100 consecutive failed attempts | NIST SP 800-63B §5.2.2 | Met when the user's OU sets `lockout-threshold` (at most 100); not met with no threshold — see below. |
 | One-time use, bounded validity, approved algorithm, protected key | OWASP ASVS V2.8.2–5 | Met, as above. |
 
 ## Limitations
 
-- No cap on consecutive failures and no lockout: the limiter paces guessing (five per
-  30-second step) instead of counting failures toward a ceiling — RFC 4226 §7.3's delay
-  scheme, chosen because a lockout turns a wrong digit into a denial of service, and the
-  counter is reachable only after the password verified. For a hard ceiling, rate-limit
-  `/auth/*` at the reverse proxy or point fail2ban at the failed `bind` / `login` rows.
+- The limiter paces guessing (five per 30-second step, RFC 4226 §7.3's delay scheme). A
+  wrong code (`invalid totp`) also counts once toward the OU's `lockout-threshold`, at every
+  door, as a wrong password does ([policies.md](policies.md#lockout)); a code used before, a code
+  past the limiter and the right password without a code count nothing. With no threshold set,
+  there is still no ceiling: rate-limit `/auth/*` at the reverse proxy or set the threshold.
 - A first enrollment proves the password with the OPAQUE login finish. The plaintext is
   nowhere on the server for that path. The finish returns a five-minute proof, and only
   when the login asked for it and the user has no factor. `startMfaEnrollment` requires

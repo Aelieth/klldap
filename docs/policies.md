@@ -2,8 +2,9 @@
 
 KLLDAP can attach a named policy of **items** to an OU, including the domain root
 (`dc=example,dc=com` → the empty key `""`). An object resolves each item by walking its
-OU chain. This pass stores and resolves those values; **nothing is enforced at login,
-bind, or any other door yet**. Each later pass consumes the same resolution at its seam.
+OU chain. The lockout items (`lockout-threshold`, `lockout-duration-seconds`) are
+enforced at every door ([Lockout](#lockout)); **the other items are stored and resolved but
+not enforced yet**. Each later pass consumes the same resolution at its seam.
 
 ## Resolution
 
@@ -63,6 +64,101 @@ the page never recomputes closest-wins values client-side.
 Users and groups still filter on the sentinel value `All`; only the visible label of
 that option is the domain name.
 
+## Lockout
+
+`lockout-threshold` (0 turns it off) and `lockout-duration-seconds` (0 holds a lock until an
+admin unlocks) lock a user after that many wrong passwords in a row. One counter per user, in
+the table `login_lockouts`, serves every door: LDAP bind, `/auth/simple/login`, the web login,
+kinit and the tickets asked with a user's ticket (renewals and service tickets), token refresh
+and token use. A wrong TOTP code counts once, like a wrong password; a code used before, a code
+past the limiter and the right password without its code count nothing ([mfa.md](mfa.md)). A
+success clears the count, and the next failure after an unlock counts from 1. For a user who
+must give a second factor at the directory's doors (enrolled, the second factor on, and not in
+`lldap_mfa_disabled`), a Kerberos ticket (asked with the password alone) does not reset the
+count, nor does it for a user whose factors the server has not read yet. When a timed
+lock runs out the count stays where it was, so one more wrong password locks again for the
+whole duration. Every user can be locked, admins included.
+
+Counting starts when the first OU policy with a lockout threshold takes effect (linked to an
+OU, the root included), for all users, from zero: the change that links it, or raises its
+threshold from 0, clears every stored count and every logged lock in its own transaction,
+starts a new counting period, and touches nothing an administrator set. Before that nothing is
+counted: where no OU sets a threshold, no door reads or writes anything for the lockout; each
+server reads the policies once every 30 seconds. Once counting is on, the failures of users
+with no threshold of their own are counted too, so a threshold added to another OU, or a move
+under one, applies at once to the failures already counted. The lock is computed, so lowering
+or raising a threshold applies at once. Removing the last threshold stops counting. Until a
+starting server has read the policies once, every door refuses the users the lockout judges
+(`policy: unreadable`), and the server reads them again every second.
+
+While locked, LDAP bind and `/auth/simple/login` answer as for a wrong password (49, 401),
+whether the password given is right or wrong, but at once: a locked user's bind skips the
+password work a wrong password takes, so the time to answer shows the lock. The web login's
+first step answers as for a name with no password, so the browser fails as for a wrong
+password, and the finish of a start made before the lock answers as a proof that does not
+verify. A token refresh or use is refused. kinit, a renewal, a service ticket and an
+S4U2Self for the user get error 18 (`CLIENT_REVOKED`, "Client's credentials have been
+revoked") before the KDC looks at any password; that is not the wrong-password answer (24),
+and anyone can see it without a password. An S4U2Self never counts. Nothing a locked user
+sends is counted. The reason is in the log: a `locked out` row for each refusal (refusals of
+the same kind from one peer coalesce in a flood, [logging.md](logging.md)), and one
+`account_lock` row when a counted failure brings the stored count to the threshold.
+
+The web login counts each attempt when it starts, because the browser checks a wrong password
+itself and sends nothing more. The start's +1 is kept beside the user's stored count, never in
+it, and counts at every door at once, so starts that are never finished lock the user as they
+come; such a lock gets its `account_lock` row when the starts join the stored count, about 10
+seconds after they began. A finish whose proof
+verifies removes its own start's +1, once, and changes nothing else; the same finish sent
+again finds nothing to remove. A sign-in that completes (the password and every factor
+verified), at any door, also drops the user's starts made before it on that server, so a
+wrong web attempt before a right one never comes back, as a wrong bind before it does not; a
+finish that stops at "code required" drops nothing. A finish on a server that does not hold its
+start writes the start's id to the user's row, with whether the sign-in completed there. A
+start that no finish removes within 10 seconds joins the stored count as a failure at the
+start's time, unless the row holds its id, or the id of a later start of the same user made on
+the same server whose sign-in completed: with two servers, a sign-in whose steps start and
+finish on either of them never counts against the user. With three or more, a sign-in whose
+two steps went through three servers can leave one count, which the user's next sign-in
+clears. At most 32 starts per user are held at once; a start beyond them joins the count at
+once. The `account_lock` row of a lock that starts reach carries the peer of the start that
+reached it. Every page
+that starts a login also finishes it; a finish without a session (a page checking the
+password) is judged and counted as any finish. At a threshold of 1 a sign-in in progress
+counts until it finishes, so the same user's other requests in that instant are refused, and
+a page left during a sign-in counts once.
+
+To unlock: GraphQL `mutation { unlockUser(userId: "bob") { ok } }` (admins), the host tool
+`lldap unlock --config-file <config> bob`, or kadmin `modprinc -unlock` on the user's principal.
+Each writes one `account_unlock` row in the unlock's transaction, stamped with the clock of the
+server, or of the host tool's own process. A password change does not unlock. An unlock by the
+host tool or by another server takes effect at this server's next sign-in attempt at the
+directory's doors, and for Kerberos within a moment of the next attempt. Such an unlock wins
+over every failure counted before it, also the ones this server had not written yet.
+
+Under a threshold, each count is written before the door answers, and the door waits at most
+250 ms for that write in all. When the database takes longer, the door answers anyway and the
+count is owed: it is tried again about a second later, and a crash before then loses it. Other
+counts are owed and written within about a second: those of a user with no threshold, and a
+web start's +1 once its 10 seconds are over. Each write carries the user's state as it stands
+(the count, the last failure, the lock), so a late or repeated write never counts twice; a
+write never undoes a later unlock, stores nothing for a user who no longer exists or for another
+account made since under the same name, and stores nothing from an earlier counting period,
+even when it meets the change that starts a new one. A write the database refuses is kept in
+memory and tried again until it is taken; the server log says so once at WARN, with the cause, and once
+at INFO when they are stored again, with how many users' rows waited. The counts in memory are
+what the doors judge with while the server runs; a door about to refuse a locked user first
+reads that user's stored row, at most once a second. A clean stop writes what is owed, every
+start still held included, within a second, so a sign-in in progress at that moment counts once
+(the user's next sign-in clears it). A crash or a power cut loses what is still owed: the
+last second or so of counts, a count whose write took longer than 250 ms, and up to the last
+10 seconds of web starts.
+
+With several servers on one database (only with Kerberos disabled), each server counts the
+attempts it sees exactly, the servers agree within 30 seconds, and a guesser who spreads the
+attempts over N servers gets at most N times the threshold before every server refuses. A
+table that cannot be read refuses the attempt (`policy: unreadable`).
+
 ## What is recorded
 
 `policy_change` rows: creating/updating/deleting a policy (target = name; detail
@@ -73,13 +169,17 @@ no-op inheritance toggle is not logged.
 
 ## Configuration
 
-None. The surface is always on (reads for admins and read-only admins, writes for admins)
-and inert until an enforcement pass.
+None. The surface is always on (reads for admins and read-only admins, writes for admins).
+The lockout is in force wherever an OU sets a threshold.
 
 ## Limitations
 
-- Nothing is enforced yet. Catalog and effective items carry `enforced: false` and say so
-  in their descriptions; per-item passes follow.
+- Only the lockout is enforced. The other items carry `enforced: false` and say so in their
+  descriptions; per-item passes follow.
+- A lock's duration runs from the last counted attempt, and a web start counts as one until
+  its finish takes it back, so the duration can run from a start that then succeeded.
+- Kerberos already tells whether a principal exists (an unknown one gets a different error);
+  a lock does not change that.
 - Depth is root / primary / secondary with one policy each — no AD multi-link stacking.
 - `updatePolicy.items` is a wholesale replace.
 - Policy applies per OU, not per object.

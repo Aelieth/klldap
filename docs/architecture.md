@@ -106,9 +106,10 @@ ends. For any other user the web UI sends no seal, so the server never sees the
 password. KLLDAP keeps no copy; the KDC stores its own keys in its own database.
 
 The optional TOTP second factor ([mfa.md](mfa.md)) is checked by the same login handler
-that checks the password: `SqlBackendHandler::bind` and `login_finish` split
-`password:code` and verify it, so the three doors share one decision and the event log sees
-one row per login.
+that checks the password: `SqlBackendHandler::bind` splits `password:code`, and
+`login_finish` takes the code the web page sends in its second step (`totp_code`); both
+verify it the same way, so the three doors share one decision and the event log sees one
+row per login.
 
 ### JWTs and refresh tokens
 

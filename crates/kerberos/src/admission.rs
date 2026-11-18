@@ -6,9 +6,11 @@ use krb5_kdc::admission::{
 use krb5_types::{HostAddress, PrincipalName, err};
 use lldap_domain::types::UserId;
 use lldap_domain_handlers::enforcement::{
-    Attempt, Door, PolicyCache, Refusal, admit_at_kdc, item_checks, policy_cache, record_kdc_row,
+    Attempt, Door, PolicyCache, Refusal, admit_at_kdc_with, item_checks, policy_cache,
+    record_kdc_row,
 };
 use lldap_domain_handlers::kerberos::user_id_for_principal_name;
+use lldap_domain_handlers::lockout::{Lockout, THRESHOLD, lock_clock, lock_detail, lockout};
 use lldap_domain_handlers::logging::LogKind;
 use std::cell::RefCell;
 use std::net::IpAddr;
@@ -36,6 +38,7 @@ thread_local! {
 pub(crate) struct KdcVerdict {
     realm: String,
     cache: &'static PolicyCache,
+    lockout: &'static Lockout,
 }
 
 impl KdcVerdict {
@@ -43,7 +46,45 @@ impl KdcVerdict {
         Self {
             realm: realm.to_owned(),
             cache: policy_cache(),
+            lockout: lockout(),
         }
+    }
+
+    #[cfg(test)]
+    fn on(realm: &str, cache: &'static PolicyCache, lockout: &'static Lockout) -> Self {
+        Self {
+            realm: realm.to_owned(),
+            cache,
+            lockout,
+        }
+    }
+
+    fn confirm_lock(&self, user: &UserId, refusal: &Refusal) {
+        if refusal.item == THRESHOLD {
+            self.lockout.confirm_soon(user);
+        }
+    }
+
+    /// Kerberos counts in the directory's one table; an S4U2Self gets no notice, so never counts.
+    fn count(&self, user: &UserId, n: &AsNotice, peer: Option<IpAddr>) {
+        if !self.cache.lockout_live() || !self.lockout.kdc_counts() {
+            return;
+        }
+        let Some(lock) = self.lockout.kdc_state(self.cache, user) else {
+            return;
+        };
+        let at = lock_clock();
+        let step = match n.reason {
+            AsReason::PreauthFailed => self.lockout.failure(&lock, at),
+            AsReason::Issued => self.lockout.ticket_issued(self.cache, &lock, at),
+            _ => return,
+        };
+        if step.lock_logged {
+            let detail = lock_detail(Door::KerberosAs);
+            let kind = LogKind::AccountLock;
+            record_kdc_row(None, user.as_str(), kind, true, peer, &detail);
+        }
+        self.lockout.carry_from_kdc(user, step);
     }
 }
 
@@ -112,7 +153,7 @@ impl HostAdmission for KdcVerdict {
     fn check_as(&self, q: &AsQuestion<'_>) -> Result<(), KdcRefusal> {
         AS_REFUSAL.with(|held| *held.borrow_mut() = None);
         let checks = item_checks();
-        if checks.is_empty() {
+        if !checks.iter().any(|check| check.live(self.cache)) {
             return Ok(());
         }
         let Some(user) = user_of(q.client, &self.realm) else {
@@ -125,9 +166,10 @@ impl HostAdmission for KdcVerdict {
         };
         let peer = q.peer.and_then(ip_of);
         let attempt = Attempt::at_kdc(&user, door, peer, q.now);
-        let Err(refusal) = admit_at_kdc(self.cache, &attempt, &checks) else {
+        let Err(refusal) = admit_at_kdc_with(self.cache, self.lockout, &attempt, &checks) else {
             return Ok(());
         };
+        self.confirm_lock(&user, &refusal);
         if q.s4u2self {
             let by = q
                 .request
@@ -168,6 +210,9 @@ impl HostAdmission for KdcVerdict {
         let issued = n.reason == AsReason::Issued;
         let detail = notice_detail(&n, item);
         record_kdc_row(user.as_ref(), target, LogKind::Login, issued, peer, &detail);
+        if let Some(user) = &user {
+            self.count(user, &n, peer);
+        }
     }
 
     fn check_tgs(&self, q: &TgsQuestion<'_>) -> Result<(), KdcRefusal> {
@@ -181,7 +226,7 @@ impl HostAdmission for KdcVerdict {
             return Err(gone());
         };
         let checks = item_checks();
-        if checks.is_empty() {
+        if !checks.iter().any(|check| check.live(self.cache)) {
             return Ok(());
         }
         let Some(user) = user_of(client, &self.realm) else {
@@ -189,9 +234,10 @@ impl HostAdmission for KdcVerdict {
         };
         let door = Door::KerberosTgs;
         let attempt = Attempt::at_kdc(&user, door, peer, q.now);
-        let Err(refusal) = admit_at_kdc(self.cache, &attempt, &checks) else {
+        let Err(refusal) = admit_at_kdc_with(self.cache, self.lockout, &attempt, &checks) else {
             return Ok(());
         };
+        self.confirm_lock(&user, &refusal);
         let detail = refusal.detail();
         record_kdc_row(
             Some(&user),
@@ -429,6 +475,16 @@ pub(crate) mod tests {
         subject: &str,
         kind: TgsKind,
     ) -> Result<(), i32> {
+        tgs_asks_of(&KdcVerdict::new(REALM), store, client, subject, kind)
+    }
+
+    fn tgs_asks_of(
+        verdict: &KdcVerdict,
+        store: &SharedDump,
+        client: Option<&str>,
+        subject: &str,
+        kind: TgsKind,
+    ) -> Result<(), i32> {
         let guard = store.read().unwrap();
         let client = client.map(|user| guard.get_name(&name(user)).unwrap());
         let krbtgt = PrincipalName::new(PrincipalName::NT_SRV_INST, ["krbtgt", REALM]);
@@ -446,7 +502,7 @@ pub(crate) mod tests {
             now: 1_700_000_000,
             kind,
         };
-        KdcVerdict::new(REALM).check_tgs(&q).map_err(|r| r.code)
+        verdict.check_tgs(&q).map_err(|r| r.code)
     }
 
     /// A service's header ticket and the subject's entry gone, as an S4U2Proxy or a U2U asks.
@@ -525,6 +581,7 @@ pub(crate) mod tests {
         policy_cache().replace(Entries {
             ous_of_users,
             items_of_ous,
+            facts: HashMap::new(),
             built_at: Utc::now(),
         });
     }
@@ -1229,6 +1286,267 @@ pub(crate) mod tests {
             (true, [(true, 0), (true, err::CLIENT_REVOKED)]),
             "sent before serve, answered after it: the allowed user gets a ticket, not a miss"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn test_kinit_counts_in_the_one_table_and_s4u2self_is_refused_but_never_counts() {
+        use lldap_domain_handlers::handler::LockoutBackendHandler;
+        use lldap_domain_handlers::lockout::LockStore;
+        let b = "e1kinit";
+        let (temp, _embedded, store) = realm(&[b]).await;
+        let svc = service(&temp, &store);
+        let cache: &'static PolicyCache = Box::leak(Box::new(PolicyCache::new()));
+        let counter: &'static Lockout = Box::leak(Box::default());
+        let handler = SqlBackendHandler::new(generate_random_private_key(), memory_pool().await)
+            .with_policy_cache(cache)
+            .with_lockout(counter);
+        directory_user(&handler, b, "e1kdcou").await;
+        let request = CreatePolicyRequest {
+            name: "e1 kdc".to_owned(),
+            description: String::new(),
+            items: [
+                ("lockout-threshold".to_owned(), "3".to_owned()),
+                ("lockout-duration-seconds".to_owned(), "0".to_owned()),
+            ]
+            .into(),
+        };
+        let id = handler.create_policy(request).await.unwrap();
+        handler.set_ou_policy("e1kdcou", id).await.unwrap();
+        fill_policy_cache(&handler, cache).await.unwrap();
+        let user = UserId::new(b);
+        let verdict = Arc::new(KdcVerdict::on(REALM, cache, counter));
+        store
+            .write()
+            .unwrap()
+            .policy
+            .plugins
+            .set_host_admission(verdict.clone());
+        let tgt = issue_tgt(&store, b);
+        counter.serve_kdc(Arc::new(handler.clone()), tokio::runtime::Handle::current());
+        let log = LogGuard::install_on_this_thread();
+        let stored = async || {
+            handler
+                .read_lock(&user)
+                .await
+                .unwrap()
+                .map(|r| r.fail_count)
+        };
+        let failed = row(
+            LogKind::Login,
+            false,
+            b,
+            "pre-authentication failed (encrypted timestamp)",
+        );
+        let issued = row(
+            LogKind::Login,
+            true,
+            b,
+            "ticket issued (encrypted timestamp)",
+        );
+        let locked = row(LogKind::Login, false, b, "locked out");
+        let lock = row(LogKind::AccountLock, true, b, "locked: kerberos");
+        for (n, rows) in [
+            (1, vec![failed.clone()]),
+            (2, vec![failed.clone()]),
+            (3, vec![failed.clone(), lock]),
+        ] {
+            let got = kinit(&store, b, Some("Wrong-Pass-1")).0;
+            let state = (got, stored().await, kdc_rows(&log));
+            assert_eq!(state, (err::PREAUTH_FAILED, Some(n), rows), "wrong {n}");
+        }
+        let got = kinit(&store, b, Some(PASSWORD));
+        let state = (got, stored().await, kdc_rows(&log));
+        assert_eq!(
+            state,
+            ((err::CLIENT_REVOKED, None), Some(3), vec![locked.clone()]),
+            "the right password while locked: 18 before pre-authentication, not counted"
+        );
+        let got = kinit(&store, b, Some("Wrong-Pass-2"));
+        let state = (got, stored().await, kdc_rows(&log));
+        assert_eq!(
+            state,
+            ((err::CLIENT_REVOKED, None), Some(3), vec![locked]),
+            "a wrong password while locked: the same 18, not counted"
+        );
+        let service = service_ticket(&store, &tgt, b, &svc);
+        let renewal = tgs_asks_of(&verdict, &store, Some(b), b, TgsKind::Renew);
+        let denied = row(LogKind::AccessDenied, false, b, "locked out");
+        assert_eq!(
+            (
+                service.map(drop).map_err(|(code, _)| code),
+                renewal,
+                stored().await,
+                kdc_rows(&log)
+            ),
+            (
+                Err(err::CLIENT_REVOKED),
+                Err(err::CLIENT_REVOKED),
+                Some(3),
+                vec![denied.clone(), peered(denied)]
+            ),
+            "on a ticket issued before the lock, a service ticket and a renewal are refused, \
+             never counted"
+        );
+        let by = format!("locked out (S4U2Self by {SERVICE}@{REALM})");
+        for x509 in [false, true] {
+            let got = s4u2self(&store, &svc, b, x509);
+            let state = (got, stored().await, kdc_rows(&log));
+            let denied = vec![row(LogKind::AccessDenied, false, b, &by)];
+            assert_eq!(
+                state,
+                (Err((err::CLIENT_REVOKED, None)), Some(3), denied),
+                "S4U2Self, PA-S4U-X509-USER {x509}: refused, never counted"
+            );
+        }
+        handler.unlock_user(&user).await.unwrap();
+        let got = kinit(&store, b, Some(PASSWORD)).0;
+        assert_eq!(
+            (got, stored().await, kdc_rows(&log)),
+            (0, Some(0), vec![issued.clone()]),
+            "unlocked: a ticket, and a count of 0 writes nothing"
+        );
+        let user_at = format!("{b}@{REALM}");
+        let ticket = Ok([user_at.clone(), user_at, format!("{SERVICE}@{REALM}")]);
+        assert_eq!(
+            s4u2self(&store, &svc, b, false),
+            ticket,
+            "S4U2Self after the unlock"
+        );
+        assert_eq!(
+            kinit(&store, b, Some("Wrong-Pass-1")).0,
+            err::PREAUTH_FAILED
+        );
+        assert_eq!(
+            stored().await,
+            Some(1),
+            "the count restarts after the unlock"
+        );
+        assert_eq!(kinit(&store, b, Some(PASSWORD)).0, 0);
+        assert_eq!(stored().await, Some(0), "a ticket clears a count");
+        assert_eq!(
+            kdc_rows(&log),
+            vec![failed, issued],
+            "one row per sign-in, no S4U2Self row once allowed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn test_a_kinit_after_an_unlock_by_another_process_is_answered_at_the_second_try() {
+        let b = "e1tool";
+        let (_temp, _embedded, store) = realm(&[b]).await;
+        let cache: &'static PolicyCache = Box::leak(Box::new(PolicyCache::new()));
+        let counter: &'static Lockout = Box::leak(Box::default());
+        let handler = SqlBackendHandler::new(generate_random_private_key(), memory_pool().await)
+            .with_policy_cache(cache)
+            .with_lockout(counter);
+        directory_user(&handler, b, "e1toolou").await;
+        let request = CreatePolicyRequest {
+            name: "e1 tool".to_owned(),
+            description: String::new(),
+            items: [
+                ("lockout-threshold".to_owned(), "3".to_owned()),
+                ("lockout-duration-seconds".to_owned(), "0".to_owned()),
+            ]
+            .into(),
+        };
+        let id = handler.create_policy(request).await.unwrap();
+        handler.set_ou_policy("e1toolou", id).await.unwrap();
+        let verdict = Arc::new(KdcVerdict::on(REALM, cache, counter));
+        store
+            .write()
+            .unwrap()
+            .policy
+            .plugins
+            .set_host_admission(verdict);
+        counter.serve_kdc(Arc::new(handler.clone()), tokio::runtime::Handle::current());
+        for _ in 0..3 {
+            assert_eq!(
+                kinit(&store, b, Some("Wrong-Pass-1")).0,
+                err::PREAUTH_FAILED
+            );
+        }
+        let user = UserId::new(b);
+        let row = lldap_domain_handlers::logging::event(
+            LogKind::AccountUnlock,
+            Some(b),
+            true,
+            Some(lldap_domain_handlers::lockout::UNLOCKED_BY_TOOL),
+        );
+        let at = lock_clock();
+        lldap_sql_backend_handler::unlock_login_on(handler.pool(), &user, at, row)
+            .await
+            .unwrap();
+        let started = Instant::now();
+        let mut tries = vec![kinit(&store, b, Some(PASSWORD)).0];
+        while tries.last() != Some(&0) && started.elapsed() < Duration::from_secs(2) {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            tries.push(kinit(&store, b, Some(PASSWORD)).0);
+        }
+        assert_eq!(
+            (tries.first(), tries.last()),
+            (Some(&err::CLIENT_REVOKED), Some(&0)),
+            "the first try is judged from memory and asks for a read; a later one within two \
+             seconds sees the unlock: {tries:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn test_a_slow_database_never_holds_the_kdcs_answer_past_the_bound() {
+        use lldap_domain_handlers::lockout::LockStore;
+        let b = "e1slow";
+        let (_temp, _embedded, store) = realm(&[b]).await;
+        let cache: &'static PolicyCache = Box::leak(Box::new(PolicyCache::new()));
+        let counter: &'static Lockout = Box::leak(Box::default());
+        let pool = memory_pool().await;
+        let handler = SqlBackendHandler::new(generate_random_private_key(), pool.clone())
+            .with_policy_cache(cache)
+            .with_lockout(counter);
+        directory_user(&handler, b, "e1slowou").await;
+        let request = CreatePolicyRequest {
+            name: "e1 slow".to_owned(),
+            description: String::new(),
+            items: [("lockout-threshold".to_owned(), "3".to_owned())].into(),
+        };
+        let id = handler.create_policy(request).await.unwrap();
+        handler.set_ou_policy("e1slowou", id).await.unwrap();
+        let verdict = Arc::new(KdcVerdict::on(REALM, cache, counter));
+        store
+            .write()
+            .unwrap()
+            .policy
+            .plugins
+            .set_host_admission(verdict);
+        counter.serve_kdc(Arc::new(handler.clone()), tokio::runtime::Handle::current());
+        let held = pool.begin().await.unwrap();
+        let released = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            held.rollback().await.unwrap();
+        });
+        let started = Instant::now();
+        let got = kinit(&store, b, Some("Wrong-Pass-1")).0;
+        let took = started.elapsed();
+        assert_eq!(got, err::PREAUTH_FAILED);
+        assert!(
+            took < Duration::from_millis(300),
+            "the KDC answered after {took:?}"
+        );
+        released.await.unwrap();
+        let user = UserId::new(b);
+        assert_eq!(
+            handler.read_lock(&user).await.unwrap(),
+            None,
+            "not landed yet"
+        );
+        assert_eq!(counter.drain(&handler).await, 1, "owed, not dropped");
+        let landed = handler
+            .read_lock(&user)
+            .await
+            .unwrap()
+            .map(|r| r.fail_count);
+        assert_eq!(landed, Some(1), "the count is right once the write lands");
     }
 
     #[tokio::test]

@@ -35,7 +35,9 @@ use lldap_domain::{
         Attribute, AttributeName, Email, GroupId, LdapObjectClass, UserId, kerberos_sync_enabled,
     },
 };
-use lldap_domain_handlers::handler::{BackendHandler, ReadSchemaBackendHandler, UserRequestFilter};
+use lldap_domain_handlers::handler::{
+    BackendHandler, LockoutBackendHandler, ReadSchemaBackendHandler, UserRequestFilter,
+};
 use lldap_domain_handlers::mfa::is_protected_group;
 use lldap_domain_handlers::password::{PasswordSync, change_password_everywhere};
 use lldap_opaque_handler::OpaqueHandler;
@@ -764,6 +766,19 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
     ) -> FieldResult<Success> {
         mfa::finish_mfa_enrollment(context, state, code).await
     }
+
+    async fn unlock_user(context: &Context<Handler>, user_id: String) -> FieldResult<Success> {
+        let span = debug_span!("[GraphQL mutation] unlock_user");
+        span.in_scope(|| debug!(?user_id));
+        let user_id = UserId::new(&user_id);
+        context
+            .get_admin_handler()
+            .ok_or_else(field_error_callback(&span, "Unauthorized user unlock"))?
+            .unlock_user(&user_id)
+            .instrument(span)
+            .await?;
+        Ok(Success::new())
+    }
 }
 fn validate_new_attribute_name(
     name: &str,
@@ -1464,6 +1479,7 @@ mod tests {
             r#"mutation { setOuPolicy(ou: "", policyId: 1) { ok } }"#,
             r#"mutation { clearOuPolicy(ou: "") { ok } }"#,
             r#"mutation { setOuPolicyInheritance(ou: "people", blocked: true) { ok } }"#,
+            r#"mutation { unlockUser(userId: "bob") { ok } }"#,
         ] {
             let context = regular_context(MockTestBackendHandler::new());
             let (_, errors) = execute(query, None, &root_schema(), &Variables::new(), &context)
@@ -1490,6 +1506,22 @@ mod tests {
             .and_then(|o| o.get_field_value(field))
             .expect(field);
         assert_eq!(inner, &graphql_value!({ "success": true }));
+    }
+
+    #[tokio::test]
+    async fn test_unlock_user_reaches_the_handler_for_an_admin() {
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_unlock_user()
+            .withf(|user| user.as_str() == "bob")
+            .times(1)
+            .returning(|_| Ok(()));
+        let context = admin_context(mock);
+        let query = r#"mutation { unlockUser(userId: "Bob") { ok } }"#;
+        let (value, errors) = execute(query, None, &root_schema(), &Variables::new(), &context)
+            .await
+            .unwrap();
+        assert_eq!(errors.len(), 0, "{errors:?}");
+        assert_eq!(value, graphql_value!({"unlockUser": {"ok": true}}));
     }
 
     #[tokio::test]

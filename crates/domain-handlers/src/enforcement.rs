@@ -1,17 +1,21 @@
 use crate::handler::{PolicyBackendHandler, UserBackendHandler, UserListerBackendHandler};
 use crate::kerberos::{CommitError, HostRow};
+use crate::lockout::{self, LockRow, Lockout, LockoutCheck, lockout};
 use crate::logging::{self, LogKind, Protocol, RequestMeta};
+use crate::mfa::{
+    MFA_DISABLED_GROUP, MfaEnrollmentStatus, MfaPolicy, MfaRequirement, mfa_requirement,
+};
 use crate::policies::{
     EffectiveItem, POLICY_ITEM_CATALOG, canonical_ou_key, resolve_effective_items,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use lldap_domain::requests::UpdateUserRequest;
-use lldap_domain::types::{UserId, user_ou};
+use lldap_domain::types::{GroupDetails, MFA_TYPE_TOTP, User, UserId, Uuid, user_ou};
 use lldap_domain_model::error::{DomainError, Result};
 use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock};
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -19,6 +23,10 @@ use tracing::warn;
 
 pub const POLICY_REFILL: Duration = Duration::from_secs(30);
 pub const FILL_GAP: Duration = Duration::from_millis(250);
+pub const FILL_BACKOFF_LIMIT: Duration = Duration::from_secs(30);
+const LOCKOUT_OFF: u8 = 0;
+const LOCKOUT_ON: u8 = 1;
+const LOCKOUT_UNKNOWN: u8 = 2;
 pub const UNREADABLE: &str = "unreadable";
 pub const NOT_LOADED: &str = "not loaded yet";
 
@@ -49,6 +57,19 @@ impl Door {
         match logging::current_request().protocol {
             Protocol::Ldap => Self::LdapBind,
             _ => Self::SimpleLogin,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::WebLogin => "web login",
+            Self::SimpleLogin => "simple login",
+            Self::Refresh => "token refresh",
+            Self::TokenUse => "token use",
+            Self::LdapBind => "ldap bind",
+            Self::KerberosAs => "kerberos",
+            Self::KerberosTgs => "kerberos service ticket",
+            Self::KerberosS4u => "kerberos S4U2Self",
         }
     }
 
@@ -101,20 +122,45 @@ pub struct Refusal {
 
 impl Refusal {
     pub fn detail(&self) -> String {
+        if self.item == lockout::THRESHOLD {
+            return lockout::LOCKED_OUT.to_owned();
+        }
         format!("policy: {}", self.item)
     }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct UserState {}
+pub struct UserState {
+    pub lock: Option<LockRow>,
+}
 
 pub trait ItemCheck: Send + Sync {
     fn key(&self) -> &'static str;
+    /// Read with the key, and enforced with it.
+    fn also_enforces(&self) -> &'static [&'static str] {
+        &[]
+    }
+    /// A check that is not live costs nothing: no read, no fill.
+    fn live(&self, _cache: &PolicyCache) -> bool {
+        true
+    }
     /// A user no check judges is admitted before any read.
     fn judges(&self, _user: &UserId) -> bool {
         true
     }
+    fn may_refuse(&self, _state: &UserState) -> bool {
+        true
+    }
     fn allows(&self, attempt: &Attempt<'_>, value: &str, state: &UserState) -> bool;
+    fn allows_among(
+        &self,
+        attempt: &Attempt<'_>,
+        value: &str,
+        _items: &[EffectiveItem],
+        state: &UserState,
+    ) -> bool {
+        self.allows(attempt, value, state)
+    }
 }
 
 pub type ItemChecks = Arc<[Arc<dyn ItemCheck>]>;
@@ -129,7 +175,7 @@ pub fn decide(
         let Some(item) = items.iter().find(|item| item.key == check.key()) else {
             continue;
         };
-        if !check.allows(attempt, &item.value, state) {
+        if !check.allows_among(attempt, &item.value, items, state) {
             return Err(Refusal {
                 item: check.key(),
                 door: attempt.door,
@@ -143,9 +189,35 @@ pub fn judged(checks: &[Arc<dyn ItemCheck>], user: &UserId) -> bool {
     checks.iter().any(|check| check.judges(user))
 }
 
+fn live(cache: &PolicyCache) -> bool {
+    item_checks().iter().any(|check| check.live(cache))
+}
+
+pub fn live_checks(checks: &[Arc<dyn ItemCheck>], cache: &PolicyCache) -> Vec<Arc<dyn ItemCheck>> {
+    let live = |check: &&Arc<dyn ItemCheck>| check.live(cache);
+    checks.iter().filter(live).cloned().collect()
+}
+
+fn refusing(
+    checks: &[Arc<dyn ItemCheck>],
+    cache: &PolicyCache,
+    lockout: &Lockout,
+    user: &UserId,
+) -> (UserState, Vec<Arc<dyn ItemCheck>>) {
+    let judging = |check: &&Arc<dyn ItemCheck>| check.live(cache) && check.judges(user);
+    let checks: Vec<_> = checks.iter().filter(judging).cloned().collect();
+    if checks.is_empty() {
+        return (UserState::default(), checks);
+    }
+    let state = lockout.user_state(user);
+    let can = |check: &Arc<dyn ItemCheck>| check.may_refuse(&state);
+    let checks = checks.into_iter().filter(can).collect();
+    (state, checks)
+}
+
 /// Each enforcing cell adds its item's check here and turns the item's `enforced` flag on.
 pub fn default_item_checks() -> ItemChecks {
-    let checks: Vec<Arc<dyn ItemCheck>> = Vec::new();
+    let checks: Vec<Arc<dyn ItemCheck>> = vec![Arc::new(LockoutCheck)];
     checks.into()
 }
 
@@ -163,10 +235,38 @@ pub fn set_item_checks(checks: ItemChecks) {
     *CHECKS.write().unwrap_or_else(PoisonError::into_inner) = checks;
 }
 
+/// What the doors need of a user that only the directory knows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UserFacts {
+    pub uuid: Uuid,
+    pub enrolled: bool,
+    pub exempt: bool,
+}
+
+impl UserFacts {
+    pub fn of<'a>(user: &User, mut groups: impl Iterator<Item = &'a GroupDetails>) -> Self {
+        Self {
+            uuid: user.uuid.clone(),
+            enrolled: user.mfa_type.as_deref() == Some(MFA_TYPE_TOTP),
+            exempt: groups.any(|group| group.display_name.as_str() == MFA_DISABLED_GROUP),
+        }
+    }
+
+    /// The bind's own test: enrolled, the second factor on, and not exempt.
+    pub fn second_factor_required(&self, policy: MfaPolicy) -> bool {
+        let status = MfaEnrollmentStatus {
+            enrolled: self.enrolled,
+            exempt: self.exempt,
+        };
+        mfa_requirement(policy, Some(&status)) == MfaRequirement::Totp
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Entries {
     pub ous_of_users: HashMap<UserId, String>,
     pub items_of_ous: HashMap<String, Arc<[EffectiveItem]>>,
+    pub facts: HashMap<UserId, UserFacts>,
     pub built_at: DateTime<Utc>,
 }
 
@@ -174,6 +274,10 @@ impl Entries {
     pub fn items_of(&self, user: &UserId) -> Option<&[EffectiveItem]> {
         let ou_key = self.ous_of_users.get(user)?;
         self.items_of_ous.get(ou_key).map(|items| &items[..])
+    }
+
+    pub fn facts_of(&self, user: &UserId) -> Option<&UserFacts> {
+        self.facts.get(user)
     }
 }
 
@@ -185,6 +289,9 @@ pub struct PolicyCache {
     fill: Notify,
     writers: tokio::sync::Mutex<()>,
     marked: Mutex<Marks>,
+    read_failed: AtomicBool,
+    lockout: AtomicU8,
+    mfa: RwLock<MfaPolicy>,
 }
 
 #[derive(Default)]
@@ -223,7 +330,41 @@ impl PolicyCache {
             fill: Notify::new(),
             writers: tokio::sync::Mutex::new(()),
             marked: Mutex::default(),
+            read_failed: AtomicBool::new(false),
+            lockout: AtomicU8::new(LOCKOUT_OFF),
+            mfa: RwLock::new(MfaPolicy::Disabled),
         }
+    }
+
+    /// Whether an OU policy sets a lockout threshold: one atomic read.
+    pub fn lockout_live(&self) -> bool {
+        self.lockout.load(Ordering::Acquire) == LOCKOUT_ON
+    }
+
+    pub fn lockout_off(&self) -> bool {
+        self.lockout.load(Ordering::Acquire) == LOCKOUT_OFF
+    }
+
+    /// Before the first read of the policies: the doors the lockout judges refuse.
+    pub fn lockout_unknown(&self) -> bool {
+        self.lockout.load(Ordering::Acquire) == LOCKOUT_UNKNOWN
+    }
+
+    pub fn set_lockout_live(&self, live: bool) {
+        let state = if live { LOCKOUT_ON } else { LOCKOUT_OFF };
+        self.lockout.store(state, Ordering::Release);
+    }
+
+    pub fn mfa_policy(&self) -> MfaPolicy {
+        *self.mfa.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub fn set_mfa_policy(&self, policy: MfaPolicy) {
+        *self.mfa.write().unwrap_or_else(PoisonError::into_inner) = policy;
+    }
+
+    pub fn set_lockout_unknown(&self) {
+        self.lockout.store(LOCKOUT_UNKNOWN, Ordering::Release);
     }
 
     fn current(&self) -> Arc<Entries> {
@@ -265,9 +406,16 @@ impl PolicyCache {
         });
     }
 
+    pub fn put_facts(&self, user: &UserId, facts: UserFacts) {
+        self.edit(|entries| {
+            entries.facts.insert(user.clone(), facts);
+        });
+    }
+
     pub fn remove_user(&self, user: &UserId) {
         self.edit(|entries| {
             entries.ous_of_users.remove(user);
+            entries.facts.remove(user);
         });
     }
 
@@ -321,14 +469,24 @@ where
     Ok(resolve_effective_items(POLICY_ITEM_CATALOG, &levels).into())
 }
 
-async fn user_entry<H>(handler: &H, user: &UserId) -> Result<(String, Arc<[EffectiveItem]>)>
+type UserEntry = (String, Arc<[EffectiveItem]>, User);
+
+async fn user_entry<H>(handler: &H, user: &UserId) -> Result<UserEntry>
 where
     H: UserBackendHandler + PolicyBackendHandler + ?Sized,
 {
     let details = handler.get_user_details(user).await?;
     let ou_key = canonical_ou_key(&user_ou(&details.attributes));
     let items = ou_items(handler, &ou_key).await?;
-    Ok((ou_key, items))
+    Ok((ou_key, items, details))
+}
+
+async fn user_facts<H>(handler: &H, user: &User) -> Result<UserFacts>
+where
+    H: UserBackendHandler + ?Sized,
+{
+    let groups = handler.get_user_groups(&user.user_id).await?;
+    Ok(UserFacts::of(user, groups.iter()))
 }
 
 pub async fn build_entries<H>(handler: &H) -> Result<Entries>
@@ -340,9 +498,11 @@ where
         ..Entries::default()
     };
     let mut ou_keys = BTreeSet::new();
-    for entry in handler.list_users(None, false).await? {
+    for entry in handler.list_users(None, true).await? {
         let ou_key = canonical_ou_key(&user_ou(&entry.user.attributes));
         ou_keys.insert(ou_key.clone());
+        let facts = UserFacts::of(&entry.user, entry.groups.iter().flatten());
+        entries.facts.insert(entry.user.user_id.clone(), facts);
         entries.ous_of_users.insert(entry.user.user_id, ou_key);
     }
     for ou_key in ou_keys {
@@ -375,17 +535,32 @@ where
     H: UserListerBackendHandler + UserBackendHandler + PolicyBackendHandler + Send + Sync + 'static,
 {
     tokio::spawn(async move {
+        let mut gap = FILL_GAP;
         loop {
             tokio::select! {
                 () = cache.poked() => {}
                 () = tokio::time::sleep(POLICY_REFILL) => {}
             }
-            if let Err(e) = fill_policy_cache(&handler, cache).await {
+            if !live(cache) {
+                continue;
+            }
+            let filled = fill_policy_cache(&handler, cache).await;
+            if let Err(e) = &filled {
                 warn!("The policy cache was not refilled: {e}");
             }
-            tokio::time::sleep(FILL_GAP).await;
+            let failed = filled.is_err() | cache.read_failed.swap(false, Ordering::AcqRel);
+            gap = next_gap(gap, failed);
+            tokio::time::sleep(gap).await;
         }
     })
+}
+
+/// A fill whose reads keep failing waits twice as long each time, up to `FILL_BACKOFF_LIMIT`.
+pub fn next_gap(gap: Duration, failed: bool) -> Duration {
+    match failed {
+        true => (gap * 2).min(FILL_BACKOFF_LIMIT),
+        false => FILL_GAP,
+    }
 }
 
 /// Before the KDC serves; nothing is read while no item is enforced.
@@ -402,7 +577,9 @@ where
     if item_checks().is_empty() {
         return None;
     }
-    if let Err(e) = fill_policy_cache(handler, policy_cache()).await {
+    if live(policy_cache())
+        && let Err(e) = fill_policy_cache(handler, policy_cache()).await
+    {
         warn!("The policy cache was not filled at start: {e}");
         policy_cache().poke_fill();
     }
@@ -413,7 +590,7 @@ pub async fn policy_changed<H>(handler: &H, cache: &PolicyCache)
 where
     H: UserListerBackendHandler + UserBackendHandler + PolicyBackendHandler + ?Sized,
 {
-    if item_checks().is_empty() {
+    if !live(cache) {
         return;
     }
     if let Err(e) = fill_policy_cache(handler, cache).await {
@@ -428,11 +605,21 @@ where
     H: UserBackendHandler + PolicyBackendHandler + ?Sized,
 {
     for (user, made) in cache.marked_now() {
-        match user_entry(handler, &user).await {
-            Ok((ou_key, items)) => cache.put_user(&user, &ou_key, items),
+        let entry = match user_entry(handler, &user).await {
+            Ok((ou_key, items, details)) => user_facts(handler, &details)
+                .await
+                .map(|facts| (ou_key, items, facts)),
+            Err(e) => Err(e),
+        };
+        match entry {
+            Ok((ou_key, items, facts)) => {
+                cache.put_user(&user, &ou_key, items);
+                cache.put_facts(&user, facts);
+            }
             Err(DomainError::EntityNotFound(_)) => cache.remove_user(&user),
             Err(e) => {
                 warn!("The policy cache did not take {user}'s change: {e}");
+                cache.read_failed.store(true, Ordering::Release);
                 continue;
             }
         }
@@ -445,7 +632,7 @@ pub async fn user_written<H>(handler: &H, cache: &PolicyCache, user: &UserId)
 where
     H: UserBackendHandler + PolicyBackendHandler + ?Sized,
 {
-    if !judged(&item_checks(), user) {
+    if !judged(&live_checks(&item_checks(), cache), user) {
         return;
     }
     cache.mark(user);
@@ -485,7 +672,7 @@ pub async fn follow_commit<H>(
 ) where
     H: UserBackendHandler + PolicyBackendHandler + ?Sized,
 {
-    let checks = item_checks();
+    let checks = live_checks(&item_checks(), cache);
     let ours: Vec<&UserId> = users.iter().filter(|user| judged(&checks, user)).collect();
     if ours.is_empty() {
         return;
@@ -543,6 +730,21 @@ where
     Ok(user_entry(handler, user).await?.1)
 }
 
+/// Until the lockout's state is read, a user it judges is refused as when a policy is unreadable.
+fn not_read_yet(
+    cache: &PolicyCache,
+    attempt: &Attempt<'_>,
+    checks: &[Arc<dyn ItemCheck>],
+) -> Option<Refusal> {
+    let judges = |check: &Arc<dyn ItemCheck>| {
+        check.key() == lockout::THRESHOLD && check.judges(attempt.user)
+    };
+    (cache.lockout_unknown() && checks.iter().any(judges)).then_some(Refusal {
+        item: UNREADABLE,
+        door: attempt.door,
+    })
+}
+
 fn record_refusal(user: &UserId, refusal: &Refusal) {
     logging::record_as(
         Some(user),
@@ -557,12 +759,27 @@ pub async fn admit<H>(handler: &H, attempt: &Attempt<'_>) -> std::result::Result
 where
     H: UserBackendHandler + PolicyBackendHandler + ?Sized,
 {
+    let cache = policy_cache();
     let checks = item_checks();
-    if !judged(&checks, attempt.user) {
+    if let Some(refusal) = not_read_yet(cache, attempt, &checks) {
+        record_refusal(attempt.user, &refusal);
+        return Err(refusal);
+    }
+    let (state, checks) = refusing(&checks, cache, lockout(), attempt.user);
+    if checks.is_empty() {
         return Ok(());
     }
-    let decision = match resolve_items(handler, policy_cache(), attempt.user).await {
-        Ok(items) => decide(attempt, &items, &UserState::default(), &checks),
+    let decision = match resolve_items(handler, cache, attempt.user).await {
+        Ok(items) => {
+            let decided = decide(attempt, &items, &state, &checks);
+            let locked = matches!(&decided, Err(refusal) if refusal.item == lockout::THRESHOLD);
+            if locked && lockout().confirm(attempt.user).await {
+                let state = lockout().user_state(attempt.user);
+                decide(attempt, &items, &state, &checks)
+            } else {
+                decided
+            }
+        }
         Err(e) => {
             warn!(
                 "The policy of {} could not be read at {:?}: {e}",
@@ -583,7 +800,20 @@ pub fn admit_at_kdc(
     attempt: &Attempt<'_>,
     checks: &[Arc<dyn ItemCheck>],
 ) -> std::result::Result<(), Refusal> {
-    if !judged(checks, attempt.user) {
+    admit_at_kdc_with(cache, lockout(), attempt, checks)
+}
+
+pub fn admit_at_kdc_with(
+    cache: &PolicyCache,
+    lockout: &Lockout,
+    attempt: &Attempt<'_>,
+    checks: &[Arc<dyn ItemCheck>],
+) -> std::result::Result<(), Refusal> {
+    if let Some(refusal) = not_read_yet(cache, attempt, checks) {
+        return Err(refusal);
+    }
+    let (state, checks) = refusing(checks, cache, lockout, attempt.user);
+    if checks.is_empty() {
         return Ok(());
     }
     let entries = cache.get();
@@ -594,7 +824,7 @@ pub fn admit_at_kdc(
             door: attempt.door,
         });
     };
-    decide(attempt, items, &UserState::default(), checks)
+    decide(attempt, items, &state, &checks)
 }
 
 pub fn record_kdc_row(
@@ -687,6 +917,7 @@ mod tests {
                 .iter()
                 .map(|(ou, items)| ((*ou).to_owned(), items.to_vec().into()))
                 .collect(),
+            facts: HashMap::new(),
             built_at: at(0),
         }
     }
@@ -766,7 +997,17 @@ mod tests {
 
     #[test]
     fn test_enforced_flags_match_the_checks() {
-        let checked: HashSet<&str> = default_item_checks().iter().map(|c| c.key()).collect();
+        let checks = default_item_checks();
+        let keys = checks.iter().map(|c| c.key());
+        let read = checks
+            .iter()
+            .flat_map(|c| c.also_enforces().iter().copied());
+        let checked: HashSet<&str> = keys.chain(read).collect();
+        assert_eq!(
+            checked,
+            HashSet::from(["lockout-threshold", "lockout-duration-seconds"]),
+            "the lockout is enforced; the other items are not yet"
+        );
         for spec in POLICY_ITEM_CATALOG {
             assert_eq!(spec.enforced, checked.contains(spec.key), "{}", spec.key);
         }
@@ -778,22 +1019,106 @@ mod tests {
     #[test]
     fn test_each_door_has_its_row_kind_and_only_logins_count() {
         let rows = [
-            (Door::WebLogin, LogKind::Login, true),
-            (Door::SimpleLogin, LogKind::Bind, true),
-            (Door::Refresh, LogKind::TokenRefresh, false),
-            (Door::TokenUse, LogKind::AccessDenied, false),
-            (Door::LdapBind, LogKind::Bind, true),
-            (Door::KerberosAs, LogKind::Login, true),
-            (Door::KerberosTgs, LogKind::AccessDenied, false),
-            (Door::KerberosS4u, LogKind::AccessDenied, false),
+            (Door::WebLogin, LogKind::Login, true, "web login"),
+            (Door::SimpleLogin, LogKind::Bind, true, "simple login"),
+            (Door::Refresh, LogKind::TokenRefresh, false, "token refresh"),
+            (Door::TokenUse, LogKind::AccessDenied, false, "token use"),
+            (Door::LdapBind, LogKind::Bind, true, "ldap bind"),
+            (Door::KerberosAs, LogKind::Login, true, "kerberos"),
+            (
+                Door::KerberosTgs,
+                LogKind::AccessDenied,
+                false,
+                "kerberos service ticket",
+            ),
+            (
+                Door::KerberosS4u,
+                LogKind::AccessDenied,
+                false,
+                "kerberos S4U2Self",
+            ),
         ];
-        for (door, kind, login) in rows {
+        for (door, kind, login, name) in rows {
             assert_eq!(
-                (door.log_kind(), door.is_login()),
-                (kind, login),
+                (door.log_kind(), door.is_login(), door.name()),
+                (kind, login, name),
                 "{door:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_the_lockout_costs_one_atomic_read_until_a_threshold_is_set_somewhere() {
+        let (clean, counted) = (UserId::new("e1clean"), UserId::new("e1counted"));
+        let (cache, counter) = (PolicyCache::new(), Lockout::default());
+        let three = [
+            item("lockout-threshold", "3"),
+            item("lockout-duration-seconds", "0"),
+        ];
+        cache.replace(entries(
+            &[("e1clean", "e1ou"), ("e1counted", "e1ou")],
+            &[("e1ou", &three[..])],
+        ));
+        let failed = Some(at(-5).naive_utc());
+        let locked = LockRow {
+            fail_count: 3,
+            last_failed: failed,
+            ..LockRow::default()
+        };
+        counter.seed(&counted, locked);
+        let checks = default_item_checks();
+        let refused = Err(Refusal {
+            item: "lockout-threshold",
+            door: Door::KerberosAs,
+        });
+        let rows = [
+            ("no threshold anywhere", false, &counted, Ok(()), 0),
+            ("a user with no count", true, &clean, Ok(()), 0),
+            ("a locked user", true, &counted, refused, 1),
+        ];
+        for (label, live, user, expected, reads) in rows {
+            cache.set_lockout_live(live);
+            let attempt = Attempt::at_kdc(user, Door::KerberosAs, None, 1_700_000_000);
+            let before = cache.reads();
+            let got = admit_at_kdc_with(&cache, &counter, &attempt, &checks);
+            assert_eq!((got, cache.reads() - before), (expected, reads), "{label}");
+        }
+        cache.set_lockout_unknown();
+        let attempt = Attempt::at_kdc(&clean, Door::KerberosAs, None, 1_700_000_000);
+        assert_eq!(
+            admit_at_kdc_with(&cache, &counter, &attempt, &checks),
+            Err(Refusal {
+                item: UNREADABLE,
+                door: Door::KerberosAs,
+            }),
+            "until the policies are read, every user the lockout judges is refused"
+        );
+        let refusal = Refusal {
+            item: "lockout-threshold",
+            door: Door::LdapBind,
+        };
+        assert_eq!(refusal.detail(), "locked out");
+    }
+
+    #[test]
+    fn test_a_fill_whose_reads_keep_failing_backs_off_to_the_limit() {
+        let mut gap = FILL_GAP;
+        let mut gaps = Vec::new();
+        for _ in 0..9 {
+            gap = next_gap(gap, true);
+            gaps.push(gap.as_millis());
+        }
+        assert_eq!(
+            gaps,
+            vec![
+                500, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000
+            ]
+        );
+        assert_eq!(
+            next_gap(gap, false),
+            FILL_GAP,
+            "a fill that reads everything"
+        );
     }
 
     #[test]
@@ -1058,7 +1383,7 @@ mod tests {
             unimplemented!()
         }
         async fn get_user_groups(&self, _: &UserId) -> Result<HashSet<GroupDetails>> {
-            unimplemented!()
+            Ok(HashSet::new())
         }
         async fn ensure_kerberos_principal_consistency(&self, _: &UserId, _: bool) -> Result<()> {
             unimplemented!()

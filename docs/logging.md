@@ -8,8 +8,8 @@ that build on them; the terminal lines are LLDAP's usual output plus these event
 
 | Kind | When | Actor / target / detail |
 |---|---|---|
-| `bind` | LDAP simple bind and `/auth/simple/login` (both go through the same login handler) | claimed user; `invalid credentials` (wrong password), `unknown user` (no such account, or an account with no password set — deliberately the same, visible only in this admin-only table; the client response does not differ), `account disabled`, `ou mismatch`, `Anonymous bind not allowed`, `SASL not supported`, a bad DN; with a second factor ([mfa.md](mfa.md)) the success detail is `totp`, the failures `invalid totp`, `totp replayed`, `totp attempts exceeded`, `totp re-enrollment required`, `mfa enrollment required`, and a right password with no code is `totp code required` |
-| `login` | web (OPAQUE) login | claimed user; `invalid credentials`, `account disabled`, the same second-factor details, and success detail `mfa enrollment pending` for a user admitted under `enable_mfa = "always"` before enrolling. An enrolled user's ordinary web login is two steps, so it writes `totp code required` and then the success row. That pair is the login, not an attack. A finish sent with `"session": false` (a page checking the password: enrollment, reset two-factor, change password) makes no session; its success detail is `no session`, after the others' detail and a `; ` when there is one (`totp; no session`), so it does not read as a sign-in. Protocol `kerberos`: a directory user's Kerberos sign-in (kinit), with `ticket issued`, `pre-authentication failed` or `not completed` and the mechanism, or `policy: <item>` when a directory policy refused it |
+| `bind` | LDAP simple bind and `/auth/simple/login` (both go through the same login handler) | claimed user; `invalid credentials` (wrong password), `unknown user` (no such account, or an account with no password set — deliberately the same, visible only in this admin-only table; the client response does not differ), `account disabled`, `ou mismatch`, `locked out` ([policies.md](policies.md#lockout)), `Anonymous bind not allowed`, `SASL not supported`, a bad DN; with a second factor ([mfa.md](mfa.md)) the success detail is `totp`, the failures `invalid totp`, `totp replayed`, `totp attempts exceeded`, `totp re-enrollment required`, `mfa enrollment required`, and a right password with no code is `totp code required` |
+| `login` | web (OPAQUE) login | claimed user; `invalid credentials`, `account disabled`, `locked out`, the same second-factor details, and success detail `mfa enrollment pending` for a user admitted under `enable_mfa = "always"` before enrolling. An enrolled user's ordinary web login is two steps, so it writes `totp code required` and then the success row. That pair is the login, not an attack. A finish sent with `"session": false` (a page checking the password: enrollment, reset two-factor, change password) makes no session; every row it writes, whatever the outcome, says so: `no session` after the row's own detail and a `; ` when there is one (`totp; no session`, `totp code required; no session`), or `no session` alone, so none reads as a sign-in or as an abandoned one. Protocol `kerberos`: a directory user's Kerberos sign-in (kinit), with `ticket issued`, `pre-authentication failed` or `not completed` and the mechanism, `locked out` for a locked user (refused before pre-authentication), or `policy: <item>` when another directory policy refused it |
 | `logout`, `token_refresh` | web session end / refresh | user; `invalid refresh token`, `account disabled` |
 | `password_reset_request`, `password_reset_complete` | reset mail requested / reset token used | target user (also unknown ones — the HTTP response stays silent, the log does not); the token itself is never recorded in this row; a failed reset mail writes the reset link's token to the server log at debug level only |
 | `password_change` | every path: web, GraphQL `setUserPassword`, LDAP `userPassword` modify, password-modify extended operation, `ldapadd` with `userPassword`, admin bootstrap | actor from the request, target user. For a `kerberossync` user one row covers the directory and the KDC: a success row is written in the change's own transaction, a failure row carries the cause, and there is no `kerberos_sync` row. A failure row with detail `result unknown: the database did not answer` or `result unknown: the change did not report` is not a verdict: a success row for the same user at the same moment means the change happened. `result unknown: the change did not report` is written when the task doing the change panicked or did not report (it never ran, for example because the server was stopping). A panic after the commit can leave both a success row and that row; the success row decides. An `ldapadd` with a password for a `kerberossync` user writes these details on its `user_create` row |
@@ -23,8 +23,10 @@ that build on them; the terminal lines are LLDAP's usual output plus these event
 | `keycloak_change` | Federation tab: test connection, save config, push realm | target url / realm |
 | `mfa_enroll` | TOTP enrollment: a state minted (`started`), confirmed (`totp`, `replaced`), or refused (`password proof required`, `enrollment busy` when every used-proof slot of the server holds a live proof, `invalid code`, `expired enrollment`, `stale enrollment`, `corrupt enrollment state`, `foreign enrollment state`; a refused current code on a replacement carries the rejection detail) | actor = target user |
 | `mfa_reset` | a second factor cleared: by an admin or password manager (no detail — the actor says who), by the user (`self`; a refused code carries the rejection detail), by a password reset (`password reset`), by the one-shot admin reset (`forced admin reset`), or for everyone after a private-key rotation (`private key changed`, `system`, no target) | target user |
+| `account_lock` | a counted failure, or a web start that no finish removed in time, brings the user's stored count to the lockout threshold; once per lock until an unlock or a success; for a lock that unfinished web starts make, when they join the stored count, about 10 seconds after they began | no actor; target user; protocol of the door; detail `locked: <door>` (`ldap bind`, `simple login`, `web login`, `kerberos`) |
+| `account_unlock` | an admin's `unlockUser`, the host tool `lldap unlock`, or kadmin `modprinc -unlock` on a directory user's principal; written in the unlock's own transaction | actor = the admin (none for the tool, the client principal for kadmin); target user; detail `unlockUser`, `lldap unlock` or `kadmin modprinc -unlock` |
 | `policy_change` | a named policy created/updated/deleted, attached to or cleared from an OU, inheritance blocked/unblocked, or OU policy state dropped on `deleteOu` | target = policy name or the OU (`(root)` for the domain root); update detail lists field names, never values |
-| `access_denied` | a GraphQL field or an LDAP operation refused for lack of rights, a rejected JWT (junk/`Invalid JWT`, `Expired JWT`, logged out, disabled account, wrong algorithm), a kadmin write refused on a directory user's principal ([kerberos.md](kerberos.md#kadmin-and-directory-users)), a Kerberos renewal, service ticket or S4U2Self refused on a directory policy, or a ticket asked for a subject whose principal is gone (`the principal is gone`; protocol `kerberos`) | actor if known, detail = the refusal message. Like failed binds, the first 8 per client address and protocol are stored one-to-one; a flood past that coalesces into `access_denied_flood`. A kadmin refusal is never coalesced when the actor (the kadmin client) is not the target; one on the client's own principal coalesces per client |
+| `access_denied` | a GraphQL field or an LDAP operation refused for lack of rights, a rejected JWT (junk/`Invalid JWT`, `Expired JWT`, logged out, disabled account, wrong algorithm), a kadmin write refused on a directory user's principal ([kerberos.md](kerberos.md#kadmin-and-directory-users)), a Kerberos renewal, service ticket or S4U2Self refused on a directory policy, a ticket asked for a subject whose principal is gone (`the principal is gone`; protocol `kerberos`), or a non-admin's sign-in with the right password while Kerberos is unavailable (`only admins may sign in while Kerberos is unavailable`; at the LDAP bind `only admins may bind while Kerberos is unavailable`, target the user), which is then the attempt's only row: no `bind` or `login` success row | actor if known, detail = the refusal message. Like failed binds, the first 8 per client address and protocol are stored one-to-one; a flood past that coalesces into `access_denied_flood`. A kadmin refusal is never coalesced when the actor (the kadmin client) is not the target; one on the client's own principal coalesces per client |
 | `server_start`, `admin_bootstrap` | boot, admin created / password forced from the configuration | `system` |
 | `log_gap` | events dropped because the writer's queue overflowed | detail = how many |
 | `bind_flood` | brackets a flood of unknown-name bind failures from one client address and protocol: a `started` row the moment the source passes the first 8 failures, then a `resolved` row when it goes quiet (~20 s) or on shutdown | no actor; peer and protocol of the source; detail `unknown-user bind flood started`, then `unknown-user bind flood resolved: N binds, M names, Ds` (`M+` past 64). An unpaired `started` = still ongoing |
@@ -213,9 +215,8 @@ state for others; this is which source answers what, and the query when it is th
 Limits to keep in mind:
 
 - The writer lags the event by up to 250 ms plus a batch and drops rows under overload
-  (`log_gap`); a lockout that counts from the table would let a burst through, so the
-  enforcement will count at the sink (in memory) and use `logActivity` only to rehydrate at
-  start.
+  (`log_gap`). The lockout therefore does not count from this table: it keeps its own,
+  `login_lockouts` ([policies.md](policies.md#lockout)).
 - The horizon is the retention (30 days / 50000 rows by default): `lastSuccess: null` means
   never, or before the horizon; users who only log in through Kerberos leave no rows here (the
   KDC keeps its own last success and failure count per principal).
@@ -240,10 +241,13 @@ Limits to keep in mind:
   one bounded row. (Plain, valid-but-expired refresh cycles are the common source; if a
   deployment sees steady `Expired JWT` rows, that is a client not refreshing in time.)
 
-Reserved for the policies: kinds `account_lock` / `account_unlock` (actor system or admin,
-target user, detail = reason); refusals stay `bind`/`login` rows with `success = false` and
-the details `locked out`, `outside login hours`, `address not allowed`, `account expired`;
-rejected passwords are `password_change` rows with `success = false`.
+A locked user's refusal is a `bind`/`login` row with `success = false` and detail
+`locked out` (a token refresh or use: `token_refresh`/`access_denied`; a renewal or a
+service ticket: `access_denied`; an S4U2Self: `access_denied`, `locked out (S4U2Self by
+<service>)`), and the lock itself is one `account_lock` row. Refusals of one kind from one
+peer coalesce in a flood, as other failures do. Reserved for the other policies: the details `outside login hours`,
+`address not allowed`, `account expired`; rejected passwords are `password_change` rows with
+`success = false`.
 
 ## Proxies and privacy
 
@@ -255,12 +259,13 @@ addresses), which is the point of it and also a reason to treat the table as sen
 ## What builds on it
 
 The same events flow through an in-process sink before they reach the table: that is the
-hot path, where the policies count (lockout after repeated failures, rate limits, alerts on
-privilege changes) without a database read per request. The table is the durable trail and
+hot path, where the policies can count (rate limits, alerts on privilege changes) without a
+database read per request; the lockout keeps its own table, `login_lockouts`. The table is the durable trail and
 the lookup for admins and other services (`logs`, `logSummary`, `logActivity`, the same
 methods on `LogBackendHandler` for in-process code). The Kerberos side keeps its own state
-(last success, failure count, kadmin policies) that the policies will surface next to it.
+(last success, failure count, kadmin policies) for the principals that are not directory
+users; a directory user's Kerberos failures are counted with the directory's.
 The second factor reports through the same rows ([mfa.md](mfa.md)): a TOTP guess is a
-failed `bind`/`login` like a wrong password, so a lockout keyed on `LOGIN_KINDS` counts it.
+failed `bind`/`login` like a wrong password, and the lockout counts it once.
 The seam (`crates/domain-handlers/src/logging.rs`), the table, the writer and the queries
 are LLDAP-neutral; the Kerberos, Keycloak, OU and POSIX kinds are KLLDAP's.

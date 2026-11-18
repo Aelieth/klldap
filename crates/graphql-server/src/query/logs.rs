@@ -58,6 +58,8 @@ pub enum GraphQLLogKind {
     MfaEnroll,
     MfaReset,
     PolicyChange,
+    AccountLock,
+    AccountUnlock,
 }
 
 #[derive(

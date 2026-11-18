@@ -15,9 +15,10 @@ use lldap_domain::{
 };
 use lldap_domain_handlers::handler::{
     BackendHandler, BindRequest, GroupBackendHandler, GroupListerBackendHandler,
-    GroupRequestFilter, LogBackendHandler, LoginHandler, MfaBackendHandler, PolicyBackendHandler,
-    PosixBackendHandler, PosixSettings, ReadSchemaBackendHandler, SchemaBackendHandler,
-    SystemConfigBackendHandler, UserBackendHandler, UserListerBackendHandler, UserRequestFilter,
+    GroupRequestFilter, LockoutBackendHandler, LogBackendHandler, LoginHandler, MfaBackendHandler,
+    PolicyBackendHandler, PosixBackendHandler, PosixSettings, ReadSchemaBackendHandler,
+    SchemaBackendHandler, SystemConfigBackendHandler, UserBackendHandler, UserListerBackendHandler,
+    UserRequestFilter,
 };
 use lldap_domain_handlers::logging::{
     LogActivity, LogBucket, LogCursor, LogDimension, LogFilter, LogKind, LogRecord,
@@ -103,6 +104,10 @@ mockall::mock! {
         async fn list_ou_policy_states(&self) -> Result<Vec<OuPolicyState>>;
         async fn get_policy_levels(&self, ou: &str) -> Result<Vec<PolicyLevel>>;
         async fn delete_ou_policy_state(&self, ou: &str) -> Result<()>;
+    }
+    #[async_trait]
+    impl LockoutBackendHandler for TestBackendHandler {
+        async fn unlock_user(&self, user_id: &UserId) -> Result<()>;
     }
     #[async_trait]
     impl BackendHandler for TestBackendHandler {}

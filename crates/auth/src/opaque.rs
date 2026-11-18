@@ -11,6 +11,13 @@ pub enum AuthenticationError {
 
 pub type AuthenticationResult<T> = std::result::Result<T, AuthenticationError>;
 
+impl AuthenticationError {
+    /// What the server's finish answers when the client's proof does not verify.
+    pub fn failed_proof() -> Self {
+        Self::ProtocolError(opaque_ke::errors::ProtocolError::InvalidLoginError)
+    }
+}
+
 pub use opaque_ke::keypair::{PrivateKey, PublicKey};
 pub type KeyPair = opaque_ke::keypair::KeyPair<opaque_ke::Ristretto255>;
 

@@ -247,6 +247,9 @@ impl CommonComponent<RegisterMfa> for RegisterMfa {
                 Ok(true)
             }
             Msg::SubmitPassword => {
+                if self.opaque_data.is_some() || self.common.is_task_running() {
+                    return Ok(false);
+                }
                 if !self.password.validate() {
                     bail!("Check the form for errors");
                 }
@@ -270,6 +273,9 @@ impl CommonComponent<RegisterMfa> for RegisterMfa {
                 Ok(true)
             }
             Msg::Submit => {
+                if self.opaque_data.is_some() || self.common.is_task_running() {
+                    return Ok(false);
+                }
                 if !self.form.validate() {
                     bail!("Check the form for errors");
                 }
@@ -292,8 +298,9 @@ impl CommonComponent<RegisterMfa> for RegisterMfa {
                 Ok(true)
             }
             Msg::AuthenticationStartResponse(res) => {
+                let held = self.opaque_data.take();
                 let res = res.map_err(|e| anyhow!("Could not initiate login: {}", e))?;
-                let Some((state, password, code)) = self.opaque_data.take() else {
+                let Some((state, password, code)) = held else {
                     bail!("Invalid state");
                 };
                 let finish_for = match self.ask_proof {
@@ -313,6 +320,7 @@ impl CommonComponent<RegisterMfa> for RegisterMfa {
                 Ok(true)
             }
             Msg::LoginFinishResponse(res) => {
+                let pending_code = self.pending_code.take();
                 let outcome = res.context("Password verification failed")?;
                 if self.ask_proof {
                     self.ask_proof = false;
@@ -326,7 +334,7 @@ impl CommonComponent<RegisterMfa> for RegisterMfa {
                     return Ok(true);
                 }
                 // The password verified. An enrolled user is told a code is still required.
-                let Some(code) = self.pending_code.take() else {
+                let Some(code) = pending_code else {
                     bail!("No enrollment in progress");
                 };
                 let Phase::InProgress(data) = &self.phase else {
@@ -596,7 +604,7 @@ impl RegisterMfa {
               } else {
                 html! {
                   <p>
-                    {"After enrolling, sign in with your password, a colon, and your two-factor code."}
+                    {"After enrolling, the web login asks for your two-factor code after your password. LDAP clients and scripts send your password, a colon, and the code."}
                   </p>
                 }
               }}

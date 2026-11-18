@@ -4,6 +4,7 @@ use crate::sql_kerberos_handler::{
     fill_alias_targets, heartbeat, load_realm, mysql_locked_hold, mysql_realm_probe,
     probe_realm_row, read_first_row, read_hold, read_hold_locked, take_realm,
 };
+use crate::sql_lockout_handler::unlock_statement;
 use crate::sql_log_handler::to_active_model;
 use crate::sql_opaque_handler::user_disabled_in;
 use crate::sql_tables::DbConnection;
@@ -716,6 +717,12 @@ async fn write_host_rows(
                 SqlBackendHandler::change_membership_in(txn, user.clone(), *group, *add)
                     .await
                     .map_err(membership_failed)?;
+            }
+            HostRow::Unlock { user, at } => {
+                if first_user(txn, std::slice::from_ref(user)).await?.is_some() {
+                    let statement = unlock_statement(txn.get_database_backend(), user, *at);
+                    txn.execute(statement).await.map_err(row_failed)?;
+                }
             }
         }
     }

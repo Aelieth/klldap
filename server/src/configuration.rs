@@ -1,7 +1,7 @@
 use crate::{
     cli::{
         GeneralConfigOpts, HealthcheckOpts, LdapsOpts, LogOpts, RunOpts, SmtpEncryption, SmtpOpts,
-        TestEmailOpts, TrueFalseAlways,
+        TestEmailOpts, TrueFalseAlways, UnlockOpts,
     },
     database_string::DatabaseUrl,
 };
@@ -671,6 +671,18 @@ impl ConfigOverrider for RunOpts {
         self.ldaps_opts.override_config(config);
         self.healthcheck_opts.override_config(config);
         self.log_opts.override_config(config);
+    }
+}
+
+impl TopLevelCommandOpts for UnlockOpts {
+    fn general_config(&self) -> &GeneralConfigOpts {
+        &self.run.general_config
+    }
+}
+
+impl ConfigOverrider for UnlockOpts {
+    fn override_config(&self, config: &mut Configuration) {
+        self.run.override_config(config);
     }
 }
 

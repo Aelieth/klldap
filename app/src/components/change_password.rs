@@ -86,6 +86,9 @@ impl CommonComponent<ChangePasswordForm> for ChangePasswordForm {
         match msg {
             Msg::FormUpdate => Ok(true),
             Msg::Submit => {
+                if self.common.is_task_running() || self.opaque_data != OpaqueData::None {
+                    return Ok(false);
+                }
                 if !self.form.validate() {
                     bail!("Check the form for errors");
                 }
@@ -103,12 +106,13 @@ impl CommonComponent<ChangePasswordForm> for ChangePasswordForm {
                         HostService::login_start(request),
                         Msg::LoginStartResponse,
                     );
-                    Ok(false)
+                    Ok(true)
                 }
             }
             Msg::LoginStartResponse(res) => {
+                let held = self.opaque_data.take();
                 let res = res.context("Old password verification failed")?;
-                let OpaqueData::Login(state, password) = self.opaque_data.take() else {
+                let OpaqueData::Login(state, password) = held else {
                     bail!("Invalid state");
                 };
                 let request = finish_login(*state, &password, *res, FinishFor::PasswordCheck)
@@ -134,11 +138,12 @@ impl CommonComponent<ChangePasswordForm> for ChangePasswordForm {
                     HostService::register_start(req),
                     Msg::RegistrationStartResponse,
                 );
-                Ok(false)
+                Ok(true)
             }
             Msg::RegistrationStartResponse(res) => {
+                let held = self.opaque_data.take();
                 let res = res.context("Could not initiate registration")?;
-                let registration = match self.opaque_data.take() {
+                let registration = match held {
                     OpaqueData::Registration(r) => *r,
                     _ => bail!("Invalid state"),
                 };

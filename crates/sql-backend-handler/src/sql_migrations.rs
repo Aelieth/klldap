@@ -175,6 +175,18 @@ pub(crate) enum KerberosRealm {
     State,
 }
 
+#[derive(DeriveIden, Clone, Copy)]
+pub(crate) enum LoginLockouts {
+    Table,
+    UserId,
+    FailCount,
+    LastFailed,
+    LastSuccess,
+    LastAdminUnlock,
+    LockLogged,
+    SplitStart,
+}
+
 // Metadata about the SQL DB.
 #[derive(DeriveIden)]
 pub(crate) enum Metadata {
@@ -2010,7 +2022,85 @@ pub(crate) async fn ensure_v13_additions(pool: &DbConnection) -> Result<(), DbEr
     ensure_logs(&transaction, backend).await?;
     ensure_policies(&transaction, backend).await?;
     ensure_kerberos(&transaction, backend).await?;
+    ensure_login_lockouts(&transaction, backend).await?;
+    ensure_lockout_period(&transaction, backend).await?;
     transaction.commit().await
+}
+
+/// The lockout's counting period: a row always there for a count write to lock.
+async fn ensure_lockout_period(
+    transaction: &DatabaseTransaction,
+    backend: sea_orm::DbBackend,
+) -> Result<(), DbErr> {
+    transaction
+        .execute(
+            backend.build(
+                Query::insert()
+                    .into_table(Alias::new("system_config"))
+                    .columns([Alias::new("key"), Alias::new("value")])
+                    .values_panic(["lockout_period".into(), "0".into()])
+                    .on_conflict(
+                        OnConflict::column(Alias::new("key"))
+                            .do_nothing_on([Alias::new("key")])
+                            .to_owned(),
+                    ),
+            ),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn ensure_login_lockouts(
+    transaction: &DatabaseTransaction,
+    backend: sea_orm::DbBackend,
+) -> Result<(), DbErr> {
+    if !relation_missing(transaction, backend, LoginLockouts::Table.into_iden()).await? {
+        return Ok(());
+    }
+    let stamp = |column| {
+        fractional_time(ColumnDef::new(column), backend)
+            .null()
+            .to_owned()
+    };
+    transaction
+        .execute(
+            backend.build(
+                Table::create()
+                    .table(LoginLockouts::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(LoginLockouts::UserId)
+                            .string_len(255)
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(LoginLockouts::FailCount)
+                            .integer()
+                            .not_null()
+                            .default(0),
+                    )
+                    .col(stamp(LoginLockouts::LastFailed))
+                    .col(stamp(LoginLockouts::LastSuccess))
+                    .col(stamp(LoginLockouts::LastAdminUnlock))
+                    .col(stamp(LoginLockouts::LockLogged))
+                    .col(
+                        ColumnDef::new(LoginLockouts::SplitStart)
+                            .big_integer()
+                            .null(),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("LoginLockoutsUserForeignKey")
+                            .from(LoginLockouts::Table, LoginLockouts::UserId)
+                            .to(Users::Table, Users::UserId)
+                            .on_delete(ForeignKeyAction::Cascade)
+                            .on_update(ForeignKeyAction::Cascade),
+                    ),
+            ),
+        )
+        .await?;
+    Ok(())
 }
 
 async fn attribute_type_map(

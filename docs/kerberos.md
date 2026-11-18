@@ -318,7 +318,7 @@ KLLDAP answers each write to it:
 | `cpw` with a password that is not valid UTF-8, or with a NUL character | Refused | `Unspecified password quality failure` |
 | `cpw -keepold`, `cpw -randkey`, `ktadd` | Refused | `Cannot change protected principal` |
 | `ktadd -norandkey` | Refused by kerber-rust itself: the keys are never read out. No log row is written. | ```Operation requires ``extract-keys'' privilege``` |
-| `modprinc -unlock` alone | Carried out by KLLDAP. Only the failure count, the unlock time and the modification stamp change. The keys and the password stay. | success |
+| `modprinc -unlock` alone | Carried out by KLLDAP as the directory's unlock, in the change's own transaction: the user's lock is cleared, stamped with the server's clock (the unlock time kadmin sends is not read). Only the failure count, the unlock time and the modification stamp change on the principal. The keys and the password stay. | success |
 | `modprinc` with any other option | Refused | `Cannot change protected principal` |
 | `setstr`, `delstr`, `purgekeys` | Refused | `Cannot change protected principal` |
 | `delprinc`, `renprinc` | Refused | `Cannot change protected principal` |
@@ -344,7 +344,8 @@ Each refusal writes one `access_denied` log row,
 A write sent through an alias adds `(requested as <alias>)`. A `cpw` that is
 carried out writes a `password_change` row,
 `kadmin change_password by <client>`, with `(self-service)` when users change
-their own. An unlock writes a `kerberos_sync` row. These rows have the
+their own. An unlock writes a `kerberos_sync` row, `kadmin unlock by <client>`,
+and an `account_unlock` row. These rows have the
 protocol `kadmin`, and the kadmin client is their actor. An admin's refusals
 are each stored. A user's refusals on its own principal coalesce like other
 refusals: past the first 8, into `access_denied_flood` rows (see
@@ -496,7 +497,22 @@ has no `database durability` warning (the warning names `fsync`,
 logs the same warning when `innodb_flush_log_at_trx_commit` or `sync_binlog`
 is unsafe; a power cut has not been tested on them.
 
-Failed sign-in counts are the file `lockout` in the same directory. A missing
+A directory user's failed Kerberos sign-ins are counted in the directory's one table,
+`login_lockouts`, with the other doors' failures ([policies.md](policies.md#lockout)):
+one counter for LDAP bind, the web, `/auth/simple/login` and kinit. Under a threshold the KDC
+waits at most 250 ms for a failure's write before it answers: a write that lands in that time
+survives a kill, and one that takes longer is owed, tried again about a second later, and lost
+if the server is killed first. A locked user gets error 18 (`CLIENT_REVOKED`) before the KDC
+looks at any password, and so does a renewal or a service ticket asked with a ticket issued
+before the lock; kinit prints "Client's credentials have been revoked". That is not the
+wrong-password answer (24), and anyone can ask for it without a password, so a lock is
+visible. An S4U2Self for a locked user is refused the same way and never counts. A ticket
+asked with the password alone clears the count only for a user who need not give a second
+factor at the directory's doors. An unlock by the host tool or by another server is seen
+within a moment of the next attempt: the one refused asks for the user's stored row, and the
+next is answered by it.
+
+The failed sign-in counts of the other principals are the file `lockout` in the same directory. A missing
 file means the realm does not open. The server comes up in the degraded
 state, and the cause says the lockout file is missing; restore it, or create
 an empty one and sync it (`sync <file>`) to count failed logins from zero. A

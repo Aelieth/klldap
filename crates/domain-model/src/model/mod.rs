@@ -7,6 +7,7 @@ pub mod jwt_storage;
 pub mod kerberos_policies;
 pub mod kerberos_principals;
 pub mod kerberos_realm;
+pub mod login_lockouts;
 pub mod logs;
 pub mod memberships;
 pub mod ou_policies;

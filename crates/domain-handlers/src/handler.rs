@@ -251,6 +251,12 @@ pub trait PolicyBackendHandler: Send + Sync {
 }
 
 #[async_trait]
+pub trait LockoutBackendHandler: Send + Sync {
+    /// Clears the user's count; the next failure counts from 1. Unknown users are an error.
+    async fn unlock_user(&self, user_id: &UserId) -> Result<()>;
+}
+
+#[async_trait]
 pub trait BackendHandler:
     Send
     + Sync
@@ -265,6 +271,7 @@ pub trait BackendHandler:
     + LogBackendHandler
     + MfaBackendHandler
     + PolicyBackendHandler
+    + LockoutBackendHandler
 {
 }
 

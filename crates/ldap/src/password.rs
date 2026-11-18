@@ -16,6 +16,7 @@ use lldap_domain_handlers::handler::{BackendHandler, BindRequest, LoginHandler};
 use lldap_domain_handlers::password::{
     PasswordChangeError, PasswordSync, change_password_everywhere,
 };
+use lldap_domain_model::error::DomainError;
 use lldap_mfa::{MFA_ENROLLMENT_REQUIRED, TOTP_SEPARATOR, TotpFailure, totp_failure};
 use lldap_opaque_handler::OpaqueHandler;
 use tracing::{info, warn};
@@ -66,6 +67,10 @@ pub(crate) async fn bind(
         .await
     {
         Ok(()) => Ok(user_id),
+        Err(DomainError::KdcUnavailable(cause)) => Err(LdapError {
+            code: LdapResultCode::Unavailable,
+            message: cause,
+        }),
         Err(e) => Err(LdapError {
             code: LdapResultCode::InvalidCredentials,
             message: totp_diagnostic(&e.to_string()),

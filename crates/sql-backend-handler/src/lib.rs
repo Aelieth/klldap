@@ -5,6 +5,7 @@ pub(crate) mod sql_durability;
 pub(crate) mod sql_group_backend_handler;
 pub(crate) mod sql_kerberos_committer;
 pub(crate) mod sql_kerberos_handler;
+pub(crate) mod sql_lockout_handler;
 pub(crate) mod sql_log_handler;
 pub(crate) mod sql_mfa_handler;
 pub(crate) mod sql_opaque_handler;
@@ -22,6 +23,9 @@ pub use sql_kerberos_committer::{
 };
 #[cfg(feature = "test-hooks")]
 pub use sql_kerberos_committer::{start_committer_losing_an_answer, start_committer_watching_for};
+pub use sql_lockout_handler::unlock_login_on;
 pub use sql_log_handler::{LogRetention, LogWriterHandle, enforce_log_retention, start_log_writer};
+#[cfg(feature = "test-clock")]
+pub use sql_mfa_handler::set_enrollment_clock;
 pub mod sql_migrations;
 pub mod sql_tables;

@@ -91,7 +91,16 @@ fn test_policy_lifecycle_over_graphql() {
         .as_array()
         .expect("catalog");
     assert_eq!(items.len(), 6, "{catalog}");
-    assert!(items.iter().all(|i| i["enforced"] == false), "{catalog}");
+    let enforced: Vec<&str> = items
+        .iter()
+        .filter(|i| i["enforced"] == true)
+        .filter_map(|i| i["key"].as_str())
+        .collect();
+    assert_eq!(
+        enforced,
+        ["lockout-threshold", "lockout-duration-seconds"],
+        "{catalog}"
+    );
 
     let bad = gql(
         &client,

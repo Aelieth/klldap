@@ -11,6 +11,8 @@ rust-version.workspace = true
 
 [features]
 test-hooks = []
+# The TOTP and enrollment clock, settable per thread by another crate's tests; never in a release.
+test-clock = []
 
 [dependencies]
 anyhow = { workspace = true }

@@ -1,4 +1,5 @@
 use crate::sql_backend_handler::SqlBackendHandler;
+use crate::sql_lockout_handler::CountingStart;
 use async_trait::async_trait;
 use lldap_domain_handlers::handler::PolicyBackendHandler;
 use lldap_domain_handlers::logging::{self, LogKind};
@@ -23,7 +24,7 @@ fn encode_items(items: &BTreeMap<String, String>) -> Result<String> {
         .map_err(|e| DomainError::InternalError(format!("serializing policy items: {e}")))
 }
 
-fn decode_items(raw: &str) -> Result<BTreeMap<String, String>> {
+pub(crate) fn decode_items(raw: &str) -> Result<BTreeMap<String, String>> {
     serde_json::from_str(raw)
         .map_err(|e| DomainError::InternalError(format!("decoding policy items: {e}")))
 }
@@ -162,7 +163,11 @@ impl PolicyBackendHandler for SqlBackendHandler {
         if changed.is_empty() {
             return Ok(());
         }
-        active.update(&self.sql_pool).await?;
+        let transaction = self.sql_pool.begin().await?;
+        let start = CountingStart::before(&transaction).await?;
+        active.update(&transaction).await?;
+        start.after(&transaction).await?;
+        transaction.commit().await?;
         self.policy_changed().await;
         let name = request.name.as_deref().unwrap_or(existing.name.as_str());
         logging::record(
@@ -206,14 +211,18 @@ impl PolicyBackendHandler for SqlBackendHandler {
             policy_id: Set(Some(policy_id.0)),
             block_inheritance: ActiveValue::NotSet,
         };
+        let transaction = self.sql_pool.begin().await?;
+        let start = CountingStart::before(&transaction).await?;
         model::OuPolicies::insert(row)
             .on_conflict(
                 OnConflict::column(OuPoliciesColumn::OuKey)
                     .update_column(OuPoliciesColumn::PolicyId)
                     .to_owned(),
             )
-            .exec(&self.sql_pool)
+            .exec(&transaction)
             .await?;
+        start.after(&transaction).await?;
+        transaction.commit().await?;
         self.policy_changed().await;
         logging::record(
             LogKind::PolicyChange,

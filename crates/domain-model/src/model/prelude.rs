@@ -18,6 +18,8 @@ pub use super::kerberos_principals::Column as KerberosPrincipalsColumn;
 pub use super::kerberos_principals::Entity as KerberosPrincipals;
 pub use super::kerberos_realm::Column as KerberosRealmColumn;
 pub use super::kerberos_realm::Entity as KerberosRealm;
+pub use super::login_lockouts::Column as LoginLockoutsColumn;
+pub use super::login_lockouts::Entity as LoginLockouts;
 pub use super::logs::Column as LogsColumn;
 pub use super::logs::Entity as Logs;
 pub use super::memberships::Column as MembershipColumn;

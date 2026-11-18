@@ -24,6 +24,7 @@ use lldap_domain_handlers::kerberos::{
     unsettled_answer, validate_directory_username, validate_kerberos_username, while_disabled,
 };
 use lldap_domain_handlers::logging::{self, LogKind};
+use lldap_domain_handlers::mfa::MFA_DISABLED_GROUP;
 use lldap_domain_model::{
     error::{DomainError, Result},
     model::{self, GroupColumn, UserColumn, codec, system_config},
@@ -835,6 +836,9 @@ impl UserBackendHandler for SqlBackendHandler {
             let log = logging::event(LogKind::UserCreate, Some(user_id.as_str()), true, None);
             let rows = vec![HostRow::CreateUser(request.clone())];
             if let Some(done) = commit_life_step(&user_id, UserStep::Create, rows, log).await {
+                if done.is_ok() {
+                    self.lockout.forget(&user_id);
+                }
                 return done;
             }
         }
@@ -843,6 +847,7 @@ impl UserBackendHandler for SqlBackendHandler {
                 Box::pin(async move { Self::create_user_in(transaction, request).await })
             })
             .await?;
+        self.lockout.forget(&user_id);
         self.user_written(&user_id).await;
         logging::record(LogKind::UserCreate, Some(user_id.as_str()), None);
         Ok(())
@@ -947,6 +952,9 @@ impl UserBackendHandler for SqlBackendHandler {
             HostRow::DeleteUser(user_id.clone()),
         ];
         if !disabled && let Some(done) = commit_life_step(user_id, step, rows, log).await {
+            if done.is_ok() {
+                self.lockout.forget(user_id);
+            }
             return done;
         }
 
@@ -958,6 +966,7 @@ impl UserBackendHandler for SqlBackendHandler {
                 "No such user: '{user_id}'"
             )));
         }
+        self.lockout.forget(user_id);
         self.user_written(user_id).await;
         logging::record(LogKind::UserDelete, Some(user_id.as_str()), None);
         if disabled && synced {
@@ -1012,6 +1021,9 @@ impl UserBackendHandler for SqlBackendHandler {
             Some(user_id.as_str()),
             Some(target_name),
         );
+        if target_name == MFA_DISABLED_GROUP {
+            self.user_written(user_id).await;
+        }
         if synced {
             status_left(&state, user_id);
         }
@@ -1063,6 +1075,9 @@ impl UserBackendHandler for SqlBackendHandler {
             Some(user_id.as_str()),
             group_name.as_deref(),
         );
+        if name == MFA_DISABLED_GROUP {
+            self.user_written(user_id).await;
+        }
         if synced {
             status_left(&state, user_id);
         }

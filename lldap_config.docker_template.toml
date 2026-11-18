@@ -103,8 +103,9 @@
 # force_update_private_key = false
 
 ## Second factor (TOTP). false = off (default); true = users who enrolled an
-## authenticator append their code to the password (yourpassword:123456); "always" =
-## every user must enroll. Members of the lldap_mfa_disabled group are exempt.
+## authenticator give its code too: the web login asks for it after the password, and LDAP
+## binds and /auth/simple/login take password:code (yourpassword:123456); "always" = every
+## user must enroll. Members of the lldap_mfa_disabled group are exempt.
 ## Env variable: LLDAP_ENABLE_MFA
 # enable_mfa = false
 

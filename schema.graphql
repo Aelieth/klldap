@@ -53,6 +53,8 @@ enum LogKind {
   MFA_ENROLL
   MFA_RESET
   POLICY_CHANGE
+  ACCOUNT_LOCK
+  ACCOUNT_UNLOCK
 }
 
 enum LogProtocol {
@@ -424,6 +426,7 @@ type Mutation {
   resetOwnMfa(code: String!): Success!
   startMfaEnrollment(currentCode: String, enrollmentProof: String): MfaEnrollmentStart!
   finishMfaEnrollment(state: String!, code: String!): Success!
+  unlockUser(userId: String!): Success!
 }
 
 type ObjectClassInfo {

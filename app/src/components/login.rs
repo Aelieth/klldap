@@ -127,6 +127,9 @@ impl CommonComponent<LoginForm> for LoginForm {
         match msg {
             Msg::Update => Ok(true),
             Msg::Submit => {
+                if self.in_flight.is_some() || self.common.is_task_running() {
+                    return Ok(false);
+                }
                 if !self.form.validate() {
                     bail!("Check the form for errors");
                 }
@@ -142,6 +145,9 @@ impl CommonComponent<LoginForm> for LoginForm {
                 )
             }
             Msg::SubmitCode => {
+                if self.in_flight.is_some() || self.common.is_task_running() {
+                    return Ok(false);
+                }
                 if !self.code_form.validate() {
                     bail!("Check the form for errors");
                 }

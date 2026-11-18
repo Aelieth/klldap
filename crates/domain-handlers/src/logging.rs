@@ -78,6 +78,8 @@ pub enum LogKind {
     MfaEnroll,
     MfaReset,
     PolicyChange,
+    AccountLock,
+    AccountUnlock,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -120,6 +122,14 @@ impl RequestMeta {
 
 tokio::task_local! {
     static REQUEST: RequestMeta;
+    static WITHOUT_SESSION: ();
+}
+
+pub const NO_SESSION: &str = "no session";
+
+/// Every row written inside says in its detail that no session was made.
+pub async fn without_session<F: Future>(f: F) -> F::Output {
+    WITHOUT_SESSION.scope((), f).await
 }
 
 pub async fn with_request<F: Future>(meta: RequestMeta, f: F) -> F::Output {
@@ -128,6 +138,24 @@ pub async fn with_request<F: Future>(meta: RequestMeta, f: F) -> F::Output {
 
 pub fn with_request_sync<T>(meta: RequestMeta, f: impl FnOnce() -> T) -> T {
     REQUEST.sync_scope(meta, f)
+}
+
+thread_local! {
+    static AS_START: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct AsStart(bool);
+
+impl Drop for AsStart {
+    fn drop(&mut self) {
+        AS_START.set(self.0);
+    }
+}
+
+/// Rows written inside are an earlier web start's: over HTTP, from its peer, in no session scope.
+pub fn as_start<T>(peer: Option<IpAddr>, f: impl FnOnce() -> T) -> T {
+    let _was = AsStart(AS_START.replace(true));
+    with_request_sync(RequestMeta::http(peer, None), f)
 }
 
 pub async fn with_actor<F: Future>(actor: Option<UserId>, f: F) -> F::Output {
@@ -392,7 +420,14 @@ fn build(
     }
 }
 
-fn record_event(event: LogEvent) {
+fn record_event(mut event: LogEvent) {
+    if !AS_START.get() && WITHOUT_SESSION.try_with(|_| ()).is_ok() {
+        let room = MAX_DETAIL_LEN - NO_SESSION.len() - 2;
+        event.detail = Some(match event.detail.take() {
+            Some(detail) => format!("{}; {NO_SESSION}", truncate(&detail, room)),
+            None => NO_SESSION.to_owned(),
+        });
+    }
     emit(&event);
     log_sink().record(event);
 }
@@ -635,6 +670,35 @@ mod tests {
         assert_eq!(inner.peer, meta.peer);
         assert_eq!(inner.forwarded_for.as_deref(), Some("10.1.1.1"));
         assert_eq!(current_request(), RequestMeta::default());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_every_row_written_without_a_session_says_so_and_no_other_does() {
+        let (recorder, _guard) = install_recorder();
+        let long = "x".repeat(MAX_DETAIL_LEN);
+        without_session(async {
+            record_as(None, LogKind::Login, None, true, None);
+            record_failure(LogKind::Login, Some("bob"), "totp code required");
+            record_failure(LogKind::AccessDenied, Some("bob"), &long);
+        })
+        .await;
+        record_failure(LogKind::Login, Some("bob"), "invalid credentials");
+        let details: Vec<_> = recorder
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|event| event.detail.clone().unwrap_or_default())
+            .collect();
+        let suffix = format!("; {NO_SESSION}");
+        assert_eq!(
+            &details[..2],
+            [NO_SESSION.to_owned(), format!("totp code required{suffix}")]
+        );
+        assert!(details[2].ends_with(&suffix), "{}", details[2]);
+        assert_eq!(details[2].chars().count(), MAX_DETAIL_LEN);
+        assert_eq!(details[3], "invalid credentials");
     }
 
     #[tokio::test]

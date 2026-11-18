@@ -14,9 +14,9 @@ use lldap_domain::{
 };
 use lldap_domain_handlers::handler::{
     BackendHandler, GroupBackendHandler, GroupListerBackendHandler, GroupRequestFilter,
-    LogBackendHandler, MfaBackendHandler, PolicyBackendHandler, PosixBackendHandler,
-    ReadSchemaBackendHandler, SchemaBackendHandler, SystemConfigBackendHandler, UserBackendHandler,
-    UserListerBackendHandler, UserRequestFilter,
+    LockoutBackendHandler, LogBackendHandler, MfaBackendHandler, PolicyBackendHandler,
+    PosixBackendHandler, ReadSchemaBackendHandler, SchemaBackendHandler,
+    SystemConfigBackendHandler, UserBackendHandler, UserListerBackendHandler, UserRequestFilter,
 };
 use lldap_domain_handlers::policies::{OuPolicyState, Policy, PolicyId, PolicyLevel};
 use lldap_domain_model::error::Result;
@@ -71,6 +71,7 @@ pub trait AdminBackendHandler:
     + PosixBackendHandler
     + LogBackendHandler
     + PolicyBackendHandler
+    + LockoutBackendHandler
     + OpaqueHandler
 {
     async fn create_user(&self, request: CreateUserRequest) -> Result<()>;

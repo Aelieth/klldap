@@ -4353,6 +4353,438 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    const OTHER_REALM_CHILD: &str = "seam::tests::child_kadmind_answers_for_the_served_realm";
+    const OTHER_REALM_DONE: &str = "kadmind answered for EXAMPLE.COM";
+    const KADM5_API_V2: u32 = 0x1234_5702;
+    const CREATE_PRINCIPAL: u32 = 1;
+    const CHPASS_PRINCIPAL: u32 = 6;
+    const CHPASS_PRINCIPAL3: u32 = 19;
+    const RPG_DATA: u32 = 0;
+    const RPG_INIT: u32 = 1;
+    const GSS_INTEGRITY: u32 = 2;
+    const FLAVOR_GSS: u32 = 6;
+
+    fn xdr(words: &[u32]) -> Vec<u8> {
+        words.iter().flat_map(|w| w.to_be_bytes()).collect()
+    }
+
+    fn opaque(bytes: &[u8]) -> Vec<u8> {
+        let mut v = xdr(&[u32::try_from(bytes.len()).unwrap()]);
+        v.extend_from_slice(bytes);
+        v.resize(v.len() + (4 - bytes.len() % 4) % 4, 0);
+        v
+    }
+
+    fn c_string(text: &str) -> Vec<u8> {
+        let mut bytes = text.as_bytes().to_vec();
+        bytes.push(0);
+        opaque(&bytes)
+    }
+
+    struct Words<'a>(&'a [u8]);
+
+    impl Words<'_> {
+        fn u32(&mut self) -> u32 {
+            let (word, rest) = self.0.split_at(4);
+            self.0 = rest;
+            u32::from_be_bytes(word.try_into().unwrap())
+        }
+
+        fn opaque(&mut self) -> Vec<u8> {
+            let n = usize::try_from(self.u32()).unwrap();
+            let bytes = self.0[..n].to_vec();
+            self.0 = &self.0[n + (4 - n % 4) % 4..];
+            bytes
+        }
+    }
+
+    fn rpc_header(xid: u32, proc: u32, cred: &[u8]) -> Vec<u8> {
+        [xdr(&[xid, 0, 2, 2112, 2, proc, FLAVOR_GSS]), opaque(cred)].concat()
+    }
+
+    fn rpcsec(gss_proc: u32, seq: u32, handle: &[u8]) -> Vec<u8> {
+        [xdr(&[1, gss_proc, seq, GSS_INTEGRITY]), opaque(handle)].concat()
+    }
+
+    fn exchange(stream: &mut std::net::TcpStream, call: &[u8]) -> Vec<u8> {
+        use std::io::{Read, Write};
+        let mark = u32::try_from(call.len()).unwrap() | 0x8000_0000;
+        stream
+            .write_all(&[&mark.to_be_bytes()[..], call].concat())
+            .unwrap();
+        let mut mark = [0; 4];
+        stream.read_exact(&mut mark).unwrap();
+        let length = u32::from_be_bytes(mark) & 0x7fff_ffff;
+        let mut reply = vec![0; usize::try_from(length).unwrap()];
+        stream.read_exact(&mut reply).unwrap();
+        reply
+    }
+
+    /// The name goes on the wire as written: "bob" carries no realm.
+    fn kadm5_args(proc: u32, name: &str, password: &str) -> Vec<u8> {
+        let fields = match proc {
+            CREATE_PRINCIPAL => vec![
+                0, 0, 0, 3600, 1, 0, 0, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1,
+            ],
+            CHPASS_PRINCIPAL3 => vec![1, 0],
+            _ => Vec::new(),
+        };
+        let head = [xdr(&[KADM5_API_V2]), c_string(name), xdr(&fields)].concat();
+        [head, c_string(password)].concat()
+    }
+
+    /// A kadmin session over kadmind's TCP socket: RPCSEC_GSS with integrity, kadm5 API v2.
+    struct Kadm5Wire {
+        stream: std::net::TcpStream,
+        gss: krb5_gss::GssContext,
+        handle: Vec<u8>,
+        seq: u32,
+    }
+
+    impl Kadm5Wire {
+        fn open(
+            kadmind: std::net::SocketAddr,
+            store: &krb5_kdc::SharedDump,
+            client: &PrincipalName,
+            key: &krb5_crypto::ProtocolKey,
+        ) -> Self {
+            let etypes = vec![krb5_crypto::EncryptionType::Aes256CtsHmacSha196.to_iana()];
+            let padata = vec![krb5_protocol::pa_enc_timestamp(key).unwrap()];
+            let service = krb5_kdc::principals::kadmin_admin();
+            let request = krb5_protocol::as_req_sname(
+                client.clone(),
+                "EXAMPLE.COM",
+                7,
+                Some(padata),
+                service,
+                etypes,
+            )
+            .unwrap();
+            let issued = krb5_kdc::issue_as(&*store.read().unwrap(), &request).unwrap();
+            let now = krb5_types::KerberosTime::now();
+            let times = krb5_protocol::TicketTimes {
+                authtime: now.clone(),
+                starttime: None,
+                endtime: now.add_hours(1).unwrap(),
+            };
+            let (mut gss, token) = krb5_gss::GssContext::init_sec_context(
+                issued.rep.0.ticket.clone(),
+                &issued.session_key,
+                &krb5_types::ascii("EXAMPLE.COM"),
+                client,
+                krb5_gss::GSS_C_MUTUAL | krb5_gss::GSS_C_SEQUENCE,
+                None,
+                None,
+                None,
+                0,
+                &times,
+            )
+            .unwrap();
+            let mut stream = std::net::TcpStream::connect(kadmind).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .unwrap();
+            let init = rpc_header(1, 0, &rpcsec(RPG_INIT, 0, &[]));
+            let reply = exchange(&mut stream, &[init, xdr(&[0, 0]), opaque(&token)].concat());
+            let mut r = Words(&reply);
+            assert_eq!([r.u32(), r.u32(), r.u32(), r.u32()], [1, 1, 0, FLAVOR_GSS]);
+            let verf = r.opaque();
+            assert_eq!(r.u32(), 0, "the context is accepted");
+            let handle = r.opaque();
+            let (_major, _minor, window) = (r.u32(), r.u32(), r.u32());
+            gss.process_ap_rep(&r.opaque(), &issued.session_key)
+                .unwrap();
+            gss.verify_mic(&window.to_be_bytes(), &verf).unwrap();
+            Self {
+                stream,
+                gss,
+                handle,
+                seq: 0,
+            }
+        }
+
+        fn call(&mut self, proc: u32, args: &[u8]) -> u32 {
+            self.seq += 1;
+            let xid = self.seq + 1;
+            let header = rpc_header(xid, proc, &rpcsec(RPG_DATA, self.seq, &self.handle));
+            let body = [&self.seq.to_be_bytes()[..], args].concat();
+            let verf = self.gss.get_mic(&header).unwrap();
+            let checksum = self.gss.get_mic(&body).unwrap();
+            let signed = [opaque(&verf), opaque(&body), opaque(&checksum)].concat();
+            let call = [header, xdr(&[FLAVOR_GSS]), signed].concat();
+            let reply = exchange(&mut self.stream, &call);
+            let mut r = Words(&reply);
+            assert_eq!(
+                [r.u32(), r.u32(), r.u32(), r.u32()],
+                [xid, 1, 0, FLAVOR_GSS]
+            );
+            let verf = r.opaque();
+            assert_eq!(r.u32(), 0, "the call is accepted");
+            self.gss.verify_mic(&self.seq.to_be_bytes(), &verf).unwrap();
+            let (body, checksum) = (r.opaque(), r.opaque());
+            self.gss.verify_mic(&body, &checksum).unwrap();
+            let mut r = Words(&body);
+            assert_eq!([r.u32(), r.u32()], [self.seq, KADM5_API_V2]);
+            r.u32()
+        }
+    }
+
+    type PasswordRow = (Option<String>, String, Option<String>, String);
+
+    fn password_rows(pool: &DatabaseConnection, runtime: &Runtime) -> Vec<PasswordRow> {
+        let query = "SELECT target, protocol, actor, detail FROM logs \
+                     WHERE kind = 'password_change' ORDER BY id";
+        let statement = sea_orm::Statement::from_string(pool.get_database_backend(), query);
+        runtime
+            .block_on(pool.query_all(statement))
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row.try_get::<Option<String>>("", "target").unwrap(),
+                    row.try_get::<String>("", "protocol").unwrap(),
+                    row.try_get::<Option<String>>("", "actor").unwrap(),
+                    row.try_get::<String>("", "detail").unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    #[serial]
+    #[ignore = "a child process of test_kadmin_writes_land_in_the_served_realm_whatever_krb5_conf_names"]
+    fn child_kadmind_answers_for_the_served_realm() {
+        use lldap_auth::opaque::server::generate_random_private_key;
+        use lldap_domain_handlers::handler::{BindRequest, LoginHandler};
+        use lldap_sql_backend_handler::SqlBackendHandler;
+        use lldap_test_utils::recording_log::LogGuard;
+
+        let named = krb5_config::load_krb5_conf().and_then(|conf| conf.default_realm);
+        if named.as_deref() != Some("OTHER.TEST") {
+            eprintln!("KRB5_CONFIG names {named:?}, not OTHER.TEST: only the parent row runs this");
+            return;
+        }
+        let guard = LogGuard::install();
+        let runtime = runtime();
+        let temp = TempRealm::new();
+        assert_eq!(
+            boot::profile(&temp.settings).krb5.default_realm.as_deref(),
+            Some("EXAMPLE.COM"),
+            "the composed profile names the served realm, the process's krb5.conf another"
+        );
+        let dir = std::env::temp_dir().join(format!("klldap-other-realm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.join("other-realm.db").display());
+        let connect = |runtime: &Runtime| sqlite_one_connection(&url, runtime);
+        let (committer, pool) = committer_on(&connect, &runtime);
+        for user in ["bob", "alice"] {
+            add_user(&pool, &runtime, user);
+        }
+        let handler = SqlBackendHandler::new(generate_random_private_key(), pool.clone());
+        let records = Records {
+            handler: Arc::new(handler.clone()),
+            runtime: runtime.handle().clone(),
+        };
+        let host = Arc::new(SqlRealm::new(committer.store()).serving("EXAMPLE.COM", Some(records)));
+        let (embedded, opened) = EmbeddedKerberos::open_on(&temp.settings, host.clone()).unwrap();
+        host.start_pass_committed();
+        runtime
+            .block_on(synced(&embedded, &UserId::new("bob"), "Bob-Password-1"))
+            .unwrap();
+        let (store, kadmind) = (opened.store(), opened.kadmin());
+        let threads = opened.serve().unwrap();
+        let (admin, bob, alice) = (boot::admin_principal(), name("bob"), name("alice"));
+        let admin_key = {
+            let realm = store.read().unwrap();
+            realm
+                .get_name(&admin)
+                .unwrap()
+                .best_key()
+                .unwrap()
+                .key
+                .clone()
+        };
+        let bob_key = krb5_crypto::string_to_key(
+            krb5_crypto::EncryptionType::Aes256CtsHmacSha196,
+            "Bob-Password-1",
+            bob.default_salt("EXAMPLE.COM"),
+            None,
+        )
+        .unwrap();
+        let mut by_admin = Kadm5Wire::open(kadmind, &store, &admin, &admin_key);
+        let mut by_bob = Kadm5Wire::open(kadmind, &store, &bob, &bob_key);
+        let record = || record_of(&pool, &runtime, "bob");
+        let kvno = || {
+            store
+                .read()
+                .unwrap()
+                .get_name(&bob)
+                .and_then(|p| p.top_kvno())
+        };
+        let no_alice = || store.read().unwrap().get_name(&alice).is_none();
+        let binds = |user: &str, password: &str| {
+            let request = BindRequest {
+                name: UserId::new(user),
+                password: password.to_owned(),
+            };
+            runtime.block_on(handler.bind(request)).is_ok()
+        };
+        let rows = || -> Rows {
+            let events = guard.recorder().take_events().into_iter();
+            events
+                .filter(|e| e.kind != LogKind::Bind)
+                .map(|e| (e.kind, e.target, e.detail))
+                .collect()
+        };
+        rows();
+        let earlier = password_rows(&pool, &runtime).len();
+
+        const BOB: &str = "bob@EXAMPLE.COM";
+        const ALICE: &str = "alice@EXAMPLE.COM";
+        type Wire = (&'static str, bool, u32, &'static str, &'static str);
+        let cases: [Wire; 8] = [
+            (
+                "an admin's cpw",
+                false,
+                CHPASS_PRINCIPAL,
+                BOB,
+                "Bob-Password-2",
+            ),
+            (
+                "a self-service cpw",
+                true,
+                CHPASS_PRINCIPAL,
+                BOB,
+                "Bob-Password-3",
+            ),
+            (
+                "an admin's cpw, bare",
+                false,
+                CHPASS_PRINCIPAL,
+                "bob",
+                "Bob-Password-4",
+            ),
+            (
+                "a self-service cpw, bare",
+                true,
+                CHPASS_PRINCIPAL,
+                "bob",
+                "Bob-Password-5",
+            ),
+            (
+                "cpw -keepold",
+                false,
+                CHPASS_PRINCIPAL3,
+                BOB,
+                "Bob-Password-6",
+            ),
+            (
+                "cpw -keepold, bare",
+                false,
+                CHPASS_PRINCIPAL3,
+                "bob",
+                "Bob-Password-7",
+            ),
+            (
+                "addprinc",
+                false,
+                CREATE_PRINCIPAL,
+                ALICE,
+                "Alice-Password-1",
+            ),
+            (
+                "addprinc, bare",
+                false,
+                CREATE_PRINCIPAL,
+                "alice",
+                "Alice-Password-2",
+            ),
+        ];
+        let mut got = Vec::new();
+        for (label, own, proc, sent, password) in cases {
+            let (before, stored) = (kvno(), record());
+            let client = if own { &mut by_bob } else { &mut by_admin };
+            let answer = match client.call(proc, &kadm5_args(proc, sent, password)) {
+                0 => "written",
+                code => code_name(code),
+            };
+            let moved = (kvno() == before.map(|k| k + 1), record() != stored);
+            let user = sent.split('@').next().unwrap();
+            let doors = (binds(user, password), no_alice());
+            got.push((label, answer, moved, doors, rows()));
+        }
+        let written = |label| (label, "written", (true, true), (true, true), Vec::new());
+        let refused = |label, code, rows| (label, code, (false, false), (false, true), rows);
+        let keepold = denial(BOB, "change_password", "PROTECT_PRINCIPAL");
+        let add = denial(ALICE, "create", "AUTH_ADD");
+        let cpw = |actor: &str, detail: String| {
+            let kadmin = "kadmin".to_owned();
+            (Some(BOB.to_owned()), kadmin, Some(actor.to_owned()), detail)
+        };
+        let by_admin_row = cpw(ADMIN, format!("kadmin change_password by {ADMIN}"));
+        let by_bob_row = cpw(
+            BOB,
+            format!("kadmin change_password by {BOB} (self-service)"),
+        );
+        assert_eq!(
+            (got, password_rows(&pool, &runtime).split_off(earlier)),
+            (
+                vec![
+                    written("an admin's cpw"),
+                    written("a self-service cpw"),
+                    written("an admin's cpw, bare"),
+                    written("a self-service cpw, bare"),
+                    refused("cpw -keepold", "PROTECT_PRINCIPAL", keepold.clone()),
+                    refused("cpw -keepold, bare", "PROTECT_PRINCIPAL", keepold),
+                    refused("addprinc", "AUTH_ADD", add.clone()),
+                    refused("addprinc, bare", "AUTH_ADD", add),
+                ],
+                vec![
+                    by_admin_row.clone(),
+                    by_bob_row.clone(),
+                    by_admin_row,
+                    by_bob_row
+                ],
+            ),
+            "krb5.conf names OTHER.TEST: each kadm5 request, qualified or bare, is on EXAMPLE.COM"
+        );
+        drop((by_admin, by_bob));
+        threads.stop();
+        drop((embedded, store, host, temp));
+        runtime.block_on(committer.shutdown());
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("{OTHER_REALM_DONE}");
+    }
+
+    #[test]
+    #[serial]
+    fn test_kadmin_writes_land_in_the_served_realm_whatever_krb5_conf_names() {
+        let dir = std::env::temp_dir().join(format!("klldap-krb5-conf-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let conf = dir.join("krb5.conf");
+        std::fs::write(&conf, "[libdefaults]\n default_realm = OTHER.TEST\n").unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                OTHER_REALM_CHILD,
+                "--exact",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("KRB5_CONFIG", &conf)
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success()
+                && stdout.contains("1 passed")
+                && stdout.contains(OTHER_REALM_DONE),
+            "{stdout}{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     fn alias_targets(pool: &DatabaseConnection, runtime: &Runtime) -> Vec<(String, String)> {
         let query = "SELECT name, alias_target FROM kerberos_principals \
                      WHERE alias_target IS NOT NULL";

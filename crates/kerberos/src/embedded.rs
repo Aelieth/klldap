@@ -3411,6 +3411,14 @@ pub(crate) mod tests {
         pub(crate) fn kdc_udp(&self) -> std::net::SocketAddr {
             self.open.kdc_udp[0].local_addr().unwrap()
         }
+
+        pub(crate) fn kadmin(&self) -> std::net::SocketAddr {
+            self.open.kadmin.local_addr().unwrap()
+        }
+
+        pub(crate) fn store(&self) -> SharedDump {
+            self.open.store.clone()
+        }
     }
 
     #[tokio::test]

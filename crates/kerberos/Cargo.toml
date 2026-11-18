@@ -41,6 +41,7 @@ path = "../opaque-handler"
 
 [dev-dependencies]
 krb5-asn1 = { workspace = true }
+krb5-gss = { workspace = true }
 pretty_assertions = { workspace = true }
 sea-orm = { workspace = true }
 serial_test = { workspace = true }

@@ -180,11 +180,12 @@ mod tests {
     use krb5_crypto::{EncryptionType, ProtocolKey, string_to_key};
     use krb5_kdc::admission::{AsReason, Mechanism, TgsKind};
     use krb5_kdc::{IssuedAs, KDB_DISALLOW_ALL_TIX, Principal, PrincipalRead, SharedDump};
-    use krb5_types::{KrbError, PrincipalName, TgsRep};
+    use krb5_types::{KerberosString, KrbError, PrincipalName, TgsRep};
     use lldap_domain::types::UserId;
     use lldap_domain_handlers::kerberos::KerberosSync;
     use pretty_assertions::assert_eq;
     use serial_test::serial;
+    use std::ops::RangeInclusive;
     use std::path::Path;
     use std::process::Command;
     use std::sync::Mutex;
@@ -351,6 +352,29 @@ mod tests {
     type Outcome = Result<[String; 3], (i32, Option<String>)>;
 
     fn s4u2self(store: &SharedDump, svc: &Service, user: &str, x509: bool, nonce: u32) -> Outcome {
+        let reply = s4u2self_reply(store, svc, user, x509, nonce);
+        if let Ok(e) = decode::<KrbError>(&reply) {
+            let text = e
+                .e_text
+                .map(|t| String::from_utf8_lossy(t.as_bytes()).into_owned());
+            return Err((e.error_code, text));
+        }
+        let rep = decode::<TgsRep>(&reply).unwrap().0;
+        let part = krb5_kdc::decrypt_ticket_part(&svc.key, &rep.ticket).unwrap();
+        Ok([
+            rep.cname.unparse_with_realm_lossy(REALM),
+            part.cname.unparse_with_realm_lossy(REALM),
+            rep.ticket.sname.unparse_with_realm_lossy(REALM),
+        ])
+    }
+
+    fn s4u2self_reply(
+        store: &SharedDump,
+        svc: &Service,
+        user: &str,
+        x509: bool,
+        nonce: u32,
+    ) -> Vec<u8> {
         let session = &svc.tgt.session_key;
         let for_user = if x509 {
             krb5_protocol::pa_s4u_x509_user(session, name(user), REALM, nonce)
@@ -372,21 +396,7 @@ mod tests {
             .padata
             .get_or_insert_with(Vec::new)
             .push(for_user.unwrap());
-        let reply =
-            krb5_kdc::handle_request(&*store.read().unwrap(), &encode(&request).unwrap()).unwrap();
-        if let Ok(e) = decode::<KrbError>(&reply) {
-            let text = e
-                .e_text
-                .map(|t| String::from_utf8_lossy(t.as_bytes()).into_owned());
-            return Err((e.error_code, text));
-        }
-        let rep = decode::<TgsRep>(&reply).unwrap().0;
-        let part = krb5_kdc::decrypt_ticket_part(&svc.key, &rep.ticket).unwrap();
-        Ok([
-            rep.cname.unparse_with_realm_lossy(REALM),
-            part.cname.unparse_with_realm_lossy(REALM),
-            rep.ticket.sname.unparse_with_realm_lossy(REALM),
-        ])
+        krb5_kdc::handle_request(&*store.read().unwrap(), &encode(&request).unwrap()).unwrap()
     }
 
     #[tokio::test]
@@ -783,6 +793,156 @@ mod tests {
                     vec![bob.clone()]
                 ),
                 "PA-S4U-X509-USER {x509}"
+            );
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Pin {
+        Stable,
+        ExpectedToChange,
+    }
+
+    const STIME_SLACK: u32 = 5;
+    const SUSEC: RangeInclusive<u32> = 0..=999_999;
+    const CLIENT_TIME: &str = "absent";
+
+    type Field = (&'static str, String, Pin);
+
+    fn either(present: (bool, bool), both: &str) -> String {
+        match present {
+            (false, false) => "absent".to_owned(),
+            (true, true) => both.to_owned(),
+            _ => "one of the two".to_owned(),
+        }
+    }
+
+    fn krb_error_fields(reply: &[u8]) -> Vec<Field> {
+        let e = decode::<KrbError>(reply).unwrap();
+        let text = |s: &KerberosString| String::from_utf8_lossy(s.as_bytes()).into_owned();
+        let realm = text(&e.realm);
+        let client = match (&e.crealm, &e.cname) {
+            (Some(crealm), Some(cname)) => cname.unparse_with_realm_lossy(&text(crealm)),
+            (crealm, cname) => either((crealm.is_some(), cname.is_some()), ""),
+        };
+        let off = krb5_types::unix_now().abs_diff(e.stime.unix_seconds());
+        let stime = if off <= STIME_SLACK {
+            "the server's clock".to_owned()
+        } else {
+            format!("{off} s off the server's clock")
+        };
+        let susec = if SUSEC.contains(&e.susec.get()) {
+            format!("{SUSEC:?}")
+        } else {
+            e.susec.get().to_string()
+        };
+        vec![
+            ("error-code", e.error_code.to_string(), Pin::Stable),
+            ("realm", realm.clone(), Pin::Stable),
+            (
+                "sname",
+                e.sname.unparse_with_realm_lossy(&realm),
+                Pin::Stable,
+            ),
+            ("crealm/cname", client, Pin::Stable),
+            (
+                "e-text",
+                e.e_text.as_ref().map_or("absent".to_owned(), text),
+                Pin::Stable,
+            ),
+            ("stime", stime, Pin::Stable),
+            ("susec", susec, Pin::ExpectedToChange),
+            (
+                "ctime/cusec",
+                either((e.ctime.is_some(), e.cusec.is_some()), "echoed"),
+                Pin::ExpectedToChange,
+            ),
+        ]
+    }
+
+    fn refusal_fields(sname: &str, client: &str) -> Vec<Field> {
+        vec![
+            ("error-code", err::CLIENT_REVOKED.to_string(), Pin::Stable),
+            ("realm", REALM.to_owned(), Pin::Stable),
+            ("sname", sname.to_owned(), Pin::Stable),
+            ("crealm/cname", client.to_owned(), Pin::Stable),
+            ("e-text", "absent".to_owned(), Pin::Stable),
+            ("stime", "the server's clock".to_owned(), Pin::Stable),
+            ("susec", format!("{SUSEC:?}"), Pin::ExpectedToChange),
+            ("ctime/cusec", CLIENT_TIME.to_owned(), Pin::ExpectedToChange),
+        ]
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_each_refusal_is_a_well_formed_krb_error() {
+        let temp = TempRealm::new();
+        let (embedded, store) = temp.embedded();
+        for user in ["bob", "carol"] {
+            synced(&embedded, &UserId::new(user), PASSWORD)
+                .await
+                .unwrap();
+        }
+        let svc = service(&temp, &store);
+        let scratch = Scratch::new("krb-error");
+        let refuse = scratch.file("refuse");
+        fs::write(&refuse, "").unwrap();
+        {
+            let mut guard = store.write().unwrap();
+            crate::boot::install_plugins(&mut guard);
+            let module = from_vars(Some(refuse.clone().into()), None);
+            guard.policy.plugins.set_host_admission(module);
+        }
+        let salt = name("bob").default_salt(REALM);
+        let key = string_to_key(EncryptionType::Aes256CtsHmacSha196, PASSWORD, salt, None).unwrap();
+        let as_request = |nonce| {
+            let padata = vec![krb5_protocol::pa_enc_timestamp(&key).unwrap()];
+            krb5_protocol::as_req(name("bob"), REALM, nonce, Some(padata)).unwrap()
+        };
+        let tgt = krb5_kdc::issue_as(&*store.read().unwrap(), &as_request(1)).unwrap();
+        let tgs_request = krb5_protocol::tgs_req(
+            tgt.rep.0.ticket.clone(),
+            &tgt.session_key,
+            REALM,
+            &name("bob"),
+            svc.name.clone(),
+            REALM,
+            2,
+        )
+        .unwrap();
+        fs::write(&refuse, "bob@EXAMPLE.COM\ncarol@EXAMPLE.COM\n").unwrap();
+        let reply =
+            |request: Vec<u8>| krb5_kdc::handle_request(&*store.read().unwrap(), &request).unwrap();
+        let (krbtgt, svc_at, bob_at) = (
+            format!("krbtgt/{REALM}@{REALM}"),
+            format!("{SERVICE}@{REALM}"),
+            format!("bob@{REALM}"),
+        );
+        let rows = [
+            (
+                "an AS, encrypted timestamp",
+                reply(encode(&as_request(3)).unwrap()),
+                krbtgt,
+                bob_at.clone(),
+            ),
+            (
+                "a TGS for a service",
+                reply(encode(&tgs_request).unwrap()),
+                svc_at.clone(),
+                bob_at,
+            ),
+            (
+                "an S4U2Self",
+                s4u2self_reply(&store, &svc, "carol", false, 4),
+                svc_at.clone(),
+                svc_at,
+            ),
+        ];
+        for (row, bytes, sname, client) in rows {
+            assert_eq!(
+                krb_error_fields(&bytes),
+                refusal_fields(&sname, &client),
+                "{row} refused by the module"
             );
         }
     }

@@ -201,6 +201,42 @@ kadmin_q() { gexec kadmin -k -t /data/kadm5.keytab -p "admin/admin@$REALM" -q "$
 
 admin_kvno() { kadmin_q "getprinc admin/admin@$REALM" | awk '/Key: vno/ {print $3; exit}' | tr -d ','; }
 
+# kadmin_protected <user> <modprinc query> <out>: K1's refusal. KP_WHY says what did not hold.
+kadmin_protected() {
+    local user="$1" query="$2" out="$3" mark before got="" i
+    KP_WHY=""
+    mark="$(graphql '{ logs(limit: 1) { id } }' '{}' 2>/dev/null | json_get logs.0.id 2>/dev/null)"
+    before="$(kadmin_q "getprinc $user" 2>/dev/null | kp_view)"
+    kadmin_q "$query" >"$out" 2>&1
+    if ! grep -qF "Cannot change protected principal" "$out"; then
+        KP_WHY="kadmin did not say 'Cannot change protected principal': $(grep -v '^Authenticating' "$out" | head -1)"
+    elif [ -z "$before" ] || [ "$(kadmin_q "getprinc $user" 2>/dev/null | kp_view)" != "$before" ]; then
+        KP_WHY="getprinc $user: no record, or its policy, flags, expiry or keys moved"
+    elif [ -z "$mark" ]; then
+        KP_WHY="no log marker could be read"
+    else
+        for i in $(seq 1 20); do
+            got="$(kp_denied "$user" "$mark")"
+            case "$got" in "" | "0 "*) sleep 0.5 ;; *) break ;; esac
+        done
+        [ "$got" = one ] && sleep 1 && got="$(kp_denied "$user" "$mark")"
+        [ "$got" = one ] || KP_WHY="access_denied rows for $user@$REALM after the marker: ${got:-unread}"
+    fi
+    [ -z "$KP_WHY" ]
+}
+kp_view() { awk '/^(Policy:|Attributes:|Expiration date:|Password expiration date:|Number of keys:|Key:)/'; }
+kp_denied() {
+    graphql 'query($id: ID!, $t: String!) { logs(filter: {kinds: [ACCESS_DENIED], target: $t}, afterId: $id, limit: 20) { success protocol actor detail } }' \
+        '{"id": "'"$2"'", "t": "'"$1@$REALM"'"}' 2>/dev/null |
+        WANT="kadmin modify on $1@$REALM by admin/admin@$REALM: PROTECT_PRINCIPAL" ACTOR="admin/admin@$REALM" python3 -c '
+import json, os, sys
+rows = json.load(sys.stdin)["logs"]
+row = rows[0] if len(rows) == 1 else {}
+ok = (row.get("detail") == os.environ["WANT"] and row.get("success") is False
+      and row.get("protocol") == "KADMIN" and row.get("actor") == os.environ["ACTOR"])
+print("one" if ok else "%d %s" % (len(rows), json.dumps(rows)[:300]))' 2>/dev/null
+}
+
 # kinit_pw <principal> <password>: password kinit inside the container, isolated cache.
 kinit_pw() {
     gexec sh -c "printf '%s\n' \"\$1\" | KRB5CCNAME=/tmp/gate_cc_\$\$ kinit \"\$0\"" \

@@ -227,73 +227,77 @@ else
     done
 fi
 
-# A password the directory takes and the KDC refuses: a kadm5 policy (min length 40) on an
-# existing principal, as MIT applies it. The directory changes, the
-# principal keeps its key, through GraphQL (an error) and through ldappasswd (Success).
+# K1 refuses a Kerberos policy on a directory user; the policy's effect is kept on a service principal.
 POL_USER="gatepolicy"
+POL_SVC="gatepwsvc/gate.test"
 POL_FIRST="GatePolicyFirstPassword2026!"
 POL_GQL="GatePolicyGql2026!"
 POL_LDAP="GatePolicyLdap2026!"
+POL_SVC_PASS="GatePolicySvcPass2026!"
+POL_SHORT="Short7x"
 POL_NAME="gatepwpol"
-POL_REFUSED="Kerberos sync failed after the directory password was set: while setting the Kerberos password: password policy: min_length 40"
+POL_FLOOR="the password must be at least 8 characters"
 POL_DN="uid=$POL_USER,ou=people,$BASE_DN"
 SET_PW='mutation($id: String!, $pw: String!) { setUserPassword(userId: $id, password: $pw) { ok } }'
 princ_kvno() { kadmin_q "getprinc $1" 2>/dev/null | awk '/Key: vno/ {print $3; exit}' | tr -d ','; }
 user_bind() { t ldapwhoami -x -H "$(ldap_url)" -D "$1" -w "$2" >/dev/null 2>&1; }
 kinit_refused() { ! kinit_pw "$1@$REALM" "$2" >"$3" 2>&1 && grep -q "Password incorrect" "$3"; }
+policy_both() {
+    local new="$1" old="$2" via="$3"
+    if user_bind "$POL_DN" "$new" && ! user_bind "$POL_DN" "$old" \
+        && kinit_pw "$POL_USER@$REALM" "$new" >"$D/kinit-policy-new-$via.log" 2>&1 \
+        && kinit_refused "$POL_USER" "$old" "$D/kinit-policy-old-$via.log"; then
+        p_ok "$via: bind and kinit both take the ${#new}-character password and refuse the old one: a directory user's password rules are the directory's (the floor of 8 now, OU policy later)"
+    else
+        p_bad "$via: bind and kinit did not both move to the ${#new}-character password (see kinit-policy-new-$via.log, kinit-policy-old-$via.log)"
+    fi
+}
 graphql 'mutation($u: CreateUserInput!) { createUser(user: $u) { id } }' \
     '{"u": {"id": "'"$POL_USER"'", "email": "'"$POL_USER"'@gate.test",
             "attributes": [{"name": "kerberossync", "value": ["1"]}]}}' \
     >"$D/create-policy.json" 2>&1 || p_bad "createUser $POL_USER failed"
 graphql "$SET_PW" '{"id": "'"$POL_USER"'", "pw": "'"$POL_FIRST"'"}' >"$D/setpw-policy-first.json" 2>&1 \
     || p_bad "first setUserPassword $POL_USER failed"
-if kadmin_q "addpol -minlength 40 $POL_NAME" >"$D/addpol.txt" 2>&1 \
-    && kadmin_q "modprinc -policy $POL_NAME $POL_USER" >"$D/modprinc-policy.txt" 2>&1 \
-    && ! grep -q " while " "$D/addpol.txt" "$D/modprinc-policy.txt"; then
-    p_ok "policy $POL_NAME (min length 40) bound to $POL_USER"
+if kadmin_q "addpol -minlength 40 $POL_NAME" >"$D/addpol.txt" 2>&1 && ! grep -q " while " "$D/addpol.txt"; then
+    p_ok "policy $POL_NAME (min length 40) created"
 else
-    p_bad "could not bind policy $POL_NAME to $POL_USER (see addpol.txt, modprinc-policy.txt)"
+    p_bad "addpol $POL_NAME failed (see addpol.txt)"
 fi
-kvno_before="$(princ_kvno "$POL_USER")"
+if kadmin_protected "$POL_USER" "modprinc -policy $POL_NAME $POL_USER" "$D/modprinc-policy.txt" \
+    && user_bind "$POL_DN" "$POL_FIRST" && kinit_pw "$POL_USER@$REALM" "$POL_FIRST" >"$D/kinit-policy-bind.log" 2>&1; then
+    p_ok "[K1.policy-bind] modprinc -policy $POL_NAME on the directory user $POL_USER: refused with PROTECT_PRINCIPAL ('Cannot change protected principal'), nothing changes, one access_denied row (protocol KADMIN, actor admin/admin@$REALM)"
+else
+    p_bad "[K1.policy-bind] ${KP_WHY:-bind or kinit lost the first password} (see modprinc-policy.txt, kinit-policy-bind.log)"
+fi
+kadmin_q "addprinc -pw $POL_SVC_PASS $POL_SVC" >"$D/svc-add.txt" 2>&1
+kadmin_q "modprinc -policy $POL_NAME $POL_SVC" >"$D/svc-modprinc.txt" 2>&1
+if ! grep -q " while " "$D/svc-add.txt" "$D/svc-modprinc.txt" \
+    && kadmin_q "getprinc $POL_SVC" >"$D/svc-getprinc.txt" 2>&1 && grep -q "^Policy: ${POL_NAME}$" "$D/svc-getprinc.txt"; then
+    p_ok "[K1.policy-svc-bind] the same bind on the unsynced service principal $POL_SVC is taken"
+else
+    p_bad "[K1.policy-svc-bind] $POL_NAME is not on $POL_SVC (see svc-add.txt, svc-modprinc.txt, svc-getprinc.txt)"
+fi
+svc_kvno="$(princ_kvno "$POL_SVC")"
+kadmin_q "cpw -pw $POL_GQL $POL_SVC" >"$D/svc-cpw.txt" 2>&1
+if grep -q "Password is too short" "$D/svc-cpw.txt" && [ -n "$svc_kvno" ] && [ "$(princ_kvno "$POL_SVC")" = "$svc_kvno" ] \
+    && kinit_pw "$POL_SVC@$REALM" "$POL_SVC_PASS" >"$D/kinit-svc-old.log" 2>&1 \
+    && kinit_refused "$POL_SVC" "$POL_GQL" "$D/kinit-svc-new.log"; then
+    p_ok "[K1.policy-svc] the policy's effect, kept on $POL_SVC: an 18-character cpw is refused ('Password is too short'), the key version stays $svc_kvno, and kinit keeps the old password"
+else
+    p_bad "[K1.policy-svc] want 'Password is too short', key version '${svc_kvno:-none}' kept, the old password kinits and the new one is incorrect (see svc-cpw.txt, kinit-svc-old.log, kinit-svc-new.log)"
+fi
 if graphql "$SET_PW" '{"id": "'"$POL_USER"'", "pw": "'"$POL_GQL"'"}' \
     >"$D/setpw-policy-gql.json" 2>"$D/setpw-policy-gql.err"; then
-    p_bad "setUserPassword answered ok although the policy refuses the password"
-elif grep -qF "$POL_REFUSED" "$D/setpw-policy-gql.err"; then
-    p_ok "setUserPassword reports the policy refusal of the Kerberos half"
+    policy_both "$POL_GQL" "$POL_FIRST" graphql
 else
-    p_bad "setUserPassword: unexpected answer (see setpw-policy-gql.err)"
+    p_bad "graphql: setUserPassword refused an 18-character password (see setpw-policy-gql.err)"
 fi
-policy_holds() {
-    local new="$1" via="$2"
-    if user_bind "$POL_DN" "$new"; then
-        p_ok "$via: the directory takes the new password"
-    else
-        p_bad "$via: the directory refuses the new password"
-    fi
-    if kinit_refused "$POL_USER" "$new" "$D/kinit-policy-new-$via.log"; then
-        p_ok "$via: kinit with the refused password fails"
-    else
-        p_bad "$via: kinit with the refused password did not fail as expected"
-    fi
-    if kinit_pw "$POL_USER@$REALM" "$POL_FIRST" >"$D/kinit-policy-old-$via.log" 2>&1; then
-        p_ok "$via: kinit with the old password still works"
-    else
-        p_bad "$via: kinit with the old password failed"
-    fi
-    if [ -n "$kvno_before" ] && [ "$(princ_kvno "$POL_USER")" = "$kvno_before" ]; then
-        p_ok "$via: the principal's key version is unchanged ($kvno_before)"
-    else
-        p_bad "$via: the principal's key version moved"
-    fi
-}
-policy_holds "$POL_GQL" graphql
 if t ldappasswd -x -H "$(ldap_url)" -D "$(admin_dn)" -w "$ADMIN_PASS" -s "$POL_LDAP" "$POL_DN" \
     >"$D/ldappasswd-policy.log" 2>&1; then
-    p_ok "ldappasswd answers Success when the Kerberos half is refused"
+    policy_both "$POL_LDAP" "$POL_GQL" ldappasswd
 else
-    p_bad "ldappasswd failed (see ldappasswd-policy.log)"
+    p_bad "ldappasswd: refused a 19-character password (see ldappasswd-policy.log)"
 fi
-policy_holds "$POL_LDAP" ldappasswd
 if lsearch -b "$POL_DN" -s base krbPrincipalName >"$D/policy-record.ldif" 2>&1 \
     && grep -qi "^krbPrincipalName: $POL_USER@$REALM" "$D/policy-record.ldif"; then
     p_ok "the first sync's principal-name record is there"
@@ -303,66 +307,84 @@ fi
 graphql 'mutation($u: String!, $g: Int!) { addUserToGroup(userId: $u, groupId: $g) { ok } }' \
     '{"u": "'"$POL_USER"'", "g": '"${disabled_gid:-0}"'}' >"$D/disable-policy.json" 2>&1 \
     || p_bad "addUserToGroup lldap_disabled for $POL_USER failed"
-if graphql "$SET_PW" '{"id": "'"$POL_USER"'", "pw": "'"$POL_GQL"'x"}' \
+kvno_before="$(princ_kvno "$POL_USER")"
+if graphql "$SET_PW" '{"id": "'"$POL_USER"'", "pw": "'"$POL_SHORT"'"}' \
     >"$D/setpw-policy-disabled.json" 2>"$D/setpw-policy-disabled.err"; then
-    p_bad "disabled: setUserPassword answered ok although the policy refuses the password"
-elif grep -qF "$POL_REFUSED" "$D/setpw-policy-disabled.err"; then
-    p_ok "disabled: setUserPassword reports the policy refusal of the Kerberos half"
+    p_bad "disabled: setUserPassword took a 7-character password"
+elif grep -qF "$POL_FLOOR" "$D/setpw-policy-disabled.err"; then
+    p_ok "disabled: setUserPassword refuses 7 characters with the directory's floor ('$POL_FLOOR')"
 else
     p_bad "disabled: setUserPassword: unexpected answer (see setpw-policy-disabled.err)"
 fi
-if t ldappasswd -x -H "$(ldap_url)" -D "$(admin_dn)" -w "$ADMIN_PASS" -s "${POL_LDAP}x" "$POL_DN" \
+if t ldappasswd -x -H "$(ldap_url)" -D "$(admin_dn)" -w "$ADMIN_PASS" -s "$POL_SHORT" "$POL_DN" \
     >"$D/ldappasswd-policy-disabled.log" 2>&1; then
-    p_ok "disabled: ldappasswd answers Success when the Kerberos half is refused"
+    p_bad "disabled: ldappasswd took a 7-character password"
+elif grep -qF "$POL_FLOOR" "$D/ldappasswd-policy-disabled.log"; then
+    p_ok "disabled: ldappasswd refuses 7 characters with the directory's floor ('$POL_FLOOR')"
 else
-    p_bad "disabled: ldappasswd failed (see ldappasswd-policy-disabled.log)"
+    p_bad "disabled: ldappasswd: unexpected answer (see ldappasswd-policy-disabled.log)"
 fi
-if principal_attrs "$POL_USER" >"$D/attrs-policy.txt" && grep -q DISALLOW_ALL_TIX "$D/attrs-policy.txt"; then
-    p_ok "a refused change leaves DISALLOW_ALL_TIX in place"
+if principal_attrs "$POL_USER" >"$D/attrs-policy.txt" && grep -q DISALLOW_ALL_TIX "$D/attrs-policy.txt" \
+    && [ -n "$kvno_before" ] && [ "$(princ_kvno "$POL_USER")" = "$kvno_before" ]; then
+    p_ok "a refused change leaves DISALLOW_ALL_TIX in place and the key version at $kvno_before"
 else
-    p_bad "after a refused change DISALLOW_ALL_TIX is not in place"
+    p_bad "after a refused change DISALLOW_ALL_TIX is not in place, or the key version moved (see attrs-policy.txt)"
 fi
 graphql 'mutation($id: String!) { deleteUser(userId: $id) { ok } }' \
     '{"id": "'"$POL_USER"'"}' >"$D/delete-policy.json" 2>&1 || p_bad "deleteUser $POL_USER failed"
+kadmin_q "delprinc -force $POL_SVC" >"$D/svc-del.txt" 2>&1
+if grep -q " while " "$D/svc-del.txt"; then
+    p_bad "delprinc $POL_SVC failed (see svc-del.txt)"
+fi
 kadmin_q "delpol -force $POL_NAME" >"$D/delpol.txt" 2>&1 || p_bad "delpol $POL_NAME failed (see delpol.txt)"
 
-# A user id the directory takes and Kerberos refuses (validate_kerberos_username): the first
-# sync fails before any principal exists, so no principal-name record is made.
+# A user id Kerberos refuses (validate_kerberos_username): sync cannot be turned on for it, at the
+# create or by the attribute, so no user is left who can never get a password (PL 20:58).
 BAD_USER="gate~env"
 BAD_PASS="GateBadIdPass2026!"
 BAD_DN="uid=$BAD_USER,ou=people,$BASE_DN"
-BAD_REFUSED="Kerberos sync failed after the directory password was set: Kerberos username must be ASCII alphanumeric plus '.', '_' or '-'"
+BAD_RULE="Kerberos sync cannot be turned on for user $BAD_USER: Kerberos username must be ASCII alphanumeric plus '.', '_' or '-'"
 if graphql 'mutation($u: CreateUserInput!) { createUser(user: $u) { id } }' \
     '{"u": {"id": "'"$BAD_USER"'", "email": "gate-env@gate.test",
             "attributes": [{"name": "kerberossync", "value": ["1"]}]}}' \
-    >"$D/create-badid.json" 2>&1; then
-    p_ok "the directory takes the user id $BAD_USER"
+    >"$D/create-badid.json" 2>"$D/create-badid.err"; then
+    p_bad "createUser with kerberosSync on answered ok for $BAD_USER, a name Kerberos refuses"
+elif grep -qF "$BAD_RULE" "$D/create-badid.err"; then
+    p_ok "createUser with kerberosSync on is refused with the name rule for $BAD_USER"
+else
+    p_bad "createUser for $BAD_USER: unexpected answer (see create-badid.err)"
+fi
+if lsearch -b "$BAD_DN" -s base uid >"$D/badid-absent.ldif" 2>&1 && grep -q "^dn:" "$D/badid-absent.ldif"; then
+    p_bad "the refused create left an entry for $BAD_USER (see badid-absent.ldif)"
+else
+    p_ok "the refused create made no entry for $BAD_USER"
+fi
+if graphql 'mutation($u: CreateUserInput!) { createUser(user: $u) { id } }' \
+    '{"u": {"id": "'"$BAD_USER"'", "email": "gate-env@gate.test"}}' \
+    >"$D/create-badid-plain.json" 2>&1; then
+    p_ok "the directory takes the user id $BAD_USER without kerberosSync"
     if graphql "$SET_PW" '{"id": "'"$BAD_USER"'", "pw": "'"$BAD_PASS"'"}' \
-        >"$D/setpw-badid.json" 2>"$D/setpw-badid.err"; then
-        p_bad "setUserPassword answered ok for a name Kerberos refuses"
-    elif grep -qF "$BAD_REFUSED" "$D/setpw-badid.err"; then
-        p_ok "setUserPassword reports the refused Kerberos name"
+        >"$D/setpw-badid.json" 2>"$D/setpw-badid.err" && user_bind "$BAD_DN" "$BAD_PASS"; then
+        p_ok "$BAD_USER without sync gets its password from the directory alone"
     else
-        p_bad "setUserPassword for $BAD_USER: unexpected answer (see setpw-badid.err)"
+        p_bad "$BAD_USER without sync: setUserPassword or the bind failed (see setpw-badid.err)"
     fi
-    if user_bind "$BAD_DN" "$BAD_PASS"; then
-        p_ok "the directory takes $BAD_USER's password"
+    if graphql 'mutation($u: UpdateUserInput!) { updateUser(user: $u) { ok } }' \
+        '{"u": {"id": "'"$BAD_USER"'", "insertAttributes": [{"name": "kerberossync", "value": ["1"]}]}}' \
+        >"$D/sync-on-badid.json" 2>"$D/sync-on-badid.err"; then
+        p_bad "turning kerberosSync on answered ok for $BAD_USER"
+    elif grep -qF "$BAD_RULE" "$D/sync-on-badid.err"; then
+        p_ok "turning kerberosSync on is refused with the name rule for $BAD_USER"
     else
-        p_bad "the directory refuses $BAD_USER's password"
+        p_bad "turning kerberosSync on for $BAD_USER: unexpected answer (see sync-on-badid.err)"
     fi
     if kadmin_q "getprinc $BAD_USER" >"$D/getprinc-badid.txt" 2>&1 && grep -q "^Principal:" "$D/getprinc-badid.txt"; then
         p_bad "a principal exists for $BAD_USER"
     else
         p_ok "no principal for $BAD_USER"
     fi
-    if lsearch -b "$BAD_DN" -s base krbPrincipalName >"$D/badid-record.ldif" 2>&1 \
-        && grep -q "^dn:" "$D/badid-record.ldif" && ! grep -qi "^krbPrincipalName:" "$D/badid-record.ldif"; then
-        p_ok "no principal-name record for $BAD_USER"
-    else
-        p_bad "$BAD_USER: a principal-name record, or the entry was not found (see badid-record.ldif)"
-    fi
     graphql 'mutation($id: String!) { deleteUser(userId: $id) { ok } }' \
         '{"id": "'"$BAD_USER"'"}' >"$D/delete-badid.json" 2>&1 || p_bad "deleteUser $BAD_USER failed"
 else
-    p_bad "the directory refuses the user id $BAD_USER (see create-badid.json); the row's premise does not hold"
+    p_bad "the directory refuses the user id $BAD_USER without sync (see create-badid-plain.json)"
 fi

@@ -1,8 +1,8 @@
 # shellcheck shell=bash
 # Phase: password length at each door. The directory minimum is 8 to 128.
 # Part A tries one character. A door that takes it is FINDING. A PASS names
-# the door's sentence, not any refusal. Part B binds a Kerberos policy of
-# minimum length 12. A split on today's product is FINDING. add-pol is a
+# the door's sentence, not any refusal. Part B: K1 refuses a Kerberos policy on a
+# directory user, 9 characters pass every door, pol-svc keeps its effect. add-pol is a
 # counted SKIP until min-length is an OU policy. The two kadmin rows are
 # re-scoped, see K1. The e-mail reset page follows after this revision has run.
 
@@ -15,6 +15,7 @@ WEB_DN="uid=${WEB},ou=people,${BASE_DN}"
 POL="pwpol"
 ADDPOL="pwadd"
 WEBPOL="pwweb"
+SVC="pwsvc/gate.test"
 SET_PW="mutation(\$id: String!, \$pw: String!) { setUserPassword(userId: \$id, password: \$pw) { ok } }"
 OUT="$D/rows.txt"
 : >"$OUT"
@@ -85,6 +86,53 @@ w1_sentence_row() {
         w1_say "$name" PASS "$answer" "$FOUR"
     else
         w1_say "$name" FAIL "$answer" "$FOUR"
+    fi
+}
+
+w1_floor_row() {
+    local name="$1" took="$2" answer="$3"
+    if [ "$took" -eq 1 ] && [ "$CLASS" = both ]; then
+        w1_say "$name" PASS "$answer" "$FOUR | a directory user's password rules are the directory's: the floor of 8 now, OU policy later"
+    else
+        w1_say "$name" FAIL "$answer" "$FOUR"
+    fi
+}
+
+w1_refused_bind() {
+    local name="$1" pol="$2" user="$3" pw="$4" dn="$5"
+    if ! kadmin_q "addpol -minlength 12 -maxfailure 0 $pol" >"$D/addpol-${name}.log" 2>&1 \
+        || grep -q " while " "$D/addpol-${name}.log"; then
+        w1_say "$name" FAIL "addpol $pol failed (see addpol-${name}.log)"
+    elif kadmin_protected "$user" "modprinc -policy $pol $user" "$D/modprinc-${name}.log" \
+        && w1_bind "$pw" "$dn" && w1_kinit "$pw" "$user" "$D/kinit-${name}.log"; then
+        w1_say "$name" PASS "modprinc -policy $pol $user refused with PROTECT_PRINCIPAL (Cannot change protected principal), nothing changes" "one access_denied, protocol KADMIN, actor admin/admin@$REALM"
+    else
+        w1_say "$name" FAIL "${KP_WHY:-bind or kinit lost the password} (see modprinc-${name}.log)"
+    fi
+}
+
+w1_svc() {
+    local kv now old=no new=no
+    kadmin_q "addprinc -pw $LONG_SVC $SVC" >"$D/svc-add.log" 2>&1
+    kadmin_q "modprinc -policy $POL $SVC" >"$D/svc-modprinc.log" 2>&1
+    if grep -q " while " "$D/svc-add.log" "$D/svc-modprinc.log" || ! w1_bound "$SVC" "$POL" "$D/svc-getprinc.txt"; then
+        w1_say pol-svc FAIL "the control: $POL is not on $SVC (see svc-add.log, svc-modprinc.log, svc-getprinc.txt)"
+        return
+    fi
+    kv="$(kadmin_q "getprinc $SVC" 2>/dev/null | awk '/Key: vno/ {print $3; exit}' | tr -d ',')"
+    kadmin_q "cpw -pw $NINE_SVC $SVC" >"$D/pol-svc.log" 2>&1
+    now="$(kadmin_q "getprinc $SVC" 2>/dev/null | awk '/Key: vno/ {print $3; exit}' | tr -d ',')"
+    if w1_kinit "$LONG_SVC" "$SVC" "$D/kinit-pol-svc-old.log"; then old=yes; fi
+    if w1_kinit "$NINE_SVC" "$SVC" "$D/kinit-pol-svc-new.log"; then
+        new=yes
+    elif grep -q "Password incorrect" "$D/kinit-pol-svc-new.log"; then
+        new=incorrect
+    fi
+    if grep -q "Password is too short" "$D/pol-svc.log" && [ -n "$kv" ] && [ "$now" = "$kv" ] \
+        && [ "$old $new" = "yes incorrect" ]; then
+        w1_say pol-svc PASS "len=${#NINE_SVC} Password is too short" "kvno=$kv kinit-old=yes kinit-new=incorrect | $POL (min 12) on the unsynced $SVC; a directory user's password rules are the directory's (the floor of 8 now, OU policy later)"
+    else
+        w1_say pol-svc FAIL "len=${#NINE_SVC} $(w1_file "$D/pol-svc.log")" "kvno=${kv:-none}->${now:-none} kinit-old=$old kinit-new=$new"
     fi
 }
 
@@ -306,14 +354,16 @@ ADD_GOOD="$(w1_gen 24)"
 LONG_WEB="$(w1_gen 24)"
 ONE_WEB="$(w1_gen 1)"
 NINE_WEB="$(w1_gen 9)"
+LONG_SVC="$(w1_gen 24)"
+NINE_SVC="$(w1_gen 9)"
 DOOR_SECRETS="$(printf '%s\n' "$LONG" "$ONE_GQL" "$ONE_MOD" "$ONE_REPL" "$ONE_TOOL" "$ONE_KADM" \
     "$LONG2" "$NINE_GQL" "$NINE_MOD" "$NINE_REPL" "$NINE_TOOL" "$NINE_KADM" \
-    "$ONE_ADD" "$ADD_GOOD" "$LONG_WEB" "$ONE_WEB" "$NINE_WEB")"
+    "$ONE_ADD" "$ADD_GOOD" "$LONG_WEB" "$ONE_WEB" "$NINE_WEB" "$LONG_SVC" "$NINE_SVC")"
 export DOOR_SECRETS
 
 if [ -z "$LONG" ] || [ -z "$ONE_GQL" ] || [ -z "$ONE_MOD" ] || [ -z "$ONE_REPL" ] \
     || [ -z "$ONE_TOOL" ] || [ -z "$ONE_KADM" ] || [ -z "$NINE_GQL" ] || [ -z "$LONG_WEB" ] \
-    || [ -z "$ADD_GOOD" ] || [ "${#ADD_GOOD}" -ne 24 ] \
+    || [ -z "$ADD_GOOD" ] || [ "${#ADD_GOOD}" -ne 24 ] || [ "${#LONG_SVC}" -ne 24 ] || [ "${#NINE_SVC}" -ne 9 ] \
     || [ "${#ONE_GQL}" -ne 1 ] || [ "${#NINE_GQL}" -ne 9 ] \
     || [ "$ONE_MOD" = "$ONE_GQL" ] || [ "$ONE_REPL" = "$ONE_MOD" ] \
     || [ "$ONE_TOOL" = "$ONE_REPL" ] || [ "$ONE_KADM" = "$ONE_REPL" ]; then
@@ -427,126 +477,93 @@ else
     p_bad "could not align the directory and Kerberos passwords before the policy"
 fi
 
-bound=0
-if kadmin_q "addpol -minlength 12 -maxfailure 0 $POL" >"$D/addpol.log" 2>&1 \
-    && kadmin_q "modprinc -policy $POL $DOOR" >"$D/modprinc.log" 2>&1 \
-    && w1_bound "$DOOR" "$POL" "$D/getprinc-policy.txt" \
-    && kadmin_q "getpol $POL" >"$D/getpol-live.txt" 2>&1 \
-    && grep -q "^Policy: ${POL}$" "$D/getpol-live.txt"; then
-    bound=1
-    note "policy $POL min length 12 max failure 0 is on $DOOR"
-else
-    p_bad "policy $POL is not on $DOOR (see getprinc-policy.txt)"
-fi
+w1_refused_bind pol-bind "$POL" "$DOOR" "$dir_pw" "$DN"
 
-if [ "$bound" -eq 1 ]; then
+gql_code=0
+if w1_set "$DOOR" "$NINE_GQL" "$D/pol-graphql.json" "$D/pol-graphql.err"; then
     gql_code=0
-    if w1_set "$DOOR" "$NINE_GQL" "$D/pol-graphql.json" "$D/pol-graphql.err"; then
-        gql_code=0
-    else
-        gql_code=$?
-    fi
-    gql_answer="exit=${gql_code} len=${#NINE_GQL} $(w1_file "$D/pol-graphql.err") $(w1_file "$D/pol-graphql.json")"
-    w1_sides "$NINE_GQL" "$dir_pw" "$krb_pw" "$DOOR" "$DN" pol-graphql
-    if grep -q "min_length 12" "$D/pol-graphql.err" && [ "$CLASS" = split ]; then
-        w1_say pol-graphql FINDING "${gql_answer}" "$FOUR"
-    elif grep -q "min_length 12" "$D/pol-graphql.err" && [ "$CLASS" = stay ]; then
-        w1_say pol-graphql PASS "${gql_answer}" "$FOUR"
-    else
-        w1_say pol-graphql FAIL "${gql_answer}" "$FOUR"
-    fi
-    w1_track "$NINE_GQL"
+else
+    gql_code=$?
+fi
+gql_answer="exit=${gql_code} len=${#NINE_GQL} $(w1_file "$D/pol-graphql.err") $(w1_file "$D/pol-graphql.json")"
+w1_sides "$NINE_GQL" "$dir_pw" "$krb_pw" "$DOOR" "$DN" pol-graphql
+took=0
+if [ "$gql_code" -eq 0 ]; then took=1; fi
+w1_floor_row pol-graphql "$took" "$gql_answer"
+w1_track "$NINE_GQL"
 
+ldap_code=0
+if t ldappasswd -x -H "$(ldap_url)" -D "$(admin_dn)" -w "$ADMIN_PASS" -s "$NINE_MOD" "$DN" \
+    >"$D/pol-modify.log" 2>&1; then
     ldap_code=0
-    if t ldappasswd -x -H "$(ldap_url)" -D "$(admin_dn)" -w "$ADMIN_PASS" -s "$NINE_MOD" "$DN" \
-        >"$D/pol-modify.log" 2>&1; then
-        ldap_code=0
-    else
-        ldap_code=$?
-    fi
-    ldap_answer="exit=${ldap_code} len=${#NINE_MOD} $(w1_file "$D/pol-modify.log")"
-    w1_sides "$NINE_MOD" "$dir_pw" "$krb_pw" "$DOOR" "$DN" pol-modify
-    if [ "$ldap_code" -eq 0 ] && [ "$CLASS" = split ]; then
-        w1_say pol-modify FINDING "${ldap_answer}" "$FOUR"
-    elif [ "$ldap_code" -ne 0 ] && [ "$CLASS" = stay ] \
-        && grep -q "min_length 12" "$D/pol-modify.log"; then
-        w1_say pol-modify PASS "${ldap_answer}" "$FOUR"
-    else
-        w1_say pol-modify FAIL "${ldap_answer}" "$FOUR"
-    fi
-    w1_track "$NINE_MOD"
+else
+    ldap_code=$?
+fi
+ldap_answer="exit=${ldap_code} len=${#NINE_MOD} $(w1_file "$D/pol-modify.log")"
+w1_sides "$NINE_MOD" "$dir_pw" "$krb_pw" "$DOOR" "$DN" pol-modify
+took=0
+if [ "$ldap_code" -eq 0 ]; then took=1; fi
+w1_floor_row pol-modify "$took" "$ldap_answer"
+w1_track "$NINE_MOD"
 
-    cat >"$D/pol-replace.ldif" <<EOF
+cat >"$D/pol-replace.ldif" <<EOF
 dn: $DN
 changetype: modify
 replace: userPassword
 userPassword: $NINE_REPL
 EOF
+ldap_code=0
+if lmodify -f "$D/pol-replace.ldif" >"$D/pol-replace.log" 2>&1; then
     ldap_code=0
-    if lmodify -f "$D/pol-replace.ldif" >"$D/pol-replace.log" 2>&1; then
-        ldap_code=0
-    else
-        ldap_code=$?
-    fi
-    ldap_answer="exit=${ldap_code} len=${#NINE_REPL} $(w1_file "$D/pol-replace.log")"
-    w1_sides "$NINE_REPL" "$dir_pw" "$krb_pw" "$DOOR" "$DN" pol-replace
-    if [ "$ldap_code" -eq 0 ] && [ "$CLASS" = split ]; then
-        w1_say pol-replace FINDING "${ldap_answer}" "$FOUR"
-    elif [ "$ldap_code" -ne 0 ] && [ "$CLASS" = stay ] \
-        && grep -q "min_length 12" "$D/pol-replace.log"; then
-        w1_say pol-replace PASS "${ldap_answer}" "$FOUR"
-    else
-        w1_say pol-replace FAIL "${ldap_answer}" "$FOUR"
-    fi
-    w1_track "$NINE_REPL"
-
-    tool_code=0
-    if gexec /app/lldap_set_password --base-url http://127.0.0.1:17170 --token "$TOKEN" \
-        --username "$DOOR" --password "$NINE_TOOL" >"$D/pol-tool.log" 2>&1; then
-        tool_code=0
-    else
-        tool_code=$?
-    fi
-    tool_answer="exit=${tool_code} len=${#NINE_TOOL} $(w1_file "$D/pol-tool.log")"
-    w1_sides "$NINE_TOOL" "$dir_pw" "$krb_pw" "$DOOR" "$DN" pol-tool
-    if [ "$CLASS" = split ]; then
-        w1_say pol-tool FINDING "${tool_answer}" "$FOUR"
-    elif [ "$tool_code" -ne 0 ] && [ "$CLASS" = stay ] \
-        && grep -q "min_length 12" "$D/pol-tool.log"; then
-        w1_say pol-tool PASS "${tool_answer}" "$FOUR"
-    else
-        w1_say pol-tool FAIL "${tool_answer}" "$FOUR"
-    fi
-    w1_track "$NINE_TOOL"
-
-    kadm_code=0
-    if kadmin_q "cpw -pw $NINE_KADM $DOOR" >"$D/pol-kadmin.log" 2>&1; then
-        kadm_code=0
-    else
-        kadm_code=$?
-    fi
-    kadm_answer="exit=${kadm_code} len=${#NINE_KADM} $(w1_file "$D/pol-kadmin.log")"
-    w1_sides "$NINE_KADM" "$dir_pw" "$krb_pw" "$DOOR" "$DN" pol-kadmin
-    refused=0
-    if [ "$kadm_code" -ne 0 ] || w1_kadmin_refused "$D/pol-kadmin.log"; then
-        refused=1
-    fi
-    if [ "$refused" -eq 1 ] && [ "$CLASS" = stay ]; then
-        w1_say pol-kadmin PASS "${kadm_answer}" "$FOUR"
-    else
-        w1_say pol-kadmin FAIL "${kadm_answer}" "$FOUR"
-    fi
-    note "pol-kadmin: re-scoped, see K1"
-    w1_track "$NINE_KADM"
 else
-    w1_say pol-graphql FAIL "policy was not on the principal"
-    w1_say pol-modify FAIL "policy was not on the principal"
-    w1_say pol-replace FAIL "policy was not on the principal"
-    w1_say pol-tool FAIL "policy was not on the principal"
-    w1_say pol-kadmin FAIL "policy was not on the principal"
+    ldap_code=$?
 fi
+ldap_answer="exit=${ldap_code} len=${#NINE_REPL} $(w1_file "$D/pol-replace.log")"
+w1_sides "$NINE_REPL" "$dir_pw" "$krb_pw" "$DOOR" "$DN" pol-replace
+took=0
+if [ "$ldap_code" -eq 0 ]; then took=1; fi
+w1_floor_row pol-replace "$took" "$ldap_answer"
+w1_track "$NINE_REPL"
+
+tool_code=0
+if gexec /app/lldap_set_password --base-url http://127.0.0.1:17170 --token "$TOKEN" \
+    --username "$DOOR" --password "$NINE_TOOL" >"$D/pol-tool.log" 2>&1; then
+    tool_code=0
+else
+    tool_code=$?
+fi
+tool_answer="exit=${tool_code} len=${#NINE_TOOL} $(w1_file "$D/pol-tool.log")"
+w1_sides "$NINE_TOOL" "$dir_pw" "$krb_pw" "$DOOR" "$DN" pol-tool
+took=0
+if [ "$tool_code" -eq 0 ]; then took=1; fi
+w1_floor_row pol-tool "$took" "$tool_answer"
+w1_track "$NINE_TOOL"
+
+kadm_code=0
+if kadmin_q "cpw -pw $NINE_KADM $DOOR" >"$D/pol-kadmin.log" 2>&1; then
+    kadm_code=0
+else
+    kadm_code=$?
+fi
+kadm_answer="exit=${kadm_code} len=${#NINE_KADM} $(w1_file "$D/pol-kadmin.log")"
+w1_sides "$NINE_KADM" "$dir_pw" "$krb_pw" "$DOOR" "$DN" pol-kadmin
+took=0
+if [ "$kadm_code" -eq 0 ] && ! w1_kadmin_refused "$D/pol-kadmin.log"; then
+    took=1
+fi
+w1_floor_row pol-kadmin "$took" "$kadm_answer"
+w1_track "$NINE_KADM"
+
+w1_svc
 
 w1_drop_user "$DOOR"
+kadmin_q "delprinc -force $SVC" >"$D/svc-del.log" 2>&1 || true
+kadmin_q "getprinc $SVC" >"$D/svc-gone.txt" 2>&1 || true
+if grep -q "Principal does not exist" "$D/svc-gone.txt"; then
+    note "principal $SVC is gone"
+else
+    p_bad "principal $SVC is not confirmed gone (see svc-del.log, svc-gone.txt)"
+fi
 w1_drop_pol "$POL"
 
 w1_add() {
@@ -648,22 +665,14 @@ else
     else
         w1_say web-one FAIL "len=${#ONE_WEB} ${page#PAGE web-one }" "$FOUR"
     fi
-    if kadmin_q "addpol -minlength 12 -maxfailure 0 $WEBPOL" >"$D/web-addpol.log" 2>&1 \
-        && kadmin_q "modprinc -policy $WEBPOL $WEB" >"$D/web-modprinc.log" 2>&1 \
-        && w1_bound "$WEB" "$WEBPOL" "$D/getprinc-web.txt"; then
-        w1_browser web-pol "$NINE_WEB" || true
-        page="$(grep '^PAGE web-pol ' "$D/web-pol.out" 2>/dev/null | head -1 || true)"
-        row="$(grep '^ROW web-pol ' "$D/web-pol.out" 2>/dev/null | head -1 || true)"
-        w1_sides "$NINE_WEB" "$LONG_WEB" "$LONG_WEB" "$WEB" "$WEB_DN" web-pol
-        if [ "$CLASS" = split ]; then
-            w1_say web-pol FINDING "len=${#NINE_WEB} ${page:-${row:-split}}" "$FOUR"
-        elif [ -n "$page" ] && printf '%s\n' "$page" | grep -q "min_length 12" && [ "$CLASS" = stay ]; then
-            w1_say web-pol PASS "len=${#NINE_WEB} ${page#PAGE web-pol }" "$FOUR"
-        else
-            w1_say web-pol FAIL "len=${#NINE_WEB} ${page:-${row:-page}}" "$FOUR"
-        fi
+    w1_refused_bind web-pol-bind "$WEBPOL" "$WEB" "$LONG_WEB" "$WEB_DN"
+    wire_page web-pol change "$WEB" "$NINE_WEB"
+    w1_sides "$NINE_WEB" "$LONG_WEB" "$LONG_WEB" "$WEB" "$WEB_DN" web-pol
+    if [ "$WIRE_LINE" = "WIRE start-key=yes finish-envelope=yes rewrite=none finish-status=200 graphql-seal=no create-sent=no page=done" ] \
+        && [ "$CLASS" = both ]; then
+        w1_say web-pol PASS "len=${#NINE_WEB} $WIRE_LINE" "$FOUR | a directory user's password rules are the directory's: the floor of 8 now, OU policy later"
     else
-        w1_say web-pol FAIL "policy $WEBPOL is not on $WEB"
+        w1_say web-pol FAIL "len=${#NINE_WEB} $WIRE_LINE ${WIRE_ALERT:+alert: $WIRE_ALERT}" "$FOUR"
     fi
     w1_drop_user "$WEB"
     w1_drop_pol "$WEBPOL"
@@ -675,15 +684,18 @@ w1_judge one-modify
 w1_judge one-replace
 w1_judge one-tool
 w1_judge one-kadmin
+w1_judge pol-bind
 w1_judge pol-graphql
 w1_judge pol-modify
 w1_judge pol-replace
 w1_judge pol-tool
 w1_judge pol-kadmin
+w1_judge pol-svc
 w1_judge add-one
 w1_judge add-pol
 if docker image inspect "$BROWSER_IMAGE" >/dev/null 2>&1; then
     w1_judge web-one
+    w1_judge web-pol-bind
     w1_judge web-pol
 fi
 unset DOOR_SECRETS

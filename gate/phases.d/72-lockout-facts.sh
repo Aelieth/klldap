@@ -257,8 +257,6 @@ lk_totp() {
 
 # kadmin -q exits 0 when its query fails, so absence needs getpol's own answer.
 lk_policy_gone() {
-    kadmin_q "modprinc -unlock $LK_USER@$REALM" >/dev/null 2>&1
-    kadmin_q "modprinc -clearpolicy $LK_USER@$REALM" >/dev/null 2>&1
     kadmin_q "delpol -force $LK_POL" >/dev/null 2>&1
     kadmin_q "listpols" >"$LK_D/listpols.txt" 2>&1
     kadmin_q "getpol $LK_POL" >"$LK_D/getpol.txt" 2>&1
@@ -266,7 +264,7 @@ lk_policy_gone() {
 }
 
 lk_kerberos() {
-    local i wrong=0 got code wrongp=""
+    local i wrong=0 na="not applicable on this product"
     for i in $(seq 1 20); do [ "$(lk_kinit "wrong-$i-$LK_RUN")" = incorrect ] || wrong=$((wrong + 1)); done
     [ "$wrong" = 0 ] || lk_finding "[L1.kinit-wrong] $wrong of 20 wrong passwords were not refused as 'Password incorrect'"
     if [ "$(lk_kinit pass)" = ok ]; then
@@ -274,52 +272,19 @@ lk_kerberos() {
     else
         lk_finding "[L1.kinit-no-policy] the right password was refused after 20 wrong, with no Kerberos policy bound"
     fi
-    kadmin_q "addpol -maxfailure 3 -failurecountinterval 0 -lockoutduration 600 $LK_POL" >"$LK_D/addpol.log" 2>&1 &&
-        kadmin_q "modprinc -policy $LK_POL $LK_USER@$REALM" >"$LK_D/modprinc.log" 2>&1 || {
-        lk_note "[L1.kinit-policy] a Kerberos policy could not be made or bound through kadmin on loopback: $(tail -n 1 -q "$LK_D/addpol.log" "$LK_D/modprinc.log" | tr '\n' ' ' | cut -c1-200)"
-        return 0
-    }
-    for i in 1 2 3; do wrongp+="$(lk_kinit "wrong-p$i-$LK_RUN") "; done
-    got="$(lk_kinit pass)"
-    if [ "$wrongp" = "incorrect incorrect incorrect " ] && [ "$got" = revoked ]; then
-        lk_pass "[L1.kinit-policy] a Kerberos policy with maxfailure 3 (kadmin on loopback): 3 wrong, each 'Password incorrect', then the right password: today refused, 'Client's credentials have been revoked' | when enforced: the same, and the OU policy also applies"
+    kadmin_q "addpol -maxfailure 3 -failurecountinterval 0 -lockoutduration 600 $LK_POL" >"$LK_D/addpol.log" 2>&1
+    if grep -q " while " "$LK_D/addpol.log"; then
+        lk_fail "[L1.kinit-policy-bind] addpol $LK_POL failed: $(grep ' while ' "$LK_D/addpol.log" | head -1 | cut -c1-200)"
+    elif kadmin_protected "$LK_USER" "modprinc -policy $LK_POL $LK_USER" "$LK_D/modprinc.log" &&
+        lk_bind "$LK_USER" pass && [ "$(lk_kinit pass)" = ok ]; then
+        lk_pass "[L1.kinit-policy-bind] modprinc -policy $LK_POL (maxfailure 3) on the directory user $LK_USER: refused with PROTECT_PRINCIPAL ('Cannot change protected principal'), nothing changes, one access_denied row (protocol KADMIN, actor admin/admin@$REALM)"
     else
-        lk_finding "[L1.kinit-policy] with maxfailure 3 bound through kadmin, the 3 wrong passwords gave '${wrongp% }' and the right password then gave '$got', not 3 x incorrect then the lockout refusal"
+        lk_fail "[L1.kinit-policy-bind] ${KP_WHY:-bind or kinit lost the password after the refusal} (see modprinc.log)"
     fi
-    t docker restart "$CONTAINER" >/dev/null 2>&1 && lk_back_up || {
-        lk_fail "[L1.kinit-restart-up] the container did not come back after the Kerberos restart"
-        return 1
-    }
-    got="$(lk_kinit pass)"
-    if [ "$got" = revoked ]; then
-        lk_pass "[L1.kinit-restart] after a clean restart the principal is still locked ('credentials have been revoked'): today kept in data_dir/lockout | when enforced: the same"
-    else
-        lk_finding "[L1.kinit-restart] after a clean restart the right password gave '$got': the Kerberos lockout was not kept"
-    fi
-    t docker kill -s KILL "$CONTAINER" >/dev/null 2>&1
-    code="$(docker inspect -f '{{.State.Running}} {{.State.ExitCode}}' "$CONTAINER" 2>&1)"
-    if [ "$code" != "false 137" ]; then
-        lk_fail "[L1.kinit-kill9-kill] the SIGKILL was not seen (state '$code', want 'false 137')"
-        t docker start "$CONTAINER" >/dev/null 2>&1 && lk_back_up
-        return 1
-    fi
-    t docker start "$CONTAINER" >/dev/null 2>&1 && lk_back_up || {
-        lk_fail "[L1.kinit-kill9-up] the container did not come back after kill -9"
-        return 1
-    }
-    got="$(lk_kinit pass)"
-    if [ "$got" = revoked ]; then
-        lk_pass "[L1.kinit-kill9] after kill -9 (exit 137) and a start the principal is still locked: today kept | when enforced: the same"
-    else
-        lk_finding "[L1.kinit-kill9] after kill -9 (exit 137) the right password gave '$got': the Kerberos lockout was not kept"
-    fi
-    kadmin_q "modprinc -unlock $LK_USER@$REALM" >"$LK_D/unlock.log" 2>&1
-    got="$(lk_kinit pass)"
-    if [ "$got" = ok ]; then
-        lk_pass "[L1.kinit-unlock] kadmin modprinc -unlock releases the principal: today allowed again"
-    else
-        lk_finding "[L1.kinit-unlock] after modprinc -unlock the right password gave '$got' ($(tail -n 1 "$LK_D/unlock.log"))"
-    fi
+    lk_note "[L1.kinit-policy] $na: K1 binds no Kerberos policy on a directory user, so kinit has no kadmin lockout; the directory's lockout (E1′) replaces it"
+    lk_note "[L1.kinit-restart] $na: no Kerberos lockout to keep over a restart; the directory's lockout (E1′) replaces it"
+    lk_note "[L1.kinit-kill9] $na: no Kerberos lockout to keep over kill -9; the directory's lockout (E1′) replaces it"
+    lk_note "[L1.kinit-unlock] $na: nothing is locked at kinit to release (phase 86 holds kadmin's unlock of a directory user)"
 }
 
 lk_cleanup() {

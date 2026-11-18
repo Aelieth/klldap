@@ -2,13 +2,15 @@
 # Phase: X1′'s kill tests. An image built with kill-points aborts a synced password change, or an
 # LDAP Add with a password, at each point of its one transaction; the release image then starts
 # on the same volumes and database. Both stores hold the old state or both the new one, and a
-# success row exists exactly when the change committed.
+# success row exists exactly when the change committed. U1′'s delete and sync off are killed the same way.
 
 KP_D="$(phase_dir)"
 KP_RUN="kp$(date +%H%M%S)"
 KP_USER="${KP_RUN}u"
 KP_DN="uid=${KP_USER},ou=people,${BASE_DN}"
 KP_ADDS=()
+KP_LIFE=() KP_GID="" KP_LU="" KP_LPW="" KP_GOT=""
+KP_UPD='mutation($u: UpdateUserInput!) { updateUser(user: $u) { ok } }'
 KP_POINTS=(opaque-prepared callback-entered directory-written batch-written committed kerberos-changed)
 KP_SET='mutation($id: String!, $pw: String!) { setUserPassword(userId: $id, password: $pw) { ok } }'
 KP_RELEASE="$GATE_IMAGE"
@@ -205,6 +207,128 @@ EOF
     fi
 }
 
+kp_life_user() {
+    KP_LU="${KP_RUN}$1$(printf %02d "${#KP_LIFE[@]}")"
+    KP_LPW="$(kp_gen)"
+    KP_LIFE+=("$KP_LU")
+    graphql 'mutation($u: CreateUserInput!) { createUser(user: $u) { id } }' \
+        '{"u": {"id": "'"$KP_LU"'", "email": "'"$KP_LU"'@gate.test", "attributes": [{"name": "kerberossync", "value": ["1"]}]}}' \
+        >"$KP_D/$KP_LU-create.json" 2>&1 &&
+        graphql "$KP_SET" "$(kp_vars "$KP_LU" "$KP_LPW")" >"$KP_D/$KP_LU-first.json" 2>&1 &&
+        graphql 'mutation($u: String!, $g: Int!) { addUserToGroup(userId: $u, groupId: $g) { ok } }' \
+            '{"u": "'"$KP_LU"'", "g": '"$KP_GID"'}' >"$KP_D/$KP_LU-member.json" 2>&1 &&
+        kp_bind "uid=$KP_LU,ou=people,$BASE_DN" "$KP_LPW" && kp_kinit "$KP_LU" "$KP_LPW"
+}
+
+kp_life_change() {
+    case "$1" in
+    delete-graphql) graphql 'mutation($u: String!) { deleteUser(userId: $u) { ok } }' '{"u": "'"$2"'"}' ;;
+    delete-ldap)
+        printf 'dn: uid=%s,ou=people,%s\nchangetype: delete\n' "$2" "$BASE_DN" >"$KP_D/delete-$2.ldif"
+        lmodify -f "$KP_D/delete-$2.ldif"
+        ;;
+    syncoff-graphql) graphql "$KP_UPD" '{"u": {"id": "'"$2"'", "insertAttributes": [{"name": "kerberossync", "value": ["0"]}]}}' ;;
+    esac
+}
+
+kp_life_state() {
+    local u="$2" f="$KP_D/$2-entry.ldif" entry=no member=error sync krb bind=ok kinit=failed rc out
+    lsearch -b "uid=$u,ou=people,$BASE_DN" -s base uid kerberossync krbPrincipalName >"$f" 2>&1
+    grep -q "^uid: $u$" "$f" && entry=yes
+    sync="$(grep -i '^kerberossync: ' "$f" | head -1 | sed 's/^[^:]*: //')"
+    krb="$(grep -i '^krbPrincipalName: ' "$f" | head -1 | sed 's/^[^:]*: //')"
+    case "$krb" in "") krb="empty" ;; "$u@$REALM") krb="set" ;; *) krb="other($krb)" ;; esac
+    if out="$(graphql 'query($g: Int!) { group(groupId: $g) { users { id } } }' '{"g": '"$KP_GID"'}' 2>"$KP_D/$u-group.err")"; then
+        member=no
+        U="$u" python3 -c 'import json,os,sys; sys.exit(os.environ["U"] not in [x["id"] for x in json.load(sys.stdin)["group"]["users"]])' <<<"$out" && member=yes
+    fi
+    kp_bind "uid=$u,ou=people,$BASE_DN" "$3"
+    rc=$?
+    case "$rc" in 0) ;; 32 | 49) bind=refused ;; *) bind="rc$rc" ;; esac
+    if kp_kinit "$u" "$3"; then
+        kinit=ok
+    elif grep -q "not found in Kerberos database" "$KP_D/kinit.out"; then
+        kinit=not-found
+    fi
+    cp "$KP_D/kinit.out" "$KP_D/$u-kinit.out"
+    case "$1" in
+    delete) KP_GOT="entry=$entry member=$member bind=$bind kinit=$kinit" ;;
+    *) KP_GOT="sync=${sync:-none} krb=$krb bind=$bind kinit=$kinit" ;;
+    esac
+}
+
+# kp_life_cycle <step> <door> <point>: opaque-prepared is a control, never reached, so no abort.
+kp_life_cycle() {
+    local step="$1" door="$2" point="$3" want kind want_got code="" running="" answered=no before after rows=x
+    local row="U1.kill-$step-$door-$point" u pw
+    [ "$step" = syncoff ] && row="U1.kill-syncoff-$point"
+    want="$(kp_want "$point")"
+    [ "$point" = opaque-prepared ] && want=new
+    kind=USER_DELETE want_got="entry=yes member=yes bind=ok kinit=ok"
+    [ "$want" = new ] && want_got="entry=no member=no bind=refused kinit=not-found"
+    if [ "$step" = syncoff ]; then
+        kind=USER_UPDATE want_got="sync=1 krb=set bind=ok kinit=ok"
+        [ "$want" = new ] && want_got="sync=0 krb=empty bind=ok kinit=not-found"
+    fi
+    kp_life_user "${step:0:1}" || {
+        p_bad "[$row] setup: the synced user $KP_LU could not be made with a password on both sides (see $KP_LU-*.json, kinit.out)"
+        return 0
+    }
+    u="$KP_LU" pw="$KP_LPW"
+    before="$(kp_successes "$kind" "$u")"
+    if ! kp_swap "kill-$step-$door-$point" "$GATE_KILL_IMAGE" --init -e "LLDAP_TEST_KILL_POINT=$point"; then
+        p_bad "[$row] the kill image did not come up"
+        kp_swap release "$KP_RELEASE"
+        return
+    fi
+    kp_life_change "$step-$door" "$u" >"$KP_D/$step-$door-$point.change" 2>&1 && answered=yes
+    if [ "$point" = opaque-prepared ]; then
+        running="$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>&1)"
+    else
+        code="$(t docker wait "$CONTAINER" 2>/dev/null)"
+    fi
+    kp_swap release "$KP_RELEASE" || {
+        p_bad "[$row] the release image did not come up after the change"
+        return 1
+    }
+    kp_life_state "$step" "$u" "$pw"
+    after="$(kp_successes "$kind" "$u")"
+    case "$before$after" in *[!0-9]*) ;; *) rows=$((after - before)) ;; esac
+    local want_rows=0 what="a delete"
+    [ "$want" = new ] && want_rows=1
+    [ "$step" = syncoff ] && what="a sync off"
+    if [ "$point" = opaque-prepared ]; then
+        if [ "$answered" = yes ] && [ "$running" = true ] && [ "$KP_GOT" = "$want_got" ] && [ "$rows" = 1 ]; then
+            p_ok "[$row] control: $what never reaches opaque-prepared; it answered, the kill image kept running, and the release image shows $KP_GOT; ${kind,,} success rows +1"
+        else
+            p_bad "[$row] control: answered=$answered running=$running, $KP_GOT, ${kind,,} rows $before -> $after; want yes, true, $want_got, +1"
+        fi
+    elif [ "$code" != 134 ]; then
+        p_bad "[$row] the server did not abort at $point (exit '${code:-none within ${GATE_TIMEOUT:-30} s}', want 134); after it: $KP_GOT"
+    elif [ "$KP_GOT" = "$want_got" ] && [ "$rows" = "$want_rows" ]; then
+        p_ok "[$row] $what killed at $point (exit 134), then the release image: both $want ($KP_GOT); ${kind,,} success rows +$rows"
+    else
+        p_bad "[$row] $what killed at $point (exit 134), then the release image: $KP_GOT, want both $want ($want_got); ${kind,,} rows $before -> $after, want +$want_rows"
+    fi
+}
+
+kp_life_all() {
+    local out door point
+    out="$(graphql 'mutation($n: String!) { createGroup(name: $n) { id } }' '{"n": "'"${KP_RUN}g"'"}' 2>"$KP_D/group.err")" &&
+        KP_GID="$(json_get createGroup.id <<<"$out")" && [ -n "$KP_GID" ] || {
+        p_bad "[U1.kill-setup] the delete rows' group could not be made (see group.err); the delete and sync off rows did not run"
+        return 0
+    }
+    for door in graphql ldap; do
+        for point in "${KP_POINTS[@]}"; do
+            kp_life_cycle delete "$door" "$point" || return 1
+        done
+    done
+    for point in "${KP_POINTS[@]}"; do
+        kp_life_cycle syncoff graphql "$point" || return 1
+    done
+}
+
 kp_all() {
     local door point
     for door in ldappasswd graphql modify; do
@@ -215,6 +339,7 @@ kp_all() {
     for point in "${KP_POINTS[@]}"; do
         kp_add_cycle "$point" || return 1
     done
+    kp_life_all
 }
 
 if kp_setup; then
@@ -226,7 +351,8 @@ if kp_setup; then
         fi
     fi
 fi
-for u in "$KP_USER" ${KP_ADDS[@]+"${KP_ADDS[@]}"}; do
+[ "$KP_UP" = release ] || kp_swap release "$KP_RELEASE" || p_bad "[X1.kill-cleanup] the release image did not come back"
+for u in "$KP_USER" ${KP_ADDS[@]+"${KP_ADDS[@]}"} ${KP_LIFE[@]+"${KP_LIFE[@]}"}; do
     graphql 'mutation($u: String!) { deleteUser(userId: $u) { ok } }' '{"u": "'"$u"'"}' >/dev/null 2>&1
 done
-[ "$KP_UP" = release ] || kp_swap release "$KP_RELEASE" || p_bad "[X1.kill-cleanup] the release image did not come back"
+[ -z "$KP_GID" ] || graphql 'mutation($g: Int!) { deleteGroup(groupId: $g) { ok } }' '{"g": '"$KP_GID"'}' >/dev/null 2>&1

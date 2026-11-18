@@ -119,60 +119,112 @@ fi
 graphql 'mutation($id: String!) { deleteUser(userId: $id) { ok } }' \
     '{"id": "'"$NOSYNC_USER"'"}' >"$D/delete-nosync.json" 2>&1 || p_bad "deleteUser $NOSYNC_USER failed"
 
-# The browser's password envelope, sealed by OpenSSL instead of the app: RSA-OAEP with SHA-256
-# and MGF1-SHA-256 under the published PKCS#1 key. The password travels on stdin only.
 ENV_USER="gateenvelope"
-ENV_PASS="GateEnvelopePass2026!"
-SYNC_MUTATION='mutation($u: String!, $e: String!) { syncKerberosPassword(userId: $u, encryptedPassword: $e) }'
-if ! gexec sh -c 'command -v openssl' >/dev/null 2>&1; then
-    p_skip "envelope rows: no openssl in the image"
-else
+ENV_PLAIN="gateenvplain"
+ENV_SET='mutation($id: String!, $pw: String!) { setUserPassword(userId: $id, password: $pw) { ok } }'
+ENV_BOTH_NEW="bind-new=yes bind-old=no kinit-new=yes kinit-old=no"
+ENV_BOTH_OLD="bind-new=no bind-old=yes kinit-new=no kinit-old=yes"
+ENV_OLD="" ENV_PLAIN_OLD="" ENV_KEY="" ENV_GOT="" ENV_MADE=""
+env_gen() { python3 -c 'import secrets; print("Ge" + secrets.token_hex(10) + "!")'; }
+env_bind() { t ldapwhoami -x -H "$(ldap_url)" -D "uid=$1,ou=people,$BASE_DN" -w "$2" >/dev/null 2>&1; }
+env_sides() {
+    local bn=no bo=no kn=no ko=no
+    env_bind "$1" "$2" && bn=yes
+    env_bind "$1" "$3" && bo=yes
+    kinit_pw "$1@$REALM" "$2" >"$D/kinit-envelope-new.log" 2>&1 && kn=yes
+    kinit_pw "$1@$REALM" "$3" >"$D/kinit-envelope-old.log" 2>&1 && ko=yes
+    ENV_GOT="bind-new=$bn bind-old=$bo kinit-new=$kn kinit-old=$ko"
+}
+
+env_setup() {
+    ENV_OLD="$(env_gen)" ENV_PLAIN_OLD="$(env_gen)"
     graphql 'mutation($u: CreateUserInput!) { createUser(user: $u) { id } }' \
         '{"u": {"id": "'"$ENV_USER"'", "email": "'"$ENV_USER"'@gate.test",
-                "attributes": [{"name": "kerberossync", "value": ["1"]}]}}' \
-        >"$D/create-envelope.json" 2>&1 || p_bad "createUser $ENV_USER failed"
-    graphql '{ kerberosInfo { publicKeyDerBase64 } }' >"$D/envelope-key.json" 2>&1 \
-        || p_bad "kerberosInfo for the envelope failed"
-    pubkey="$(json_get kerberosInfo.publicKeyDerBase64 <"$D/envelope-key.json" 2>/dev/null)"
-    printf '%s' "$ENV_PASS" | t docker exec -i -e KEY="$pubkey" "$CONTAINER" sh -c '
-        printf %s "$KEY" | base64 -d >/tmp/gate_envelope.der &&
-            openssl rsa -RSAPublicKey_in -inform DER -in /tmp/gate_envelope.der \
-                -pubout -out /tmp/gate_envelope.pem 2>/dev/null &&
-            openssl pkeyutl -encrypt -pubin -inkey /tmp/gate_envelope.pem \
-                -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 \
-                -pkeyopt rsa_mgf1_md:sha256 | base64 -w0
-        rc=$?; rm -f /tmp/gate_envelope.der /tmp/gate_envelope.pem; exit $rc' \
-        >"$D/envelope.b64" 2>"$D/envelope.err"
-    sealed="$(cat "$D/envelope.b64")"
-    if [ -n "$sealed" ] && graphql "$SYNC_MUTATION" '{"u": "'"$ENV_USER"'", "e": "'"$sealed"'"}' \
-        >"$D/envelope-sync.json" 2>"$D/envelope-sync.err" \
-        && [ "$(json_get syncKerberosPassword <"$D/envelope-sync.json")" = "True" ]; then
-        p_ok "syncKerberosPassword takes an OpenSSL OAEP-SHA256 envelope"
+                "attributes": [{"name": "kerberossync", "value": ["1"]}]}}' >"$D/create-envelope.json" 2>&1 &&
+        graphql 'mutation($u: CreateUserInput!) { createUser(user: $u) { id } }' \
+            '{"u": {"id": "'"$ENV_PLAIN"'", "email": "'"$ENV_PLAIN"'@gate.test"}}' >>"$D/create-envelope.json" 2>&1 &&
+        graphql "$ENV_SET" '{"id": "'"$ENV_USER"'", "pw": "'"$ENV_OLD"'"}' >>"$D/create-envelope.json" 2>&1 &&
+        graphql "$ENV_SET" '{"id": "'"$ENV_PLAIN"'", "pw": "'"$ENV_PLAIN_OLD"'"}' >>"$D/create-envelope.json" 2>&1 &&
+        env_bind "$ENV_USER" "$ENV_OLD" && env_bind "$ENV_PLAIN" "$ENV_PLAIN_OLD" &&
+        kinit_pw "$ENV_USER@$REALM" "$ENV_OLD" >"$D/kinit-envelope-first.log" 2>&1 || {
+        p_bad "[U1.env-setup] the envelope users could not be made, or a first password does not hold (see create-envelope.json, kinit-envelope-first.log)"
+        return 1
+    }
+}
+
+env_synced() {
+    local new want="WIRE start-key=yes finish-envelope=yes rewrite=none finish-status=200 graphql-seal=no create-sent=no page=done"
+    new="$(env_gen)"
+    wire_page env-synced change "$ENV_USER" "$new"
+    env_sides "$ENV_USER" "$new" "$ENV_OLD"
+    if [ "$WIRE_LINE" = "$want" ] && [ "$ENV_GOT" = "$ENV_BOTH_NEW" ]; then
+        ENV_OLD="$new"
+        p_ok "[U1.env-page-synced] the change page for a synced user: register/start gives the key, the finish carries the envelope, and bind and kinit both take the new password"
     else
-        p_bad "syncKerberosPassword refused the OpenSSL envelope (see envelope.err, envelope-sync.err)"
+        env_bind "$ENV_USER" "$new" && ENV_OLD="$new"
+        p_bad "[U1.env-page-synced] $WIRE_LINE ${WIRE_ALERT:+(alert: $WIRE_ALERT) }; $ENV_GOT; want $want and $ENV_BOTH_NEW"
     fi
-    if printf '%s\n' "$ENV_PASS" | t docker exec -i "$CONTAINER" \
-        sh -c 'KRB5CCNAME=/tmp/gate_cc_envelope kinit "$0"; rc=$?; kdestroy -q 2>/dev/null; exit $rc' \
-        "$ENV_USER@$REALM" >"$D/kinit-envelope.log" 2>&1; then
-        p_ok "kinit with the enveloped password succeeds"
+}
+
+env_nosync() {
+    local new sealed bn=no bo=no made=no
+    local want="WIRE start-key=no finish-envelope=no rewrite=added finish-status=400 graphql-seal=no create-sent=no page=stayed"
+    new="$(env_gen)"
+    sealed="$(wire_seal "$ENV_KEY" "$new" "$ENV_PLAIN")"
+    [ -n "$sealed" ] || {
+        p_bad "[U1.env-nosync-refused] OpenSSL did not seal (see seal.err)"
+        return
+    }
+    wire_page env-nosync change "$ENV_PLAIN" "$new" add "$sealed"
+    env_bind "$ENV_PLAIN" "$new" && bn=yes
+    env_bind "$ENV_PLAIN" "$ENV_PLAIN_OLD" && bo=yes
+    principal_exists "$ENV_PLAIN" && made=yes
+    if [ "$WIRE_LINE" = "$want" ] && [ "bind-new=$bn bind-old=$bo principal=$made" = "bind-new=no bind-old=yes principal=no" ] &&
+        grep -qF 'a Kerberos password envelope is taken only for a user with Kerberos sync' <<<"$WIRE_ALERT"; then
+        p_ok "[U1.env-nosync-refused] a finish with an envelope for a user without sync: 400 '$WIRE_ALERT'; nothing written: the old password binds, the new one does not, and there is no principal"
     else
-        p_bad "kinit with the enveloped password failed"
+        p_bad "[U1.env-nosync-refused] $WIRE_LINE (alert: ${WIRE_ALERT:-none}); bind-new=$bn bind-old=$bo principal=$made; want $want, the sync sentence, bind-new=no bind-old=yes principal=no"
     fi
-    flipped="$(printf '%s' "$sealed" | python3 -c '
-import base64, sys
-sealed = bytearray(base64.b64decode(sys.stdin.read()))
-sealed[-1] ^= 1
-print(base64.b64encode(sealed).decode())' 2>/dev/null)"
-    if graphql "$SYNC_MUTATION" '{"u": "'"$ENV_USER"'", "e": "'"$flipped"'"}' \
-        >"$D/envelope-flipped.json" 2>"$D/envelope-flipped.err"; then
-        p_bad "syncKerberosPassword took an envelope with one byte flipped"
-    elif grep -q "Kerberos password decryption failed" "$D/envelope-flipped.err"; then
-        p_ok "an envelope with one byte flipped is refused"
+}
+
+env_other() {
+    local typed sealed
+    local want="WIRE start-key=yes finish-envelope=yes rewrite=swapped finish-status=400 graphql-seal=no create-sent=no page=stayed"
+    typed="$(env_gen)"
+    sealed="$(wire_seal "$ENV_KEY" "$typed" "$ENV_PLAIN")"
+    [ -n "$sealed" ] || {
+        p_bad "[U1.env-other-label] OpenSSL did not seal (see seal.err)"
+        return
+    }
+    wire_page env-other change "$ENV_USER" "$typed" swap "$sealed"
+    env_sides "$ENV_USER" "$typed" "$ENV_OLD"
+    if [ "$WIRE_LINE" = "$want" ] && [ "$ENV_GOT" = "$ENV_BOTH_OLD" ] &&
+        grep -qF 'the Kerberos password envelope did not open' <<<"$WIRE_ALERT"; then
+        p_ok "[U1.env-other-label] $ENV_USER's finish with an envelope sealed under $ENV_PLAIN's label: 400 '$WIRE_ALERT', and bind and kinit keep the old password"
     else
-        p_bad "flipped envelope: unexpected answer (see envelope-flipped.err)"
+        p_bad "[U1.env-other-label] $WIRE_LINE (alert: ${WIRE_ALERT:-none}); $ENV_GOT; want $want, 'did not open', $ENV_BOTH_OLD"
     fi
-    graphql 'mutation($id: String!) { deleteUser(userId: $id) { ok } }' \
-        '{"id": "'"$ENV_USER"'"}' >"$D/delete-envelope.json" 2>&1 || p_bad "deleteUser $ENV_USER failed"
+}
+
+if ! docker image inspect "$WIRE_IMAGE" >/dev/null 2>&1; then
+    p_skip "[U1.env-pages] browser image absent: $WIRE_IMAGE; the envelope rows did not run"
+else
+    if env_setup; then
+        ENV_MADE=1
+        env_synced
+        graphql '{ kerberosInfo { publicKeyDerBase64 } }' >"$D/envelope-key.json" 2>&1 &&
+            ENV_KEY="$(json_get kerberosInfo.publicKeyDerBase64 <"$D/envelope-key.json" 2>/dev/null)"
+        if [ -n "$ENV_KEY" ] && gexec sh -c 'command -v openssl' >/dev/null 2>&1; then
+            env_nosync
+            env_other
+        else
+            p_skip "[U1.env-openssl] no transport key or no openssl in the image (see envelope-key.json): the two refused-envelope rows did not run"
+        fi
+    fi
+    for u in "$ENV_USER" "$ENV_PLAIN"; do
+        graphql 'mutation($id: String!) { deleteUser(userId: $id) { ok } }' '{"id": "'"$u"'"}' \
+            >"$D/delete-$u.json" 2>&1 || [ -z "$ENV_MADE" ] || p_bad "deleteUser $u failed"
+    done
 fi
 
 # A password the directory takes and the KDC refuses: a kadm5 policy (min length 40) on an

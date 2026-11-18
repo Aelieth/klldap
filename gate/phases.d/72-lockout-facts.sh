@@ -348,6 +348,7 @@ lk_two_server() {
     : >"$LK_D/two.err"
     if ! t docker stop "$CONTAINER" >/dev/null 2>&1; then
         lk_note "[L1.totp-two-servers] the gate's server could not be stopped for this row; not run"
+        lk_note "[L1.totp-used-two-servers] the gate's server could not be stopped for this row; not run"
         return 0
     fi
     if lk_plain_up "$LK_ONE" "$LK_ONE_VOL" && lk_plain_up "$LK_TWO" "$LK_TWO_VOL"; then
@@ -355,6 +356,7 @@ lk_two_server() {
     fi
     if [ -z "$one_port" ] || [ -z "$two_port" ]; then
         lk_note "[L1.totp-two-servers] the two servers with Kerberos disabled did not both become healthy ($(head -c 200 "$LK_D/two.err")); not run"
+        lk_note "[L1.totp-used-two-servers] the two servers did not both become healthy; not run"
     else
         lk_step_start
         step="$(lk_step)"
@@ -367,19 +369,40 @@ lk_two_server() {
             lk_note "[L1.totp-two-servers] the attempts did not fall in one 30 s step; this run cannot tell"
         elif ! grep -q 'Too many TOTP attempts' <<<"$ctl"; then
             lk_fail "[L1.totp-two-servers] control: server one did not refuse the right code for too many attempts in step $step ($ctl), so it was not at its limit"
-        elif [ "$out" = "200 token" ]; then
-            lk_pass "[L1.totp-two-servers] 5 wrong codes on one server, then the right code on a second server on the same database in the same step ($step): today allowed, nothing shared; control: server one refused the same code for too many attempts | when enforced: refused, the count shared"
         elif grep -q 'Too many TOTP attempts' <<<"$out"; then
-            lk_finding "[L1.totp-two-servers] the healthy second server refused the right code for too many attempts: the count is shared after all"
+            lk_pass "[L1.totp-two-servers] 5 wrong codes on one server, then the right code on a second server on the same database in the same step ($step): refused for too many attempts, the count shared in the database; control: server one refused it too"
+        elif [ "$out" = "200 token" ]; then
+            lk_finding "[L1.totp-two-servers] the second server allowed the right code after 5 wrong codes on server one in the same step: the count is not shared"
         else
             lk_note "[L1.totp-two-servers] the healthy second server answered '$out'; this run cannot tell"
         fi
+        lk_used_two_servers "$one_port" "$two_port"
     fi
     docker rm -fv "$LK_ONE" "$LK_TWO" >/dev/null 2>&1
     docker volume rm "$LK_ONE_VOL" "$LK_TWO_VOL" >/dev/null 2>&1
     t docker start "$CONTAINER" >/dev/null 2>&1 && lk_back_up ||
         lk_fail "[L1.totp-two-servers-back] the gate's server did not come back after the row"
     return 0
+}
+
+# The same right code on both servers in one fresh step: the second must answer 'already used'.
+lk_used_two_servers() {
+    local one two step
+    lk_step_start
+    step="$(lk_step)"
+    one="$(lk_simple_at "$1" "$LK_MFA" pass:code)"
+    two="$(lk_simple_at "$2" "$LK_MFA" pass:code)"
+    if [ "$(lk_step)" != "$step" ]; then
+        lk_note "[L1.totp-used-two-servers] the two sign-ins did not fall in one 30 s step; this run cannot tell"
+    elif [ "$one" != "200 token" ]; then
+        lk_note "[L1.totp-used-two-servers] server one did not take the right code in a fresh step ($one); this run cannot tell"
+    elif grep -q 'TOTP code already used' <<<"$two"; then
+        lk_pass "[L1.totp-used-two-servers] a code taken on server one in step $step is refused on server two as already used: the used mark is shared in the database"
+    elif [ "$two" = "200 token" ]; then
+        lk_finding "[L1.totp-used-two-servers] the code taken on server one was taken again on server two in step $step"
+    else
+        lk_note "[L1.totp-used-two-servers] server two answered '$two'; this run cannot tell"
+    fi
 }
 
 lk_totp() {
@@ -395,7 +418,7 @@ lk_totp() {
     elif [ "$n" != 5 ]; then
         lk_note "[L1.totp-sixth] only $n of 5 wrong codes were answered 'Invalid TOTP code'; this run cannot tell"
     elif grep -q 'Too many TOTP attempts' <<<"$out"; then
-        lk_pass "[L1.totp-sixth] 5 wrong codes each answered 'Invalid TOTP code', then the right code in the same 30 s step (step $step) is refused: today 'Too many TOTP attempts', 5 per step, kept in memory | when enforced: refused, and the failures also count toward lockout-threshold"
+        lk_pass "[L1.totp-sixth] 5 wrong codes each answered 'Invalid TOTP code', then the right code in the same 30 s step (step $step) is refused: 'Too many TOTP attempts', 5 per step, kept in the database"
     else
         lk_finding "[L1.totp-sixth] after 5 wrong codes in step $step the right code was not refused for too many attempts ($out)"
     fi
@@ -416,15 +439,21 @@ lk_totp() {
         lk_note "[L1.totp-restart] only $n of 5 wrong codes were answered 'Invalid TOTP code' before the restart ($many 'Too many'); this run cannot tell"
     elif [ "$(lk_step)" != "$step" ]; then
         lk_note "[L1.totp-restart] the restart took past the 30 s step, so this run cannot tell whether it forgot the count"
-    elif [ "$(lk_simple "$LK_MFA" pass:code)" = "200 token" ]; then
-        lk_pass "[L1.totp-restart] 5 wrong codes, a restart in the same step, then the right code: today allowed, the count is lost with the process | when enforced: refused, the count kept in the database"
     else
-        lk_finding "[L1.totp-restart] after a restart in the same step the right code was refused"
+        out="$(lk_simple "$LK_MFA" pass:code)"
+        if grep -q 'Too many TOTP attempts' <<<"$out"; then
+            lk_pass "[L1.totp-restart] 5 wrong codes, a restart in the same step, then the right code: refused for too many attempts, the count kept in the database"
+        elif [ "$out" = "200 token" ]; then
+            lk_finding "[L1.totp-restart] after a restart in the same step the right code was allowed: the count was lost with the process"
+        else
+            lk_note "[L1.totp-restart] after the restart the right code was answered '$out'; this run cannot tell"
+        fi
     fi
     if [ "$GATE_DB" = postgres ]; then
         lk_two_server
     else
-        lk_note "[L1.totp-two-servers] two servers need one shared database; on $GATE_DB this row is not run | when enforced: the count is shared"
+        lk_note "[L1.totp-two-servers] two servers need one shared database; on $GATE_DB this row is not run"
+        lk_note "[L1.totp-used-two-servers] two servers need one shared database; on $GATE_DB this row is not run"
     fi
     return 0
 }
@@ -1011,4 +1040,4 @@ fi
 lk_cleanup
 note "lockout-facts FINDING ids: ${LK_FIND[*]:-none}"
 note "lockout-facts: $LK_N rows, $LK_P pass, $LK_F FINDING, $LK_K NOTE, $LK_X FAIL"
-note "lockout-facts: a correct product gives 33 rows, 0 FINDING, 0 FAIL: 33 pass on postgres; 31 pass and 2 NOTE ([L1.totp-two-servers], [L1.fill-kinit-counted-user]) on sqlite"
+note "lockout-facts: a correct product gives 34 rows, 0 FINDING, 0 FAIL: 34 pass on postgres; 31 pass and 3 NOTE ([L1.totp-two-servers], [L1.totp-used-two-servers], [L1.fill-kinit-counted-user]) on sqlite"

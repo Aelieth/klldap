@@ -48,6 +48,11 @@ set isn't working, try the following:
     kadmin -k -t /data/kadm5.keytab -p admin/admin -q listprincs
   ```
 - A user in `lldap_disabled` cannot get tickets by design.
+- "KDC policy rejects request" with "second factor needed: sign in to the directory with
+  your code ...": the user must give a second factor at the directory. Sign in with
+  `yourpassword:123456` at an LDAP bind or `/auth/simple/login`, or at the web login with
+  the code, then run kinit within the window (10 minutes by default). See
+  [kerberos.md](kerberos.md#a-second-factor-and-kinit).
 - Check the client's `krb5.conf` realm and KDC address, and that port 88 (tcp and
   udp) reaches the container. kadmin listens on loopback inside the container and
   is not published. See [kerberos.md](kerberos.md).

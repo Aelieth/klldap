@@ -3,8 +3,9 @@
 KLLDAP can attach a named policy of **items** to an OU, including the domain root
 (`dc=example,dc=com` → the empty key `""`). An object resolves each item by walking its
 OU chain. The lockout items (`lockout-threshold`, `lockout-duration-seconds`) are
-enforced at every door ([Lockout](#lockout)); **the other items are stored and resolved but
-not enforced yet**. Each later pass consumes the same resolution at its seam.
+enforced at every door ([Lockout](#lockout)), and `enable-mfa` at the directory's doors
+([Second factor](#second-factor)); **the other items are stored and resolved but not
+enforced yet**. Each later pass consumes the same resolution at its seam.
 
 ## Resolution
 
@@ -14,7 +15,7 @@ the chain then restarts at that OU (its own policy still applies). The root cann
 One policy per OU; a policy may still be linked to many OUs. Server-scope items (none in
 v1) always resolve from the root only.
 
-Example: root policy sets `require-mfa=off`, `people\labs` sets `require-mfa=always`. A
+Example: root policy sets `enable-mfa=off`, `people\labs` sets `enable-mfa=always`. A
 user in `people\labs` sees `always` with source `people\labs`. If `people\labs` blocks
 inheritance, root's other items no longer apply there.
 
@@ -28,7 +29,7 @@ comma-separated CIDR with an explicit prefix.
 
 ```graphql
 { policyItemCatalog { key scope defaultValue enforced description } }
-mutation { createPolicy(name: "Hours", items: [{key: "require-mfa", value: "always"}]) { id } }
+mutation { createPolicy(name: "Hours", items: [{key: "enable-mfa", value: "always"}]) { id } }
 mutation { setOuPolicy(ou: "", policyId: 1) { ok } }
 mutation { setOuPolicyInheritance(ou: "people", blocked: true) { ok } }
 { effectivePolicyItems(ou: "people\\labs") { key value enforced sourceOu sourcePolicyName } }
@@ -64,6 +65,50 @@ the page never recomputes closest-wins values client-side.
 Users and groups still filter on the sentinel value `All`; only the visible label of
 that option is the domain name.
 
+## Second factor
+
+`enable-mfa` (`off`, `enabled`, `always`) is the OU's value of `enable_mfa`
+([mfa.md](mfa.md#modes)). A user's value comes from one resolution path: the server-wide
+`enable_mfa` if one is set, which overrides every OU; else the user's OU, by the inheritance
+above; else `off`. Members of `lldap_mfa_disabled` give no code whatever their value. The
+directory's doors follow the user's value:
+
+| Door | A user with a factor (`enabled` or `always`) | `always`, a user without one |
+|---|---|---|
+| LDAP bind, `/auth/simple/login` | `password:code` | refused, *MFA enrollment required* |
+| Web login | the code step | admitted only to enroll (`mfaEnrollmentRequired`) |
+| Token refresh and use | as the session was made ([mfa.md](mfa.md#modes)) | confined to reading their own user and enrolling |
+| kinit, renewals, service tickets | a ticket within `mfa_proof_window` of a sign-in with the code ([kerberos.md](kerberos.md#a-second-factor-and-kinit)) | refused (error 12) until the user enrols, which opens the window |
+
+A user whose value is `off` gives no code and cannot enroll (*MFA is disabled for this
+user*); one whose value is `always` cannot reset their own factor. Where the server-wide
+value is set, the policy page says so above the OU's items: it overrides their
+`enable-mfa`. 0.8.0 called the item `require-mfa` (`off`, `enrolled`, `always`): a stored
+policy is carried over at start (`enrolled` becomes `enabled`; where both names are present
+`enable-mfa` is kept), and `require-mfa` given to `createPolicy` or `updatePolicy` is refused
+with a message naming `enable-mfa`.
+
+What it costs: every server reads the policies once every 30 seconds, whatever is set, and
+that one small read (with the lockout's counting period beside it) serves this item and the
+lockout alike. The doors read the value from the policy cache, and only while some OU's policy
+sets it above `off` and nothing is set server-wide; where no OU sets it or a lockout
+threshold, the doors themselves read nothing for either. With Kerberos on and `enable_mfa`
+set server-wide to `enabled` or `always`, every server also keeps each user's factor and
+group in memory, refilled about every 30 seconds, because the KDC judges from memory alone.
+Linking, editing or removing a policy, and moving a user to another OU, apply at the user's
+next sign-in: at once on the server that made the change, within about 30 seconds on the
+others. Where no OU set the item
+before, another server resolves every user to `off` until its read sees the change, for up
+to those 30 seconds. Until a starting server has read the item once, and whenever a user's policy cannot
+be read, the directory's doors refuse the users whose value an OU could set (`policy:
+unreadable`), token refresh and use among them, and the server reads the policies again every
+second until it can. With `enable_mfa` set server-wide the OUs' item takes no part in the
+decision and nothing is refused for it; where Kerberos is on, the memory described above is
+still kept for the KDC.
+
+At start the server warns once with the number of OUs that set `enable-mfa` to `enabled` or
+`always` while nothing is set server-wide; the warning names no OU.
+
 ## Lockout
 
 `lockout-threshold` (0 turns it off) and `lockout-duration-seconds` (0 holds a lock until an
@@ -74,9 +119,10 @@ and token use. A wrong TOTP code counts once, like a wrong password; a code used
 past the limiter, a code refused because the database could not answer (`totp: unreadable`) and
 the right password without its code count nothing ([mfa.md](mfa.md)). A
 success clears the count, and the next failure after an unlock counts from 1. For a user who
-must give a second factor at the directory's doors (enrolled, the second factor on, and not in
-`lldap_mfa_disabled`), a Kerberos ticket (asked with the password alone) does not reset the
-count, nor does it for a user whose factors the server has not read yet. When a timed
+must give a second factor at the directory's doors (enrolled, their `enable_mfa` value
+`enabled` or `always`, and not in `lldap_mfa_disabled`), a Kerberos ticket (asked with the
+password alone) does not reset the count, nor does it for a user whose factors or value the
+server has not read yet. When a timed
 lock runs out the count stays where it was, so one more wrong password locks again for the
 whole duration. Every user can be locked, admins included.
 
@@ -171,12 +217,16 @@ no-op inheritance toggle is not logged.
 ## Configuration
 
 None. The surface is always on (reads for admins and read-only admins, writes for admins).
-The lockout is in force wherever an OU sets a threshold.
+The lockout is in force wherever an OU sets a threshold, and `enable-mfa` wherever an OU sets
+it, unless `enable_mfa` is set server-wide, which overrides it. `lldap_mfa_disabled` is made
+at start when `enable_mfa` is set server-wide to `enabled` or `always`; otherwise by
+whichever server first reads an OU's `enable-mfa` above `off` (at the change, or at its
+30-second read), never while the policies are not read.
 
 ## Limitations
 
-- Only the lockout is enforced. The other items carry `enforced: false` and say so in their
-  descriptions; per-item passes follow.
+- Only the lockout and `enable-mfa` are enforced. The other items carry `enforced: false` and
+  say so in their descriptions; per-item passes follow.
 - A lock's duration runs from the last counted attempt, and a web start counts as one until
   its finish takes it back, so the duration can run from a start that then succeeded.
 - Kerberos already tells whether a principal exists (an unknown one gets a different error);

@@ -364,6 +364,68 @@ Make these changes in the directory instead:
 - **A principal for a directory user:** turn `kerberosSync` on for the user,
   then set the user's password.
 
+## A second factor and kinit
+
+A directory user who must give a second factor at the directory's doors (their resolved
+`enable_mfa` is `always`, or `enabled` and they are enrolled, and they are not in
+`lldap_mfa_disabled`; see [mfa.md](mfa.md#modes)) gets a ticket only within
+`mfa_proof_window` (default 10 minutes) after signing in at a directory door with the
+password and a code: an LDAP bind or `/auth/simple/login` with `password:code`, the web
+login with its code step, or the finish of an enrolment or of a replacement of the factor.
+Nothing else opens the window: not the password alone, a token refresh or a ticket. Every
+other user's kinit is unchanged, and nothing is read for them.
+
+```sh
+ldapwhoami -x -H ldap://ldap.example.com:3890 -D uid=alice,ou=people,dc=example,dc=com -W
+kinit alice
+```
+
+At the prompt, type the password, a colon and the current code.
+
+- **The refusal:** without a fresh proof the KDC answers error 12 (KDC policy rejects
+  request) with the text "second factor needed: sign in to the directory with your code
+  (enrol there first if you have none), then run kinit again", before it looks at the
+  password. It writes one `login` row, `policy: enable-mfa (no fresh proof)`, and counts
+  nothing toward the lockout. A locked user is refused as locked first. kinit prints only
+  the code's message, `KDC policy rejects request`, and its trace (`KRB5_TRACE`) only the
+  code: the text travels in the KDC's answer, for a client that shows it, and the server's
+  log row names the reason.
+- **Tickets:** a ticket issued under a proof is an ordinary ticket. Its renewals,
+  validations and service tickets are judged by the time it was issued, which must lie in
+  a window, so they go on after the window ends. A ticket issued before the requirement
+  applied to the user (an enrolment, a policy change, the upgrade) is refused at its next
+  renewal or service ticket, with the same code and text and an `access_denied` row. A
+  postdated ticket is judged by the time it was issued like any other, and is refused once
+  its window is no longer kept (the longer of the ticket and renewable lifetimes, plus an
+  hour).
+- **Services acting for users** (S4U2Self, S4U2Proxy) are not asked: the user is not there
+  to give a code.
+- **The window is a stated limit:** inside it, the password alone gets a ticket.
+- **What a request shows:** the refusal comes before the password check, so anyone who
+  can send the KDC a request for a user's name can see, without the password, whether
+  that user needs a second factor and whether they proved it within the window: such a
+  user is answered error 12 outside a window. Each refusal writes its `login` row.
+- **The address:** with `mfa_proof_same_address = true` the kinit must come from the
+  address the code was given from, the one on that sign-in's log row. An IPv4 address
+  seen over IPv6 (`::ffff:192.0.2.7`) counts as the IPv4 address.
+- **Clocks:** a window is stamped by the directory server's clock and judged by the
+  KDC's. A proof stamped up to 60 seconds ahead of the KDC's clock still opens its window,
+  and nothing is allowed at its end. Keep the servers' clocks synchronised.
+- **Servers:** the windows are kept in the database (`mfa_windows`), shared by every
+  server. Another server learns of a proof at its next read of the policy cache (about every 30
+  seconds), and at once after a refusal there reads that user again, factor, group and
+  windows (at most once a second): the next kinit passes.
+- **A proof belongs to its factor:** resetting or removing a user's factor ends their
+  windows at once, and a replacement ends the old ones and opens its own. A password change
+  leaves them.
+- **Retention:** a window is kept for the longer of `ticket_lifetime` and `renew_lifetime`
+  in force when it is pruned, and an hour more. Raising either later does not bring pruned
+  windows back.
+- **Failures:** a proof that cannot be stored leaves the sign-in standing, and its row says
+  `proof not stored`. While the second factor's settings cannot be read, a user known to
+  need a proof is refused, and every other user gets today's kinit.
+- **Later:** a path that asks the code inside Kerberos itself, in one exchange, is planned.
+
 ## Ports and clients
 
 The KDC listens on 1088 and is published as `88:1088` (tcp and udp).
@@ -400,6 +462,8 @@ realm with KLLDAP as an LDAP + Kerberos user-federation provider. See
 | `renew_lifetime` | `7d` |
 | `forwardable` | `true` |
 | `client_case_fold` | `true` |
+| `mfa_proof_window` | `10m` |
+| `mfa_proof_same_address` | `false` |
 | `supported_enctypes` | `aes256-cts-hmac-sha1-96` |
 | `kdc_host` / `kdc_port` | `0.0.0.0` / `1088` |
 | `kadmin_host` / `kadmin_port` | `127.0.0.1` / `1749` |

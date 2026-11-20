@@ -20,6 +20,21 @@
 
 ### Added
 
+- `enable_mfa` per OU: the policy item `enable-mfa` (`off`, `enabled`, `always`) sets the second
+  factor for an OU's users, by the OU policies' inheritance, wherever `enable_mfa` is not set
+  server-wide. One resolution path gives each user's value: the server-wide value if set, else
+  the user's OU, else `off`. Every directory door follows it (LDAP bind and
+  `/auth/simple/login` ask `password:code` or refuse a user without a factor under `always`;
+  the web login asks the code, or admits only to enroll), and so do enrollment (refused as
+  *MFA is disabled for this user*), one's own reset, token refresh and use, and the web app
+  (the new self-only GraphQL field `User.mfaMode`). A Kerberos ticket on the password alone
+  clears a lockout count only where the bind would ask no code. The doors read the value from
+  the policy cache only while some OU sets it and nothing is set server-wide; every server reads
+  the policies once every 30 seconds, one small read shared with the lockout, and while they
+  are not read the directory's doors it concerns refuse (`policy: unreadable`, token refresh
+  and use among them) and the read is tried again every second. A change applies at once on
+  the server that made it and within 30 seconds on the others. Where `enable_mfa` is set server-wide, the policy page says that it overrides
+  the OUs (`/settings` gives it as `mfa_server_wide`).
 - `/auth/opaque/login/finish` takes an optional `"session": false`: the finish verifies the
   password (and a code sent with it), admits or refuses the user as any finish does, and
   makes no session: no token, no refresh token, no cookie. A verified one answers
@@ -81,6 +96,34 @@
 
 ### Changed
 
+- **kinit needs a fresh proof under `enabled` and `always`.** A directory user who must
+  give a second factor at the directory's doors gets a Kerberos ticket only within
+  `kerberos_options.mfa_proof_window` (default 10 minutes) after a sign-in at a directory
+  door with the password and a code (an LDAP bind or `/auth/simple/login` with
+  `password:code`, the web login's code step, or an enrolment's or a replacement's
+  finish). Otherwise kinit is refused with error 12 and a text that says what to do, one
+  `login` row `policy: enable-mfa (no fresh proof)`, and nothing counted. Renewals and
+  service tickets are judged by the time their ticket was issued: a ticket issued outside
+  every window is refused at its next renewal or service ticket. Services
+  acting for users (S4U2Self, S4U2Proxy) are not asked. The windows are kept in the new
+  table `mfa_windows` (made at start), shared by every server, for the longer of the ticket
+  and renewable lifetimes and an hour, and end with a reset or a replacement of the factor;
+  `kerberos_options.mfa_proof_same_address` ties a kinit to the address the code was given
+  from.
+- `enable_mfa` takes `off`, `enabled` or `always`; 0.8.0's `false` and `true` still work.
+  A value written in the file, the environment or the command line is explicit and overrides
+  every OU's `enable-mfa`, so **an explicit `false` now keeps every OU from turning the factor
+  on**: remove the line to let the OUs decide. Left unset, it is `off` until an OU says
+  otherwise.
+- The policy item `require-mfa` (`off`, `enrolled`, `always`) is now `enable-mfa` (`off`,
+  `enabled`, `always`). Policies stored by the 0.8.0 pre-release are carried over at start
+  (`enrolled` becomes `enabled`) and are enforced from then on. `createPolicy` and
+  `updatePolicy` given `require-mfa` are refused with a message naming `enable-mfa`.
+- `lldap_mfa_disabled` is created the first time a value is known to turn the factor on: at
+  start for a server-wide `enabled` or `always`; otherwise by whichever server first reads an
+  OU's `enable-mfa` above `off` (at start, at the policy change, or at its 30-second read),
+  never while the policies are not read. It is protected only while a value can turn the
+  factor on; an install that sets nothing stays plain LLDAP, with no such group.
 - The web login asks for the code in a second step: the password alone first, then, when
   the account has a factor, a code field; a wrong code keeps that step open. The password
   field no longer takes `password:code` (that text fails as a wrong password, and the page

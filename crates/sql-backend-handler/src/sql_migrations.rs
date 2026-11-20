@@ -205,6 +205,15 @@ pub(crate) enum MfaUsedProofs {
     ExpiresAt,
 }
 
+#[derive(DeriveIden, Clone, Copy)]
+pub(crate) enum MfaWindows {
+    Table,
+    UserId,
+    Peer,
+    OpenedAt,
+    UntilAt,
+}
+
 // Metadata about the SQL DB.
 #[derive(DeriveIden)]
 pub(crate) enum Metadata {
@@ -2044,6 +2053,7 @@ pub(crate) async fn ensure_v13_additions(pool: &DbConnection) -> Result<(), DbEr
     ensure_login_lockouts(&transaction, backend).await?;
     ensure_totp_steps(&transaction, backend).await?;
     ensure_mfa_used_proofs(&transaction, backend).await?;
+    ensure_mfa_windows(&transaction, backend).await?;
     ensure_lockout_period(&transaction, backend).await?;
     transaction.commit().await
 }
@@ -2221,6 +2231,57 @@ async fn ensure_mfa_used_proofs(
                         ColumnDef::new(MfaUsedProofs::ExpiresAt)
                             .big_integer()
                             .not_null(),
+                    ),
+            ),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Kerberos's windows opened by a second factor proven at a directory door.
+async fn ensure_mfa_windows(
+    transaction: &DatabaseTransaction,
+    backend: sea_orm::DbBackend,
+) -> Result<(), DbErr> {
+    if !relation_missing(transaction, backend, MfaWindows::Table.into_iden()).await? {
+        return Ok(());
+    }
+    transaction
+        .execute(
+            backend.build(
+                Table::create()
+                    .table(MfaWindows::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(MfaWindows::UserId)
+                            .string_len(255)
+                            .not_null(),
+                    )
+                    .col(
+                        ColumnDef::new(MfaWindows::Peer)
+                            .string_len(64)
+                            .not_null()
+                            .default(""),
+                    )
+                    .col(
+                        ColumnDef::new(MfaWindows::OpenedAt)
+                            .big_integer()
+                            .not_null(),
+                    )
+                    .col(ColumnDef::new(MfaWindows::UntilAt).big_integer().not_null())
+                    .primary_key(
+                        Index::create()
+                            .col(MfaWindows::UserId)
+                            .col(MfaWindows::Peer)
+                            .col(MfaWindows::OpenedAt),
+                    )
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("MfaWindowsUserForeignKey")
+                            .from(MfaWindows::Table, MfaWindows::UserId)
+                            .to(Users::Table, Users::UserId)
+                            .on_delete(ForeignKeyAction::Cascade)
+                            .on_update(ForeignKeyAction::Cascade),
                     ),
             ),
         )

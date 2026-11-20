@@ -434,7 +434,8 @@ async fn set_up_server(
     let backend_handler =
         SqlBackendHandler::new(config.get_server_setup().clone(), sql_pool.clone())
             .with_read_pool(setup_read_pool(&config.database_url, &sql_pool).await?)
-            .with_mfa_setting(config.mfa_policy());
+            .with_mfa_setting(config.mfa_policy())
+            .with_proofs(config.proof_settings()?);
     // Every sealed TOTP secret was keyed from the old private key.
     if key_rotated {
         backend_handler.clear_all_mfa().await?;

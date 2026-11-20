@@ -227,6 +227,16 @@ key_seed = "RanD0m STR1ng"
 ## name. At start the server warns once for each set of principals that differ
 ## only in case. Set false to match names exactly.
 #client_case_fold = true
+## A user who must give a second factor at the directory (enable_mfa or an OU's
+## enable-mfa at "always", or at "enabled" once enrolled) gets a Kerberos ticket only
+## within this long after a sign-in with password and code at a directory door (an LDAP
+## bind or /auth/simple/login with "password:code", the web login, or the finish of an
+## enrolment or of a replacement of the factor). A Kerberos
+## duration ("10m", "1h") or a bare number of seconds ("600"). Zero and a negative are
+## refused.
+#mfa_proof_window = "10m"
+## Ask that kinit come from the address the code was given from.
+#mfa_proof_same_address = false
 ## Session and long-term keys. Accepts aes256-cts-hmac-sha1-96,
 ## aes128-cts-hmac-sha1-96, aes256-cts-hmac-sha384-192 and
 ## aes128-cts-hmac-sha256-128. 3DES and RC4 are refused as deprecated

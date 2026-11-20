@@ -1,3 +1,4 @@
+use crate::kdc_proof::ProofWindow;
 use crate::logging::{
     LogActivity, LogBucket, LogCursor, LogDimension, LogFilter, LogKind, LogRecord,
 };
@@ -252,6 +253,13 @@ pub trait PolicyBackendHandler: Send + Sync {
     /// Root-first levels for `ou`, including keys with no row. Enforcement consumes this.
     async fn get_policy_levels(&self, ou: &str) -> Result<Vec<PolicyLevel>>;
     async fn delete_ou_policy_state(&self, ou: &str) -> Result<()>;
+    /// Kerberos's windows opened by a second factor, the user's or everyone's.
+    async fn read_proof_windows(
+        &self,
+        _user: Option<&UserId>,
+    ) -> Result<Vec<(UserId, ProofWindow)>> {
+        Ok(Vec::new())
+    }
 }
 
 #[async_trait]

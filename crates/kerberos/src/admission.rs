@@ -1,17 +1,19 @@
 use crate::policy::NOT_FOUND;
 use krb5_kdc::Principal;
 use krb5_kdc::admission::{
-    AsNotice, AsQuestion, AsReason, HostAdmission, KdcRefusal, Mechanism, TgsQuestion,
+    AsNotice, AsQuestion, AsReason, HostAdmission, KdcRefusal, Mechanism, TgsKind, TgsQuestion,
 };
-use krb5_types::{HostAddress, PrincipalName, err};
+use krb5_types::{EncTicketPart, HostAddress, PrincipalName, err};
 use lldap_domain::types::UserId;
 use lldap_domain_handlers::enforcement::{
     Attempt, Door, PolicyCache, Refusal, admit_at_kdc_with, item_checks, policy_cache,
     record_kdc_row,
 };
+use lldap_domain_handlers::kdc_proof::{ProofVerdict, kdc_verdict, proof_at_as, proof_at_tgs};
 use lldap_domain_handlers::kerberos::user_id_for_principal_name;
 use lldap_domain_handlers::lockout::{Lockout, THRESHOLD, lock_clock, lock_detail, lockout};
 use lldap_domain_handlers::logging::LogKind;
+use lldap_domain_handlers::mfa::ENABLE_MFA;
 use std::cell::RefCell;
 use std::net::IpAddr;
 
@@ -29,9 +31,35 @@ fn gone() -> KdcRefusal {
     }
 }
 const NOT_SAID: &str = "refused by the directory";
+/// One code and one ASCII text for every user who needs a fresh proof: a text that is not
+/// ASCII never reaches the client.
+const PROOF_CODE: i32 = err::POLICY;
+pub(crate) const PROOF_TEXT: &str = "second factor needed: sign in to the directory with your \
+    code (enrol there first if you have none), then run kinit again";
+const NO_FRESH_PROOF: &str = "no fresh proof";
+
+fn proof_refusal() -> KdcRefusal {
+    KdcRefusal {
+        code: PROOF_CODE,
+        e_text: Some(PROOF_TEXT.to_owned()),
+    }
+}
+
+fn proof_detail(door: Door) -> String {
+    let refusal = Refusal {
+        item: ENABLE_MFA,
+        door,
+    };
+    format!("{} ({NO_FRESH_PROOF})", refusal.detail())
+}
+
+/// A renewal, a validation, a service ticket or user-to-user: the user is the one asking.
+fn present(kind: TgsKind) -> bool {
+    !matches!(kind, TgsKind::S4u2Self | TgsKind::S4u2Proxy)
+}
 
 thread_local! {
-    static AS_REFUSAL: RefCell<Option<(String, &'static str)>> = const { RefCell::new(None) };
+    static AS_REFUSAL: RefCell<Option<(String, String)>> = const { RefCell::new(None) };
 }
 
 /// The directory's verdict at the KDC, from memory under the store's read guard.
@@ -63,6 +91,38 @@ impl KdcVerdict {
         if refusal.item == THRESHOLD {
             self.lockout.confirm_soon(user);
         }
+    }
+
+    /// The directory's items, the lockout among them, judged before the second factor.
+    fn judge_items(
+        &self,
+        user: &UserId,
+        door: Door,
+        peer: Option<IpAddr>,
+        now: u32,
+    ) -> Result<(), Refusal> {
+        let checks = item_checks();
+        if !checks.iter().any(|check| check.live(self.cache)) {
+            return Ok(());
+        }
+        let attempt = Attempt::at_kdc(user, door, peer, now);
+        let verdict = admit_at_kdc_with(self.cache, self.lockout, &attempt, &checks);
+        if let Err(refusal) = &verdict {
+            self.confirm_lock(user, refusal);
+        }
+        verdict
+    }
+
+    /// A refusal for want of a fresh proof asks for the user's windows again.
+    fn no_fresh_proof(&self, user: &UserId, verdict: ProofVerdict, door: Door) -> Option<String> {
+        let verdict = kdc_verdict(self.cache, user, verdict);
+        (verdict == ProofVerdict::NoFreshProof).then(|| proof_detail(door))
+    }
+
+    fn proof_at_tgs(&self, user: &UserId, ticket: &EncTicketPart) -> Option<String> {
+        let authtime = i64::from(ticket.authtime.unix_seconds());
+        let verdict = proof_at_tgs(self.cache, user, authtime);
+        self.no_fresh_proof(user, verdict, Door::KerberosTgs)
     }
 
     /// Kerberos counts in the directory's one table; an S4U2Self gets no notice, so never counts.
@@ -127,13 +187,9 @@ fn mechanism_name(mechanism: Mechanism) -> &'static str {
     }
 }
 
-fn notice_detail(n: &AsNotice, item: Option<&'static str>) -> String {
-    let outcome = match (n.reason, item) {
-        (AsReason::HostRefused, Some(item)) => Refusal {
-            item,
-            door: Door::KerberosAs,
-        }
-        .detail(),
+fn notice_detail(n: &AsNotice, said: Option<&str>) -> String {
+    let outcome = match (n.reason, said) {
+        (AsReason::HostRefused, Some(said)) => said.to_owned(),
         (AsReason::HostRefused, None) => NOT_SAID.to_owned(),
         (AsReason::Issued, _) => "ticket issued".to_owned(),
         (AsReason::PreauthFailed, _) => "pre-authentication failed".to_owned(),
@@ -152,10 +208,6 @@ fn notice_detail(n: &AsNotice, item: Option<&'static str>) -> String {
 impl HostAdmission for KdcVerdict {
     fn check_as(&self, q: &AsQuestion<'_>) -> Result<(), KdcRefusal> {
         AS_REFUSAL.with(|held| *held.borrow_mut() = None);
-        let checks = item_checks();
-        if !checks.iter().any(|check| check.live(self.cache)) {
-            return Ok(());
-        }
         let Some(user) = user_of(q.client, &self.realm) else {
             return Ok(());
         };
@@ -165,11 +217,17 @@ impl HostAdmission for KdcVerdict {
             Door::KerberosAs
         };
         let peer = q.peer.and_then(ip_of);
-        let attempt = Attempt::at_kdc(&user, door, peer, q.now);
-        let Err(refusal) = admit_at_kdc_with(self.cache, self.lockout, &attempt, &checks) else {
-            return Ok(());
+        let (detail, answer) = match self.judge_items(&user, door, peer, q.now) {
+            Err(refusal) => (refusal.detail(), REFUSED),
+            Ok(()) if q.s4u2self => return Ok(()),
+            Ok(()) => {
+                let verdict = proof_at_as(self.cache, &user, i64::from(q.now), peer);
+                match self.no_fresh_proof(&user, verdict, door) {
+                    Some(detail) => (detail, proof_refusal()),
+                    None => return Ok(()),
+                }
+            }
         };
-        self.confirm_lock(&user, &refusal);
         if q.s4u2self {
             let by = q
                 .request
@@ -178,7 +236,7 @@ impl HostAdmission for KdcVerdict {
                 .map_or_else(String::new, |service| {
                     format!(" by {}", service.unparse_with_realm_lossy(&self.realm))
                 });
-            let detail = format!("{} (S4U2Self{by})", refusal.detail());
+            let detail = format!("{detail} (S4U2Self{by})");
             record_kdc_row(
                 Some(&user),
                 user.as_str(),
@@ -188,9 +246,9 @@ impl HostAdmission for KdcVerdict {
                 &detail,
             );
         } else {
-            AS_REFUSAL.with(|held| *held.borrow_mut() = Some((q.client.id(), refusal.item)));
+            AS_REFUSAL.with(|held| *held.borrow_mut() = Some((q.client.id(), detail)));
         }
-        Err(REFUSED)
+        Err(answer)
     }
 
     fn as_notice(&self, n: AsNotice) {
@@ -201,14 +259,14 @@ impl HostAdmission for KdcVerdict {
         ) {
             return;
         }
-        let item = held
+        let said = held
             .filter(|(client, _)| *client == n.client)
-            .map(|(_, item)| item);
+            .map(|(_, detail)| detail);
         let user = user_of_id(&n.client, &self.realm);
         let target = user.as_ref().map_or(n.client.as_str(), UserId::as_str);
         let peer = n.peer.as_ref().and_then(ip_of);
         let issued = n.reason == AsReason::Issued;
-        let detail = notice_detail(&n, item);
+        let detail = notice_detail(&n, said.as_deref());
         record_kdc_row(user.as_ref(), target, LogKind::Login, issued, peer, &detail);
         if let Some(user) = &user {
             self.count(user, &n, peer);
@@ -225,20 +283,18 @@ impl HostAdmission for KdcVerdict {
             record_kdc_row(user.as_ref(), target, kind, false, peer, GONE);
             return Err(gone());
         };
-        let checks = item_checks();
-        if !checks.iter().any(|check| check.live(self.cache)) {
-            return Ok(());
-        }
         let Some(user) = user_of(client, &self.realm) else {
             return Ok(());
         };
         let door = Door::KerberosTgs;
-        let attempt = Attempt::at_kdc(&user, door, peer, q.now);
-        let Err(refusal) = admit_at_kdc_with(self.cache, self.lockout, &attempt, &checks) else {
-            return Ok(());
+        let (detail, answer) = match self.judge_items(&user, door, peer, q.now) {
+            Err(refusal) => (refusal.detail(), REFUSED),
+            Ok(()) if !present(q.kind) => return Ok(()),
+            Ok(()) => match self.proof_at_tgs(&user, q.ticket) {
+                Some(detail) => (detail, proof_refusal()),
+                None => return Ok(()),
+            },
         };
-        self.confirm_lock(&user, &refusal);
-        let detail = refusal.detail();
         record_kdc_row(
             Some(&user),
             user.as_str(),
@@ -247,7 +303,7 @@ impl HostAdmission for KdcVerdict {
             peer,
             &detail,
         );
-        Err(REFUSED)
+        Err(answer)
     }
 }
 
@@ -263,17 +319,23 @@ pub(crate) mod tests {
     use krb5_crypto::{EncryptionType, ProtocolKey, string_to_key};
     use krb5_kdc::admission::TgsKind;
     use krb5_kdc::{IssuedAs, PrincipalRead, SharedDump};
-    use krb5_types::{KrbError, TgsRep};
+    use krb5_protocol::{
+        TgsReqParams, armor_key, attach_fast, build_fast_armor, fx_fast_padata_over, tgs_req_ex,
+        unwrap_fast_rep,
+    };
+    use krb5_types::{KdcOptions, KrbError, MethodData, TgsRep, ascii, pa};
     use lldap_auth::opaque::server::generate_random_private_key;
     use lldap_domain::requests::CreateUserRequest;
     use lldap_domain::types::Attribute;
-    use lldap_domain_handlers::enforcement::cached_mfa_policy;
     use lldap_domain_handlers::enforcement::{Entries, fill_policy_cache, start_policy_cache};
     use lldap_domain_handlers::handler::{PolicyBackendHandler, UserBackendHandler};
+    use lldap_domain_handlers::kdc_proof::ProofSettings;
     use lldap_domain_handlers::kerberos::KerberosSync;
-    use lldap_domain_handlers::logging::Protocol;
+    use lldap_domain_handlers::logging::{Protocol, RequestMeta, with_request};
     use lldap_domain_handlers::mfa::{ENABLE_MFA, MfaPolicy};
-    use lldap_domain_handlers::policies::{CreatePolicyRequest, EffectiveItem, PolicyScope};
+    use lldap_domain_handlers::policies::{
+        CreatePolicyRequest, EffectiveItem, PolicyScope, UpdatePolicyRequest,
+    };
     use lldap_sql_backend_handler::SqlBackendHandler;
     use lldap_sql_backend_handler::sql_tables::init_table;
     use lldap_test_utils::enforcement::EnforcementGuard;
@@ -540,6 +602,15 @@ pub(crate) mod tests {
     }
 
     fn as_asks(store: &SharedDump, user: &str, s4u2self: bool) -> Result<(), i32> {
+        as_asks_of(&KdcVerdict::new(REALM), store, user, s4u2self)
+    }
+
+    fn as_asks_of(
+        verdict: &KdcVerdict,
+        store: &SharedDump,
+        user: &str,
+        s4u2self: bool,
+    ) -> Result<(), i32> {
         let guard = store.read().unwrap();
         let client = guard.get_name(&name(user)).unwrap();
         let krbtgt = PrincipalName::new(PrincipalName::NT_SRV_INST, ["krbtgt", REALM]);
@@ -557,7 +628,7 @@ pub(crate) mod tests {
             request: &request,
             s4u2self,
         };
-        KdcVerdict::new(REALM).check_as(&q).map_err(|r| r.code)
+        verdict.check_as(&q).map_err(|r| r.code)
     }
 
     fn hours(value: &str) -> Arc<[EffectiveItem]> {
@@ -587,6 +658,7 @@ pub(crate) mod tests {
             ous_of_users,
             items_of_ous,
             facts: HashMap::new(),
+            windows: HashMap::new(),
             built_at: Utc::now(),
         });
     }
@@ -1200,61 +1272,411 @@ pub(crate) mod tests {
         );
     }
 
-    #[tokio::test]
-    #[serial]
-    async fn test_under_the_default_checks_always_takes_no_ticket_at_as_tgs_or_s4u2self() {
-        let (bare, enrolled) = (REFUSED_USER, ALLOWED_USER);
-        let (temp, _embedded, store) = realm(&[bare, enrolled]).await;
-        let svc = service(&temp, &store);
+    fn proofs(same_address: bool) -> ProofSettings {
+        ProofSettings::new(600, same_address, 3600)
+    }
+
+    /// A server whose verdict asks proofs, on its own cache and lockout.
+    struct Proving {
+        handler: SqlBackendHandler,
+        cache: &'static PolicyCache,
+        counter: &'static Lockout,
+        verdict: Arc<KdcVerdict>,
+        pool: DatabaseConnection,
+    }
+
+    async fn proving(
+        store: &SharedDump,
+        users: &[&str],
+        ou: &str,
+        server: Option<MfaPolicy>,
+        same_address: bool,
+    ) -> Proving {
         let cache: &'static PolicyCache = Box::leak(Box::new(PolicyCache::new()));
         let counter: &'static Lockout = Box::leak(Box::default());
         let pool = memory_pool().await;
-        let handler = SqlBackendHandler::new(generate_random_private_key(), pool.clone());
-        let handler = handler.with_lockout(counter).with_policy_cache(cache);
-        for user in [bare, enrolled] {
-            directory_user(&handler, user, "people\\labs").await;
+        let handler = SqlBackendHandler::new(generate_random_private_key(), pool.clone())
+            .with_lockout(counter)
+            .with_policy_cache(cache)
+            .with_mfa_setting(server)
+            .with_proofs(Some(proofs(same_address)));
+        for user in users {
+            directory_user(&handler, user, ou).await;
         }
-        let enrol = format!("UPDATE users SET mfa_type = 'totp' WHERE user_id = '{enrolled}'");
-        let enrol = Statement::from_string(DbBackend::Sqlite, enrol);
-        pool.execute(enrol).await.unwrap();
-        strict_labs(&handler).await;
+        fill_policy_cache(&handler, cache).await.unwrap();
         let verdict = Arc::new(KdcVerdict::on(REALM, cache, counter));
         store
             .write()
             .unwrap()
             .policy
             .plugins
-            .set_host_admission(verdict);
+            .set_host_admission(verdict.clone());
+        Proving {
+            handler,
+            cache,
+            counter,
+            verdict,
+            pool,
+        }
+    }
+
+    impl Proving {
+        async fn enrol(&self, user: &str) {
+            let sql = format!("UPDATE users SET mfa_type = 'totp' WHERE user_id = '{user}'");
+            let enrolled = Statement::from_string(DbBackend::Sqlite, sql);
+            self.pool.execute(enrolled).await.unwrap();
+            fill_policy_cache(&self.handler, self.cache).await.unwrap();
+        }
+
+        /// A directory door's proof, made from `from`.
+        async fn prove(&self, user: &str, at: i64, from: &str) -> bool {
+            let user = UserId::new(user);
+            let meta = RequestMeta::http(from.parse().ok(), None);
+            with_request(meta, self.handler.note_proof(&user, at)).await
+        }
+
+        /// Three wrong passwords in a row lock the OU's users, and the KDC counts.
+        async fn locking(&self, ou: &str) {
+            let items = [
+                ("lockout-threshold", "3"),
+                ("lockout-duration-seconds", "0"),
+            ];
+            let request = CreatePolicyRequest {
+                name: format!("lock {ou}"),
+                description: String::new(),
+                items: items.map(|(k, v)| (k.to_owned(), v.to_owned())).into(),
+            };
+            let id = self.handler.create_policy(request).await.unwrap();
+            self.handler.set_ou_policy(ou, id).await.unwrap();
+            let store = Arc::new(self.handler.clone());
+            self.counter
+                .serve_kdc(store, tokio::runtime::Handle::current());
+        }
+    }
+
+    fn reply(store: &SharedDump, request: &[u8]) -> Vec<u8> {
+        let guard = store.read().unwrap();
+        krb5_kdc::handle_request(&*guard, request).unwrap()
+    }
+
+    type Said = (i32, Option<String>);
+
+    fn said(e: &KrbError) -> Said {
+        let text = e.e_text.as_ref();
+        let text = text.map(|t| String::from_utf8_lossy(t.as_bytes()).into_owned());
+        (e.error_code, text)
+    }
+
+    /// The KRB-ERROR's code and text, and those of the error FAST carries inside it.
+    fn fast_said(reply: &[u8], armor: &ProtocolKey) -> [Said; 2] {
+        let outer = decode::<KrbError>(reply).unwrap();
+        let carried = outer.e_data.as_ref().unwrap();
+        let padata: MethodData = decode(carried.as_ref()).unwrap();
+        let fast = unwrap_fast_rep(armor, &Some(padata)).unwrap();
+        let inner = fast.padata.iter().find(|p| p.padata_type == pa::FX_ERROR);
+        let inner = decode::<KrbError>(inner.unwrap().padata_value.as_ref()).unwrap();
+        [said(&outer), said(&inner)]
+    }
+
+    fn fast_kinit(store: &SharedDump, svc: &Service, user: &str) -> [Said; 2] {
+        let sub = ProtocolKey::from_bytes(EncryptionType::Aes256CtsHmacSha196, &[0x47; 32]);
+        let sub = sub.unwrap();
+        let (ticket, session) = (svc.tgt.rep.0.ticket.clone(), &svc.tgt.session_key);
+        let realm = ascii(REALM);
+        let armor = build_fast_armor(ticket, session, &realm, &svc.name, Some(&sub)).unwrap();
+        let akey = armor_key(session, Some(&sub)).unwrap();
+        let mut request = krb5_protocol::as_req(name(user), REALM, nonce(), None).unwrap();
+        let inner = vec![krb5_protocol::pa_enc_timestamp(&user_key(user, PASSWORD)).unwrap()];
+        attach_fast(&mut request, &armor, &akey, inner).unwrap();
+        fast_said(&reply(store, &encode(&request).unwrap()), &akey)
+    }
+
+    /// A service ticket asked inside FAST, armored by the TGT's own session and a subkey.
+    fn fast_service_ticket(
+        store: &SharedDump,
+        tgt: &IssuedAs,
+        user: &str,
+        svc: &Service,
+    ) -> [Said; 2] {
+        let sub = ProtocolKey::from_bytes(EncryptionType::Aes256CtsHmacSha196, &[0x51; 32]);
+        let sub = sub.unwrap();
+        let cname = name(user);
+        let params = TgsReqParams {
+            ticket: tgt.rep.0.ticket.clone(),
+            session: &tgt.session_key,
+            crealm: REALM,
+            cname: &cname,
+            sname: svc.name.clone(),
+            realm: REALM,
+            nonce: nonce(),
+            kdc_options: KdcOptions::forwardable(),
+            additional_tickets: None,
+            extra_padata: Vec::new(),
+            etypes: vec![EncryptionType::Aes256CtsHmacSha196.to_iana()],
+            addresses: None,
+            from: None,
+            enc_authorization_data: None,
+            till: None,
+            subkey: Some(&sub),
+            time_offset: 0,
+        };
+        let mut request = tgs_req_ex(params).unwrap();
+        let akey = armor_key(&tgt.session_key, Some(&sub)).unwrap();
+        let ap = request.0.padata.as_ref().unwrap()[0]
+            .padata_value
+            .as_ref()
+            .to_vec();
+        let options = krb5_types::fast::fast_options_none();
+        let body = &request.0.req_body;
+        let fast = fx_fast_padata_over(None, &akey, &ap, body, Vec::new(), &options).unwrap();
+        request.0.padata.get_or_insert_with(Vec::new).push(fast);
+        fast_said(&reply(store, &encode(&request).unwrap()), &akey)
+    }
+
+    #[test]
+    fn test_the_refusal_is_one_code_and_one_ascii_text() {
+        let refusal = proof_refusal();
+        let text = "second factor needed: sign in to the directory with your code (enrol there \
+                    first if you have none), then run kinit again";
+        assert_eq!(
+            (refusal.code, PROOF_CODE, refusal.e_text.as_deref()),
+            (12, err::POLICY, Some(text))
+        );
+        assert!(
+            text.is_ascii(),
+            "a text that is not ASCII is dropped on the wire"
+        );
+        assert_eq!(
+            proof_detail(Door::KerberosAs),
+            "policy: enable-mfa (no fresh proof)"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_under_the_default_checks_always_asks_a_fresh_proof_at_as_and_tgs_not_at_s4u() {
+        let (bare, enrolled) = (REFUSED_USER, ALLOWED_USER);
+        let (temp, _embedded, store) = realm(&[bare, enrolled]).await;
+        let svc = service(&temp, &store);
+        let at = proving(&store, &[bare, enrolled], "people\\labs", None, false).await;
+        at.enrol(enrolled).await;
+        strict_labs(&at.handler).await;
         let registered: Vec<_> = item_checks().iter().map(|check| check.key()).collect();
         assert_eq!(registered, [THRESHOLD, ENABLE_MFA], "the default checks");
-        let entries = cache.get();
-        let resolved = |user: &str| {
-            let user = UserId::new(user);
-            let enrolled = entries.facts.get(&user).map(|facts| facts.enrolled);
-            (cached_mfa_policy(cache, &entries, &user), enrolled)
-        };
-        assert_eq!(
-            [bare, enrolled].map(resolved),
-            [
-                (Some(MfaPolicy::Always), Some(false)),
-                (Some(MfaPolicy::Always), Some(true))
-            ],
-            "resolved always from memory, one enrolled and one not"
-        );
         let log = LogGuard::install_on_this_thread();
+        let refused = (PROOF_CODE, Some(PROOF_TEXT.to_owned()));
+        let impersonated = |user: &str| -> Outcome {
+            let user = format!("{user}@{REALM}");
+            Ok([user.clone(), user, format!("{SERVICE}@{REALM}")])
+        };
         for user in [bare, enrolled] {
-            let as_code = kinit(&store, user, Some(PASSWORD)).0;
-            let tgt = issue_tgt(&store, user);
-            let tgs = service_ticket(&store, &tgt, user, &svc).is_ok();
-            let s4u = s4u2self(&store, &svc, user, false).is_ok();
-            assert_eq!(
-                (as_code, tgs, s4u),
-                (0, true, true),
-                "{user}: a ticket at each"
+            let asked = (
+                kinit(&store, user, Some(PASSWORD)),
+                s4u2self(&store, &svc, user, false),
             );
+            let label = format!("{user}: always, no proof yet");
+            assert_eq!(asked, (refused.clone(), impersonated(user)), "{label}");
         }
-        let refusals = kdc_rows(&log).into_iter().filter(|row| !row.1);
-        assert_eq!(refusals.count(), 0, "no refusal row at any Kerberos door");
+        let no_proof = |user| row(LogKind::Login, false, user, &proof_detail(Door::KerberosAs));
+        assert_eq!(
+            kdc_rows(&log),
+            vec![no_proof(bare), no_proof(enrolled)],
+            "one row for each refusal, none for S4U2Self"
+        );
+        at.enrol(bare).await;
+        let mut tickets = Vec::new();
+        for user in [bare, enrolled] {
+            assert!(
+                at.prove(user, Utc::now().timestamp(), "").await,
+                "{user}: stored"
+            );
+            let tgt = issue_tgt(&store, user);
+            let served = service_ticket(&store, &tgt, user, &svc).is_ok();
+            tickets.push((kinit(&store, user, Some(PASSWORD)).0, served));
+        }
+        assert_eq!(
+            tickets,
+            vec![(0, true), (0, true)],
+            "with a fresh proof, enrolled now or before: a ticket, and service tickets on it"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_on_the_wire_12_and_the_text_plain_and_inside_fast_at_as_and_tgs_count_nothing() {
+        use lldap_domain_handlers::lockout::LockStore;
+        let user = "e2kwire";
+        let (temp, _embedded, store) = realm(&[user]).await;
+        let svc = service(&temp, &store);
+        let at = proving(
+            &store,
+            &[user],
+            "e2kwireou",
+            Some(MfaPolicy::Enrolled),
+            false,
+        )
+        .await;
+        at.locking("e2kwireou").await;
+        let tgt = issue_tgt(&store, user);
+        at.enrol(user).await;
+        let log = LogGuard::install_on_this_thread();
+        let ours: Said = (PROOF_CODE, Some(PROOF_TEXT.to_owned()));
+        let refused = kinit(&store, user, Some(PASSWORD));
+        let served = service_ticket(&store, &tgt, user, &svc);
+        let plain = [refused, served.map(drop).unwrap_err()];
+        let fast = [
+            fast_kinit(&store, &svc, user),
+            fast_service_ticket(&store, &tgt, user, &svc),
+        ];
+        let stored = at.handler.read_lock(&UserId::new(user)).await.unwrap();
+        let viewed = at
+            .counter
+            .row(&UserId::new(user))
+            .map(|lock| lock.fail_count);
+        let both = [ours.clone(), ours.clone()];
+        assert_eq!(
+            (
+                plain,
+                fast,
+                stored.map(|lock| lock.fail_count),
+                viewed.unwrap_or(0)
+            ),
+            (both.clone(), [both.clone(), both], None, 0),
+            "a kinit without a proof, and a ticket from before the enrolment: 12 and the text, \
+             plain and inside FAST, and nothing counted, in the table or in memory"
+        );
+        let as_row = row(LogKind::Login, false, user, &proof_detail(Door::KerberosAs));
+        let tgs_row = row(
+            LogKind::AccessDenied,
+            false,
+            user,
+            &proof_detail(Door::KerberosTgs),
+        );
+        assert_eq!(
+            kdc_rows(&log),
+            vec![as_row.clone(), tgs_row.clone(), as_row, tgs_row],
+            "one row for each refusal"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_at_tgs_the_tickets_authentication_time_decides_and_s4u_is_not_judged() {
+        let user = "e2kkinds";
+        let (_temp, _embedded, store) = realm(&[user]).await;
+        let at = proving(&store, &[user], "people", Some(MfaPolicy::Always), false).await;
+        let kinds = [
+            TgsKind::Normal,
+            TgsKind::Renew,
+            TgsKind::Validate,
+            TgsKind::U2u,
+            TgsKind::S4u2Self,
+            TgsKind::S4u2Proxy,
+        ];
+        let asked = || kinds.map(|kind| tgs_asks_of(&at.verdict, &store, Some(user), user, kind));
+        let before = asked();
+        at.prove(user, 1_700_000_000 - 30, "").await;
+        let refused = Err(PROOF_CODE);
+        assert_eq!(
+            (before, asked()),
+            (
+                [refused, refused, refused, refused, Ok(()), Ok(())],
+                [Ok(()); 6]
+            ),
+            "a renewal, a validation, a service ticket and U2U ask the ticket's authentication \
+             time inside a window, long passed now; S4U2Self and S4U2Proxy are not judged"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_an_ou_change_after_issue_reaches_the_ticket_and_an_ended_window_opens_nothing() {
+        let user = "e2kafter";
+        let (_temp, _embedded, store) = realm(&[user]).await;
+        let at = proving(&store, &[user], "e2kafterou", None, false).await;
+        let item = |value: &str| [(ENABLE_MFA.to_owned(), value.to_owned())].into();
+        let request = CreatePolicyRequest {
+            name: "e2k after".to_owned(),
+            description: String::new(),
+            items: item("off"),
+        };
+        let id = at.handler.create_policy(request).await.unwrap();
+        at.handler.set_ou_policy("e2kafterou", id).await.unwrap();
+        at.enrol(user).await;
+        let asked = || {
+            let renewal = tgs_asks_of(&at.verdict, &store, Some(user), user, TgsKind::Renew);
+            (as_asks_of(&at.verdict, &store, user, false), renewal)
+        };
+        let before = asked();
+        let change = UpdatePolicyRequest {
+            id,
+            name: None,
+            description: None,
+            items: Some(item("always")),
+        };
+        at.handler.update_policy(change).await.unwrap();
+        let changed = asked();
+        assert!(at.prove(user, 1_700_000_000 - 700, "").await);
+        let held = at.cache.get().windows_of(&UserId::new(user)).len();
+        let refused = Err(PROOF_CODE);
+        assert_eq!(
+            (before, changed, held, asked()),
+            ((Ok(()), Ok(())), (refused, refused), 1, (refused, refused)),
+            "the OU at off: no proof asked. Its value changed to always after the ticket was \
+             issued: kinit and the ticket's renewal are refused. A window that ended 100 s ago, \
+             held in memory, covers neither the kinit nor the ticket"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_with_the_address_tie_only_a_proof_from_the_kinits_address_opens_it() {
+        let (here, there) = ("e2khere", "e2kthere");
+        let (_temp, _embedded, store) = realm(&[here, there]).await;
+        let at = proving(
+            &store,
+            &[here, there],
+            "people",
+            Some(MfaPolicy::Always),
+            true,
+        )
+        .await;
+        let stored = [
+            at.prove(here, 1_700_000_000, PEER).await,
+            at.prove(there, 1_700_000_000, "198.51.100.9").await,
+        ];
+        let asked = [here, there].map(|user| as_asks_of(&at.verdict, &store, user, false));
+        assert_eq!(
+            (stored, asked),
+            ([true, true], [Ok(()), Err(PROOF_CODE)]),
+            "the kinit comes from {PEER}: only the proof made from there opens it"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_locked_user_who_also_needs_a_proof_is_refused_as_locked() {
+        let user = "e2klocked";
+        let (_temp, _embedded, store) = realm(&[user]).await;
+        let at = proving(
+            &store,
+            &[user],
+            "e2klockou",
+            Some(MfaPolicy::Enrolled),
+            false,
+        )
+        .await;
+        at.locking("e2klockou").await;
+        for _ in 0..3 {
+            let _ = kinit(&store, user, Some("Wrong-Pass-1"));
+        }
+        at.enrol(user).await;
+        let renewal = tgs_asks_of(&at.verdict, &store, Some(user), user, TgsKind::Renew);
+        assert_eq!(
+            (kinit(&store, user, Some(PASSWORD)).0, renewal),
+            (err::CLIENT_REVOKED, Err(err::CLIENT_REVOKED)),
+            "the lockout is judged first: 18, not 12"
+        );
     }
 
     #[tokio::test]

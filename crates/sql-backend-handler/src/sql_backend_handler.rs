@@ -3,6 +3,7 @@ use itertools::Itertools;
 use lldap_auth::opaque::server::ServerSetup;
 use lldap_domain::types::{Attribute, AttributeName, AttributeValue, UserId};
 use lldap_domain_handlers::enforcement::{self, PolicyCache};
+use lldap_domain_handlers::kdc_proof::ProofSettings;
 use lldap_domain_handlers::lockout::{Lockout, lockout};
 use lldap_domain_handlers::mfa::MfaPolicy;
 use lldap_schema::PublicSchema;
@@ -65,6 +66,8 @@ pub struct SqlBackendHandler {
     pub(crate) read_pool: DbConnection,
     /// The explicit server-wide `enable_mfa`; `None` lets the OUs decide.
     pub(crate) mfa_policy: Option<MfaPolicy>,
+    /// What a proven second factor opens at the KDC; `None` without a realm.
+    pub(crate) proofs: Option<ProofSettings>,
     /// A `totp_steps` row was written since the last prune; true at start, for one prune then.
     pub(crate) codes_written: Arc<AtomicBool>,
     pub(crate) policy_cache: &'static PolicyCache,
@@ -79,6 +82,7 @@ impl SqlBackendHandler {
             read_pool: sql_pool.clone(),
             sql_pool,
             mfa_policy: None,
+            proofs: None,
             codes_written: Arc::new(AtomicBool::new(true)),
             policy_cache: enforcement::policy_cache(),
             lockout: lockout(),
@@ -95,7 +99,14 @@ impl SqlBackendHandler {
     /// The process's cache unless a test gives its own.
     pub fn with_policy_cache(mut self, policy_cache: &'static PolicyCache) -> Self {
         policy_cache.set_mfa_policy(self.mfa_policy);
+        policy_cache.set_proofs(self.proofs);
         self.policy_cache = policy_cache;
+        self
+    }
+
+    pub fn with_proofs(mut self, proofs: Option<ProofSettings>) -> Self {
+        self.policy_cache.set_proofs(proofs);
+        self.proofs = proofs;
         self
     }
 

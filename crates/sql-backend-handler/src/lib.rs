@@ -8,6 +8,7 @@ pub(crate) mod sql_kerberos_handler;
 pub(crate) mod sql_lockout_handler;
 pub(crate) mod sql_log_handler;
 pub(crate) mod sql_mfa_handler;
+pub(crate) mod sql_mfa_windows;
 pub(crate) mod sql_opaque_handler;
 pub(crate) mod sql_policy_handler;
 pub(crate) mod sql_posix_backend_handler;

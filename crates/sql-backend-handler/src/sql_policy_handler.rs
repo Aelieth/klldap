@@ -1,7 +1,10 @@
 use crate::sql_backend_handler::SqlBackendHandler;
 use crate::sql_lockout_handler::CountingStart;
+use crate::sql_mfa_windows::read_windows;
 use async_trait::async_trait;
+use lldap_domain::types::UserId;
 use lldap_domain_handlers::handler::PolicyBackendHandler;
+use lldap_domain_handlers::kdc_proof::ProofWindow;
 use lldap_domain_handlers::logging::{self, LogKind};
 use lldap_domain_handlers::policies::{
     AttachedPolicy, CreatePolicyRequest, OuPolicyState, Policy, PolicyId, PolicyLevel,
@@ -371,6 +374,13 @@ impl PolicyBackendHandler for SqlBackendHandler {
             );
         }
         Ok(())
+    }
+
+    async fn read_proof_windows(
+        &self,
+        user: Option<&UserId>,
+    ) -> Result<Vec<(UserId, ProofWindow)>> {
+        read_windows(&self.sql_pool, user).await
     }
 }
 

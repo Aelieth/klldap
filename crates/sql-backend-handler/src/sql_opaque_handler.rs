@@ -1,6 +1,7 @@
 use crate::SqlBackendHandler;
 use crate::sql_log_handler::UNKNOWN_USER_DETAIL;
-use crate::sql_mfa_handler::TotpRejection;
+use crate::sql_mfa_handler::{TotpRejection, now_unix};
+use crate::sql_mfa_windows::with_proof;
 use async_trait::async_trait;
 use base64::Engine;
 use lldap_auth::opaque;
@@ -298,7 +299,9 @@ impl LoginHandler for SqlBackendHandler {
                 Ok(()) => {
                     self.admit_at(&name, door, true).await?;
                     self.admit_while_degraded(&name, door).await?;
-                    logging::record_as(Some(&name), LogKind::Bind, None, true, Some("totp"));
+                    let stored = self.note_proof(&name, now_unix()).await;
+                    let detail = with_proof("totp", stored);
+                    logging::record_as(Some(&name), LogKind::Bind, None, true, Some(&detail));
                     self.count_success(lock.as_ref(), door, now).await;
                     Ok(())
                 }
@@ -514,8 +517,16 @@ impl OpaqueHandler for SqlOpaqueHandler {
         self.admit_at(&username, Door::WebLogin, second_factor)
             .await?;
         self.admit_while_degraded(&username, Door::WebLogin).await?;
+        let stored = !second_factor || self.note_proof(&username, now_unix()).await;
+        let detail = detail.map(|detail| with_proof(detail, stored));
         info!(r#"OPAQUE login successful for "{}""#, &username);
-        logging::record_as(Some(&username), LogKind::Login, None, true, detail);
+        logging::record_as(
+            Some(&username),
+            LogKind::Login,
+            None,
+            true,
+            detail.as_deref(),
+        );
         self.count_success(lock.as_ref(), Door::WebLogin, now).await;
         if let Some(id) = foreign {
             let step = self.lockout.split(&username, id, true);

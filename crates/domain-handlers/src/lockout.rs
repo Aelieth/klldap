@@ -1557,6 +1557,7 @@ where
     prune_spent_steps(store).await;
     let store = Arc::new(store.clone());
     lockout.serve_kdc(store.clone(), tokio::runtime::Handle::current());
+    cache.serve_windows(store.clone(), tokio::runtime::Handle::current());
     lockout.run(store, cache)
 }
 

@@ -2438,7 +2438,12 @@ fn period_key_sql(backend: DbBackend, statement: &str) -> String {
 
 async fn drop_lockout_tables(pool: &DbConnection) {
     let backend = pool.get_database_backend();
-    for table in ["login_lockouts", "totp_steps", "mfa_used_proofs"] {
+    for table in [
+        "login_lockouts",
+        "totp_steps",
+        "mfa_used_proofs",
+        "mfa_windows",
+    ] {
         pool.execute(sea_orm::Statement::from_string(
             backend,
             format!("DROP TABLE {table}"),
@@ -2474,6 +2479,12 @@ async fn expect_lockout_tables(pool: &DbConnection) {
     ))
     .await
     .expect("mfa_used_proofs restored");
+    pool.execute(sea_orm::Statement::from_string(
+        backend,
+        "SELECT user_id, peer, opened_at, until_at FROM mfa_windows LIMIT 1".to_owned(),
+    ))
+    .await
+    .expect("mfa_windows restored");
     let period = pool
         .query_one(sea_orm::Statement::from_string(
             backend,
@@ -3772,6 +3783,72 @@ async fn test_mysql_one_proof_used_at_once_is_taken_once() {
         return;
     };
     crate::sql_used_proofs::tests::used_proofs_lane(&pool).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_proofs_at_once_open_one_window_and_extend_it() {
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres_sized(10).await else {
+        return;
+    };
+    crate::sql_mfa_windows::tests::windows_lane(&pool).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_proofs_at_once_open_one_window_and_extend_it() {
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql_sized(10).await else {
+        return;
+    };
+    crate::sql_mfa_windows::tests::windows_lane(&pool).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_a_proof_on_one_server_admits_a_kinit_on_the_other_after_its_reread() {
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres().await else {
+        return;
+    };
+    crate::sql_mfa_windows::tests::two_servers_lane(&pool).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_a_factor_reset_on_one_server_ends_the_refusal_on_the_other() {
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres().await else {
+        return;
+    };
+    crate::sql_mfa_windows::tests::reset_elsewhere_lane(&pool).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_a_proof_on_one_server_admits_a_kinit_on_the_other_after_its_reread() {
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql().await else {
+        return;
+    };
+    crate::sql_mfa_windows::tests::two_servers_lane(&pool).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_a_factor_reset_on_one_server_ends_the_refusal_on_the_other() {
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql().await else {
+        return;
+    };
+    crate::sql_mfa_windows::tests::reset_elsewhere_lane(&pool).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

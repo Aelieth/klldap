@@ -1,6 +1,7 @@
 use crate::sql_backend_handler::SqlBackendHandler;
 use crate::sql_lockout_handler::numbered;
 use crate::sql_mfa_handler::now_unix;
+use crate::sql_mfa_windows::prune_windows;
 use crate::sql_tables::DbConnection;
 use crate::sql_used_proofs::prune_used_proofs;
 use lldap_domain::types::UserId;
@@ -121,7 +122,7 @@ pub(crate) async fn mark_used(
 }
 
 /// MySQL and MariaDB answer a deadlock or a lock wait with "try restarting transaction".
-fn lock_conflict(e: &DomainError) -> bool {
+pub(crate) fn lock_conflict(e: &DomainError) -> bool {
     e.to_string().contains("try restarting transaction")
 }
 
@@ -230,7 +231,11 @@ impl SqlBackendHandler {
         let both = async {
             let steps = prune(&self.sql_pool, current_step()).await?;
             let proofs = prune_used_proofs(&self.sql_pool, now_unix()).await?;
-            Ok::<u64, DomainError>(steps + proofs)
+            let windows = match self.proofs {
+                Some(settings) => prune_windows(&self.sql_pool, now_unix() - settings.kept).await?,
+                None => 0,
+            };
+            Ok::<u64, DomainError>(steps + proofs + windows)
         };
         let pruned = tokio::time::timeout(PRUNE_BOUND, both)
             .await

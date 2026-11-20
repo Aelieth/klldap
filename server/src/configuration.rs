@@ -17,6 +17,7 @@ use lldap_auth::opaque::{
 };
 use lldap_domain::types::{AttributeName, UserId};
 use lldap_domain_handlers::{
+    kdc_proof::ProofSettings,
     kerberos::{domain_from_base_dn, realm_from},
     mfa::MfaPolicy,
 };
@@ -140,6 +141,11 @@ pub struct KerberosOptions {
     pub client_config: PathBuf,
     #[builder(default = "true")]
     pub client_case_fold: bool,
+    #[builder(default = r#"String::from("10m")"#)]
+    #[serde(deserialize_with = "deserialize_lifetime")]
+    pub mfa_proof_window: String,
+    #[builder(default = "false")]
+    pub mfa_proof_same_address: bool,
 }
 
 impl std::default::Default for KerberosOptions {
@@ -372,6 +378,17 @@ impl Configuration {
             domain_from_base_dn(&self.ldap_base_dn),
             self.keycloak_options.keytab.clone(),
         )
+    }
+
+    /// What a second factor proven at a directory door opens at the KDC; none without a realm.
+    pub fn proof_settings(&self) -> Result<Option<ProofSettings>> {
+        let options = &self.kerberos_options;
+        let window = seconds("mfa_proof_window", &options.mfa_proof_window)?;
+        let renew = seconds("renew_lifetime", &options.renew_lifetime)?;
+        let ticket = seconds("ticket_lifetime", &options.ticket_lifetime)?;
+        let longest = ticket.max(renew);
+        let settings = ProofSettings::new(window, options.mfa_proof_same_address, longest);
+        Ok(options.enabled.then_some(settings))
     }
 
     /// The explicit server-wide value: present in the file, the environment or the command line.
@@ -999,6 +1016,7 @@ where
 
     overrides.override_config(&mut config);
     config.kerberos_settings()?;
+    config.proof_settings()?;
     if config.verbose {
         println!("Configuration: {:#?}", config);
     }
@@ -1714,6 +1732,52 @@ mod tests {
                 jail.create_file("lldap_config.toml", "")?;
                 jail.set_env(env, value);
                 assert_eq!(read(&init(default_run_opts()).unwrap()), value, "{env}");
+                Ok(())
+            });
+        }
+    }
+
+    #[test]
+    fn test_the_proof_window_and_the_address_tie() {
+        type Want = std::result::Result<Option<(i64, bool, i64)>, &'static str>;
+        let week = 7 * 86_400 + 3600;
+        let rows: [(&[(&str, &str)], Want); 9] = [
+            (&[], Ok(Some((600, false, week)))),
+            (&[("MFA_PROOF_WINDOW", "1h")], Ok(Some((3600, false, week)))),
+            (&[("MFA_PROOF_WINDOW", "90")], Ok(Some((90, false, week)))),
+            (
+                &[("MFA_PROOF_SAME_ADDRESS", "true")],
+                Ok(Some((600, true, week))),
+            ),
+            (
+                &[("RENEW_LIFETIME", "1d")],
+                Ok(Some((600, false, 86_400 + 3600))),
+            ),
+            (&[("ENABLED", "false")], Ok(None)),
+            (
+                &[("TICKET_LIFETIME", "10d"), ("RENEW_LIFETIME", "1d")],
+                Ok(Some((600, false, 10 * 86_400 + 3600))),
+            ),
+            (
+                &[("MFA_PROOF_WINDOW", "0")],
+                Err("mfa_proof_window = \"0\" is not a positive Kerberos duration"),
+            ),
+            (&[("MFA_PROOF_WINDOW", "-1m")], Err("mfa_proof_window")),
+        ];
+        for (env, expected) in rows {
+            Jail::expect_with(|jail| {
+                jail.clear_env();
+                jail.set_env("LLDAP_JWT_SECRET", "secret");
+                for (key, value) in env {
+                    jail.set_env(format!("LLDAP_KERBEROS_OPTIONS__{key}"), value);
+                }
+                let loaded = init(default_run_opts()).and_then(|config| config.proof_settings());
+                let seen = |s: ProofSettings| (s.window, s.same_address, s.kept);
+                match (loaded, expected) {
+                    (Ok(got), Ok(want)) => assert_eq!(got.map(seen), want, "{env:?}"),
+                    (Err(e), Err(text)) => assert!(e.to_string().contains(text), "{env:?}: {e}"),
+                    (loaded, _) => panic!("{env:?}: unexpected {loaded:?}"),
+                }
                 Ok(())
             });
         }

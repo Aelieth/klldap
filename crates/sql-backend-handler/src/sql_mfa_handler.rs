@@ -1,5 +1,6 @@
 use crate::SqlBackendHandler;
 use crate::sql_lockout_handler::numbered;
+use crate::sql_mfa_windows::{clear_windows, with_proof};
 use crate::sql_opaque_handler::invalid_credentials;
 use crate::sql_totp_steps::{Mark, clear_used, mark_in, mark_used, refund, reserve};
 use crate::sql_used_proofs::take_proof_id;
@@ -167,7 +168,7 @@ async fn stored_factor(txn: &impl ConnectionTrait, user_id: &UserId) -> Result<O
     })
 }
 
-/// The user's factor and the old key's used marks change together, in the caller's transaction.
+/// The factor, its used marks and its proofs change together, in the caller's transaction.
 async fn change_factor(
     txn: &impl ConnectionTrait,
     user_id: &UserId,
@@ -182,7 +183,8 @@ async fn change_factor(
         ..Default::default()
     };
     user_update.update(txn).await?;
-    clear_used(txn, Some(user_id)).await
+    clear_used(txn, Some(user_id)).await?;
+    clear_windows(txn, Some(user_id)).await
 }
 
 impl SqlBackendHandler {
@@ -334,6 +336,7 @@ impl SqlBackendHandler {
             .await?
             .rows_affected;
         clear_used(&txn, None).await?;
+        clear_windows(&txn, None).await?;
         txn.commit().await?;
         if cleared > 0 {
             logging::record(LogKind::MfaReset, None, Some("private key changed"));
@@ -533,13 +536,18 @@ impl MfaBackendHandler for SqlBackendHandler {
         }
         txn.commit().await?;
         self.user_written(user_id).await;
+        let stored = self.note_proof(user_id, now).await;
         info!(r#"TOTP enrollment completed for "{}""#, user_id);
         let detail = if state.replaces_existing {
             "replaced"
         } else {
             "totp"
         };
-        logging::record(LogKind::MfaEnroll, target, Some(detail));
+        logging::record(
+            LogKind::MfaEnroll,
+            target,
+            Some(&with_proof(detail, stored)),
+        );
         Ok(())
     }
 }

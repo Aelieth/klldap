@@ -2,6 +2,8 @@ use crate::handler::{
     GroupBackendHandler, GroupListerBackendHandler, GroupRequestFilter, PolicyBackendHandler,
     UserBackendHandler, UserListerBackendHandler,
 };
+use crate::kdc_proof::{ProofSettings, ProofWindow, Reread, WindowReader};
+use crate::kdc_proof::{fill_windows, proofs_live, take_user_windows};
 use crate::kerberos::{CommitError, HostRow};
 use crate::lockout::{self, LockRow, Lockout, LockoutCheck, lockout};
 use crate::logging::{self, LogKind, Protocol, RequestMeta};
@@ -266,7 +268,7 @@ impl UserFacts {
     }
 }
 
-/// Keeps the cache filled while an OU sets `enable-mfa`; `mfa_requirement` judges it.
+/// Keeps the cache filled while an OU sets `enable-mfa` or the KDC asks a proof.
 pub struct MfaItemCheck;
 
 impl ItemCheck for MfaItemCheck {
@@ -275,7 +277,7 @@ impl ItemCheck for MfaItemCheck {
     }
 
     fn live(&self, cache: &PolicyCache) -> bool {
-        cache.mfa_policy().is_none() && !cache.mfa_item_off()
+        (cache.mfa_policy().is_none() && !cache.mfa_item_off()) || proofs_live(cache)
     }
 
     fn may_refuse(&self, _: &UserState) -> bool {
@@ -323,6 +325,7 @@ pub struct Entries {
     pub ous_of_users: HashMap<UserId, String>,
     pub items_of_ous: HashMap<String, Arc<[EffectiveItem]>>,
     pub facts: HashMap<UserId, UserFacts>,
+    pub windows: HashMap<UserId, Arc<[ProofWindow]>>,
     pub built_at: DateTime<Utc>,
 }
 
@@ -335,6 +338,13 @@ impl Entries {
     pub fn facts_of(&self, user: &UserId) -> Option<&UserFacts> {
         self.facts.get(user)
     }
+
+    pub fn windows_of(&self, user: &UserId) -> &[ProofWindow] {
+        self.windows
+            .get(user)
+            .map(|windows| &windows[..])
+            .unwrap_or_default()
+    }
 }
 
 /// Swapped whole: a reader holds the old entries or the new ones, never none.
@@ -343,12 +353,15 @@ pub struct PolicyCache {
     generation: AtomicU64,
     reads: AtomicU64,
     fill: Notify,
-    writers: tokio::sync::Mutex<()>,
+    pub(crate) writers: tokio::sync::Mutex<()>,
     marked: Mutex<Marks>,
     read_failed: AtomicBool,
     lockout: AtomicU8,
     mfa: RwLock<Option<MfaPolicy>>,
     mfa_item: AtomicU8,
+    pub(crate) proofs: RwLock<Option<ProofSettings>>,
+    pub(crate) reader: RwLock<Option<WindowReader>>,
+    pub(crate) rereads: Mutex<HashMap<UserId, Reread>>,
 }
 
 #[derive(Default)]
@@ -391,6 +404,9 @@ impl PolicyCache {
             lockout: AtomicU8::new(FLAG_OFF),
             mfa: RwLock::new(None),
             mfa_item: AtomicU8::new(FLAG_OFF),
+            proofs: RwLock::new(None),
+            reader: RwLock::new(None),
+            rereads: Mutex::default(),
         }
     }
 
@@ -474,7 +490,7 @@ impl PolicyCache {
         self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
-    fn edit(&self, change: impl FnOnce(&mut Entries)) {
+    pub(crate) fn edit(&self, change: impl FnOnce(&mut Entries)) {
         let mut next = Entries::clone(&self.current());
         change(&mut next);
         self.replace(next);
@@ -497,14 +513,19 @@ impl PolicyCache {
         self.edit(|entries| {
             entries.ous_of_users.remove(user);
             entries.facts.remove(user);
+            entries.windows.remove(user);
         });
+    }
+
+    pub(crate) fn note_read_failed(&self) {
+        self.read_failed.store(true, Ordering::Release);
     }
 
     fn marks(&self) -> std::sync::MutexGuard<'_, Marks> {
         self.marked.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn mark(&self, user: &UserId) {
+    pub(crate) fn mark(&self, user: &UserId) {
         let mut marks = self.marks();
         marks.made += 1;
         let made = marks.made;
@@ -602,7 +623,8 @@ where
         cache,
         writers: Some(writers),
     };
-    let entries = build_entries(handler).await?;
+    let mut entries = build_entries(handler).await?;
+    fill_windows(handler, cache, &mut entries).await;
     cache.replace(entries);
     take_marks(handler, cache).await;
     Ok(())
@@ -778,6 +800,10 @@ where
             Ok((ou_key, items, facts)) => {
                 cache.put_user(&user, &ou_key, items);
                 cache.put_facts(&user, facts);
+                if !take_user_windows(handler, cache, &user).await {
+                    cache.note_read_failed();
+                    continue;
+                }
             }
             Err(DomainError::EntityNotFound(_)) => cache.remove_user(&user),
             Err(e) => {
@@ -1093,6 +1119,7 @@ mod tests {
                 .map(|(ou, items)| ((*ou).to_owned(), items.to_vec().into()))
                 .collect(),
             facts: HashMap::new(),
+            windows: HashMap::new(),
             built_at: at(0),
         }
     }
@@ -1642,6 +1669,9 @@ mod tests {
         users_down: AtomicBool,
         user_lists: AtomicU64,
         groups: Mutex<Vec<CreateGroupRequest>>,
+        proof_rows: Vec<(UserId, ProofWindow)>,
+        proofs_down: AtomicBool,
+        proof_reads: AtomicU64,
     }
 
     impl Directory {
@@ -1666,6 +1696,15 @@ mod tests {
                 items: BTreeMap::from([(ENABLE_MFA.to_owned(), value.to_owned())]),
                 linked_ous: vec![LABS.to_owned()],
             }];
+            self
+        }
+
+        fn enrolling(mut self, names: &[&str]) -> Self {
+            let named = |user: &&mut User| names.contains(&user.user_id.as_str());
+            let enrol = |user: &mut User| user.mfa_type = Some(MFA_TYPE_TOTP.to_owned());
+            self.listed.iter_mut().filter(named).for_each(enrol);
+            let users = self.users.get_mut().unwrap().values_mut();
+            users.filter(named).for_each(enrol);
             self
         }
 
@@ -1779,6 +1818,18 @@ mod tests {
         }
         async fn delete_ou_policy_state(&self, _: &str) -> Result<()> {
             unimplemented!()
+        }
+        async fn read_proof_windows(
+            &self,
+            user: Option<&UserId>,
+        ) -> Result<Vec<(UserId, ProofWindow)>> {
+            self.proof_reads.fetch_add(1, Ordering::Relaxed);
+            if self.proofs_down.load(Ordering::Relaxed) {
+                return Err(DomainError::InternalError("down".to_owned()));
+            }
+            let rows = self.proof_rows.iter();
+            let theirs = rows.filter(|(owner, _)| user.is_none_or(|user| owner == user));
+            Ok(theirs.cloned().collect())
         }
     }
 
@@ -2037,6 +2088,112 @@ mod tests {
         for (server, ous) in rows {
             assert_eq!(ous_asking_mfa(server, &policies), ous, "{server:?}");
         }
+    }
+
+    fn opened() -> ProofWindow {
+        let peer = String::new();
+        ProofWindow {
+            opened_at: 1_700_000_000,
+            until_at: 1_700_000_600,
+            peer,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_the_fill_reads_the_windows_once_for_the_users_who_need_a_proof() {
+        type Row = (&'static str, MfaPolicy, bool, u64, usize);
+        let rows: [Row; 4] = [
+            (
+                "enabled: the enrolled user's",
+                MfaPolicy::Enrolled,
+                false,
+                1,
+                1,
+            ),
+            (
+                "off: nobody's, nothing read",
+                MfaPolicy::Disabled,
+                false,
+                0,
+                0,
+            ),
+            ("always: both users'", MfaPolicy::Always, false, 1, 2),
+            (
+                "a failed read: none, the fill stands",
+                MfaPolicy::Enrolled,
+                true,
+                1,
+                0,
+            ),
+        ];
+        for (label, server, down, reads, held) in rows {
+            let cache = PolicyCache::new();
+            cache.set_proofs(Some(ProofSettings::new(600, false, 3600)));
+            cache.set_mfa_policy(Some(server));
+            let directory = Directory::knowing(&[LATE, OTHER]).listing(&[LATE, OTHER]);
+            let mut directory = directory.enrolling(&[LATE]);
+            let both = [LATE, OTHER].map(|name| (UserId::new(name), opened()));
+            directory.proof_rows = both.to_vec();
+            directory.proofs_down.store(down, Ordering::Relaxed);
+            let filled = fill_policy_cache(&directory, &cache).await;
+            let entries = cache.get();
+            let kept = [LATE, OTHER].map(|name| entries.windows_of(&UserId::new(name)).len());
+            let failed = cache.read_failed.load(Ordering::Acquire);
+            let read = directory.proof_reads.load(Ordering::Relaxed);
+            assert_eq!(
+                (filled.is_ok(), read, kept.iter().sum::<usize>(), failed),
+                (true, reads, held, down),
+                "{label}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_proof_put_while_a_fill_holds_the_lock_is_read_by_the_taker() {
+        let cache = PolicyCache::new();
+        cache.set_proofs(Some(ProofSettings::new(600, false, 3600)));
+        cache.set_mfa_policy(Some(MfaPolicy::Enrolled));
+        let directory = Directory::knowing(&[LATE]).listing(&[LATE]);
+        let mut directory = directory.enrolling(&[LATE]);
+        directory.proof_rows = vec![(UserId::new(LATE), opened())];
+        let late = UserId::new(LATE);
+        let held = cache.writers.lock().await;
+        cache.put_window(&late, opened());
+        let entries = cache.get();
+        let while_held = (entries.windows_of(&late).len(), cache.marks().users.len());
+        drop(held);
+        fill_policy_cache(&directory, &cache).await.unwrap();
+        let entries = cache.get();
+        let taken = (
+            entries.windows_of(&late).to_vec(),
+            cache.marks().users.len(),
+        );
+        assert_eq!(
+            (while_held, taken),
+            ((0, 1), (vec![opened()], 0)),
+            "under a held lock the proof marks its user instead of editing; the taker reads it"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_a_written_user_who_needs_a_proof_reads_their_own_windows_again() {
+        let cache = PolicyCache::new();
+        cache.set_proofs(Some(ProofSettings::new(600, false, 3600)));
+        cache.set_mfa_policy(Some(MfaPolicy::Enrolled));
+        let mut directory = Directory::knowing(&[LATE, OTHER]).enrolling(&[LATE]);
+        let both = [LATE, OTHER].map(|name| (UserId::new(name), opened()));
+        directory.proof_rows = both.to_vec();
+        let (late, other) = (UserId::new(LATE), UserId::new(OTHER));
+        user_written(&directory, &cache, &late).await;
+        user_written(&directory, &cache, &other).await;
+        let entries = cache.get();
+        let held = (entries.windows_of(&late), entries.windows_of(&other).len());
+        assert_eq!(
+            (directory.proof_reads.load(Ordering::Relaxed), held),
+            (1, (&[opened()][..], 0)),
+            "the enrolled user's own rows, read once; a user who needs no proof reads nothing"
+        );
     }
 
     fn ou_of(cache: &PolicyCache, user: &UserId) -> Option<String> {

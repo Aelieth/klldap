@@ -1589,6 +1589,11 @@ mod tests {
     use crate::policies::PolicyScope;
     use pretty_assertions::assert_eq;
 
+    #[test]
+    fn test_a_kdc_door_waits_at_most_a_quarter_second_for_its_count_to_be_written() {
+        assert_eq!(WRITE_BOUND, Duration::from_millis(250));
+    }
+
     fn at(seconds: i64) -> NaiveDateTime {
         chrono::DateTime::from_timestamp(1_700_000_000 + seconds, 0)
             .unwrap()

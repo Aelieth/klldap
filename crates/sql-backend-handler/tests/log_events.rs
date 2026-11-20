@@ -46,7 +46,7 @@ fn attribute(name: &str) -> CreateAttributeRequest {
 #[serial]
 async fn test_every_directory_write_records_a_log_event() {
     let handler = handler().await;
-    let guard = LogGuard::install();
+    let guard = LogGuard::install_on_this_thread();
     let bob = UserId::new("bob");
 
     handler
@@ -244,7 +244,7 @@ async fn test_bind_records_the_claimed_user_and_the_request_scope() {
         .await
         .unwrap();
     let ldap_peer: IpAddr = "10.0.0.5".parse().unwrap();
-    let guard = LogGuard::install();
+    let guard = LogGuard::install_on_this_thread();
 
     with_actor(
         Some(UserId::new("admin")),

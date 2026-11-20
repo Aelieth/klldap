@@ -895,12 +895,20 @@ mod tests {
         assert!(matches!(refused, Err(KerberosStoreError::Refused(_))));
     }
 
-    #[derive(Default)]
-    struct Rows(Mutex<Vec<crate::logging::LogEvent>>);
+    /// The sink is process-wide: keep only rows from the thread that installed it.
+    struct Rows(Mutex<Vec<crate::logging::LogEvent>>, std::thread::ThreadId);
+
+    impl Default for Rows {
+        fn default() -> Self {
+            Self(Mutex::default(), std::thread::current().id())
+        }
+    }
 
     impl crate::logging::LogSink for Rows {
         fn record(&self, event: crate::logging::LogEvent) {
-            self.0.lock().unwrap().push(event);
+            if std::thread::current().id() == self.1 {
+                self.0.lock().unwrap().push(event);
+            }
         }
     }
 

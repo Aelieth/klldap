@@ -884,7 +884,7 @@ mod tests {
     #[serial]
     async fn test_bind_enforces_totp() {
         let _clock = pin_clock(AT as i64);
-        let guard = LogGuard::install();
+        let guard = LogGuard::install_on_this_thread();
         let peer = "10.77.1.1";
         let handler = mfa_handler(MfaPolicy::Enrolled).await;
         insert_user(&handler, "bob", "bob00").await;
@@ -999,7 +999,7 @@ mod tests {
     #[serial]
     async fn test_login_finish_enforces_totp() {
         let _clock = pin_clock(AT as i64);
-        let guard = LogGuard::install();
+        let guard = LogGuard::install_on_this_thread();
         let peer = "10.77.1.2";
         let handler = mfa_handler(MfaPolicy::Always).await;
         insert_user(&handler, "bob", "bob00").await;
@@ -1053,7 +1053,7 @@ mod tests {
     #[serial]
     async fn test_a_sessionless_finish_writes_the_doors_one_row_saying_no_session() {
         let _clock = pin_clock(AT as i64);
-        let guard = LogGuard::install();
+        let guard = LogGuard::install_on_this_thread();
         let peer = "10.77.1.3";
         let handler = mfa_handler(MfaPolicy::Always).await;
         insert_user(&handler, "bob", "bob00").await;
@@ -1457,7 +1457,7 @@ mod tests {
             ("eleven minutes", 660, false),
             ("a day", 86_400, false),
         ];
-        let log = LogGuard::install();
+        let log = LogGuard::install_on_this_thread();
         for (label, age, opens) in rows {
             let got = handler.registration_user(&issued(age)).await;
             let refused = got

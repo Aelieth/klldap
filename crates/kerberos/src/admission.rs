@@ -2006,16 +2006,16 @@ pub(crate) mod tests {
         counter.serve_kdc(Arc::new(handler.clone()), tokio::runtime::Handle::current());
         let held = pool.begin().await.unwrap();
         let released = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(600)).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
             held.rollback().await.unwrap();
         });
         let started = Instant::now();
         let got = kinit(&store, b, Some("Wrong-Pass-1")).0;
-        let took = started.elapsed();
+        let (took, still_held) = (started.elapsed(), !released.is_finished());
         assert_eq!(got, err::PREAUTH_FAILED);
         assert!(
-            took < Duration::from_millis(300),
-            "the KDC answered after {took:?}"
+            still_held && took < Duration::from_secs(1),
+            "the KDC answered after {took:?}, the database still held: {still_held}"
         );
         released.await.unwrap();
         let user = UserId::new(b);

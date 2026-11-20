@@ -568,7 +568,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_policy_log_rows() {
-        let guard = LogGuard::install();
+        let guard = LogGuard::install_on_this_thread();
         let peer = "10.88.0.1";
         with_request(
             RequestMeta::http(Some(peer.parse().unwrap()), None),

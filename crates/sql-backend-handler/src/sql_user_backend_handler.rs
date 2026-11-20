@@ -2685,7 +2685,7 @@ mod tests {
         use lldap_test_utils::recording_log::LogGuard;
         let _guard = RecordingGuard::install();
         let fixture = TestFixture::new().await;
-        let log = LogGuard::install();
+        let log = LogGuard::install_on_this_thread();
         let sync_on = || Attribute {
             name: "kerberossync".into(),
             value: 1i64.into(),
@@ -2758,7 +2758,7 @@ mod tests {
                    that alias first (kadmin delprinc carl@RECORDER.TEST)";
         let _guard = RecordingGuard::install_aliased(why);
         let fixture = TestFixture::new().await;
-        let log = LogGuard::install();
+        let log = LogGuard::install_on_this_thread();
         let request = |sync: i64| CreateUserRequest {
             user_id: UserId::new("carl"),
             email: "carl@example.com".into(),

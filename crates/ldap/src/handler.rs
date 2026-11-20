@@ -573,7 +573,7 @@ pub mod tests {
     #[serial]
     async fn test_only_admins_bind_while_kerberos_is_unavailable() {
         use ldap3_proto::proto::LdapBindCred;
-        let guard = LogGuard::install();
+        let guard = LogGuard::install_on_this_thread();
         let _kdc = DegradedGuard::install();
         let rows = [
             ("lldap_admin", "pass", LdapResultCode::Success),
@@ -695,7 +695,7 @@ pub mod tests {
     #[tokio::test]
     #[serial]
     async fn test_access_denied_events() {
-        let guard = LogGuard::install();
+        let guard = LogGuard::install_on_this_thread();
         let mut mock = MockTestBackendHandler::new();
         setup_default_ldap_mock(&mut mock);
         let mut bound = setup_bound_handler_with_group(mock, "regular").await;
@@ -765,7 +765,7 @@ pub mod tests {
             .returning(|_| Err(DomainError::AuthenticationError("nope".to_string())));
         let mut handler = LdapHandler::new_for_tests(mock, "dc=example,dc=com");
         handler.peer = Some("198.51.100.3".parse().unwrap());
-        let guard = LogGuard::install();
+        let guard = LogGuard::install_on_this_thread();
 
         for (dn, cred) in [
             (
@@ -828,7 +828,7 @@ pub mod tests {
         mock.expect_bind().times(0);
         let mut handler = LdapHandler::new_for_tests(mock, "dc=example,dc=com");
         handler.peer = Some("198.51.100.4".parse().unwrap());
-        let guard = LogGuard::install();
+        let guard = LogGuard::install_on_this_thread();
 
         let response = handler
             .handle_ldap_message(LdapOp::BindRequest(LdapBindRequest {

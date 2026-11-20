@@ -938,12 +938,22 @@ mod tests {
         );
     }
 
-    #[derive(Default)]
-    struct Rows(std::sync::Mutex<Vec<logging::LogEvent>>);
+    struct Rows(
+        std::sync::Mutex<Vec<logging::LogEvent>>,
+        std::thread::ThreadId,
+    );
+
+    impl Default for Rows {
+        fn default() -> Self {
+            Self(Default::default(), std::thread::current().id())
+        }
+    }
 
     impl logging::LogSink for Rows {
         fn record(&self, event: logging::LogEvent) {
-            self.0.lock().unwrap().push(event);
+            if std::thread::current().id() == self.1 {
+                self.0.lock().unwrap().push(event);
+            }
         }
     }
 

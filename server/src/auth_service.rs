@@ -1551,7 +1551,7 @@ pub(crate) mod tests {
                 None,
             ),
         ];
-        let log = LogGuard::install();
+        let log = LogGuard::install_on_this_thread();
         let reader = || Some(UserId::new("row-reader"));
         let failures = || -> Vec<(LogKind, Option<String>, Option<String>)> {
             log.recorder()

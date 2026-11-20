@@ -542,11 +542,13 @@ mod tests {
     use serial_test::serial;
     use std::sync::Mutex;
 
-    struct Recorder(Mutex<Vec<LogEvent>>);
+    struct Recorder(Mutex<Vec<LogEvent>>, std::thread::ThreadId);
 
     impl LogSink for Recorder {
         fn record(&self, event: LogEvent) {
-            self.0.lock().unwrap().push(event);
+            if std::thread::current().id() == self.1 {
+                self.0.lock().unwrap().push(event);
+            }
         }
     }
 
@@ -558,7 +560,7 @@ mod tests {
     }
 
     fn install_recorder() -> (Arc<Recorder>, SinkGuard) {
-        let recorder = Arc::new(Recorder(Mutex::new(Vec::new())));
+        let recorder = Arc::new(Recorder(Mutex::default(), std::thread::current().id()));
         set_log_sink(recorder.clone());
         (recorder, SinkGuard)
     }

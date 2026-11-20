@@ -1511,7 +1511,7 @@ pub(crate) mod tests {
     #[serial]
     async fn test_mfa_log_rows() {
         let _clock = pin_clock(AT);
-        let guard = LogGuard::install();
+        let guard = LogGuard::install_on_this_thread();
         let peer = "10.77.0.1";
         let meta = RequestMeta::http(Some(peer.parse().unwrap()), None);
         with_request(meta, async {

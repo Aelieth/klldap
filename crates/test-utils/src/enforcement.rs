@@ -85,6 +85,7 @@ impl EnforcementGuard {
             .collect();
         set_item_checks(checks.into());
         policy_cache().replace(Entries::default());
+        policy_cache().set_mfa_item_live(false);
         Self { check }
     }
 
@@ -107,5 +108,6 @@ impl Drop for EnforcementGuard {
     fn drop(&mut self) {
         set_item_checks(default_item_checks());
         policy_cache().replace(Entries::default());
+        policy_cache().set_mfa_item_live(false);
     }
 }

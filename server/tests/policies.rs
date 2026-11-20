@@ -98,7 +98,11 @@ fn test_policy_lifecycle_over_graphql() {
         .collect();
     assert_eq!(
         enforced,
-        ["lockout-threshold", "lockout-duration-seconds"],
+        [
+            "enable-mfa",
+            "lockout-threshold",
+            "lockout-duration-seconds"
+        ],
         "{catalog}"
     );
 
@@ -110,13 +114,24 @@ fn test_policy_lifecycle_over_graphql() {
         json!({"n": "Hours", "i": [{"key": "nope", "value": "1"}]}),
     );
     assert!(has_error(&bad, "Unknown policy item"), "{bad}");
+    let old = gql(
+        &client,
+        &url,
+        &admin,
+        CREATE,
+        json!({"n": "Hours", "i": [{"key": "require-mfa", "value": "always"}]}),
+    );
+    assert!(
+        has_error(&old, "'require-mfa' is now 'enable-mfa'"),
+        "{old}"
+    );
 
     let created = gql(
         &client,
         &url,
         &admin,
         CREATE,
-        json!({"n": "Hours", "i": [{"key": "require-mfa", "value": "off"}]}),
+        json!({"n": "Hours", "i": [{"key": "enable-mfa", "value": "off"}]}),
     );
     let root_id = created["data"]["createPolicy"]["id"].as_i64().expect("id") as i32;
     let dup = gql(
@@ -133,7 +148,7 @@ fn test_policy_lifecycle_over_graphql() {
         &url,
         &admin,
         CREATE,
-        json!({"n": "Labs", "i": [{"key": "require-mfa", "value": "always"}]}),
+        json!({"n": "Labs", "i": [{"key": "enable-mfa", "value": "always"}]}),
     );
     let leaf_id = leaf["data"]["createPolicy"]["id"].as_i64().expect("leaf") as i32;
 
@@ -172,7 +187,7 @@ fn test_policy_lifecycle_over_graphql() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|i| i["key"] == "require-mfa")
+        .find(|i| i["key"] == "enable-mfa")
         .unwrap();
     assert_eq!(require["value"], "always", "{effective}");
     assert_eq!(require["sourceOu"], "people\\labs", "{effective}");
@@ -183,7 +198,7 @@ fn test_policy_lifecycle_over_graphql() {
         &url,
         &admin,
         CREATE,
-        json!({"n": "Labs2", "i": [{"key": "require-mfa", "value": "enrolled"}]}),
+        json!({"n": "Labs2", "i": [{"key": "enable-mfa", "value": "enabled"}]}),
     );
     let replace_id = replace["data"]["createPolicy"]["id"].as_i64().unwrap() as i32;
     assert_eq!(
@@ -207,9 +222,9 @@ fn test_policy_lifecycle_over_graphql() {
         .as_array()
         .unwrap()
         .iter()
-        .find(|i| i["key"] == "require-mfa")
+        .find(|i| i["key"] == "enable-mfa")
         .unwrap();
-    assert_eq!(require["value"], "enrolled", "{effective}");
+    assert_eq!(require["value"], "enabled", "{effective}");
 
     assert_eq!(
         gql(

@@ -1,5 +1,6 @@
 query OwnMfa($id: String!) {
   user(userId: $id) {
     mfaEnrolled
+    mfaMode
   }
 }

@@ -1,8 +1,9 @@
 use crate::{
     components::{
         form::submit::Submit,
-        register_mfa::has_combined_shape,
+        register_mfa::{OwnMfa, has_combined_shape, own_mfa},
         router::{AppRoute, Link},
+        user_details::blocks_own_reset,
     },
     infra::{
         api::{HostService, LoginOutcome},
@@ -57,6 +58,7 @@ pub enum Msg {
     AuthenticationStartResponse(Result<Box<login::ServerLoginStartResponse>>),
     LoginFinishResponse(Result<LoginOutcome>),
     ResetResponse(Result<reset_own_mfa::ResponseData>),
+    ModeLoaded(Result<own_mfa::ResponseData>),
 }
 
 impl CommonComponent<ResetOwnMfaForm> for ResetOwnMfaForm {
@@ -130,6 +132,14 @@ impl CommonComponent<ResetOwnMfaForm> for ResetOwnMfaForm {
                 });
                 Ok(true)
             }
+            Msg::ModeLoaded(res) => {
+                if blocks_own_reset(true, res?.user.mfa_mode.as_deref()) {
+                    ctx.link().history().unwrap().push(AppRoute::UserDetails {
+                        user_id: ctx.props().username.clone(),
+                    });
+                }
+                Ok(false)
+            }
         }
     }
 
@@ -142,13 +152,22 @@ impl Component for ResetOwnMfaForm {
     type Message = Msg;
     type Properties = Props;
 
-    fn create(_: &Context<Self>) -> Self {
-        ResetOwnMfaForm {
+    fn create(ctx: &Context<Self>) -> Self {
+        let mut form = ResetOwnMfaForm {
             common: CommonComponentParts::<Self>::create(),
             form: Form::<FormModel>::new(FormModel::default()),
             opaque_data: None,
             pending_code: None,
-        }
+        };
+        form.common.call_graphql::<OwnMfa, _>(
+            ctx,
+            own_mfa::Variables {
+                id: ctx.props().username.clone(),
+            },
+            Msg::ModeLoaded,
+            "Error reading two-factor status",
+        );
+        form
     }
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {

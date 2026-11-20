@@ -23,7 +23,7 @@ use lldap_domain_handlers::handler::{
 use lldap_domain_handlers::logging::{
     LogActivity, LogBucket, LogCursor, LogDimension, LogFilter, LogKind, LogRecord,
 };
-use lldap_domain_handlers::mfa::{MfaRequirement, MfaResetReason};
+use lldap_domain_handlers::mfa::{MfaPolicy, MfaRequirement, MfaResetReason};
 use lldap_domain_handlers::policies::{
     CreatePolicyRequest, OuPolicyState, Policy, PolicyId, PolicyLevel, UpdatePolicyRequest,
 };
@@ -85,6 +85,8 @@ mockall::mock! {
     #[async_trait]
     impl MfaBackendHandler for TestBackendHandler {
         async fn mfa_requirement(&self, user_id: &UserId) -> Result<MfaRequirement>;
+        async fn enrollment_pending(&self, user_id: &UserId) -> Result<bool>;
+        async fn mfa_mode(&self, user_id: &UserId) -> Result<MfaPolicy>;
         async fn start_totp_enrollment(&self, user_id: &UserId, current_code: Option<String>, enrollment_proof: Option<String>) -> Result<TotpEnrollmentStart>;
         async fn seal_enrollment_proof(&self, user_id: &UserId) -> Result<Option<String>>;
         async fn finish_totp_enrollment(&self, user_id: &UserId, state: &str, code: &str) -> Result<()>;

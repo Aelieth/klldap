@@ -3513,7 +3513,7 @@ async fn policy_store_lane(pool: &DbConnection) {
         .create_policy(CreatePolicyRequest {
             name: "Lane Base".to_owned(),
             description: "lane".to_owned(),
-            items: items(&[("require-mfa", "always"), ("lockout-threshold", "5")]),
+            items: items(&[("enable-mfa", "always"), ("lockout-threshold", "5")]),
         })
         .await
         .expect("create base");
@@ -3536,7 +3536,7 @@ async fn policy_store_lane(pool: &DbConnection) {
     assert_eq!(names, vec!["Lane Base".to_owned(), "Lane Other".to_owned()]);
     assert_eq!(
         handler.get_policy(base).await.expect("get").items,
-        items(&[("lockout-threshold", "5"), ("require-mfa", "always")])
+        items(&[("enable-mfa", "always"), ("lockout-threshold", "5")])
     );
     assert!(
         handler
@@ -3904,4 +3904,91 @@ async fn test_mysql_a_finish_waits_for_one_held_open_then_is_stale() {
         return;
     };
     crate::sql_mfa_handler::tests::finish_held_lane(&pool).await;
+}
+
+async fn renamed_items_lane(pool: &DbConnection) {
+    init_table(pool).await.expect("fresh init");
+    let backend = pool.get_database_backend();
+    let stored = [
+        ("Old", r#"{"require-mfa":"enrolled"}"#),
+        (
+            "Strict",
+            r#"{"lockout-threshold":"3","require-mfa":"always"}"#,
+        ),
+        ("Both", r#"{"enable-mfa":"off","require-mfa":"always"}"#),
+        ("New", r#"{"enable-mfa":"always"}"#),
+        ("Junk", "not json"),
+    ];
+    for (name, items) in stored {
+        let insert = Query::insert()
+            .into_table(Policies::Table)
+            .columns([
+                Policies::Name,
+                Policies::LowercaseName,
+                Policies::Description,
+                Policies::Items,
+            ])
+            .values_panic([
+                name.into(),
+                name.to_lowercase().into(),
+                "".into(),
+                items.into(),
+            ])
+            .to_owned();
+        pool.execute(backend.build(&insert)).await.expect("insert");
+    }
+    let read = async || {
+        let select = Query::select()
+            .columns([Policies::Name, Policies::Items])
+            .from(Policies::Table)
+            .order_by(Policies::Name, Order::Asc)
+            .to_owned();
+        let rows = pool.query_all(backend.build(&select)).await.expect("read");
+        rows.iter()
+            .map(|row| {
+                let name: String = row.try_get("", "name").unwrap();
+                let items: String = row.try_get("", "items").unwrap();
+                (name, items)
+            })
+            .collect::<Vec<_>>()
+    };
+    let carried = vec![
+        ("Both".to_owned(), r#"{"enable-mfa":"off"}"#.to_owned()),
+        ("Junk".to_owned(), "not json".to_owned()),
+        ("New".to_owned(), r#"{"enable-mfa":"always"}"#.to_owned()),
+        ("Old".to_owned(), r#"{"enable-mfa":"enabled"}"#.to_owned()),
+        (
+            "Strict".to_owned(),
+            r#"{"enable-mfa":"always","lockout-threshold":"3"}"#.to_owned(),
+        ),
+    ];
+    for run in ["first", "second"] {
+        ensure_v13_additions(pool).await.expect("v13 additions");
+        assert_eq!(read().await, carried, "{run} start");
+    }
+}
+
+#[tokio::test]
+async fn test_a_stored_require_mfa_is_carried_over_to_enable_mfa_once() {
+    renamed_items_lane(&get_in_memory_db().await).await;
+}
+
+#[tokio::test]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_carries_require_mfa_over_to_enable_mfa_once() {
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres().await else {
+        return;
+    };
+    renamed_items_lane(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_carries_require_mfa_over_to_enable_mfa_once() {
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql().await else {
+        return;
+    };
+    renamed_items_lane(&pool).await;
 }

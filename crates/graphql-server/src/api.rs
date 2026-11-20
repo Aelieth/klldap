@@ -20,8 +20,10 @@ impl<T: BackendHandler + OpaqueHandler> FullHandler for T {}
 pub struct Context<Handler: FullHandler> {
     pub handler: AccessControlledBackendHandler<Handler>,
     pub validation_result: ValidationResults,
+    /// The actor's resolved `enable_mfa`.
     pub mfa_policy: MfaPolicy,
     pub mfa_enrollment_pending: bool,
+    pub mfa_group_protected: bool,
     pub keycloak: Arc<KeycloakSettings>,
 }
 
@@ -54,6 +56,7 @@ impl<Handler: FullHandler> Context<Handler> {
             validation_result,
             mfa_policy,
             mfa_enrollment_pending,
+            mfa_group_protected: mfa_policy != MfaPolicy::Disabled,
             keycloak: Arc::new(KeycloakSettings {
                 base_dn: "dc=example,dc=com".into(),
                 config_file: std::path::PathBuf::from("/data/keycloak_config.toml"),
@@ -127,7 +130,7 @@ impl<Handler: FullHandler> Context<Handler> {
     pub fn reject_if_mfa_disabled(&self, span: &tracing::Span) -> FieldResult<()> {
         if self.mfa_policy == MfaPolicy::Disabled {
             span.in_scope(|| debug!("MFA disabled"));
-            return Err("MFA is disabled by the server configuration".into());
+            return Err("MFA is disabled for this user".into());
         }
         Ok(())
     }

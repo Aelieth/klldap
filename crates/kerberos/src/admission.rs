@@ -267,17 +267,22 @@ pub(crate) mod tests {
     use lldap_auth::opaque::server::generate_random_private_key;
     use lldap_domain::requests::CreateUserRequest;
     use lldap_domain::types::Attribute;
+    use lldap_domain_handlers::enforcement::cached_mfa_policy;
     use lldap_domain_handlers::enforcement::{Entries, fill_policy_cache, start_policy_cache};
     use lldap_domain_handlers::handler::{PolicyBackendHandler, UserBackendHandler};
     use lldap_domain_handlers::kerberos::KerberosSync;
     use lldap_domain_handlers::logging::Protocol;
+    use lldap_domain_handlers::mfa::{ENABLE_MFA, MfaPolicy};
     use lldap_domain_handlers::policies::{CreatePolicyRequest, EffectiveItem, PolicyScope};
     use lldap_sql_backend_handler::SqlBackendHandler;
     use lldap_sql_backend_handler::sql_tables::init_table;
     use lldap_test_utils::enforcement::EnforcementGuard;
     use lldap_test_utils::recording_log::LogGuard;
     use pretty_assertions::assert_eq;
-    use sea_orm::{ConnectOptions, Database, DatabaseConnection, TransactionTrait};
+    use sea_orm::{
+        ConnectOptions, ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement,
+        TransactionTrait,
+    };
     use serial_test::serial;
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -641,14 +646,14 @@ pub(crate) mod tests {
         let request = CreatePolicyRequest {
             name: "Strict".to_owned(),
             description: String::new(),
-            items: [("require-mfa".to_owned(), "always".to_owned())].into(),
+            items: [("enable-mfa".to_owned(), "always".to_owned())].into(),
         };
         let id = handler.create_policy(request).await.unwrap();
         handler.set_ou_policy("people\\labs", id).await.unwrap();
     }
 
     fn strict() -> EnforcementGuard {
-        EnforcementGuard::deciding(OURS, "require-mfa", |value| value != "always")
+        EnforcementGuard::deciding(OURS, "enable-mfa", |value| value != "always")
     }
 
     #[test]
@@ -1193,6 +1198,63 @@ pub(crate) mod tests {
             !Door::KerberosS4u.is_login(),
             "an S4U2Self counts no attempt"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_under_the_default_checks_always_takes_no_ticket_at_as_tgs_or_s4u2self() {
+        let (bare, enrolled) = (REFUSED_USER, ALLOWED_USER);
+        let (temp, _embedded, store) = realm(&[bare, enrolled]).await;
+        let svc = service(&temp, &store);
+        let cache: &'static PolicyCache = Box::leak(Box::new(PolicyCache::new()));
+        let counter: &'static Lockout = Box::leak(Box::default());
+        let pool = memory_pool().await;
+        let handler = SqlBackendHandler::new(generate_random_private_key(), pool.clone());
+        let handler = handler.with_lockout(counter).with_policy_cache(cache);
+        for user in [bare, enrolled] {
+            directory_user(&handler, user, "people\\labs").await;
+        }
+        let enrol = format!("UPDATE users SET mfa_type = 'totp' WHERE user_id = '{enrolled}'");
+        let enrol = Statement::from_string(DbBackend::Sqlite, enrol);
+        pool.execute(enrol).await.unwrap();
+        strict_labs(&handler).await;
+        let verdict = Arc::new(KdcVerdict::on(REALM, cache, counter));
+        store
+            .write()
+            .unwrap()
+            .policy
+            .plugins
+            .set_host_admission(verdict);
+        let registered: Vec<_> = item_checks().iter().map(|check| check.key()).collect();
+        assert_eq!(registered, [THRESHOLD, ENABLE_MFA], "the default checks");
+        let entries = cache.get();
+        let resolved = |user: &str| {
+            let user = UserId::new(user);
+            let enrolled = entries.facts.get(&user).map(|facts| facts.enrolled);
+            (cached_mfa_policy(cache, &entries, &user), enrolled)
+        };
+        assert_eq!(
+            [bare, enrolled].map(resolved),
+            [
+                (Some(MfaPolicy::Always), Some(false)),
+                (Some(MfaPolicy::Always), Some(true))
+            ],
+            "resolved always from memory, one enrolled and one not"
+        );
+        let log = LogGuard::install_on_this_thread();
+        for user in [bare, enrolled] {
+            let as_code = kinit(&store, user, Some(PASSWORD)).0;
+            let tgt = issue_tgt(&store, user);
+            let tgs = service_ticket(&store, &tgt, user, &svc).is_ok();
+            let s4u = s4u2self(&store, &svc, user, false).is_ok();
+            assert_eq!(
+                (as_code, tgs, s4u),
+                (0, true, true),
+                "{user}: a ticket at each"
+            );
+        }
+        let refusals = kdc_rows(&log).into_iter().filter(|row| !row.1);
+        assert_eq!(refusals.count(), 0, "no refusal row at any Kerberos door");
     }
 
     #[tokio::test]

@@ -23,7 +23,7 @@ use lldap_auth::{
     login, password_reset, registration,
 };
 use lldap_domain::types::{GroupDetails, GroupName, LoginOutcome, UserId, kerberos_sync_enabled};
-use lldap_domain_handlers::enforcement::{Attempt, Door, admit};
+use lldap_domain_handlers::enforcement::{Attempt, Door, admit, refuse_unreadable};
 use lldap_domain_handlers::handler::{
     BackendHandler, BindRequest, LoginHandler, MfaBackendHandler, UserRequestFilter,
 };
@@ -32,7 +32,7 @@ use lldap_domain_handlers::kerberos::{
     while_disabled,
 };
 use lldap_domain_handlers::logging::{self, LogKind, with_actor};
-use lldap_domain_handlers::mfa::{MfaRequirement, MfaResetReason};
+use lldap_domain_handlers::mfa::{MfaPolicy, MfaRequirement, MfaResetReason};
 use lldap_domain_handlers::password::{
     PasswordChangeError, finish_plain, finish_synced_registration, realm_not_ready, record_failed,
 };
@@ -168,8 +168,14 @@ where
     }
     let handler = data.backend_handler.unsafe_get_handler();
     admit_refresh(handler, &user).await?;
-    let mfa_enrollment_pending =
-        data.get_mfa_handler().mfa_requirement(&user).await? == MfaRequirement::Enrollment;
+    let mfa = data.get_mfa_handler();
+    let mfa_enrollment_pending = match mfa.mfa_requirement(&user).await {
+        Ok(requirement) => requirement == MfaRequirement::Enrollment,
+        Err(e) => {
+            mfa_unreadable(&user, Door::Refresh, &e);
+            return Err(refresh_refused(&user));
+        }
+    };
     let token = create_jwt(data.get_tcp_handler(), jwt_key, &user, groups, false).await;
     logging::record_as(Some(&user), LogKind::TokenRefresh, None, true, None);
     Ok(HttpResponse::Ok()
@@ -1018,11 +1024,35 @@ const ACCESS_REFUSED: &str = "Access refused";
 async fn admit_refresh<H: BackendHandler + ?Sized>(handler: &H, user: &UserId) -> TcpResult<()> {
     admit(handler, &Attempt::new(user, Door::Refresh))
         .await
-        .map_err(|_| {
-            TcpError::DomainError(DomainError::AuthenticationError(format!(
-                r#"for user "{user}""#
-            )))
-        })
+        .map_err(|_| refresh_refused(user))
+}
+
+fn refresh_refused(user: &UserId) -> TcpError {
+    TcpError::DomainError(DomainError::AuthenticationError(format!(
+        r#"for user "{user}""#
+    )))
+}
+
+fn mfa_unreadable(user: &UserId, door: Door, e: &DomainError) {
+    warn!(r#"The OU policy of "{user}" could not be read for enable-mfa at {door:?}: {e}"#);
+    refuse_unreadable(user, door);
+}
+
+/// The session's value and its hold to enrolment; one that cannot be read refuses with its row.
+pub(crate) async fn session_mfa<Backend: MfaBackendHandler>(
+    state: &AppState<Backend>,
+    user: &UserId,
+) -> Result<(MfaPolicy, bool), actix_web::Error> {
+    let mfa = state.get_mfa_handler();
+    let read = async {
+        let policy = mfa.mfa_mode(user).await?;
+        let pending = policy == MfaPolicy::Always && mfa.enrollment_pending(user).await?;
+        Ok::<_, DomainError>((policy, pending))
+    };
+    read.await.map_err(|e| {
+        mfa_unreadable(user, Door::TokenUse, &e);
+        ErrorUnauthorized(ACCESS_REFUSED)
+    })
 }
 
 async fn admit_token_use<H: BackendHandler + ?Sized>(
@@ -1722,7 +1752,7 @@ pub(crate) mod tests {
             mail_options: crate::configuration::MailOptionsBuilder::default()
                 .build()
                 .unwrap(),
-            mfa_policy: lldap_domain_handlers::mfa::MfaPolicy::Disabled,
+            mfa_policy: None,
             domain: "example.com".to_owned(),
             keycloak: std::sync::Arc::new(lldap_keycloak::KeycloakSettings {
                 base_dn: "dc=example,dc=com".to_owned(),
@@ -2349,6 +2379,58 @@ pub(crate) mod tests {
                     "{label}"
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_an_unreadable_mfa_value_refuses_the_refresh_and_the_token_with_one_row() {
+        use lldap_test_utils::recording_log::LogGuard;
+        let _backend = ONE_BACKEND.lock().await;
+        let log = LogGuard::install_on_this_thread();
+        let _guard = EnforcementGuard::none();
+        let user = UserId::new("e2http");
+        for (n, door) in [Door::Refresh, Door::TokenUse].into_iter().enumerate() {
+            let unreadable = || DomainError::InternalError("not read yet".to_owned());
+            let mut mock = MockTestBackendHandler::new();
+            mock.expect_get_user_groups()
+                .returning(|_| Ok(HashSet::new()));
+            mock.expect_mfa_requirement()
+                .returning(move |_| Err(unreadable()));
+            mock.expect_mfa_mode().returning(move |_| Err(unreadable()));
+            let state = app_state(mock);
+            let peer = format!("192.0.2.{}", 60 + n);
+            let meta = RequestMeta::http(Some(peer.parse().unwrap()), None);
+            let status = with_request(meta, async {
+                if door == Door::Refresh {
+                    let request = actix_web::test::TestRequest::get()
+                        .insert_header(("refresh-token", "e2-refresh+e2http"))
+                        .to_http_request();
+                    return get_refresh_handler(state, request).await.status().as_u16();
+                }
+                match session_mfa(&state, &user).await {
+                    Ok(_) => 200,
+                    Err(e) => e.as_response_error().status_code().as_u16(),
+                }
+            })
+            .await;
+            let rows: Vec<_> = log
+                .recorder()
+                .take_events()
+                .into_iter()
+                .filter(|e| e.peer.as_deref() == Some(peer.as_str()))
+                .map(|e| (e.kind, e.success, e.target, e.detail))
+                .collect();
+            let refused = (
+                door.log_kind(),
+                false,
+                Some("e2http".to_owned()),
+                Some("policy: unreadable".to_owned()),
+            );
+            assert_eq!(
+                (status, rows),
+                (401, vec![refused]),
+                "{door:?}: a refusal with its one row, not a 500"
+            );
         }
     }
 

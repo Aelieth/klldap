@@ -690,3 +690,80 @@ fn test_mfa_always_gates_api_and_doors() {
     let body = gql(&client, &url, &admin, RESET_USER, json!({"u": admin_name}));
     assert!(has_error(&body, "Cannot reset your own MFA"), "{body}");
 }
+
+#[test]
+fn test_enrolment_and_ones_own_reset_follow_each_users_resolved_value() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let db_url = format!("sqlite://{}/users.db?mode=rwc", dir.path().display());
+    let server = server_with_env(&db_url, &[]);
+    let client = client();
+    let url = server.http_url();
+    let (admin_name, admin_pass) = (env::admin_dn(), env::admin_password());
+    let admin = get_token(&client, &url);
+    let ou_policy = |ou: &str, value: &str| {
+        let query = "mutation($n: String!) { createOu(name: $n) { ok } }";
+        let created = gql(&client, &url, &admin, query, json!({"n": ou}));
+        assert_eq!(created["data"]["createOu"]["ok"], true, "{created}");
+        let query = "mutation($n: String!, $i: [PolicyItemInput!]) { createPolicy(name: $n, items: $i) { id } }";
+        let items = json!([{"key": "enable-mfa", "value": value}]);
+        let policy = gql(&client, &url, &admin, query, json!({"n": ou, "i": items}));
+        let query = "mutation($o: String!, $p: Int!) { setOuPolicy(ou: $o, policyId: $p) { ok } }";
+        let id = policy["data"]["createPolicy"]["id"].clone();
+        let linked = gql(&client, &url, &admin, query, json!({"o": ou, "p": id}));
+        assert_eq!(linked["data"]["setOuPolicy"]["ok"], true, "{linked}");
+    };
+    let move_to = |users: &[&str], ou: &str| {
+        let query =
+            "mutation($u: [String!]!, $o: String!) { changeUserOu(userIds: $u, newOu: $o) { ok } }";
+        let moved = gql(&client, &url, &admin, query, json!({"u": users, "o": ou}));
+        assert_eq!(moved["data"]["changeUserOu"]["ok"], true, "{moved}");
+    };
+    let mode = |token: &str, user: &str| {
+        let query = "query($u: String!) { user(userId: $u) { mfaMode } }";
+        gql(&client, &url, token, query, json!({"u": user}))["data"]["user"]["mfaMode"].clone()
+    };
+    ou_policy("open", "enabled");
+    ou_policy("strict", "always");
+    for user in ["bob", "kim", "sam"] {
+        create_user(&client, &url, &admin, user);
+        set_password(&client, &url, &admin, user, &format!("{user}pass1"));
+    }
+    move_to(&["bob", "kim", admin_name.as_str()], "open");
+    let bob = get_token_for(&client, &url, "bob", "bobpass1");
+    let kim = get_token_for(&client, &url, "kim", "kimpass1");
+    let sam = get_token_for(&client, &url, "sam", "sampass1");
+    let settings = settings(&client, &url);
+    assert_eq!(
+        (&settings["mfa_enabled"], &settings["mfa_server_wide"]),
+        (&json!(true), &Value::Null),
+        "an OU turns it on, nothing is set server-wide: {settings}"
+    );
+
+    let body = start_enrollment(&client, &url, &sam, None, None);
+    assert!(has_error(&body, "MFA is disabled for this user"), "{body}");
+    assert_eq!(mode(&sam, "sam"), "off");
+    let bob_secret = enroll(&client, &url, &bob, "bob", "bobpass1");
+    let kim_secret = enroll(&client, &url, &kim, "kim", "kimpass1");
+    enroll(&client, &url, &admin, &admin_name, &admin_pass);
+    move_to(&["bob", admin_name.as_str()], "strict");
+    assert_eq!(
+        (mode(&bob, "bob"), mode(&kim, "kim"), mode(&bob, "kim")),
+        (json!("always"), json!("enabled"), Value::Null),
+        "each user's own value, told to their own page only"
+    );
+
+    let (_, next) = fresh_codes(&bob_secret);
+    let body = gql(&client, &url, &bob, RESET_OWN, json!({"c": next}));
+    assert!(has_error(&body, "MFA is required"), "{body}");
+    let body = gql(&client, &url, &admin, RESET_USER, json!({"u": admin_name}));
+    assert!(has_error(&body, "Cannot reset your own MFA"), "{body}");
+    assert_eq!(mfa_enrolled(&client, &url, &admin, "bob"), true);
+    let (_, next) = fresh_codes(&kim_secret);
+    let body = gql(&client, &url, &kim, RESET_OWN, json!({"c": next}));
+    assert_eq!(body["data"]["resetOwnMfa"]["ok"], true, "enabled: {body}");
+    let body = gql(&client, &url, &admin, RESET_USER, json!({"u": "bob"}));
+    assert_eq!(
+        body["data"]["resetUserMfa"]["ok"], true,
+        "another user's: {body}"
+    );
+}

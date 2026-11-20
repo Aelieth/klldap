@@ -16,9 +16,11 @@ pub(super) async fn reset_user_mfa<Handler: FullHandler + OpaqueHandler>(
     span.in_scope(|| debug!(?user_id));
     let user_id = UserId::new(&user_id);
     if context.mfa_policy == MfaPolicy::Always && user_id == context.validation_result.user {
-        return Err(
-            "Cannot reset your own MFA when it is required by the server configuration".into(),
-        );
+        return Err(concat!(
+            "Cannot reset your own MFA when it is required by the server configuration ",
+            "or your OU's policy"
+        )
+        .into());
     }
     let user_is_admin = context
         .get_readable_handler(user_id.clone())
@@ -44,7 +46,7 @@ pub(super) async fn reset_own_mfa<Handler: FullHandler + OpaqueHandler>(
     span.in_scope(|| debug!(?user_id));
     context.reject_if_mfa_disabled(&span)?;
     if context.mfa_policy == MfaPolicy::Always {
-        return Err("MFA is required by the server configuration".into());
+        return Err("MFA is required by the server configuration or your OU's policy".into());
     }
     context
         .get_mfa_self_handler()

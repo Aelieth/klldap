@@ -560,6 +560,8 @@ type User {
   isDisabled: Boolean!
   "Whether the user has a second factor enrolled (admin or self)."
   mfaEnrolled: Boolean
+  "The user's resolved enable_mfa: off, enabled or always (self)."
+  mfaMode: String
   "User-defined attributes, including ou and sshpublickey for legacy clients."
   attributes: [AttributeValue!]!
   "The groups to which this user belongs."

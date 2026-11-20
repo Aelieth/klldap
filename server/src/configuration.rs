@@ -1,7 +1,7 @@
 use crate::{
     cli::{
-        GeneralConfigOpts, HealthcheckOpts, LdapsOpts, LogOpts, RunOpts, SmtpEncryption, SmtpOpts,
-        TestEmailOpts, TrueFalseAlways, UnlockOpts,
+        GeneralConfigOpts, HealthcheckOpts, LdapsOpts, LogOpts, OffEnabledAlways, RunOpts,
+        SmtpEncryption, SmtpOpts, TestEmailOpts, TrueFalseAlways, UnlockOpts,
     },
     database_string::DatabaseUrl,
 };
@@ -285,7 +285,7 @@ pub struct Configuration {
     #[builder(default = "false")]
     pub force_update_private_key: bool,
     #[builder(default)]
-    pub enable_mfa: TrueFalseAlways,
+    pub enable_mfa: Option<OffEnabledAlways>,
     #[builder(default = r#"DatabaseUrl::from("sqlite://users.db?mode=rwc")"#)]
     pub database_url: DatabaseUrl,
     #[builder(default)]
@@ -374,12 +374,13 @@ impl Configuration {
         )
     }
 
-    pub fn mfa_policy(&self) -> MfaPolicy {
-        match self.enable_mfa {
-            TrueFalseAlways::False => MfaPolicy::Disabled,
-            TrueFalseAlways::True => MfaPolicy::Enrolled,
-            TrueFalseAlways::Always => MfaPolicy::Always,
-        }
+    /// The explicit server-wide value: present in the file, the environment or the command line.
+    pub fn mfa_policy(&self) -> Option<MfaPolicy> {
+        self.enable_mfa.map(|value| match value {
+            OffEnabledAlways::Off => MfaPolicy::Disabled,
+            OffEnabledAlways::Enabled => MfaPolicy::Enrolled,
+            OffEnabledAlways::Always => MfaPolicy::Always,
+        })
     }
 
     pub fn get_private_key_info(&self) -> PrivateKeyInfo {
@@ -665,7 +666,7 @@ impl ConfigOverrider for RunOpts {
             });
 
         self.enable_mfa
-            .inspect(|&enable_mfa| config.enable_mfa = enable_mfa);
+            .inspect(|&enable_mfa| config.enable_mfa = Some(enable_mfa));
 
         self.smtp_opts.override_config(config);
         self.ldaps_opts.override_config(config);
@@ -1429,7 +1430,7 @@ mod tests {
             assert_eq!(config.log_options.retention_days, 30);
             assert_eq!(config.log_options.max_entries, 50000);
             assert_eq!(config.log_options.bind_coalesce_seconds, 300);
-            assert_eq!(config.mfa_policy(), MfaPolicy::Disabled);
+            assert_eq!(config.mfa_policy(), None);
 
             jail.create_file(
                 "lldap_config.toml",
@@ -1439,27 +1440,86 @@ mod tests {
             assert_eq!(config.log_options.retention_days, 5);
             assert_eq!(config.log_options.max_entries, 7);
             assert_eq!(config.log_options.bind_coalesce_seconds, 9);
-            assert_eq!(config.mfa_policy(), MfaPolicy::Enrolled);
+            assert_eq!(config.mfa_policy(), Some(MfaPolicy::Enrolled));
 
             jail.set_env("LLDAP_LOG_OPTIONS__RETENTION_DAYS", "90");
             jail.set_env("LLDAP_ENABLE_MFA", "always");
             let config = init(default_run_opts()).unwrap();
             assert_eq!(config.log_options.retention_days, 90);
             assert_eq!(config.log_options.max_entries, 7);
-            assert_eq!(config.mfa_policy(), MfaPolicy::Always);
+            assert_eq!(config.mfa_policy(), Some(MfaPolicy::Always));
 
             let mut opts = default_run_opts();
             opts.log_opts.log_persist = Some(false);
             opts.log_opts.log_bind_coalesce_seconds = Some(0);
-            opts.enable_mfa = Some(TrueFalseAlways::False);
+            opts.enable_mfa = Some(OffEnabledAlways::Off);
             let config = init(opts).unwrap();
             assert!(!config.log_options.persist);
             assert_eq!(config.log_options.retention_days, 90);
             assert_eq!(config.log_options.max_entries, 7);
             assert_eq!(config.log_options.bind_coalesce_seconds, 0);
-            assert_eq!(config.mfa_policy(), MfaPolicy::Disabled);
+            assert_eq!(config.mfa_policy(), Some(MfaPolicy::Disabled));
             Ok(())
         });
+    }
+
+    #[test]
+    fn test_enable_mfa_is_explicit_only_where_written_and_takes_both_spellings() {
+        type Row = (&'static str, Option<&'static str>, Option<MfaPolicy>);
+        let rows: [Row; 12] = [
+            ("", None, None),
+            ("# enable_mfa = false\n", None, None),
+            ("enable_mfa = false\n", None, Some(MfaPolicy::Disabled)),
+            ("enable_mfa = true\n", None, Some(MfaPolicy::Enrolled)),
+            ("enable_mfa = \"always\"\n", None, Some(MfaPolicy::Always)),
+            ("enable_mfa = \"off\"\n", None, Some(MfaPolicy::Disabled)),
+            (
+                "enable_mfa = \"enabled\"\n",
+                None,
+                Some(MfaPolicy::Enrolled),
+            ),
+            ("enable_mfa = \"Always\"\n", None, Some(MfaPolicy::Always)),
+            ("", Some("false"), Some(MfaPolicy::Disabled)),
+            ("", Some("enabled"), Some(MfaPolicy::Enrolled)),
+            ("", Some("off"), Some(MfaPolicy::Disabled)),
+            (
+                "enable_mfa = \"always\"\n",
+                Some("true"),
+                Some(MfaPolicy::Enrolled),
+            ),
+        ];
+        for (file, env, expected) in rows {
+            Jail::expect_with(|jail| {
+                jail.clear_env();
+                jail.set_env("LLDAP_JWT_SECRET", "secret");
+                jail.create_file("lldap_config.toml", file)?;
+                if let Some(env) = env {
+                    jail.set_env("LLDAP_ENABLE_MFA", env);
+                }
+                let config = init(default_run_opts()).unwrap();
+                assert_eq!(config.mfa_policy(), expected, "{file:?} {env:?}");
+                Ok(())
+            });
+        }
+        for (flag, expected) in [
+            ("off", MfaPolicy::Disabled),
+            ("false", MfaPolicy::Disabled),
+            ("enabled", MfaPolicy::Enrolled),
+            ("true", MfaPolicy::Enrolled),
+            ("always", MfaPolicy::Always),
+        ] {
+            let parsed: OffEnabledAlways = flag.parse().unwrap();
+            let mut opts = default_run_opts();
+            opts.enable_mfa = Some(parsed);
+            Jail::expect_with(|jail| {
+                jail.clear_env();
+                jail.set_env("LLDAP_JWT_SECRET", "secret");
+                let config = init(opts.clone()).unwrap();
+                assert_eq!(config.mfa_policy(), Some(expected), "--enable-mfa {flag}");
+                Ok(())
+            });
+        }
+        assert!("sometimes".parse::<OffEnabledAlways>().is_err());
     }
 
     #[test]

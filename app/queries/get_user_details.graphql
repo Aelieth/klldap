@@ -7,6 +7,7 @@ query GetUserDetails($id: String!) {
     creationDate
     uuid
     mfaEnrolled
+    mfaMode
     groups {
       id
       displayName

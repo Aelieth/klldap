@@ -7,7 +7,8 @@ use lldap_access_control::UserReadableBackendHandler;
 use lldap_domain::types::{
     MFA_TYPE_TOTP, User as DomainUser, UserAndGroups as DomainUserAndGroups,
 };
-use lldap_domain_handlers::handler::BackendHandler;
+use lldap_domain_handlers::handler::{BackendHandler, MfaBackendHandler};
+use lldap_domain_handlers::mfa::MfaPolicy;
 use lldap_opaque_handler::OpaqueHandler;
 use lldap_schema::PublicSchema;
 use serde::{Deserialize, Serialize};
@@ -151,6 +152,16 @@ impl<Handler: BackendHandler + OpaqueHandler> User<Handler> {
         (context.validation_result.is_admin()
             || context.validation_result.user == self.user.user_id)
             .then(|| self.user.mfa_type.as_deref() == Some(MFA_TYPE_TOTP))
+    }
+
+    /// The user's resolved enable_mfa: off, enabled or always (self).
+    async fn mfa_mode(&self, context: &Context<Handler>) -> Option<String> {
+        let user = &self.user.user_id;
+        if context.validation_result.user != *user {
+            return None;
+        }
+        let mode = context.get_mfa_self_handler().mfa_mode(user).await;
+        Some(mode.unwrap_or(MfaPolicy::Always).item().to_owned())
     }
 
     /// User-defined attributes, including ou and sshpublickey for legacy clients.

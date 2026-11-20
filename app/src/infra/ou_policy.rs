@@ -157,7 +157,11 @@ pub struct CatalogText {
 /// key and the server-supplied description.
 pub fn catalog_text(key: &str) -> Option<CatalogText> {
     let (label, help, placeholder) = match key {
-        "require-mfa" => ("Require MFA", "Must users show a TOTP code to log in?", ""),
+        "enable-mfa" => (
+            "Enable MFA",
+            "Must users show a TOTP code to log in? off, enabled (who enrolled), always",
+            "",
+        ),
         "lockout-threshold" => ("Failed logins before lockout", "0 turns lockout off", ""),
         "lockout-duration-seconds" => (
             "Lockout duration (seconds)",
@@ -378,7 +382,7 @@ mod tests {
 
     #[test]
     fn test_catalog_text() {
-        assert_eq!(catalog_text("require-mfa").unwrap().label, "Require MFA");
+        assert_eq!(catalog_text("enable-mfa").unwrap().label, "Enable MFA");
         assert_eq!(
             catalog_text("login-hours").unwrap().placeholder,
             "mon-fri 08:00-18:00"
@@ -389,7 +393,7 @@ mod tests {
     #[test]
     fn test_format_item_value() {
         for (name, key, value, expected) in [
-            ("mfa token verbatim", "require-mfa", "always", "always"),
+            ("mfa token verbatim", "enable-mfa", "always", "always"),
             ("empty hours mean always", "login-hours", "", "always"),
             (
                 "set hours verbatim",
@@ -444,7 +448,7 @@ mod tests {
         let ok = validate_draft_items(
             "  Front Desk  ",
             &[
-                entry("require-mfa", true, "always", None),
+                entry("enable-mfa", true, "always", None),
                 entry("lockout-threshold", true, " 7 ", Some((0, 100))),
                 entry("login-hours", false, "garbage everywhere", None),
             ],
@@ -453,13 +457,13 @@ mod tests {
         assert_eq!(
             ok,
             vec![
-                ("require-mfa".to_owned(), "always".to_owned()),
+                ("enable-mfa".to_owned(), "always".to_owned()),
                 ("lockout-threshold".to_owned(), "7".to_owned()),
             ],
             "ints normalize, disabled garbage is ignored"
         );
 
-        let one = [entry("require-mfa", true, "off", None)];
+        let one = [entry("enable-mfa", true, "off", None)];
         for (name, policy_name, entries, expected_err) in [
             ("empty name", "   ", &one[..], "1 to 64 characters"),
             (
@@ -483,7 +487,7 @@ mod tests {
             (
                 "nothing ticked",
                 "P",
-                &[entry("require-mfa", false, "off", None)][..],
+                &[entry("enable-mfa", false, "off", None)][..],
                 "at least one rule",
             ),
         ] {

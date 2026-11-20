@@ -544,7 +544,9 @@ pub(crate) mod tests {
     };
     use lldap_domain_handlers::lockout::{DURATION, Lockout, THRESHOLD, lock_detail};
     use lldap_domain_handlers::logging::{Protocol, RequestMeta, with_request, without_session};
-    use lldap_domain_handlers::mfa::{MFA_DISABLED_GROUP, MfaPolicy, MfaResetReason};
+    use lldap_domain_handlers::mfa::{
+        MFA_DISABLED_GROUP, MfaPolicy, MfaRequirement, MfaResetReason,
+    };
     use lldap_domain_handlers::policies::{CreatePolicyRequest, PolicyId, UpdatePolicyRequest};
     use lldap_mfa::{
         TOTP_MAX_ATTEMPTS_PER_STEP, TOTP_STEP_SECS, TOTP_TOO_MANY_ATTEMPTS, format_code, totp_code,
@@ -557,15 +559,15 @@ pub(crate) mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
 
-    const RIGHT: &str = "Right-Pass-1";
+    pub(crate) const RIGHT: &str = "Right-Pass-1";
 
-    fn own(handler: SqlBackendHandler) -> SqlBackendHandler {
+    pub(crate) fn own(handler: SqlBackendHandler) -> SqlBackendHandler {
         let lockout: &'static Lockout = Box::leak(Box::default());
         let cache: &'static PolicyCache = Box::leak(Box::new(PolicyCache::new()));
         handler.with_lockout(lockout).with_policy_cache(cache)
     }
 
-    async fn handler() -> SqlBackendHandler {
+    pub(crate) async fn handler() -> SqlBackendHandler {
         own(SqlBackendHandler::new(
             generate_random_private_key(),
             get_initialized_db().await,
@@ -581,7 +583,7 @@ pub(crate) mod tests {
         )
     }
 
-    async fn user_in(handler: &SqlBackendHandler, user: &str, ou: &str) {
+    pub(crate) async fn user_in(handler: &SqlBackendHandler, user: &str, ou: &str) {
         let request = CreateUserRequest {
             user_id: UserId::new(user),
             email: format!("{user}@example.com").into(),
@@ -612,6 +614,24 @@ pub(crate) mod tests {
         id
     }
 
+    pub(crate) async fn policy_on(
+        handler: &SqlBackendHandler,
+        ou: &str,
+        items: &[(&str, &str)],
+    ) -> PolicyId {
+        let pairs = items
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()));
+        let request = CreatePolicyRequest {
+            name: format!("on {ou}"),
+            description: String::new(),
+            items: pairs.collect(),
+        };
+        let id = handler.create_policy(request).await.unwrap();
+        handler.set_ou_policy(ou, id).await.unwrap();
+        id
+    }
+
     async fn follow(handler: &SqlBackendHandler) {
         let cache = handler.policy_cache;
         handler
@@ -621,7 +641,11 @@ pub(crate) mod tests {
             .unwrap();
     }
 
-    async fn bind_as(handler: &SqlBackendHandler, user: &str, password: &str) -> Result<()> {
+    pub(crate) async fn bind_as(
+        handler: &SqlBackendHandler,
+        user: &str,
+        password: &str,
+    ) -> Result<()> {
         let request = BindRequest {
             name: UserId::new(user),
             password: password.to_owned(),
@@ -629,7 +653,7 @@ pub(crate) mod tests {
         handler.bind(request).await
     }
 
-    async fn bind(handler: &SqlBackendHandler, user: &str, password: &str) -> bool {
+    pub(crate) async fn bind(handler: &SqlBackendHandler, user: &str, password: &str) -> bool {
         bind_as(handler, user, password).await.is_ok()
     }
 
@@ -684,7 +708,7 @@ pub(crate) mod tests {
         })
     }
 
-    async fn web(
+    pub(crate) async fn web(
         handler: &SqlBackendHandler,
         user: &str,
         password: &str,
@@ -695,7 +719,10 @@ pub(crate) mod tests {
         handler.login_finish(request).await.map_err(|_| "server")
     }
 
-    fn rows(log: &LogGuard, kinds: &[LogKind]) -> Vec<(LogKind, Option<String>, Option<String>)> {
+    pub(crate) fn rows(
+        log: &LogGuard,
+        kinds: &[LogKind],
+    ) -> Vec<(LogKind, Option<String>, Option<String>)> {
         let events = log.recorder().take_events().into_iter();
         events
             .filter(|e| kinds.contains(&e.kind))
@@ -1345,11 +1372,11 @@ pub(crate) mod tests {
 
     const AT: i64 = 1_770_000_015;
 
-    fn pinned() -> (PinnedClock, u64) {
+    pub(crate) fn pinned() -> (PinnedClock, u64) {
         (pin_clock(AT), AT as u64)
     }
 
-    async fn enroll(handler: &SqlBackendHandler, user: &str, now: u64) -> Vec<u8> {
+    pub(crate) async fn enroll(handler: &SqlBackendHandler, user: &str, now: u64) -> Vec<u8> {
         let user_id = UserId::new(user);
         let proof = handler.seal_enrollment_proof(&user_id).await.unwrap();
         let start = handler
@@ -1366,7 +1393,7 @@ pub(crate) mod tests {
     }
 
     /// Two codes valid now and not yet used, and one valid at no accepted step.
-    fn codes(seed: &[u8], now: u64) -> ([String; 2], String) {
+    pub(crate) fn codes(seed: &[u8], now: u64) -> ([String; 2], String) {
         let at = |t: u64| format_code(totp_code(seed, t).unwrap());
         let valid = [at(now - TOTP_STEP_SECS), at(now), at(now + TOTP_STEP_SECS)];
         let wrong = (0..)
@@ -1659,6 +1686,51 @@ pub(crate) mod tests {
             let lock = h.lockout.kdc_state(h.policy_cache, &user).unwrap();
             let _ = h.lockout.ticket_issued(h.policy_cache, &lock, lock_clock());
             assert_eq!(viewed(&h, "e1exempt"), count, "{label}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_ticket_clears_where_the_bind_asks_no_code_the_ous_item_counted() {
+        let (_clock, at) = pinned();
+        let rows = [
+            ("an OU's always, enrolled", None, "always", true, 1),
+            ("an OU's always, no factor", None, "always", false, 0),
+            ("an OU's enabled, enrolled", None, "enabled", true, 1),
+            (
+                "an OU's enabled, an explicit off",
+                Some(MfaPolicy::Disabled),
+                "enabled",
+                true,
+                0,
+            ),
+            (
+                "an OU's off, an explicit enabled",
+                Some(MfaPolicy::Enrolled),
+                "off",
+                true,
+                1,
+            ),
+        ];
+        for (label, server, item, enrolled, count) in rows {
+            let h = handler().await;
+            user_in(&h, "e2ticket", "e2ticketou").await;
+            let items = [(THRESHOLD, "9"), (DURATION, "0"), ("enable-mfa", item)];
+            policy_on(&h, "e2ticketou", &items).await;
+            if enrolled {
+                enroll(&h, "e2ticket", at).await;
+            }
+            let h = h.with_mfa_setting(server);
+            assert!(!bind(&h, "e2ticket", "nope").await, "{label}");
+            let user = UserId::new("e2ticket");
+            let asks = h.mfa_requirement(&user).await.unwrap() == MfaRequirement::Totp;
+            let lock = h.lockout.kdc_state(h.policy_cache, &user).unwrap();
+            let _ = h.lockout.ticket_issued(h.policy_cache, &lock, lock_clock());
+            assert_eq!(
+                (viewed(&h, "e2ticket"), asks),
+                (count, count == 1),
+                "{label}: the ticket clears only where the bind asks no code"
+            );
         }
     }
 

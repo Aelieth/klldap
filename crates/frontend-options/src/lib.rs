@@ -8,6 +8,9 @@ pub struct Options {
     pub mfa_enabled: bool,
     #[serde(default)]
     pub mfa_required: bool,
+    /// The explicit server-wide `enable_mfa`, which overrides every OU's.
+    #[serde(default)]
+    pub mfa_server_wide: Option<String>,
     #[serde(default)]
     pub domain: String,
 }

@@ -273,7 +273,7 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         });
         if new_display_name.is_some()
             && let Ok(details) = handler.get_group_details(GroupId(group.id)).await
-            && is_protected_group(details.display_name.as_str(), context.mfa_policy)
+            && is_protected_group(details.display_name.as_str(), context.mfa_group_protected)
         {
             span.in_scope(|| debug!("Cannot rename built-in group '{}'", details.display_name));
             return Err(format!("Cannot rename built-in group '{}'", details.display_name).into());
@@ -397,7 +397,7 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             .get_admin_handler()
             .ok_or_else(field_error_callback(&span, "Unauthorized group deletion"))?;
         if let Ok(details) = handler.get_group_details(GroupId(group_id)).await
-            && is_protected_group(details.display_name.as_str(), context.mfa_policy)
+            && is_protected_group(details.display_name.as_str(), context.mfa_group_protected)
         {
             span.in_scope(|| debug!("Cannot delete built-in group '{}'", details.display_name));
             return Err(format!("Cannot delete built-in group '{}'", details.display_name).into());

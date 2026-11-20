@@ -1,4 +1,5 @@
-use crate::{auth_service::check_if_token_is_valid, tcp_server::AppState};
+use crate::auth_service::{check_if_token_is_valid, session_mfa};
+use crate::tcp_server::AppState;
 use actix_web::FromRequest;
 use actix_web::HttpMessage;
 use actix_web::{Error, HttpRequest, HttpResponse, error::JsonPayloadError, web};
@@ -10,9 +11,9 @@ use juniper::{
         playground::playground_source,
     },
 };
-use lldap_domain_handlers::handler::{BackendHandler, MfaBackendHandler};
+use lldap_domain_handlers::enforcement::{mfa_can_be_on, policy_cache};
+use lldap_domain_handlers::handler::BackendHandler;
 use lldap_domain_handlers::logging::{Protocol, current_request, with_actor, with_request};
-use lldap_domain_handlers::mfa::{MfaPolicy, MfaRequirement};
 use lldap_graphql_server::api::Context;
 use lldap_graphql_server::api::{query_schema, schema};
 
@@ -175,19 +176,13 @@ async fn graphql_route<Handler: BackendHandler + lldap_opaque_handler::OpaqueHan
         let bearer = BearerAuth::from_request(&req, &mut inner_payload).await?;
         let validation_result = check_if_token_is_valid(&data, bearer.token()).await?;
         let actor = validation_result.user.clone();
-        // Under "always" an unenrolled session is confined to reading itself and enrolling.
-        let mfa_enrollment_pending = data.mfa_policy == MfaPolicy::Always
-            && data
-                .get_mfa_handler()
-                .mfa_requirement(&actor)
-                .await
-                .map_err(actix_web::error::ErrorInternalServerError)?
-                == MfaRequirement::Enrollment;
+        let (mfa_policy, mfa_enrollment_pending) = session_mfa(&data, &actor).await?;
         let context = Context::<Handler> {
             handler: data.backend_handler.clone(),
             validation_result,
-            mfa_policy: data.mfa_policy,
+            mfa_policy,
             mfa_enrollment_pending,
+            mfa_group_protected: mfa_can_be_on(data.mfa_policy, policy_cache()),
             keycloak: data.keycloak.clone(),
         };
         let context = &context;

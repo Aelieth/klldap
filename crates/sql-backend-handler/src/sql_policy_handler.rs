@@ -477,27 +477,24 @@ mod tests {
     fn mfa_of(cache: &PolicyCache, user: &str) -> Option<String> {
         let entries = cache.get();
         let items = entries.items_of(&UserId::new(user))?;
-        let item = items.iter().find(|item| item.key == "require-mfa")?;
+        let item = items.iter().find(|item| item.key == "enable-mfa")?;
         Some(item.value.clone())
     }
 
     #[tokio::test]
     async fn test_policy_lifecycle() {
-        let handler = handler().await;
+        let handler = handler().await.with_policy_cache(own_cache());
         let id = handler
             .create_policy(CreatePolicyRequest {
                 name: "Base".to_owned(),
                 description: "d".to_owned(),
-                items: items(&[("require-mfa", "off")]),
+                items: items(&[("enable-mfa", "off")]),
             })
             .await
             .unwrap();
         let got = handler.get_policy(id).await.unwrap();
         assert_eq!(got.name, "Base");
-        assert_eq!(
-            got.items.get("require-mfa").map(String::as_str),
-            Some("off")
-        );
+        assert_eq!(got.items.get("enable-mfa").map(String::as_str), Some("off"));
         let listed = handler.list_policies().await.unwrap();
         assert_eq!(listed.len(), 1);
 
@@ -506,7 +503,7 @@ mod tests {
                 id,
                 name: Some("Base Policy".to_owned()),
                 description: None,
-                items: Some(items(&[("require-mfa", "always")])),
+                items: Some(items(&[("enable-mfa", "always")])),
             })
             .await
             .unwrap();
@@ -734,17 +731,22 @@ mod tests {
         let handler = handler().await.with_policy_cache(cache);
         user_in(&handler, "e0rook", "people").await;
         user_in(&handler, "e0sable", "People\\Labs").await;
-        let root = policy(&handler, "Root", &[("require-mfa", "enrolled")]).await;
-        let labs = policy(&handler, "Labs", &[("require-mfa", "always")]).await;
+        let root = policy(&handler, "Root", &[("enable-mfa", "enabled")]).await;
+        let labs = policy(&handler, "Labs", &[("enable-mfa", "always")]).await;
+        assert_eq!(
+            cache.get().ous_of_users.len(),
+            0,
+            "while no OU sets an enforced item the writes fill nothing"
+        );
         handler.set_ou_policy("", root).await.unwrap();
         handler.set_ou_policy("people\\labs", labs).await.unwrap();
         assert_eq!(
             cache.get().ous_of_users.len(),
-            0,
-            "while no item is enforced the writes fill nothing"
+            2,
+            "the first OU to set enable-mfa fills the cache at once"
         );
 
-        let _guard = EnforcementGuard::allowing(&["e0rook", "e0sable", "e0tarn"], "require-mfa");
+        let _guard = EnforcementGuard::allowing(&["e0rook", "e0sable", "e0tarn"], "enable-mfa");
         fill_policy_cache(&handler, cache).await.unwrap();
         let ous: BTreeMap<_, _> = cache
             .get()
@@ -762,19 +764,19 @@ mod tests {
         let mfa = |user| mfa_of(cache, user);
         assert_eq!(
             (mfa("e0rook"), mfa("e0sable"), mfa("e0tarn")),
-            (Some("enrolled".to_owned()), Some("always".to_owned()), None),
+            (Some("enabled".to_owned()), Some("always".to_owned()), None),
             "filled"
         );
         let rows = [
             ("a policy edit", "e0sable", Some("off")),
             ("a user created here", "e0tarn", Some("off")),
             ("an OU move", "e0rook", Some("off")),
-            ("an OU's policy cleared", "e0sable", Some("enrolled")),
+            ("an OU's policy cleared", "e0sable", Some("enabled")),
             ("a user deleted", "e0tarn", None),
         ];
         for (row, user, expected) in rows {
             match row {
-                "a policy edit" => set_items(&handler, labs, &[("require-mfa", "off")]).await,
+                "a policy edit" => set_items(&handler, labs, &[("enable-mfa", "off")]).await,
                 "a user created here" => user_in(&handler, "e0tarn", "people\\labs").await,
                 "an OU move" => move_to(&handler, "e0rook", "people\\labs").await,
                 "an OU's policy cleared" => handler.clear_ou_policy("people\\labs").await.unwrap(),
@@ -790,11 +792,11 @@ mod tests {
         let cache = own_cache();
         let handler = handler().await.with_policy_cache(cache);
         user_in(&handler, "e0wren", "people").await;
-        let base = policy(&handler, "Base", &[("require-mfa", "off")]).await;
+        let base = policy(&handler, "Base", &[("enable-mfa", "off")]).await;
         handler.set_ou_policy("people", base).await.unwrap();
         handler.set_ou_policy("people\\labs", base).await.unwrap();
         let _guard =
-            EnforcementGuard::deciding(&["e0wren"], "require-mfa", |value| value != "always");
+            EnforcementGuard::deciding(&["e0wren"], "enable-mfa", |value| value != "always");
         fill_policy_cache(&handler, cache).await.unwrap();
         let stop = Arc::new(AtomicBool::new(false));
         let reader = {
@@ -815,10 +817,10 @@ mod tests {
         };
         for turn in 0..50 {
             let (value, at) = match turn % 2 {
-                0 => ("enrolled", "people\\labs"),
+                0 => ("enabled", "people\\labs"),
                 _ => ("off", "people"),
             };
-            set_items(&handler, base, &[("require-mfa", value)]).await;
+            set_items(&handler, base, &[("enable-mfa", value)]).await;
             move_to(&handler, "e0wren", at).await;
         }
         stop.store(true, Ordering::Relaxed);
@@ -835,7 +837,7 @@ mod tests {
         let cache = own_cache();
         let handler = handler().await;
         user_in(&handler, "e0kept", "people\\labs").await;
-        let _guard = EnforcementGuard::allowing(&["e0kept", "e0gone"], "require-mfa");
+        let _guard = EnforcementGuard::allowing(&["e0kept", "e0gone"], "enable-mfa");
         let (kept, gone) = (UserId::new("e0kept"), UserId::new("e0gone"));
         let held = || {
             let entries = cache.get();
@@ -887,7 +889,7 @@ mod tests {
     async fn test_a_late_delete_hook_keeps_a_user_created_again_under_its_name() {
         let cache = own_cache();
         let handler = handler().await.with_policy_cache(cache);
-        let _guard = EnforcementGuard::allowing(&["e0again"], "require-mfa");
+        let _guard = EnforcementGuard::allowing(&["e0again"], "enable-mfa");
         let user = UserId::new("e0again");
         user_in(&handler, "e0again", "people").await;
         handler.delete_user(&user).await.unwrap();

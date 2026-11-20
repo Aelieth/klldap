@@ -2,6 +2,7 @@ use crate::sql_tables::{DbConnection, LAST_SCHEMA_VERSION, SchemaVersion};
 use base64::{Engine as _, engine::general_purpose};
 use itertools::Itertools;
 use lldap_domain::types::{AttributeType, Avatar, GroupId, Serialized, UserId, Uuid};
+use lldap_domain_handlers::policies::rename_items;
 use lldap_schema::PublicSchema;
 use sea_orm::{
     ConnectionTrait, DatabaseTransaction, DbErr, DeriveIden, FromQueryResult, Iden, Order,
@@ -12,6 +13,7 @@ use sea_orm::{
     },
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use tracing::{debug, error, info, instrument, warn};
 
 #[derive(DeriveIden, PartialEq, Eq, Debug, Serialize, Deserialize, Clone, Copy)]
@@ -2037,12 +2039,43 @@ pub(crate) async fn ensure_v13_additions(pool: &DbConnection) -> Result<(), DbEr
     let backend = transaction.get_database_backend();
     ensure_logs(&transaction, backend).await?;
     ensure_policies(&transaction, backend).await?;
+    ensure_renamed_items(&transaction, backend).await?;
     ensure_kerberos(&transaction, backend).await?;
     ensure_login_lockouts(&transaction, backend).await?;
     ensure_totp_steps(&transaction, backend).await?;
     ensure_mfa_used_proofs(&transaction, backend).await?;
     ensure_lockout_period(&transaction, backend).await?;
     transaction.commit().await
+}
+
+/// A policy item stored under an older name is carried over; a second run finds none.
+async fn ensure_renamed_items(
+    transaction: &DatabaseTransaction,
+    backend: sea_orm::DbBackend,
+) -> Result<(), DbErr> {
+    let select = Query::select()
+        .columns([Policies::Id, Policies::Items])
+        .from(Policies::Table)
+        .to_owned();
+    for row in transaction.query_all(backend.build(&select)).await? {
+        let id: i32 = row.try_get("", &Policies::Id.to_string())?;
+        let raw: String = row.try_get("", &Policies::Items.to_string())?;
+        let Ok(mut items) = serde_json::from_str::<BTreeMap<String, String>>(&raw) else {
+            continue;
+        };
+        if !rename_items(&mut items) {
+            continue;
+        }
+        let encoded = serde_json::to_string(&items).map_err(|e| DbErr::Custom(e.to_string()))?;
+        info!("Policy {id}: an item carried over to its new name");
+        let update = Query::update()
+            .table(Policies::Table)
+            .value(Policies::Items, encoded)
+            .and_where(Expr::col(Policies::Id).eq(id))
+            .to_owned();
+        transaction.execute(backend.build(&update)).await?;
+    }
+    Ok(())
 }
 
 /// The lockout's counting period: a row always there for a count write to lock.

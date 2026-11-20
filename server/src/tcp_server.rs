@@ -21,6 +21,7 @@ use hmac::Hmac;
 use lldap_access_control::{
     AccessControlledBackendHandler, ReadonlyBackendHandler, UserReadableBackendHandler,
 };
+use lldap_domain_handlers::enforcement::{mfa_can_be_on, policy_cache};
 use lldap_domain_handlers::handler::{BackendHandler, LoginHandler, MfaBackendHandler};
 use lldap_domain_handlers::kerberos::{KerberosSync, domain_from_base_dn, kerberos_backend};
 use lldap_domain_handlers::logging::{RequestMeta, with_request};
@@ -157,8 +158,9 @@ async fn wasm_handler_compressed<Backend>(
 async fn get_settings<Backend>(data: web::Data<AppState<Backend>>) -> HttpResponse {
     HttpResponse::Ok().json(lldap_frontend_options::Options {
         password_reset_enabled: data.mail_options.enable_password_reset,
-        mfa_enabled: data.mfa_policy != MfaPolicy::Disabled,
-        mfa_required: data.mfa_policy == MfaPolicy::Always,
+        mfa_enabled: mfa_can_be_on(data.mfa_policy, policy_cache()),
+        mfa_required: data.mfa_policy == Some(MfaPolicy::Always),
+        mfa_server_wide: data.mfa_policy.map(|policy| policy.item().to_owned()),
         domain: data.domain.clone(),
     })
 }
@@ -169,7 +171,7 @@ struct WebOptions {
     server_url: url::Url,
     assets_path: PathBuf,
     mail_options: MailOptions,
-    mfa_policy: MfaPolicy,
+    mfa_policy: Option<MfaPolicy>,
     domain: String,
     keycloak: Arc<KeycloakSettings>,
 }
@@ -246,7 +248,7 @@ pub(crate) struct AppState<Backend> {
     pub server_url: url::Url,
     pub assets_path: PathBuf,
     pub mail_options: MailOptions,
-    pub mfa_policy: MfaPolicy,
+    pub mfa_policy: Option<MfaPolicy>,
     pub domain: String,
     pub keycloak: Arc<KeycloakSettings>,
 }

@@ -39,7 +39,9 @@ use tracing::{Instrument, Level, debug, error, info, instrument, span, warn};
 
 use lldap_domain::requests::{CreateGroupRequest, CreateUserRequest};
 use lldap_domain::types::{Attribute, BUILTIN_GROUPS, UserId, kerberos_sync_enabled};
-use lldap_domain_handlers::enforcement::{CacheFollower, policy_cache, start_policy_cache};
+use lldap_domain_handlers::enforcement::{
+    CacheFollower, StartWarning, policy_cache, start_policy_cache,
+};
 use lldap_domain_handlers::kerberos::{
     DegradedKerberos, KerberosSync, NoopKerberos, kerberos_backend, kerberos_store,
     set_kerberos_backend,
@@ -54,9 +56,9 @@ use lldap_kerberos::embedded::{EmbeddedKerberos, FOLLOW_EVERY, Opened, RealmThre
 
 use lldap_domain_handlers::handler::{
     GroupBackendHandler, GroupListerBackendHandler, GroupRequestFilter, MfaBackendHandler,
-    UserBackendHandler, UserListerBackendHandler, UserRequestFilter,
+    PolicyBackendHandler, UserBackendHandler, UserListerBackendHandler, UserRequestFilter,
 };
-use lldap_domain_handlers::mfa::{MFA_DISABLED_GROUP, MfaResetReason};
+use lldap_domain_handlers::mfa::{MfaPolicy, MfaResetReason};
 
 const ADMIN_PASSWORD_MISSING_ERROR: &str = "The LDAP admin password must be initialized. \
             Either set the `ldap_user_pass` config value or the `LLDAP_LDAP_USER_PASS` environment variable. \
@@ -307,6 +309,17 @@ async fn create_admin_user(handler: &SqlBackendHandler, config: &Configuration) 
         .context("Error adding admin user to group")
 }
 
+/// A count, never a name: 0.8.0 stored the item and checked nothing.
+async fn warn_ous_asking_mfa(handler: &SqlBackendHandler, server: Option<MfaPolicy>) {
+    static WARNING: StartWarning = StartWarning::new();
+    let Ok(policies) = handler.list_policies().await else {
+        return;
+    };
+    if let Some(text) = WARNING.take(server, &policies) {
+        warn!("{text}");
+    }
+}
+
 async fn ensure_group_exists(handler: &SqlBackendHandler, group_name: &str) -> Result<()> {
     if handler
         .list_groups(Some(GroupRequestFilter::DisplayName(group_name.into())))
@@ -421,16 +434,13 @@ async fn set_up_server(
     let backend_handler =
         SqlBackendHandler::new(config.get_server_setup().clone(), sql_pool.clone())
             .with_read_pool(setup_read_pool(&config.database_url, &sql_pool).await?)
-            .with_mfa_policy(config.mfa_policy());
+            .with_mfa_setting(config.mfa_policy());
     // Every sealed TOTP secret was keyed from the old private key.
     if key_rotated {
         backend_handler.clear_all_mfa().await?;
     }
     for group in BUILTIN_GROUPS {
         ensure_group_exists(&backend_handler, group).await?;
-    }
-    if config.enable_mfa.is_positive() {
-        ensure_group_exists(&backend_handler, MFA_DISABLED_GROUP).await?;
     }
     let mut deferred = None;
     let admin_present = if let Ok(admins) = backend_handler
@@ -488,6 +498,11 @@ async fn set_up_server(
     }
     let _policy_filler = start_policy_cache(&backend_handler).await;
     let _lockout = start_lockout(&backend_handler, policy_cache()).await;
+    backend_handler
+        .exempt_group_at_start()
+        .await
+        .context("while creating the lldap_mfa_disabled group")?;
+    warn_ous_asking_mfa(&backend_handler, config.mfa_policy()).await;
     let (realm_threads, embedded) = match config.kerberos_options.enabled {
         false => (None, None),
         true => {

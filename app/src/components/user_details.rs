@@ -79,7 +79,14 @@ pub struct Props {
     pub is_admin: bool,
     pub is_self: bool,
     pub mfa_enabled: bool,
-    pub mfa_required: bool,
+}
+
+pub fn blocks_own_reset(is_self: bool, mfa_mode: Option<&str>) -> bool {
+    is_self && mfa_mode != Some("enabled")
+}
+
+pub fn offers_enrolment(mfa_mode: Option<&str>) -> bool {
+    matches!(mfa_mode, Some("enabled" | "always"))
 }
 
 impl CommonComponent<UserDetails> for UserDetails {
@@ -258,7 +265,8 @@ impl Component for UserDetails {
                 let is_disabled = u.groups.iter().any(|g| g.display_name == "lldap_disabled");
                 let mfa_enrolled = u.mfa_enrolled.unwrap_or(false);
                 // Under "always" an account may not be left without a factor.
-                let own_reset_blocked = ctx.props().is_self && ctx.props().mfa_required;
+                let own_reset_blocked =
+                    blocks_own_reset(ctx.props().is_self, u.mfa_mode.as_deref());
 
                 let link = ctx.link();
 
@@ -305,7 +313,7 @@ impl Component for UserDetails {
                       </Link>
                     }
                   } else { html! {} }}
-                  { if ctx.props().is_self && ctx.props().mfa_enabled {
+                  { if ctx.props().is_self && offers_enrolment(u.mfa_mode.as_deref()) {
                     html! {
                       <Link
                       to={AppRoute::RegisterMfa{user_id: u.id.clone()}}
@@ -460,6 +468,29 @@ impl UserDetails {
             }
         } else {
             html! {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_the_buttons_follow_the_users_resolved_mode() {
+        for (is_self, mode, blocked, offered) in [
+            (true, Some("always"), true, true),
+            (true, Some("enabled"), false, true),
+            (true, Some("off"), true, false),
+            (true, None, true, false),
+            (false, Some("always"), false, true),
+            (false, None, false, false),
+        ] {
+            assert_eq!(
+                (blocks_own_reset(is_self, mode), offers_enrolment(mode)),
+                (blocked, offered),
+                "{is_self} {mode:?}"
+            );
         }
     }
 }

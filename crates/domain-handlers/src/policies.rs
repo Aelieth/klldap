@@ -52,14 +52,14 @@ pub struct PolicyItemSpec {
 
 pub static POLICY_ITEM_CATALOG: &[PolicyItemSpec] = &[
     PolicyItemSpec {
-        key: "require-mfa",
+        key: "enable-mfa",
         scope: PolicyScope::User,
         value_type: PolicyValueType::Enum {
-            allowed: &["off", "enrolled", "always"],
+            allowed: &["off", "enabled", "always"],
         },
         default_value: "off",
-        enforced: false,
-        description: "Whether users in this OU must present TOTP (off / enrolled / always). Not yet enforced.",
+        enforced: true,
+        description: "Whether users in this OU present TOTP (off / enabled / always); an explicit server-wide enable_mfa overrides it.",
     },
     PolicyItemSpec {
         key: "lockout-threshold",
@@ -109,6 +109,68 @@ pub static POLICY_ITEM_CATALOG: &[PolicyItemSpec] = &[
         description: "Days without a login before the account is disabled; 0 disables. Not yet enforced.",
     },
 ];
+
+/// An item stored under an older name: carried over by the migration, refused at input.
+pub struct RenamedItem {
+    pub old: &'static str,
+    pub new: &'static str,
+    pub values: &'static [(&'static str, &'static str)],
+}
+
+pub static RENAMED_ITEMS: &[RenamedItem] = &[RenamedItem {
+    old: "require-mfa",
+    new: "enable-mfa",
+    values: &[("enrolled", "enabled")],
+}];
+
+pub fn rename_items(items: &mut BTreeMap<String, String>) -> bool {
+    let mut changed = false;
+    for renamed in RENAMED_ITEMS {
+        let Some(value) = items.remove(renamed.old) else {
+            continue;
+        };
+        changed = true;
+        let value = match renamed.values.iter().find(|(old, _)| *old == value) {
+            Some((_, new)) => (*new).to_owned(),
+            None => value,
+        };
+        items.entry(renamed.new.to_owned()).or_insert(value);
+    }
+    changed
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SettingSource {
+    Server,
+    Ou,
+    Default,
+}
+
+/// A setting both the server and an OU's policy can set: a new one needs its catalog entry,
+/// its server-wide key and this.
+pub trait Setting {
+    type Value;
+    const KEY: &'static str;
+    fn parse(value: &str) -> Self::Value;
+}
+
+/// The explicit server-wide value overrides the OUs; else the user's OU decides by the
+/// inheritance above; else the catalog's default.
+pub fn resolve<S: Setting>(
+    server: Option<S::Value>,
+    items: &[EffectiveItem],
+) -> (S::Value, SettingSource) {
+    if let Some(value) = server {
+        return (value, SettingSource::Server);
+    }
+    match items.iter().find(|item| item.key == S::KEY) {
+        Some(item) if item.source.is_some() => (S::parse(&item.value), SettingSource::Ou),
+        _ => {
+            let default = catalog_item(S::KEY).map_or("", |spec| spec.default_value);
+            (S::parse(default), SettingSource::Default)
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PolicyId(pub i32);
@@ -222,6 +284,9 @@ pub fn validate_policy_name(name: &str) -> Result<String, String> {
 
 pub fn validate_items(items: &BTreeMap<String, String>) -> Result<(), String> {
     for (key, value) in items {
+        if let Some(renamed) = RENAMED_ITEMS.iter().find(|renamed| renamed.old == key) {
+            return Err(format!("Policy item '{key}' is now '{}'", renamed.new));
+        }
         let spec = catalog_item(key).ok_or_else(|| format!("Unknown policy item '{key}'"))?;
         validate_value(&spec.value_type, value).map_err(|e| format!("{key}: {e}"))?;
     }
@@ -456,7 +521,12 @@ mod tests {
             );
         };
         err(&[("nope", "1")], "Unknown policy item");
-        err(&[("require-mfa", "TRUE")], "must be one of");
+        err(&[("enable-mfa", "TRUE")], "must be one of");
+        err(&[("enable-mfa", "enrolled")], "must be one of");
+        err(
+            &[("require-mfa", "always")],
+            "'require-mfa' is now 'enable-mfa'",
+        );
         err(&[("lockout-threshold", "x")], "base-10");
         err(&[("lockout-threshold", "101")], "between");
         err(&[("lockout-threshold", "-1")], "between");
@@ -470,7 +540,8 @@ mod tests {
             &[("login-hours", "mon 18:00-08:00")],
             "start must be before",
         );
-        ok(&[("require-mfa", "always")]);
+        ok(&[("enable-mfa", "always")]);
+        ok(&[("enable-mfa", "enabled")]);
         ok(&[("lockout-threshold", "0")]);
         ok(&[("lockout-duration-seconds", "604800")]);
         ok(&[("inactivity-days", "3650")]);
@@ -482,6 +553,78 @@ mod tests {
         assert!(validate_policy_name("  ").is_err());
         assert!(validate_policy_name(&"x".repeat(65)).is_err());
         assert!(validate_policy_name("ok name").is_ok());
+    }
+
+    #[test]
+    fn test_an_old_item_is_carried_over_once_and_the_new_name_wins() {
+        let rows = [
+            (
+                vec![("require-mfa", "enrolled")],
+                vec![("enable-mfa", "enabled")],
+                true,
+            ),
+            (
+                vec![("require-mfa", "always")],
+                vec![("enable-mfa", "always")],
+                true,
+            ),
+            (
+                vec![("require-mfa", "off")],
+                vec![("enable-mfa", "off")],
+                true,
+            ),
+            (
+                vec![("require-mfa", "always"), ("enable-mfa", "off")],
+                vec![("enable-mfa", "off")],
+                true,
+            ),
+            (
+                vec![("enable-mfa", "enabled"), ("lockout-threshold", "3")],
+                vec![("enable-mfa", "enabled"), ("lockout-threshold", "3")],
+                false,
+            ),
+            (vec![], vec![], false),
+        ];
+        for (before, after, changed) in rows {
+            let mut stored = items(&before);
+            assert_eq!(rename_items(&mut stored), changed, "{before:?}");
+            assert_eq!(stored, items(&after), "{before:?}");
+            assert!(
+                !rename_items(&mut stored),
+                "{before:?}: a second run changes nothing"
+            );
+        }
+    }
+
+    struct Threshold;
+
+    impl Setting for Threshold {
+        type Value = String;
+        const KEY: &'static str = "lockout-threshold";
+        fn parse(value: &str) -> String {
+            value.to_owned()
+        }
+    }
+
+    #[test]
+    fn test_the_explicit_server_value_then_the_ou_then_the_default() {
+        let levels = |set: Option<&str>| {
+            let policy = set.map(|value| attached(1, "p", &[("lockout-threshold", value)]));
+            vec![level("", false, None), level("labs", false, policy)]
+        };
+        let rows = [
+            (Some("9"), Some("3"), ("9", SettingSource::Server)),
+            (Some("0"), Some("3"), ("0", SettingSource::Server)),
+            (Some("9"), None, ("9", SettingSource::Server)),
+            (None, Some("3"), ("3", SettingSource::Ou)),
+            (None, Some("0"), ("0", SettingSource::Ou)),
+            (None, None, ("0", SettingSource::Default)),
+        ];
+        for (server, ou, (value, source)) in rows {
+            let items = resolve_effective_items(POLICY_ITEM_CATALOG, &levels(ou));
+            let got = resolve::<Threshold>(server.map(str::to_owned), &items);
+            assert_eq!(got, (value.to_owned(), source), "{server:?} {ou:?}");
+        }
     }
 
     #[test]
@@ -691,7 +834,14 @@ mod tests {
             .filter(|s| s.enforced)
             .map(|s| s.key)
             .collect();
-        assert_eq!(enforced, ["lockout-threshold", "lockout-duration-seconds"]);
+        assert_eq!(
+            enforced,
+            [
+                "enable-mfa",
+                "lockout-threshold",
+                "lockout-duration-seconds"
+            ]
+        );
         for spec in POLICY_ITEM_CATALOG {
             let says_not_yet = spec.description.contains("Not yet enforced");
             assert_eq!(says_not_yet, !spec.enforced, "{}", spec.key);

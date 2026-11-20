@@ -2,6 +2,7 @@ use crate::{
     components::{
         form::submit::Submit,
         router::{AppRoute, Link},
+        user_details::offers_enrolment,
     },
     infra::{
         api::{HostService, LoginOutcome},
@@ -176,7 +177,11 @@ impl CommonComponent<RegisterMfa> for RegisterMfa {
         use anyhow::Context;
         match msg {
             Msg::OwnMfaLoaded(res) => {
-                let enrolled = res?.user.mfa_enrolled.unwrap_or(false);
+                let user = res?.user;
+                if !offers_enrolment(user.mfa_mode.as_deref()) {
+                    bail!("Two-factor authentication is disabled for this user");
+                }
+                let enrolled = user.mfa_enrolled.unwrap_or(false);
                 self.phase = if enrolled {
                     Phase::Gate
                 } else {

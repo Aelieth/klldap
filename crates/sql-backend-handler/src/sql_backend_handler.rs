@@ -63,7 +63,8 @@ pub struct SqlBackendHandler {
     pub(crate) opaque_setup: ServerSetup,
     pub(crate) sql_pool: DbConnection,
     pub(crate) read_pool: DbConnection,
-    pub(crate) mfa_policy: MfaPolicy,
+    /// The explicit server-wide `enable_mfa`; `None` lets the OUs decide.
+    pub(crate) mfa_policy: Option<MfaPolicy>,
     /// A `totp_steps` row was written since the last prune; true at start, for one prune then.
     pub(crate) codes_written: Arc<AtomicBool>,
     pub(crate) policy_cache: &'static PolicyCache,
@@ -77,7 +78,7 @@ impl SqlBackendHandler {
             opaque_setup,
             read_pool: sql_pool.clone(),
             sql_pool,
-            mfa_policy: MfaPolicy::default(),
+            mfa_policy: None,
             codes_written: Arc::new(AtomicBool::new(true)),
             policy_cache: enforcement::policy_cache(),
             lockout: lockout(),
@@ -104,7 +105,11 @@ impl SqlBackendHandler {
         self
     }
 
-    pub fn with_mfa_policy(mut self, mfa_policy: MfaPolicy) -> Self {
+    pub fn with_mfa_policy(self, mfa_policy: MfaPolicy) -> Self {
+        self.with_mfa_setting(Some(mfa_policy))
+    }
+
+    pub fn with_mfa_setting(mut self, mfa_policy: Option<MfaPolicy>) -> Self {
         self.policy_cache.set_mfa_policy(mfa_policy);
         self.mfa_policy = mfa_policy;
         self
@@ -116,12 +121,16 @@ impl SqlBackendHandler {
 
     pub(crate) async fn policy_changed(&self) {
         self.policy_changes.fetch_add(1, Ordering::Relaxed);
-        match self.lockout.follow_policies(self, self.policy_cache).await {
-            Ok(true) => return,
-            Ok(false) => {}
-            Err(e) => warn!("The lockout did not follow a policy change: {e}"),
+        let filled = match self.lockout.follow_policies(self, self.policy_cache).await {
+            Ok(filled) => filled,
+            Err(e) => {
+                warn!("The lockout did not follow a policy change: {e}");
+                false
+            }
+        };
+        if !filled {
+            enforcement::policy_changed(self, self.policy_cache).await;
         }
-        enforcement::policy_changed(self, self.policy_cache).await;
     }
 
     pub(crate) async fn user_written(&self, user: &UserId) {

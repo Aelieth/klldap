@@ -1,7 +1,7 @@
 use crate::logging::{
     LogActivity, LogBucket, LogCursor, LogDimension, LogFilter, LogKind, LogRecord,
 };
-use crate::mfa::{MfaRequirement, MfaResetReason};
+use crate::mfa::{MfaPolicy, MfaRequirement, MfaResetReason};
 use crate::policies::{
     CreatePolicyRequest, OuPolicyState, Policy, PolicyId, PolicyLevel, UpdatePolicyRequest,
 };
@@ -218,8 +218,12 @@ pub trait LogBackendHandler: Send + Sync {
 
 #[async_trait]
 pub trait MfaBackendHandler: Send + Sync {
-    /// What a login must present under the current policy; a per-group policy plugs in here.
+    /// What a login must present under the user's resolved `enable_mfa`.
     async fn mfa_requirement(&self, user_id: &UserId) -> Result<MfaRequirement>;
+    /// Whether a session is confined to reading itself and enrolling.
+    async fn enrollment_pending(&self, user_id: &UserId) -> Result<bool>;
+    /// The user's resolved `enable_mfa`: the explicit server-wide value, else the OU's.
+    async fn mfa_mode(&self, user_id: &UserId) -> Result<MfaPolicy>;
     async fn start_totp_enrollment(
         &self,
         user_id: &UserId,

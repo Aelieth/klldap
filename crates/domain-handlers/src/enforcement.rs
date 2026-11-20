@@ -1,17 +1,21 @@
-use crate::handler::{PolicyBackendHandler, UserBackendHandler, UserListerBackendHandler};
+use crate::handler::{
+    GroupBackendHandler, GroupListerBackendHandler, GroupRequestFilter, PolicyBackendHandler,
+    UserBackendHandler, UserListerBackendHandler,
+};
 use crate::kerberos::{CommitError, HostRow};
 use crate::lockout::{self, LockRow, Lockout, LockoutCheck, lockout};
 use crate::logging::{self, LogKind, Protocol, RequestMeta};
 use crate::mfa::{
-    MFA_DISABLED_GROUP, MfaEnrollmentStatus, MfaPolicy, MfaRequirement, mfa_requirement,
+    ENABLE_MFA, EnableMfa, MFA_DISABLED_GROUP, MfaEnrollmentStatus, MfaPolicy, MfaRequirement,
+    mfa_requirement,
 };
 use crate::policies::{
-    EffectiveItem, POLICY_ITEM_CATALOG, canonical_ou_key, resolve_effective_items,
+    EffectiveItem, POLICY_ITEM_CATALOG, Policy, canonical_ou_key, resolve, resolve_effective_items,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use lldap_domain::requests::UpdateUserRequest;
-use lldap_domain::types::{GroupDetails, MFA_TYPE_TOTP, User, UserId, Uuid, user_ou};
+use lldap_domain::requests::{CreateGroupRequest, UpdateUserRequest};
+use lldap_domain::types::{Attribute, GroupDetails, MFA_TYPE_TOTP, User, UserId, Uuid, user_ou};
 use lldap_domain_model::error::{DomainError, Result};
 use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
@@ -24,9 +28,9 @@ use tracing::warn;
 pub const POLICY_REFILL: Duration = Duration::from_secs(30);
 pub const FILL_GAP: Duration = Duration::from_millis(250);
 pub const FILL_BACKOFF_LIMIT: Duration = Duration::from_secs(30);
-const LOCKOUT_OFF: u8 = 0;
-const LOCKOUT_ON: u8 = 1;
-const LOCKOUT_UNKNOWN: u8 = 2;
+const FLAG_OFF: u8 = 0;
+const FLAG_ON: u8 = 1;
+const FLAG_UNKNOWN: u8 = 2;
 pub const UNREADABLE: &str = "unreadable";
 pub const NOT_LOADED: &str = "not loaded yet";
 
@@ -217,7 +221,7 @@ fn refusing(
 
 /// Each enforcing cell adds its item's check here and turns the item's `enforced` flag on.
 pub fn default_item_checks() -> ItemChecks {
-    let checks: Vec<Arc<dyn ItemCheck>> = vec![Arc::new(LockoutCheck)];
+    let checks: Vec<Arc<dyn ItemCheck>> = vec![Arc::new(LockoutCheck), Arc::new(MfaItemCheck)];
     checks.into()
 }
 
@@ -262,6 +266,58 @@ impl UserFacts {
     }
 }
 
+/// Keeps the cache filled while an OU sets `enable-mfa`; `mfa_requirement` judges it.
+pub struct MfaItemCheck;
+
+impl ItemCheck for MfaItemCheck {
+    fn key(&self) -> &'static str {
+        ENABLE_MFA
+    }
+
+    fn live(&self, cache: &PolicyCache) -> bool {
+        cache.mfa_policy().is_none() && !cache.mfa_item_off()
+    }
+
+    fn may_refuse(&self, _: &UserState) -> bool {
+        false
+    }
+
+    fn allows(&self, _: &Attempt<'_>, _: &str, _: &UserState) -> bool {
+        true
+    }
+}
+
+/// `Some(false)` when no OU's value is needed: an explicit server-wide value, or no OU sets
+/// one; `None` until the policies are read.
+pub fn mfa_item_matters(cache: &PolicyCache, server: Option<MfaPolicy>) -> Option<bool> {
+    if server.is_some() || cache.mfa_item_off() {
+        return Some(false);
+    }
+    (!cache.mfa_item_unknown()).then_some(true)
+}
+
+/// The user's resolved value from memory alone.
+pub fn cached_mfa_policy(
+    cache: &PolicyCache,
+    entries: &Entries,
+    user: &UserId,
+) -> Option<MfaPolicy> {
+    let server = cache.mfa_policy();
+    let resolved = |items: &[EffectiveItem]| resolve::<EnableMfa>(server, items).0;
+    match mfa_item_matters(cache, server)? {
+        false => Some(resolved(&[])),
+        true => entries.items_of(user).map(resolved),
+    }
+}
+
+/// Whether the resolution can turn the factor on for anyone; while unknown, it can.
+pub fn mfa_can_be_on(server: Option<MfaPolicy>, cache: &PolicyCache) -> bool {
+    match server {
+        Some(policy) => policy != MfaPolicy::Disabled,
+        None => !cache.mfa_item_off(),
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Entries {
     pub ous_of_users: HashMap<UserId, String>,
@@ -291,7 +347,8 @@ pub struct PolicyCache {
     marked: Mutex<Marks>,
     read_failed: AtomicBool,
     lockout: AtomicU8,
-    mfa: RwLock<MfaPolicy>,
+    mfa: RwLock<Option<MfaPolicy>>,
+    mfa_item: AtomicU8,
 }
 
 #[derive(Default)]
@@ -331,40 +388,64 @@ impl PolicyCache {
             writers: tokio::sync::Mutex::new(()),
             marked: Mutex::default(),
             read_failed: AtomicBool::new(false),
-            lockout: AtomicU8::new(LOCKOUT_OFF),
-            mfa: RwLock::new(MfaPolicy::Disabled),
+            lockout: AtomicU8::new(FLAG_OFF),
+            mfa: RwLock::new(None),
+            mfa_item: AtomicU8::new(FLAG_OFF),
         }
     }
 
     /// Whether an OU policy sets a lockout threshold: one atomic read.
     pub fn lockout_live(&self) -> bool {
-        self.lockout.load(Ordering::Acquire) == LOCKOUT_ON
+        self.lockout.load(Ordering::Acquire) == FLAG_ON
     }
 
     pub fn lockout_off(&self) -> bool {
-        self.lockout.load(Ordering::Acquire) == LOCKOUT_OFF
+        self.lockout.load(Ordering::Acquire) == FLAG_OFF
     }
 
     /// Before the first read of the policies: the doors the lockout judges refuse.
     pub fn lockout_unknown(&self) -> bool {
-        self.lockout.load(Ordering::Acquire) == LOCKOUT_UNKNOWN
+        self.lockout.load(Ordering::Acquire) == FLAG_UNKNOWN
     }
 
     pub fn set_lockout_live(&self, live: bool) {
-        let state = if live { LOCKOUT_ON } else { LOCKOUT_OFF };
+        let state = if live { FLAG_ON } else { FLAG_OFF };
         self.lockout.store(state, Ordering::Release);
     }
 
-    pub fn mfa_policy(&self) -> MfaPolicy {
+    /// The explicit server-wide `enable_mfa`; `None` lets the OUs decide.
+    pub fn mfa_policy(&self) -> Option<MfaPolicy> {
         *self.mfa.read().unwrap_or_else(PoisonError::into_inner)
     }
 
-    pub fn set_mfa_policy(&self, policy: MfaPolicy) {
+    pub fn set_mfa_policy(&self, policy: Option<MfaPolicy>) {
         *self.mfa.write().unwrap_or_else(PoisonError::into_inner) = policy;
     }
 
     pub fn set_lockout_unknown(&self) {
-        self.lockout.store(LOCKOUT_UNKNOWN, Ordering::Release);
+        self.lockout.store(FLAG_UNKNOWN, Ordering::Release);
+    }
+
+    /// Whether an OU policy sets `enable-mfa`: one atomic read.
+    pub fn mfa_item_live(&self) -> bool {
+        self.mfa_item.load(Ordering::Acquire) == FLAG_ON
+    }
+
+    pub fn mfa_item_off(&self) -> bool {
+        self.mfa_item.load(Ordering::Acquire) == FLAG_OFF
+    }
+
+    pub fn mfa_item_unknown(&self) -> bool {
+        self.mfa_item.load(Ordering::Acquire) == FLAG_UNKNOWN
+    }
+
+    pub fn set_mfa_item_live(&self, live: bool) {
+        let state = if live { FLAG_ON } else { FLAG_OFF };
+        self.mfa_item.store(state, Ordering::Release);
+    }
+
+    pub fn set_mfa_item_unknown(&self) {
+        self.mfa_item.store(FLAG_UNKNOWN, Ordering::Release);
     }
 
     fn current(&self) -> Arc<Entries> {
@@ -586,6 +667,88 @@ where
     Some(start_policy_filler(handler.clone(), policy_cache()))
 }
 
+/// When a linked policy first asks a second factor, the cache is filled before the flag lets a
+/// door use it; a fill that fails leaves the flag unknown, and the doors it concerns refuse.
+pub async fn follow_mfa_item<H>(
+    handler: &H,
+    cache: &PolicyCache,
+    policies: &[Policy],
+) -> Result<bool>
+where
+    H: UserListerBackendHandler + UserBackendHandler + PolicyBackendHandler + ?Sized,
+{
+    let live = cache.mfa_policy().is_none() && policies.iter().any(asks_mfa);
+    if !live || cache.mfa_item_live() {
+        cache.set_mfa_item_live(live);
+        return Ok(false);
+    }
+    if let Err(e) = fill_policy_cache(handler, cache).await {
+        cache.set_mfa_item_unknown();
+        return Err(e);
+    }
+    cache.set_mfa_item_live(true);
+    if let Err(e) = fill_policy_cache(handler, cache).await {
+        cache.set_mfa_item_unknown();
+        return Err(e);
+    }
+    Ok(true)
+}
+
+fn asks_mfa(policy: &Policy) -> bool {
+    let value = policy.items.get(ENABLE_MFA);
+    !policy.linked_ous.is_empty() && value.is_some_and(|value| value != "off")
+}
+
+/// The OUs whose policy turns the factor on with no explicit server-wide value over them.
+pub fn ous_asking_mfa(server: Option<MfaPolicy>, policies: &[Policy]) -> usize {
+    let asking = policies.iter().filter(|policy| asks_mfa(policy));
+    let ous = asking.map(|policy| policy.linked_ous.len()).sum();
+    if server.is_some() { 0 } else { ous }
+}
+
+/// The start's one warning that stored OU items now ask a factor: a count, never a name.
+#[derive(Default)]
+pub struct StartWarning(AtomicBool);
+
+impl StartWarning {
+    pub const fn new() -> Self {
+        Self(AtomicBool::new(false))
+    }
+
+    pub fn take(&self, server: Option<MfaPolicy>, policies: &[Policy]) -> Option<String> {
+        let ous = ous_asking_mfa(server, policies);
+        if ous == 0 || self.0.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        Some(format!(
+            "{ous} OU(s) set enable-mfa to enabled or always, and no server-wide enable_mfa \
+             overrides them: under always, a user without a factor is refused at the LDAP bind \
+             and the simple login, administrators and service accounts too, until enrolled or \
+             in {MFA_DISABLED_GROUP}"
+        ))
+    }
+}
+
+/// Made by whichever server first sees the item apply; one of that name is kept.
+pub async fn ensure_exempt_group<H>(handler: &H) -> Result<()>
+where
+    H: GroupListerBackendHandler + GroupBackendHandler + ?Sized,
+{
+    let filter = GroupRequestFilter::DisplayName(MFA_DISABLED_GROUP.into());
+    if !handler.list_groups(Some(filter)).await?.is_empty() {
+        return Ok(());
+    }
+    let ou = Attribute {
+        name: "ou".into(),
+        value: "groups".to_owned().into(),
+    };
+    let request = CreateGroupRequest {
+        display_name: MFA_DISABLED_GROUP.into(),
+        attributes: vec![ou],
+    };
+    handler.create_group(request).await.map(drop)
+}
+
 pub async fn policy_changed<H>(handler: &H, cache: &PolicyCache)
 where
     H: UserListerBackendHandler + UserBackendHandler + PolicyBackendHandler + ?Sized,
@@ -745,6 +908,16 @@ fn not_read_yet(
     })
 }
 
+/// The door's one row for a value that could not be read.
+pub fn refuse_unreadable(user: &UserId, door: Door) -> Refusal {
+    let refusal = Refusal {
+        item: UNREADABLE,
+        door,
+    };
+    record_refusal(user, &refusal);
+    refusal
+}
+
 fn record_refusal(user: &UserId, refusal: &Refusal) {
     logging::record_as(
         Some(user),
@@ -849,15 +1022,17 @@ pub fn record_kdc_row(
 mod tests {
     use super::*;
     use crate::handler::{ReadSchemaBackendHandler, UserRequestFilter};
+    use crate::lockout::{LockStore, LockWrite, SplitMark, StoredLock, Written, first_follow};
     use crate::policies::{
-        CreatePolicyRequest, OuPolicyState, Policy, PolicyId, PolicyLevel, PolicyScope,
+        CreatePolicyRequest, ItemSource, OuPolicyState, Policy, PolicyId, PolicyLevel, PolicyScope,
         UpdatePolicyRequest, catalog_item,
     };
-    use lldap_domain::requests::CreateUserRequest;
-    use lldap_domain::types::{Attribute, GroupDetails, GroupId, User, UserAndGroups, Uuid};
+    use chrono::NaiveDateTime;
+    use lldap_domain::requests::{CreateUserRequest, UpdateGroupRequest};
+    use lldap_domain::types::{Attribute, Group, GroupDetails, GroupId, User, UserAndGroups, Uuid};
     use lldap_schema::PublicSchema;
     use pretty_assertions::assert_eq;
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashSet};
     use std::sync::atomic::AtomicBool;
 
     struct Check(&'static str, fn(&Attempt<'_>, &str) -> bool);
@@ -936,7 +1111,7 @@ mod tests {
         let allow = |key| check(key, |_, _| true);
         let items = [
             item("login-hours", "mon 08:00-09:00"),
-            item("require-mfa", "always"),
+            item("enable-mfa", "always"),
         ];
         let refused = |item| {
             Err(Refusal {
@@ -960,19 +1135,19 @@ mod tests {
                 "the first refusing is named",
                 vec![
                     allow("login-hours"),
-                    refuse("require-mfa"),
+                    refuse("enable-mfa"),
                     refuse("login-hours"),
                 ],
-                refused("require-mfa"),
+                refused("enable-mfa"),
             ),
             (
                 "the check sees the value",
-                vec![check("require-mfa", |_, value| value == "off")],
-                refused("require-mfa"),
+                vec![check("enable-mfa", |_, value| value == "off")],
+                refused("enable-mfa"),
             ),
             (
                 "the check sees the attempt",
-                vec![check("require-mfa", |attempt, _| attempt.second_factor)],
+                vec![check("enable-mfa", |attempt, _| attempt.second_factor)],
                 Ok(()),
             ),
             (
@@ -1005,8 +1180,12 @@ mod tests {
         let checked: HashSet<&str> = keys.chain(read).collect();
         assert_eq!(
             checked,
-            HashSet::from(["lockout-threshold", "lockout-duration-seconds"]),
-            "the lockout is enforced; the other items are not yet"
+            HashSet::from([
+                "lockout-threshold",
+                "lockout-duration-seconds",
+                "enable-mfa"
+            ]),
+            "the lockout and enable-mfa are enforced; the other items are not yet"
         );
         for spec in POLICY_ITEM_CATALOG {
             assert_eq!(spec.enforced, checked.contains(spec.key), "{}", spec.key);
@@ -1014,6 +1193,152 @@ mod tests {
         for key in checked {
             assert!(catalog_item(key).is_some(), "{key} is not a catalog item");
         }
+    }
+
+    fn set_by_ou(key: &str, value: &str) -> EffectiveItem {
+        let source = ItemSource {
+            policy_id: PolicyId(1),
+            policy_name: "p".to_owned(),
+            ou_key: "e2ou".to_owned(),
+        };
+        EffectiveItem {
+            source: Some(source),
+            ..item(key, value)
+        }
+    }
+
+    #[test]
+    fn test_the_mfa_item_costs_one_atomic_read_until_an_ou_sets_it() {
+        use MfaPolicy::{Always, Disabled, Enrolled};
+        let cache = PolicyCache::new();
+        let strict = [set_by_ou("enable-mfa", "always")];
+        let loose = [set_by_ou("enable-mfa", "enabled")];
+        cache.replace(entries(
+            &[("e2strict", "e2s"), ("e2loose", "e2l")],
+            &[("e2s", &strict[..]), ("e2l", &loose[..])],
+        ));
+        let (strict, loose, missing) = (
+            UserId::new("e2strict"),
+            UserId::new("e2loose"),
+            UserId::new("e2missing"),
+        );
+        let flag = |live: Option<bool>| match live {
+            Some(live) => cache.set_mfa_item_live(live),
+            None => cache.set_mfa_item_unknown(),
+        };
+        let (off, on, unknown) = (Some(false), Some(true), None);
+        let rows = [
+            (
+                "nothing set anywhere",
+                off,
+                None,
+                Some(false),
+                [Some(Disabled); 3],
+                false,
+            ),
+            (
+                "an OU sets it",
+                on,
+                None,
+                Some(true),
+                [Some(Always), Some(Enrolled), None],
+                true,
+            ),
+            (
+                "an explicit always overrides",
+                on,
+                Some(Always),
+                Some(false),
+                [Some(Always); 3],
+                true,
+            ),
+            (
+                "an explicit enabled overrides",
+                on,
+                Some(Enrolled),
+                Some(false),
+                [Some(Enrolled); 3],
+                true,
+            ),
+            (
+                "an explicit off overrides",
+                on,
+                Some(Disabled),
+                Some(false),
+                [Some(Disabled); 3],
+                false,
+            ),
+            ("not read yet", unknown, None, None, [None; 3], true),
+            (
+                "not read yet, an explicit off",
+                unknown,
+                Some(Disabled),
+                Some(false),
+                [Some(Disabled); 3],
+                false,
+            ),
+        ];
+        for (label, live, server, matters, policies, can_be_on) in rows {
+            flag(live);
+            cache.set_mfa_policy(server);
+            let reads = cache.reads();
+            assert_eq!(mfa_item_matters(&cache, server), matters, "{label}");
+            assert_eq!(mfa_can_be_on(server, &cache), can_be_on, "{label}");
+            assert_eq!(cache.reads(), reads, "{label}: no read of the entries");
+            let held = cache.get();
+            let got =
+                [&strict, &loose, &missing].map(|user| cached_mfa_policy(&cache, &held, user));
+            assert_eq!(got, policies, "{label}");
+        }
+        for live in [unknown, on] {
+            flag(live);
+            cache.set_mfa_policy(Some(Enrolled));
+            assert!(
+                !MfaItemCheck.live(&cache),
+                "an explicit value: the OUs' item is not live ({live:?})"
+            );
+        }
+        cache.set_mfa_policy(None);
+        flag(unknown);
+        assert!(
+            MfaItemCheck.live(&cache),
+            "not read yet: the cache is kept filled"
+        );
+        flag(off);
+        assert!(!MfaItemCheck.live(&cache), "no OU sets it: no fill");
+    }
+
+    #[test]
+    fn test_the_mfa_item_check_refuses_nothing_at_any_door() {
+        let bob = UserId::new("bob");
+        let items = [item("enable-mfa", "always")];
+        let checks: Vec<Arc<dyn ItemCheck>> = vec![Arc::new(MfaItemCheck)];
+        let (cache, counter) = (PolicyCache::new(), Lockout::default());
+        cache.replace(entries(&[("bob", "e2s")], &[("e2s", &items[..])]));
+        cache.set_mfa_item_live(true);
+        for door in [
+            Door::LdapBind,
+            Door::WebLogin,
+            Door::KerberosAs,
+            Door::KerberosTgs,
+        ] {
+            let attempt = Attempt::at_kdc(&bob, door, None, 1_700_000_000);
+            assert_eq!(
+                decide(&attempt, &items, &UserState::default(), &checks),
+                Ok(()),
+                "{door:?}"
+            );
+            let reads = cache.reads();
+            assert_eq!(
+                (
+                    admit_at_kdc_with(&cache, &counter, &attempt, &checks),
+                    cache.reads() - reads
+                ),
+                (Ok(()), 0),
+                "{door:?}: the KDC's verdict is as it was"
+            );
+        }
+        assert!(!MfaItemCheck.may_refuse(&UserState::default()));
     }
 
     #[test]
@@ -1311,6 +1636,12 @@ mod tests {
         stalled: AtomicBool,
         moves: Mutex<Option<(UserId, &'static str)>>,
         meanwhile: Mutex<Option<(&'static PolicyCache, UserId)>>,
+        policies_down: AtomicBool,
+        policy_reads: AtomicU64,
+        policies: Vec<Policy>,
+        users_down: AtomicBool,
+        user_lists: AtomicU64,
+        groups: Mutex<Vec<CreateGroupRequest>>,
     }
 
     impl Directory {
@@ -1325,6 +1656,22 @@ mod tests {
         fn listing(mut self, names: &[&str]) -> Self {
             self.listed = names.iter().map(|name| user(name)).collect();
             self
+        }
+
+        fn asking(mut self, value: &str) -> Self {
+            self.policies = vec![Policy {
+                id: PolicyId(1),
+                name: "labs".to_owned(),
+                description: String::new(),
+                items: BTreeMap::from([(ENABLE_MFA.to_owned(), value.to_owned())]),
+                linked_ous: vec![LABS.to_owned()],
+            }];
+            self
+        }
+
+        fn group_names(&self) -> Vec<String> {
+            let made = self.groups.lock().unwrap();
+            made.iter().map(|g| g.display_name.to_string()).collect()
         }
     }
 
@@ -1342,6 +1689,10 @@ mod tests {
             _: Option<UserRequestFilter>,
             _: bool,
         ) -> Result<Vec<UserAndGroups>> {
+            self.user_lists.fetch_add(1, Ordering::Relaxed);
+            if self.users_down.load(Ordering::Relaxed) {
+                return Err(DomainError::InternalError("down".to_owned()));
+            }
             let listed = self.listed.iter().cloned();
             Ok(listed
                 .map(|user| UserAndGroups { user, groups: None })
@@ -1393,7 +1744,11 @@ mod tests {
     #[async_trait]
     impl PolicyBackendHandler for Directory {
         async fn list_policies(&self) -> Result<Vec<Policy>> {
-            unimplemented!()
+            self.policy_reads.fetch_add(1, Ordering::Relaxed);
+            match self.policies_down.load(Ordering::Relaxed) {
+                true => Err(DomainError::InternalError("down".to_owned())),
+                false => Ok(self.policies.clone()),
+            }
         }
         async fn get_policy(&self, _: PolicyId) -> Result<Policy> {
             unimplemented!()
@@ -1424,6 +1779,263 @@ mod tests {
         }
         async fn delete_ou_policy_state(&self, _: &str) -> Result<()> {
             unimplemented!()
+        }
+    }
+
+    #[async_trait]
+    impl GroupListerBackendHandler for Directory {
+        async fn list_groups(&self, _: Option<GroupRequestFilter>) -> Result<Vec<Group>> {
+            let epoch = DateTime::from_timestamp(0, 0).unwrap().naive_utc();
+            let made = self.groups.lock().unwrap().clone();
+            let group = |(n, made): (usize, CreateGroupRequest)| Group {
+                id: GroupId(n as i32 + 1),
+                uuid: Uuid::from_name_and_date(made.display_name.as_str(), &epoch),
+                display_name: made.display_name,
+                creation_date: epoch,
+                users: Vec::new(),
+                attributes: made.attributes,
+                modified_date: epoch,
+            };
+            Ok(made.into_iter().enumerate().map(group).collect())
+        }
+    }
+
+    #[async_trait]
+    impl GroupBackendHandler for Directory {
+        async fn get_group_details(&self, _: GroupId) -> Result<GroupDetails> {
+            unimplemented!()
+        }
+        async fn update_group(&self, _: UpdateGroupRequest) -> Result<()> {
+            unimplemented!()
+        }
+        async fn create_group(&self, request: CreateGroupRequest) -> Result<GroupId> {
+            let mut made = self.groups.lock().unwrap();
+            made.push(request);
+            Ok(GroupId(made.len() as i32))
+        }
+        async fn delete_group(&self, _: GroupId) -> Result<()> {
+            unimplemented!()
+        }
+    }
+
+    #[async_trait]
+    impl LockStore for Directory {
+        async fn read_lock(&self, _: &UserId) -> Result<Option<LockRow>> {
+            Ok(None)
+        }
+        async fn read_locks(&self, _: Option<NaiveDateTime>) -> Result<Vec<StoredLock>> {
+            Ok(Vec::new())
+        }
+        async fn read_lock_users(&self) -> Result<Vec<UserId>> {
+            Ok(Vec::new())
+        }
+        async fn read_split(&self, _: &UserId) -> Result<Option<SplitMark>> {
+            Ok(None)
+        }
+        async fn read_period(&self) -> Result<String> {
+            Ok("0".to_owned())
+        }
+        async fn write_locks(&self, period: &str, _: &[LockWrite]) -> Result<Written> {
+            let period = period.to_owned();
+            Ok(Written {
+                period,
+                ..Written::default()
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_while_the_mfa_item_is_unknown_the_policies_are_read_again_every_second() {
+        let cache: &'static PolicyCache = Box::leak(Box::new(PolicyCache::new()));
+        let counter: &'static Lockout = Box::leak(Box::default());
+        let directory = Arc::new(Directory::default());
+        directory.policies_down.store(true, Ordering::Relaxed);
+        cache.set_mfa_item_unknown();
+        let running = counter.run(directory.clone(), cache);
+        let reads = || directory.policy_reads.load(Ordering::Relaxed);
+        let doors = || mfa_item_matters(cache, None);
+        tokio::time::sleep(Duration::from_millis(3_900)).await;
+        assert_eq!(
+            (reads(), doors()),
+            (3, None),
+            "unreadable: read again each second, and the doors it concerns refuse"
+        );
+        directory.policies_down.store(false, Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(1_250)).await;
+        assert_eq!(
+            (reads(), doors()),
+            (4, Some(false)),
+            "the next second's read takes it, and the doors serve"
+        );
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        assert_eq!(reads(), 4, "once read, no read until the next tick");
+        counter.follow_policies(&*directory, cache).await.unwrap();
+        assert_eq!(
+            reads(),
+            5,
+            "a follow reads the policies once for both flags"
+        );
+        running.abort();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_at_start_an_unreadable_mfa_item_leaves_the_lockout_known_and_the_kdc_admitting() {
+        let (cache, counter) = (PolicyCache::new(), Lockout::default());
+        let directory = Directory::knowing(&[LATE]).listing(&[LATE]);
+        let directory = directory.asking("always");
+        directory.users_down.store(true, Ordering::Relaxed);
+        let started = first_follow(&counter, &directory, &cache).await;
+        let flags = (cache.lockout_unknown(), mfa_item_matters(&cache, None));
+        assert_eq!(
+            (started.is_err(), flags),
+            (true, (false, None)),
+            "the item's fill failed; the lockout's flag left unknown all the same"
+        );
+        let (late, checks) = (UserId::new(LATE), default_item_checks());
+        for door in [Door::KerberosAs, Door::KerberosTgs, Door::KerberosS4u] {
+            let attempt = Attempt::new(&late, door);
+            let verdict = admit_at_kdc(&cache, &attempt, &checks);
+            assert_eq!(verdict, Ok(()), "{door:?}: no `policy: unreadable`");
+        }
+        assert_eq!(
+            directory.group_names(),
+            Vec::<String>::new(),
+            "none while unknown"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_the_follow_makes_the_exempt_group_only_once_the_item_is_read_applying() {
+        let always = Some(MfaPolicy::Always);
+        let rows = [
+            ("unreadable: unknown", "always", None, true, false),
+            ("off", "off", None, false, false),
+            (
+                "an explicit value: the item is not read",
+                "always",
+                always,
+                false,
+                false,
+            ),
+            ("enabled, read", "enabled", None, false, true),
+            ("always, read", "always", None, false, true),
+        ];
+        for (label, value, server, down, made) in rows {
+            let (cache, counter) = (PolicyCache::new(), Lockout::default());
+            cache.set_mfa_policy(server);
+            let directory = Directory::knowing(&[LATE]).listing(&[LATE]);
+            let directory = directory.asking(value);
+            directory.users_down.store(down, Ordering::Relaxed);
+            let _ = first_follow(&counter, &directory, &cache).await;
+            let expected = match made {
+                true => vec![MFA_DISABLED_GROUP.to_owned()],
+                false => vec![],
+            };
+            assert_eq!(directory.group_names(), expected, "{label}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_whichever_server_first_reads_the_item_applying_makes_the_one_exempt_group() {
+        let directory = Directory::knowing(&[LATE]).listing(&[LATE]);
+        let directory = directory.asking("always");
+        let (here, there) = (PolicyCache::new(), PolicyCache::new());
+        let (counter_here, counter_there) = (Lockout::default(), Lockout::default());
+        directory.users_down.store(true, Ordering::Relaxed);
+        let _ = first_follow(&counter_here, &directory, &here).await;
+        assert_eq!(directory.group_names().len(), 0, "unreadable at this start");
+        directory.users_down.store(false, Ordering::Relaxed);
+        let tick = counter_there.follow_policies(&directory, &there).await;
+        assert_eq!(
+            (tick.is_ok(), directory.group_names()),
+            (true, vec![MFA_DISABLED_GROUP.to_owned()]),
+            "the other server's refill tick reads it applying and makes it"
+        );
+        let next = counter_here.follow_policies(&directory, &here).await;
+        assert_eq!(
+            (next.is_ok(), directory.group_names().len()),
+            (true, 1),
+            "this server's next follow keeps the one"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_under_an_explicit_value_the_ou_item_is_never_read() {
+        let late = UserId::new(LATE);
+        for server in [MfaPolicy::Disabled, MfaPolicy::Enrolled, MfaPolicy::Always] {
+            let (cache, counter) = (PolicyCache::new(), Lockout::default());
+            cache.set_mfa_policy(Some(server));
+            let directory = Directory::knowing(&[LATE]).listing(&[LATE]);
+            let directory = directory.asking("always");
+            first_follow(&counter, &directory, &cache).await.unwrap();
+            user_written(&directory, &cache, &late).await;
+            policy_changed(&directory, &cache).await;
+            let live = live_checks(&default_item_checks(), &cache).len();
+            let lists = directory.user_lists.load(Ordering::Relaxed);
+            assert_eq!(
+                (live, lists, ou_of(&cache, &late)),
+                (0, 0, None),
+                "{server:?}: no fill at the follow, no re-read at a write"
+            );
+        }
+    }
+
+    #[test]
+    fn test_the_start_warns_once_with_the_ou_count_when_stored_items_now_ask_a_factor() {
+        let warning = StartWarning::new();
+        let policy = |value: &str, ous: &[&str]| Policy {
+            id: PolicyId(1),
+            name: "p".to_owned(),
+            description: String::new(),
+            items: BTreeMap::from([(ENABLE_MFA.to_owned(), value.to_owned())]),
+            linked_ous: ous.iter().map(|ou| ou.to_string()).collect(),
+        };
+        let (off, stored) = (
+            [policy("off", &["people"])],
+            [policy("always", &["a", "b"])],
+        );
+        let said = [
+            warning.take(None, &off),
+            warning.take(Some(MfaPolicy::Enrolled), &stored),
+            warning.take(None, &stored),
+            warning.take(None, &stored),
+        ];
+        let counted = said.map(|text| text.map(|t| t.starts_with("2 OU(s) set enable-mfa ")));
+        assert_eq!(
+            counted,
+            [None, None, Some(true), None],
+            "nothing stored, or an explicit value: no warning; stored items now enforced: one \
+             warning with the count; a second call: none"
+        );
+    }
+
+    #[test]
+    fn test_the_start_counts_the_ous_that_turn_the_factor_on() {
+        let policy = |id, value: &str, ous: &[&str]| Policy {
+            id: PolicyId(id),
+            name: format!("p{id}"),
+            description: String::new(),
+            items: BTreeMap::from([(ENABLE_MFA.to_owned(), value.to_owned())]),
+            linked_ous: ous.iter().map(|ou| ou.to_string()).collect(),
+        };
+        let policies = [
+            policy(1, "enabled", &["people", "people\\labs"]),
+            policy(2, "always", &["staff"]),
+            policy(3, "off", &["guests"]),
+            policy(4, "always", &[]),
+        ];
+        let rows = [
+            (None, 3),
+            (Some(MfaPolicy::Disabled), 0),
+            (Some(MfaPolicy::Enrolled), 0),
+            (Some(MfaPolicy::Always), 0),
+        ];
+        for (server, ous) in rows {
+            assert_eq!(ous_asking_mfa(server, &policies), ous, "{server:?}");
         }
     }
 

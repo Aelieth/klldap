@@ -10,13 +10,14 @@ use lldap_domain::{
         Serialized, UserId, Uuid,
     },
 };
+use lldap_domain_handlers::enforcement::{self, mfa_can_be_on};
 use lldap_domain_handlers::handler::{
     GroupBackendHandler, GroupListerBackendHandler, GroupRequestFilter, ReadSchemaBackendHandler,
     SubStringFilter, SystemConfigBackendHandler,
 };
 use lldap_domain_handlers::kerberos::require_kdc_ready;
 use lldap_domain_handlers::logging::{self, LogKind};
-use lldap_domain_handlers::mfa::is_protected_group;
+use lldap_domain_handlers::mfa::{MfaPolicy, is_protected_group};
 use lldap_domain_model::{
     error::{DomainError, Result},
     model::{self, GroupColumn, MembershipColumn, codec},
@@ -315,7 +316,8 @@ impl GroupBackendHandler for SqlBackendHandler {
             .ok_or_else(|| {
                 DomainError::EntityNotFound(format!("No such group: '{:?}'", request.group_id))
             })?;
-        if request.display_name.is_some() && is_protected_group(&current_name, self.mfa_policy) {
+        let mfa = mfa_can_be_on(self.mfa_policy, self.policy_cache);
+        if request.display_name.is_some() && is_protected_group(&current_name, mfa) {
             return Err(DomainError::InternalError(format!(
                 "Cannot rename built-in group '{current_name}'"
             )));
@@ -457,7 +459,8 @@ impl GroupBackendHandler for SqlBackendHandler {
         require_kdc_ready()?;
         let group_details = self.get_group_details(group_id).await?;
 
-        if is_protected_group(group_details.display_name.as_str(), self.mfa_policy) {
+        let mfa = mfa_can_be_on(self.mfa_policy, self.policy_cache);
+        if is_protected_group(group_details.display_name.as_str(), mfa) {
             return Err(DomainError::InternalError(format!(
                 "Cannot delete built-in group '{}'",
                 group_details.display_name
@@ -482,6 +485,17 @@ impl GroupBackendHandler for SqlBackendHandler {
 }
 
 impl SqlBackendHandler {
+    /// At start, for an explicit server-wide `enabled` or `always`; the OUs' item is the follow's.
+    pub async fn exempt_group_at_start(&self) -> Result<()> {
+        let on = self
+            .mfa_policy
+            .is_some_and(|policy| policy != MfaPolicy::Disabled);
+        match on {
+            true => enforcement::ensure_exempt_group(self).await,
+            false => Ok(()),
+        }
+    }
+
     async fn update_group_with_transaction(
         request: UpdateGroupRequest,
         transaction: &DatabaseTransaction,

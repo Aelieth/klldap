@@ -1,15 +1,18 @@
 use crate::SqlBackendHandler;
 use crate::sql_lockout_handler::numbered;
+use crate::sql_opaque_handler::invalid_credentials;
 use crate::sql_totp_steps::{Mark, clear_used, mark_in, mark_used, refund, reserve};
 use crate::sql_used_proofs::take_proof_id;
 use async_trait::async_trait;
 use lldap_domain::types::{MFA_TYPE_TOTP, TotpEnrollmentStart, UserId};
+use lldap_domain_handlers::enforcement::{UNREADABLE, mfa_item_matters, resolve_items};
 use lldap_domain_handlers::handler::MfaBackendHandler;
 use lldap_domain_handlers::logging::{self, LogKind};
 use lldap_domain_handlers::mfa::{
-    MFA_DISABLED_GROUP, MfaEnrollmentStatus, MfaPolicy, MfaRequirement, MfaResetReason,
+    EnableMfa, MFA_DISABLED_GROUP, MfaEnrollmentStatus, MfaPolicy, MfaRequirement, MfaResetReason,
     mfa_requirement,
 };
+use lldap_domain_handlers::policies::resolve;
 use lldap_domain_model::{
     error::{DomainError, Result},
     model::{self, UserColumn},
@@ -28,6 +31,7 @@ use std::cell::Cell;
 use tracing::{info, instrument, warn};
 
 const TOTP_ISSUER: &str = "KLLDAP";
+const OU_ITEM_NOT_READ: &str = "the OU policies are not read yet";
 
 #[cfg(any(test, feature = "test-clock"))]
 thread_local! {
@@ -223,6 +227,51 @@ impl SqlBackendHandler {
         }))
     }
 
+    /// The user's resolved `enable_mfa`.
+    pub(crate) async fn user_mfa_policy(&self, user_id: &UserId) -> Result<MfaPolicy> {
+        let (server, cache) = (self.mfa_policy, self.policy_cache);
+        match mfa_item_matters(cache, server) {
+            Some(false) => return Ok(resolve::<EnableMfa>(server, &[]).0),
+            None => return Err(DomainError::InternalError(OU_ITEM_NOT_READ.to_owned())),
+            Some(true) => {}
+        }
+        match resolve_items(self, cache, user_id).await {
+            Ok(items) => Ok(resolve::<EnableMfa>(server, &items).0),
+            Err(DomainError::EntityNotFound(_)) => Ok(resolve::<EnableMfa>(server, &[]).0),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn requirement_under(
+        &self,
+        policy: MfaPolicy,
+        user_id: &UserId,
+    ) -> Result<MfaRequirement> {
+        if policy == MfaPolicy::Disabled {
+            return Ok(MfaRequirement::None);
+        }
+        let status = self.mfa_enrollment_status(user_id).await?;
+        Ok(mfa_requirement(policy, status.as_ref()))
+    }
+
+    /// At a door, an OU item that cannot be read refuses with the door's own row.
+    pub(crate) async fn door_requirement(
+        &self,
+        user_id: &UserId,
+        kind: LogKind,
+    ) -> Result<MfaRequirement> {
+        let policy = match self.user_mfa_policy(user_id).await {
+            Ok(policy) => policy,
+            Err(e) => {
+                warn!(r#"The OU policy of "{user_id}" could not be read for enable-mfa: {e}"#);
+                let detail = format!("policy: {UNREADABLE}");
+                logging::record_as(Some(user_id), kind, None, false, Some(&detail));
+                return Err(invalid_credentials(user_id));
+            }
+        };
+        self.requirement_under(policy, user_id).await
+    }
+
     // Reserve before verifying, so a spent allowance cannot keep testing codes; a right code is
     // refunded, used or not, unless its key changed meanwhile: that one counts as invalid.
     pub(crate) async fn verify_user_totp(
@@ -297,11 +346,20 @@ impl SqlBackendHandler {
 #[async_trait]
 impl MfaBackendHandler for SqlBackendHandler {
     async fn mfa_requirement(&self, user_id: &UserId) -> Result<MfaRequirement> {
-        if self.mfa_policy == MfaPolicy::Disabled {
-            return Ok(MfaRequirement::None);
+        let policy = self.user_mfa_policy(user_id).await?;
+        self.requirement_under(policy, user_id).await
+    }
+
+    async fn enrollment_pending(&self, user_id: &UserId) -> Result<bool> {
+        let policy = self.user_mfa_policy(user_id).await?;
+        if policy != MfaPolicy::Always {
+            return Ok(false);
         }
-        let status = self.mfa_enrollment_status(user_id).await?;
-        Ok(mfa_requirement(self.mfa_policy, status.as_ref()))
+        Ok(self.requirement_under(policy, user_id).await? == MfaRequirement::Enrollment)
+    }
+
+    async fn mfa_mode(&self, user_id: &UserId) -> Result<MfaPolicy> {
+        self.user_mfa_policy(user_id).await
     }
 
     async fn seal_enrollment_proof(&self, user_id: &UserId) -> Result<Option<String>> {
@@ -489,10 +547,22 @@ impl MfaBackendHandler for SqlBackendHandler {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::sql_backend_handler::tests::{get_initialized_db, insert_user_no_password};
+    use crate::sql_backend_handler::tests::{
+        get_initialized_db, insert_group, insert_membership, insert_user_no_password,
+    };
+    use crate::sql_lockout_handler::tests as doors;
     use crate::sql_tables::{DbConnection, init_table};
     use lldap_auth::opaque::server::{ServerSetup, generate_random_private_key};
+    use lldap_domain::requests::UpdateGroupRequest;
+    use lldap_domain::requests::UpdateUserRequest;
+    use lldap_domain::types::{Attribute, LoginOutcome};
+    use lldap_domain_handlers::handler::{
+        GroupBackendHandler, GroupListerBackendHandler, GroupRequestFilter,
+    };
+    use lldap_domain_handlers::handler::{PolicyBackendHandler, UserBackendHandler};
     use lldap_domain_handlers::logging::{RequestMeta, with_request};
+    use lldap_domain_handlers::mfa::ENABLE_MFA;
+    use lldap_domain_handlers::policies::{CreatePolicyRequest, PolicyId, UpdatePolicyRequest};
     use lldap_mfa::{
         EnrollmentState, SEALED_BLOB_LEN, SEALED_PREFIX, TOTP_CURRENT_CODE_REQUIRED,
         TOTP_ENROLLMENT_TTL_SECS, TOTP_MAX_ATTEMPTS_PER_STEP, TOTP_SEED_LEN, format_code,
@@ -502,6 +572,7 @@ pub(crate) mod tests {
     use pretty_assertions::assert_eq;
     use sea_orm::{ConnectionTrait, DbBackend, Statement};
     use serial_test::serial;
+    use std::sync::{Arc, Mutex};
 
     const AT: i64 = 1_770_000_015;
 
@@ -1563,6 +1634,390 @@ pub(crate) mod tests {
                 row(LogKind::MfaEnroll, true, "bob", "totp"),
                 row(LogKind::MfaEnroll, false, "bob", "invalid totp"),
             ]
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_the_requirement_follows_the_resolved_value_in_48_cases() {
+        use MfaPolicy::{Always, Disabled, Enrolled};
+        use MfaRequirement::{Enrollment, Totp};
+        let (_clock, at) = doors::pinned();
+        let h = doors::handler().await;
+        let exempt = insert_group(&h, MFA_DISABLED_GROUP).await;
+        let kinds = ["totp", "none", "exempt"];
+        for item in ["unset", "off", "enabled", "always"] {
+            let ou = format!("e2{item}ou");
+            if item != "unset" {
+                doors::policy_on(&h, &ou, &[(ENABLE_MFA, item)]).await;
+            }
+            for kind in kinds {
+                let name = format!("e2{item}-{kind}");
+                doors::user_in(&h, &name, &ou).await;
+                if kind != "none" {
+                    doors::enroll(&h, &name, at).await;
+                }
+                if kind == "exempt" {
+                    insert_membership(&h, exempt, &name).await;
+                }
+            }
+        }
+        let free = MfaRequirement::None;
+        let rows = [
+            (None, "unset", Disabled),
+            (None, "off", Disabled),
+            (None, "enabled", Enrolled),
+            (None, "always", Always),
+            (Some(Disabled), "unset", Disabled),
+            (Some(Disabled), "off", Disabled),
+            (Some(Disabled), "enabled", Disabled),
+            (Some(Disabled), "always", Disabled),
+            (Some(Enrolled), "unset", Enrolled),
+            (Some(Enrolled), "off", Enrolled),
+            (Some(Enrolled), "enabled", Enrolled),
+            (Some(Enrolled), "always", Enrolled),
+            (Some(Always), "unset", Always),
+            (Some(Always), "off", Always),
+            (Some(Always), "enabled", Always),
+            (Some(Always), "always", Always),
+        ];
+        assert_eq!(rows.len() * kinds.len(), 48);
+        for (server, item, mode) in rows {
+            let expected = match mode {
+                Disabled => [free, free, free],
+                Enrolled => [Totp, free, free],
+                Always => [Totp, Enrollment, free],
+            };
+            let h = h.clone().with_mfa_setting(server);
+            for (kind, want) in kinds.into_iter().zip(expected) {
+                let user = UserId::new(&format!("e2{item}-{kind}"));
+                let got = (
+                    h.mfa_mode(&user).await.unwrap(),
+                    h.mfa_requirement(&user).await.unwrap(),
+                );
+                assert_eq!(got, (mode, want), "server {server:?}, OU {item}, {kind}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_an_ous_always_refuses_an_unenrolled_bind_and_simple_login_and_confines_the_web() {
+        let log = LogGuard::install_on_this_thread();
+        let h = doors::handler().await;
+        doors::policy_on(&h, "e2strictou", &[(ENABLE_MFA, "always")]).await;
+        doors::user_in(&h, "e2strict", "e2strictou").await;
+        doors::user_in(&h, "e2plain", "e2plainou").await;
+        let row = |user: &str, detail: Option<&str>, kind| {
+            (kind, Some(user.to_owned()), detail.map(str::to_owned))
+        };
+        let required = Some("mfa enrollment required");
+        for meta in [RequestMeta::ldap(None, None), RequestMeta::http(None, None)] {
+            let binds = with_request(meta, async {
+                let strict = doors::bind(&h, "e2strict", doors::RIGHT).await;
+                (strict, doors::bind(&h, "e2plain", doors::RIGHT).await)
+            });
+            assert_eq!(binds.await, (false, true), "the right password, no factor");
+            assert_eq!(
+                doors::rows(&log, &[LogKind::Bind]),
+                vec![
+                    row("e2strict", required, LogKind::Bind),
+                    row("e2plain", None, LogKind::Bind),
+                ]
+            );
+        }
+        let strict = doors::web(&h, "e2strict", doors::RIGHT, None).await;
+        let plain = doors::web(&h, "e2plain", doors::RIGHT, None).await;
+        let signed_in = |user: &str, pending| LoginOutcome::Authenticated {
+            user_id: UserId::new(user),
+            mfa_enrollment_pending: pending,
+        };
+        assert_eq!(
+            (strict, plain),
+            (
+                Ok(signed_in("e2strict", true)),
+                Ok(signed_in("e2plain", false))
+            ),
+            "the web admits the user only to enrol"
+        );
+        assert_eq!(
+            doors::rows(&log, &[LogKind::Login]),
+            vec![
+                row("e2strict", Some("mfa enrollment pending"), LogKind::Login),
+                row("e2plain", None, LogKind::Login),
+            ]
+        );
+        let (strict, plain) = (UserId::new("e2strict"), UserId::new("e2plain"));
+        let confined = (
+            h.enrollment_pending(&strict).await.unwrap(),
+            h.enrollment_pending(&plain).await.unwrap(),
+        );
+        assert_eq!(confined, (true, false), "a token's requests are confined");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_an_ous_enabled_asks_the_code_and_an_explicit_off_overrides_it() {
+        let (_clock, at) = doors::pinned();
+        let h = doors::handler().await;
+        doors::policy_on(&h, "e2codeou", &[(ENABLE_MFA, "enabled")]).await;
+        doors::user_in(&h, "e2code", "e2codeou").await;
+        let seed = doors::enroll(&h, "e2code", at).await;
+        let ([code, _], _) = doors::codes(&seed, at);
+        let with_code = format!("{}:{code}", doors::RIGHT);
+        let bare = doors::bind(&h, "e2code", doors::RIGHT).await;
+        let coded = doors::bind(&h, "e2code", &with_code).await;
+        assert_eq!(
+            (bare, coded),
+            (false, true),
+            "the OU's enabled: password:code"
+        );
+        let off = h.clone().with_mfa_policy(MfaPolicy::Disabled);
+        let bare = doors::bind(&off, "e2code", doors::RIGHT).await;
+        let coded = doors::bind(&off, "e2code", &with_code).await;
+        assert_eq!(
+            (bare, coded),
+            (true, false),
+            "an explicit server-wide off overrides the OU: the code is part of a wrong password"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_with_nothing_set_the_doors_read_no_policy_fill_nothing_and_make_no_group() {
+        let statements = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut pool = get_initialized_db().await;
+        let seen = statements.clone();
+        pool.set_metric_callback(move |info| {
+            seen.lock().unwrap().push(info.statement.sql.clone());
+        });
+        let h = doors::own(SqlBackendHandler::new(generate_random_private_key(), pool));
+        doors::policy_on(&h, "e2quietou", &[(ENABLE_MFA, "off")]).await;
+        doors::user_in(&h, "e2quiet", "e2quietou").await;
+        let (user, cache) = (UserId::new("e2quiet"), h.policy_cache);
+        let run = async |h: &SqlBackendHandler, door: &str| -> (Vec<String>, u64, u64) {
+            statements.lock().unwrap().clear();
+            let (reads, generation) = (cache.reads(), cache.generation());
+            match door {
+                "bind" => assert!(doors::bind(h, "e2quiet", doors::RIGHT).await),
+                "web" => assert!(doors::web(h, "e2quiet", doors::RIGHT, None).await.is_ok()),
+                "requirement" => assert_eq!(
+                    h.mfa_requirement(&user).await.unwrap(),
+                    MfaRequirement::None
+                ),
+                _ => assert!(!h.enrollment_pending(&user).await.unwrap()),
+            }
+            let sql = std::mem::take(&mut *statements.lock().unwrap());
+            let policies = |statement: &&String| {
+                statement.contains("ou_policies") || statement.contains("\"policies\"")
+            };
+            let read: Vec<String> = sql.iter().filter(policies).cloned().collect();
+            (read, cache.reads() - reads, cache.generation() - generation)
+        };
+        let exempt_group = async || {
+            let filter = GroupRequestFilter::DisplayName(MFA_DISABLED_GROUP.into());
+            !h.list_groups(Some(filter)).await.unwrap().is_empty()
+        };
+        let asked = ["bind", "web", "requirement", "pending"];
+        for door in asked {
+            assert_eq!(
+                run(&h, door).await,
+                (vec![], 0, 0),
+                "{door}: nothing set anywhere, so nothing is read or filled"
+            );
+        }
+        assert!(
+            !cache.mfa_item_live() && !exempt_group().await,
+            "an install that sets nothing stays plain LLDAP"
+        );
+        doors::policy_on(&h, "e2elsewhereou", &[(ENABLE_MFA, "always")]).await;
+        assert!(
+            cache.mfa_item_live() && exempt_group().await,
+            "an OU that sets it turns the item on, and the write that links it makes the group"
+        );
+        for door in asked {
+            assert_eq!(
+                run(&h, door).await,
+                (vec![], 1, 0),
+                "{door}: one read of the cache, none of the tables"
+            );
+        }
+        let explicit = h.clone().with_mfa_policy(MfaPolicy::Disabled);
+        for door in asked {
+            assert_eq!(
+                run(&explicit, door).await,
+                (vec![], 0, 0),
+                "{door}: an explicit server-wide value reads no OU"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_the_exempt_group_is_ordinary_until_a_value_can_turn_the_factor_on() {
+        let h = doors::handler().await;
+        let group = insert_group(&h, MFA_DISABLED_GROUP).await;
+        let rename = async |h: &SqlBackendHandler, name: &str| {
+            let request = UpdateGroupRequest {
+                group_id: group,
+                display_name: Some(name.into()),
+                delete_attributes: Vec::new(),
+                insert_attributes: Vec::new(),
+            };
+            h.update_group(request).await.is_ok()
+        };
+        let away_and_back = async |h: &SqlBackendHandler| {
+            rename(h, "e2renamed").await && rename(h, MFA_DISABLED_GROUP).await
+        };
+        assert!(away_and_back(&h).await, "nothing set: an ordinary group");
+        let id = doors::policy_on(&h, "e2onou", &[(ENABLE_MFA, "enabled")]).await;
+        assert!(!rename(&h, "e2renamed").await, "an OU's enabled guards it");
+        let request = UpdatePolicyRequest {
+            id,
+            name: None,
+            description: None,
+            items: Some([(ENABLE_MFA.to_owned(), "off".to_owned())].into()),
+        };
+        h.update_policy(request).await.unwrap();
+        assert!(away_and_back(&h).await, "every OU off again: ordinary");
+        let explicit = h.clone().with_mfa_policy(MfaPolicy::Enrolled);
+        assert!(
+            !rename(&explicit, "e2renamed").await,
+            "an explicit server-wide enabled guards it whatever the OUs say"
+        );
+        h.policy_cache.set_mfa_item_unknown();
+        assert!(
+            !rename(&h, "e2renamed").await,
+            "while the policies are not read it is guarded"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_the_start_makes_the_exempt_group_only_for_an_explicit_value_that_turns_it_on() {
+        let rows = [
+            ("nothing set, the item not read yet", None, false),
+            ("an explicit off", Some(MfaPolicy::Disabled), false),
+            ("an explicit enabled", Some(MfaPolicy::Enrolled), true),
+            ("an explicit always", Some(MfaPolicy::Always), true),
+        ];
+        for (label, server, made) in rows {
+            let h = doors::handler().await.with_mfa_setting(server);
+            h.policy_cache.set_mfa_item_unknown();
+            let started = h.exempt_group_at_start().await;
+            let filter = GroupRequestFilter::DisplayName(MFA_DISABLED_GROUP.into());
+            let groups = h.list_groups(Some(filter)).await.unwrap();
+            assert_eq!(
+                (started.is_ok(), !groups.is_empty()),
+                (true, made),
+                "{label}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_move_a_link_and_an_edit_change_the_requirement_at_the_next_bind() {
+        let h = doors::handler().await;
+        doors::user_in(&h, "e2mover", "e2plainou").await;
+        let strict = doors::policy_on(&h, "e2strictou", &[(ENABLE_MFA, "always")]).await;
+        let request = CreatePolicyRequest {
+            name: "e2 loose".to_owned(),
+            description: String::new(),
+            items: [(ENABLE_MFA.to_owned(), "off".to_owned())].into(),
+        };
+        let loose = h.create_policy(request).await.unwrap();
+        let edit = async |id: PolicyId, value: &str| {
+            let request = UpdatePolicyRequest {
+                id,
+                name: None,
+                description: None,
+                items: Some([(ENABLE_MFA.to_owned(), value.to_owned())].into()),
+            };
+            h.update_policy(request).await.unwrap();
+        };
+        let binds = async || doors::bind(&h, "e2mover", doors::RIGHT).await;
+        assert!(binds().await, "a plain OU: the password alone");
+        let moved = UpdateUserRequest {
+            user_id: UserId::new("e2mover"),
+            insert_attributes: vec![Attribute {
+                name: "ou".into(),
+                value: "e2strictou".to_owned().into(),
+            }],
+            ..Default::default()
+        };
+        h.update_user(moved).await.unwrap();
+        assert!(!binds().await, "moved under always: refused until enrolled");
+        edit(strict, "enabled").await;
+        assert!(
+            binds().await,
+            "the policy edited to enabled: no factor, none asked"
+        );
+        edit(strict, "always").await;
+        assert!(!binds().await, "and back to always");
+        h.set_ou_policy("e2strictou", loose).await.unwrap();
+        assert!(
+            binds().await && !h.policy_cache.mfa_item_live(),
+            "another policy linked in its place: no OU asks, and the item is off"
+        );
+        h.set_ou_policy("e2strictou", strict).await.unwrap();
+        assert!(!binds().await, "linked again");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_an_ou_item_that_cannot_be_read_refuses_closed() {
+        let log = LogGuard::install_on_this_thread();
+        let h = doors::handler().await;
+        doors::policy_on(&h, "e2lostou", &[(ENABLE_MFA, "enabled")]).await;
+        doors::user_in(&h, "e2lost", "e2lostou").await;
+        let user = UserId::new("e2lost");
+        let refused = |kind| {
+            let detail = Some(format!("policy: {UNREADABLE}"));
+            vec![(kind, Some("e2lost".to_owned()), detail)]
+        };
+        h.policy_cache.set_mfa_item_unknown();
+        assert!(!doors::bind(&h, "e2lost", doors::RIGHT).await);
+        assert_eq!(doors::rows(&log, &[LogKind::Bind]), refused(LogKind::Bind));
+        assert!(doors::web(&h, "e2lost", doors::RIGHT, None).await.is_err());
+        assert_eq!(
+            doors::rows(&log, &[LogKind::Login]),
+            refused(LogKind::Login)
+        );
+        let tokens = (
+            h.mfa_requirement(&user).await.is_err(),
+            h.enrollment_pending(&user).await.is_err(),
+        );
+        assert_eq!(
+            tokens,
+            (true, true),
+            "not read yet: a refresh and a token refuse"
+        );
+        let off = h.clone().with_mfa_policy(MfaPolicy::Disabled);
+        assert!(
+            doors::bind(&off, "e2lost", doors::RIGHT).await,
+            "an explicit server-wide value: nothing to read"
+        );
+        h.policy_cache.set_mfa_item_live(true);
+        h.policy_cache.remove_user(&user);
+        let rename = |from: &str, to: &str| {
+            let sql = format!("ALTER TABLE {from} RENAME TO {to}");
+            Statement::from_string(DbBackend::Sqlite, sql)
+        };
+        let away = rename("ou_policies", "ou_policies_away");
+        h.sql_pool.execute(away).await.unwrap();
+        let _ = doors::rows(&log, &[]);
+        assert!(!doors::bind(&h, "e2lost", doors::RIGHT).await);
+        assert_eq!(
+            doors::rows(&log, &[LogKind::Bind]),
+            refused(LogKind::Bind),
+            "a user the cache lacks, and the table cannot answer"
+        );
+        let back = rename("ou_policies_away", "ou_policies");
+        h.sql_pool.execute(back).await.unwrap();
+        assert!(
+            doors::bind(&h, "e2lost", doors::RIGHT).await,
+            "read again: no factor, none asked"
         );
     }
 }

@@ -1,10 +1,13 @@
 use crate::enforcement::{
-    Attempt, Door, ItemCheck, POLICY_REFILL, PolicyCache, UserState, fill_policy_cache,
-    item_checks, resolve_items,
+    Attempt, Door, ItemCheck, POLICY_REFILL, PolicyCache, UserState, cached_mfa_policy,
+    ensure_exempt_group, fill_policy_cache, follow_mfa_item, item_checks, resolve_items,
 };
-use crate::handler::{PolicyBackendHandler, UserBackendHandler, UserListerBackendHandler};
+use crate::handler::{
+    GroupBackendHandler, GroupListerBackendHandler, PolicyBackendHandler, UserBackendHandler,
+    UserListerBackendHandler,
+};
 use crate::logging::{self, LogKind};
-use crate::policies::{EffectiveItem, catalog_item};
+use crate::policies::{EffectiveItem, Policy, catalog_item};
 use async_trait::async_trait;
 use chrono::NaiveDateTime;
 use lldap_domain::types::{UserId, Uuid};
@@ -236,11 +239,10 @@ pub trait LockStore: Send + Sync {
 }
 
 /// Whether any OU's policy sets a lockout threshold above 0.
-pub async fn threshold_set<H: PolicyBackendHandler + ?Sized>(handler: &H) -> Result<bool> {
-    let policies = handler.list_policies().await?;
-    Ok(policies
+pub fn threshold_set(policies: &[Policy]) -> bool {
+    policies
         .iter()
-        .any(|policy| !policy.linked_ous.is_empty() && sets_threshold(&policy.items)))
+        .any(|policy| !policy.linked_ous.is_empty() && sets_threshold(&policy.items))
 }
 
 pub fn sets_threshold(items: &std::collections::BTreeMap<String, String>) -> bool {
@@ -1053,10 +1055,11 @@ impl Lockout {
     /// A ticket on the password alone is a sign-in only for a user known to have no second factor.
     pub fn ticket_issued(&self, cache: &PolicyCache, state: &LockState, at: NaiveDateTime) -> Step {
         let entries = cache.get();
-        let policy = cache.mfa_policy();
+        let policy = cached_mfa_policy(cache, &entries, &state.user);
         let one_factor = entries
             .facts_of(&state.user)
-            .is_some_and(|facts| !facts.second_factor_required(policy));
+            .zip(policy)
+            .is_some_and(|(facts, policy)| !facts.second_factor_required(policy));
         if !one_factor {
             return Step::default();
         }
@@ -1396,10 +1399,37 @@ impl Lockout {
         self.reread(store, false).await
     }
 
-    /// One at a time. When a threshold first takes effect, or the counting period moved on
-    /// since this server last read it, everything in memory is dropped and read again before
-    /// the flag lets a verdict use it. Returns whether the cache was filled.
+    /// One at a time, one read for both flags, neither part stopping the other; true when filled.
     pub async fn follow_policies<H>(&self, handler: &H, cache: &PolicyCache) -> Result<bool>
+    where
+        H: UserListerBackendHandler
+            + UserBackendHandler
+            + PolicyBackendHandler
+            + GroupListerBackendHandler
+            + GroupBackendHandler
+            + LockStore
+            + ?Sized,
+    {
+        let _following = self.following.lock().await;
+        let policies = handler.list_policies().await?;
+        let mfa = follow_mfa_item(handler, cache, &policies).await;
+        let lockout = self.follow_threshold(handler, cache, &policies).await;
+        if cache.mfa_item_live()
+            && let Err(e) = ensure_exempt_group(handler).await
+        {
+            warn!("The exempt group was not made: {e}");
+        }
+        Ok(mfa? | lockout?)
+    }
+
+    /// A threshold that first takes effect, or a counting period that moved on, drops all in
+    /// memory and reads it again before the flag lets a verdict use it.
+    async fn follow_threshold<H>(
+        &self,
+        handler: &H,
+        cache: &PolicyCache,
+        policies: &[Policy],
+    ) -> Result<bool>
     where
         H: UserListerBackendHandler
             + UserBackendHandler
@@ -1407,8 +1437,7 @@ impl Lockout {
             + LockStore
             + ?Sized,
     {
-        let _following = self.following.lock().await;
-        let live = threshold_set(handler).await?;
+        let live = threshold_set(policies);
         let period = handler.read_period().await?;
         let stale = self.stale.swap(false, Ordering::AcqRel);
         let moved = stale || period != self.period();
@@ -1444,6 +1473,8 @@ impl Lockout {
             + UserListerBackendHandler
             + UserBackendHandler
             + PolicyBackendHandler
+            + GroupListerBackendHandler
+            + GroupBackendHandler
             + 'static,
     {
         tokio::spawn(async move {
@@ -1457,6 +1488,7 @@ impl Lockout {
                 while self.drain(&*store).await == BATCH_LIMIT {}
                 let due = followed.elapsed() >= POLICY_REFILL
                     || cache.lockout_unknown()
+                    || cache.mfa_item_unknown()
                     || self.stale.load(Ordering::Acquire);
                 if !due {
                     continue;
@@ -1506,27 +1538,42 @@ impl Lockout {
 pub type Running = tokio::task::JoinHandle<()>;
 
 /// Before the KDC serves: until the first follow reads the policies, every door the lockout
-/// judges refuses, and the follow is tried again every second.
+/// or enable-mfa judges refuses, and the follow is tried again every second.
 pub async fn start_lockout<S>(store: &S, cache: &'static PolicyCache) -> Running
 where
     S: LockStore
         + UserListerBackendHandler
         + UserBackendHandler
         + PolicyBackendHandler
+        + GroupListerBackendHandler
+        + GroupBackendHandler
         + Clone
         + 'static,
 {
     let lockout = lockout();
-    cache.set_lockout_unknown();
-    if let Err(e) = lockout.follow_policies(store, cache).await {
-        warn!(
-            "The lockout's policies were not read at start; the doors refuse until they are: {e}"
-        );
+    if let Err(e) = first_follow(lockout, store, cache).await {
+        warn!("The policies were not read at start; the doors needing them refuse until read: {e}");
     }
     prune_spent_steps(store).await;
     let store = Arc::new(store.clone());
     lockout.serve_kdc(store.clone(), tokio::runtime::Handle::current());
     lockout.run(store, cache)
+}
+
+/// Both flags unknown until read; the lockout's leaves that state whatever the MFA part answers.
+pub async fn first_follow<S>(lockout: &Lockout, store: &S, cache: &PolicyCache) -> Result<bool>
+where
+    S: LockStore
+        + UserListerBackendHandler
+        + UserBackendHandler
+        + PolicyBackendHandler
+        + GroupListerBackendHandler
+        + GroupBackendHandler
+        + ?Sized,
+{
+    cache.set_lockout_unknown();
+    cache.set_mfa_item_unknown();
+    lockout.follow_policies(store, cache).await
 }
 
 async fn prune_spent_steps<S: LockStore + ?Sized>(store: &S) {

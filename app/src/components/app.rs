@@ -51,8 +51,8 @@ pub struct App {
     redirect_to: Option<AppRoute>,
     password_reset_enabled: Option<bool>,
     mfa_enabled: Option<bool>,
-    mfa_required: bool,
     mfa_enrollment_pending: bool,
+    mfa_server_wide: Option<String>,
     domain: Option<String>,
 }
 
@@ -60,8 +60,8 @@ pub struct App {
 struct SessionRouting {
     user: Option<String>,
     mfa_enabled: Option<bool>,
-    mfa_required: bool,
     mfa_enrollment_pending: bool,
+    mfa_server_wide: Option<String>,
     domain: Option<String>,
 }
 
@@ -95,8 +95,8 @@ impl Component for App {
             redirect_to: Self::get_redirect_route(ctx),
             password_reset_enabled: None,
             mfa_enabled: None,
-            mfa_required: false,
             mfa_enrollment_pending: false,
+            mfa_server_wide: None,
             domain: None,
         };
         ctx.link()
@@ -140,7 +140,7 @@ impl Component for App {
             Msg::SettingsReceived(Ok(settings)) => {
                 self.password_reset_enabled = Some(settings.password_reset_enabled);
                 self.mfa_enabled = Some(settings.mfa_enabled);
-                self.mfa_required = settings.mfa_required;
+                self.mfa_server_wide = settings.mfa_server_wide;
                 self.domain = Some(settings.domain).filter(|d| !d.is_empty());
             }
             Msg::SettingsReceived(Err(err)) => {
@@ -168,8 +168,8 @@ impl Component for App {
         let session = SessionRouting {
             user: username.clone(),
             mfa_enabled: self.mfa_enabled,
-            mfa_required: self.mfa_required,
             mfa_enrollment_pending: self.mfa_enrollment_pending,
+            mfa_server_wide: self.mfa_server_wide.clone(),
             domain: self.domain.clone(),
         };
         html! {
@@ -249,7 +249,6 @@ impl App {
         let is_self =
             |user_id: &str| logged_in_user.is_some_and(|u| u.eq_ignore_ascii_case(user_id));
         let mfa_enabled = session.mfa_enabled;
-        let mfa_required = session.mfa_required;
         let mfa_enrollment_pending = session.mfa_enrollment_pending;
         let domain = session.domain.clone();
         // Under "always" an unenrolled session may only enroll: every other page redirects
@@ -290,7 +289,7 @@ impl App {
                 }
             }
             AppRoute::ListPolicies => html! {
-                <PolicyWorkbench domain={domain.clone()} />
+                <PolicyWorkbench domain={domain.clone()} mfa_server_wide={session.mfa_server_wide.clone()} />
             },
             AppRoute::ListUserSchema => html! {
                 <ListUserSchema />
@@ -309,8 +308,7 @@ impl App {
                     username={user_id.clone()}
                     is_admin={is_admin}
                     is_self={is_self(user_id)}
-                    mfa_enabled={mfa_enabled.unwrap_or(false)}
-                    mfa_required={mfa_required} />
+                    mfa_enabled={mfa_enabled.unwrap_or(false)} />
             },
             AppRoute::ChangePassword { user_id } => html! {
                 <ChangePasswordForm username={user_id.clone()} is_admin={is_admin} />
@@ -331,7 +329,7 @@ impl App {
             },
             AppRoute::ResetOwnMfa { user_id } => match mfa_enabled {
                 None => html! {},
-                Some(true) if !mfa_required && is_self(user_id) => html! {
+                Some(true) if is_self(user_id) => html! {
                     <ResetOwnMfaForm username={user_id.clone()} />
                 },
                 Some(_) => html! {

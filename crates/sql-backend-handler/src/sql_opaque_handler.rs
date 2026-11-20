@@ -6,7 +6,7 @@ use base64::Engine;
 use lldap_auth::opaque;
 use lldap_domain::types::{LoginOutcome, UserId};
 use lldap_domain_handlers::enforcement::{Attempt, Door, admit};
-use lldap_domain_handlers::handler::{BindRequest, LoginHandler, MfaBackendHandler};
+use lldap_domain_handlers::handler::{BindRequest, LoginHandler};
 use lldap_domain_handlers::kerberos::{
     LDAP_ADMINS_ONLY, kerberos_backend, refusal_while_degraded, require_kdc_ready,
 };
@@ -217,7 +217,7 @@ impl LoginHandler for SqlBackendHandler {
             );
             return Err(invalid_credentials(&name));
         }
-        let requirement = self.mfa_requirement(&name).await?;
+        let requirement = self.door_requirement(&name, LogKind::Bind).await?;
         // An enrolled user binds with password:code; the password is checked first either way.
         let (password, code) = match requirement {
             MfaRequirement::Totp => match split_totp_suffix(&password) {
@@ -469,7 +469,8 @@ impl OpaqueHandler for SqlOpaqueHandler {
             Some(id) => self.lockout.split(&username, id, false),
             None => Step::default(),
         };
-        let (detail, mfa_enrollment_pending) = match self.mfa_requirement(&username).await? {
+        let requirement = self.door_requirement(&username, LogKind::Login).await?;
+        let (detail, mfa_enrollment_pending) = match requirement {
             MfaRequirement::None => (None, false),
             MfaRequirement::Enrollment => (Some("mfa enrollment pending"), true),
             MfaRequirement::Totp => match totp_code.as_deref() {
@@ -593,6 +594,7 @@ mod tests {
     use crate::sql_backend_handler::tests::{
         get_initialized_db, insert_group, insert_membership, insert_user, insert_user_no_password,
     };
+    use lldap_domain_handlers::handler::MfaBackendHandler;
     use lldap_opaque_handler::register_password;
 
     async fn attempt_login(

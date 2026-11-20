@@ -73,6 +73,58 @@ impl<'de> Deserialize<'de> for TrueFalseAlways {
     }
 }
 
+/// `enable_mfa`: off, enabled or always; 0.8.0's false and true still read as off and enabled.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OffEnabledAlways {
+    Off,
+    Enabled,
+    Always,
+}
+
+impl FromStr for OffEnabledAlways {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "off" | "false" => Ok(Self::Off),
+            "enabled" | "true" => Ok(Self::Enabled),
+            "always" => Ok(Self::Always),
+            _ => Err(format!("'{value}': expected off, enabled or always")),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for OffEnabledAlways {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = OffEnabledAlways;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("off, enabled or always")
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(match value {
+                    true => OffEnabledAlways::Enabled,
+                    false => OffEnabledAlways::Off,
+                })
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                OffEnabledAlways::from_str(value).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
 #[derive(Debug, Parser, Clone)]
 #[clap(version, author, about = "lldap is a lightweight LDAP server")]
 pub struct CLIOpts {
@@ -209,9 +261,9 @@ pub struct RunOpts {
     #[clap(
         long,
         env = "LLDAP_ENABLE_MFA",
-        help = "Second factor (TOTP): false = off, true = only users who enrolled present a code, \"always\" = every user must enroll. Members of lldap_mfa_disabled are exempt"
+        help = "Second factor (TOTP) for every user, overriding the OU policies: off, enabled = only users who enrolled present a code, always = every user must enroll (0.8.0's false and true still work). Unset, each OU's enable-mfa decides. Members of lldap_mfa_disabled are exempt"
     )]
-    pub enable_mfa: Option<TrueFalseAlways>,
+    pub enable_mfa: Option<OffEnabledAlways>,
 
     #[clap(flatten)]
     pub smtp_opts: SmtpOpts,

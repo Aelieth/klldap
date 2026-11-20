@@ -2639,7 +2639,7 @@ mod tests {
         with_verdict(&store);
         let decides = |value: &str| value != "always";
         let _guard =
-            EnforcementGuard::deciding(&[ldap_add, synced_create, plain], "require-mfa", decides);
+            EnforcementGuard::deciding(&[ldap_add, synced_create, plain], "enable-mfa", decides);
         set_thread_kerberos_backend(Some(embedded.clone()));
         let ou = |value: &str| Attribute {
             name: "ou".into(),

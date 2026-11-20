@@ -145,6 +145,14 @@ struct PendingUpdate {
 #[derive(Properties, PartialEq)]
 pub struct Props {
     pub domain: Option<String>,
+    #[prop_or_default]
+    pub mfa_server_wide: Option<String>,
+}
+
+pub fn server_wide_line(value: &str) -> String {
+    format!(
+        "The server sets enable_mfa = {value} for every user: it overrides the OUs' enable-mfa."
+    )
 }
 
 pub struct PolicyWorkbench {
@@ -1092,10 +1100,14 @@ impl PolicyWorkbench {
             .filter(|row| !row.enforced)
             .map(|row| self.item_label(&row.key))
             .collect();
+        let server_wide = ctx.props().mfa_server_wide.as_deref().map(server_wide_line);
         html! {
             <div class="d-flex flex-column gap-2">
                 <div class="text-muted small text-uppercase">{"Current OU policy"}</div>
                 {body}
+                { server_wide.map_or_else(|| html! {}, |line| html! {
+                    <span class="small text-muted">{line}</span>
+                }) }
                 { if unenforced.is_empty() { html! {} } else {
                     html! {
                         <span class="small text-muted">

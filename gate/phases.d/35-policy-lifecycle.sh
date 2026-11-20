@@ -8,7 +8,7 @@ graphql 'mutation($n: String!) { createOu(name: $n) { ok } }' '{"n": "'"$OU_NAME
     >"$D/create-ou.json" 2>&1 || p_bad "createOu $OU_NAME failed"
 
 graphql 'mutation($n: String!, $i: [PolicyItemInput!]) { createPolicy(name: $n, items: $i) { id name } }' \
-    '{"n": "GateHours", "i": [{"key": "require-mfa", "value": "always"}]}' \
+    '{"n": "GateHours", "i": [{"key": "enable-mfa", "value": "always"}]}' \
     >"$D/create-policy.json" 2>&1 || p_bad "createPolicy failed"
 PID="$(json_get createPolicy.id <"$D/create-policy.json")"
 [ -n "$PID" ] || p_bad "createPolicy did not return an id"
@@ -20,7 +20,7 @@ graphql 'query($o: String!) { effectivePolicyItems(ou: $o) { key value sourceOu 
     '{"o": "'"$OU_NAME"'"}' >"$D/effective.json" 2>&1 || p_bad "effectivePolicyItems failed"
 if json_get effectivePolicyItems <"$D/effective.json" >"$D/effective-items.txt" \
     && grep -q always "$D/effective-items.txt"; then
-    p_ok "effectivePolicyItems shows require-mfa=always from $OU_NAME"
+    p_ok "effectivePolicyItems shows enable-mfa=always from $OU_NAME"
 else
     p_bad "effectivePolicyItems missing always: $(cat "$D/effective.json")"
 fi

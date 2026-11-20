@@ -247,3 +247,247 @@ else
     fi
     docker rm -f -v "$MFA_BROWSER_CTN" >/dev/null 2>&1 || true
 fi
+
+# An OU's enable-mfa. The main server sets LLDAP_ENABLE_MFA=true, which overrides every OU: its
+# rows show an OU's always and off change nothing there. The OU rows run on a server that sets
+# no value (OU_SIDE), and two rows on one that sets it off (OU_OFF); each is removed by name.
+OU_PASS="GateOuPass2026!"
+OU_SIDE="$CONTAINER-ou67" OU_SIDE_VOL="klldap-gate-ou67-$RUNID"
+OU_OFF="$CONTAINER-mfaoff" OU_OFF_VOL="klldap-gate-mfaoff-$RUNID"
+OU_BROWSER_CTN="klldap-mfa-ou-${RUNID}"
+OU_MAIN_POLICIES=()
+EXTRA_CONTAINERS+=("$OU_SIDE" "$OU_OFF" "$OU_BROWSER_CTN")
+EXTRA_VOLUMES+=("$OU_SIDE_VOL" "$OU_OFF_VOL")
+
+# ou_link <ou> <value>: the OU with a policy of its own setting enable-mfa; prints the policy id.
+# shellcheck disable=SC2016
+ou_link() {
+    local id
+    graphql 'mutation($n: String!) { createOu(name: $n) { ok } }' '{"n": "'"$1"'"}' >/dev/null || return 1
+    id="$(graphql 'mutation($n: String!, $i: [PolicyItemInput!]) { createPolicy(name: $n, items: $i) { id } }' \
+        '{"n": "gate '"$1"'", "i": [{"key": "enable-mfa", "value": "'"$2"'"}]}' | json_get createPolicy.id)" &&
+        [ -n "$id" ] || return 1
+    if graphql 'mutation($o: String!, $p: Int!) { setOuPolicy(ou: $o, policyId: $p) { ok } }' \
+        '{"o": "'"$1"'", "p": '"$id"'}' >/dev/null; then
+        printf '%s\n' "$id"
+        return 0
+    fi
+    graphql 'mutation($p: Int!) { deletePolicy(policyId: $p) { ok } }' '{"p": '"$id"'}' >/dev/null 2>&1 || true
+    return 1
+}
+
+# ou_user <user> <ou>
+# shellcheck disable=SC2016
+ou_user() {
+    graphql 'mutation($u: CreateUserInput!) { createUser(user: $u) { id } }' \
+        '{"u": {"id": "'"$1"'", "email": "'"$1"'@gate.test"}}' >/dev/null &&
+        graphql 'mutation($id: String!, $pw: String!) { setUserPassword(userId: $id, password: $pw) { ok } }' \
+            '{"id": "'"$1"'", "pw": "'"$OU_PASS"'"}' >/dev/null &&
+        graphql 'mutation($ids: [String!]!, $ou: String!) { changeUserOu(userIds: $ids, newOu: $ou) { ok } }' \
+            '{"ids": ["'"$1"'"], "ou": "'"$2"'"}' >/dev/null
+}
+
+# ou_enrol <user>: enrolled with the current step's code; prints the secret.
+# shellcheck disable=SC2016
+ou_enrol() {
+    local token proof state secret
+    token="$(gate_login "$1" "$OU_PASS")" &&
+        proof="$(gate_enrollment_proof "$1" "$OU_PASS")" &&
+        TOKEN="$token" graphql 'mutation($p: String) { startMfaEnrollment(enrollmentProof: $p) { secretBase32 state } }' \
+            '{"p": "'"$proof"'"}' >"$D/ou-start-$1.json" || return 1
+    secret="$(json_get startMfaEnrollment.secretBase32 <"$D/ou-start-$1.json")"
+    state="$(json_get startMfaEnrollment.state <"$D/ou-start-$1.json")"
+    TOKEN="$token" graphql 'mutation($s: String!, $c: String!) { finishMfaEnrollment(state: $s, code: $c) { ok } }' \
+        '{"s": "'"$state"'", "c": "'"$(totp_code "$secret" 0)"'"}' >/dev/null && printf '%s\n' "$secret"
+}
+
+ou_dn() {
+    lsearch -o ldif-wrap=no -b "$BASE_DN" -s sub "(uid=$1)" dn 2>/dev/null | sed -n 's/^dn: //p' | head -1
+}
+
+# ou_try <user> <bind|simple> <out>: the right password alone; status 0 when let in.
+ou_try() {
+    local dn
+    case "$2" in
+    bind)
+        dn="$(ou_dn "$1")"
+        [ -n "$dn" ] || { echo "no DN found for $1" >"$3" && return 2; }
+        t ldapwhoami -x -H "$(ldap_url)" -D "$dn" -w "$OU_PASS" >"$3" 2>&1
+        ;;
+    simple) gate_login "$1" "$OU_PASS" >"$3" 2>&1 ;;
+    esac
+}
+
+# ou_refused <id> <label> <user> <bind|simple> <want>
+ou_refused() {
+    local out="$D/ou-$1.out"
+    if ou_try "$3" "$4" "$out"; then
+        p_bad "[M2.$1] $2: the password alone was let in"
+    elif grep -q "$5" "$out" && { [ "$4" = bind ] || grep -q "HTTP 401" "$out"; }; then
+        p_ok "[M2.$1] $2: refused with '$5'"
+    else
+        p_bad "[M2.$1] $2: refused without '$5' (see ou-$1.out)"
+    fi
+}
+
+# ou_admitted <id> <label> <user> <bind|simple>
+ou_admitted() {
+    if ou_try "$3" "$4" "$D/ou-$1.out"; then
+        p_ok "[M2.$1] $2: the password alone is let in"
+    else
+        p_bad "[M2.$1] $2: refused (see ou-$1.out)"
+    fi
+}
+
+# ou_no_enrolment <id> <label> <user>
+# shellcheck disable=SC2016
+ou_no_enrolment() {
+    local token out="$D/ou-$1.out"
+    token="$(gate_login "$3" "$OU_PASS" 2>"$out")" &&
+        TOKEN="$token" graphql 'mutation { startMfaEnrollment { state } }' '{}' >>"$out" 2>&1
+    if grep -q "MFA is disabled for this user" "$out"; then
+        p_ok "[M2.$1] $2: refused with 'MFA is disabled for this user'"
+    else
+        p_bad "[M2.$1] $2: not refused as disabled for this user (see ou-$1.out)"
+    fi
+}
+
+# ou_pages <mode> <server> <user> <code user> <secret> <out>
+ou_pages() {
+    docker rm -f -v "$OU_BROWSER_CTN" >/dev/null 2>&1 || true
+    # -e NAME, not -e NAME=value, so the password and the secret are not on the host's command line.
+    BROWSER_PASS="$OU_PASS" BROWSER_TOTP_SECRET="$5" \
+        timeout 300 docker run --rm --name "$OU_BROWSER_CTN" --network "$NET" --init --shm-size=1g \
+        --user "$(id -u):$(id -g)" --entrypoint node \
+        -v "$GATE_ROOT/lib/browser.mjs:/work/browser.mjs:ro" -v "$D:/out" \
+        -e HOME=/tmp/home -e BROWSER_OUT=/out -e BROWSER_MODE="$1" \
+        -e BROWSER_URL="http://$2:17170" -e BROWSER_USER="$3" -e BROWSER_CODE_USER="$4" \
+        -e BROWSER_PASS -e BROWSER_TOTP_SECRET \
+        "$MFA_BROWSER_IMAGE" /work/browser.mjs >"$6" 2>"$6.err"
+    docker rm -f -v "$OU_BROWSER_CTN" >/dev/null 2>&1 || true
+    grep '^CONTEXT \|^FINDING ' "$6" 2>/dev/null | while IFS= read -r line; do note "$line"; done
+}
+
+# ou_wire <out> <name|label|want>...: each row passed, with exactly its WIRE line.
+ou_wire() {
+    local out="$1" entry name label want row wire
+    shift
+    for entry in "$@"; do
+        IFS='|' read -r name label want <<<"$entry"
+        row="$(grep -m1 "^ROW $name " "$out" 2>/dev/null)"
+        wire="$(grep -m1 "^WIRE $name " "$out" 2>/dev/null)"
+        if [ "$row" = "ROW $name PASS" ] && [ "$wire" = "WIRE $name $want $MFA_TAIL" ]; then
+            p_ok "[M2.$name] $label; nothing sent or kept carries the password"
+        else
+            p_bad "[M2.$name] $label: ${row:-not reached}, ${wire:-no WIRE line}; want WIRE $name $want $MFA_TAIL (see ${out##*/})"
+        fi
+    done
+}
+
+ou_browser() {
+    docker image inspect "$MFA_BROWSER_IMAGE" >/dev/null 2>&1 && return 0
+    p_skip "[M2.$1] browser image absent: ${MFA_BROWSER_IMAGE}; the web rows did not run"
+    return 1
+}
+
+ou_main() {
+    local id secret=""
+    if id="$(ou_link gatemfaalways always)" && OU_MAIN_POLICIES+=("$id") &&
+        id="$(ou_link gatemfaoff off)" && OU_MAIN_POLICIES+=("$id") &&
+        ou_user gateoumainalways gatemfaalways && ou_user gateoumainoff gatemfaoff; then
+        secret="$(ou_enrol gateoumainoff)"
+    fi
+    if [ -z "$secret" ]; then
+        p_bad "[M2.main-setup] the OUs, their policies and users on the main server could not be made (see ou-main-setup.err)"
+        return
+    fi
+    ou_admitted main-bind-always "the main server's explicit enabled overrides the OU's always: LDAP bind of an unenrolled user" gateoumainalways bind
+    ou_admitted main-simple-always "the main server's explicit enabled overrides the OU's always: simple login of an unenrolled user" gateoumainalways simple
+    ou_refused main-bind-off "the main server's explicit enabled overrides the OU's off: LDAP bind of an enrolled user without the code" gateoumainoff bind "TOTP code required"
+    ou_refused main-simple-off "the main server's explicit enabled overrides the OU's off: simple login of an enrolled user without the code" gateoumainoff simple "TOTP code required"
+    ou_browser main-web || return 0
+    ou_pages ou-main "$CONTAINER" gateoumainalways gateoumainoff "$secret" "$D/ou-main.out"
+    ou_wire "$D/ou-main.out" \
+        "ou-main-always|the main server's explicit enabled overrides the OU's always: an unenrolled user's web login lands on their own page|starts=1 finishes=1 sessionless=0 proof-asked=0 codes=0 statuses=200" \
+        "ou-main-off|the main server's explicit enabled overrides the OU's off: an enrolled user's web login asks the code, then signs in with it|starts=2 finishes=2 sessionless=0 proof-asked=0 codes=1 statuses=200/200"
+}
+
+# shellcheck disable=SC2016
+ou_main_cleanup() {
+    local ou id user
+    for ou in gatemfaalways gatemfaoff; do
+        graphql 'mutation($o: String!) { clearOuPolicy(ou: $o) { ok } }' '{"o": "'"$ou"'"}' >/dev/null 2>&1
+    done
+    for id in "${OU_MAIN_POLICIES[@]}"; do
+        graphql 'mutation($p: Int!) { deletePolicy(policyId: $p) { ok } }' '{"p": '"$id"'}' >/dev/null 2>&1
+    done
+    for user in gateoumainalways gateoumainoff; do
+        graphql 'mutation($u: String!) { deleteUser(userId: $u) { ok } }' '{"u": "'"$user"'"}' >/dev/null 2>&1
+    done
+    for ou in gatemfaalways gatemfaoff; do
+        graphql 'mutation($n: String!) { deleteOu(name: $n) { ok } }' '{"n": "'"$ou"'"}' >/dev/null 2>&1 ||
+            p_bad "[M2.main-cleanup] OU $ou was not removed from the main server"
+    done
+}
+
+ou_side() {
+    local ports secret=""
+    if ! ports="$(side_up "$OU_SIDE" "$OU_SIDE_VOL" 2>"$D/ou-side.err")"; then
+        p_bad "[M2.side-setup] the server without LLDAP_ENABLE_MFA did not become healthy (see ou-side.err, ou-side.log)"
+        side_down "$OU_SIDE" "$OU_SIDE_VOL" "$D/ou-side.log"
+        return
+    fi
+    # shellcheck disable=SC2086
+    side_use $ports
+    if [ -n "$TOKEN" ] && ou_link gatemfaalways always >/dev/null && ou_link gatemfaenabled enabled >/dev/null &&
+        ou_link gatemfaoff off >/dev/null && ou_user gateoualways gatemfaalways &&
+        ou_user gateouenrolled gatemfaenabled && ou_user gateouoff gatemfaoff; then
+        secret="$(ou_enrol gateouenrolled)"
+    fi
+    if [ -z "$secret" ]; then
+        p_bad "[M2.side-setup] the OUs, their policies and users on $OU_SIDE could not be made (see ou-side-setup.err)"
+    else
+        ou_refused bind-always "no server-wide value, the OU's always: LDAP bind of an unenrolled user" gateoualways bind "MFA enrollment required"
+        ou_refused simple-always "no server-wide value, the OU's always: simple login of an unenrolled user" gateoualways simple "MFA enrollment required"
+        ou_refused bind-enrolled "no server-wide value, the OU's enabled: LDAP bind of an enrolled user without the code" gateouenrolled bind "TOTP code required"
+        ou_refused simple-enrolled "no server-wide value, the OU's enabled: simple login of an enrolled user without the code" gateouenrolled simple "TOTP code required"
+        ou_no_enrolment enrol-off "no server-wide value, the OU's off: enrolment" gateouoff
+        if ou_browser side-web; then
+            ou_pages ou-mfa "$OU_SIDE" gateoualways gateouenrolled "$secret" "$D/ou-side.out"
+            ou_wire "$D/ou-side.out" \
+                "ou-pending|no server-wide value, the OU's always: an unenrolled user's web login lands on enrolment only|starts=1 finishes=1 sessionless=0 proof-asked=0 codes=0 statuses=200" \
+                "ou-code|no server-wide value, the OU's enabled: an enrolled user's web login asks the code, then signs in with it|starts=2 finishes=2 sessionless=0 proof-asked=0 codes=1 statuses=200/200"
+            if grep -q '^ROW ou-confined PASS' "$D/ou-side.out" 2>/dev/null; then
+                p_ok "[M2.ou-confined] the OU's always: another page of the pending session goes back to enrolment"
+            else
+                p_bad "[M2.ou-confined] the pending session reached another page (see ou-side.out)"
+            fi
+        fi
+    fi
+    side_back
+    side_down "$OU_SIDE" "$OU_SIDE_VOL" "$D/ou-side.log"
+}
+
+ou_off() {
+    local ports
+    if ! ports="$(side_up "$OU_OFF" "$OU_OFF_VOL" -e LLDAP_ENABLE_MFA=off 2>"$D/ou-off.err")"; then
+        p_bad "[M2.off-setup] the server with LLDAP_ENABLE_MFA=off did not become healthy (see ou-off.err, ou-off.log)"
+        side_down "$OU_OFF" "$OU_OFF_VOL" "$D/ou-off.log"
+        return
+    fi
+    # shellcheck disable=SC2086
+    side_use $ports
+    if [ -n "$TOKEN" ] && ou_link gatemfaalways always >/dev/null && ou_user gateoualways gatemfaalways; then
+        ou_admitted off-bind-always "the server's explicit off overrides the OU's always: LDAP bind of an unenrolled user" gateoualways bind
+        ou_no_enrolment off-enrol "the server's explicit off overrides the OU's always: enrolment" gateoualways
+    else
+        p_bad "[M2.off-setup] the OU, its policy and user on $OU_OFF could not be made (see ou-off-setup.err)"
+    fi
+    side_back
+    side_down "$OU_OFF" "$OU_OFF_VOL" "$D/ou-off.log"
+}
+
+ou_main 2>"$D/ou-main-setup.err"
+ou_main_cleanup
+ou_side 2>"$D/ou-side-setup.err"
+ou_off 2>"$D/ou-off-setup.err"

@@ -74,7 +74,7 @@ for part in detail.split(";"):
     key, shown = part.split(" page=", 1)
     page[key] = shown
 expect_page = {
-    "require-mfa": "always",
+    "enable-mfa": "always",
     "lockout-threshold": "3 tries",
     "lockout-duration-seconds": "120 s",
     "login-hours": "Mon-Fri 09:00-17:00",
@@ -82,7 +82,7 @@ expect_page = {
     "inactivity-days": "30 days",
 }
 expect_raw = {
-    "require-mfa": "always",
+    "enable-mfa": "always",
     "lockout-threshold": "3",
     "lockout-duration-seconds": "120",
     "login-hours": "Mon-Fri 09:00-17:00",
@@ -224,6 +224,7 @@ p3_run() {
             -e BROWSER_BADINT="$BADINT" \
             -e BROWSER_BADHOURS="$BADHOURS" \
             -e BROWSER_UNENFORCED="$UNENFORCED" \
+            -e BROWSER_SERVER_WIDE="$SERVER_WIDE" \
             "$BROWSER_IMAGE" /work/browser-policies.mjs \
             >"$OUT" 2>"$D/policies.err"
     ) &
@@ -276,6 +277,8 @@ print(",".join(
 ))
 PY
 )"
+        # The main server's explicit LLDAP_ENABLE_MFA=true, by the name the page gives it.
+        SERVER_WIDE=enabled
         p3_run
         ready_for=$((SECONDS + 280))
         while [ ! -f "$D/graphql-match.ready" ] && [ "$SECONDS" -lt "$ready_for" ]; do
@@ -305,6 +308,7 @@ PY
         p3_judge remove "removes the policy from the child"
         p3_judge delete-policy "deletes the policy"
         p3_judge notice "the not-enforced notice"
+        p3_judge override-line "the main server's explicit enable_mfa is said to override the OUs' enable-mfa"
         p3_judge empty-name "refuses an empty name"
         p3_judge invalid-int "refuses a lockout threshold of 101"
         p3_judge invalid-string "refuses a bad login-hours and a bad CIDR"

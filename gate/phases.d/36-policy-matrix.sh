@@ -191,9 +191,9 @@ pm_catalog() {
 import json, os
 c = json.loads(os.environ["PMA"])["data"]["policyItemCatalog"]
 print(len(c), ",".join(sorted(i["key"] for i in c if i["enforced"] is True)), all(isinstance(i["enforced"], bool) for i in c))')"
-    pm_row "$([ "$got" = "6 lockout-duration-seconds,lockout-threshold True" ] && echo 0 || echo 1)" \
-        "catalog lists six items, exactly lockout-threshold and lockout-duration-seconds enforced" "got $got"
-    for want in "require-mfa=off" "lockout-threshold=0" "lockout-duration-seconds=900" "login-hours=" "allowed-networks=" "inactivity-days=0"; do
+    pm_row "$([ "$got" = "6 enable-mfa,lockout-duration-seconds,lockout-threshold True" ] && echo 0 || echo 1)" \
+        "catalog lists six items, exactly enable-mfa, lockout-threshold and lockout-duration-seconds enforced" "got $got"
+    for want in "enable-mfa=off" "lockout-threshold=0" "lockout-duration-seconds=900" "login-hours=" "allowed-networks=" "inactivity-days=0"; do
         got="$(PMA="$a" PMK="${want%%=*}" python3 -c '
 import json, os
 c = {i["key"]: i["defaultValue"] for i in json.loads(os.environ["PMA"])["data"]["policyItemCatalog"]}
@@ -209,7 +209,7 @@ pm_items_cycle() {
         p_bad "createPolicy for the item cycle failed"
         return 1
     }
-    for row in "require-mfa|enrolled|always" "lockout-threshold|3|100" "lockout-duration-seconds|60|604800" \
+    for row in "enable-mfa|enabled|always" "lockout-threshold|3|100" "lockout-duration-seconds|60|604800" \
         "login-hours|mon-fri 08:00-18:00|sat 10:00-12:00;sun 10:00-11:00" \
         "allowed-networks|10.0.0.0/8|192.168.1.0/24, 2001:db8::/32" "inactivity-days|1|3650"; do
         IFS='|' read -r key v1 v2 <<<"$row"
@@ -232,7 +232,7 @@ pm_bad_values() {
     p="$PM_CYCLE"
     pm_set_items "$p" '[{"key": "lockout-threshold", "value": "5"}]' >/dev/null
     before="$(pm_items "$p")"
-    for row in "require-mfa|sometimes" "require-mfa|" "lockout-threshold|-1" "lockout-threshold|101" "lockout-threshold|3.5" \
+    for row in "enable-mfa|sometimes" "enable-mfa|" "enable-mfa|enrolled" "require-mfa|always" "lockout-threshold|-1" "lockout-threshold|101" "lockout-threshold|3.5" \
         "lockout-duration-seconds|604801" "login-hours|mon 25:00-26:00" "login-hours|funday 09:00-17:00" \
         "login-hours|mon 18:00-08:00" "allowed-networks|10.0.0.1" "allowed-networks|10.0.0.0/33" "allowed-networks|foo/8" \
         "allowed-networks|10.0.0.0/8,," "inactivity-days|3651" "inactivity-days|-1" "max-sessions|3"; do
@@ -283,7 +283,7 @@ pm_names() {
 
 pm_attach() {
     local a
-    pm_set_items "$PM_CYCLE" '[{"key": "require-mfa", "value": "always"}, {"key": "lockout-threshold", "value": "5"}]' >/dev/null
+    pm_set_items "$PM_CYCLE" '[{"key": "enable-mfa", "value": "always"}, {"key": "lockout-threshold", "value": "5"}]' >/dev/null
     pm_q "$TOKEN" 'mutation($o: String!, $p: Int!) { setOuPolicy(ou: $o, policyId: $p) { ok } }' "o=$PM_A" "p=i:$PM_P2" >/dev/null
     pm_q "$TOKEN" 'mutation($o: String!, $p: Int!) { setOuPolicy(ou: $o, policyId: $p) { ok } }' "o=$PM_A" "p=i:$PM_CYCLE" >/dev/null
     a="$(pm_states_of "${PM_A,,}")"
@@ -297,15 +297,15 @@ pm_attach() {
 pm_nesting() {
     local nest_key a p3
     nest_key="${PM_NEST,,}"
-    a="$(pm_eff "$PM_NEST" require-mfa value)|$(pm_eff "$PM_NEST" require-mfa sourceOu)"
-    pm_row "$([ "$a" = "always|${PM_A,,}" ] && echo 0 || echo 1)" "the nested OU inherits require-mfa=always from its parent" "got $a"
+    a="$(pm_eff "$PM_NEST" enable-mfa value)|$(pm_eff "$PM_NEST" enable-mfa sourceOu)"
+    pm_row "$([ "$a" = "always|${PM_A,,}" ] && echo 0 || echo 1)" "the nested OU inherits enable-mfa=always from its parent" "got $a"
     p3="$(pm_new_policy "${PM_RUN} nested" '[{"key": "lockout-threshold", "value": "9"}]')"
     PM_P3="$p3"
     pm_q "$TOKEN" 'mutation($o: String!, $p: Int!) { setOuPolicy(ou: $o, policyId: $p) { ok } }' "o=$PM_NEST" "p=i:$p3" >/dev/null
-    a="$(pm_eff "$PM_NEST" lockout-threshold value)|$(pm_eff "$PM_NEST" lockout-threshold sourceOu)|$(pm_eff "$PM_NEST" require-mfa value)"
+    a="$(pm_eff "$PM_NEST" lockout-threshold value)|$(pm_eff "$PM_NEST" lockout-threshold sourceOu)|$(pm_eff "$PM_NEST" enable-mfa value)"
     pm_row "$([ "$a" = "9|$nest_key|always" ] && echo 0 || echo 1)" "the nested OU's own value wins and the parent's other item still reaches it" "got $a"
     pm_q "$TOKEN" 'mutation($o: String!, $b: Boolean!) { setOuPolicyInheritance(ou: $o, blocked: $b) { ok } }' "o=$PM_NEST" "b=b:true" >/dev/null
-    a="$(pm_eff "$PM_NEST" require-mfa value)|$(pm_eff "$PM_NEST" require-mfa sourceOu)|$(pm_eff "$PM_NEST" lockout-threshold value)"
+    a="$(pm_eff "$PM_NEST" enable-mfa value)|$(pm_eff "$PM_NEST" enable-mfa sourceOu)|$(pm_eff "$PM_NEST" lockout-threshold value)"
     pm_row "$([ "$a" = "off|<none>|9" ] && echo 0 || echo 1)" "a blocked nested OU loses the parent's items and keeps its own" "got $a"
     a="$(pm_q "$TOKEN" 'mutation { setOuPolicyInheritance(ou: "", blocked: true) { ok } }')"
     pm_row "$(pm_refused "$a" && echo 0 || echo 1)" "the root cannot block inheritance" "$(pm_err "$a")"
@@ -339,7 +339,7 @@ pm_ou_delete() {
     a="$(pm_state)"
     pm_row "$([ "$a" != "<error>" ] && ! grep -q "\"${PM_C,,}\"" <<<"$a" && echo 0 || echo 1)" "deleteOu with a policy attached drops its policy state" "state: $(cut -c1-120 <<<"$a")"
     pm_q "$TOKEN" 'mutation($n: String!) { createOu(name: $n) { ok } }' "n=$PM_C" >/dev/null
-    a="$(pm_eff "$PM_C" require-mfa sourceOu)|$(pm_states_of "${PM_C,,}")"
+    a="$(pm_eff "$PM_C" enable-mfa sourceOu)|$(pm_states_of "${PM_C,,}")"
     pm_row "$([ "$a" = "<none>|0  " ] && echo 0 || echo 1)" "recreating the OU brings back no stale policy" "sourceOu|state $a"
 }
 

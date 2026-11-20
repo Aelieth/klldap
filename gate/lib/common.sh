@@ -211,6 +211,74 @@ wait_healthy() {
     return 1
 }
 
+# side_up <name> <volume> [-e NAME=value ...]: another server on its own SQLite volume with
+# Kerberos off, removed and made again by its exact name; prints its HTTP and LDAP ports.
+side_up() {
+    local name="$1" vol="$2" i=0
+    shift 2
+    docker rm -fv "$name" >/dev/null 2>&1 || true
+    docker volume rm "$vol" >/dev/null 2>&1 || true
+    docker volume create "$vol" >/dev/null || return 1
+    LLDAP_JWT_SECRET="$JWT_SECRET" LLDAP_KEY_SEED="$KEY_SEED" LLDAP_LDAP_USER_PASS="$ADMIN_PASS" \
+        docker run -d --name "$name" --network "$NET" -p "127.0.0.1::17170" -p "127.0.0.1::3890" \
+        -v "$vol:/data" -e LLDAP_JWT_SECRET -e LLDAP_KEY_SEED -e LLDAP_LDAP_USER_PASS \
+        -e LLDAP_LDAP_BASE_DN="$BASE_DN" -e LLDAP_DATABASE_URL="sqlite:////data/users.db?mode=rwc" \
+        -e LLDAP_KERBEROS_OPTIONS__ENABLED=false -e LLDAP_VERBOSE=true "$@" \
+        "$GATE_IMAGE" >/dev/null || return 1
+    while ! docker exec "$name" /app/lldap healthcheck --config-file /data/lldap_config.toml \
+        >/dev/null 2>&1; do
+        i=$((i + 1))
+        [ "$i" -lt 90 ] && [ -n "$(docker ps -q -f "name=^${name}$")" ] || return 1
+        sleep 1
+    done
+    printf '%s %s\n' "$(docker port "$name" 17170/tcp | head -1 | sed 's/.*://')" \
+        "$(docker port "$name" 3890/tcp | head -1 | sed 's/.*://')"
+}
+
+# side_up_kdc <name> <volume> <kdc volume> [-e NAME=value ...]: another server on its own SQLite
+# volume with its own realm on a second volume (Kerberos on, nothing set server-wide), removed and
+# made again by its exact name; prints its HTTP, LDAP and KDC (tcp) ports. kinit runs inside it.
+side_up_kdc() {
+    local name="$1" vol="$2" kvol="$3" i=0
+    shift 3
+    docker rm -fv "$name" >/dev/null 2>&1 || true
+    docker volume rm "$vol" "$kvol" >/dev/null 2>&1 || true
+    docker volume create "$vol" >/dev/null || return 1
+    docker volume create "$kvol" >/dev/null || return 1
+    LLDAP_JWT_SECRET="$JWT_SECRET" LLDAP_KEY_SEED="$KEY_SEED" LLDAP_LDAP_USER_PASS="$ADMIN_PASS" \
+        docker run -d --name "$name" --network "$NET" -p "127.0.0.1::17170" -p "127.0.0.1::3890" \
+        -p "127.0.0.1::1088/tcp" -v "$vol:/data" -v "$kvol:/var/kerberos/krb5kdc" \
+        -e LLDAP_JWT_SECRET -e LLDAP_KEY_SEED -e LLDAP_LDAP_USER_PASS \
+        -e LLDAP_LDAP_BASE_DN="$BASE_DN" -e LLDAP_DATABASE_URL="sqlite:////data/users.db?mode=rwc" \
+        -e LLDAP_VERBOSE=true "$@" "$GATE_IMAGE" >/dev/null || return 1
+    while ! docker exec "$name" /app/lldap healthcheck --config-file /data/lldap_config.toml \
+        >/dev/null 2>&1; do
+        i=$((i + 1))
+        [ "$i" -lt 90 ] && [ -n "$(docker ps -q -f "name=^${name}$")" ] || return 1
+        sleep 1
+    done
+    printf '%s %s %s\n' "$(docker port "$name" 17170/tcp | head -1 | sed 's/.*://')" \
+        "$(docker port "$name" 3890/tcp | head -1 | sed 's/.*://')" \
+        "$(docker port "$name" 1088/tcp | head -1 | sed 's/.*://')"
+}
+
+# side_down <name> <volume> <log>: its log kept, then the container and its volume removed by name.
+side_down() {
+    docker logs -t "$1" >"$3" 2>&1 || true
+    docker rm -fv "$1" >/dev/null 2>&1 || true
+    docker volume rm "$2" >/dev/null 2>&1 || true
+}
+
+# side_use <http port> <ldap port>: the gate's helpers talk to that server, as admin, until side_back.
+side_use() {
+    SIDE_SAVED="$HTTP_PORT $LDAP_PORT $TOKEN"
+    HTTP_PORT="$1" LDAP_PORT="$2"
+    TOKEN="$(gate_login)"
+}
+side_back() {
+    read -r HTTP_PORT LDAP_PORT TOKEN <<<"$SIDE_SAVED"
+}
+
 # file_contains <path> <needle>: pure-sh substring check inside the container
 # (the minimal runtime image is not guaranteed to ship grep).
 file_contains() {

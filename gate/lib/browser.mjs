@@ -1,6 +1,7 @@
 // Drives the gate's own server through the Chromium baked into the Playwright image.
 // Node's built-in WebSocket speaks CDP. Nothing is installed here. BROWSER_MODE mfa drives the
-// two-factor pages as BROWSER_USER and prints, per row, what the page sent (WIRE lines).
+// two-factor pages as BROWSER_USER and prints, per row, what the page sent (WIRE lines);
+// ou-mfa and ou-main sign in BROWSER_USER and BROWSER_CODE_USER under their OUs' enable-mfa.
 
 import { spawn } from "node:child_process";
 import { createHmac } from "node:crypto";
@@ -15,7 +16,9 @@ const userId = process.env.BROWSER_USER;
 const adminPass = process.env.BROWSER_ADMIN_PASS || "";
 const firstPass = process.env.BROWSER_PASS || "";
 const newPass = process.env.BROWSER_NEW_PASS || "";
-const secrets = [adminPass, firstPass, newPass].filter((s) => s.length > 0);
+const codeUser = process.env.BROWSER_CODE_USER || "";
+const totpSecret = process.env.BROWSER_TOTP_SECRET || "";
+const secrets = [adminPass, firstPass, newPass, totpSecret].filter((s) => s.length > 0);
 const userSecrets = [firstPass, newPass].filter((s) => s.length > 0);
 const WAIT_MS = 30000;
 const LOGIN_START = "/auth/opaque/login/start";
@@ -330,7 +333,8 @@ async function connect() {
   ws.addEventListener("message", onMessage);
   await send("Page.enable");
   await send("Runtime.enable");
-  if (mode === "mfa" || mode === "pages-one" || mode === "change" || mode === "code-retry") {
+  const captured = ["mfa", "pages-one", "change", "code-retry", "ou-mfa", "ou-main"];
+  if (captured.includes(mode)) {
     await send("Network.enable", { maxPostDataSize: 65536 });
   }
 }
@@ -340,8 +344,14 @@ async function recordContext() {
   say(`CONTEXT secure=${info.secure} url=${info.url}`);
 }
 
-let currentStep =
-  { change: "user-login", mfa: "mfa-login", "code-retry": "retry-enrol" }[mode] || "admin-login";
+const firstSteps = {
+  change: "user-login",
+  mfa: "mfa-login",
+  "code-retry": "retry-enrol",
+  "ou-mfa": "ou-pending",
+  "ou-main": "ou-main-always",
+};
+let currentStep = firstSteps[mode] || "admin-login";
 
 async function login(who, password, row) {
   currentStep = row;
@@ -600,6 +610,54 @@ async function mfaPages() {
   await endRow("mfa-reset");
 }
 
+// The code step for BROWSER_CODE_USER, with the step after the one its enrolment spent.
+async function codeStep(row) {
+  beginRow(row);
+  await typeCredentials(codeUser, firstPass);
+  await waitFor(`!!document.querySelector("#totp_code")`, "#totp_code");
+  await fill("#totp_code", totp(totpSecret, 1));
+  await clickButton("Verify");
+  await waitFor(LOGOUT_VISIBLE, "button Logout");
+  await endRow(row);
+}
+
+// No server-wide value: the OU's always lets the unenrolled BROWSER_USER in only to enroll, and
+// the OU's enabled asks the enrolled BROWSER_CODE_USER for the code.
+async function ouMfa() {
+  const enrol = `/user/${userId}/mfa`;
+  beginRow("ou-pending");
+  await goto("/login");
+  await recordContext();
+  await typeCredentials(userId, firstPass);
+  await waitFor(`location.pathname === ${JSON.stringify(enrol)}`, `path ${enrol}`);
+  await waitFor(`!!document.querySelector("#current_password")`, "#current_password");
+  await endRow("ou-pending");
+
+  currentStep = "ou-confined";
+  await goto(`/user/${userId}`);
+  await waitFor(`location.pathname === ${JSON.stringify(enrol)}`, `path ${enrol} again`);
+  say("ROW ou-confined PASS");
+
+  await clickButton("Logout");
+  await codeStep("ou-code");
+}
+
+// The server's explicit enabled overrides the OUs: under the OU's always the unenrolled
+// BROWSER_USER signs in to their own page, and under the OU's off the enrolled one gets the code.
+async function ouMain() {
+  const own = `/user/${userId}`;
+  beginRow("ou-main-always");
+  await goto("/login");
+  await recordContext();
+  await typeCredentials(userId, firstPass);
+  await waitFor(LOGOUT_VISIBLE, "button Logout");
+  await waitFor(`location.pathname === ${JSON.stringify(own)}`, `path ${own}`);
+  await endRow("ou-main-always");
+
+  await clickButton("Logout");
+  await codeStep("ou-main-off");
+}
+
 // A refused user at both login doors, from this container's own address.
 async function refused() {
   currentStep = "refused-web";
@@ -730,6 +788,10 @@ async function main() {
     await codeRetry();
   } else if (mode === "pages-one") {
     await pagesAtOne();
+  } else if (mode === "ou-mfa") {
+    await ouMfa();
+  } else if (mode === "ou-main") {
+    await ouMain();
   } else {
     throw fail("BROWSER_MODE", mode || "unset");
   }

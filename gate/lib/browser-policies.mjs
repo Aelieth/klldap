@@ -20,13 +20,14 @@ const editedName = process.env.BROWSER_EDITED || "";
 const otherName = process.env.BROWSER_OTHER || "";
 const badIntName = process.env.BROWSER_BADINT || "";
 const badHoursName = process.env.BROWSER_BADHOURS || "";
+const serverWide = process.env.BROWSER_SERVER_WIDE || "";
 const unenforcedKeys = (process.env.BROWSER_UNENFORCED || "")
   .split(",")
   .map((key) => key.trim())
   .filter((key) => key.length > 0);
 
 const ITEMS = [
-  ["require-mfa", "Require MFA", "always", "always", "select"],
+  ["enable-mfa", "Enable MFA", "always", "always", "select"],
   ["lockout-threshold", "Failed logins before lockout", "3", "3 tries", "number"],
   ["lockout-duration-seconds", "Lockout duration (seconds)", "120", "120 s", "number"],
   ["login-hours", "Login hours", "Mon-Fri 09:00-17:00", "Mon-Fri 09:00-17:00", "text"],
@@ -313,8 +314,8 @@ async function panelValue(label) {
 
 async function waitPanel() {
   await waitFor(
-    `[...document.querySelectorAll("span.text-truncate")].some((s) => s.textContent.trim() === "Require MFA")`,
-    "Require MFA",
+    `[...document.querySelectorAll("span.text-truncate")].some((s) => s.textContent.trim() === "Enable MFA")`,
+    "Enable MFA",
   );
 }
 
@@ -502,7 +503,7 @@ async function editPolicy() {
 async function swapPolicy() {
   await clickButton("New policy");
   await fill('input[placeholder="e.g. Front Desk"]', otherName);
-  await setRule("require-mfa", "select", "off");
+  await setRule("enable-mfa", "select", "off");
   await clickButton("Save");
   await waitFor(
     `document.querySelector(".alert-success")?.textContent.includes(${JSON.stringify(otherName)})`,
@@ -594,6 +595,23 @@ async function notice() {
     row("notice", "PASS", text);
   } else {
     row("notice", "FAIL", text || "missing");
+  }
+}
+
+// Where the server sets enable_mfa, the page says it overrides every OU's enable-mfa.
+async function overrideLine() {
+  const text = await evalValue(`(() => {
+    const span = [...document.querySelectorAll("span.small.text-muted")].find((node) =>
+      node.textContent.includes("The server sets enable_mfa"));
+    return span ? span.textContent.replace(/\\s+/g, " ").trim() : "";
+  })()`);
+  const expected = serverWide
+    ? `The server sets enable_mfa = ${serverWide} for every user: it overrides the OUs' enable-mfa.`
+    : "";
+  if (text === expected) {
+    row("override-line", "PASS", text || "no server-wide value, no line");
+  } else {
+    row("override-line", "FAIL", text || "missing");
   }
 }
 
@@ -777,6 +795,7 @@ const steps = [
   ["remove", removePolicy],
   ["delete-policy", deletePolicy],
   ["notice", notice],
+  ["override-line", overrideLine],
   ["empty-name", emptyName],
   ["invalid-int", invalidInt],
   ["invalid-string", invalidString],

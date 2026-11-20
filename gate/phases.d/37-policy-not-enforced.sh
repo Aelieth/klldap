@@ -1,13 +1,18 @@
 # shellcheck shell=bash
-# Phase: each policy item set and shown effective, then simple login, LDAP bind, kinit; lockout-threshold locks, the other rows say today | when enforced.
+# Phase: each policy item set and shown effective, then simple login, LDAP bind, kinit; lockout-threshold locks, enable-mfa=always is overridden here
+# by the server's explicit LLDAP_ENABLE_MFA and refuses the binds on a server without it, the other rows say today | when enforced.
 
 NE_D="$(phase_dir)"
 NE_N=0 NE_P=0 NE_F=0 NE_K=0 NE_FIND=()
 NE_RUN="ne$(date +%H%M%S)"
 NE_OU="${NE_RUN}ou" NE_USER="${NE_RUN}-u" NE_POLICY=""
 NE_PASS="$(python3 -c 'import secrets; print("Ne" + secrets.token_hex(10) + "!")')"
+NE_SIDE="$CONTAINER-ou37" NE_SIDE_VOL="klldap-gate-ou37-$RUNID"
+EXTRA_CONTAINERS+=("$NE_SIDE")
+EXTRA_VOLUMES+=("$NE_SIDE_VOL")
 
 ne_pass() { NE_N=$((NE_N + 1)) NE_P=$((NE_P + 1)); p_ok "$1"; }
+ne_bad() { NE_N=$((NE_N + 1)); p_bad "$1"; }
 ne_note() { NE_N=$((NE_N + 1)) NE_K=$((NE_K + 1)); note "[NOTE] ${PHASE}: $1"; }
 ne_finding() { NE_N=$((NE_N + 1)) NE_F=$((NE_F + 1)) NE_FIND+=("$1"); note "[FINDING] ${PHASE}: $1"; }
 ne_gql() { graphql "$1" "$2" 2>"$NE_D/last.err"; }
@@ -146,13 +151,81 @@ print(next((str(x["policyId"] or "") for x in json.load(sys.stdin)["ouPolicyStat
     done
 }
 
+# shellcheck disable=SC2016
+ne_side_setup() {
+    local id
+    ne_gql 'mutation($n: String!) { createOu(name: $n) { ok } }' '{"n": "'"$NE_OU"'"}' >/dev/null &&
+        ne_gql 'mutation($u: CreateUserInput!) { createUser(user: $u) { id } }' \
+            '{"u": {"id": "'"$NE_USER"'", "email": "'"$NE_USER"'@gate.test"}}' >/dev/null &&
+        NE_VARS="$(NEU="$NE_USER" NEP="$NE_PASS" python3 -c 'import json,os; print(json.dumps({"id": os.environ["NEU"], "pw": os.environ["NEP"]}))')" &&
+        ne_gql 'mutation($id: String!, $pw: String!) { setUserPassword(userId: $id, password: $pw) { ok } }' "$NE_VARS" >/dev/null &&
+        ne_gql 'mutation($ids: [String!]!, $ou: String!) { changeUserOu(userIds: $ids, newOu: $ou) { ok } }' \
+            '{"ids": ["'"$NE_USER"'"], "ou": "'"$NE_OU"'"}' >/dev/null || return 1
+    unset NE_VARS
+    NE_DN="$(lsearch -o ldif-wrap=no -b "$BASE_DN" -s sub "(uid=$NE_USER)" dn 2>/dev/null | sed -n 's/^dn: //p' | head -1)"
+    [ -n "$NE_DN" ] && ne_right simple-login && ne_right ldap-bind || return 1
+    id="$(ne_gql 'mutation($n: String!, $i: [PolicyItemInput!]) { createPolicy(name: $n, items: $i) { id } }' \
+        '{"n": "'"$NE_RUN"' side", "i": [{"key": "enable-mfa", "value": "always"}]}' | json_get createPolicy.id)" &&
+        [ -n "$id" ] || return 1
+    ne_gql 'mutation($o: String!, $p: Int!) { setOuPolicy(ou: $o, policyId: $p) { ok } }' \
+        '{"o": "'"$NE_OU"'", "p": '"$id"'}' >/dev/null && return 0
+    graphql 'mutation($p: Int!) { deletePolicy(policyId: $p) { ok } }' '{"p": '"$id"'}' >/dev/null 2>&1 || true
+    return 1
+}
+
+# P2.1 turned round on a server that sets no LLDAP_ENABLE_MFA, so the OU's enable-mfa decides.
+ne_side() {
+    local ports main_dn="$NE_DN" door
+    if ! ports="$(side_up "$NE_SIDE" "$NE_SIDE_VOL" 2>"$NE_D/side.err")"; then
+        p_bad "[P2.1-side] the server without LLDAP_ENABLE_MFA did not become healthy (see side.err, side.log)"
+        side_down "$NE_SIDE" "$NE_SIDE_VOL" "$NE_D/side.log"
+        return
+    fi
+    # shellcheck disable=SC2086
+    side_use $ports
+    if [ -z "$TOKEN" ] || ! ne_side_setup; then
+        p_bad "[P2.1-side] setup on $NE_SIDE failed: $(head -c 200 "$NE_D/last.err")"
+    else
+        for door in simple-login ldap-bind; do
+            if ne_enrol_refused "$door"; then
+                ne_pass "[P2.1-$door] enable-mfa=always on the user's OU, no server-wide value: $door with the right password is refused until the user enrols a second factor (HTTP 401, LDAP 49 'MFA enrollment required'); control: allowed before the OU set it"
+            else
+                ne_bad "[P2.1-$door] enable-mfa=always on the user's OU, no server-wide value: $door was not refused as 'MFA enrollment required' (see simple.out, bind.out)"
+            fi
+        done
+    fi
+    side_back
+    NE_DN="$main_dn"
+    side_down "$NE_SIDE" "$NE_SIDE_VOL" "$NE_D/side.log"
+}
+
+ne_enrol_refused() {
+    case "$1" in
+    simple-login)
+        ! gate_login "$NE_USER" "$NE_PASS" >"$NE_D/simple.out" 2>&1 &&
+            grep -q "HTTP 401" "$NE_D/simple.out" && grep -q "MFA enrollment required" "$NE_D/simple.out"
+        ;;
+    ldap-bind) [ "$(ne_bind "$NE_PASS")" = 49 ] && grep -q "MFA enrollment required" "$NE_D/bind.out" ;;
+    esac
+}
+
 ne_today() {
     local day i bad want
-    ne_case require-mfa always &&
-        for door in simple-login ldap-bind kinit; do
-            ne_door "P2.1-$door" "require-mfa=always, user without MFA" "$door" \
-                "refused until the user enrols a second factor$([ "$door" = kinit ] && echo '; kinit has no code today, so enforcement needs a Kerberos-side answer')"
+    ne_case enable-mfa always && {
+        for door in simple-login ldap-bind; do
+            if ne_right "$door"; then
+                ne_pass "[P2.1-main-$door] enable-mfa=always on the user's OU, overridden by the main server's explicit LLDAP_ENABLE_MFA=true: $door with the password alone is allowed, as for an unenrolled user under 'enabled'"
+            else
+                ne_bad "[P2.1-main-$door] enable-mfa=always on the user's OU: $door was refused although the main server's explicit LLDAP_ENABLE_MFA=true overrides the OUs"
+            fi
         done
+        if ne_right kinit; then
+            ne_pass "[P2.1-kinit] enable-mfa=always on the user's OU, overridden by the main server's explicit LLDAP_ENABLE_MFA=true, the user not enrolled: the KDC asks no fresh proof, kinit with the right password is allowed (a user who must give a factor needs one: phase 88)"
+        else
+            ne_bad "[P2.1-kinit] the user is not enrolled under the main server's explicit LLDAP_ENABLE_MFA=true, so the KDC asks no proof, yet kinit with the right password was refused (see kinit.out)"
+        fi
+    }
+    ne_side
     ne_root before && ne_case lockout-threshold 3 &&
         for door in simple-login ldap-bind kinit; do
             bad=0

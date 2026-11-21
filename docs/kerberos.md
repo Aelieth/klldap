@@ -227,8 +227,17 @@ ACL text, read at boot.
   A principal not made by the directory (made with kadmin, or one the start
   disabled) is adopted: it keeps its fields, but its keys are replaced with
   random ones and the old keys dropped, and it is marked and disabled, with one
-  `kerberos_sync` row, so no password the directory never saw works on it
-  (its key history, which only a password policy's reuse check reads, stays).
+  `kerberos_sync` row, so no password the directory never saw works on it.
+  The exception is its Kerberos password policy: adoption clears it, and the
+  password expiry date it set with it, in the same transaction, with a second
+  `kerberos_sync` row that names the policy. Every rule that policy carried
+  goes with it: its minimum length, password history, character classes,
+  minimum password life, allowed key types and its lockout threshold. For a
+  directory user the OU policy item `password-min-length` is the rule
+  ([policies.md](policies.md#password-length)). The principal's own expiry
+  date (kadmin `-expire`) and its other fields stay, and so does the policy
+  itself, for the principals the directory does not own. The key history
+  stays too; with no policy, nothing reads it.
   So is a principal the directory made, when the switch goes from off to on:
   one left behind by a sync turned off or a forced reset keeps no old key.
   Turning the switch on when it is already on changes nothing.
@@ -242,7 +251,16 @@ ACL text, read at boot.
   Adoption does not revoke tickets already issued to the principal: they run
   out with their lifetime.
   An LDAP ADD with the switch on and a password sets both forms and marks the
-  principal, whoever made it. Turning the switch on for a user id
+  principal, whoever made it. When an LDAP ADD that carries a password takes
+  over such a principal, that one password must also satisfy the principal's
+  old Kerberos policy (whose minimum counts bytes); the policy is cleared with
+  that change. To avoid it, create the user without a password, or clear the
+  policy with kadmin (`modprinc -clearpolicy`), first.
+  The start pass clears the policy of every principal the directory owns that
+  still has one, such as those adopted before 0.8.1, before the KDC serves:
+  one `kerberos_sync` row each, and a start that finds none writes nothing. A
+  clear that cannot be written is a warning in the server log; the start goes
+  on, and the next start tries again. Turning the switch on for a user id
   that Kerberos refuses (ASCII letters, digits, `.`, `_` and `-`, starting with
   a letter or a digit, and not `krbtgt`, `kadmin`, `kiprop` or `wellknown`) is
   refused with that rule, at `createUser` and `updateUser` alike. Both also
@@ -722,7 +740,11 @@ Podman follows the steps below. Those steps are what the script does.
    the admin line (name them in `kadmin_acl`), and MIT's logs.
 
    At each start, KLLDAP takes the principal of each user with `kerberosSync`
-   as its own, and only KLLDAP changes it from then on. A principal of a
+   as its own, and only KLLDAP changes it from then on. It clears that
+   principal's Kerberos password policy, with one `kerberos_sync` row, so the
+   user's `password-min-length` is the rule. (kadmin binds a policy named
+   `default`, when the realm has one, to each principal it adds without
+   `-policy` or `-clearpolicy`.) A principal of a
    directory user without `kerberosSync` is disabled, not deleted, and a
    `kerberos_sync` log row names it. To use it again, turn `kerberosSync` on
    for the user, then change the user's password: the password change is what

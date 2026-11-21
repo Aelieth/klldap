@@ -706,8 +706,8 @@ async fn start_pass(handler: &SqlBackendHandler, embedded: &EmbeddedKerberos) ->
     let pass = embedded.start_pass(users).await?;
     info!(
         "🎟️ Kerberos start pass: {} principals marked, {} removed, {} disabled, {} set from \
-         lldap_disabled",
-        pass.marked, pass.removed, pass.disabled, pass.followed
+         lldap_disabled, {} Kerberos password policies cleared",
+        pass.marked, pass.removed, pass.disabled, pass.followed, pass.cleared
     );
     Ok(())
 }

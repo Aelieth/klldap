@@ -190,6 +190,16 @@
   principal is enabled then, unless its user is in `lldap_disabled`. Deleting a user without
   sync touches no principal. Sync on at `createUser` is refused for a name that is an alias, as
   at `updateUser`.
+- **For a directory user, the OU policy's `password-min-length` is the rule; a Kerberos password
+  policy no longer applies on top.** An adoption (sync turned on, a create with sync, an LDAP
+  ADD with a password, the start's mark) clears the principal's Kerberos policy in the same
+  transaction, with one `kerberos_sync` row, `Kerberos password policy <policy> cleared from
+  <principal>: the directory's password-min-length applies`; the password expiry that policy
+  set goes with it. The start pass clears it once from every principal adopted before,
+  one row each; a clear that cannot be written is a warning, and the next start tries again.
+  The policies stay, and so do the bindings of principals the directory does not own. An LDAP
+  ADD whose password adopts a bound principal is still judged once by that policy; create the
+  user without a password, or `modprinc -clearpolicy` first.
 - A change of `lldap_disabled` membership is never refused because Kerberos is disabled or not
   ready. With Kerberos disabled in the configuration, or the realm not ready, it changes the
   directory alone with a `kerberos_sync` row saying the principal's status is left for the start

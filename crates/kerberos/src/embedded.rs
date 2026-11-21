@@ -38,7 +38,7 @@ use std::sync::{Arc, OnceLock, RwLock, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
-use tracing::{Span, error, info};
+use tracing::{Span, error, info, warn};
 use zeroize::Zeroizing;
 
 const KADMIND_START: Duration = Duration::from_secs(10);
@@ -346,8 +346,8 @@ impl EmbeddedKerberos {
     }
 
     /// At each start, before the listeners, on users read beforehand with their sync: marks each
-    /// synced user's principal, removes a marked one no synced user has, and disables an
-    /// unmarked one of a user without sync, `START_CHUNK` per change. A second run writes nothing.
+    /// synced user's principal, removes a marked one no synced user has, disables an unmarked one
+    /// of a user without sync, clears marked ones' Kerberos policies. A second run writes nothing.
     pub async fn start_pass(&self, users: Vec<(UserId, bool)>) -> Result<StartPass> {
         self.start_pass_in(users, START_CHUNK).await
     }
@@ -355,7 +355,7 @@ impl EmbeddedKerberos {
     async fn start_pass_in(&self, users: Vec<(UserId, bool)>, chunk: usize) -> Result<StartPass> {
         let own = self.own();
         let serial = self.writes.clone().lock_owned().await;
-        let (swept, aliases, followed) = tokio::task::spawn_blocking(move || {
+        let (swept, aliases, followed, cleared) = tokio::task::spawn_blocking(move || {
             let _serial = serial;
             let (swept, aliases, listed) = {
                 let store = own
@@ -386,7 +386,7 @@ impl EmbeddedKerberos {
                 info!("Filled the alias target of {filled} alias rows written before the column");
             }
             for part in swept.chunks(chunk) {
-                let rows = swept_rows(part);
+                let rows = swept_rows(part, &own.realm);
                 let mut store = own
                     .store
                     .write()
@@ -396,7 +396,10 @@ impl EmbeddedKerberos {
                     .change_committing(committing_with(own.host.as_ref(), logged), |s| {
                         for one in part {
                             match one.sweep {
-                                Sweep::Mark => s.set_host_owned_in(&one.name, &own.realm, true)?,
+                                Sweep::Mark => {
+                                    s.set_host_owned_in(&one.name, &own.realm, true)?;
+                                    clear_policy(s, &one.name, &own)?;
+                                }
                                 Sweep::Remove(_) => s.remove_in(&one.name, &own.realm)?,
                                 Sweep::Disable => {
                                     s.set_status(&one.name, true, one.pw_expire, &own.actor)?;
@@ -410,6 +413,7 @@ impl EmbeddedKerberos {
                 drop(store);
                 rows.iter().for_each(logging::print);
             }
+            let cleared = clear_policies(&own, chunk);
             let marked: Vec<_> = swept
                 .iter()
                 .filter(|one| one.sweep == Sweep::Mark)
@@ -417,7 +421,7 @@ impl EmbeddedKerberos {
                 .collect();
             let followed = follow_statuses(&own, Some(marked.as_slice()), chunk, AT_OPEN)?;
             own.host.start_pass_committed();
-            Ok::<_, anyhow::Error>((swept, aliases, followed))
+            Ok::<_, anyhow::Error>((swept, aliases, followed, cleared))
         })
         .await
         .context("the start pass did not complete")??;
@@ -433,7 +437,9 @@ impl EmbeddedKerberos {
                 Sweep::Disable => pass.disabled += 1,
             }
         }
+        let bound_at_mark = swept.iter().filter(|one| one.cleared().is_some()).count();
         pass.followed = followed;
+        pass.cleared = bound_at_mark + cleared;
         Ok(pass)
     }
 
@@ -485,11 +491,12 @@ impl EmbeddedKerberos {
                         commit_owned(&own, &password, &enctypes, &ent, change)
                     }));
                     match &done {
-                        Ok(Ok(())) => printed.iter().for_each(logging::print),
+                        Ok(Ok(noted)) => printed.iter().chain(noted).for_each(logging::print),
                         Ok(Err(e)) => record_commit_failure(kind, &worker, e),
                         Err(_) => record_unreported(kind, &worker, PANICKED),
                     }
                     done.unwrap_or_else(|_| Err(CommitError::Unknown(PANICKED.to_owned())))
+                        .map(drop)
                 })
             })
         })
@@ -1149,8 +1156,8 @@ struct Own {
     actor: String,
 }
 
-// `commit` makes each attempt's closure; at most one of them reaches the host. `locked` is the
-// directory's state for an existing principal, set with its keys; None leaves its status.
+// `commit` makes each attempt's closure, given the rows the mark adds; at most one reaches the
+// host. `locked` is the directory's state for an existing principal; None leaves its status.
 fn set_password<C>(
     own: &Own,
     user: &UserId,
@@ -1159,12 +1166,14 @@ fn set_password<C>(
     ent: &AdminEnt,
     locked: Option<bool>,
     commit: impl Fn() -> C,
-) -> Result<(), StoreError>
+) -> Result<Option<logging::LogEvent>, StoreError>
 where
-    C: FnOnce(HostChange) -> Result<(), KerberosStoreError>,
+    C: FnOnce(HostChange, Vec<HostRow>) -> Result<(), KerberosStoreError>,
 {
     let name = user_principal(user);
+    let noted: RefCell<Option<logging::LogEvent>> = RefCell::new(None);
     let change = || {
+        let (made, noted) = (commit(), &noted);
         krb5_kdc::change_password_shared_committing_then(
             &own.store,
             &name,
@@ -1174,23 +1183,32 @@ where
             &own.actor,
             enctypes,
             |s| not_an_alias(s, &own.realm, user),
-            commit(),
+            move |host_change| {
+                let rows = noted.borrow().iter().cloned().map(HostRow::Log).collect();
+                made(host_change, rows)
+            },
             |s| {
                 follow_directory(s, &name, locked, &own.actor)?;
-                mark(s, &name, &own.realm)
+                let cleared = mark(s, &name, own)?;
+                *noted.borrow_mut() =
+                    cleared.map(|policy| cleared_row(user.as_str(), &policy, &name, &own.realm));
+                Ok(())
             },
         )
     };
     let mut next = after_change(change());
     if next == Next::Create {
-        let created = create_owned(own, user, password, enctypes, ent, locked, commit());
+        let made = commit();
+        let created = create_owned(own, user, password, enctypes, ent, locked, |change| {
+            made(change, Vec::new())
+        });
         next = after_create(created);
     }
     if next == Next::ChangeAgain {
         next = after_change(change());
     }
     match next {
-        Next::Done => Ok(()),
+        Next::Done => Ok(noted.into_inner()),
         Next::Fail(e) => Err(e),
         Next::Create | Next::ChangeAgain => Err(StoreError::NotFound),
     }
@@ -1224,11 +1242,48 @@ fn create_owned(
     )
 }
 
-fn mark(s: &mut PrincipalStore, name: &PrincipalName, realm: &str) -> Result<(), StoreError> {
+/// Marks a principal the directory did not make and clears its Kerberos password policy.
+fn mark(
+    s: &mut PrincipalStore,
+    name: &PrincipalName,
+    own: &Own,
+) -> Result<Option<String>, StoreError> {
     match s.get_name(name).map(|p| p.host_owned()) {
-        Some(false) => s.set_host_owned_in(name, realm, true),
-        _ => Ok(()),
+        Some(false) => {
+            s.set_host_owned_in(name, &own.realm, true)?;
+            clear_policy(s, name, own)
+        }
+        _ => Ok(None),
     }
+}
+
+/// As kadmin's `-clearpolicy`, with the password expiry the policy set; the policy stays.
+fn clear_policy(
+    s: &mut PrincipalStore,
+    name: &PrincipalName,
+    own: &Own,
+) -> Result<Option<String>, StoreError> {
+    let Some(policy) = s.get_name(name).and_then(|p| p.pw_policy.clone()) else {
+        return Ok(None);
+    };
+    let fields = AdminFields {
+        clear_policy: true,
+        ..Default::default()
+    };
+    s.apply_admin_fields_in(name, &own.realm, fields, &own.actor)?;
+    Ok(Some(policy))
+}
+
+fn policy_cleared(policy: &str, principal: &str) -> String {
+    format!(
+        "Kerberos password policy {policy} cleared from {principal}: the directory's \
+         password-min-length applies"
+    )
+}
+
+fn cleared_row(target: &str, policy: &str, name: &PrincipalName, realm: &str) -> logging::LogEvent {
+    let detail = policy_cleared(policy, &name.unparse_with_realm_lossy(realm));
+    logging::event(LogKind::KerberosSync, Some(target), true, Some(&detail))
 }
 
 // `set_status` also writes `pw_expire`: the one the keys or the create left goes through.
@@ -1266,7 +1321,7 @@ fn commit_owned(
     enctypes: &[KeySalt],
     ent: &AdminEnt,
     change: PasswordCommit,
-) -> Result<(), CommitError> {
+) -> Result<Option<logging::LogEvent>, CommitError> {
     let PasswordCommit { user, rows, .. } = change;
     let disabled = own
         .host
@@ -1277,22 +1332,26 @@ fn commit_owned(
         ent.attributes |= KDB_DISALLOW_ALL_TIX;
     }
     let made = set_password(own, &user, password, enctypes, &ent, Some(disabled), || {
-        committing_with(own.host.as_ref(), rows.clone())
+        let rows = rows.clone();
+        move |host_change: HostChange, noted: Vec<HostRow>| {
+            let rows = [rows, noted].concat();
+            committing_with(own.host.as_ref(), rows)(host_change)
+        }
     });
     if let Err(StoreError::InvalidArgument(why)) = &made
         && why.starts_with(&aliased(&user, ""))
     {
         return Err(CommitError::Refused(why.clone()));
     }
-    made.map_err(commit_error)?;
+    let noted = made.map_err(commit_error)?;
     kill_point("kerberos-changed");
-    Ok(())
+    Ok(noted)
 }
 
 // A synced user's delete, sync change or `lldap_disabled` change, on the blocking task that owns
 // `writes`: the principal's change and `rows` in one transaction. A name that is an alias is
 // never written through.
-fn user_change(own: &Own, change: UserChange) -> Result<Option<logging::LogEvent>, CommitError> {
+fn user_change(own: &Own, change: UserChange) -> Result<Vec<logging::LogEvent>, CommitError> {
     let UserChange {
         user,
         step,
@@ -1316,7 +1375,7 @@ fn user_change(own: &Own, change: UserChange) -> Result<Option<logging::LogEvent
         rows.insert(0, HostRow::SyncIs(user.clone(), synced));
     }
     let name = user_principal(&user);
-    let noted = RefCell::new(None);
+    let noted = RefCell::new(Vec::new());
     let note = |detail: String| {
         let row = logging::event(
             LogKind::KerberosSync,
@@ -1324,12 +1383,12 @@ fn user_change(own: &Own, change: UserChange) -> Result<Option<logging::LogEvent
             true,
             Some(&detail),
         );
-        *noted.borrow_mut() = Some(row);
+        noted.borrow_mut().push(row);
     };
     let (host, extra) = (own.host.as_ref(), &noted);
     let commit = move |change: HostChange| {
         let mut rows = rows;
-        rows.extend(extra.borrow().clone().map(HostRow::Log));
+        rows.extend(extra.borrow().iter().cloned().map(HostRow::Log));
         committing_with(host, rows)(change)
     };
     let edit = |s: &mut PrincipalStore| -> Result<(), StoreError> {
@@ -1354,8 +1413,12 @@ fn user_change(own: &Own, change: UserChange) -> Result<Option<logging::LogEvent
         match step {
             UserStep::Delete | UserStep::SyncOff => s.remove_in(&name, &own.realm),
             UserStep::SyncOn | UserStep::Create => {
-                adopt(s, &name, own, principal.pw_expire)?;
+                let cleared = adopt(s, &name, own, principal.pw_expire)?;
                 note(ADOPTED.to_owned());
+                if let Some(policy) = cleared {
+                    let full = name.unparse_with_realm_lossy(&own.realm);
+                    note(policy_cleared(&policy, &full));
+                }
                 Ok(())
             }
             UserStep::Disable | UserStep::Enable => {
@@ -1387,18 +1450,20 @@ fn user_change(own: &Own, change: UserChange) -> Result<Option<logging::LogEvent
     }
 }
 
-/// The principal stays; its keys are replaced, the old ones dropped, so no password the
-/// directory never saw works on it.
+/// The principal stays, without its Kerberos password policy; its keys are replaced, the old ones
+/// dropped, so no password the directory never saw works on it.
 fn adopt(
     s: &mut PrincipalStore,
     name: &PrincipalName,
     own: &Own,
     pw_expire: u32,
-) -> Result<(), StoreError> {
+) -> Result<Option<String>, StoreError> {
     s.set_host_owned_in(name, &own.realm, true)?;
+    let cleared = clear_policy(s, name, own)?;
     s.chrand_etypes_keepold_in(name, &own.realm, &[], 0, &own.actor)?;
     let pw_expire = s.get_name(name).map_or(pw_expire, |p| p.pw_expire);
-    s.set_status(name, true, pw_expire, &own.actor)
+    s.set_status(name, true, pw_expire, &own.actor)?;
+    Ok(cleared)
 }
 
 fn commit_error(e: StoreError) -> CommitError {
@@ -1442,6 +1507,7 @@ pub struct StartPass {
     pub removed: usize,
     pub disabled: usize,
     pub followed: usize,
+    pub cleared: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1455,7 +1521,17 @@ struct Swept {
     name: PrincipalName,
     target: String,
     pw_expire: u32,
+    policy: Option<String>,
     sweep: Sweep,
+}
+
+impl Swept {
+    fn cleared(&self) -> Option<&str> {
+        match self.sweep {
+            Sweep::Mark => self.policy.as_deref(),
+            Sweep::Remove(_) | Sweep::Disable => None,
+        }
+    }
 }
 
 // `user` is the sync of the directory user the one-part name matches, or None.
@@ -1488,14 +1564,15 @@ fn sweep_plan(
                 name: p.name.clone(),
                 target: p.name.unparse_no_realm_lossy(),
                 pw_expire: p.pw_expire,
+                policy: p.pw_policy.clone(),
                 sweep: sweep_of(p.host_owned(), p.locked(), user)?,
             })
         })
         .collect()
 }
 
-/// The rows of one chunk of the start pass: one per removal or disable, and its marks counted.
-fn swept_rows(part: &[Swept]) -> Vec<logging::LogEvent> {
+/// The rows of one chunk of the start pass: removals, disables, cleared policies, marks counted.
+fn swept_rows(part: &[Swept], realm: &str) -> Vec<logging::LogEvent> {
     let row = |target: Option<&str>, detail: &str| {
         logging::event(LogKind::KerberosSync, target, true, Some(detail))
     };
@@ -1503,7 +1580,11 @@ fn swept_rows(part: &[Swept]) -> Vec<logging::LogEvent> {
     for one in part {
         let target = Some(one.target.as_str());
         match one.sweep {
-            Sweep::Mark => {}
+            Sweep::Mark => {
+                if let Some(policy) = one.cleared() {
+                    rows.push(cleared_row(&one.target, policy, &one.name, realm));
+                }
+            }
             Sweep::Remove(reason) => rows.push(row(target, &format!("removed at start: {reason}"))),
             Sweep::Disable => rows.push(row(target, DISABLED_AT_START)),
         }
@@ -1513,6 +1594,78 @@ fn swept_rows(part: &[Swept]) -> Vec<logging::LogEvent> {
         rows.push(row(None, &format!("marked at start: {marked} principals")));
     }
     rows
+}
+
+/// Marked principals still bound to a Kerberos policy, found or not, lose it, `chunk` per change;
+/// a change that fails leaves the rest to the next start, and the start goes on.
+fn clear_policies(own: &Own, chunk: usize) -> usize {
+    let bound = own.store.read().map(|s| bound_principals(&s, &own.realm));
+    let Ok(bound) = bound else {
+        warn!("No Kerberos password policy was cleared: the principal store was poisoned");
+        return 0;
+    };
+    let mut cleared = 0;
+    for (at, part) in bound.chunks(chunk).enumerate() {
+        match clear_chunk(own, part) {
+            Ok(written) => {
+                written.iter().for_each(logging::print);
+                cleared += written.len();
+            }
+            Err(e) => {
+                let left = bound.len() - at * chunk;
+                warn!(
+                    "The Kerberos password policy of {left} directory principals was not \
+                     cleared; the next start tries again: {e}"
+                );
+                break;
+            }
+        }
+    }
+    cleared
+}
+
+fn bound_principals(store: &PrincipalStore, realm: &str) -> Vec<PrincipalName> {
+    store
+        .ids()
+        .iter()
+        .filter_map(|id| store.get_raw(id))
+        .filter(|p| directory_bound(p, realm))
+        .map(|p| p.name.clone())
+        .collect()
+}
+
+fn directory_bound(p: &krb5_kdc::Principal, realm: &str) -> bool {
+    p.realm == realm && p.alias_target().is_none() && p.host_owned() && p.pw_policy.is_some()
+}
+
+fn clear_chunk(own: &Own, part: &[PrincipalName]) -> Result<Vec<logging::LogEvent>, StoreError> {
+    let logged: RefCell<Vec<logging::LogEvent>> = RefCell::new(Vec::new());
+    let host = own.host.as_ref();
+    let commit = |change: HostChange| {
+        let written = logged.borrow().iter().cloned().map(HostRow::Log).collect();
+        committing_with(host, written)(change)
+    };
+    let edit = |s: &mut PrincipalStore| -> Result<(), StoreError> {
+        for name in part {
+            let id = lookup_principal_id(name, &own.realm);
+            let still = id.and_then(|id| s.get_raw(&id).map(|p| directory_bound(p, &own.realm)));
+            if still != Some(true) {
+                continue;
+            }
+            if let Some(policy) = clear_policy(s, name, own)? {
+                let target = name.unparse_no_realm_lossy();
+                let row = cleared_row(&target, &policy, name, &own.realm);
+                logged.borrow_mut().push(row);
+            }
+        }
+        Ok(())
+    };
+    let mut store = own.store.write().map_err(|_| poisoned())?;
+    store
+        .change_committing(commit, edit)
+        .and_then(|done| done)?;
+    drop(store);
+    Ok(logged.into_inner())
 }
 
 fn user_principal(user: &UserId) -> PrincipalName {
@@ -2282,7 +2435,8 @@ pub(crate) mod tests {
                     marked: 1,
                     removed: 2,
                     disabled: 1,
-                    followed: 0
+                    followed: 0,
+                    cleared: 0
                 },
                 vec![
                     ("alice", Some((true, false))),
@@ -3941,27 +4095,97 @@ pub(crate) mod tests {
         );
     }
 
+    fn put_policy(store: &SharedDump, name: &str, min_length: u32, pw_max_life: u32) {
+        let mut policy = krb5_kdc::NamedPolicy::new(name);
+        policy.min_length = min_length;
+        policy.pw_max_life = pw_max_life;
+        store.write().unwrap().put_policy(policy).unwrap();
+    }
+
+    fn bind_policy(embedded: &EmbeddedKerberos, name: &PrincipalName, policy: &str) {
+        in_change(&embedded.own(), |s| {
+            s.set_principal_policy(name, Some(policy.to_owned()))
+        })
+        .unwrap();
+    }
+
+    type Keys = Vec<(u32, EncryptionType, Vec<u8>)>;
+
+    fn keys_of(store: &SharedDump, user: &str) -> Option<Keys> {
+        let guard = store.read().unwrap();
+        let p = guard.get_name(&user_principal(&UserId::new(user)))?;
+        let keys = p.keys.iter();
+        Some(
+            keys.map(|k| (k.kvno, k.etype, k.key.as_bytes().to_vec()))
+                .collect(),
+        )
+    }
+
+    fn binding(store: &SharedDump, user: &str) -> Option<(bool, Option<String>, bool)> {
+        let guard = store.read().unwrap();
+        let p = guard.get_name(&user_principal(&UserId::new(user)))?;
+        Some((p.host_owned(), p.pw_policy.clone(), p.pw_expire > 0))
+    }
+
+    const EXPIRES: u32 = 2_000_000_000;
+
+    fn expire_at(embedded: &EmbeddedKerberos, user: &str, at: u32) {
+        let fields = AdminFields {
+            expiration: Some(at),
+            ..Default::default()
+        };
+        let name = user_principal(&UserId::new(user));
+        in_change(&embedded.own(), |s| {
+            s.apply_admin_fields_in(&name, "EXAMPLE.COM", fields, "test")
+        })
+        .unwrap();
+    }
+
+    fn expiries(store: &SharedDump, user: &str) -> Option<(u32, u32)> {
+        let guard = store.read().unwrap();
+        let p = guard.get_name(&user_principal(&UserId::new(user)))?;
+        Some((p.pw_expire, p.expiration))
+    }
+
+    type Logged = Vec<(LogKind, Option<String>, Option<String>)>;
+
+    fn sync_rows(rows: Logged) -> Vec<(Option<String>, Option<String>)> {
+        let rows = rows
+            .into_iter()
+            .filter(|(kind, ..)| *kind == LogKind::KerberosSync);
+        rows.map(|(_, target, detail)| (target, detail)).collect()
+    }
+
+    fn cleared_from(user: &str, policy: &str) -> (Option<String>, Option<String>) {
+        let detail = policy_cleared(policy, &format!("{user}@EXAMPLE.COM"));
+        (Some(user.to_owned()), Some(detail))
+    }
+
     #[tokio::test]
     #[serial]
-    async fn test_an_adopted_principal_keeps_its_kerberos_policy_under_a_directory_change() {
+    async fn test_an_adopted_principal_loses_its_kerberos_policy_and_the_directory_minimum_applies()
+    {
         use lldap_auth::opaque::server::generate_random_private_key;
         use lldap_domain_handlers::kerberos::{NoopKerberos, set_kerberos_backend};
         use lldap_domain_handlers::password::{
             PasswordChangeError, PasswordSync, change_password_everywhere,
         };
-        const REFUSED: &str = "password policy: min_length 12";
+        const SEVEN: &str = "Dora-P7";
         const EIGHT: &str = "Dora-Pw8";
         const ELEVEN: &str = "Dora-Pass-1";
         const ELEVEN_IN_13_BYTES: &str = "Dörä-Pass-1";
         assert_eq!(
-            [EIGHT, ELEVEN, ELEVEN_IN_13_BYTES].map(|p| (p.chars().count(), p.len())),
-            [(8, 8), (11, 11), (11, 13)]
+            [SEVEN, EIGHT, ELEVEN, ELEVEN_IN_13_BYTES].map(|p| (p.chars().count(), p.len())),
+            [(7, 7), (8, 8), (11, 11), (11, 13)]
         );
         let dora = UserId::new("dora");
-        let bound = Some((true, Some("min12".to_owned())));
-        let refused_row = vec![(
+        let adoption_rows = vec![
+            (Some("dora".to_owned()), Some(ADOPTED.to_owned())),
+            cleared_from("dora", "min12"),
+        ];
+        let too_short = vec![(
             Some("dora".to_owned()),
-            Some(format!("refused by Kerberos: {REFUSED}")),
+            Some("the password must be at least 8 characters".to_owned()),
         )];
         let pool = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
         let handler =
@@ -3971,32 +4195,38 @@ pub(crate) mod tests {
             let temp = TempRealm::new();
             let (embedded, store) = temp.embedded();
             unmarked(&embedded, "dora", false);
-            let mut policy = krb5_kdc::NamedPolicy::new("min12");
-            policy.min_length = 12;
-            store.write().unwrap().put_policy(policy).unwrap();
-            in_change(&embedded.own(), |s| {
-                s.set_principal_policy(&user_principal(&dora), Some("min12".to_owned()))
-            })
-            .unwrap();
+            expire_at(&embedded, "dora", EXPIRES);
+            put_policy(&store, "min12", 12, 86_400);
+            bind_policy(&embedded, &user_principal(&dora), "min12");
             temp.host.set_directory(Some(&[]));
-            let policy_of = || {
-                let guard = store.read().unwrap();
-                let principal = guard.get_name(&user_principal(&dora))?;
-                Some((principal.host_owned(), principal.pw_policy.clone()))
-            };
+            let before = (
+                binding(&store, "dora"),
+                expiries(&store, "dora").map(|e| e.1),
+            );
+            let logged = temp.host.logged().len();
             let adopted = embedded.commit_user(life("dora", UserStep::SyncOn)).await;
-            let after_adoption = policy_of();
+            let after_adoption = (binding(&store, "dora"), expiries(&store, "dora"));
+            let rows = sync_rows(temp.host.logged().split_off(logged));
             let in_bytes = embedded.check_password(&dora, ELEVEN_IN_13_BYTES).await;
             log.recorder().take_events();
             set_kerberos_backend(Arc::new(embedded));
-            let answer = change_password_everywhere(
-                &handler,
-                &dora,
-                password,
-                PasswordSync::On,
-                PASSWORD_MIN_LENGTH,
-            )
-            .await;
+            let change = |password: &'static str| {
+                let (handler, dora) = (&handler, &dora);
+                async move {
+                    let on = PasswordSync::On;
+                    change_password_everywhere(handler, dora, password, on, PASSWORD_MIN_LENGTH)
+                        .await
+                }
+            };
+            let answer = change(password).await;
+            let (record, keys) = (temp.host.password_record(&dora), keys_of(&store, "dora"));
+            let taken = (record.is_some(), kinit_code(&store, "dora", password));
+            let refused = change(SEVEN).await;
+            let unmoved = (
+                temp.host.password_record(&dora) == record,
+                keys_of(&store, "dora") == keys,
+                kinit_code(&store, "dora", password),
+            );
             set_kerberos_backend(Arc::new(NoopKerberos::default()));
             let failed: Vec<_> = log
                 .recorder()
@@ -4006,25 +4236,598 @@ pub(crate) mod tests {
                 .map(|e| (e.target, e.detail))
                 .collect();
             assert_eq!(
+                (before, adopted, after_adoption, rows, in_bytes),
                 (
-                    adopted,
-                    after_adoption,
-                    in_bytes,
-                    answer,
-                    failed,
-                    policy_of()
-                ),
-                (
+                    (Some((false, Some("min12".to_owned()), true)), Some(EXPIRES)),
                     Some(Ok(())),
-                    bound.clone(),
-                    Ok(()),
-                    Err(PasswordChangeError::Refused(REFUSED.to_owned())),
-                    refused_row.clone(),
-                    bound.clone()
+                    (Some((true, None, false)), Some((0, EXPIRES))),
+                    adoption_rows.clone(),
+                    Ok(())
                 ),
-                "{password}: kerber-rust's policy counts bytes and refuses before the record"
+                "{password}: the adoption clears the binding and the password expiry it set in \
+                 its own change, with its row, and the principal's own expiry stays; the 13-byte \
+                 check answers as with no policy"
+            );
+            assert_eq!(
+                (
+                    answer,
+                    taken,
+                    refused,
+                    unmoved,
+                    failed,
+                    binding(&store, "dora"),
+                    expiries(&store, "dora")
+                ),
+                (
+                    Ok(()),
+                    (true, 0),
+                    Err(PasswordChangeError::TooShort(PASSWORD_MIN_LENGTH)),
+                    (true, true, 0),
+                    too_short.clone(),
+                    Some((true, None, false)),
+                    Some((0, EXPIRES))
+                ),
+                "{password}: taken on both sides; 7 characters are refused by the directory's \
+                 floor and neither the record nor the keys move"
             );
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_an_add_with_a_password_onto_a_bound_principal_is_judged_once_by_its_old_policy() {
+        use lldap_auth::opaque::server::generate_random_private_key;
+        use lldap_domain::requests::CreateUserRequest;
+        use lldap_domain_handlers::kerberos::{NoopKerberos, set_kerberos_backend};
+        use lldap_domain_handlers::password::{
+            PasswordChangeError, PasswordSync, change_password_everywhere, create_synced_user,
+        };
+        const REFUSED: &str = "password policy: min_length 12";
+        const EIGHT: &str = "Fred-Pw8";
+        const TWELVE: &str = "Fred-Pass-12";
+        const NINE: &str = "Fred-Pw-9";
+        assert_eq!(
+            [EIGHT, TWELVE, NINE].map(|p| (p.chars().count(), p.len())),
+            [(8, 8), (12, 12), (9, 9)]
+        );
+        let fred = UserId::new("fred");
+        let temp = TempRealm::new();
+        let (embedded, store) = temp.embedded();
+        unmarked(&embedded, "fred", false);
+        put_policy(&store, "min12", 12, 86_400);
+        bind_policy(&embedded, &user_principal(&fred), "min12");
+        temp.host.set_directory(Some(&[]));
+        let (keys, logged) = (keys_of(&store, "fred"), temp.host.logged().len());
+        let pool = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        let handler =
+            lldap_sql_backend_handler::SqlBackendHandler::new(generate_random_private_key(), pool);
+        let log = LogGuard::install_on_this_thread();
+        set_kerberos_backend(Arc::new(embedded));
+        let add = |password: &'static str| {
+            let request = CreateUserRequest {
+                user_id: fred.clone(),
+                ..Default::default()
+            };
+            create_synced_user(&handler, request, password, PASSWORD_MIN_LENGTH)
+        };
+        let refused = add(EIGHT).await;
+        let after_refusal = (
+            binding(&store, "fred"),
+            keys_of(&store, "fred") == keys,
+            temp.host.rows(),
+            temp.host.password_record(&fred),
+        );
+        let failed: Vec<_> = log
+            .recorder()
+            .take_events()
+            .into_iter()
+            .filter(|e| e.kind == LogKind::UserCreate && !e.success)
+            .map(|e| (e.target, e.detail))
+            .collect();
+        let added = add(TWELVE).await;
+        let after_add = (
+            binding(&store, "fred"),
+            expiries(&store, "fred").map(|(pw_expire, _)| pw_expire),
+            temp.host.rows(),
+            sync_rows(temp.host.logged().split_off(logged)),
+            temp.host.password_record(&fred).is_some(),
+            kinit_code(&store, "fred", TWELVE),
+        );
+        let next = change_password_everywhere(
+            &handler,
+            &fred,
+            NINE,
+            PasswordSync::On,
+            PASSWORD_MIN_LENGTH,
+        )
+        .await;
+        let after_next = (binding(&store, "fred"), kinit_code(&store, "fred", NINE));
+        set_kerberos_backend(Arc::new(NoopKerberos::default()));
+        assert_eq!(
+            (refused, after_refusal, failed),
+            (
+                Err(PasswordChangeError::Refused(REFUSED.to_owned())),
+                (
+                    Some((false, Some("min12".to_owned()), true)),
+                    true,
+                    Vec::<String>::new(),
+                    None
+                ),
+                vec![(
+                    Some("fred".to_owned()),
+                    Some(format!("refused by Kerberos: {REFUSED}"))
+                )]
+            ),
+            "the known moment: the add that would adopt is judged by the principal's old policy \
+             before the mark; refused, nothing is made and the principal stays as it was"
+        );
+        assert_eq!(
+            (added, after_add, next, after_next),
+            (
+                Ok(()),
+                (
+                    Some((true, None, false)),
+                    Some(0),
+                    [
+                        "create fred",
+                        "password fred",
+                        "synced fred",
+                        "log user_create",
+                        "log password_change",
+                        "log kerberos_sync"
+                    ]
+                    .map(str::to_owned)
+                    .to_vec(),
+                    vec![cleared_from("fred", "min12")],
+                    true,
+                    0
+                ),
+                Ok(()),
+                (Some((true, None, false)), 0)
+            ),
+            "a password both take adopts the principal and clears the binding and the password \
+             expiry it set in the mark's change, with its row; the next change is judged by the \
+             directory's minimum alone"
+        );
+    }
+
+    type View = Vec<(String, bool, Option<String>, bool)>;
+
+    fn policy_view(store: &SharedDump) -> View {
+        let guard = store.read().unwrap();
+        let ids = guard.ids();
+        let all = ids.iter().filter_map(|id| guard.get_raw(id));
+        all.filter(|p| p.host_owned() || p.pw_policy.is_some())
+            .map(|p| {
+                let name = p.name.unparse_no_realm_lossy();
+                (name, p.host_owned(), p.pw_policy.clone(), p.pw_expire > 0)
+            })
+            .collect()
+    }
+
+    fn service_principal(embedded: &EmbeddedKerberos) -> PrincipalName {
+        let svc = PrincipalName::new(PrincipalName::NT_SRV_HST, ["svc", "host"]);
+        in_change(&embedded.own(), |s| {
+            s.insert_new_randkey(&svc, "EXAMPLE.COM", &[], "test")
+        })
+        .unwrap();
+        svc
+    }
+
+    fn view(
+        name: &str,
+        owned: bool,
+        policy: Option<&str>,
+        expires: bool,
+    ) -> (String, bool, Option<String>, bool) {
+        (name.to_owned(), owned, policy.map(str::to_owned), expires)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_the_start_pass_clears_the_kerberos_policy_of_each_directory_principal_once() {
+        let guard = LogGuard::install_on_this_thread();
+        let temp = TempRealm::new();
+        let (embedded, store) = temp.embedded();
+        temp.host.set_directory(Some(&[]));
+        put_policy(&store, "min12", 12, 86_400);
+        for user in ["pat", "quinn", "rae"] {
+            synced(&embedded, &UserId::new(user), "A-Password-1")
+                .await
+                .unwrap();
+        }
+        expire_at(&embedded, "pat", EXPIRES);
+        unmarked(&embedded, "sam", false);
+        unmarked(&embedded, "tess", true);
+        let svc = service_principal(&embedded);
+        let bound = [
+            ("pat", "min12"),
+            ("quinn", "gone"),
+            ("sam", "min12"),
+            ("tess", "min12"),
+        ];
+        for (user, policy) in bound {
+            bind_policy(&embedded, &user_principal(&UserId::new(user)), policy);
+        }
+        bind_policy(&embedded, &svc, "min12");
+        let users: Vec<(UserId, bool)> = [
+            ("pat", true),
+            ("quinn", true),
+            ("rae", true),
+            ("sam", true),
+            ("tess", false),
+        ]
+        .into_iter()
+        .map(|(user, sync)| (UserId::new(user), sync))
+        .collect();
+        let policies = store.read().unwrap().policies().clone();
+        let logged = temp.host.logged().len();
+        guard.recorder().take_events();
+
+        let pass = embedded.start_pass_in(users.clone(), 2).await.unwrap();
+        let rows = sync_rows(temp.host.logged().split_off(logged));
+        let reloaded = temp
+            .reopened()
+            .get_name(&user_principal(&UserId::new("pat")))
+            .map(|p| p.pw_policy.clone());
+        assert_eq!(
+            (
+                pass,
+                policy_view(&store),
+                rows,
+                guard.recorder().take_events().len()
+            ),
+            (
+                StartPass {
+                    marked: 1,
+                    cleared: 3,
+                    ..StartPass::default()
+                },
+                vec![
+                    view("pat", true, None, false),
+                    view("quinn", true, None, false),
+                    view("rae", true, None, false),
+                    view("sam", true, None, false),
+                    view("svc/host", false, Some("min12"), true),
+                    view("tess", false, Some("min12"), true),
+                ],
+                vec![
+                    cleared_from("sam", "min12"),
+                    (None, Some("marked at start: 1 principals".to_owned())),
+                    cleared_from("pat", "min12"),
+                    cleared_from("quinn", "gone"),
+                ],
+                0
+            ),
+            "a principal the start marks loses its binding in the mark's change; one marked \
+             before loses it, its policy found or not, with its expiry, one row each in the \
+             change; a principal the directory does not own keeps its binding"
+        );
+        assert_eq!(
+            (
+                store.read().unwrap().policies() == &policies,
+                reloaded,
+                expiries(&store, "pat")
+            ),
+            (true, Some(None), Some((0, EXPIRES))),
+            "no policy is removed, the clear reached the host, and pat's own expiry stays"
+        );
+
+        let (writes, logged) = (temp.own_writes(), temp.host.logged().len());
+        let again = embedded.start_pass_in(users, 2).await.unwrap();
+        assert_eq!(
+            (again, temp.own_writes(), temp.host.logged().len()),
+            (StartPass::default(), writes, logged),
+            "a second start finds no binding and writes nothing"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_policy_clear_that_fails_at_start_leaves_the_start_going_and_the_next_clears_it()
+    {
+        let temp = TempRealm::new();
+        let (embedded, store) = temp.embedded();
+        temp.host.set_directory(Some(&[]));
+        put_policy(&store, "min12", 12, 0);
+        let names = ["pat", "quinn", "rae"];
+        for user in names {
+            synced(&embedded, &UserId::new(user), "A-Password-1")
+                .await
+                .unwrap();
+            bind_policy(&embedded, &user_principal(&UserId::new(user)), "min12");
+        }
+        let users: Vec<_> = names.iter().map(|u| (UserId::new(u), true)).collect();
+        let bound = || names.map(|u| binding(&store, u).and_then(|(_, policy, _)| policy));
+        let min12 = || Some("min12".to_owned());
+        let logged = temp.host.logged().len();
+        temp.host.set_fault_after(1, Fault::Failed);
+        let failed = embedded.start_pass_in(users.clone(), 2).await;
+        let flagged = temp.host.started_at.lock().unwrap().take().is_some();
+        let after_failure = (bound(), sync_rows(temp.host.logged().split_off(logged)));
+        assert_eq!(
+            (failed.map_err(|e| format!("{e:#}")), flagged, after_failure),
+            (
+                Ok(StartPass {
+                    cleared: 2,
+                    ..StartPass::default()
+                }),
+                true,
+                (
+                    [None, None, min12()],
+                    vec![cleared_from("pat", "min12"), cleared_from("quinn", "min12")]
+                )
+            ),
+            "the first chunk's clears commit with their rows; the failed chunk changes nothing \
+             and writes no row, and the start goes on to its end"
+        );
+
+        *temp.host.fault_after.lock().unwrap() = None;
+        let logged = temp.host.logged().len();
+        let next = embedded.start_pass_in(users.clone(), 2).await;
+        let rows = sync_rows(temp.host.logged().split_off(logged));
+        let writes = temp.own_writes();
+        let again = embedded.start_pass_in(users, 2).await;
+        assert_eq!(
+            (
+                next.map_err(|e| format!("{e:#}")),
+                bound(),
+                rows,
+                again.map_err(|e| format!("{e:#}")),
+                temp.own_writes() - writes
+            ),
+            (
+                Ok(StartPass {
+                    cleared: 1,
+                    ..StartPass::default()
+                }),
+                [None, None, None],
+                vec![cleared_from("rae", "min12")],
+                Ok(StartPass::default()),
+                0
+            ),
+            "the next start clears what was left, once"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_principal_the_directory_stops_owning_after_the_listing_keeps_its_policy() {
+        let temp = TempRealm::new();
+        let (embedded, store) = temp.embedded();
+        temp.host.set_directory(Some(&[]));
+        put_policy(&store, "min12", 12, 86_400);
+        for user in ["pat", "quinn"] {
+            synced(&embedded, &UserId::new(user), "A-Password-1")
+                .await
+                .unwrap();
+            bind_policy(&embedded, &user_principal(&UserId::new(user)), "min12");
+        }
+        let listed = bound_principals(&store.read().unwrap(), "EXAMPLE.COM");
+        let quinn = user_principal(&UserId::new("quinn"));
+        in_change(&embedded.own(), |s| {
+            s.set_host_owned_in(&quinn, "EXAMPLE.COM", false)
+        })
+        .unwrap();
+        let logged = temp.host.logged().len();
+        let cleared = clear_chunk(&embedded.own(), &listed).map(|written| written.len());
+        let rows = sync_rows(temp.host.logged().split_off(logged));
+        let names: Vec<String> = listed.iter().map(|n| n.unparse_no_realm_lossy()).collect();
+        assert_eq!(
+            (
+                names,
+                cleared.map_err(|e| e.to_string()),
+                rows,
+                policy_view(&store)
+            ),
+            (
+                vec!["pat".to_owned(), "quinn".to_owned()],
+                Ok(1),
+                vec![cleared_from("pat", "min12")],
+                vec![
+                    view("pat", true, None, false),
+                    view("quinn", false, Some("min12"), true),
+                ]
+            ),
+            "a principal the directory no longer owns when the change runs keeps its binding \
+             and its expiry, with no row; the one still owned is cleared"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_after_adoption_no_rule_of_the_old_policy_survives() {
+        use lldap_auth::opaque::server::generate_random_private_key;
+        use lldap_domain_handlers::kerberos::{NoopKerberos, set_kerberos_backend};
+        use lldap_domain_handlers::password::{PasswordSync, change_password_everywhere};
+        const FIRST: &str = "Hana-Pass-1";
+        const SECOND: &str = "Hana-Pass-2";
+        const LOWER: &str = "allinlowercase";
+        let hana = UserId::new("hana");
+        let name = user_principal(&hana);
+        let temp = TempRealm::new();
+        let (embedded, store) = temp.embedded();
+        unmarked(&embedded, "hana", false);
+        let mut policy = krb5_kdc::NamedPolicy::new("rules");
+        policy.history = 2;
+        policy.min_classes = 3;
+        store.write().unwrap().put_policy(policy).unwrap();
+        bind_policy(&embedded, &name, "rules");
+        for password in [FIRST, SECOND] {
+            in_change(&embedded.own(), |s| {
+                let etypes = &embedded.enctypes;
+                let bytes = password.as_bytes();
+                s.set_password_etypes_keepold_n_in(&name, "EXAMPLE.COM", bytes, 0, "test", etypes)
+            })
+            .unwrap();
+        }
+        temp.host.set_directory(Some(&[]));
+        let mut old_rules = Vec::new();
+        for password in [FIRST, SECOND, LOWER] {
+            old_rules.push(embedded.check_password(&hana, password).await);
+        }
+        let adopted = embedded.commit_user(life("hana", UserStep::SyncOn)).await;
+        let pool = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        let handler =
+            lldap_sql_backend_handler::SqlBackendHandler::new(generate_random_private_key(), pool);
+        set_kerberos_backend(Arc::new(embedded));
+        let mut taken = Vec::new();
+        for password in [FIRST, FIRST, LOWER] {
+            let on = PasswordSync::On;
+            let answer =
+                change_password_everywhere(&handler, &hana, password, on, PASSWORD_MIN_LENGTH)
+                    .await;
+            taken.push((answer, kinit_code(&store, "hana", password)));
+        }
+        set_kerberos_backend(Arc::new(NoopKerberos::default()));
+        let refused =
+            |rule: &str| -> Result<(), String> { Err(format!("password policy: {rule}")) };
+        assert_eq!(
+            (old_rules, adopted, taken, binding(&store, "hana")),
+            (
+                vec![
+                    refused("history"),
+                    refused("history"),
+                    refused("min_classes 3")
+                ],
+                Some(Ok(())),
+                vec![(Ok(()), 0), (Ok(()), 0), (Ok(()), 0)],
+                Some((true, None, false))
+            ),
+            "before adoption the policy refuses the previous and the current password by history \
+             and an all-lowercase one by classes; after it, the previous password, the same one \
+             again and the all-lowercase one are each taken on both sides"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_no_directory_principal_keeps_a_kerberos_policy_both_sides_agree_at_the_minimum() {
+        use lldap_auth::opaque::server::generate_random_private_key;
+        use lldap_domain::requests::CreateUserRequest;
+        use lldap_domain_handlers::kerberos::{NoopKerberos, set_kerberos_backend};
+        use lldap_domain_handlers::logging::event;
+        use lldap_domain_handlers::password::{
+            PasswordChangeError, PasswordSync, change_password_everywhere,
+        };
+        const MIN: usize = 12;
+        let (twelve, eleven) = ("ä".repeat(MIN), "ä".repeat(MIN - 1));
+        assert_eq!(
+            [&twelve, &eleven].map(|p| (p.chars().count(), p.len())),
+            [(12, 24), (11, 22)]
+        );
+        let temp = TempRealm::new();
+        let (embedded, store) = temp.embedded();
+        temp.host.set_directory(Some(&[]));
+        put_policy(&store, "default", 30, 0);
+        put_policy(&store, "min40", 40, 0);
+        synced(&embedded, &UserId::new("ann"), "Ann-Password-1")
+            .await
+            .unwrap();
+        unmarked(&embedded, "ben", false);
+        unmarked(&embedded, "cy", false);
+        unmarked(&embedded, "dan", true);
+        let svc = service_principal(&embedded);
+        let bound = [
+            ("ann", "default"),
+            ("ben", "default"),
+            ("cy", "min40"),
+            ("dan", "default"),
+        ];
+        for (user, policy) in bound {
+            bind_policy(&embedded, &user_principal(&UserId::new(user)), policy);
+        }
+        bind_policy(&embedded, &svc, "default");
+        let users: Vec<(UserId, bool)> =
+            [("ann", true), ("ben", true), ("cy", false), ("dan", false)]
+                .into_iter()
+                .map(|(user, sync)| (UserId::new(user), sync))
+                .collect();
+        let logged = temp.host.logged().len();
+
+        let pass = embedded.start_pass(users).await.unwrap();
+        let adopted = embedded.commit_user(life("cy", UserStep::SyncOn)).await;
+        let eve = UserId::new("eve");
+        let request = CreateUserRequest {
+            user_id: eve.clone(),
+            ..Default::default()
+        };
+        let created = embedded
+            .commit_user(UserChange {
+                user: eve.clone(),
+                step: UserStep::Create,
+                rows: vec![
+                    HostRow::CreateUser(request),
+                    HostRow::Log(event(LogKind::UserCreate, Some("eve"), true, None)),
+                ],
+            })
+            .await;
+        synced(&embedded, &eve, "Eve-Password-1").await.unwrap();
+        let rows = sync_rows(temp.host.logged().split_off(logged));
+        assert_eq!(
+            (pass, adopted, created, policy_view(&store), rows),
+            (
+                StartPass {
+                    marked: 1,
+                    disabled: 1,
+                    cleared: 2,
+                    ..StartPass::default()
+                },
+                Some(Ok(())),
+                Some(Ok(())),
+                vec![
+                    view("ann", true, None, false),
+                    view("ben", true, None, false),
+                    view("cy", true, None, false),
+                    view("dan", false, Some("default"), false),
+                    view("eve", true, None, false),
+                    view("svc/host", false, Some("default"), false),
+                ],
+                vec![
+                    cleared_from("ben", "default"),
+                    (Some("cy".to_owned()), Some(DISABLED_AT_START.to_owned())),
+                    (None, Some("marked at start: 1 principals".to_owned())),
+                    cleared_from("ann", "default"),
+                    (Some("cy".to_owned()), Some(ADOPTED.to_owned())),
+                    cleared_from("cy", "min40"),
+                ]
+            ),
+            "after the start, an adoption and a create with sync while a policy named default \
+             exists, no principal the directory owns carries a binding; the others keep theirs"
+        );
+
+        let ben = UserId::new("ben");
+        let pool = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        let handler =
+            lldap_sql_backend_handler::SqlBackendHandler::new(generate_random_private_key(), pool);
+        let embedded = Arc::new(embedded);
+        set_kerberos_backend(embedded.clone());
+        let unowned = embedded.check_password(&UserId::new("dan"), &twelve).await;
+        let at_min =
+            change_password_everywhere(&handler, &ben, &twelve, PasswordSync::On, MIN).await;
+        let (record, keys) = (temp.host.password_record(&ben), keys_of(&store, "ben"));
+        let taken = (record.is_some(), kinit_code(&store, "ben", &twelve));
+        let below =
+            change_password_everywhere(&handler, &ben, &eleven, PasswordSync::On, MIN).await;
+        let unmoved = (
+            temp.host.password_record(&ben) == record,
+            keys_of(&store, "ben") == keys,
+            kinit_code(&store, "ben", &twelve),
+        );
+        set_kerberos_backend(Arc::new(NoopKerberos::default()));
+        assert_eq!(
+            (unowned, at_min, taken, below, unmoved),
+            (
+                Err("password policy: min_length 30".to_owned()),
+                Ok(()),
+                (true, 0),
+                Err(PasswordChangeError::TooShort(MIN)),
+                (true, true, 0)
+            ),
+            "12 characters in 24 bytes, under the 30 bytes of the policy ben was bound to: the \
+             directory takes them and so does the KDC; 11 are refused and nothing moves. The \
+             unowned dan is still held to its policy"
+        );
     }
 
     #[tokio::test]

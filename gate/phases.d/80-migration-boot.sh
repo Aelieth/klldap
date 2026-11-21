@@ -1,7 +1,8 @@
 # shellcheck shell=bash
 # Phase: a 0.7.2 realm on first boot, on copies. A: the committed fixture's dump (LIVEBOB.TEST)
 # migrates for livebob with kerberosSync on. A2: the same dump for livebob WITHOUT sync: the first
-# start disables the principal, keeps it, and logs one row. B: a local 0.7.2 install without its
+# start disables the principal, keeps it, and logs one row; a kadmin policy bound to it then goes
+# when its sync turns on, and 8 characters are taken. B: a local 0.7.2 install without its
 # dump is refused: degraded, nothing moved. B runs
 # when GATE_FIXTURE_DATA, GATE_FIXTURE_KDC and GATE_FIXTURE_BASE_DN are set;
 # GATE_FIXTURE_ADMIN_PASS adds the admin's bind while degraded.
@@ -170,6 +171,48 @@ if mig_healthy "$MIG_A2" branch-a2; then
         p_ok "A2: one kerberos_sync row names the disabled principal"
     else
         p_bad "A2: expected one 'disabled at start' row for livebob, found $disabled (see branch-a2-rows.json)"
+    fi
+    # The policy row: a kadmin policy on livebob, not the directory's yet, goes when sync turns on.
+    A2_POL=mig6pol
+    A2_PW=Lb6-Pw8x
+    A2_CLEARED="Kerberos password policy $A2_POL cleared from livebob@LIVEBOB.TEST: the directory's password-min-length applies"
+    a2_kadmin() { CONTAINER="$MIG_A2" REALM="LIVEBOB.TEST" kadmin_q "$1"; }
+    a2_port="$(docker port "$MIG_A2" 17170/tcp | head -1 | sed 's/.*://')"
+    a2_token="$(HTTP_PORT="$a2_port" gate_login)" || a2_token=""
+    if a2_kadmin "addpol -minlength 40 $A2_POL" >"$D/a2-addpol.txt" 2>&1 && ! grep -q " while " "$D/a2-addpol.txt" \
+        && a2_kadmin "modprinc -policy $A2_POL livebob" >"$D/a2-modprinc.txt" 2>&1 \
+        && ! grep -q " while " "$D/a2-modprinc.txt" \
+        && a2_kadmin "getprinc livebob" >"$D/a2-bound.txt" 2>&1 && grep -qxF "Policy: $A2_POL" "$D/a2-bound.txt"; then
+        p_ok "A2: kadmin binds $A2_POL (minimum 40) to livebob, which the directory does not own yet"
+    else
+        p_bad "A2: $A2_POL is not on livebob (see a2-addpol.txt, a2-modprinc.txt, a2-bound.txt)"
+    fi
+    a2_why=""
+    # shellcheck disable=SC2016
+    if ! HTTP_PORT="$a2_port" TOKEN="$a2_token" graphql \
+        'mutation($u: UpdateUserInput!) { updateUser(user: $u) { ok } }' \
+        '{"u": {"id": "livebob", "insertAttributes": [{"name": "kerberossync", "value": ["1"]}]}}' \
+        >"$D/a2-sync-on.json" 2>&1; then
+        a2_why="turning kerberosSync on failed (see a2-sync-on.json)"
+    elif ! { a2_kadmin "getprinc livebob" >"$D/a2-cleared.txt" 2>&1 \
+        && grep -qxF "Policy: [none]" "$D/a2-cleared.txt"; }; then
+        a2_why="getprinc livebob does not show 'Policy: [none]' (see a2-cleared.txt)"
+    elif [ "$(mig_rows "$MIG_A2" a2-cleared livebob "$A2_CLEARED")" != 1 ]; then
+        a2_why="not exactly one kerberos_sync row '$A2_CLEARED' (see a2-cleared-rows.json)"
+    elif ! { a2_kadmin "getpol $A2_POL" >"$D/a2-getpol.txt" 2>&1 \
+        && grep -qxF "Policy: $A2_POL" "$D/a2-getpol.txt"; }; then
+        a2_why="the policy $A2_POL itself is gone (see a2-getpol.txt)"
+    elif ! HTTP_PORT="$a2_port" TOKEN="$a2_token" graphql \
+        'mutation($id: String!, $pw: String!) { setUserPassword(userId: $id, password: $pw) { ok } }' \
+        '{"id": "livebob", "pw": "'"$A2_PW"'"}' >"$D/a2-setpw.json" 2>&1; then
+        a2_why="setUserPassword of an 8-character password, under the policy's 40, failed (see a2-setpw.json)"
+    elif ! CONTAINER="$MIG_A2" kinit_pw "livebob@LIVEBOB.TEST" "$A2_PW" >"$D/a2-kinit.log" 2>&1; then
+        a2_why="kinit livebob with the 8-character password failed (see a2-kinit.log)"
+    fi
+    if [ -z "$a2_why" ]; then
+        p_ok "A2: turning kerberosSync on adopts livebob and clears $A2_POL: getprinc 'Policy: [none]', one kerberos_sync row names it, getpol still answers; an 8-character password, under the policy's 40, is taken and kinit works"
+    else
+        p_bad "A2: $a2_why"
     fi
 else
     p_bad "A2: the dump did not boot to a serving realm (see branch-a2-docker.log)"

@@ -4237,7 +4237,7 @@ mod tests {
         rows();
 
         let held = (host.load().unwrap(), record());
-        let on_bob: [Case; 13] = [
+        let on_bob: [Case; 15] = [
             (
                 "randkey",
                 Operation::Randkey,
@@ -4284,6 +4284,34 @@ mod tests {
                 mask(kadm5_mask::FAIL_AUTH_COUNT | kadm5_mask::MAX_LIFE),
                 Box::new(|s: &mut PrincipalStore| {
                     s.apply_admin_fields_in(&bob, "EXAMPLE.COM", fields(), ADMIN)
+                }),
+                "modify: PROTECT_PRINCIPAL",
+            ),
+            (
+                "modify -policy",
+                Operation::Modify,
+                &["bob"],
+                mask(kadm5_mask::POLICY),
+                Box::new(|s: &mut PrincipalStore| {
+                    let set = AdminFields {
+                        policy: Some("min12".to_owned()),
+                        ..Default::default()
+                    };
+                    s.apply_admin_fields_in(&bob, "EXAMPLE.COM", set, ADMIN)
+                }),
+                "modify: PROTECT_PRINCIPAL",
+            ),
+            (
+                "modify -clearpolicy",
+                Operation::Modify,
+                &["bob"],
+                mask(kadm5_mask::POLICY_CLR),
+                Box::new(|s: &mut PrincipalStore| {
+                    let clear = AdminFields {
+                        clear_policy: true,
+                        ..Default::default()
+                    };
+                    s.apply_admin_fields_in(&bob, "EXAMPLE.COM", clear, ADMIN)
                 }),
                 "modify: PROTECT_PRINCIPAL",
             ),

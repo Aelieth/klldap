@@ -132,5 +132,47 @@ else
     p_bad "--log-retention-days missing from lldap run --help"
 fi
 
+# A name sent with an empty password: the LDAP bind and the simple login, for a user and for a name with no user.
+lg_bind_rc=""
+lg_bind_no_password() {
+    lg_bind_rc=0
+    t ldapwhoami -x -H "$(ldap_url)" -D "uid=$1,ou=people,$BASE_DN" -w '' >"$D/$2.out" 2>&1 || lg_bind_rc=$?
+    [ "$lg_bind_rc" = 53 ] && grep -q "a bind with a name needs a password" "$D/$2.out"
+}
+lg_login_status=""
+lg_login_no_password() {
+    : >"$D/$2.hdr"
+    : >"$D/$2.body"
+    t curl -sS -D "$D/$2.hdr" -o "$D/$2.body" -H 'Content-Type: application/json' \
+        --data-binary '{"username": "'"$1"'", "password": ""}' "$(http_url)/auth/simple/login" \
+        2>"$D/$2.err" || true
+    lg_login_status="$(awk 'NR==1 { print $2; exit }' "$D/$2.hdr")"
+    [ "$lg_login_status" = 401 ] && ! grep -qi '^set-cookie:' "$D/$2.hdr"
+}
+
+if lg_bind_no_password "$LOG_USER" bind-no-password; then
+    p_ok "bind as $LOG_USER with no password answers 53: a bind with a name needs a password"
+else
+    p_bad "bind as $LOG_USER with no password answered $lg_bind_rc (want 53 and the text; see bind-no-password.out)"
+fi
+
+if lg_bind_no_password "$LOG_USER-nobody" bind-no-password-nobody; then
+    p_ok "bind as $LOG_USER-nobody, a name with no user, with no password answers 53: a bind with a name needs a password"
+else
+    p_bad "bind as $LOG_USER-nobody with no password answered $lg_bind_rc (want 53 and the text; see bind-no-password-nobody.out)"
+fi
+
+if lg_login_no_password "$LOG_USER" login-no-password; then
+    p_ok "simple login as $LOG_USER with no password answers 401 with no cookie"
+else
+    p_bad "simple login as $LOG_USER with no password answered ${lg_login_status:-nothing}, Set-Cookie lines $(grep -ci '^set-cookie:' "$D/login-no-password.hdr") (want 401 and 0; see login-no-password.hdr)"
+fi
+
+if lg_login_no_password "$LOG_USER-nobody" login-no-password-nobody; then
+    p_ok "simple login as $LOG_USER-nobody, a name with no user, with no password answers 401 with no cookie"
+else
+    p_bad "simple login as $LOG_USER-nobody with no password answered ${lg_login_status:-nothing}, Set-Cookie lines $(grep -ci '^set-cookie:' "$D/login-no-password-nobody.hdr") (want 401 and 0; see login-no-password-nobody.hdr)"
+fi
+
 graphql 'mutation($id: String!) { deleteUser(userId: $id) { ok } }' '{"id": "'"$LOG_USER"'"}' \
     >"$D/delete.json" 2>&1 || p_bad "deleteUser $LOG_USER failed"

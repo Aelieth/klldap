@@ -1843,6 +1843,223 @@ pub(crate) mod tests {
         handler
     }
 
+    pub(crate) struct PinnedEnrollmentClock;
+
+    impl Drop for PinnedEnrollmentClock {
+        fn drop(&mut self) {
+            lldap_sql_backend_handler::set_enrollment_clock(None);
+        }
+    }
+
+    /// e3plain, e3off in `lldap_disabled` and e3code enrolled, each with its own password. The
+    /// code is one e3code's next sign-in accepts.
+    pub(crate) async fn doors_directory() -> (
+        lldap_sql_backend_handler::SqlBackendHandler,
+        PinnedEnrollmentClock,
+        String,
+    ) {
+        use lldap_domain_handlers::handler::{GroupBackendHandler, UserBackendHandler};
+        let users = [
+            ("e3plain", "e3plain-pass-1"),
+            ("e3off", "e3off-pass-1"),
+            ("e3code", "e3code-pass-1"),
+        ];
+        let handler = sql_handler_with(&users)
+            .await
+            .with_mfa_policy(MfaPolicy::Enrolled);
+        let disabled = lldap_domain::requests::CreateGroupRequest {
+            display_name: "lldap_disabled".into(),
+            ..Default::default()
+        };
+        let disabled = handler.create_group(disabled).await.unwrap();
+        handler
+            .add_user_to_group(&UserId::new("e3off"), disabled)
+            .await
+            .unwrap();
+        let now = Utc::now().timestamp();
+        lldap_sql_backend_handler::set_enrollment_clock(Some(now));
+        let clock = PinnedEnrollmentClock;
+        let (now, id) = (now as u64, UserId::new("e3code"));
+        let proof = handler.seal_enrollment_proof(&id).await.unwrap().unwrap();
+        let start = handler
+            .start_totp_enrollment(&id, None, Some(proof))
+            .await
+            .unwrap();
+        let seed = lldap_mfa::seed_from_base32(&start.secret_base32).unwrap();
+        let code_at = |t: u64| lldap_mfa::format_code(lldap_mfa::totp_code(&seed, t).unwrap());
+        let spent = code_at(now);
+        handler
+            .finish_totp_enrollment(&id, &start.state, &spent)
+            .await
+            .unwrap();
+        let code = [code_at(now + 30), code_at(now - 30)]
+            .into_iter()
+            .find(|c| *c != spent)
+            .unwrap();
+        (handler, clock, code)
+    }
+
+    #[tokio::test]
+    async fn test_a_simple_login_with_no_password_answers_as_any_failure_and_mints_nothing() {
+        use lldap_test_utils::recording_log::LogGuard;
+        let _backend = ONE_BACKEND.lock().await;
+        let _guard = EnforcementGuard::none();
+        let (handler, _clock, code) = doors_directory().await;
+        let pool = handler.pool().clone();
+        let state = app_state(handler);
+        let mut options = sea_orm::ConnectOptions::new("sqlite::memory:".to_owned());
+        options.max_connections(1);
+        let db = sea_orm::Database::connect(options).await.unwrap();
+        let key = opaque::server::generate_random_private_key();
+        let no_tables = app_state(lldap_sql_backend_handler::SqlBackendHandler::new(key, db));
+        let log = LogGuard::install_on_this_thread();
+        let failed = |user: &str| format!("`Authentication error for user \"{user}\"`");
+        type Case = (
+            String,
+            bool,
+            &'static str,
+            String,
+            u16,
+            String,
+            Option<(bool, Option<&'static str>)>,
+        );
+        let mut cases: Vec<Case> = Vec::new();
+        let names = [
+            ("a user", "e3plain"),
+            ("a disabled user", "e3off"),
+            ("an enrolled user", "e3code"),
+            ("an unknown name", "e3nobody"),
+        ];
+        for (who, user) in names {
+            for (what, password) in [
+                ("no password", String::new()),
+                ("a code alone", format!(":{code}")),
+            ] {
+                for (place, bare) in [("", false), (", no tables", true)] {
+                    cases.push((
+                        format!("{who}, {what}{place}"),
+                        bare,
+                        user,
+                        password.clone(),
+                        401,
+                        failed(user),
+                        Some((false, Some("no password given"))),
+                    ));
+                }
+            }
+        }
+        cases.extend([
+            (
+                "control: a user, a wrong password".to_owned(),
+                false,
+                "e3plain",
+                "e3plain-wrong-1".to_owned(),
+                401,
+                failed("e3plain"),
+                Some((false, Some("invalid credentials"))),
+            ),
+            (
+                "control: a disabled user, the password".to_owned(),
+                false,
+                "e3off",
+                "e3off-pass-1".to_owned(),
+                401,
+                failed("e3off"),
+                Some((false, Some("account disabled"))),
+            ),
+            (
+                "control: an enrolled user, the password alone".to_owned(),
+                false,
+                "e3code",
+                "e3code-pass-1".to_owned(),
+                401,
+                "`Authentication error TOTP code required for user \"e3code\"`".to_owned(),
+                Some((false, Some("totp code required"))),
+            ),
+            (
+                "control: an unknown name, a password".to_owned(),
+                false,
+                "e3nobody",
+                "e3plain-wrong-1".to_owned(),
+                401,
+                failed("e3nobody"),
+                Some((false, Some("unknown user"))),
+            ),
+            (
+                "control: a password, no tables".to_owned(),
+                true,
+                "e3plain",
+                "e3plain-pass-1".to_owned(),
+                500,
+                "<database error>".to_owned(),
+                None,
+            ),
+            (
+                "control: a user, the password".to_owned(),
+                false,
+                "e3plain",
+                "e3plain-pass-1".to_owned(),
+                200,
+                "<session>".to_owned(),
+                Some((true, None)),
+            ),
+        ]);
+        let (mut got, mut wanted) = (Vec::new(), Vec::new());
+        for (label, bare, user, password, status, body, row) in cases {
+            let door = if bare { &no_tables } else { &state };
+            let before = minted(&pool).await;
+            let request = login::ClientSimpleLoginRequest {
+                username: UserId::new(user),
+                password,
+                enrollment_proof: None,
+            };
+            let response = simple_login_handler(door.clone(), web::Json(request)).await;
+            let got_status = response.status().as_u16();
+            let cookies = response.cookies().count();
+            let bytes = actix_web::body::to_bytes(response.into_body())
+                .await
+                .unwrap();
+            let got_body = match got_status {
+                200 => "<session>".to_owned(),
+                500 => "<database error>".to_owned(),
+                _ => String::from_utf8_lossy(&bytes).into_owned(),
+            };
+            let rows: Vec<_> = log
+                .recorder()
+                .take_events()
+                .into_iter()
+                .filter(|e| e.actor.as_deref() == Some(user))
+                .map(|e| (e.kind, e.success, e.detail))
+                .collect();
+            let (cookies_wanted, minted_wanted) = match status {
+                200 => (2_usize, (before.0 + 1, before.1 + 1)),
+                _ => (0, before),
+            };
+            let row =
+                row.map(|(success, detail)| (LogKind::Bind, success, detail.map(str::to_owned)));
+            got.push((
+                label.clone(),
+                got_status,
+                got_body,
+                cookies,
+                minted(&pool).await,
+                rows,
+            ));
+            wanted.push((
+                label,
+                status,
+                body,
+                cookies_wanted,
+                minted_wanted,
+                Vec::from_iter(row),
+            ));
+        }
+        assert_eq!(
+            got, wanted,
+            "per row: status, body, cookies, minted tokens, its one row"
+        );
+    }
+
     #[tokio::test]
     async fn test_a_policy_refusal_at_the_web_and_simple_login_routes_is_one_row_with_its_peer() {
         use lldap_test_utils::recording_log::LogGuard;

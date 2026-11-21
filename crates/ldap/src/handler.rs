@@ -23,7 +23,8 @@ use lldap_access_control::AccessControlledBackendHandler;
 use lldap_auth::access_control::ValidationResults;
 use lldap_domain::types::UserId;
 use lldap_domain_handlers::handler::{BackendHandler, LoginHandler};
-use lldap_domain_handlers::logging::{self, LogKind, RequestMeta, with_request};
+use lldap_domain_handlers::logging::{self, LogKind, NO_PASSWORD, RequestMeta, with_request};
+use lldap_mfa::without_password;
 use lldap_opaque_handler::OpaqueHandler;
 use lldap_schema::PublicSchema;
 use std::net::IpAddr;
@@ -221,6 +222,20 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
                     Some(&err.message),
                 );
             })?;
+        // RFC 4513 5.1.2: refused before the name is looked up, so every name gets one answer.
+        if without_password(password) {
+            logging::record_as(
+                Some(&user_id),
+                LogKind::Bind,
+                None,
+                false,
+                Some(NO_PASSWORD),
+            );
+            return Err(LdapError {
+                code: LdapResultCode::UnwillingToPerform,
+                message: "a bind with a name needs a password".to_owned(),
+            });
+        }
         let inner = self.backend_handler.unsafe_get_handler();
         if let Ok(user) = inner.get_user_details(&user_id).await {
             let stored_ou = crate::attributes::get_user_ou(&user);

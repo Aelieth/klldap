@@ -68,6 +68,9 @@ wherever the server sees its text:
 `setUserPassword`, the LDAP password doors, and a synced user's web pages and
 `lldap_set_password`. A shorter one is refused and nothing is written. For a user
 without sync, the web pages and `lldap_set_password` check 8 themselves.
+`lldap_set_password` needs a password, from `--password` or `LLDAP_USER_PASSWORD`, and
+refuses an empty one before it sends anything; `--bypass-password-policy` skips only the
+minimum length.
 
 ### Getting a token
 

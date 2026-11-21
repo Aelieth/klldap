@@ -1274,6 +1274,62 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn test_a_bind_with_no_password_counts_nothing_locked_or_not() {
+        let log = LogGuard::install_on_this_thread();
+        let h = handler().await;
+        user_in(&h, "e3count", "e3countou").await;
+        threshold(&h, "e3countou", "2").await;
+        let meta = RequestMeta::ldap(None, Some("10.71.3.1".parse().unwrap()));
+        let (got, wanted) = with_request(meta, async {
+            let before = stored(&h, "e3count").await;
+            type Step = (&'static str, &'static str, bool, Option<u32>);
+            let steps: [Step; 7] = [
+                ("no password", "", false, before),
+                ("again", "", false, before),
+                ("a code alone", ":123456", false, before),
+                (
+                    "the password still binds, its count not read",
+                    RIGHT,
+                    true,
+                    None,
+                ),
+                ("wrong", "nope-1", false, Some(1)),
+                ("the second wrong locks", "nope-2", false, Some(2)),
+                ("no password while locked", "", false, Some(2)),
+            ];
+            let (mut got, mut wanted) = (Vec::new(), Vec::new());
+            for (label, password, ok, count) in steps {
+                let bound = bind(&h, "e3count", password).await;
+                let count_now = match ok {
+                    true => None,
+                    false => stored(&h, "e3count").await,
+                };
+                got.push((label, bound, count_now));
+                wanted.push((label, ok, count));
+            }
+            (got, wanted)
+        })
+        .await;
+        let user = Some("e3count".to_owned());
+        let refused = |detail: &str| (LogKind::Bind, user.clone(), Some(detail.to_owned()));
+        let mut expected = vec![refused("no password given"); 3];
+        expected.push((LogKind::Bind, user.clone(), None));
+        expected.extend(vec![refused("invalid credentials"); 2]);
+        expected.push((
+            LogKind::AccountLock,
+            user.clone(),
+            Some("locked: ldap bind".to_owned()),
+        ));
+        expected.push(refused("no password given"));
+        assert_eq!(
+            (got, rows(&log, &[LogKind::Bind, LogKind::AccountLock])),
+            (wanted, expected),
+            "per step: bound, the stored count; then the rows"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_wrong_binds_at_once_each_count_on_the_current_row() {
         let h = handler().await;
         user_in(&h, "e1many", "e1manyou").await;

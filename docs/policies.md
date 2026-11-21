@@ -149,7 +149,11 @@ revoked") before the KDC looks at any password; that is not the wrong-password a
 and anyone can see it without a password. An S4U2Self never counts. Nothing a locked user
 sends is counted. The reason is in the log: a `locked out` row for each refusal (refusals of
 the same kind from one peer coalesce in a flood, [logging.md](logging.md)), and one
-`account_lock` row when a counted failure brings the stored count to the threshold.
+`account_lock` row when a counted failure brings the stored count to the threshold. At LDAP
+bind and `/auth/simple/login` an empty password, or `:` and a code alone, is refused before
+the lock is read, locked or not: LDAP answers 53 (*unwillingToPerform*), `/auth/simple/login`
+401 as for a wrong password, with one `bind` row `no password given` and no `locked out` row;
+it is never counted.
 
 The web login counts each attempt when it starts, because the browser checks a wrong password
 itself and sends nothing more. The start's +1 is kept beside the user's stored count, never in

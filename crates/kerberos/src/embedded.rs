@@ -4391,4 +4391,31 @@ pub(crate) mod tests {
             "an LDAP Add with a password: both forms set, and the principal marked"
         );
     }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_synced_users_kinit_with_an_empty_password_is_refused() {
+        use krb5_types::err::PREAUTH_FAILED;
+        let temp = TempRealm::new();
+        let (embedded, store) = temp.embedded();
+        synced(&embedded, &bob(), "Bob-Password-1").await.unwrap();
+        let rows = [
+            ("its password", "Bob-Password-1", 0),
+            ("an empty password", "", PREAUTH_FAILED),
+            (
+                "control: a wrong password",
+                "Bob-Password-2",
+                PREAUTH_FAILED,
+            ),
+        ];
+        let got: Vec<_> = rows
+            .iter()
+            .map(|(label, password, _)| (*label, kinit_code(&store, "bob", password)))
+            .collect();
+        let wanted: Vec<_> = rows
+            .iter()
+            .map(|(label, _, code)| (*label, *code))
+            .collect();
+        assert_eq!(got, wanted, "per row: kinit's answer");
+    }
 }

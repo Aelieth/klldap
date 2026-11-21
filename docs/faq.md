@@ -36,6 +36,9 @@ set isn't working, try the following:
   `yourpassword:123456` (password, a colon, the current code) and refuse the bare
   password. Service accounts that cannot type a code belong in `lldap_mfa_disabled`. See
   [mfa.md](mfa.md).
+- An empty password is refused at sign-in: an LDAP bind with a name and no password answers 53
+  (*unwillingToPerform*), and the simple login answers as any failed sign-in;
+  `lldap_set_password` and the pages refuse an empty password.
 - Make sure you restart the server.
 
 ## kinit fails for a user

@@ -126,6 +126,7 @@ tokio::task_local! {
 }
 
 pub const NO_SESSION: &str = "no session";
+pub const NO_PASSWORD: &str = "no password given";
 
 /// Every row written inside says in its detail that no session was made.
 pub async fn without_session<F: Future>(f: F) -> F::Output {

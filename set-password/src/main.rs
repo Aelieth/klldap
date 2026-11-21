@@ -30,13 +30,13 @@ pub struct CliOpts {
     #[clap(
         short,
         long,
-        help = "New password for the user. Can also be passed as the environment variable LLDAP_USER_PASSWORD"
+        help = "New password for the user, required. Can also be passed as the environment variable LLDAP_USER_PASSWORD. An empty one is refused"
     )]
     pub password: Option<String>,
 
     #[clap(
         long,
-        help = "Bypass password requirements such as minimum length. Unsafe"
+        help = "Skip the minimum length check. An empty password is still refused. Unsafe"
     )]
     pub bypass_password_policy: bool,
 }
@@ -112,10 +112,11 @@ pub fn register_finish(
 fn main() -> Result<()> {
     let opts = CliOpts::parse();
 
-    let password = match opts.password {
-        Some(v) => v,
-        None => env::var("LLDAP_USER_PASSWORD").unwrap_or_default(),
-    };
+    let password = opts
+        .password
+        .or_else(|| env::var("LLDAP_USER_PASSWORD").ok())
+        .filter(|password| !password.is_empty())
+        .context("no password given: pass --password or set LLDAP_USER_PASSWORD")?;
 
     ensure!(
         opts.bypass_password_policy || password.chars().count() >= 8,

@@ -4,7 +4,7 @@
 //! component field between the start and finish steps.
 
 use crate::infra::encrypt::seal_kerberos_envelope;
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use lldap_auth::{login, opaque, registration};
 
 pub type RegistrationState = opaque::client::registration::ClientRegistration;
@@ -19,6 +19,7 @@ pub fn begin_registration(
     RegistrationState,
     registration::ClientRegistrationStartRequest,
 )> {
+    ensure!(!password.is_empty(), "a password is required");
     let mut rng = rand::rngs::OsRng;
     let start = opaque::client::registration::start_registration(password.as_bytes(), &mut rng)
         .context("Could not initiate registration")?;
@@ -140,5 +141,18 @@ mod tests {
             let label = format!("{finish_for:?}");
             assert_eq!(finish_for.fields(), expected, "{label}");
         }
+    }
+
+    #[test]
+    fn test_no_page_registers_an_empty_password() {
+        let started = |password| {
+            begin_registration("bob", password)
+                .map(drop)
+                .map_err(|e| e.to_string())
+        };
+        assert_eq!(
+            (started(""), started("Bob-Password-1")),
+            (Err("a password is required".to_owned()), Ok(()))
+        );
     }
 }

@@ -49,6 +49,12 @@ pub fn split_totp_suffix(password: &str) -> Option<(&str, &str)> {
         .then_some((prefix, code))
 }
 
+pub fn without_password(sign_in: &str) -> bool {
+    split_totp_suffix(sign_in)
+        .map_or(sign_in, |(password, _)| password)
+        .is_empty()
+}
+
 pub fn totp_verify(secret: &[u8], code: &str, unix_secs: u64) -> Result<bool> {
     Ok(totp_matched_step(secret, code, unix_secs)?.is_some())
 }
@@ -141,5 +147,22 @@ mod tests {
         assert_eq!(split_totp_suffix("password:12345"), None);
         assert_eq!(split_totp_suffix("password:1234567"), None);
         assert_eq!(split_totp_suffix("password:12345a"), None);
+    }
+
+    #[test]
+    fn test_without_password_cases() {
+        let rows = [
+            ("", true),
+            (":123456", true),
+            ("::123456", false),
+            (":12345", false),
+            (":", false),
+            ("x:123456", false),
+            ("password", false),
+            (" ", false),
+        ];
+        for (sign_in, none) in rows {
+            assert_eq!(without_password(sign_in), none, "{sign_in:?}");
+        }
     }
 }

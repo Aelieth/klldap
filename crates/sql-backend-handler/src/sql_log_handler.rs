@@ -5,7 +5,7 @@ use lldap_domain::types::UserId;
 use lldap_domain_handlers::handler::LogBackendHandler;
 use lldap_domain_handlers::logging::{
     LogActivity, LogBucket, LogCursor, LogDimension, LogEvent, LogFilter, LogKind, LogRecord,
-    LogSink, NoopLogSink, Protocol, flush_suppressed_warnings, set_log_sink,
+    LogSink, NO_PASSWORD, NoopLogSink, Protocol, flush_suppressed_warnings, set_log_sink,
 };
 use lldap_domain_model::{
     error::Result as DomainResult,
@@ -198,7 +198,11 @@ impl FloodClass {
     fn classify(event: &LogEvent) -> Option<Self> {
         match event.kind {
             LogKind::Bind
-                if !event.success && event.detail.as_deref() == Some(UNKNOWN_USER_DETAIL) =>
+                if !event.success
+                    && matches!(
+                        event.detail.as_deref(),
+                        Some(UNKNOWN_USER_DETAIL | NO_PASSWORD)
+                    ) =>
             {
                 Some(Self::UnknownBind)
             }
@@ -1416,6 +1420,34 @@ mod tests {
             assert!(flood.keep(&no_detail));
         }
         assert!(flood.flush(base, true).is_empty());
+    }
+
+    #[test]
+    fn test_binds_with_no_password_coalesce_as_unknown_names_do() {
+        let mut flood = FloodCoalescer::new(FloodClass::UnknownBind, FLOOD_IDLE_SECONDS);
+        let base = at(1, 9, 0);
+        let kept: Vec<bool> = (0..10)
+            .map(|i| {
+                let no_password = LogEvent {
+                    detail: Some("no password given".to_owned()),
+                    ..unknown_bind(&format!("spray-{i}"), "10.0.0.9", base)
+                };
+                flood.keep(&no_password)
+            })
+            .collect();
+        let closed = flood.flush(base + chrono::Duration::seconds(30), false);
+        let details: Vec<_> = closed.iter().filter_map(|r| r.detail.as_deref()).collect();
+        assert_eq!(
+            (kept, details),
+            (
+                [vec![true; 8], vec![false; 2]].concat(),
+                vec![
+                    "unknown-user bind flood started",
+                    "unknown-user bind flood resolved: 2 binds, 2 names, 0s"
+                ]
+            ),
+            "the first eight pass, the rest are counted in one incident"
+        );
     }
 
     #[test]

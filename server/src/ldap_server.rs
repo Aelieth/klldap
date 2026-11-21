@@ -322,4 +322,181 @@ mod tests {
             );
         }
     }
+
+    type Answer = (LdapResultCode, String);
+    type Bound = (Answer, Answer, Vec<(bool, Option<String>, Option<String>)>);
+
+    async fn bind_and_ask_who<B>(backend: B, log: &LogGuard, dn: String, password: String) -> Bound
+    where
+        B: BackendHandler + LoginHandler + OpaqueHandler,
+    {
+        let info = LdapInfo::new("dc=example,dc=com", Vec::new(), Vec::new()).unwrap();
+        let peer: IpAddr = "198.51.100.33".parse().unwrap();
+        let mut session = LdapHandler::new(
+            AccessControlledBackendHandler::new(backend),
+            Box::leak(Box::new(info)),
+            Uuid::new_v4(),
+            Some(peer),
+        );
+        let bind = LdapOp::BindRequest(LdapBindRequest {
+            dn,
+            cred: LdapBindCred::Simple(password),
+        });
+        let bound = answered(session.handle_ldap_message(bind).await);
+        let binds = log
+            .recorder()
+            .take_events()
+            .into_iter()
+            .filter(|e| e.kind == LogKind::Bind)
+            .map(|e| (e.success, e.actor, e.detail))
+            .collect();
+        let whoami = LdapOp::ExtendedRequest(LdapExtendedRequest {
+            name: OID_WHOAMI.to_owned(),
+            value: None,
+        });
+        let identity = answered(session.handle_ldap_message(whoami).await);
+        let _ = log.recorder().take_events();
+        (bound, identity, binds)
+    }
+
+    #[tokio::test]
+    async fn test_a_bind_with_a_name_and_no_password_is_refused_before_any_lookup() {
+        use crate::auth_service::tests::doors_directory;
+        use lldap_test_utils::MockTestBackendHandler;
+        let _backend = ONE_BACKEND.lock().await;
+        let _guard = EnforcementGuard::none();
+        let (handler, _clock, code) = doors_directory().await;
+        let log = LogGuard::install_on_this_thread();
+        let refused: Answer = (
+            LdapResultCode::UnwillingToPerform,
+            "a bind with a name needs a password".to_owned(),
+        );
+        let wrong: Answer = (LdapResultCode::InvalidCredentials, String::new());
+        let unbound: Answer = (
+            LdapResultCode::InsufficentAccessRights,
+            "No user currently bound".to_owned(),
+        );
+        type Case = (
+            String,
+            bool,
+            &'static str,
+            &'static str,
+            String,
+            Answer,
+            Answer,
+            (bool, Option<&'static str>),
+        );
+        let mut cases: Vec<Case> = Vec::new();
+        let names = [
+            ("a user", "e3plain", "people"),
+            ("a disabled user", "e3off", "people"),
+            ("an enrolled user", "e3code", "people"),
+            ("an unknown name", "e3nobody", "people"),
+            ("a user under another OU", "e3plain", "lab"),
+            ("an unknown name under another OU", "e3nobody", "lab"),
+        ];
+        for (who, user, ou) in names {
+            for (what, password) in [
+                ("no password", String::new()),
+                ("a code alone", format!(":{code}")),
+            ] {
+                for (place, mock) in [("", false), (", a backend that answers nothing", true)] {
+                    cases.push((
+                        format!("{who}, {what}{place}"),
+                        mock,
+                        user,
+                        ou,
+                        password.clone(),
+                        refused.clone(),
+                        unbound.clone(),
+                        (false, Some("no password given")),
+                    ));
+                }
+            }
+        }
+        cases.extend([
+            (
+                "control: a user, a wrong password".to_owned(),
+                false,
+                "e3plain",
+                "people",
+                "e3plain-wrong-1".to_owned(),
+                wrong.clone(),
+                unbound.clone(),
+                (false, Some("invalid credentials")),
+            ),
+            (
+                "control: a disabled user, the password".to_owned(),
+                false,
+                "e3off",
+                "people",
+                "e3off-pass-1".to_owned(),
+                wrong.clone(),
+                unbound.clone(),
+                (false, Some("account disabled")),
+            ),
+            (
+                "control: an enrolled user, the password alone".to_owned(),
+                false,
+                "e3code",
+                "people",
+                "e3code-pass-1".to_owned(),
+                (
+                    LdapResultCode::InvalidCredentials,
+                    "TOTP code required: append ':' and the code".to_owned(),
+                ),
+                unbound.clone(),
+                (false, Some("totp code required")),
+            ),
+            (
+                "control: an unknown name, a password".to_owned(),
+                false,
+                "e3nobody",
+                "people",
+                "e3plain-wrong-1".to_owned(),
+                wrong.clone(),
+                unbound.clone(),
+                (false, Some("unknown user")),
+            ),
+            (
+                "control: a user under another OU, the password".to_owned(),
+                false,
+                "e3plain",
+                "lab",
+                "e3plain-pass-1".to_owned(),
+                wrong,
+                unbound,
+                (false, Some("ou mismatch")),
+            ),
+            (
+                "control: a user, the password".to_owned(),
+                false,
+                "e3plain",
+                "people",
+                "e3plain-pass-1".to_owned(),
+                (LdapResultCode::Success, String::new()),
+                (
+                    LdapResultCode::Success,
+                    "dn:uid=e3plain,ou=people,dc=example,dc=com".to_owned(),
+                ),
+                (true, None),
+            ),
+        ]);
+        let (mut got, mut wanted) = (Vec::new(), Vec::new());
+        for (label, mock, user, ou, password, bind_answer, whoami_answer, row) in cases {
+            let dn = format!("uid={user},ou={ou},dc=example,dc=com");
+            let answers = match mock {
+                true => bind_and_ask_who(MockTestBackendHandler::new(), &log, dn, password).await,
+                false => bind_and_ask_who(handler.clone(), &log, dn, password).await,
+            };
+            let (success, detail) = row;
+            let row = (success, Some(user.to_owned()), detail.map(str::to_owned));
+            got.push((label.clone(), answers));
+            wanted.push((label, (bind_answer, whoami_answer, vec![row])));
+        }
+        assert_eq!(
+            got, wanted,
+            "per row: the bind's answer, who the connection is after it, its one row"
+        );
+    }
 }

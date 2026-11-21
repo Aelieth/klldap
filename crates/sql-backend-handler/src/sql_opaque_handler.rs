@@ -12,13 +12,13 @@ use lldap_domain_handlers::kerberos::{
     LDAP_ADMINS_ONLY, kerberos_backend, refusal_while_degraded, require_kdc_ready,
 };
 use lldap_domain_handlers::lockout::{Step, lock_clock};
-use lldap_domain_handlers::logging::{self, LogKind};
+use lldap_domain_handlers::logging::{self, LogKind, NO_PASSWORD};
 use lldap_domain_handlers::mfa::MfaRequirement;
 use lldap_domain_model::{
     error::{DomainError, Result},
     model::{self, UserColumn},
 };
-use lldap_mfa::{MFA_ENROLLMENT_REQUIRED, TOTP_CODE_REQUIRED, split_totp_suffix};
+use lldap_mfa::{MFA_ENROLLMENT_REQUIRED, TOTP_CODE_REQUIRED, split_totp_suffix, without_password};
 use lldap_opaque_handler::{OpaqueHandler, STRETCH_FAILED, login, registration, stretch};
 use sea_orm::{ActiveModelTrait, ActiveValue, ConnectionTrait, DbErr, EntityTrait, QuerySelect};
 use tracing::{debug, info, instrument, warn};
@@ -207,6 +207,10 @@ impl LoginHandler for SqlBackendHandler {
     #[instrument(skip_all, level = "debug", err(level = "debug"))]
     async fn bind(&self, request: BindRequest) -> Result<()> {
         let BindRequest { name, password } = request;
+        if without_password(&password) {
+            logging::record_as(Some(&name), LogKind::Bind, None, false, Some(NO_PASSWORD));
+            return Err(invalid_credentials(&name));
+        }
         if self.is_user_disabled(&name).await? {
             warn!(r#"Login attempt denied for disabled user "{}""#, &name);
             logging::record_as(
@@ -1686,5 +1690,147 @@ mod tests {
             (false, vec![refused], vec![(Door::LdapBind, true)]),
             "the code was right; the refusal is the one row and no success row"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_bind_with_no_password_is_refused_first_whoever_the_name_is() {
+        use crate::sql_backend_handler::tests::get_in_memory_db;
+        use crate::sql_lockout_handler::tests as doors;
+        use lldap_domain_handlers::lockout::{DURATION, THRESHOLD};
+        let _clock = pin_clock(AT as i64);
+        let directory = doors::handler().await.with_mfa_policy(MfaPolicy::Enrolled);
+        let users = [
+            ("e3on", "e3ou"),
+            ("e3off", "e3ou"),
+            ("e3lock", "e3lockou"),
+            ("e3code", "e3ou"),
+        ];
+        for (user, ou) in users {
+            doors::user_in(&directory, user, ou).await;
+        }
+        let disabled = insert_group(&directory, "lldap_disabled").await;
+        insert_membership(&directory, disabled, "e3off").await;
+        doors::policy_on(&directory, "e3lockou", &[(THRESHOLD, "2"), (DURATION, "0")]).await;
+        for wrong in ["e3lock-wrong-1", "e3lock-wrong-2"] {
+            doors::bind_as(&directory, "e3lock", wrong)
+                .await
+                .unwrap_err();
+        }
+        let seed = enroll(&directory, "e3code", AT).await;
+        let (code, _) = fresh_and_wrong(&seed, AT);
+        let no_tables =
+            SqlBackendHandler::new(generate_random_private_key(), get_in_memory_db().await);
+        let log = LogGuard::install_on_this_thread();
+        let failed = |user: &str| format!(r#"Authentication error for user "{user}""#);
+        type Case = (
+            String,
+            bool,
+            &'static str,
+            String,
+            std::result::Result<(), String>,
+            Option<(bool, Option<&'static str>)>,
+        );
+        let mut cases: Vec<Case> = Vec::new();
+        let names = [
+            ("a user", "e3on"),
+            ("a disabled user", "e3off"),
+            ("a locked user", "e3lock"),
+            ("an enrolled user", "e3code"),
+            ("an unknown name", "e3nobody"),
+        ];
+        for (who, user) in names {
+            for (what, password) in [
+                ("no password", String::new()),
+                ("a code alone", format!(":{code}")),
+            ] {
+                for (place, bare) in [("", false), (", no tables", true)] {
+                    cases.push((
+                        format!("{who}, {what}{place}"),
+                        bare,
+                        user,
+                        password.clone(),
+                        Err(failed(user)),
+                        Some((false, Some("no password given"))),
+                    ));
+                }
+            }
+        }
+        let right = doors::RIGHT.to_owned();
+        cases.extend([
+            (
+                "control: a user, the password".to_owned(),
+                false,
+                "e3on",
+                right.clone(),
+                Ok(()),
+                Some((true, None)),
+            ),
+            (
+                "control: a disabled user, the password".to_owned(),
+                false,
+                "e3off",
+                right.clone(),
+                Err(failed("e3off")),
+                Some((false, Some("account disabled"))),
+            ),
+            (
+                "control: a locked user, the password".to_owned(),
+                false,
+                "e3lock",
+                right.clone(),
+                Err(failed("e3lock")),
+                Some((false, Some("locked out"))),
+            ),
+            (
+                "control: an enrolled user, the password alone".to_owned(),
+                false,
+                "e3code",
+                right.clone(),
+                Err(r#"Authentication error TOTP code required for user "e3code""#.to_owned()),
+                Some((false, Some("totp code required"))),
+            ),
+            (
+                "control: an unknown name, a password".to_owned(),
+                false,
+                "e3nobody",
+                right.clone(),
+                Err(failed("e3nobody")),
+                Some((false, Some("unknown user"))),
+            ),
+            (
+                "control: a password, no tables".to_owned(),
+                true,
+                "e3on",
+                right,
+                Err("<database error>".to_owned()),
+                None,
+            ),
+        ]);
+        let (mut got, mut wanted) = (Vec::new(), Vec::new());
+        for (label, bare, user, password, answer, row) in cases {
+            let handler = if bare { &no_tables } else { &directory };
+            let got_answer =
+                handler
+                    .bind(bind_request(user, &password))
+                    .await
+                    .map_err(|e| match e {
+                        DomainError::DatabaseError(_) => "<database error>".to_owned(),
+                        e => e.to_string(),
+                    });
+            let rows: Vec<_> = log
+                .recorder()
+                .take_events()
+                .into_iter()
+                .filter(|e| e.kind == LogKind::Bind)
+                .map(|e| (e.success, e.actor, e.detail))
+                .collect();
+            let row = row.map(|(success, detail)| {
+                (success, Some(user.to_owned()), detail.map(str::to_owned))
+            });
+            got.push((label.clone(), got_answer, rows));
+            wanted.push((label, answer, Vec::from_iter(row)));
+        }
+        assert_eq!(got, wanted, "per row: the answer and its one row");
     }
 }

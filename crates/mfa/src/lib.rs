@@ -26,7 +26,9 @@ pub use secret::{
     EnrollmentState, FACTOR_DIGEST_LEN, factor_digest, generate_seed, open_enrollment,
     open_totp_secret, seal_enrollment, seal_totp_secret,
 };
-pub use totp::{format_code, split_totp_suffix, totp_code, totp_matched_step, totp_verify};
+pub use totp::{
+    format_code, split_totp_suffix, totp_code, totp_matched_step, totp_verify, without_password,
+};
 pub use types::{
     MFA_ENROLLMENT_REQUIRED, PASSWORD_PROOF_REQUIRED, TOTP_CODE_ALREADY_USED, TOTP_CODE_REQUIRED,
     TOTP_CURRENT_CODE_REQUIRED, TOTP_DIGITS, TOTP_ENROLLMENT_EXPIRED, TOTP_ENROLLMENT_TTL_SECS,

@@ -18,7 +18,7 @@ server-wide spellings still work: `false` is `off`, `true` is `enabled`.
 
 | Value | Effect |
 |---|---|
-| `off` (the built-in default) | Off. Enrollment is refused (*MFA is disabled for this user*) and nothing is ever split: a password that happens to end in `:123456` is the whole password. |
+| `off` (the built-in default) | Off. Enrollment is refused (*MFA is disabled for this user*) and nothing is ever split: a password that happens to end in `:123456` is the whole password, though `:123456` alone is refused as no password given at LDAP simple bind and `/auth/simple/login`. |
 | `enabled` | Users may enroll an authenticator; only enrolled users must present a code. |
 | `always` | Every user must enroll. Until they do, the web login admits them flagged `mfaEnrollmentRequired` and the API is confined to reading their own user and enrolling, while `/auth/simple/login` and LDAP bind refuse them with *MFA enrollment required*. |
 
@@ -45,8 +45,9 @@ value can turn the factor on, its name is load-bearing: it cannot be renamed or 
 install that sets nothing gets no such group, and a group of that name is then an ordinary
 group. Members are exempt whatever their value: they authenticate with the password alone
 even if enrolled. The combined `password:code` string is not split for them, so it is a
-wrong password — use the bare password. Put service accounts there, and keep one admin
-exempt or unenrolled as the break-glass.
+wrong password — use the bare password. At LDAP simple bind and `/auth/simple/login` a code
+alone (`:123456`) is refused as no password given, for them too. Put service accounts there,
+and keep one admin exempt or unenrolled as the break-glass.
 
 ## Enrollment
 
@@ -86,7 +87,10 @@ yourpassword:123456
 That combined form is for LDAP simple bind and `/auth/simple/login`; the web login's
 password field takes the password alone (the combined form fails there as a wrong password,
 and the page says the code comes next). The change-password page takes the current
-password alone too.
+password alone too. At LDAP simple bind and `/auth/simple/login` a sign-in whose password
+part is empty (`:` and the six digits alone, or nothing at all) is refused as `no password
+given` before the name is looked up, whoever the user is: LDAP answers 53
+(*unwillingToPerform*), `/auth/simple/login` 401 as for a wrong password.
 
 | Door | Code missing | Code wrong | Code replayed / attempts spent |
 |---|---|---|---|

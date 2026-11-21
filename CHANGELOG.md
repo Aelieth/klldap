@@ -259,6 +259,9 @@
   start). The commit counts as landed only when the row holds this server's own realm and
   realm record; a row another server created first is answered "another server created the
   realm first", and this server stops.
+- An empty password is refused at sign-in: an LDAP bind with a name and no password answers 53
+  (unwillingToPerform), and the simple login answers as any failed sign-in; `lldap_set_password`
+  and the pages refuse an empty password.
 - A password-reset finish registers only the reset token's own user.
 
 ### Fixed

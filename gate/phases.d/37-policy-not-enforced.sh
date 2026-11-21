@@ -1,18 +1,26 @@
 # shellcheck shell=bash
 # Phase: each policy item set and shown effective, then simple login, LDAP bind, kinit; lockout-threshold locks, enable-mfa=always is overridden here
-# by the server's explicit LLDAP_ENABLE_MFA and refuses the binds on a server without it, the other rows say today | when enforced.
+# by the server's explicit LLDAP_ENABLE_MFA and refuses the binds on a server without it. login-hours and allowed-networks refuse, on the user's OU
+# only; inactivity-days admits a user who is not idle. A refusing policy on the root is undone with lldap policy-unlink.
 
+# Passwords and tokens travel in this phase's variables and helpers: nothing of it is traced. The
+# tracing state is put back at the end, for the phases after this one.
+NE_XT=0
+case $- in *x*) NE_XT=1 ;; esac
+{ set +x; } 2>/dev/null
 NE_D="$(phase_dir)"
-NE_N=0 NE_P=0 NE_F=0 NE_K=0 NE_FIND=()
+NE_N=0 NE_P=0 NE_F=0 NE_K=0 NE_X=0 NE_FIND=()
 NE_RUN="ne$(date +%H%M%S)"
 NE_OU="${NE_RUN}ou" NE_USER="${NE_RUN}-u" NE_POLICY=""
+NE_ROOT_POLICY="" NE_ROOT_HELD=0 NE_WAITED=0 NE_POLLED_401=0 NE_STUCK=0
+NE_HOURS="policy: login-hours (outside login hours)"
 NE_PASS="$(python3 -c 'import secrets; print("Ne" + secrets.token_hex(10) + "!")')"
 NE_SIDE="$CONTAINER-ou37" NE_SIDE_VOL="klldap-gate-ou37-$RUNID"
 EXTRA_CONTAINERS+=("$NE_SIDE")
 EXTRA_VOLUMES+=("$NE_SIDE_VOL")
 
 ne_pass() { NE_N=$((NE_N + 1)) NE_P=$((NE_P + 1)); p_ok "$1"; }
-ne_bad() { NE_N=$((NE_N + 1)); p_bad "$1"; }
+ne_bad() { NE_N=$((NE_N + 1)) NE_X=$((NE_X + 1)); p_bad "$1"; }
 ne_note() { NE_N=$((NE_N + 1)) NE_K=$((NE_K + 1)); note "[NOTE] ${PHASE}: $1"; }
 ne_finding() { NE_N=$((NE_N + 1)) NE_F=$((NE_F + 1)) NE_FIND+=("$1"); note "[FINDING] ${PHASE}: $1"; }
 ne_gql() { graphql "$1" "$2" 2>"$NE_D/last.err"; }
@@ -76,12 +84,53 @@ ne_root() {
     fi
 }
 
+# ne_answer <door>: the right password's answer: the HTTP status, the bind's exit, or kinit's word.
+ne_answer() {
+    case "$1" in
+    simple-login) ne_simple "$NE_USER" "$NE_PASS" ;;
+    ldap-bind) ne_bind "$NE_PASS" ;;
+    kinit) ne_kinit "$NE_PASS" ;;
+    esac
+}
+ne_want() {
+    case "$1:$2" in
+    simple-login:out) echo 401 ;;
+    ldap-bind:out) echo 49 ;;
+    kinit:out) echo revoked ;;
+    simple-login:in) echo 200 ;;
+    ldap-bind:in) echo 0 ;;
+    kinit:in) echo ok ;;
+    esac
+}
+
+# The kind and protocol of a refusal's one row at each door.
+ne_row_of() {
+    case "$1" in
+    simple-login) echo "BIND HTTP" ;;
+    ldap-bind) echo "BIND LDAP" ;;
+    kinit) echo "LOGIN KERBEROS" ;;
+    esac
+}
+
+# ne_door ID CASE DOOR in|out [DETAIL]: the right password is admitted (in) or refused as a wrong
+# one (out); with DETAIL, the refusal's one row must name that reason.
 ne_door() {
-    local id="$1" case_="$2" door="$3" enforced="$4"
-    if ne_right "$door"; then
-        ne_pass "[$id] $case_, $door with the right password: today allowed (as pinned) | when enforced: $enforced"
+    local id="$1" case_="$2" door="$3" detail="${5:-}" want got said=refused mark="" kind proto
+    want="$(ne_want "$door" "$4")"
+    [ "$4" = in ] && said=admitted
+    [ -n "$detail" ] && mark="$(log_mark)"
+    got="$(ne_answer "$door")"
+    if [ "$got" != "$want" ]; then
+        ne_bad "[$id] $case_, $door with the right password answered '$got' (want $said, $want)"
+    elif [ -z "$detail" ]; then
+        ne_pass "[$id] $case_, $door with the right password: $said ($want)"
     else
-        ne_finding "[$id] $case_, $door with the right password: today REFUSED, but nothing is enforced yet | when enforced: $enforced"
+        read -r kind proto <<<"$(ne_row_of "$door")"
+        if fail_once "$kind" "$NE_USER" "$detail" "$mark" "$proto"; then
+            ne_pass "[$id] $case_, $door with the right password: $said ($want), one $kind row (protocol $proto) '$detail'"
+        else
+            ne_bad "[$id] $case_, $door with the right password: $said ($want), but $FAIL_WHY"
+        fi
     fi
 }
 
@@ -226,7 +275,11 @@ ne_today() {
         fi
     }
     ne_side
-    ne_root before && ne_case lockout-threshold 3 &&
+    if ! ne_root before; then
+        ne_bad "[P2.root-before] the root could not take back its own policy, so P2.2 to P2.5 are not run: no item of the test policy may reach the admin"
+        return
+    fi
+    ne_case lockout-threshold 3 &&
         for door in simple-login ldap-bind kinit; do
             bad=0
             for i in $(seq 1 10); do
@@ -247,27 +300,148 @@ ne_today() {
             fi
         done
     day="$(LC_ALL=C date -d '+2 days' +%a | tr 'A-Z' 'a-z')"
-    # The root takes the test policy again only once its items no longer hold the threshold.
-    ne_case login-hours "$day 03:00-03:01" && {
-        ne_root ours || ne_finding "[P2.2-root] the test policy could not be set on the root again"
+    # From here the test policy is on the user's OU only; the root keeps what it had.
+    ne_case login-hours "$day 03:00-03:01" &&
         for door in simple-login ldap-bind kinit; do
-            ne_door "P2.3-$door" "login-hours='$day 03:00-03:01' (now is outside it)" "$door" "refused outside the window"
+            ne_door "P2.3-$door" "login-hours='$day 03:00-03:01' on the user's OU (now is outside it)" "$door" out \
+                "$NE_HOURS"
         done
-    }
     ne_case allowed-networks "192.0.2.0/24" &&
         for door in simple-login ldap-bind kinit; do
-            ne_door "P2.4-$door" "allowed-networks=192.0.2.0/24 (TEST-NET-1, RFC 5737; the client is not in it)" "$door" \
-                "refused from outside the listed networks"
+            ne_door "P2.4-$door" "allowed-networks=192.0.2.0/24 on the user's OU (TEST-NET-1, RFC 5737; no client of the gate is in it)" \
+                "$door" out "policy: allowed-networks (address not allowed)"
         done
-    ne_case inactivity-days 1 && {
-        ne_note "[P2.5-record] inactivity-days=1: the server keeps no last-login time, so nothing can age a user today | when enforced: a user idle over 1 day is refused, which first needs a last-login record"
+    ne_case inactivity-days 1 &&
         for door in simple-login ldap-bind kinit; do
-            ne_door "P2.5-$door" "inactivity-days=1" "$door" "refused only for a user idle over 1 day (this user is not)"
+            ne_door "P2.5-$door" "inactivity-days=1 on the user's OU, linked now: the user, made minutes ago, is not idle" "$door" in
         done
-    }
+    ne_root_unlink "$day 03:00-03:01"
+}
+
+# The host tool in the gate's container, as the server's own user: the way back when a root
+# policy refuses the admin, whose token is then refused too.
+ne_tool_unlink() {
+    local u args=()
+    u="$(uid_of_comm lldap)"
+    [ -n "$u" ] && args=(-u "$u")
+    t docker exec "${args[@]}" "$CONTAINER" /app/lldap policy-unlink --config-file /data/lldap_config.toml "(root)"
+}
+
+# ne_admin_back: the admin's simple login every 5 s for up to 45 s; NE_WAITED, NE_POLLED_401.
+ne_admin_back() {
+    local got
+    NE_WAITED=0 NE_POLLED_401=0
+    while [ "$NE_WAITED" -le 45 ]; do
+        got="$(ne_simple admin "$ADMIN_PASS")"
+        [ "$got" = 200 ] && return 0
+        [ "$got" = 401 ] && NE_POLLED_401=$((NE_POLLED_401 + 1))
+        sleep 5
+        NE_WAITED=$((NE_WAITED + 5))
+    done
+    return 1
+}
+
+# ne_token_use: one GraphQL request on the admin's session: "<status> <refused|other>".
+ne_token_use() {
+    GQ_URL="$(http_url)/api/graphql" GQ_TOKEN="$TOKEN" t python3 - <<'PY'
+import json, os, urllib.error, urllib.request
+req = urllib.request.Request(os.environ["GQ_URL"],
+    headers={"Content-Type": "application/json", "Authorization": "Bearer " + os.environ["GQ_TOKEN"]},
+    data=json.dumps({"query": '{ user(userId: "admin") { id } }'}).encode())
+try:
+    urllib.request.urlopen(req)
+    print("200 other")
+except urllib.error.HTTPError as e:
+    print(e.code, "refused" if e.read().decode(errors="replace").strip() == "Access refused" else "other")
+except Exception:
+    print("000 none")
+PY
+}
+
+ne__rows() {
+    graphql "query(\$id: ID!, \$t: String!) { logs(filter: {kinds: [$1], target: \$t}, afterId: \$id, limit: 50) { success protocol detail } }" \
+        "$(ID="$6" T="$2" python3 -c 'import json,os; print(json.dumps({"id": os.environ["ID"], "t": os.environ["T"]}))')" 2>/dev/null |
+        WANT="$3" PROTO="$4" OK="$5" python3 -c '
+import json, os, sys
+rows = json.load(sys.stdin)["logs"]
+print(sum(1 for r in rows if r.get("detail") == os.environ["WANT"] and r.get("protocol") == os.environ["PROTO"]
+          and r.get("success") is (os.environ["OK"] == "true")))' 2>/dev/null
+}
+# ne_rows KIND TARGET DETAIL PROTOCOL true|false MARK WANT: the count of such rows after the mark.
+ne_rows() {
+    local n=""
+    for _ in $(seq 1 20); do
+        n="$(ne__rows "$@")"
+        [ "${n:-0}" -ge "$7" ] && break
+        sleep 0.5
+    done
+    sleep 1
+    n="$(ne__rows "$@")"
+    printf '%s\n' "${n:-0}"
+}
+
+# One row: a policy that refuses the admin on the root, undone from the host. No GraphQL call is
+# made between the link and the unlink: the admin's token is refused there.
+ne_root_unlink() {
+    local value="$1" mark simple token rc said unlinked bind denied
+    unlinked="policy cleared: $NE_RUN root (lldap policy-unlink)"
+    said="Removed the policy link of (root); a running server sees it within 30 seconds."
+    mark="$(log_mark)"
+    NE_ROOT_POLICY="$(ne_gql 'mutation($n: String!, $i: [PolicyItemInput!]) { createPolicy(name: $n, items: $i) { id } }' \
+        '{"n": "'"$NE_RUN"' root", "i": [{"key": "login-hours", "value": "'"$value"'"}]}' | json_get createPolicy.id 2>/dev/null)"
+    if [ -z "$mark" ] || [ -z "$NE_ROOT_POLICY" ]; then
+        ne_bad "[P2.root-unlink] no log marker, or the policy '$NE_RUN root' could not be made: $(head -c 200 "$NE_D/last.err")"
+        return
+    fi
+    NE_ROOT_HELD=1
+    if ! ne_gql 'mutation($p: Int!) { setOuPolicy(ou: "", policyId: $p) { ok } }' '{"p": '"$NE_ROOT_POLICY"'}' >/dev/null; then
+        NE_ROOT_HELD=0
+        ne_bad "[P2.root-unlink] the policy could not be linked to the root: $(head -c 200 "$NE_D/last.err")"
+        return
+    fi
+    simple="$(ne_simple admin "$ADMIN_PASS")"
+    token="$(ne_token_use)"
+    ne_tool_unlink >"$NE_D/policy-unlink.out" 2>&1
+    rc=$?
+    if ! ne_admin_back; then
+        ne_bad "[P2.root-unlink] after lldap policy-unlink (exit $rc: '$(head -c 200 "$NE_D/policy-unlink.out")') the admin's simple login was still refused for 45 s"
+        ne_tool_unlink >"$NE_D/policy-unlink-again.out" 2>&1
+        rc=$?
+        ne_admin_back || ne_root_stuck "$rc"
+        NE_ROOT_HELD=0
+        TOKEN="$(gate_login)"
+        return
+    fi
+    NE_ROOT_HELD=0
+    TOKEN="$(gate_login)"
+    bind="$(ne_rows BIND admin "$NE_HOURS" HTTP false "$mark" $((1 + NE_POLLED_401)))"
+    denied="$(ne_rows ACCESS_DENIED admin "$NE_HOURS" GRAPHQL false "$mark" 1)"
+    unlinked="$(ne_rows POLICY_CHANGE "(root)" "$unlinked" SYSTEM true "$mark" 1)"
+    if [ "$simple $token $rc" = "401 401 refused 0" ] && grep -qF "$said" "$NE_D/policy-unlink.out" &&
+        [ "$bind $denied $unlinked" = "$((1 + NE_POLLED_401)) 1 1" ]; then
+        ne_pass "[P2.root-unlink] login-hours='$value' linked to the root reaches the admin: the simple login 401 and the session's next request 401 'Access refused' (BIND and ACCESS_DENIED rows '$NE_HOURS'); lldap policy-unlink '(root)' in the container (exit 0, '$said'): the admin signs in again after $NE_WAITED s (within 45 s), one POLICY_CHANGE row on (root) 'policy cleared: $NE_RUN root (lldap policy-unlink)' (protocol SYSTEM)"
+    else
+        ne_bad "[P2.root-unlink] simple login '$simple', session '$token' (want 401, 401 refused); the tool exited $rc: '$(head -c 160 "$NE_D/policy-unlink.out")'; BIND rows $bind (want $((1 + NE_POLLED_401))), ACCESS_DENIED rows $denied (want 1), POLICY_CHANGE unlink rows $unlinked (want 1)"
+    fi
+}
+
+# The tool ran twice and the admin is still refused: no later phase could sign in, so the run
+# stops here, and the gate's own exit removes its containers.
+ne_root_stuck() {
+    NE_STUCK=1
+    ne_bad "[P2.root-stuck] lldap policy-unlink '(root)' ran twice (the second exit $1: '$(head -c 200 "$NE_D/policy-unlink-again.out")') and the admin was still refused 45 s after each: the run stops here"
+    note "policy-not-enforced: $NE_N rows, $NE_P pass, $NE_F FINDING, $NE_K NOTE, $NE_X FAIL"
+    gate_summary
+    exit 1
 }
 
 ne_cleanup() {
+    [ "$NE_STUCK" = 1 ] && return 0
+    if [ "$NE_ROOT_HELD" = 1 ]; then
+        ne_tool_unlink >"$NE_D/policy-unlink-cleanup.out" 2>&1
+        ne_admin_back && TOKEN="$(gate_login)"
+        NE_ROOT_HELD=0
+    fi
     if [ -n "${NE_ROOT_BEFORE:-}" ]; then
         ne_gql 'mutation($p: Int!) { setOuPolicy(ou: "", policyId: $p) { ok } }' '{"p": '"$NE_ROOT_BEFORE"'}' >/dev/null
     else
@@ -275,6 +449,7 @@ ne_cleanup() {
     fi
     ne_gql 'mutation($o: String!) { clearOuPolicy(ou: $o) { ok } }' '{"o": "'"$NE_OU"'"}' >/dev/null
     [ -n "$NE_POLICY" ] && ne_gql 'mutation($p: Int!) { deletePolicy(policyId: $p) { ok } }' '{"p": '"$NE_POLICY"'}' >/dev/null
+    [ -n "$NE_ROOT_POLICY" ] && ne_gql 'mutation($p: Int!) { deletePolicy(policyId: $p) { ok } }' '{"p": '"$NE_ROOT_POLICY"'}' >/dev/null
     ne_gql 'mutation($u: String!) { deleteUser(userId: $u) { ok } }' '{"u": "'"$NE_USER"'"}' >/dev/null
     ne_gql 'mutation($n: String!) { deleteOu(name: $n) { ok } }' '{"n": "'"$NE_OU"'"}' >/dev/null
     local left
@@ -302,4 +477,6 @@ ne_cleanup
 if [ -n "$NE_TRAP" ]; then eval "$NE_TRAP"; else trap - EXIT; fi
 note "--- policy-not-enforced FINDING rows ---"
 for f in "${NE_FIND[@]}"; do note "[FINDING] ${PHASE}: $f"; done
-note "policy-not-enforced: $NE_N rows, $NE_P pass, $NE_F FINDING, $NE_K NOTE"
+note "policy-not-enforced: $NE_N rows, $NE_P pass, $NE_F FINDING, $NE_K NOTE, $NE_X FAIL"
+note "policy-not-enforced: a correct product gives 26 rows, 26 pass, 0 FINDING, 0 NOTE, 0 FAIL"
+if [ "$NE_XT" = 1 ]; then set -x; fi

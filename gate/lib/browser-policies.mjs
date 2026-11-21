@@ -11,7 +11,12 @@ const plainUser = process.env.BROWSER_PLAIN_USER || "";
 const plainPass = process.env.BROWSER_PLAIN_PASS || "";
 const roUser = process.env.BROWSER_RO_USER || "";
 const roPass = process.env.BROWSER_RO_PASS || "";
-const secrets = [adminPass, plainPass, roPass].filter((s) => s.length > 0);
+const warnUser = process.env.BROWSER_WARN_USER || "";
+const warnPass = process.env.BROWSER_WARN_PASS || "";
+const warnOu = process.env.BROWSER_WARN_OU || "";
+const warnPolicy = process.env.BROWSER_WARN_POLICY || "";
+const zone = process.env.BROWSER_ZONE || "";
+const secrets = [adminPass, plainPass, roPass, warnPass].filter((s) => s.length > 0);
 const WAIT_MS = 30000;
 const primary = process.env.BROWSER_PRIMARY || "";
 const CHILD = process.env.BROWSER_CHILD || "";
@@ -32,7 +37,7 @@ const ITEMS = [
   ["lockout-duration-seconds", "Lockout duration (seconds)", "120", "120 s", "number"],
   ["login-hours", "Login hours", "Mon-Fri 09:00-17:00", "Mon-Fri 09:00-17:00", "text"],
   ["allowed-networks", "Allowed networks", "10.0.0.0/8", "10.0.0.0/8", "text"],
-  ["inactivity-days", "Disable after inactivity (days)", "30", "30 days", "number"],
+  ["inactivity-days", "Inactivity limit (days)", "30", "30 days", "number"],
 ];
 
 const consoleLines = [];
@@ -372,7 +377,11 @@ async function createChild() {
 }
 
 async function openEditorAttached() {
-  await selectOu(CHILD);
+  await openEditorOn(CHILD);
+}
+
+async function openEditorOn(ou) {
+  await selectOu(ou);
   await clickButton("Attach a policy");
   await waitFor(
     `[...document.querySelectorAll("[role=button]")].some((el) => el.textContent.includes("Make a new policy and attach it here"))`,
@@ -454,7 +463,105 @@ async function openPolicies() {
 async function saveControls() {
   await openEditorAttached();
   await saveNamed(frontName, "desk hours");
+  await checkNoWarning("save-controls");
   row("save-controls", "PASS", ITEMS.map((item) => `${item[0]}=${item[2]}`).join(" "));
+}
+
+// The address the server judges for this page's own session, as the page asks it.
+async function clientAddress() {
+  return evalValue(`fetch("/api/graphql", {
+    method: "POST",
+    credentials: "same-origin",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query: "{ clientAddress }" }),
+  }).then((r) => r.json()).then((b) => (b.data ? b.data.clientAddress : "<error>"))`);
+}
+
+async function noteText(selector) {
+  await waitFor(`!!document.querySelector(${JSON.stringify(selector)})`, selector);
+  return evalValue(`document.querySelector(${JSON.stringify(selector)}).textContent.trim()`);
+}
+
+async function zoneNote() {
+  await openEditorAttached();
+  const want = `judged in ${zone}`;
+  const text = await noteText("#wb-note-login-hours");
+  row("zone-note", text === want ? "PASS" : "FAIL", text === want ? text : `${text} (want ${want})`);
+}
+
+async function addressNote() {
+  try {
+    const text = await noteText("#wb-note-allowed-networks");
+    const seen = await clientAddress();
+    const want = `The server sees you as ${seen ?? "unknown"}`;
+    row("address-note", text === want ? "PASS" : "FAIL", text === want ? text : `${text} (want ${want})`);
+  } finally {
+    await clickButton("Cancel");
+  }
+}
+
+// An ordinary save shows its success line and no save warning: the policy reaches no admin.
+const checkedSaves = [];
+const warnedSaves = [];
+const unseenSaves = [];
+async function checkNoWarning(step) {
+  try {
+    await waitFor(`!!document.querySelector(".alert-success.mt-3")`, `${step} success line`);
+  } catch {
+    unseenSaves.push(step);
+    return;
+  }
+  if (await evalValue(`!!document.querySelector(".wb-save-warning")`)) warnedSaves.push(step);
+  checkedSaves.push(step);
+}
+
+async function noSaveWarning() {
+  const want = "save-controls,edit-policy,swap,block-inheritance,remove,delete-policy";
+  if (checkedSaves.join(",") === want && warnedSaves.length === 0) {
+    row("no-save-warning", "PASS", `no .wb-save-warning after ${checkedSaves.join(", ")}`);
+  } else {
+    row("no-save-warning", "FAIL", `checked ${checkedSaves.join(",") || "none"}; warned after ${warnedSaves.join(",") || "none"}; no success line after ${unseenSaves.join(",") || "none"}`);
+  }
+}
+
+// A phase admin in its own OU links a list that refuses itself: the save stands, with its warning.
+async function saveWarning() {
+  if (!warnUser || !warnPass || !warnOu || !warnPolicy) throw fail("BROWSER_WARN_USER", "unset");
+  await logout();
+  await login(warnUser, warnPass);
+  await goto("/policies");
+  await openEditorOn(warnOu);
+  const seen = await clientAddress();
+  await fill('input[placeholder="e.g. Front Desk"]', warnPolicy);
+  await setRule("allowed-networks", "text", "192.0.2.0/24");
+  await clickButton("Save");
+  const saved = `Policy ${warnPolicy} set on ${warnOu}`;
+  const warned = "allowed-networks: the list that now applies to you does not contain the address " +
+    `the server sees you as (${seen ?? "unknown"}). The way back, on the host: lldap policy-unlink ` +
+    `--config-file <config> '${warnOu}'`;
+  const refused = "The server refused the next request: this session is outside the list now. " +
+    "The way back is on the host: lldap policy-unlink, as the warning above names it.";
+  const lines = `(() => [...document.querySelectorAll(".alert-success.mt-3, .wb-save-warning")]
+    .map((n) => n.textContent.replace(/\\s+/g, " ").trim()))()`;
+  const said = `(() => [...document.querySelectorAll("div.alert.alert-warning.mt-3.wb-save-refused")]
+    .map((n) => n.textContent.replace(/\\s+/g, " ").trim()))()`;
+  try {
+    await waitFor(`(${lines}).includes(${JSON.stringify(warned)})`, ".wb-save-warning");
+    // The refetch after the save is this session's next request: refused, then said in words.
+    await waitFor(`(${said}).length > 0`, ".wb-save-refused");
+  } catch {
+    // The row below names what was shown.
+  }
+  const shown = await evalValue(lines);
+  const after = await evalValue(said);
+  const red = await evalValue(`[...document.querySelectorAll(".alert-danger")].map((n) => n.textContent.trim()).join(" | ")`);
+  if (shown.length === 2 && shown[0] === saved && shown[1] === warned &&
+    after.length === 1 && after[0] === refused && !red) {
+    row("save-warning", "PASS", `${saved} | ${warned} | ${refused}`);
+  } else {
+    row("save-warning", "FAIL", `${shown.join(" | ") || "nothing"}; refused line: ${after.join(" | ") || "none"}; ` +
+      `red: ${red || "none"} (want ${saved} | ${warned}; ${refused}; no red alert)`);
+  }
 }
 
 async function reloadPage() {
@@ -497,6 +604,7 @@ async function editPolicy() {
     })()`,
     editedName,
   );
+  await checkNoWarning("edit-policy");
   row("edit-policy", "PASS", editedName);
 }
 
@@ -519,6 +627,7 @@ async function swapPolicy() {
     })()`,
     otherName,
   );
+  await checkNoWarning("swap");
   row("swap", "PASS", otherName);
 }
 
@@ -527,6 +636,7 @@ async function blockInheritance() {
   const checked = await evalValue(`document.querySelector("#wb-block-switch").checked`);
   if (!checked) await evalValue(`document.querySelector("#wb-block-switch").click()`);
   await waitFor(`document.querySelector("#wb-block-switch").checked`, "#wb-block-switch");
+  await checkNoWarning("block-inheritance");
   row("block-inheritance", "PASS");
 }
 
@@ -536,6 +646,7 @@ async function removePolicy() {
     `[...document.querySelectorAll("button")].some((b) => b.textContent.includes("Attach a policy") && !b.disabled)`,
     "button Attach a policy",
   );
+  await checkNoWarning("remove");
   row("remove", "PASS");
 }
 
@@ -560,7 +671,13 @@ async function deletePolicy() {
     `[...document.querySelectorAll(".pol-card")].some((card) => card.textContent.includes(${JSON.stringify(editedName)}))`,
   );
   if (still) throw fail(editedName, "still on the page");
-  row("delete-policy", "PASS");
+  const deleted = `Policy ${editedName} deleted`;
+  await waitFor(
+    `[...document.querySelectorAll(".alert-success.mt-3")].some((n) => n.textContent.trim() === ${JSON.stringify(deleted)})`,
+    deleted,
+  );
+  await checkNoWarning("delete-policy");
+  row("delete-policy", "PASS", deleted);
 }
 
 async function notice() {
@@ -786,6 +903,8 @@ const steps = [
   ["admin-login", adminLogin],
   ["create-ou", createOu],
   ["open-policies", openPolicies],
+  ["zone-note", zoneNote],
+  ["address-note", addressNote],
   ["save-controls", saveControls],
   ["reload-page", reloadPage],
   ["graphql-match", graphqlMatch],
@@ -794,6 +913,7 @@ const steps = [
   ["block-inheritance", blockInheritance],
   ["remove", removePolicy],
   ["delete-policy", deletePolicy],
+  ["no-save-warning", noSaveWarning],
   ["notice", notice],
   ["override-line", overrideLine],
   ["empty-name", emptyName],
@@ -801,6 +921,7 @@ const steps = [
   ["invalid-string", invalidString],
   ["plain-user", loginPlain],
   ["readonly", readOnly],
+  ["save-warning", saveWarning],
 ];
 
 let failed = false;

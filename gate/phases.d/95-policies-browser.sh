@@ -15,6 +15,9 @@ EDITED="p3e${TAG}"
 OTHER="p3x${TAG}"
 BADINT="p3i${TAG}"
 BADHOURS="p3h${TAG}"
+WARN_USER="p3a${TAG}"
+WARN_OU="p3v${TAG}"
+WARN_POLICY="p3n${TAG}"
 OUT="$D/policies.out"
 
 p3_pass() {
@@ -53,6 +56,19 @@ p3_judge() {
         p_bad "${name}: ${label} (${line#ROW "${name}" })"
         ;;
     esac
+}
+
+# Every catalog item is enforced, so the page shows no not-enforced notice at all.
+p3_notice() {
+    local line
+    line="$(grep "^ROW notice " "$OUT" 2>/dev/null | head -1 || true)"
+    if [ -n "$UNENFORCED" ]; then
+        p_bad "notice: the catalog still lists items that are not enforced: ${UNENFORCED}"
+    elif [ "$line" = "ROW notice PASS the catalog has no unenforced item" ]; then
+        p_ok "notice: no not-enforced notice, every catalog item is enforced"
+    else
+        p3_judge notice "no not-enforced notice"
+    fi
 }
 
 p3_match() {
@@ -149,8 +165,8 @@ p3_cleanup() {
         esac
     done < <(OUS="$D/cleanup-ous.json" POLICIES="$D/cleanup-policies.json" USERS="$D/cleanup-users.json" \
         CHILD_KEY="$CHILD_KEY" PRIMARY="$PRIMARY" \
-        POLICY_NAMES="$(printf '%s\n' "$OTHER" "$FRONT" "$EDITED" "$BADINT" "$BADHOURS")" \
-        USER_NAMES="$(printf '%s\n' "$PLAIN_USER" "$RO_USER")" \
+        POLICY_NAMES="$(printf '%s\n' "$OTHER" "$FRONT" "$EDITED" "$BADINT" "$BADHOURS" "$WARN_POLICY")" \
+        USER_NAMES="$(printf '%s\n' "$PLAIN_USER" "$RO_USER" "$WARN_USER")" WARN_OU="$WARN_OU" \
         python3 - <<'PY'
 import json, os
 def load(path):
@@ -180,8 +196,27 @@ if primary in ous:
 for user in users:
     if user.get("id") in user_names:
         print(f"user {user['id']}")
+if os.environ["WARN_OU"] in ous:
+    print(f"ou {os.environ['WARN_OU']}")
 PY
 )
+}
+
+# A phase admin alone in an OU of its own: only its own save can refuse it.
+p3_warn_admin() {
+    local gid
+    gid="$(p3_group lldap_admin)"
+    [ -n "$gid" ] &&
+        graphql "mutation(\$n: String!) { createOu(name: \$n) { ok } }" '{"n": "'"$WARN_OU"'"}' >"$D/warn-ou.json" 2>&1 &&
+        graphql "mutation(\$u: CreateUserInput!) { createUser(user: \$u) { id } }" \
+            '{"u": {"id": "'"$WARN_USER"'", "email": "'"$WARN_USER"'@gate.test"}}' >"$D/warn-user.json" 2>&1 &&
+        graphql "mutation(\$id: String!, \$pw: String!) { setUserPassword(userId: \$id, password: \$pw) { ok } }" \
+            "$(ID="$WARN_USER" PW="$WARN_PASS" python3 -c 'import json,os; print(json.dumps({"id": os.environ["ID"], "pw": os.environ["PW"]}))')" \
+            >"$D/warn-pass.json" 2>&1 &&
+        graphql "mutation(\$u: String!, \$g: Int!) { addUserToGroup(userId: \$u, groupId: \$g) { ok } }" \
+            '{"u": "'"$WARN_USER"'", "g": '"$gid"'}' >"$D/warn-group.json" 2>&1 &&
+        graphql "mutation(\$ids: [String!]!, \$ou: String!) { changeUserOu(userIds: \$ids, newOu: \$ou) { ok } }" \
+            '{"ids": ["'"$WARN_USER"'"], "ou": "'"$WARN_OU"'"}' >"$D/warn-move.json" 2>&1
 }
 
 p3_group() {
@@ -200,6 +235,7 @@ p3_run() {
         export BROWSER_PLAIN_PASS="$PLAIN_PASS"
         export BROWSER_RO_USER="$RO_USER"
         export BROWSER_RO_PASS="$RO_PASS"
+        export BROWSER_WARN_PASS="$WARN_PASS"
         timeout 300 docker run --rm --name "$BROWSER_CTN" \
             --network "$NET" \
             --init \
@@ -216,6 +252,11 @@ p3_run() {
             -e BROWSER_PLAIN_PASS \
             -e BROWSER_RO_USER \
             -e BROWSER_RO_PASS \
+            -e BROWSER_WARN_USER="$WARN_USER" \
+            -e BROWSER_WARN_PASS \
+            -e BROWSER_WARN_OU="$WARN_OU" \
+            -e BROWSER_WARN_POLICY="$WARN_POLICY" \
+            -e BROWSER_ZONE="$ZONE" \
             -e BROWSER_PRIMARY="$PRIMARY" \
             -e BROWSER_CHILD="$CHILD_OU_NAME" \
             -e BROWSER_FRONT="$FRONT" \
@@ -238,9 +279,10 @@ else
     EXTRA_CONTAINERS+=("$BROWSER_CTN")
     PLAIN_PASS="$(p3_pass)"
     RO_PASS="$(p3_pass)"
+    WARN_PASS="$(p3_pass)"
     if [ -z "$TAG" ]; then
         p_bad "run id is empty"
-    elif [ -z "$PLAIN_PASS" ] || [ -z "$RO_PASS" ]; then
+    elif [ -z "$PLAIN_PASS" ] || [ -z "$RO_PASS" ] || [ -z "$WARN_PASS" ]; then
         p_bad "generated password is empty"
     else
         graphql "mutation(\$u: CreateUserInput!) { createUser(user: \$u) { id } }" \
@@ -263,6 +305,9 @@ else
         else
             p_bad "lldap_strict_readonly group not found"
         fi
+        p3_warn_admin || p_bad "the phase admin $WARN_USER in $WARN_OU could not be made"
+        # The main server sets no login_hours_timezone: its default is UTC.
+        ZONE=UTC
         graphql '{ policyItemCatalog { key enforced } }' '{}' \
             >"$D/catalog.json" 2>"$D/catalog.err" || p_bad "policyItemCatalog failed"
         UNENFORCED="$(CATALOG="$D/catalog.json" python3 - <<'PY'
@@ -299,6 +344,8 @@ PY
         p3_judge admin-login "admin logs in"
         p3_judge create-ou "creates a primary OU and a child"
         p3_judge open-policies "opens the policies page on the child"
+        p3_judge zone-note "the login-hours field says 'judged in UTC'"
+        p3_judge address-note "the allowed-networks field says the address the server sees for this session"
         p3_judge save-controls "saves every rule"
         p3_judge reload-page "shows the six values after reload"
         p3_match
@@ -306,14 +353,16 @@ PY
         p3_judge swap "swaps the attached policy"
         p3_judge block-inheritance "blocks inheritance on the child"
         p3_judge remove "removes the policy from the child"
-        p3_judge delete-policy "deletes the policy"
-        p3_judge notice "the not-enforced notice"
+        p3_judge delete-policy "deletes the policy: 'Policy <name> deleted'"
+        p3_judge no-save-warning "no save warning after the five saves and the delete on the child, which holds no admin"
+        p3_notice
         p3_judge override-line "the main server's explicit enable_mfa is said to override the OUs' enable-mfa"
         p3_judge empty-name "refuses an empty name"
         p3_judge invalid-int "refuses a lockout threshold of 101"
         p3_judge invalid-string "refuses a bad login-hours and a bad CIDR"
         p3_judge plain-user "a plain user is refused the page"
         p3_judge readonly "what a read-only admin is shown"
+        p3_judge save-warning "a phase admin's own list that refuses it: the save stands with its warning and the way back, then the refused refetch is said in words, with no red alert"
         p3_cleanup
     fi
     p3_summary

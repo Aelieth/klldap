@@ -181,7 +181,7 @@ print(next((str(x["policyId"] or "") for x in json.load(sys.stdin) if x["ou"] ==
 
 pm_catalog() {
     local a want got
-    a="$(pm_q "$TOKEN" '{ policyItemCatalog { key enforced defaultValue } }')"
+    a="$(pm_q "$TOKEN" '{ policyItemCatalog { key enforced defaultValue description } }')"
     printf '%s\n' "$a" >"$PM_D/catalog.json"
     pm_ok "$a" || {
         pm_finding "the catalog could not be read ($(pm_err "$a"))"
@@ -190,9 +190,16 @@ pm_catalog() {
     got="$(PMA="$a" python3 -c '
 import json, os
 c = json.loads(os.environ["PMA"])["data"]["policyItemCatalog"]
-print(len(c), ",".join(sorted(i["key"] for i in c if i["enforced"] is True)), all(isinstance(i["enforced"], bool) for i in c))')"
-    pm_row "$([ "$got" = "7 enable-mfa,lockout-duration-seconds,lockout-threshold,password-min-length True" ] && echo 0 || echo 1)" \
-        "catalog lists seven items, exactly enable-mfa, lockout-threshold, lockout-duration-seconds and password-min-length enforced" "got $got"
+print(len(c), ",".join(sorted(i["key"] for i in c if i["enforced"] is True)), all(isinstance(i["enforced"], bool) for i in c),
+      not any("Not yet enforced" in i["description"] for i in c))')"
+    pm_row "$([ "$got" = "7 allowed-networks,enable-mfa,inactivity-days,lockout-duration-seconds,lockout-threshold,login-hours,password-min-length True True" ] && echo 0 || echo 1)" \
+        "catalog lists seven items, all seven enforced, and no description says 'Not yet enforced'" "got $got"
+    want="Refuses sign-in to a user with no successful sign-in for this many days; 0 turns it off. An admin re-enables the user."
+    got="$(PMA="$a" python3 -c '
+import json, os
+c = {i["key"]: i["description"] for i in json.loads(os.environ["PMA"])["data"]["policyItemCatalog"]}
+print(c.get("inactivity-days", "<missing>"))')"
+    pm_row "$([ "$got" = "$want" ] && echo 0 || echo 1)" "catalog description of inactivity-days is '$want'" "got '$got'"
     for want in "enable-mfa=off" "lockout-threshold=0" "lockout-duration-seconds=900" "login-hours=" "allowed-networks=" "inactivity-days=0" "password-min-length=8"; do
         got="$(PMA="$a" PMK="${want%%=*}" python3 -c '
 import json, os

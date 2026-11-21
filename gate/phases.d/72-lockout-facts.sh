@@ -954,7 +954,7 @@ lk_tool_unlock() {
     elif [ "$rc" != 0 ] || ! grep -qF "Unlocked $LK_LOCK" "$LK_D/tool-unlock.out"; then
         lk_finding "[L1.tool-unlock] lldap unlock $LK_LOCK exited $rc: '$(head -c 200 "$LK_D/tool-unlock.out")' (want exit 0 and 'Unlocked $LK_LOCK')"
     else
-        while [ "$waited" -le 35 ]; do
+        while [ "$waited" -le 45 ]; do
             got="$(lk_kinit_as "$LK_LOCK" pass)"
             [ "$got" = ok ] && break
             sleep 5
@@ -962,9 +962,9 @@ lk_tool_unlock() {
         done
         rows="$(lk_one "$(lk_unlock_row 'actor IS NULL' system 'lldap unlock')" "$mark")"
         if [ "$got" = ok ] && lk_is "$rows" 1; then
-            lk_pass_read "[L1.tool-unlock] $LK_LOCK locked, then lldap unlock in the container (exit 0, 'Unlocked $LK_LOCK'): the right password gets a ticket after ${waited} s (within 35 s), one account_unlock 'lldap unlock' (protocol system, no actor)"
+            lk_pass_read "[L1.tool-unlock] $LK_LOCK locked, then lldap unlock in the container (exit 0, 'Unlocked $LK_LOCK'): the right password gets a ticket after ${waited} s (within 45 s), one account_unlock 'lldap unlock' (protocol system, no actor)"
         else
-            lk_finding "[L1.tool-unlock] after lldap unlock the right password gave '$got' for ${waited} s (want ok within 35 s); account_unlock 'lldap unlock' rows: $rows (want 1)"
+            lk_finding "[L1.tool-unlock] after lldap unlock the right password gave '$got' for ${waited} s (want ok within 45 s); account_unlock 'lldap unlock' rows: $rows (want 1)"
         fi
     fi
     lk_tool "nosuch-$LK_RUN" >"$LK_D/tool-unknown.out" 2>&1

@@ -59,7 +59,7 @@ sqlite | postgres | mysql | mariadb) ;;
 esac
 case "$ROW:$DB" in
 acc8:mysql | acc8:mariadb)
-    echo "gate/dur.sh: acc8 does not take --db $DB: 0.8.0 has no power leg for an external MySQL or" \
+    echo "gate/dur.sh: acc8 does not take --db $DB: this release has no power leg for an external MySQL or" \
         "MariaDB server (acc3 and acc4 cover them)" >&2
     exit 2
     ;;

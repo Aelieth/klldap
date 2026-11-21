@@ -3,6 +3,11 @@
 # synced user; that user's finish carries the password sealed for that user (OAEP label
 # klldap-kerberos-envelope-v1:<user>), and the server commits it to both stores in one transaction.
 
+# Passwords and tokens travel in this phase's variables and helpers: nothing of it is traced. The
+# tracing state is put back at the end.
+PP_XT=0
+case $- in *x*) PP_XT=1 ;; esac
+{ set +x; } 2>/dev/null
 PP_D="$(phase_dir)"
 PP_RUN="pp$(date +%H%M%S)"
 PP_PM="${PP_RUN}m" PP_SYNC="${PP_RUN}s" PP_PLAIN="${PP_RUN}p" PP_BIG="${PP_RUN}b" PP_NEW="${PP_RUN}n"
@@ -618,6 +623,235 @@ print(next(g["id"] for g in json.load(sys.stdin)["groups"] if g["displayName"] =
     docker logs "$PP_OFF_CTN" >"$PP_D/krb-off-docker.log" 2>&1
 }
 
+# The user page's sign-in state (E7, E7-b), on a phase OU with lockout-threshold 3 for ever and
+# inactivity-days 1: a locked user, an inactive one (its times set back with the gate's server
+# stopped, as phase 38 does, so this runs last), and a fresh one. Each button shows only with its state.
+PP_ACT_OU="${PP_RUN}a" PP_LOCK="${PP_RUN}l" PP_IDLE="${PP_RUN}i" PP_FRESH="${PP_RUN}f"
+PP_ACT_POLICY="" PP_ACT_PASS="" PP_ACT_SINCE="" PP_ACT_AGED=0
+PP_ACT_CTN="klldap-pp-act-${RUNID}"
+EXTRA_CONTAINERS+=("$PP_ACT_CTN")
+
+# pp_act_page <mode> <tag> [user]: the page driver; its ROW lines in actions-<tag>.out.
+pp_act_page() {
+    docker rm -f "$PP_ACT_CTN" >/dev/null 2>&1 || true
+    (
+        BROWSER_ADMIN_PASS="$ADMIN_PASS" BROWSER_PASS="$PP_ACT_PASS" \
+            timeout 240 docker run --rm --name "$PP_ACT_CTN" --network "$NET" --init --shm-size=1g \
+            --user "$(id -u):$(id -g)" --entrypoint node \
+            -v "$GATE_ROOT/lib/sign-in-actions.mjs:/work/sign-in-actions.mjs:ro" -v "$PP_D:/out" \
+            -e HOME=/tmp/home -e BROWSER_OUT=/out -e BROWSER_URL="http://${CONTAINER}:17170" \
+            -e BROWSER_MODE="$1" -e BROWSER_USER="${3:-}" -e BROWSER_LOCKED="$PP_LOCK" -e BROWSER_FRESH="$PP_FRESH" \
+            -e BROWSER_IDLE="$([ "$PP_ACT_AGED" = 1 ] && echo "$PP_IDLE")" -e BROWSER_INACTIVE="$PP_ACT_SINCE" \
+            -e BROWSER_ADMIN_PASS -e BROWSER_PASS \
+            "$PP_BROWSER_IMAGE" /work/sign-in-actions.mjs >"$PP_D/actions-$2.out" 2>"$PP_D/actions-$2.err"
+    )
+    docker rm -f "$PP_ACT_CTN" >/dev/null 2>&1 || true
+}
+pp_act_row() { grep -m1 "^ROW $2 " "$PP_D/actions-$1.out" 2>/dev/null || echo "ROW $2 none (see actions-$1.err)"; }
+# A user in an OU has its DN from the directory, as 37 and 72 read it.
+pp_act_dn() { lsearch -o ldif-wrap=no -b "$BASE_DN" -s sub "(uid=$1)" dn 2>/dev/null | sed -n 's/^dn: //p' | head -1; }
+pp_act_bind() { pp_bind_at "$(pp_act_dn "$1")" "$2" && echo 0 || echo refused; }
+
+# pp_act_none <kind> <user> <mark>: how many such rows after the mark, two seconds on.
+pp_act_none() {
+    sleep 2
+    graphql "query(\$id: ID!, \$t: String!) { logs(filter: {kinds: [$1], target: \$t}, afterId: \$id, limit: 20) { id } }" \
+        '{"id": "'"$3"'", "t": "'"$2"'"}' 2>/dev/null | python3 -c 'import json,sys; print(len(json.load(sys.stdin)["logs"]))' 2>/dev/null
+}
+
+pp_act_setup() {
+    PP_ACT_PASS="$(pp_gen)"
+    graphql 'mutation($n: String!) { createOu(name: $n) { ok } }' '{"n": "'"$PP_ACT_OU"'"}' >/dev/null 2>&1 &&
+        PP_ACT_POLICY="$(graphql 'mutation($n: String!, $i: [PolicyItemInput!]) { createPolicy(name: $n, items: $i) { id } }' \
+            '{"n": "'"$PP_RUN"' actions", "i": [{"key": "lockout-threshold", "value": "3"}, {"key": "lockout-duration-seconds", "value": "0"}, {"key": "inactivity-days", "value": "1"}]}' \
+            2>/dev/null | json_get createPolicy.id 2>/dev/null)" && [ -n "$PP_ACT_POLICY" ] &&
+        graphql 'mutation($o: String!, $p: Int!) { setOuPolicy(ou: $o, policyId: $p) { ok } }' \
+            '{"o": "'"$PP_ACT_OU"'", "p": '"$PP_ACT_POLICY"'}' >/dev/null 2>&1 || return 1
+    for u in "$PP_LOCK" "$PP_IDLE" "$PP_FRESH"; do
+        graphql 'mutation($u: CreateUserInput!) { createUser(user: $u) { id } }' \
+            '{"u": {"id": "'"$u"'", "email": "'"$u"'@gate.test"}}' >/dev/null 2>&1 &&
+            graphql "$PP_SET" "$(pp_vars "$u" "$PP_ACT_PASS")" >/dev/null 2>&1 &&
+            graphql 'mutation($ids: [String!]!, $ou: String!) { changeUserOu(userIds: $ids, newOu: $ou) { ok } }' \
+                '{"ids": ["'"$u"'"], "ou": "'"$PP_ACT_OU"'"}' >/dev/null 2>&1 || return 1
+    done
+    [ "$(pp_act_bind "$PP_IDLE" "$PP_ACT_PASS")" = 0 ]
+}
+
+# pp_act_setback: the idle user's creation, last success and re-enable, and recording_since, each
+# three days earlier, with the gate's server stopped; then it is healthy again (phase 38's way).
+# PP_ACT_SINCE is the badge the page then owes: the latest of the four, plus the one day, as a UTC date.
+pp_act_setback() {
+    local copy="$PP_D/setback.db" said="" rc=0 since side
+    t docker stop "$CONTAINER" >/dev/null 2>&1 || return 1
+    case "$GATE_DB" in
+    sqlite)
+        rm -f "$copy"
+        # A journal left beside the stopped database would undo the edit at its next open.
+        for side in users.db-journal users.db-wal users.db-shm; do
+            docker cp "$CONTAINER:/data/$side" - >/dev/null 2>&1 && said="$side is beside the stopped database" && rc=1
+        done
+        [ "$rc" = 0 ] && docker cp "$CONTAINER:/data/users.db" "$copy" >/dev/null 2>&1 &&
+            said="$(PP_DB="$copy" PP_U="$PP_IDLE" python3 - 2>&1 <<'PY'
+import os, sqlite3
+con = sqlite3.connect(os.environ["PP_DB"])
+user = os.environ["PP_U"]
+back = "strftime('%Y-%m-%d %H:%M:%f', {0}, '-3 days')"
+made = con.execute("UPDATE users SET creation_date = " + back.format("creation_date") + " WHERE user_id = ?", (user,)).rowcount
+con.execute("UPDATE user_activity SET last_success = " + back.format("last_success") + ", reenabled_at = "
+            + back.format("reenabled_at") + " WHERE user_id = ?", (user,))
+since = con.execute("""UPDATE system_config SET "value" = strftime('%Y-%m-%dT%H:%M:%fZ', "value", '-3 days')
+    WHERE "key" = 'inactivity_recording_since' AND "value" <> 'off'""").rowcount
+con.commit()
+end = con.execute("""SELECT date(max(julianday(u.creation_date), coalesce(julianday(a.last_success), 0),
+    coalesce(julianday(a.reenabled_at), 0), coalesce(julianday(s."value"), 0)) + 1) FROM users u
+    LEFT JOIN user_activity a ON a.user_id = u.user_id
+    LEFT JOIN system_config s ON s."key" = 'inactivity_recording_since' WHERE u.user_id = ?""", (user,)).fetchone()[0]
+print(f"users {made}, recording_since {since}")
+print(end)
+raise SystemExit(0 if made == 1 and since == 1 and end else 1)
+PY
+)" && docker cp "$copy" "$CONTAINER:/data/users.db" >/dev/null 2>&1 || rc=1
+        rm -f "$copy"
+        ;;
+    postgres)
+        said="$(gexec_in "$PG_CONTAINER" psql -U klldap -d klldap -v ON_ERROR_STOP=1 -q -tA -c "BEGIN;
+UPDATE users SET creation_date = creation_date - interval '3 days' WHERE user_id = '$PP_IDLE';
+UPDATE user_activity SET last_success = last_success - interval '3 days',
+    reenabled_at = reenabled_at - interval '3 days' WHERE user_id = '$PP_IDLE';
+UPDATE system_config SET \"value\" = to_char((\"value\"::timestamptz - interval '3 days') AT TIME ZONE 'UTC',
+    'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') WHERE \"key\" = 'inactivity_recording_since' AND \"value\" <> 'off';
+COMMIT;
+SELECT to_char(GREATEST(u.creation_date, a.last_success, a.reenabled_at,
+    s.\"value\"::timestamptz AT TIME ZONE 'UTC') + interval '1 day', 'YYYY-MM-DD') FROM users u
+    LEFT JOIN user_activity a ON a.user_id = u.user_id
+    JOIN system_config s ON s.\"key\" = 'inactivity_recording_since' WHERE u.user_id = '$PP_IDLE'
+    AND GREATEST(u.creation_date, a.last_success, a.reenabled_at, s.\"value\"::timestamptz AT TIME ZONE 'UTC')
+        < (now() AT TIME ZONE 'UTC') - interval '2 days';" 2>&1)"
+        ;;
+    *) rc=1 ;;
+    esac
+    printf '%s\n' "$said" >>"$PP_D/setback.out"
+    since="$(tail -n 1 <<<"$said")"
+    case "$since" in [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]) PP_ACT_SINCE="Inactive since $since" ;; *) rc=1 ;; esac
+    pp_act_restart
+    return "$rc"
+}
+
+# The gate's server, healthy again before the next row; started a second time if it is not. Down
+# after both, the rows after it would fail on it, so the run stops here.
+pp_act_up() { t docker start "$CONTAINER" >/dev/null 2>&1 && wait_healthy 120 && discover_ports && TOKEN="$(gate_login)"; }
+pp_act_restart() {
+    pp_act_up && return 0
+    pp_act_up && return 0
+    p_bad "[U1.actions-server-down] the gate's server did not come back healthy after the set-back, started twice: the run stops here"
+    gate_summary
+    exit 1
+}
+
+# The three inactive rows' SKIP: what kept them from running.
+pp_act_unaged() {
+    case "$GATE_DB" in
+    sqlite | postgres) printf '%s\n' "not run: the set-back failed (see [U1.actions-setback] and setback.out)" ;;
+    *) printf '%s\n' "the gate sets times back only on sqlite and postgres; on $GATE_DB not run" ;;
+    esac
+}
+
+# pp_act_said <tag> <row> <label> <what the page must show> <case>: the row, judged here.
+pp_act_said() {
+    local got
+    got="$(pp_act_row "$1" "$2")"
+    if [ "$got" = "ROW $2 SEEN $4" ]; then
+        p_ok "[$3] $5: $4"
+    else
+        p_bad "[$3] $5: ${got#ROW "$2" } (want $4)"
+    fi
+}
+
+pp_actions() {
+    local row mark i got before after idle_before
+    if ! pp_act_setup; then
+        p_bad "[U1.actions-setup] $PP_ACT_OU, its policy (lockout-threshold 3, duration 0, inactivity-days 1) or its users could not be made"
+        return
+    fi
+    for i in 1 2 3; do pp_act_bind "$PP_LOCK" "wrong-$i-$PP_RUN" >/dev/null; done
+    before="$(pp_act_bind "$PP_LOCK" "$PP_ACT_PASS")"
+    case "$GATE_DB" in
+    sqlite | postgres)
+        if pp_act_setback; then
+            PP_ACT_AGED=1
+        else
+            p_bad "[U1.actions-setback] $PP_IDLE's times could not be set back, or were not read back three days old (see setback.out)"
+        fi
+        ;;
+    esac
+    idle_before="$(pp_act_bind "$PP_IDLE" "$PP_ACT_PASS")"
+    mark="$(log_mark)"
+    pp_act_page admin admin
+    pp_act_said admin state-locked U1.actions-state-locked \
+        "locked='Locked until an admin unlocks' inactive=none unlock='Unlock' reenable=none" \
+        "an admin on $PP_LOCK's page, locked until an admin unlocks (duration 0)"
+    pp_act_said admin state-fresh U1.actions-state-fresh "locked=none inactive=none unlock=none reenable=none" \
+        "an admin on $PP_FRESH's page, neither locked nor inactive, once its state has answered"
+    if [ "$PP_ACT_AGED" = 1 ]; then
+        pp_act_said admin state-inactive U1.actions-state-inactive \
+            "locked=none inactive='$PP_ACT_SINCE' unlock=none reenable='Re-enable after inactivity'" \
+            "an admin on $PP_IDLE's page, idle past inactivity-days 1 (the latest start plus one day)"
+    else
+        p_skip "[U1.actions-state-inactive] $(pp_act_unaged)"
+    fi
+    row="U1.actions-unlock" FAIL_WHY=""
+    got="$(pp_act_row admin unlock-page)"
+    after="$(pp_act_bind "$PP_LOCK" "$PP_ACT_PASS")"
+    if [ "$before" = refused ] && [ "$got" = "ROW unlock-page SEEN Unlocked $PP_LOCK | the badge and the button are gone" ] &&
+        [ "$after" = 0 ] && log_once true ACCOUNT_UNLOCK "$PP_LOCK" unlockUser "$mark" GRAPHQL; then
+        p_ok "[$row] $PP_LOCK locked (3 wrong, the right password refused); Unlock on its page: 'Unlocked $PP_LOCK', the badge and the button go, one ACCOUNT_UNLOCK row 'unlockUser' (protocol GRAPHQL), the right password binds"
+    else
+        p_bad "[$row] before: $before (want refused); page: $got; after: $after (want 0); ${FAIL_WHY:-want one ACCOUNT_UNLOCK row}"
+    fi
+    if [ "$PP_ACT_AGED" = 1 ]; then
+        row="U1.actions-reenable-cancel"
+        got="$(pp_act_row admin reenable-modal)"
+        i="$(pp_act_none ACCOUNT_REENABLE "$PP_IDLE" "$mark")"
+        if [ "$got" = "ROW reenable-modal SEEN Re-enable $PP_IDLE? | Re-enable sign-in for this user (resets the inactivity count) | Cancel | no result line" ] &&
+            [ "$i" = 0 ]; then
+            p_ok "[$row] Re-enable on $PP_IDLE's page opens 'Re-enable $PP_IDLE?' with 'Re-enable sign-in for this user (resets the inactivity count)'; Cancel leaves no result line and writes no ACCOUNT_REENABLE row"
+        else
+            p_bad "[$row] $got; ACCOUNT_REENABLE rows after Cancel: ${i:-unread} (want 0)"
+        fi
+    else
+        p_skip "[U1.actions-reenable-cancel] $(pp_act_unaged)"
+    fi
+    pp_act_page own own "$PP_FRESH"
+    pp_act_said own buttons-own U1.actions-own-page "locked=none inactive=none unlock=none reenable=none" \
+        "$PP_FRESH on its own page"
+    row="U1.actions-reenable" FAIL_WHY=""
+    if [ "$PP_ACT_AGED" != 1 ]; then
+        p_skip "[$row] $(pp_act_unaged)"
+        return
+    fi
+    mark="$(log_mark)"
+    pp_act_page reenable reenable
+    got="$(pp_act_row reenable reenable-page)"
+    after="$(pp_act_bind "$PP_IDLE" "$PP_ACT_PASS")"
+    if [ "$idle_before" = refused ] && [ "$got" = "ROW reenable-page SEEN Re-enabled $PP_IDLE | the badge and the button are gone" ] &&
+        [ "$after" = 0 ] && log_once true ACCOUNT_REENABLE "$PP_IDLE" reenableUser "$mark" GRAPHQL; then
+        p_ok "[$row] $PP_IDLE idle past inactivity-days 1 (refused); Yes, re-enable on its page: 'Re-enabled $PP_IDLE', the badge and the button go, one ACCOUNT_REENABLE row 'reenableUser' (protocol GRAPHQL), the right password binds"
+    else
+        p_bad "[$row] before: $idle_before (want refused); page: $got; after: $after (want 0); ${FAIL_WHY:-want one ACCOUNT_REENABLE row}"
+    fi
+}
+
+pp_act_cleanup() {
+    local u
+    docker rm -f "$PP_ACT_CTN" >/dev/null 2>&1 || true
+    for u in "$PP_LOCK" "$PP_IDLE" "$PP_FRESH"; do
+        graphql 'mutation($u: String!) { deleteUser(userId: $u) { ok } }' '{"u": "'"$u"'"}' >/dev/null 2>&1
+    done
+    graphql 'mutation($o: String!) { clearOuPolicy(ou: $o) { ok } }' '{"o": "'"$PP_ACT_OU"'"}' >/dev/null 2>&1
+    [ -n "$PP_ACT_POLICY" ] && graphql 'mutation($p: Int!) { deletePolicy(policyId: $p) { ok } }' '{"p": '"$PP_ACT_POLICY"'}' >/dev/null 2>&1
+    graphql 'mutation($n: String!) { deleteOu(name: $n) { ok } }' '{"n": "'"$PP_ACT_OU"'"}' >/dev/null 2>&1
+}
+
 if pp_setup; then
     pp_gone
     pp_floor
@@ -634,11 +868,16 @@ if pp_setup; then
         p_skip "[U1.pages-browser] browser image absent: ${PP_BROWSER_IMAGE}; the page rows did not run"
     fi
     pp_no_progress
+    if docker image inspect "$PP_BROWSER_IMAGE" >/dev/null 2>&1; then
+        pp_actions
+    fi
 fi
 docker rm -f "$PP_BROWSER_CTN" >/dev/null 2>&1 || true
 for u in "$PP_PM" "$PP_SYNC" "$PP_PLAIN" "$PP_BIG" "$PP_NEW"; do
     graphql 'mutation($u: String!) { deleteUser(userId: $u) { ok } }' '{"u": "'"$u"'"}' >/dev/null 2>&1
 done
+pp_act_cleanup
 pp_krb_off
 docker rm -fv "$PP_OFF_CTN" >/dev/null 2>&1
 docker volume rm "$PP_OFF_DATA" "$PP_OFF_KDC" >/dev/null 2>&1
+if [ "$PP_XT" = 1 ]; then set -x; fi

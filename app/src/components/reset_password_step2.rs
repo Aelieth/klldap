@@ -1,4 +1,4 @@
-use crate::infra::opaque::{begin_registration, finish_registration};
+use crate::infra::opaque::{begin_registration, finish_registration, registration_started};
 use crate::{
     components::{
         form::{field::Field, submit::Submit},
@@ -53,7 +53,6 @@ impl CommonComponent<ResetPasswordStep2Form> for ResetPasswordStep2Form {
         ctx: &Context<Self>,
         msg: <Self as Component>::Message,
     ) -> Result<bool> {
-        use anyhow::Context;
         match msg {
             Msg::ValidateTokenResponse(response) => {
                 self.username = Some(response?.user_id);
@@ -78,7 +77,7 @@ impl CommonComponent<ResetPasswordStep2Form> for ResetPasswordStep2Form {
                 Ok(false)
             }
             Msg::RegistrationStartResponse(res) => {
-                let res = res.context("Could not initiate registration")?;
+                let res = registration_started(res)?;
                 let registration = match self.opaque_data.take() {
                     Some(r) => r,
                     None => bail!("Invalid state"),

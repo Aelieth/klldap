@@ -90,7 +90,7 @@ fn test_policy_lifecycle_over_graphql() {
     let items = catalog["data"]["policyItemCatalog"]
         .as_array()
         .expect("catalog");
-    assert_eq!(items.len(), 6, "{catalog}");
+    assert_eq!(items.len(), 7, "{catalog}");
     let enforced: Vec<&str> = items
         .iter()
         .filter(|i| i["enforced"] == true)
@@ -101,10 +101,24 @@ fn test_policy_lifecycle_over_graphql() {
         [
             "enable-mfa",
             "lockout-threshold",
-            "lockout-duration-seconds"
+            "lockout-duration-seconds",
+            "password-min-length"
         ],
         "{catalog}"
     );
+    for value in ["7", "129"] {
+        let refused = gql(
+            &client,
+            &url,
+            &admin,
+            CREATE,
+            json!({"n": "Short", "i": [{"key": "password-min-length", "value": value}]}),
+        );
+        assert!(
+            has_error(&refused, "password-min-length: must be between 8 and 128"),
+            "{refused}"
+        );
+    }
 
     let bad = gql(
         &client,

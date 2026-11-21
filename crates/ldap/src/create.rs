@@ -21,8 +21,8 @@ use lldap_domain::{
 use lldap_domain_handlers::kerberos::{KerberosState, settled_state};
 use lldap_domain_handlers::logging::LogKind;
 use lldap_domain_handlers::password::{
-    PasswordSync, change_password_everywhere, create_synced_user, password_rules, realm_not_ready,
-    record_failed,
+    PASSWORD_MIN_LENGTH, PasswordSync, change_password_everywhere, create_synced_user,
+    min_length_in_ou, password_rules, realm_not_ready, record_failed,
 };
 use lldap_schema::{AttributeList, KERBEROS_SYNC, PublicSchema};
 use std::collections::HashMap;
@@ -194,7 +194,7 @@ async fn create_user(
     attributes
         .entry(KERBEROS_SYNC.to_string())
         .or_insert_with(|| b"0".to_vec());
-    attributes.insert("ou".to_string(), internal_ou.into_bytes());
+    attributes.insert("ou".to_string(), internal_ou.as_bytes().to_vec());
     let text = |name: &str| {
         attributes
             .get(name)
@@ -270,6 +270,12 @@ async fn create_user(
         display_name: text("cn")?,
         attributes: new_user_attributes,
     };
+    let min = match plain_password {
+        Some(_) => min_length_in_ou(backend_handler, &internal_ou, &user_id, LogKind::UserCreate)
+            .await
+            .map_err(password_change_error)?,
+        None => PASSWORD_MIN_LENGTH,
+    };
     if let Some(plain) = plain_password
         && kerberossync_enabled
     {
@@ -279,7 +285,7 @@ async fn create_user(
                 message: format!("Could not create user: {user_id} already exists"),
             });
         }
-        create_synced_user(backend_handler, request, plain)
+        create_synced_user(backend_handler, request, plain, min)
             .await
             .map_err(|e| {
                 warn!("LDAP Add of {user_id} failed: {e}");
@@ -297,7 +303,7 @@ async fn create_user(
         record_failed(LogKind::UserCreate, &user_id, &refused);
         return Err(password_change_error(refused));
     }
-    if let Some(Err(e)) = plain_password.map(password_rules) {
+    if let Some(Err(e)) = plain_password.map(|plain| password_rules(plain, min)) {
         record_failed(LogKind::UserCreate, &user_id, &e);
         return Err(password_change_error(e));
     }
@@ -310,7 +316,7 @@ async fn create_user(
         })?;
 
     if let Some(plain) = plain_password {
-        change_password_everywhere(backend_handler, &user_id, plain, PasswordSync::Off)
+        change_password_everywhere(backend_handler, &user_id, plain, PasswordSync::Off, min)
             .await
             .map_err(|e| LdapError {
                 code: LdapResultCode::Other,
@@ -952,6 +958,9 @@ mod tests {
         for (label, synced, with_password) in cases {
             let one_transaction = synced && with_password;
             let mut mock = MockTestBackendHandler::new();
+            mock.expect_get_policy_levels()
+                .times(usize::from(with_password))
+                .returning(|_| Ok(vec![]));
             mock.expect_get_user_details()
                 .returning(|u| Err(DomainError::EntityNotFound(u.to_string())));
             mock.expect_create_user()
@@ -1007,6 +1016,7 @@ mod tests {
         for (kdc, code, message) in kdc_rows() {
             let (guard, _offline, reached) = install(kdc.clone());
             let mut mock = MockTestBackendHandler::new();
+            mock.expect_get_policy_levels().returning(|_| Ok(vec![]));
             mock.expect_get_user_details()
                 .returning(|u| Err(DomainError::EntityNotFound(u.to_string())));
             mock.expect_create_user().times(0);
@@ -1048,9 +1058,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_an_add_with_a_short_password_makes_nothing() {
-        use lldap_domain_handlers::password::{PASSWORD_HAS_NUL, PASSWORD_TOO_SHORT};
+        use lldap_domain_handlers::password::PASSWORD_HAS_NUL;
         let refusals = [
-            ("pässwör", PASSWORD_TOO_SHORT),
+            ("pässwör", "the password must be at least 8 characters"),
             ("a\0aaaaaaa", PASSWORD_HAS_NUL),
         ];
         for (synced, (password, refusal)) in [false, true]
@@ -1059,6 +1069,7 @@ mod tests {
         {
             let guard = RecordingGuard::install();
             let mut mock = MockTestBackendHandler::new();
+            mock.expect_get_policy_levels().returning(|_| Ok(vec![]));
             mock.expect_get_user_details()
                 .returning(|u| Err(DomainError::EntityNotFound(u.to_string())));
             mock.expect_create_user().times(0);
@@ -1101,6 +1112,7 @@ mod tests {
         use lldap_test_utils::recording_kerberos::{DEGRADED_CAUSE, DegradedGuard};
         use lldap_test_utils::recording_log::LogGuard;
         let mut mock = MockTestBackendHandler::new();
+        mock.expect_get_policy_levels().returning(|_| Ok(vec![]));
         mock.expect_get_user_details()
             .returning(|u| Err(DomainError::EntityNotFound(u.to_string())));
         mock.expect_create_user().times(0);
@@ -1141,6 +1153,7 @@ mod tests {
     async fn test_a_synced_add_with_kerberos_disabled_makes_nothing() {
         use lldap_domain_handlers::kerberos::CREATE_WITHOUT_SYNC;
         let mut mock = MockTestBackendHandler::new();
+        mock.expect_get_policy_levels().returning(|_| Ok(vec![]));
         mock.expect_get_user_details()
             .returning(|u| Err(DomainError::EntityNotFound(u.to_string())));
         mock.expect_create_user().times(0);
@@ -1163,6 +1176,7 @@ mod tests {
     async fn test_create_synced_user_that_exists_is_refused_as_before() {
         let guard = RecordingGuard::install();
         let mut mock = MockTestBackendHandler::new();
+        mock.expect_get_policy_levels().returning(|_| Ok(vec![]));
         mock.expect_get_user_details().returning(|u| {
             Ok(User {
                 user_id: u.clone(),
@@ -1181,5 +1195,201 @@ mod tests {
             "{got:?}"
         );
         assert_eq!(guard.recorder().take_ops(), vec![]);
+    }
+
+    fn sales_add(synced: bool, password: &str) -> LdapAddRequest {
+        let mut attributes = vec![LdapPartialAttribute {
+            atype: "userPassword".to_owned(),
+            vals: vec![password.as_bytes().to_vec()],
+        }];
+        if synced {
+            attributes.push(LdapPartialAttribute {
+                atype: "kerberossync".to_owned(),
+                vals: vec![b"1".to_vec()],
+            });
+        }
+        LdapAddRequest {
+            dn: "uid=bob,ou=Sales,ou=people,dc=example,dc=com".to_owned(),
+            attributes,
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_an_add_is_held_to_the_minimum_of_the_ou_its_dn_names() {
+        use lldap_domain_handlers::policies::{AttachedPolicy, PolicyId, PolicyLevel};
+        use lldap_test_utils::recording_log::LogGuard;
+        let (eleven, twelve) = ("Eleven-11ch", "Twelve-12chr");
+        let short = "the password must be at least 12 characters";
+        let unreadable = "the password policy could not be read; try again";
+        type Row = (bool, bool, &'static str, Option<&'static str>);
+        let rows: [Row; 6] = [
+            (false, true, eleven, Some(short)),
+            (true, true, eleven, Some(short)),
+            (false, true, twelve, None),
+            (true, true, twelve, None),
+            (false, false, twelve, Some(unreadable)),
+            (true, false, twelve, Some(unreadable)),
+        ];
+        assert_eq!((eleven.chars().count(), twelve.chars().count()), (11, 12));
+        for (synced, readable, password, refusal) in rows {
+            let guard = RecordingGuard::install();
+            let log = LogGuard::install_on_this_thread();
+            let levels = match readable {
+                true => Ok(vec![PolicyLevel {
+                    ou_key: "people\\sales".to_owned(),
+                    blocked: false,
+                    policy: Some(AttachedPolicy {
+                        id: PolicyId(1),
+                        name: "sales".to_owned(),
+                        items: [("password-min-length".to_owned(), "12".to_owned())].into(),
+                    }),
+                }]),
+                false => Err(DomainError::InternalError("down".to_owned())),
+            };
+            let made = refusal.is_none();
+            let mut mock = MockTestBackendHandler::new();
+            mock.expect_get_policy_levels()
+                .withf(|ou| ou == "people\\sales")
+                .times(1)
+                .return_once(move |_| levels);
+            mock.expect_get_user_details()
+                .returning(|u| Err(DomainError::EntityNotFound(u.to_string())));
+            mock.expect_create_user()
+                .times(usize::from(made && !synced))
+                .return_once(|_| Ok(()));
+            match (made, synced) {
+                (true, false) => expect_password_registration(&mut mock, "bob"),
+                (true, true) => {
+                    expect_registration_start(&mut mock, "bob");
+                    mock.expect_registration_finish().times(0);
+                }
+                (false, _) => {
+                    mock.expect_registration_start().times(0);
+                    mock.expect_registration_finish().times(0);
+                }
+            }
+            let ldap_handler = setup_bound_admin_handler(mock).await;
+            let got = ldap_handler
+                .create_user_or_group(&mut sales_add(synced, password))
+                .await;
+            let failed: Vec<_> = log
+                .recorder()
+                .take_events()
+                .into_iter()
+                .filter(|e| !e.success)
+                .map(|e| (e.kind, e.target, e.detail))
+                .collect();
+            let ops = match (made, synced) {
+                (true, true) => vec![KerberosOp::CommitPassword {
+                    username: "bob".into(),
+                    password: password.into(),
+                    rows: add_rows("bob"),
+                }],
+                _ => vec![],
+            };
+            let (answer, rows) = match refusal {
+                None => (
+                    Ok(vec![make_add_response(
+                        LdapResultCode::Success,
+                        String::new(),
+                    )]),
+                    vec![],
+                ),
+                Some(refusal) => (
+                    Err(LdapError {
+                        code: LdapResultCode::UnwillingToPerform,
+                        message: refusal.to_owned(),
+                    }),
+                    vec![(
+                        LogKind::UserCreate,
+                        Some("bob".to_owned()),
+                        Some(refusal.to_owned()),
+                    )],
+                ),
+            };
+            assert_eq!(
+                (got, guard.recorder().take_ops(), failed),
+                (answer, ops, rows),
+                "synced {synced}, readable {readable}, {password}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_an_add_whose_dn_names_no_ou_is_held_to_the_roots_minimum() {
+        use lldap_domain_handlers::policies::{AttachedPolicy, PolicyId, PolicyLevel};
+        use lldap_test_utils::recording_log::LogGuard;
+        let eleven = "Eleven-11ch";
+        let short = "the password must be at least 12 characters";
+        for (root_policy, refusal) in [(false, None), (true, Some(short))] {
+            let _guard = RecordingGuard::install();
+            let log = LogGuard::install_on_this_thread();
+            let policy = root_policy.then(|| AttachedPolicy {
+                id: PolicyId(1),
+                name: "root".to_owned(),
+                items: [("password-min-length".to_owned(), "12".to_owned())].into(),
+            });
+            let levels = vec![PolicyLevel {
+                ou_key: String::new(),
+                blocked: false,
+                policy,
+            }];
+            let made = refusal.is_none();
+            let mut mock = MockTestBackendHandler::new();
+            mock.expect_get_policy_levels()
+                .withf(|ou| ou.is_empty())
+                .times(1)
+                .return_once(move |_| Ok(levels));
+            mock.expect_get_user_details()
+                .returning(|u| Err(DomainError::EntityNotFound(u.to_string())));
+            mock.expect_create_user()
+                .times(usize::from(made))
+                .return_once(|_| Ok(()));
+            match made {
+                true => expect_password_registration(&mut mock, "bob"),
+                false => {
+                    mock.expect_registration_start().times(0);
+                    mock.expect_registration_finish().times(0);
+                }
+            }
+            let ldap_handler = setup_bound_admin_handler(mock).await;
+            let mut request = sales_add(false, eleven);
+            request.dn = "uid=bob,dc=example,dc=com".to_owned();
+            let got = ldap_handler.create_user_or_group(&mut request).await;
+            let failed: Vec<_> = log
+                .recorder()
+                .take_events()
+                .into_iter()
+                .filter(|e| !e.success)
+                .map(|e| (e.kind, e.target, e.detail))
+                .collect();
+            let (answer, rows) = match refusal {
+                None => (
+                    Ok(vec![make_add_response(
+                        LdapResultCode::Success,
+                        String::new(),
+                    )]),
+                    vec![],
+                ),
+                Some(refusal) => (
+                    Err(LdapError {
+                        code: LdapResultCode::UnwillingToPerform,
+                        message: refusal.to_owned(),
+                    }),
+                    vec![(
+                        LogKind::UserCreate,
+                        Some("bob".to_owned()),
+                        Some(refusal.to_owned()),
+                    )],
+                ),
+            };
+            assert_eq!(
+                (got, failed),
+                (answer, rows),
+                "no OU in the DN reads the root's key; a root policy of 12: {root_policy}"
+            );
+        }
     }
 }

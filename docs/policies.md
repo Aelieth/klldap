@@ -3,9 +3,10 @@
 KLLDAP can attach a named policy of **items** to an OU, including the domain root
 (`dc=example,dc=com` → the empty key `""`). An object resolves each item by walking its
 OU chain. The lockout items (`lockout-threshold`, `lockout-duration-seconds`) are
-enforced at every door ([Lockout](#lockout)), and `enable-mfa` at the directory's doors
-([Second factor](#second-factor)); **the other items are stored and resolved but not
-enforced yet**. Each later pass consumes the same resolution at its seam.
+enforced at every door ([Lockout](#lockout)), `enable-mfa` at the directory's doors
+([Second factor](#second-factor)), and `password-min-length` wherever a new password is
+set ([Password length](#password-length)); **the other items are stored and resolved but
+not enforced yet**. Each later pass consumes the same resolution at its seam.
 
 ## Resolution
 
@@ -213,6 +214,60 @@ attempts it sees exactly, the servers agree within 30 seconds, and a guesser who
 attempts over N servers gets at most N times the threshold before every server refuses. A
 table that cannot be read refuses the attempt (`policy: unreadable`).
 
+## Password length
+
+`password-min-length` (8 to 128, default 8) is the fewest characters a new password may
+have. Characters are counted, not bytes: `pässwört` has 8. Only new and changed passwords are
+held to it; a password already set is never judged, so a user moved under a higher minimum
+keeps signing in with the old password until it changes. A user's value comes from their
+OU, by the inheritance above. There is no server-wide setting.
+
+The server holds every password it sees to the user's minimum, and refuses a shorter one with
+"the password must be at least N characters", N being that minimum:
+
+| Door | A shorter password |
+|---|---|
+| GraphQL `setUserPassword` | a GraphQL error |
+| LDAP password modify (`ldappasswd`), LDAP Modify replacing `userPassword` | 53 (unwillingToPerform) |
+| LDAP Add with `userPassword` | 53, judged by the OU the DN names; nothing is made |
+| The web pages and `lldap_set_password`, for a user with `kerberosSync` | 400 at the finish |
+| kadmin `cpw` on a directory user's principal | `PASS_Q_TOOSHORT`, which kadmin shows as *Password is too short* |
+
+Each refusal writes one failure row, and the password is not changed.
+
+For a user without `kerberosSync`, the web pages and `lldap_set_password` never show the
+server the password (OPAQUE), so the server does not enforce the minimum there. Instead the
+register start's answer carries the user's minimum (`password_min_length`, see
+[scripting.md](scripting.md)), and the pages and the tool refuse a shorter password before the
+finish. The pages say *Invalid password. Min length: N*, and the tool says *New password is
+too short, expected at least N characters*. They check the same number for a synced user, so
+the server's 400 is seen only by a client that skips the check. A client older than the field
+keeps checking 8.
+
+When the user's policy cannot be read, every door above refuses the change with "the
+password policy could not be read; try again", never holding it to 8 instead; kadmin `cpw`
+answers `PASS_Q_GENERIC`, which kadmin shows as *Unspecified password quality failure*, and
+waits at most 2 seconds for the read. The register start is refused the same way (400) for
+every user, and the pages show the sentence.
+
+The configuration's admin password (`ldap_user_pass`) is checked against 8 only, at the first
+start and at a forced reset (`force_ldap_user_pass_reset`). When the admin's minimum is higher
+than that password's length, the start logs one warning with the two numbers: *The admin
+password in ldap_user_pass has 9 characters; the admin's password-min-length is 12: the
+configuration's password is checked against 8 only, and a change of it is held to 12*. Any
+other change of the admin's password is held to the minimum.
+
+A synced user's password crosses the web pages and `lldap_set_password` in an envelope of at
+most 318 bytes, so there a high minimum cannot be met in letters of several bytes each: 128
+characters of 3 bytes are 384 bytes. The pages and the tool refuse such a password with *A
+password with Kerberos sync can be at most 318 bytes long*. `setUserPassword` and LDAP have no
+such bound.
+
+The create-user page makes the user first and sets the password after. When the OU's minimum
+refuses the password, the user stays created without a password, and the page says so:
+*Invalid password. Min length: 12. User bob was created without a password; set one from the
+user's page*.
+
 ## What is recorded
 
 `policy_change` rows: creating/updating/deleting a policy (target = name; detail
@@ -224,16 +279,17 @@ no-op inheritance toggle is not logged.
 ## Configuration
 
 None. The surface is always on (reads for admins and read-only admins, writes for admins).
-The lockout is in force wherever an OU sets a threshold, and `enable-mfa` wherever an OU sets
-it, unless `enable_mfa` is set server-wide, which overrides it. `lldap_mfa_disabled` is made
+The lockout is in force wherever an OU sets a threshold, `password-min-length` wherever an OU
+sets it (8 elsewhere), and `enable-mfa` wherever an OU sets it, unless `enable_mfa` is set
+server-wide, which overrides it. `lldap_mfa_disabled` is made
 at start when `enable_mfa` is set server-wide to `enabled` or `always`; otherwise by
 whichever server first reads an OU's `enable-mfa` above `off` (at the change, or at its
 30-second read), never while the policies are not read.
 
 ## Limitations
 
-- Only the lockout and `enable-mfa` are enforced. The other items carry `enforced: false` and
-  say so in their descriptions; per-item passes follow.
+- Only the lockout, `enable-mfa` and `password-min-length` are enforced. The other items carry
+  `enforced: false` and say so in their descriptions; per-item passes follow.
 - A lock's duration runs from the last counted attempt, and a web start counts as one until
   its finish takes it back, so the duration can run from a start that then succeeded.
 - Kerberos already tells whether a principal exists (an unknown one gets a different error);

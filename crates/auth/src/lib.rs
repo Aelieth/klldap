@@ -179,13 +179,15 @@ pub mod registration {
         password.len() <= KERBEROS_ENVELOPE_MAX_BYTES
     }
 
-    /// register/start's answer: upstream's, plus the sealing key for a user with Kerberos sync.
+    /// register/start's answer: upstream's, plus a synced user's sealing key and the min length.
     #[derive(Serialize, Deserialize, Clone)]
     pub struct ServerRegistrationStart {
         #[serde(flatten)]
         pub response: ServerRegistrationStartResponse,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub kerberos_envelope_key: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub password_min_length: Option<u32>,
     }
 
     /// register/finish's body: upstream's, and for a user with Kerberos sync the sealed password.

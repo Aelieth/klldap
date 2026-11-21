@@ -24,6 +24,7 @@ use lldap_domain_handlers::logging::{
     LogActivity, LogBucket, LogCursor, LogDimension, LogFilter, LogKind, LogRecord,
 };
 use lldap_domain_handlers::mfa::{MfaPolicy, MfaRequirement, MfaResetReason};
+use lldap_domain_handlers::password::PASSWORD_MIN_LENGTH;
 use lldap_domain_handlers::policies::{
     CreatePolicyRequest, OuPolicyState, Policy, PolicyId, PolicyLevel, UpdatePolicyRequest,
 };
@@ -107,6 +108,7 @@ mockall::mock! {
         async fn get_policy_levels(&self, ou: &str) -> Result<Vec<PolicyLevel>>;
         async fn delete_ou_policy_state(&self, ou: &str) -> Result<()>;
         async fn bounded_policy_entry(&self, user: &UserId) -> Result<(User, Vec<PolicyLevel>)>;
+        async fn password_min_length(&self, user_id: &UserId) -> Result<usize>;
     }
     #[async_trait]
     impl LockoutBackendHandler for TestBackendHandler {
@@ -186,4 +188,7 @@ pub fn setup_default_ldap_mock(mock: &mut MockTestBackendHandler) {
 
     mock.expect_get_user_groups()
         .returning(|_| Ok(HashSet::new()));
+
+    mock.expect_password_min_length()
+        .returning(|_| Ok(PASSWORD_MIN_LENGTH));
 }

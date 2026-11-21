@@ -49,7 +49,8 @@ use lldap_domain_handlers::kerberos::{
 use lldap_domain_handlers::lockout::{UNLOCKED_BY_TOOL, lock_clock, lockout, start_lockout};
 use lldap_domain_handlers::logging::{self as rows, LogKind, event, record};
 use lldap_domain_handlers::password::{
-    PasswordChangeError, PasswordSync, change_password_everywhere, password_rules,
+    PASSWORD_MIN_LENGTH, PasswordChangeError, PasswordSync, change_password_everywhere,
+    password_rules,
 };
 use lldap_kerberos::boot::{RealmSettings, client_address};
 use lldap_kerberos::embedded::{EmbeddedKerberos, FOLLOW_EVERY, Opened, RealmThreads, Records};
@@ -243,11 +244,17 @@ async fn reset_with_realm(
     sync: PasswordSync,
 ) -> Result<()> {
     let admin = &config.ldap_user_dn;
-    change_password_everywhere(handler, admin, admin_password(config), sync)
-        .instrument(reset_span(config))
-        .await
-        .map_err(|e| anyhow!("{e}"))
-        .with_context(|| format!("while resetting admin password for {admin}"))?;
+    change_password_everywhere(
+        handler,
+        admin,
+        admin_password(config),
+        sync,
+        PASSWORD_MIN_LENGTH,
+    )
+    .instrument(reset_span(config))
+    .await
+    .map_err(|e| anyhow!("{e}"))
+    .with_context(|| format!("while resetting admin password for {admin}"))?;
     let detail = match sync {
         PasswordSync::On => {
             info!("Reset the password and the Kerberos keys of {admin} from the configuration");
@@ -261,18 +268,42 @@ async fn reset_with_realm(
     finish_reset(handler, config, detail).await
 }
 
+/// The first start's floor of 8, counted in characters as every other check counts.
+fn first_start_floor(password: &str) -> Result<(), String> {
+    let pass_length = password.chars().count();
+    match pass_length >= 8 {
+        true => Ok(()),
+        false => Err(format!(
+            "Minimum password length is 8 characters, got {pass_length} characters"
+        )),
+    }
+}
+
+fn admin_min_length_warning(len: usize, min: usize) -> Option<String> {
+    (len < min).then(|| {
+        format!(
+            "The admin password in ldap_user_pass has {len} characters; the admin's \
+             password-min-length is {min}: the configuration's password is checked against 8 \
+             only, and a change of it is held to {min}"
+        )
+    })
+}
+
+/// One warning, on the starts that apply the configuration's password; an unread minimum, none.
+async fn warn_admin_min_length(handler: &SqlBackendHandler, config: &Configuration) {
+    let len = admin_password(config).chars().count();
+    if let Ok(min) = handler.password_min_length(&config.ldap_user_dn).await
+        && let Some(text) = admin_min_length_warning(len, min)
+    {
+        warn!("{text}");
+    }
+}
+
 async fn create_admin_user(handler: &SqlBackendHandler, config: &Configuration) -> Result<()> {
-    let pass_length = config
-        .ldap_user_pass
-        .as_ref()
-        .expect(ADMIN_PASSWORD_MISSING_ERROR)
-        .unsecure()
-        .len();
-    assert!(
-        pass_length >= 8,
-        "Minimum password length is 8 characters, got {pass_length} characters"
-    );
-    if let Err(e) = password_rules(admin_password(config)) {
+    if let Err(why) = first_start_floor(admin_password(config)) {
+        panic!("{why}");
+    }
+    if let Err(e) = password_rules(admin_password(config), PASSWORD_MIN_LENGTH) {
         bail!("The admin password in ldap_user_pass is refused: {e}");
     }
     handler
@@ -468,10 +499,12 @@ async fn set_up_server(
             Some(config.ldap_user_dn.as_str()),
             Some("admin user created"),
         );
+        warn_admin_min_length(&backend_handler, &config).await;
     } else if config.force_ldap_user_pass_reset.is_positive() {
-        if let Err(e) = password_rules(admin_password(&config)) {
+        if let Err(e) = password_rules(admin_password(&config), PASSWORD_MIN_LENGTH) {
             bail!(reset_refused(e));
         }
+        warn_admin_min_length(&backend_handler, &config).await;
         let admin = backend_handler
             .get_user_details(&config.ldap_user_dn)
             .await
@@ -513,6 +546,7 @@ async fn set_up_server(
                 .context("while reading database durability");
             let records = Records {
                 handler: Arc::new(backend_handler.clone()),
+                policies: Arc::new(backend_handler.clone()),
                 runtime: tokio::runtime::Handle::current(),
             };
             let opened = match durable {
@@ -926,7 +960,7 @@ mod tests {
 
     #[test]
     fn test_a_forced_reset_is_refused_only_for_its_password() {
-        let floor = reset_refused(PasswordChangeError::TooShort);
+        let floor = reset_refused(PasswordChangeError::TooShort(8));
         let nul = reset_refused(PasswordChangeError::HasNul);
         let off = sync_turned_off(KERBEROS_OFF);
         let rows = [
@@ -1120,6 +1154,55 @@ mod tests {
         ];
         for (host, expected) in rows {
             assert_eq!(loopback(host), expected, "{host}");
+        }
+    }
+
+    #[test]
+    fn test_the_first_start_counts_the_admin_password_in_characters() {
+        let short = |n: usize| {
+            Err(format!(
+                "Minimum password length is 8 characters, got {n} characters"
+            ))
+        };
+        let rows = [
+            ("pässwö", (6, 8), short(6)),
+            ("pässwör", (7, 9), short(7)),
+            ("Seven-7", (7, 7), short(7)),
+            ("pässwört", (8, 10), Ok(())),
+            ("Eight-88", (8, 8), Ok(())),
+        ];
+        for (password, counts, expected) in rows {
+            assert_eq!(
+                (
+                    (password.chars().count(), password.len()),
+                    first_start_floor(password)
+                ),
+                (counts, expected),
+                "{password}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_one_warning_when_the_admins_minimum_is_above_the_configured_password() {
+        let rows = [
+            (
+                (9, 12),
+                Some(
+                    "The admin password in ldap_user_pass has 9 characters; the admin's \
+                     password-min-length is 12: the configuration's password is checked against \
+                     8 only, and a change of it is held to 12",
+                ),
+            ),
+            ((12, 12), None),
+            ((20, 8), None),
+        ];
+        for ((len, min), expected) in rows {
+            assert_eq!(
+                admin_min_length_warning(len, min).as_deref(),
+                expected,
+                "{len} {min}"
+            );
         }
     }
 }

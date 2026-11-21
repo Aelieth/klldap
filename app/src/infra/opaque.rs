@@ -4,11 +4,30 @@
 //! component field between the start and finish steps.
 
 use crate::infra::encrypt::seal_kerberos_envelope;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use lldap_auth::{login, opaque, registration};
 
 pub type RegistrationState = opaque::client::registration::ClientRegistration;
 pub type LoginState = opaque::client::login::ClientLogin;
+
+const START_FAILED: &str = "Could not initiate registration";
+const POLICY_UNREADABLE: &str = "the password policy could not be read; try again";
+
+/// The line a failed start shows: the server's sentence only for the unreadable-policy 400.
+pub fn start_failure_message(failure: &str) -> &'static str {
+    if failure.contains("[400 ") && failure.contains(POLICY_UNREADABLE) {
+        POLICY_UNREADABLE
+    } else {
+        START_FAILED
+    }
+}
+
+pub fn registration_started<T>(res: Result<T>) -> Result<T> {
+    res.map_err(|e| {
+        let shown = start_failure_message(&format!("{e:#}"));
+        e.context(shown)
+    })
+}
 
 /// Begins registration: returns the client state to stash and the start request
 /// to POST to the server.
@@ -22,12 +41,17 @@ pub fn begin_registration(
     ensure!(!password.is_empty(), "a password is required");
     let mut rng = rand::rngs::OsRng;
     let start = opaque::client::registration::start_registration(password.as_bytes(), &mut rng)
-        .context("Could not initiate registration")?;
+        .context(START_FAILED)?;
     let request = registration::ClientRegistrationStartRequest {
         username: username.into(),
         registration_start_request: start.message,
     };
     Ok((start.state, request))
+}
+
+/// The user's `password-min-length` from the start's answer when `password` is shorter.
+pub fn unmet_min_length(password: &str, min: Option<u32>) -> Option<u32> {
+    min.filter(|&min| password.chars().count() < min as usize)
 }
 
 /// Completes registration from the stashed state and the server's start
@@ -41,7 +65,11 @@ pub fn finish_registration(
     let registration::ServerRegistrationStart {
         response,
         kerberos_envelope_key,
+        password_min_length,
     } = start;
+    if let Some(min) = unmet_min_length(password, password_min_length) {
+        bail!("Invalid password. Min length: {min}");
+    }
     let mut rng = rand::rngs::OsRng;
     let finish = opaque::client::registration::finish_registration(
         state,
@@ -127,6 +155,87 @@ pub fn finish_login(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_a_password_shorter_than_the_servers_minimum_is_not_finished() {
+        const SEVEN: &str = "Seven-7";
+        const ELEVEN: &str = "Eleven-11ch";
+        const TWELVE: &str = "Twelve-12chr";
+        const ELEVEN_UMLAUTS: &str = "pässwörter1";
+        let rows = [
+            (ELEVEN, Some(12), Some(12)),
+            (ELEVEN_UMLAUTS, Some(12), Some(12)),
+            (TWELVE, Some(12), None),
+            (TWELVE, Some(8), None),
+            (ELEVEN, None, None),
+            (SEVEN, None, None),
+        ];
+        assert_eq!(
+            [SEVEN, ELEVEN, TWELVE, ELEVEN_UMLAUTS].map(|p| (p.chars().count(), p.len())),
+            [(7, 7), (11, 11), (12, 12), (11, 13)]
+        );
+        for (password, min, expected) in rows {
+            assert_eq!(
+                unmet_min_length(password, min),
+                expected,
+                "{password} {min:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_only_the_unreadable_policy_refusal_shows_the_servers_sentence() {
+        const UNREADABLE: &str = "the password policy could not be read; try again";
+        const GENERIC: &str = "Could not initiate registration";
+        let refused =
+            |status: &str, body: &str| format!("Could not start registration: [{status}]: {body}");
+        let rows = [
+            (
+                refused(
+                    "400 Bad Request",
+                    "Bad request: `the password policy could not be read; try again`",
+                ),
+                UNREADABLE,
+            ),
+            (
+                refused(
+                    "400 ",
+                    "Bad request: `the password policy could not be read; try again`",
+                ),
+                UNREADABLE,
+            ),
+            (
+                refused(
+                    "500 Internal Server Error",
+                    "the password policy could not be read; try again",
+                ),
+                GENERIC,
+            ),
+            (
+                refused(
+                    "400 Bad Request",
+                    "Bad request: `the password must be at least 12 characters`",
+                ),
+                GENERIC,
+            ),
+            (
+                refused(
+                    "401 Unauthorized",
+                    "Unauthorized: `Not authorized to change the user's password`",
+                ),
+                GENERIC,
+            ),
+            ("Could not parse response".to_owned(), GENERIC),
+        ];
+        for (failure, expected) in rows {
+            assert_eq!(start_failure_message(&failure), expected, "{failure}");
+            let shown = registration_started::<()>(Err(anyhow::anyhow!("{failure}")))
+                .unwrap_err()
+                .to_string();
+            assert_eq!(shown, expected, "{failure}");
+        }
+        assert_eq!(registration_started(Ok(7)).unwrap(), 7);
+    }
 
     #[test]
     fn test_only_a_sign_in_asks_for_a_session() {

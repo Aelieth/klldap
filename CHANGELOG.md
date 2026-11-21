@@ -88,6 +88,20 @@
   Until a starting server has read the policies once, the doors refuse (`policy: unreadable`).
 - When lockout count writes start failing, the server log says so once at WARN, with the cause;
   when they are stored again, once at INFO, with how many users' rows waited.
+- `password-min-length` per OU: the policy item (8 to 128, default 8, by the OU policies'
+  inheritance; no server-wide setting) sets the fewest characters, not bytes, of a new or
+  changed password; a password already set is never judged. The server holds every password it
+  sees to the user's minimum and refuses a shorter one with "the password must be at least N
+  characters": `setUserPassword`, LDAP password modify and `userPassword` replace (53), LDAP Add
+  with `userPassword` (53, by the OU its DN names), a synced user's web pages and
+  `lldap_set_password` (400 at the finish), and kadmin `cpw` on a directory user's principal
+  (`PASS_Q_TOOSHORT`). The register start answers the user's minimum in the new optional field
+  `password_min_length`, and the pages and the tool refuse a shorter password before the
+  finish (*Invalid password. Min length: N*), the only check for a user without sync; a client
+  that ignores the field keeps checking 8. A policy that cannot be read refuses the change
+  ("the password policy could not be read; try again"; kadmin `PASS_Q_GENERIC`). The
+  configuration's admin password is still checked against 8 only, and the start warns once
+  when the admin's minimum is higher.
 
 ### Removed
 
@@ -146,12 +160,13 @@
   record and the Kerberos keys in one transaction. An envelope sealed for another user, or
   sent for a user without sync, is refused (400) and nothing is written. Every other user's
   register calls are LLDAP's, and their pages send no password to the server.
-- A synced user's password from the web pages or `lldap_set_password` must be at least 8
-  characters (400). The pages and the tool check 8 for every user, counting characters.
+- A synced user's password from the web pages or `lldap_set_password` must be at least the
+  user's minimum (8 by default) in characters (400). The pages and the tool check that minimum
+  for every user, counting characters.
 - The create-user page refuses a password longer than 318 bytes for a user with Kerberos sync
   before it creates the user.
 - `lldap_set_password` prints the server's answer when a call fails.
-- A password with a NUL character (U+0000) is refused at every door that checks the floor of 8:
+- A password with a NUL character (U+0000) is refused at every door that checks its length:
   GraphQL, LDAP (53), the web finish and `lldap_set_password` (400), kadmin `cpw`
   (`PASS_Q_GENERIC`), the forced reset and the first start's admin password. Each refused
   change writes one failure row, the web finish's envelope refusals included.

@@ -168,6 +168,11 @@ pub fn catalog_text(key: &str) -> Option<CatalogText> {
             "How long a locked account stays locked",
             "",
         ),
+        "password-min-length" => (
+            "Minimum password length",
+            "Fewest characters in a new password, 8 to 128",
+            "",
+        ),
         "login-hours" => (
             "Login hours",
             "DAY[-DAY] HH:MM-HH:MM, ; separated · empty = always",
@@ -197,6 +202,7 @@ pub fn format_item_value(key: &str, value: &str) -> String {
         "lockout-threshold" if value == "0" => "off".to_owned(),
         "lockout-threshold" => format!("{value} tries"),
         "lockout-duration-seconds" => format!("{value} s"),
+        "password-min-length" => format!("{value} characters"),
         _ => value.to_owned(),
     }
 }
@@ -384,6 +390,10 @@ mod tests {
     fn test_catalog_text() {
         assert_eq!(catalog_text("enable-mfa").unwrap().label, "Enable MFA");
         assert_eq!(
+            catalog_text("password-min-length").unwrap().label,
+            "Minimum password length"
+        );
+        assert_eq!(
             catalog_text("login-hours").unwrap().placeholder,
             "mon-fri 08:00-18:00"
         );
@@ -422,6 +432,12 @@ mod tests {
                 "lockout-duration-seconds",
                 "900",
                 "900 s",
+            ),
+            (
+                "min length gets characters",
+                "password-min-length",
+                "12",
+                "12 characters",
             ),
             ("unknown key verbatim", "future-key", "x", "x"),
         ] {

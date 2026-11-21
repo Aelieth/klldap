@@ -1,5 +1,6 @@
 use crate::infra::opaque::{
     FinishFor, LoginState, begin_login, begin_registration, finish_login, finish_registration,
+    registration_started,
 };
 use crate::{
     components::{
@@ -142,7 +143,7 @@ impl CommonComponent<ChangePasswordForm> for ChangePasswordForm {
             }
             Msg::RegistrationStartResponse(res) => {
                 let held = self.opaque_data.take();
-                let res = res.context("Could not initiate registration")?;
+                let res = registration_started(res)?;
                 let registration = match held {
                     OpaqueData::Registration(r) => *r,
                     _ => bail!("Invalid state"),

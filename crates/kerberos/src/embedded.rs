@@ -27,7 +27,7 @@ use lldap_domain_handlers::logging::{
     self, LogKind, current_request, record, record_outcome, with_request_sync,
 };
 use lldap_domain_handlers::password::{
-    kill_point, password_rules, record_commit_failure, record_unreported,
+    PASSWORD_MIN_LENGTH, kill_point, password_rules, record_commit_failure, record_unreported,
 };
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -564,7 +564,7 @@ impl KerberosSync for EmbeddedKerberos {
     }
     async fn check_password(&self, user: &UserId, password: &str) -> Result<(), String> {
         validate_kerberos_username(user.as_str())?;
-        password_rules(password).map_err(|e| e.to_string())?;
+        password_rules(password, PASSWORD_MIN_LENGTH).map_err(|e| e.to_string())?;
         let (store, realm, id) = (self.store.clone(), self.realm.clone(), user.clone());
         let password = Zeroizing::new(password.as_bytes().to_vec());
         read_store(move || {
@@ -1601,7 +1601,7 @@ pub(crate) mod tests {
     };
     use lldap_domain_handlers::kerberos::{CREATED_FIRST, HostRow};
     use lldap_domain_handlers::logging::{RequestMeta, with_request};
-    use lldap_domain_handlers::password::{PASSWORD_HAS_NUL, PASSWORD_TOO_SHORT};
+    use lldap_domain_handlers::password::PASSWORD_HAS_NUL;
     use lldap_test_utils::recording_log::LogGuard;
     use pretty_assertions::assert_eq;
     use serial_test::serial;
@@ -2715,7 +2715,14 @@ pub(crate) mod tests {
         set_kerberos_backend(Arc::new(embedded));
         let log = LogGuard::install_on_this_thread();
         let plain = PasswordSync::Off;
-        let answer = change_password_everywhere(&handler, &bob(), "Bob-Password-1", plain).await;
+        let answer = change_password_everywhere(
+            &handler,
+            &bob(),
+            "Bob-Password-1",
+            plain,
+            PASSWORD_MIN_LENGTH,
+        )
+        .await;
         let directory = require_kdc_ready().is_ok();
         set_kerberos_backend(Arc::new(NoopKerberos::default()));
         let rows: Vec<_> = log
@@ -3295,7 +3302,7 @@ pub(crate) mod tests {
         let (embedded, store) = temp.embedded();
         assert_eq!(
             embedded.check_password(&bob(), "Short-7").await,
-            Err(PASSWORD_TOO_SHORT.to_owned()),
+            Err("the password must be at least 8 characters".to_owned()),
             "no principal yet, and still the directory's floor"
         );
         assert_eq!(
@@ -3932,6 +3939,92 @@ pub(crate) mod tests {
                 0
             )
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_an_adopted_principal_keeps_its_kerberos_policy_under_a_directory_change() {
+        use lldap_auth::opaque::server::generate_random_private_key;
+        use lldap_domain_handlers::kerberos::{NoopKerberos, set_kerberos_backend};
+        use lldap_domain_handlers::password::{
+            PasswordChangeError, PasswordSync, change_password_everywhere,
+        };
+        const REFUSED: &str = "password policy: min_length 12";
+        const EIGHT: &str = "Dora-Pw8";
+        const ELEVEN: &str = "Dora-Pass-1";
+        const ELEVEN_IN_13_BYTES: &str = "Dörä-Pass-1";
+        assert_eq!(
+            [EIGHT, ELEVEN, ELEVEN_IN_13_BYTES].map(|p| (p.chars().count(), p.len())),
+            [(8, 8), (11, 11), (11, 13)]
+        );
+        let dora = UserId::new("dora");
+        let bound = Some((true, Some("min12".to_owned())));
+        let refused_row = vec![(
+            Some("dora".to_owned()),
+            Some(format!("refused by Kerberos: {REFUSED}")),
+        )];
+        let pool = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        let handler =
+            lldap_sql_backend_handler::SqlBackendHandler::new(generate_random_private_key(), pool);
+        let log = LogGuard::install_on_this_thread();
+        for password in [EIGHT, ELEVEN] {
+            let temp = TempRealm::new();
+            let (embedded, store) = temp.embedded();
+            unmarked(&embedded, "dora", false);
+            let mut policy = krb5_kdc::NamedPolicy::new("min12");
+            policy.min_length = 12;
+            store.write().unwrap().put_policy(policy).unwrap();
+            in_change(&embedded.own(), |s| {
+                s.set_principal_policy(&user_principal(&dora), Some("min12".to_owned()))
+            })
+            .unwrap();
+            temp.host.set_directory(Some(&[]));
+            let policy_of = || {
+                let guard = store.read().unwrap();
+                let principal = guard.get_name(&user_principal(&dora))?;
+                Some((principal.host_owned(), principal.pw_policy.clone()))
+            };
+            let adopted = embedded.commit_user(life("dora", UserStep::SyncOn)).await;
+            let after_adoption = policy_of();
+            let in_bytes = embedded.check_password(&dora, ELEVEN_IN_13_BYTES).await;
+            log.recorder().take_events();
+            set_kerberos_backend(Arc::new(embedded));
+            let answer = change_password_everywhere(
+                &handler,
+                &dora,
+                password,
+                PasswordSync::On,
+                PASSWORD_MIN_LENGTH,
+            )
+            .await;
+            set_kerberos_backend(Arc::new(NoopKerberos::default()));
+            let failed: Vec<_> = log
+                .recorder()
+                .take_events()
+                .into_iter()
+                .filter(|e| e.kind == LogKind::PasswordChange && !e.success)
+                .map(|e| (e.target, e.detail))
+                .collect();
+            assert_eq!(
+                (
+                    adopted,
+                    after_adoption,
+                    in_bytes,
+                    answer,
+                    failed,
+                    policy_of()
+                ),
+                (
+                    Some(Ok(())),
+                    bound.clone(),
+                    Ok(()),
+                    Err(PasswordChangeError::Refused(REFUSED.to_owned())),
+                    refused_row.clone(),
+                    bound.clone()
+                ),
+                "{password}: kerber-rust's policy counts bytes and refuses before the record"
+            );
+        }
     }
 
     #[tokio::test]

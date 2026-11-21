@@ -9,12 +9,15 @@ use krb5_kdc::{
     lookup_principal_id,
 };
 use lldap_domain::types::UserId;
+use lldap_domain_handlers::handler::PolicyBackendHandler;
 use lldap_domain_handlers::kerberos::{
     self as directory, AliasOnto, DIRECTORY_TARGET, DIRECTORY_USER, HostRow,
 };
 use lldap_domain_handlers::lockout::{UNLOCKED_BY_KADMIN, lock_clock, lockout};
 use lldap_domain_handlers::logging::{self, LogKind};
-use lldap_domain_handlers::password::{PASSWORD_MIN_LENGTH, PasswordChangeError, password_rules};
+use lldap_domain_handlers::password::{
+    PASSWORD_MIN_LENGTH, PASSWORD_POLICY_UNREADABLE, PasswordChangeError, password_rules,
+};
 use lldap_opaque_handler::{OpaqueHandler, prepare_registration};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -29,18 +32,48 @@ pub(crate) const KADM5_AUTH_ADD: u32 = 43_787_522;
 pub(crate) const KADM5_PASS_Q_GENERIC: u32 = 43_787_577;
 const DERIVE_WAIT: Duration = Duration::from_secs(30);
 const UNPREPARED: &str = "the change could not be prepared";
+const MIN_WAIT: Duration = Duration::from_secs(2);
+const POLICY_UNREAD: &str = "the password policy could not be read";
 const NO_FOLLOW: &str = "after kadmin change_password the status was not set from \
      lldap_disabled and stays as it was: no realm engine is wired to this host";
 const UNLOCK_ROW_BITS: u32 = kadm5_mask::TL_DATA | kadm5_mask::MOD_TIME | kadm5_mask::MOD_NAME;
 
-/// What derives a kadmin `cpw`'s OPAQUE record: the server's handler, on the server's runtime.
+/// What derives a kadmin `cpw`'s OPAQUE record and reads its minimum: the server's handlers.
 #[derive(Clone)]
 pub struct Records {
     pub handler: Arc<dyn OpaqueHandler>,
+    pub policies: Arc<dyn PolicyBackendHandler>,
     pub runtime: tokio::runtime::Handle,
 }
 
 impl Records {
+    fn min_length(&self, user: &UserId) -> Result<usize, String> {
+        let (policies, user) = (Arc::clone(&self.policies), user.clone());
+        let task = self.runtime.spawn(async move {
+            tokio::time::timeout(MIN_WAIT, policies.password_min_length(&user)).await
+        });
+        match self.runtime.block_on(task) {
+            Ok(Ok(Ok(min))) => Ok(min),
+            Ok(Ok(Err(e))) => Err(e.to_string()),
+            Ok(Err(_)) => Err(format!("no answer within {MIN_WAIT:?}")),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    fn hold(
+        &self,
+        intent: &WriteIntent,
+        named: &Named,
+        user: &UserId,
+        password: &[u8],
+    ) -> Result<usize, KerberosStoreError> {
+        let min = self.min_length(user).map_err(|why| {
+            warn!("kadmin change_password for {user}: {POLICY_UNREAD}: {why}");
+            denied(intent, Refusal::PolicyUnread, named)
+        })?;
+        held_to(intent, named, password, min).map(|()| min)
+    }
+
     fn derive(&self, user: &UserId, password: &[u8]) -> Result<Vec<u8>, KerberosStoreError> {
         let (handler, user) = (Arc::clone(&self.handler), user.clone());
         let password = Zeroizing::new(password.to_vec());
@@ -370,9 +403,11 @@ fn password_verdict(intent: &WriteIntent, named: Named) -> Verdict {
     let keepold = intent.keepold.is_some_and(|keepold| keepold != 0);
     let code = match &intent.password {
         _ if keepold || named.user.is_none() => KADM5_PROTECT_PRINCIPAL,
-        Some(password) => match std::str::from_utf8(password.as_slice()).map(password_rules) {
+        Some(password) => match std::str::from_utf8(password.as_slice())
+            .map(|password| password_rules(password, PASSWORD_MIN_LENGTH))
+        {
             Ok(Ok(())) => return Verdict::Password(named),
-            Ok(Err(PasswordChangeError::TooShort)) => KADM5_PASS_Q_TOOSHORT,
+            Ok(Err(PasswordChangeError::TooShort(_))) => KADM5_PASS_Q_TOOSHORT,
             Ok(Err(_)) | Err(_) => KADM5_PASS_Q_GENERIC,
         },
         None => KADM5_PROTECT_PRINCIPAL,
@@ -432,24 +467,56 @@ pub(crate) fn code_name(code: u32) -> &'static str {
     }
 }
 
-fn denied(intent: &WriteIntent, code: u32, named: &Named) -> KerberosStoreError {
-    let text = match code {
-        KADM5_PASS_Q_TOOSHORT => {
-            format!("the password is shorter than {PASSWORD_MIN_LENGTH} characters")
+/// Why a kadmin write is denied: its code, a password under a minimum, or no minimum read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Refusal {
+    Code(u32),
+    TooShort(usize),
+    PolicyUnread,
+}
+
+const PROTECTED: Refusal = Refusal::Code(KADM5_PROTECT_PRINCIPAL);
+
+impl Refusal {
+    /// A verdict's code: its TOOSHORT is the floor's.
+    fn of(code: u32) -> Self {
+        match code {
+            KADM5_PASS_Q_TOOSHORT => Self::TooShort(PASSWORD_MIN_LENGTH),
+            code => Self::Code(code),
         }
-        KADM5_PASS_Q_GENERIC => {
+    }
+
+    fn code(self) -> u32 {
+        match self {
+            Self::Code(code) => code,
+            Self::TooShort(_) => KADM5_PASS_Q_TOOSHORT,
+            Self::PolicyUnread => KADM5_PASS_Q_GENERIC,
+        }
+    }
+}
+
+fn denied(intent: &WriteIntent, refusal: Refusal, named: &Named) -> KerberosStoreError {
+    let code = refusal.code();
+    let cause = match refusal {
+        Refusal::PolicyUnread => format!(": {POLICY_UNREAD}"),
+        _ => String::new(),
+    };
+    let text = match refusal {
+        Refusal::TooShort(min) => format!("the password is shorter than {min} characters"),
+        Refusal::PolicyUnread => PASSWORD_POLICY_UNREADABLE.to_owned(),
+        Refusal::Code(KADM5_PASS_Q_GENERIC) => {
             "the password must be valid UTF-8 without a NUL character (U+0000)".to_owned()
         }
-        KADM5_AUTH_ADD => format!(
+        Refusal::Code(KADM5_AUTH_ADD) => format!(
             "{} is a directory user's name; turn on Kerberos for the user in KLLDAP",
             named.principal
         ),
-        _ => format!(
+        Refusal::Code(_) => format!(
             "{} belongs to a directory user; change it in KLLDAP",
             named.principal
         ),
     };
-    logged_denial(intent, code, named, "", text)
+    logged_denial(intent, code, named, &cause, text)
 }
 
 /// A `cpw` whose commit came without the record `prepare` derived for its user.
@@ -487,9 +554,25 @@ fn logged_denial(
     })
 }
 
+/// A `cpw` held to the user's minimum, at `prepare` and again at the commit.
+fn held_to(
+    intent: &WriteIntent,
+    named: &Named,
+    password: &[u8],
+    min: usize,
+) -> Result<(), KerberosStoreError> {
+    let refusal = match std::str::from_utf8(password).map(|text| password_rules(text, min)) {
+        Ok(Ok(())) => return Ok(()),
+        Ok(Err(PasswordChangeError::TooShort(n))) => Refusal::TooShort(n),
+        Ok(Err(_)) | Err(_) => Refusal::Code(KADM5_PASS_Q_GENERIC),
+    };
+    Err(denied(intent, refusal, named))
+}
+
 struct PreparedRecord {
     user: UserId,
     record: Vec<u8>,
+    min: usize,
 }
 
 impl KerberosStore for SqlRealm {
@@ -568,7 +651,7 @@ impl KerberosStore for SqlRealm {
                 Ok(())
             }
             Verdict::Password(named) => self.commit_password(change, &named),
-            Verdict::Deny { code, named } => Err(denied(&change.intent, code, &named)),
+            Verdict::Deny { code, named } => Err(denied(&change.intent, Refusal::of(code), &named)),
         }
     }
 
@@ -588,7 +671,7 @@ impl KerberosStore for SqlRealm {
             }
             Verdict::Unlock(_) => Ok(None),
             Verdict::Password(named) => self.prepared(intent, &named).map(Some),
-            Verdict::Deny { code, named } => Err(denied(intent, code, &named)),
+            Verdict::Deny { code, named } => Err(denied(intent, Refusal::of(code), &named)),
         }
     }
 }
@@ -694,10 +777,10 @@ impl SqlRealm {
             Ok(found) => {
                 let held = |named: &Named| named.user.as_ref().is_some_and(|u| found.contains(u));
                 if let Some(named) = onto.iter().find(|&named| held(named)) {
-                    return Err(denied(intent, KADM5_PROTECT_PRINCIPAL, named));
+                    return Err(denied(intent, PROTECTED, named));
                 }
                 match new.iter().find(|&named| held(named)) {
-                    Some(named) => Err(denied(intent, KADM5_AUTH_ADD, named)),
+                    Some(named) => Err(denied(intent, Refusal::Code(KADM5_AUTH_ADD), named)),
                     None => Ok(()),
                 }
             }
@@ -716,12 +799,15 @@ impl SqlRealm {
         named: &Named,
     ) -> Result<HostPrepared, KerberosStoreError> {
         let (Some(user), Some(password)) = (&named.user, &intent.password) else {
-            return Err(denied(intent, KADM5_PROTECT_PRINCIPAL, named));
+            return Err(denied(intent, PROTECTED, named));
         };
-        let record = self.records()?.derive(user, password.as_slice())?;
+        let records = self.records()?;
+        let min = records.hold(intent, named, user, password.as_slice())?;
+        let record = records.derive(user, password.as_slice())?;
         Ok(Box::new(PreparedRecord {
             user: user.clone(),
             record,
+            min,
         }))
     }
 
@@ -745,10 +831,11 @@ impl SqlRealm {
                     .strip_prefix(DIRECTORY_TARGET)
                     .and_then(|rest| rest.strip_prefix(": "));
                 let named = self.reached(onto, found);
-                Err(denied(&change.intent, KADM5_PROTECT_PRINCIPAL, &named))
+                Err(denied(&change.intent, PROTECTED, &named))
             }
             Err(KerberosStoreError::Refused(why)) if why == DIRECTORY_USER => {
-                Err(denied(&change.intent, KADM5_AUTH_ADD, &one_of(new)))
+                let refusal = Refusal::Code(KADM5_AUTH_ADD);
+                Err(denied(&change.intent, refusal, &one_of(new)))
             }
             written => written,
         }
@@ -761,11 +848,14 @@ impl SqlRealm {
             batch,
             ..
         } = change;
-        let (Some(user), Some(_)) = (named.user.clone(), &intent.password) else {
-            return Err(denied(&intent, KADM5_PROTECT_PRINCIPAL, named));
+        let (Some(user), Some(password)) = (named.user.clone(), &intent.password) else {
+            return Err(denied(&intent, PROTECTED, named));
         };
         let record = match prepared.and_then(|p| p.downcast::<PreparedRecord>().ok()) {
-            Some(p) if p.user == user => p.record,
+            Some(p) if p.user == user => {
+                held_to(&intent, named, password.as_slice(), p.min)?;
+                p.record
+            }
             _ => {
                 warn!(
                     "kadmin change_password for {user}: kadmind's commit came without its \
@@ -2206,9 +2296,15 @@ mod tests {
         let (kim, group) = (UserId::new("kim"), GroupId(7));
         runtime.block_on(async {
             handler.update_user(sync_request("kim", 1)).await.unwrap();
-            change_password_everywhere(&handler, &kim, "Kim-Pass-1", PasswordSync::On)
-                .await
-                .unwrap();
+            change_password_everywhere(
+                &handler,
+                &kim,
+                "Kim-Pass-1",
+                PasswordSync::On,
+                PASSWORD_MIN_LENGTH,
+            )
+            .await
+            .unwrap();
         });
         let log = LogGuard::install_on_this_thread();
         let n = |query: &str| count(&pool, &runtime, query);
@@ -2329,9 +2425,15 @@ mod tests {
         let lee = UserId::new("lee");
         runtime.block_on(async {
             handler.update_user(sync_request("lee", 1)).await.unwrap();
-            change_password_everywhere(&handler, &lee, "Lee-Pass-1", PasswordSync::On)
-                .await
-                .unwrap();
+            change_password_everywhere(
+                &handler,
+                &lee,
+                "Lee-Pass-1",
+                PasswordSync::On,
+                PASSWORD_MIN_LENGTH,
+            )
+            .await
+            .unwrap();
         });
         let attribute = "FROM user_attributes WHERE user_attribute_user_id = 'lee' AND \
                          user_attribute_name = 'kerberossync'";
@@ -2405,9 +2507,15 @@ mod tests {
         let kim = UserId::new("kim");
         runtime.block_on(async {
             handler.update_user(sync_request("kim", 1)).await.unwrap();
-            change_password_everywhere(&handler, &kim, "Kim-Pass-1", PasswordSync::On)
-                .await
-                .unwrap();
+            change_password_everywhere(
+                &handler,
+                &kim,
+                "Kim-Pass-1",
+                PasswordSync::On,
+                PASSWORD_MIN_LENGTH,
+            )
+            .await
+            .unwrap();
         });
         set_kerberos_backend(Arc::new(NoopKerberos::default()));
         drop((embedded, store, host));
@@ -2425,6 +2533,7 @@ mod tests {
             runtime.block_on(async { start_committer_watching_for(pool.clone(), watch) });
         let records = Records {
             handler: Arc::new(handler.clone()),
+            policies: Arc::new(handler.clone()),
             runtime: runtime.handle().clone(),
         };
         let started = std::time::Instant::now();
@@ -2478,9 +2587,15 @@ mod tests {
         let hal = UserId::new("hal");
         runtime.block_on(async {
             handler.update_user(sync_request("hal", 1)).await.unwrap();
-            change_password_everywhere(&handler, &hal, "Hal-Pass-1", PasswordSync::On)
-                .await
-                .unwrap();
+            change_password_everywhere(
+                &handler,
+                &hal,
+                "Hal-Pass-1",
+                PasswordSync::On,
+                PASSWORD_MIN_LENGTH,
+            )
+            .await
+            .unwrap();
         });
         set_kerberos_backend(Arc::new(NoopKerberos::default()));
         sql(&pool, &runtime, DISABLED_GROUP);
@@ -2542,9 +2657,15 @@ mod tests {
                 handler.update_user(sync_request(user, 1)).await.unwrap();
                 let password = format!("{user}-Pass-1");
                 let id = UserId::new(user);
-                change_password_everywhere(&handler, &id, &password, PasswordSync::On)
-                    .await
-                    .unwrap();
+                change_password_everywhere(
+                    &handler,
+                    &id,
+                    &password,
+                    PasswordSync::On,
+                    PASSWORD_MIN_LENGTH,
+                )
+                .await
+                .unwrap();
             }
         });
         set_kerberos_backend(Arc::new(NoopKerberos::default()));
@@ -2705,7 +2826,7 @@ mod tests {
                 match row {
                     "an LDAP Add with a password, synced: realm commit" => {
                         let request = create(user, vec![ou("people\\labs"), sync()]);
-                        create_synced_user(&handler, request, PASSWORD)
+                        create_synced_user(&handler, request, PASSWORD, PASSWORD_MIN_LENGTH)
                             .await
                             .map_err(|e| e.to_string())
                     }
@@ -2771,6 +2892,15 @@ mod tests {
     );
 
     fn wired_realm(connect: Reconnect, users: &[&str]) -> Realm {
+        wired_realm_with(connect, users, None, None)
+    }
+
+    fn wired_realm_with(
+        connect: Reconnect,
+        users: &[&str],
+        cache: Option<&'static lldap_domain_handlers::enforcement::PolicyCache>,
+        policies: Option<Arc<dyn PolicyBackendHandler>>,
+    ) -> Realm {
         use lldap_auth::opaque::server::generate_random_private_key;
         use lldap_sql_backend_handler::SqlBackendHandler;
         let runtime = runtime();
@@ -2781,8 +2911,17 @@ mod tests {
             add_user(&pool, &runtime, user);
         }
         let handler = SqlBackendHandler::new(generate_random_private_key(), pool.clone());
+        let handler = match cache {
+            Some(cache) => handler.with_policy_cache(cache),
+            None => handler,
+        };
+        let policies: Arc<dyn PolicyBackendHandler> = match policies {
+            Some(policies) => policies,
+            None => Arc::new(handler.clone()),
+        };
         let records = Records {
             handler: Arc::new(handler.clone()),
+            policies,
             runtime: runtime.handle().clone(),
         };
         let host = Arc::new(SqlRealm::new(committer.store()).serving("EXAMPLE.COM", Some(records)));
@@ -2932,6 +3071,429 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    fn minimums(
+        answers: &'static [Option<usize>],
+    ) -> (Arc<dyn PolicyBackendHandler>, Arc<AtomicUsize>) {
+        let asked = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&asked);
+        let mut mock = lldap_test_utils::MockTestBackendHandler::new();
+        mock.expect_password_min_length().returning(move |_| {
+            let at = count.fetch_add(1, Ordering::SeqCst);
+            match answers.get(at).copied().flatten() {
+                Some(min) => Ok(min),
+                None => Err(sea_orm::DbErr::Custom("the policy store is down".to_owned()).into()),
+            }
+        });
+        let policies: Arc<dyn PolicyBackendHandler> = Arc::new(mock);
+        (policies, asked)
+    }
+
+    type HeldCpw = ((String, Option<String>), Rows, bool, usize);
+
+    fn held_cpw(
+        guard: &lldap_test_utils::recording_log::LogGuard,
+        declared: bool,
+        password: &'static str,
+        answers: &'static [Option<usize>],
+    ) -> HeldCpw {
+        let (policies, count) = minimums(answers);
+        let memory = |runtime: &Runtime| sqlite_one_connection("sqlite::memory:", runtime);
+        let (runtime, temp, committer, pool, _handler, host, store, embedded) =
+            wired_realm_with(&memory, &["dora"], None, Some(policies));
+        runtime
+            .block_on(synced(&embedded, &UserId::new("dora"), "Dora-Password-0"))
+            .unwrap();
+        let etypes: Vec<krb5_crypto::KeySalt> = temp
+            .settings
+            .supported_enctypes
+            .iter()
+            .map(|&e| e.into())
+            .collect();
+        let dora = name("dora");
+        let before = record_of(&pool, &runtime, "dora");
+        guard.recorder().take_events();
+        let fill = with_password(password, 0);
+        let intent = intent_of(Operation::ChangePassword, kadmin(false), &["dora"], &fill);
+        let edit = |s: &mut krb5_kdc::PrincipalStore| {
+            let bytes = password.as_bytes();
+            s.set_password_etypes_keepold_n_in(&dora, "EXAMPLE.COM", bytes, 0, ADMIN, &etypes)
+        };
+        let answered = match kadmin_try(&store, declared, intent, &dora, &edit) {
+            Ok(()) => ("written".to_owned(), None),
+            Err(StoreError::Host(KerberosStoreError::Denied(denial))) => {
+                (code_name(denial.kadm5_code).to_owned(), Some(denial.text))
+            }
+            Err(e) => (e.to_string(), None),
+        };
+        let denials: Rows = guard
+            .recorder()
+            .take_events()
+            .into_iter()
+            .filter(|e| e.kind == LogKind::AccessDenied)
+            .map(|e| (e.kind, e.target, e.detail))
+            .collect();
+        let moved = record_of(&pool, &runtime, "dora") != before;
+        drop((embedded, store, host, temp));
+        runtime.block_on(committer.shutdown());
+        (answered, denials, moved, count.load(Ordering::SeqCst))
+    }
+
+    fn held_cpw_wanted(answer: (&str, Option<&str>), asked: usize, code: &str) -> HeldCpw {
+        let written = answer.0 == "written";
+        let logged = match written {
+            true => Vec::new(),
+            false => denial("dora@EXAMPLE.COM", "change_password", code),
+        };
+        let answer = (answer.0.to_owned(), answer.1.map(str::to_owned));
+        (answer, logged, written, asked)
+    }
+
+    #[test]
+    #[serial]
+    fn test_a_kadmin_cpw_is_held_to_the_users_minimum_read_once_at_prepare() {
+        use lldap_test_utils::recording_log::LogGuard;
+        const SHORT_12: &str = "the password is shorter than 12 characters";
+        type Row = (
+            &'static str,
+            &'static str,
+            &'static [Option<usize>],
+            (&'static str, Option<&'static str>),
+            usize,
+            &'static str,
+        );
+        let rows: [Row; 6] = [
+            (
+                "7 characters: the floor, before any read",
+                "Short-7",
+                &[Some(12)],
+                (
+                    "PASS_Q_TOOSHORT",
+                    Some("the password is shorter than 8 characters"),
+                ),
+                0,
+                "PASS_Q_TOOSHORT",
+            ),
+            (
+                "11 characters, minimum 12",
+                "Dora-Pass-1",
+                &[Some(12)],
+                ("PASS_Q_TOOSHORT", Some(SHORT_12)),
+                1,
+                "PASS_Q_TOOSHORT",
+            ),
+            (
+                "11 characters in 13 bytes, minimum 12",
+                "Dörä-Pass-1",
+                &[Some(12)],
+                ("PASS_Q_TOOSHORT", Some(SHORT_12)),
+                1,
+                "PASS_Q_TOOSHORT",
+            ),
+            (
+                "12 characters, minimum 12, and 20 if asked again",
+                "Dora-Pass-12",
+                &[Some(12), Some(20)],
+                ("written", None),
+                1,
+                "",
+            ),
+            (
+                "12 characters in 14 bytes, minimum 12",
+                "Dörä-Pass-12",
+                &[Some(12)],
+                ("written", None),
+                1,
+                "",
+            ),
+            (
+                "the policy not read",
+                "Dora-Pass-12",
+                &[None],
+                (
+                    "PASS_Q_GENERIC",
+                    Some("the password policy could not be read; try again"),
+                ),
+                1,
+                "PASS_Q_GENERIC: the password policy could not be read",
+            ),
+        ];
+        assert_eq!(
+            rows.map(|(_, password, ..)| (password.chars().count(), password.len())),
+            [(7, 7), (11, 11), (11, 13), (12, 12), (12, 14), (12, 12)]
+        );
+        let guard = LogGuard::install();
+        let (mut got, mut want) = (Vec::new(), Vec::new());
+        for (label, password, answers, answer, asked, code) in rows {
+            got.push((label, held_cpw(&guard, true, password, answers)));
+            want.push((label, held_cpw_wanted(answer, asked, code)));
+        }
+        assert_eq!(
+            got, want,
+            "a kadmin cpw is held to the user's minimum, read once, at prepare"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_a_cpw_kadmind_did_not_prepare_is_refused_without_a_read() {
+        use lldap_test_utils::recording_log::LogGuard;
+        type Row = (&'static str, &'static str, &'static [Option<usize>]);
+        let guard = LogGuard::install();
+        let rows: [Row; 3] = [
+            ("11 characters, minimum 12", "Dora-Pass-1", &[Some(12)]),
+            ("12 characters, minimum 12", "Dora-Pass-12", &[Some(12)]),
+            (
+                "12 characters, the policy store down",
+                "Dora-Pass-12",
+                &[None],
+            ),
+        ];
+        let refused = held_cpw_wanted(
+            (
+                "PASS_Q_GENERIC",
+                Some("the change could not be prepared; try again"),
+            ),
+            0,
+            "PASS_Q_GENERIC: the change could not be prepared",
+        );
+        for (label, password, answers) in rows {
+            let got = held_cpw(&guard, false, password, answers);
+            assert_eq!(
+                got, refused,
+                "no prepare, {label}: no read, the record unchanged"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_a_held_database_never_holds_a_kadmin_cpw_past_the_minimums_bound() {
+        use lldap_domain_handlers::enforcement::PolicyCache;
+        use lldap_test_utils::recording_log::LogGuard;
+        const PASSWORD: &str = "Dora-Pass-12";
+        let guard = LogGuard::install();
+        let memory = |runtime: &Runtime| sqlite_one_connection("sqlite::memory:", runtime);
+        let cache: &'static PolicyCache = Box::leak(Box::new(PolicyCache::new()));
+        let (runtime, temp, committer, pool, _handler, host, store, embedded) =
+            wired_realm_with(&memory, &["dora"], Some(cache), None);
+        runtime
+            .block_on(synced(&embedded, &UserId::new("dora"), "Dora-Password-0"))
+            .unwrap();
+        let etypes: Vec<krb5_crypto::KeySalt> = temp
+            .settings
+            .supported_enctypes
+            .iter()
+            .map(|&e| e.into())
+            .collect();
+        let dora = name("dora");
+        let before = record_of(&pool, &runtime, "dora");
+        guard.recorder().take_events();
+        let (held_tx, held) = std::sync::mpsc::channel();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        let holder = runtime.spawn({
+            let pool = pool.clone();
+            async move {
+                let txn = pool.begin().await.unwrap();
+                held_tx.send(()).unwrap();
+                let _ = tokio::time::timeout(Duration::from_secs(10), released).await;
+                txn.rollback().await.unwrap();
+            }
+        });
+        held.recv().unwrap();
+        let fill = with_password(PASSWORD, 0);
+        let intent = intent_of(Operation::ChangePassword, kadmin(false), &["dora"], &fill);
+        let edit = |s: &mut krb5_kdc::PrincipalStore| {
+            let bytes = PASSWORD.as_bytes();
+            s.set_password_etypes_keepold_n_in(&dora, "EXAMPLE.COM", bytes, 0, ADMIN, &etypes)
+        };
+        let started = std::time::Instant::now();
+        let answered = match kadmin_try(&store, true, intent, &dora, &edit) {
+            Ok(()) => ("written".to_owned(), String::new()),
+            Err(StoreError::Host(KerberosStoreError::Denied(denial))) => {
+                (code_name(denial.kadm5_code).to_owned(), denial.text)
+            }
+            Err(e) => ("another answer".to_owned(), e.to_string()),
+        };
+        let (took, still_held) = (started.elapsed(), !holder.is_finished());
+        let _ = release.send(());
+        runtime.block_on(holder).unwrap();
+        let denials: Rows = guard
+            .recorder()
+            .take_events()
+            .into_iter()
+            .filter(|e| e.kind == LogKind::AccessDenied)
+            .map(|e| (e.kind, e.target, e.detail))
+            .collect();
+        let unchanged = record_of(&pool, &runtime, "dora") == before;
+        assert_eq!(
+            (answered, denials, unchanged),
+            (
+                (
+                    "PASS_Q_GENERIC".to_owned(),
+                    "the password policy could not be read; try again".to_owned()
+                ),
+                denial(
+                    "dora@EXAMPLE.COM",
+                    "change_password",
+                    "PASS_Q_GENERIC: the password policy could not be read"
+                ),
+                true
+            ),
+            "the minimum not read within its bound: the generic refusal, the record unchanged"
+        );
+        assert!(
+            still_held && took >= MIN_WAIT && took < MIN_WAIT + Duration::from_secs(3),
+            "the cpw was answered after {took:?}, the database still held: {still_held}"
+        );
+        drop((embedded, store, host, temp));
+        runtime.block_on(committer.shutdown());
+    }
+
+    #[test]
+    #[serial]
+    fn test_a_kadmin_cpw_is_held_to_the_minimum_of_the_users_ou() {
+        use lldap_domain_handlers::enforcement::PolicyCache;
+        use lldap_domain_handlers::password::PASSWORD_MIN_LENGTH_ITEM;
+        use lldap_domain_handlers::policies::CreatePolicyRequest;
+        const SHORT_12: &str = "PASS_Q_TOOSHORT: the password is shorter than 12 characters";
+        let memory = |runtime: &Runtime| sqlite_one_connection("sqlite::memory:", runtime);
+        let cache: &'static PolicyCache = Box::leak(Box::new(PolicyCache::new()));
+        let (runtime, temp, committer, _pool, handler, host, store, embedded) =
+            wired_realm_with(&memory, &["dora"], Some(cache), None);
+        runtime
+            .block_on(synced(&embedded, &UserId::new("dora"), "Dora-Password-0"))
+            .unwrap();
+        let etypes: Vec<krb5_crypto::KeySalt> = temp
+            .settings
+            .supported_enctypes
+            .iter()
+            .map(|&e| e.into())
+            .collect();
+        let dora = name("dora");
+        let cpw = |password: &'static str| {
+            let fill = with_password(password, 0);
+            let intent = intent_of(Operation::ChangePassword, kadmin(false), &["dora"], &fill);
+            let edit = |s: &mut krb5_kdc::PrincipalStore| {
+                let bytes = password.as_bytes();
+                s.set_password_etypes_keepold_n_in(&dora, "EXAMPLE.COM", bytes, 0, ADMIN, &etypes)
+            };
+            match kadmin_try(&store, true, intent, &dora, &edit) {
+                Ok(()) => "written".to_owned(),
+                Err(StoreError::Host(KerberosStoreError::Denied(denial))) => {
+                    format!("{}: {}", code_name(denial.kadm5_code), denial.text)
+                }
+                Err(e) => e.to_string(),
+            }
+        };
+        let without = cpw("Dora-Pw8");
+        let request = CreatePolicyRequest {
+            name: "min 12".to_owned(),
+            description: String::new(),
+            items: std::collections::BTreeMap::from([(
+                PASSWORD_MIN_LENGTH_ITEM.to_owned(),
+                "12".to_owned(),
+            )]),
+        };
+        runtime.block_on(async {
+            let id = handler.create_policy(request).await.unwrap();
+            handler.set_ou_policy("people", id).await.unwrap();
+        });
+        let with = [cpw("Dora-Pass-1"), cpw("Dora-Pass-12"), cpw("Dora-Pw8")];
+        assert_eq!(
+            (without, with),
+            (
+                "written".to_owned(),
+                [
+                    SHORT_12.to_owned(),
+                    "written".to_owned(),
+                    SHORT_12.to_owned()
+                ]
+            ),
+            "no policy: the default 8; the OU people at 12: 11 refused, 12 written, 8 refused"
+        );
+        drop((embedded, store, host, temp));
+        runtime.block_on(committer.shutdown());
+    }
+
+    #[test]
+    #[serial]
+    fn test_the_commit_judges_the_minimum_its_prepare_read() {
+        use lldap_test_utils::recording_log::LogGuard;
+        let guard = LogGuard::install();
+        let realm = SqlRealm::new(Arc::new(Nothing)).serving("EXAMPLE.COM", None);
+        realm.start_pass_committed();
+        let dora = krb5_kdc::PrincipalBuilder::new(name("dora"), "EXAMPLE.COM").build();
+        let change = |password: &'static str, min: usize| {
+            let prepared: HostPrepared = Box::new(PreparedRecord {
+                user: UserId::new("dora"),
+                record: Vec::new(),
+                min,
+            });
+            let fill = with_password(password, 0);
+            HostChange {
+                intent: intent_of(Operation::ChangePassword, kadmin(false), &["dora"], &fill),
+                rows: vec![RowChange {
+                    id: "dora@EXAMPLE.COM".to_owned(),
+                    before: Some(dora.clone()),
+                    after: Some(dora.clone()),
+                    mask: 0,
+                    host_owned: true,
+                }],
+                prepared: Some(prepared),
+                batch: RealmBatch::default(),
+            }
+        };
+        let too_short = |n: usize| {
+            let text = format!("the password is shorter than {n} characters");
+            let row = denial("dora@EXAMPLE.COM", "change_password", "PASS_Q_TOOSHORT");
+            (("PASS_Q_TOOSHORT".to_owned(), text), row)
+        };
+        let written = (
+            (
+                "refused".to_owned(),
+                "this Kerberos store writes no directory rows".to_owned(),
+            ),
+            Vec::new(),
+        );
+        let rows = [
+            (
+                "11 characters, 12 at prepare",
+                "Dora-Pass-1",
+                12,
+                too_short(12),
+            ),
+            (
+                "12 characters, 20 at prepare",
+                "Dora-Pass-12",
+                20,
+                too_short(20),
+            ),
+            (
+                "12 characters, 12 at prepare: on to the write",
+                "Dora-Pass-12",
+                12,
+                written,
+            ),
+        ];
+        for (label, password, min, expected) in rows {
+            let got = match realm.commit_change(change(password, min)) {
+                Err(KerberosStoreError::Denied(denial)) => {
+                    (code_name(denial.kadm5_code).to_owned(), denial.text)
+                }
+                Err(KerberosStoreError::Refused(why)) => ("refused".to_owned(), why),
+                other => ("another answer".to_owned(), format!("{other:?}")),
+            };
+            let denials: Rows = guard
+                .recorder()
+                .take_events()
+                .into_iter()
+                .filter(|e| e.kind == LogKind::AccessDenied)
+                .map(|e| (e.kind, e.target, e.detail))
+                .collect();
+            assert_eq!((got, denials), expected, "{label}");
+        }
+    }
+
     fn door_races_on(connect: Reconnect) {
         use crate::embedded::tests::kinit_code;
         use lldap_domain_handlers::handler::{BindRequest, LoginHandler, UserBackendHandler};
@@ -2945,9 +3507,15 @@ mod tests {
         let (carl, dave) = (UserId::new("carl"), UserId::new("dave"));
         runtime.block_on(async {
             handler.update_user(sync_request("dave", 1)).await.unwrap();
-            change_password_everywhere(&handler, &dave, "Dave-Pass-1", PasswordSync::On)
-                .await
-                .unwrap();
+            change_password_everywhere(
+                &handler,
+                &dave,
+                "Dave-Pass-1",
+                PasswordSync::On,
+                PASSWORD_MIN_LENGTH,
+            )
+            .await
+            .unwrap();
         });
         let binds = |user: &str, password: &str| {
             let request = BindRequest {
@@ -2960,14 +3528,26 @@ mod tests {
         let pause::Paused { reached, resume } = pause::arm(&carl);
         let (plain, ()) = runtime.block_on(async {
             tokio::join!(
-                change_password_everywhere(&handler, &carl, "Carl-Plain-1", PasswordSync::Off),
+                change_password_everywhere(
+                    &handler,
+                    &carl,
+                    "Carl-Plain-1",
+                    PasswordSync::Off,
+                    PASSWORD_MIN_LENGTH
+                ),
                 async {
                     reached.await.unwrap();
                     handler.update_user(sync_request("carl", 1)).await.unwrap();
                     let synced = PasswordSync::On;
-                    change_password_everywhere(&handler, &carl, "Carl-Synced-1", synced)
-                        .await
-                        .unwrap();
+                    change_password_everywhere(
+                        &handler,
+                        &carl,
+                        "Carl-Synced-1",
+                        synced,
+                        PASSWORD_MIN_LENGTH,
+                    )
+                    .await
+                    .unwrap();
                     resume.send(()).unwrap();
                 }
             )
@@ -2985,7 +3565,13 @@ mod tests {
         let pause::Paused { reached, resume } = pause::arm(&dave);
         let (synced, ()) = runtime.block_on(async {
             tokio::join!(
-                change_password_everywhere(&handler, &dave, "Dave-Pass-2", PasswordSync::On),
+                change_password_everywhere(
+                    &handler,
+                    &dave,
+                    "Dave-Pass-2",
+                    PasswordSync::On,
+                    PASSWORD_MIN_LENGTH
+                ),
                 async {
                     reached.await.unwrap();
                     handler.update_user(sync_request("dave", 0)).await.unwrap();
@@ -3009,9 +3595,15 @@ mod tests {
                 reached.await.unwrap();
                 handler.update_user(sync_request("erin", 1)).await.unwrap();
                 let synced = PasswordSync::On;
-                change_password_everywhere(&handler, &erin, "Erin-Synced-1", synced)
-                    .await
-                    .unwrap();
+                change_password_everywhere(
+                    &handler,
+                    &erin,
+                    "Erin-Synced-1",
+                    synced,
+                    PASSWORD_MIN_LENGTH,
+                )
+                .await
+                .unwrap();
                 resume.send(()).unwrap();
             })
         });
@@ -3052,9 +3644,15 @@ mod tests {
         let hal = UserId::new("hal");
         runtime.block_on(async {
             handler.update_user(sync_request("hal", 1)).await.unwrap();
-            change_password_everywhere(&handler, &hal, "Hal-Pass-1", PasswordSync::On)
-                .await
-                .unwrap();
+            change_password_everywhere(
+                &handler,
+                &hal,
+                "Hal-Pass-1",
+                PasswordSync::On,
+                PASSWORD_MIN_LENGTH,
+            )
+            .await
+            .unwrap();
         });
         set_kerberos_backend(Arc::new(NoopKerberos::default()));
         sql(
@@ -3124,7 +3722,13 @@ mod tests {
         let ivy = UserId::new("ivy");
         let change = |password: &str| {
             let plain = PasswordSync::Off;
-            runtime.block_on(change_password_everywhere(&handler, &ivy, password, plain))
+            runtime.block_on(change_password_everywhere(
+                &handler,
+                &ivy,
+                password,
+                plain,
+                PASSWORD_MIN_LENGTH,
+            ))
         };
         let refusals = || {
             log.recorder()
@@ -3467,6 +4071,7 @@ mod tests {
         let handler = SqlBackendHandler::new(generate_random_private_key(), pool.clone());
         let records = Records {
             handler: Arc::new(handler.clone()),
+            policies: Arc::new(handler.clone()),
             runtime: runtime.handle().clone(),
         };
         let host = Arc::new(SqlRealm::new(committer.store()).serving("EXAMPLE.COM", Some(records)));
@@ -4565,8 +5170,10 @@ mod tests {
             add_user(&pool, &runtime, user);
         }
         let calls = Arc::new(AtomicUsize::new(0));
+        let (policies, _) = minimums(&[Some(PASSWORD_MIN_LENGTH)]);
         let records = Records {
             handler: counting_deriver(Arc::clone(&calls)),
+            policies,
             runtime: runtime.handle().clone(),
         };
         let host = Arc::new(SqlRealm::new(committer.store()).serving("EXAMPLE.COM", Some(records)));
@@ -4611,6 +5218,7 @@ mod tests {
             let alice = PreparedRecord {
                 user: UserId::new("alice"),
                 record: b"alice's record".to_vec(),
+                min: PASSWORD_MIN_LENGTH,
             };
             (intent, Some(Box::new(alice) as HostPrepared))
         };
@@ -4949,6 +5557,7 @@ mod tests {
         let handler = SqlBackendHandler::new(generate_random_private_key(), pool.clone());
         let records = Records {
             handler: Arc::new(handler.clone()),
+            policies: Arc::new(handler.clone()),
             runtime: runtime.handle().clone(),
         };
         let host = Arc::new(SqlRealm::new(committer.store()).serving("EXAMPLE.COM", Some(records)));
@@ -5168,6 +5777,7 @@ mod tests {
         let handler = SqlBackendHandler::new(generate_random_private_key(), pool.clone());
         let records = Records {
             handler: Arc::new(handler.clone()),
+            policies: Arc::new(handler.clone()),
             runtime: runtime.handle().clone(),
         };
         let host = Arc::new(SqlRealm::new(committer.store()).serving("EXAMPLE.COM", Some(records)));

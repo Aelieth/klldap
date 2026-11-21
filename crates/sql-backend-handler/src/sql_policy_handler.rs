@@ -3,12 +3,14 @@ use crate::sql_lockout_handler::CountingStart;
 use crate::sql_mfa_windows::read_windows;
 use async_trait::async_trait;
 use lldap_domain::types::{User, UserId};
+use lldap_domain_handlers::enforcement::resolve_items;
 use lldap_domain_handlers::handler::PolicyBackendHandler;
 use lldap_domain_handlers::kdc_proof::ProofWindow;
 use lldap_domain_handlers::logging::{self, LogKind};
+use lldap_domain_handlers::password::PasswordMinLength;
 use lldap_domain_handlers::policies::{
     AttachedPolicy, CreatePolicyRequest, OuPolicyState, Policy, PolicyId, PolicyLevel,
-    UpdatePolicyRequest, canonical_ou_key, ou_chain, ou_display,
+    UpdatePolicyRequest, canonical_ou_key, ou_chain, ou_display, resolve,
 };
 use lldap_domain_model::{
     error::{DomainError, Result},
@@ -392,6 +394,14 @@ impl PolicyBackendHandler for SqlBackendHandler {
         self.bounded_entry(user).await
     }
 
+    async fn password_min_length(&self, user_id: &UserId) -> Result<usize> {
+        match resolve_items(self, self.policy_cache, user_id).await {
+            Ok(items) => Ok(resolve::<PasswordMinLength>(None, &items).0),
+            Err(DomainError::EntityNotFound(_)) => Ok(resolve::<PasswordMinLength>(None, &[]).0),
+            Err(e) => Err(e),
+        }
+    }
+
     async fn read_proof_windows(
         &self,
         user: Option<&UserId>,
@@ -404,9 +414,10 @@ impl PolicyBackendHandler for SqlBackendHandler {
 mod tests {
     use super::*;
     use crate::sql_backend_handler::tests::get_initialized_db;
+    use crate::sql_lockout_handler::tests as doors;
     use lldap_auth::opaque::server::generate_random_private_key;
     use lldap_domain::requests::{CreateUserRequest, UpdateUserRequest};
-    use lldap_domain::types::{Attribute, UserId};
+    use lldap_domain::types::{Attribute, LoginOutcome, UserId};
     use lldap_domain_handlers::enforcement::{
         Attempt, Door, PolicyCache, Refusal, UNREADABLE, admit, admit_at_kdc, fill_policy_cache,
         follow_commit, item_checks, user_written,
@@ -414,6 +425,10 @@ mod tests {
     use lldap_domain_handlers::handler::UserBackendHandler;
     use lldap_domain_handlers::kerberos::CommitError;
     use lldap_domain_handlers::logging::{LogKind, RequestMeta, with_request};
+    use lldap_domain_handlers::password::{
+        PASSWORD_MIN_LENGTH, PASSWORD_MIN_LENGTH_ITEM, PasswordChangeError, PasswordSync,
+        change_password_everywhere, min_length_of,
+    };
     use lldap_test_utils::enforcement::EnforcementGuard;
     use lldap_test_utils::recording_log::LogGuard;
     use pretty_assertions::assert_eq;
@@ -702,6 +717,127 @@ mod tests {
         assert_eq!(swapped(&handler), 0, "nothing to remove");
         handler.delete_policy(id).await.unwrap();
         assert_eq!(swapped(&handler), 1, "delete");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_the_minimum_is_the_users_ou_value_else_eight() {
+        let h = doors::handler().await;
+        doors::user_in(&h, "e3long", "e3ou").await;
+        doors::user_in(&h, "e3east", "e3ou\\east").await;
+        doors::user_in(&h, "e3plain", "e3other").await;
+        doors::policy_on(&h, "e3ou", &[(PASSWORD_MIN_LENGTH_ITEM, "12")]).await;
+        let mut got = Vec::new();
+        for user in ["e3long", "e3east", "e3plain", "e3nobody"] {
+            got.push(h.password_min_length(&UserId::new(user)).await.unwrap());
+        }
+        h.set_ou_policy_inheritance("e3ou\\east", true)
+            .await
+            .unwrap();
+        let blocked = h.password_min_length(&UserId::new("e3east")).await;
+        assert_eq!(
+            (got, blocked.unwrap()),
+            (vec![12, 12, 8, 8], 8),
+            "the OU's 12, inherited below it; 8 elsewhere, for no user, and below a block"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_change_is_held_to_the_minimum_it_is_given_with_one_row() {
+        let log = LogGuard::install_on_this_thread();
+        let h = doors::handler().await;
+        doors::user_in(&h, "e3change", "e3ou").await;
+        let user = UserId::new("e3change");
+        let plain = PasswordSync::Off;
+        let _ = doors::rows(&log, &[]);
+        let short = change_password_everywhere(&h, &user, "Eleven-11ch", plain, 12).await;
+        let short_rows = doors::rows(&log, &[LogKind::PasswordChange]);
+        let long = change_password_everywhere(&h, &user, "Twelve-12chr", plain, 12).await;
+        let long_rows = doors::rows(&log, &[LogKind::PasswordChange]);
+        let target = || Some("e3change".to_owned());
+        assert_eq!(
+            (short, short_rows),
+            (
+                Err(PasswordChangeError::TooShort(12)),
+                vec![(
+                    LogKind::PasswordChange,
+                    target(),
+                    Some("the password must be at least 12 characters".to_owned())
+                )]
+            ),
+            "an 11-character password is refused with one row"
+        );
+        assert_eq!(
+            (
+                long,
+                long_rows,
+                doors::bind(&h, "e3change", "Twelve-12chr").await
+            ),
+            (
+                Ok(()),
+                vec![(LogKind::PasswordChange, target(), None)],
+                true
+            ),
+            "a 12-character one is stored and binds"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_password_set_before_the_minimum_rose_still_signs_in() {
+        let h = doors::handler().await;
+        doors::user_in(&h, "e3old", "e3ou").await;
+        let user = UserId::new("e3old");
+        let floor = PASSWORD_MIN_LENGTH;
+        let set = change_password_everywhere(&h, &user, "Nine-99ch", PasswordSync::Off, floor);
+        set.await.unwrap();
+        doors::policy_on(&h, "e3ou", &[(PASSWORD_MIN_LENGTH_ITEM, "12")]).await;
+        let web = doors::web(&h, "e3old", "Nine-99ch", None).await;
+        assert_eq!(
+            (
+                "Nine-99ch".chars().count(),
+                h.password_min_length(&user).await.unwrap(),
+                doors::bind(&h, "e3old", "Nine-99ch").await,
+                matches!(web, Ok(LoginOutcome::Authenticated { .. }))
+            ),
+            (9, 12, true, true),
+            "a 9-character password set under 8 still binds and logs in under 12"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_an_unreadable_minimum_refuses_the_change_never_eight() {
+        let log = LogGuard::install_on_this_thread();
+        let h = doors::handler().await;
+        doors::user_in(&h, "e3unread", "e3bad").await;
+        let id = doors::policy_on(&h, "e3bad", &[(PASSWORD_MIN_LENGTH_ITEM, "12")]).await;
+        store_items(&h, id, "not json").await;
+        let user = UserId::new("e3unread");
+        assert!(
+            h.policy_cache.get().items_of(&user).is_none(),
+            "the handler's cache holds no entry for the user, so the read below reaches the database"
+        );
+        let _ = doors::rows(&log, &[]);
+        let read = h.password_min_length(&user).await;
+        let refused = min_length_of(&h, &user).await;
+        assert_eq!(
+            (
+                read.is_err(),
+                refused,
+                doors::rows(&log, &[LogKind::PasswordChange])
+            ),
+            (
+                true,
+                Err(PasswordChangeError::PolicyUnreadable),
+                vec![(
+                    LogKind::PasswordChange,
+                    Some("e3unread".to_owned()),
+                    Some("the password policy could not be read; try again".to_owned())
+                )]
+            )
+        );
     }
 
     #[tokio::test]

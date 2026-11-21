@@ -2259,7 +2259,9 @@ mod tests {
         step: Life,
         disabled: GroupId,
     ) -> (UserId, std::result::Result<(), String>) {
-        use lldap_domain_handlers::password::{PasswordSync, change_password_everywhere};
+        use lldap_domain_handlers::password::{
+            PASSWORD_MIN_LENGTH, PasswordSync, change_password_everywhere,
+        };
         let create = |on: i64| CreateUserRequest {
             user_id: UserId::new("erin"),
             email: "erin@example.com".into(),
@@ -2278,8 +2280,14 @@ mod tests {
             }
             Life::SyncedPassword => {
                 let patrick = UserId::new("patrick");
-                let done =
-                    change_password_everywhere(handler, &patrick, "Patrick-1", PasswordSync::On);
+                let on = PasswordSync::On;
+                let done = change_password_everywhere(
+                    handler,
+                    &patrick,
+                    "Patrick-1",
+                    on,
+                    PASSWORD_MIN_LENGTH,
+                );
                 let done = done.await.map_err(|e| e.to_string());
                 return (patrick, done);
             }
@@ -2299,8 +2307,14 @@ mod tests {
             }
             Life::PlainPassword => {
                 let john = UserId::new("John");
-                let done =
-                    change_password_everywhere(handler, &john, "John-Pass-1", PasswordSync::Off);
+                let off = PasswordSync::Off;
+                let done = change_password_everywhere(
+                    handler,
+                    &john,
+                    "John-Pass-1",
+                    off,
+                    PASSWORD_MIN_LENGTH,
+                );
                 let done = done.await.map_err(|e| e.to_string());
                 return (john, done);
             }

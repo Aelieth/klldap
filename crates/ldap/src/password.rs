@@ -14,7 +14,7 @@ use lldap_auth::access_control::ValidationResults;
 use lldap_domain::types::{UserId, kerberos_sync_enabled};
 use lldap_domain_handlers::handler::{BackendHandler, BindRequest, LoginHandler};
 use lldap_domain_handlers::password::{
-    PasswordChangeError, PasswordSync, change_password_everywhere,
+    PasswordChangeError, PasswordSync, change_password_everywhere, min_length_of,
 };
 use lldap_domain_model::error::DomainError;
 use lldap_mfa::{MFA_ENROLLMENT_REQUIRED, TOTP_SEPARATOR, TotpFailure, totp_failure};
@@ -94,8 +94,9 @@ fn totp_diagnostic(message: &str) -> String {
 
 pub(crate) fn password_change_error(e: PasswordChangeError) -> LdapError {
     let code = match &e {
-        PasswordChangeError::TooShort
+        PasswordChangeError::TooShort(_)
         | PasswordChangeError::HasNul
+        | PasswordChangeError::PolicyUnreadable
         | PasswordChangeError::Refused(_)
         | PasswordChangeError::SyncChanged
         | PasswordChangeError::KerberosDisabled(_) => LdapResultCode::UnwillingToPerform,
@@ -128,7 +129,11 @@ pub(crate) async fn change_password<Handler: BackendHandler + OpaqueHandler>(
         })?;
     let sync_enabled = kerberos_sync_enabled(&user.attributes);
     let sync = PasswordSync::of(sync_enabled);
-    if let Err(e) = change_password_everywhere(opaque_handler, user_id, password, sync).await {
+    let changed = match min_length_of(backend_handler.unsafe_get_handler(), user_id).await {
+        Ok(min) => change_password_everywhere(opaque_handler, user_id, password, sync, min).await,
+        Err(e) => Err(e),
+    };
+    if let Err(e) = changed {
         warn!("LDAP password change for {user_id} failed: {e}");
         return Err(password_change_error(e));
     }

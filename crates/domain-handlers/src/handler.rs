@@ -255,6 +255,8 @@ pub trait PolicyBackendHandler: Send + Sync {
     async fn delete_ou_policy_state(&self, ou: &str) -> Result<()>;
     /// The user and the levels of the user's OU, in one read the database bounds.
     async fn bounded_policy_entry(&self, user: &UserId) -> Result<(User, Vec<PolicyLevel>)>;
+    /// The user's resolved `password-min-length`, in characters.
+    async fn password_min_length(&self, user_id: &UserId) -> Result<usize>;
     /// Kerberos's windows opened by a second factor, the user's or everyone's.
     async fn read_proof_windows(
         &self,

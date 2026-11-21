@@ -39,7 +39,7 @@ use lldap_domain_handlers::handler::{
     BackendHandler, LockoutBackendHandler, ReadSchemaBackendHandler, UserRequestFilter,
 };
 use lldap_domain_handlers::mfa::is_protected_group;
-use lldap_domain_handlers::password::{PasswordSync, change_password_everywhere};
+use lldap_domain_handlers::password::{PasswordSync, change_password_everywhere, min_length_of};
 use lldap_opaque_handler::OpaqueHandler;
 use lldap_schema::schema::AttributeList;
 use lldap_validation::attributes::{ALLOWED_CHARACTERS_DESCRIPTION, validate_attribute_name};
@@ -152,8 +152,13 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             .map_err(|e| anyhow!("Failed to fetch user for Kerberos sync check: {e}"))?;
         let sync_enabled = kerberos_sync_enabled(&user.attributes);
         let sync = PasswordSync::of(sync_enabled);
-        if let Err(e) = change_password_everywhere(handler, &target_user_id, &password, sync).await
-        {
+        let changed = match min_length_of(handler, &target_user_id).await {
+            Ok(min) => {
+                change_password_everywhere(handler, &target_user_id, &password, sync, min).await
+            }
+            Err(e) => Err(e),
+        };
+        if let Err(e) = changed {
             warn!("Password set for {target_user_id} failed: {e}");
             return Err(anyhow!("{e}").into());
         }
@@ -1652,6 +1657,13 @@ mod tests {
         mock.expect_get_user_groups()
             .with(eq(UserId::new("alice")))
             .returning(move |_| Ok(groups.clone()));
+        expect_the_floor(mock);
+    }
+
+    fn expect_the_floor(mock: &mut MockTestBackendHandler) {
+        use lldap_domain_handlers::password::PASSWORD_MIN_LENGTH;
+        mock.expect_password_min_length()
+            .returning(|_| Ok(PASSWORD_MIN_LENGTH));
     }
 
     fn alice_committed() -> KerberosOp {
@@ -1833,9 +1845,9 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_set_user_password_refuses_a_short_password() {
-        use lldap_domain_handlers::password::{PASSWORD_HAS_NUL, PASSWORD_TOO_SHORT};
+        use lldap_domain_handlers::password::PASSWORD_HAS_NUL;
         let refusals = [
-            ("pässwör", PASSWORD_TOO_SHORT),
+            ("pässwör", "the password must be at least 8 characters"),
             ("a\0aaaaaaa", PASSWORD_HAS_NUL),
         ];
         for (synced, (password, refusal)) in [false, true]
@@ -1852,6 +1864,7 @@ mod tests {
                 mock.expect_get_user_groups()
                     .with(eq(UserId::new("alice")))
                     .returning(|_| Ok(std::collections::HashSet::new()));
+                expect_the_floor(&mut mock);
             }
             mock.expect_registration_start().times(0);
             mock.expect_registration_finish().times(0);
@@ -1873,6 +1886,84 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn test_set_user_password_asks_the_users_minimum_and_refuses_when_it_is_unreadable() {
+        use lldap_domain_handlers::logging::LogKind;
+        use lldap_domain_model::error::DomainError;
+        use lldap_test_utils::recording_log::LogGuard;
+        let eleven = "Eleven-11ch";
+        let rows: [(bool, Option<usize>, &str); 4] = [
+            (
+                false,
+                Some(12),
+                "the password must be at least 12 characters",
+            ),
+            (
+                true,
+                Some(12),
+                "the password must be at least 12 characters",
+            ),
+            (
+                false,
+                None,
+                "the password policy could not be read; try again",
+            ),
+            (
+                true,
+                None,
+                "the password policy could not be read; try again",
+            ),
+        ];
+        assert_eq!(eleven.chars().count(), 11);
+        for (synced, min, refusal) in rows {
+            let mut mock = MockTestBackendHandler::new();
+            mock.expect_password_min_length()
+                .with(eq(UserId::new("alice")))
+                .times(1)
+                .returning(move |_| {
+                    min.ok_or_else(|| DomainError::InternalError("down".to_owned()))
+                });
+            if synced {
+                synced_alice(&mut mock, std::collections::HashSet::new());
+            } else {
+                mock.expect_get_user_details()
+                    .with(eq(UserId::new("alice")))
+                    .returning(|uid| Ok(sample_user(uid.as_str(), vec![])));
+                mock.expect_get_user_groups()
+                    .with(eq(UserId::new("alice")))
+                    .returning(|_| Ok(std::collections::HashSet::new()));
+            }
+            mock.expect_registration_start().times(0);
+            mock.expect_registration_finish().times(0);
+            mock.expect_ensure_kerberos_principal_consistency().times(0);
+            let guard = RecordingGuard::install();
+            let log = LogGuard::install_on_this_thread();
+            let (value, errors) = set_password_to("alice", eleven, mock).await;
+            let messages: Vec<_> = errors
+                .iter()
+                .map(|e| e.error().message().to_owned())
+                .collect();
+            let logged: Vec<_> = log
+                .recorder()
+                .take_events()
+                .into_iter()
+                .filter(|e| e.kind == LogKind::PasswordChange)
+                .map(|e| (e.target, e.success, e.detail))
+                .collect();
+            assert_ne!(value, graphql_value!({"setUserPassword": {"ok": true}}));
+            assert_eq!(
+                (messages, guard.recorder().take_ops(), logged),
+                (
+                    vec![refusal.to_owned()],
+                    vec![],
+                    vec![(Some("alice".to_owned()), false, Some(refusal.to_owned()))]
+                ),
+                "synced {synced}, {min:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_set_user_password_without_sync_is_the_directory_write_alone() {
         let mut mock = MockTestBackendHandler::new();
         mock.expect_get_user_details()
@@ -1881,6 +1972,7 @@ mod tests {
         mock.expect_get_user_groups()
             .with(eq(UserId::new("alice")))
             .returning(|_| Ok(std::collections::HashSet::new()));
+        expect_the_floor(&mut mock);
         expect_registration_start(&mut mock, "alice");
         mock.expect_registration_finish()
             .times(1)
@@ -1932,6 +2024,7 @@ mod tests {
         mock.expect_get_user_details()
             .with(eq(UserId::new("bob")))
             .returning(|uid| Ok(sample_user(uid.as_str(), vec![])));
+        expect_the_floor(&mut mock);
         mock.expect_ensure_kerberos_principal_consistency()
             .with(eq(UserId::new("bob")), eq(false))
             .times(1)

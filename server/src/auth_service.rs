@@ -25,7 +25,8 @@ use lldap_auth::{
 use lldap_domain::types::{GroupDetails, GroupName, LoginOutcome, UserId, kerberos_sync_enabled};
 use lldap_domain_handlers::enforcement::{Attempt, Door, admit, refuse_unreadable};
 use lldap_domain_handlers::handler::{
-    BackendHandler, BindRequest, LoginHandler, MfaBackendHandler, UserRequestFilter,
+    BackendHandler, BindRequest, LoginHandler, MfaBackendHandler, PolicyBackendHandler,
+    UserRequestFilter,
 };
 use lldap_domain_handlers::kerberos::{
     KerberosState, SYNC_OFF_FIRST, kerberos_backend, refusal_while_degraded, settled_state,
@@ -34,7 +35,8 @@ use lldap_domain_handlers::kerberos::{
 use lldap_domain_handlers::logging::{self, LogKind, with_actor};
 use lldap_domain_handlers::mfa::{MfaPolicy, MfaRequirement, MfaResetReason};
 use lldap_domain_handlers::password::{
-    PasswordChangeError, finish_plain, finish_synced_registration, realm_not_ready, record_failed,
+    PasswordChangeError, finish_plain, finish_synced_registration, min_length_of, realm_not_ready,
+    record_failed,
 };
 use lldap_domain_model::{error::DomainError, model::UserColumn};
 use lldap_graphql_server::{open_password_envelope, public_key_der_base64};
@@ -669,24 +671,36 @@ where
             "Not authorized to change the user's password".to_string(),
         ));
     }
-    let kerberos_envelope_key = envelope_key_for(
-        data.get_readonly_handler(),
-        user_id,
+    start_answer(
+        data.get_password_handler(),
+        registration_start_request,
         settled_state(),
         public_key_der_base64,
     )
-    .await?;
-    let response = data
-        .get_opaque_handler()
-        .registration_start(registration_start_request)
-        .await?;
+    .await
+}
+
+/// The start's answer: the sealing key for a synced user, and every user's minimum length.
+async fn start_answer(
+    handler: &(impl OpaqueHandler + UserReadableBackendHandler + PolicyBackendHandler),
+    request: registration::ClientRegistrationStartRequest,
+    state: KerberosState,
+    key: impl FnOnce() -> String,
+) -> TcpResult<registration::ServerRegistrationStart> {
+    let user_id = request.username.clone();
+    let kerberos_envelope_key = envelope_key_for(handler, &user_id, state, key).await?;
+    let min = min_length_of(handler, &user_id)
+        .await
+        .map_err(password_change_error)?;
+    let response = handler.registration_start(request).await?;
     Ok(registration::ServerRegistrationStart {
         response,
         kerberos_envelope_key,
+        password_min_length: Some(min as u32),
     })
 }
 
-/// Only a user with Kerberos sync gets the key; anyone else's start answer is upstream's.
+/// Only a user with Kerberos sync gets the key; anyone else's start answer has none.
 async fn envelope_key_for(
     handler: &impl UserReadableBackendHandler,
     user_id: &UserId,
@@ -750,7 +764,7 @@ async fn finish_registration<Handler>(
     open: impl FnOnce(&str, &UserId) -> anyhow::Result<Zeroizing<String>>,
 ) -> TcpResult<UserId>
 where
-    Handler: OpaqueHandler + UserReadableBackendHandler,
+    Handler: OpaqueHandler + UserReadableBackendHandler + PolicyBackendHandler,
 {
     let registration::ClientRegistrationFinish {
         request,
@@ -787,11 +801,14 @@ where
             KerberosState::NotReady(cause) => return Err(not_ready(&user_id, cause)),
         },
     };
+    let min = min_length_of(handler, &user_id)
+        .await
+        .map_err(password_change_error)?;
     let password = open(&envelope, &user_id).map_err(|e| {
         warn!("A Kerberos password envelope for {user_id} did not open: {e}");
         refused_change(&user_id, format!("{ENVELOPE_UNOPENED}: {e}"))
     })?;
-    match finish_synced_registration(handler, &user_id, &password).await {
+    match finish_synced_registration(handler, &user_id, &password, min).await {
         Ok(()) => {
             info!("Kerberos principal synced for user {user_id}");
             Ok(user_id)
@@ -806,8 +823,9 @@ where
 fn password_change_error(e: PasswordChangeError) -> TcpError {
     match e {
         PasswordChangeError::Refused(_)
-        | PasswordChangeError::TooShort
+        | PasswordChangeError::TooShort(_)
         | PasswordChangeError::HasNul
+        | PasswordChangeError::PolicyUnreadable
         | PasswordChangeError::SyncChanged
         | PasswordChangeError::KerberosDisabled(_) => TcpError::BadRequest(e.to_string()),
         PasswordChangeError::InProgress => TcpError::Conflict(e.to_string()),
@@ -1246,23 +1264,49 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_without_a_key_or_an_envelope_the_wire_is_upstreams() {
+    fn test_without_a_key_or_an_envelope_the_wire_carries_only_the_minimum() {
         let start = start_response();
         let plain = serde_json::to_value(&start).unwrap();
         let mut keyed = plain.clone();
         keyed["kerberos_envelope_key"] = "the key".into();
-        for (key, wire) in [(None, plain.clone()), (Some("the key"), keyed)] {
+        let mut twelve = plain.clone();
+        twelve["password_min_length"] = 12.into();
+        let mut both = keyed.clone();
+        both["password_min_length"] = 12.into();
+        let rows = [
+            (None, None, plain.clone()),
+            (Some("the key"), None, keyed),
+            (None, Some(12), twelve),
+            (Some("the key"), Some(12), both),
+        ];
+        for (key, min, wire) in rows {
             let answer = registration::ServerRegistrationStart {
                 response: start.clone(),
                 kerberos_envelope_key: key.map(str::to_owned),
+                password_min_length: min,
             };
-            assert_eq!(serde_json::to_value(&answer).unwrap(), wire, "{key:?}");
+            assert_eq!(
+                serde_json::to_value(&answer).unwrap(),
+                wire,
+                "{key:?} {min:?}"
+            );
             let read: registration::ServerRegistrationStart =
                 serde_json::from_value(wire.clone()).unwrap();
-            assert_eq!(read.kerberos_envelope_key.as_deref(), key, "{key:?}");
+            assert_eq!(
+                (
+                    read.kerberos_envelope_key.as_deref(),
+                    read.password_min_length
+                ),
+                (key, min),
+                "{key:?} {min:?}"
+            );
             let upstream: registration::ServerRegistrationStartResponse =
                 serde_json::from_value(wire).unwrap();
-            assert_eq!(serde_json::to_value(&upstream).unwrap(), plain, "{key:?}");
+            assert_eq!(
+                serde_json::to_value(&upstream).unwrap(),
+                plain,
+                "{key:?} {min:?}"
+            );
         }
         let request = finish_request();
         let plain = serde_json::to_value(&request).unwrap();
@@ -1346,7 +1390,7 @@ pub(crate) mod tests {
     async fn test_a_synced_users_finish_is_one_transaction_and_takes_only_its_own_envelope() {
         let _backend = ONE_BACKEND.lock().await;
         use lldap_domain_handlers::kerberos::{ANSWER_UNSETTLED, SYNC_CHANGED};
-        use lldap_domain_handlers::password::{PASSWORD_HAS_NUL, PASSWORD_TOO_SHORT};
+        use lldap_domain_handlers::password::PASSWORD_HAS_NUL;
         use lldap_test_utils::recording_log::LogGuard;
         const OPENED: &str = "Opened-pass-1";
         const REFUSAL: &str = "password policy: min_length 40";
@@ -1488,7 +1532,7 @@ pub(crate) mod tests {
                 Kdc::Ready,
                 400,
                 false,
-                Some(PASSWORD_TOO_SHORT),
+                Some("the password must be at least 8 characters"),
             ),
             (
                 "sync, a NUL in nine characters",
@@ -1586,6 +1630,8 @@ pub(crate) mod tests {
             mock.expect_registration_finish()
                 .times(usize::from(upstream))
                 .returning(|_| Ok(UserId::new("alice")));
+            mock.expect_password_min_length()
+                .returning(|_| Ok(PASSWORD_MIN_LENGTH));
             let start = start_response();
             mock.expect_registration_start()
                 .times(usize::from(committed))
@@ -1684,8 +1730,10 @@ pub(crate) mod tests {
     fn test_a_password_change_error_answers_its_status() {
         let rows = [
             (PasswordChangeError::Refused("policy".to_owned()), 400),
-            (PasswordChangeError::TooShort, 400),
+            (PasswordChangeError::TooShort(8), 400),
+            (PasswordChangeError::TooShort(12), 400),
             (PasswordChangeError::HasNul, 400),
+            (PasswordChangeError::PolicyUnreadable, 400),
             (PasswordChangeError::SyncChanged, 400),
             (PasswordChangeError::KerberosDisabled("off".to_owned()), 400),
             (PasswordChangeError::InProgress, 409),
@@ -1700,9 +1748,176 @@ pub(crate) mod tests {
             assert_eq!(response.status().as_u16(), status, "{text}");
         }
         assert_eq!(
-            PasswordChangeError::TooShort.to_string(),
-            format!("the password must be at least {PASSWORD_MIN_LENGTH} characters")
+            PasswordChangeError::TooShort(PASSWORD_MIN_LENGTH).to_string(),
+            "the password must be at least 8 characters"
         );
+    }
+
+    #[tokio::test]
+    async fn test_a_synced_finish_asks_the_users_minimum_before_it_opens_the_envelope() {
+        let _backend = ONE_BACKEND.lock().await;
+        use lldap_test_utils::recording_log::LogGuard;
+        const ELEVEN: &str = "Eleven-11ch";
+        const TWELVE: &str = "Twelve-12chr";
+        type Row = (Option<usize>, &'static str, u16, bool, Option<&'static str>);
+        let rows: [Row; 3] = [
+            (
+                Some(12),
+                ELEVEN,
+                400,
+                true,
+                Some("the password must be at least 12 characters"),
+            ),
+            (Some(12), TWELVE, 200, true, None),
+            (
+                None,
+                TWELVE,
+                400,
+                false,
+                Some("the password policy could not be read; try again"),
+            ),
+        ];
+        assert_eq!((ELEVEN.chars().count(), TWELVE.chars().count()), (11, 12));
+        let log = LogGuard::install_on_this_thread();
+        for (min, password, status, opens, refusal) in rows {
+            let guard = RecordingGuard::install();
+            let committed = status == 200;
+            let mut mock = MockTestBackendHandler::new();
+            mock.expect_registration_user()
+                .times(1)
+                .returning(|_| Ok(UserId::new("alice")));
+            mock.expect_get_user_details()
+                .with(eq(UserId::new("alice")))
+                .times(1)
+                .returning(|_| Ok(alice(true)));
+            mock.expect_password_min_length()
+                .with(eq(UserId::new("alice")))
+                .times(1)
+                .returning(move |_| {
+                    min.ok_or_else(|| DomainError::InternalError("down".to_owned()))
+                });
+            mock.expect_registration_finish().times(0);
+            let start = start_response();
+            mock.expect_registration_start()
+                .times(usize::from(committed))
+                .returning(move |_| Ok(start.clone()));
+            let opened = Cell::new(false);
+            let finish =
+                finish_registration(&mock, None, finish_body(Some("for:alice")), |e, u| {
+                    opened.set(true);
+                    open_as(password)(e, u)
+                });
+            let got = finish
+                .await
+                .map_err(|e| error_to_http_response(e).status().as_u16());
+            let ops = guard.recorder().take_ops().len();
+            let rows: Vec<_> = log
+                .recorder()
+                .take_events()
+                .into_iter()
+                .filter(|e| e.kind == LogKind::PasswordChange && !e.success)
+                .map(|e| (e.target, e.detail))
+                .collect();
+            let expected = match status {
+                200 => Ok(UserId::new("alice")),
+                status => Err(status),
+            };
+            let one_row = refusal.map(|text| (Some("alice".to_owned()), Some(text.to_owned())));
+            assert_eq!(
+                (got, opened.get(), ops, rows),
+                (
+                    expected,
+                    opens,
+                    usize::from(committed),
+                    one_row.into_iter().collect::<Vec<_>>()
+                ),
+                "{min:?} {password}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_every_start_answers_the_users_minimum_and_an_unreadable_one_refuses() {
+        let _backend = ONE_BACKEND.lock().await;
+        use lldap_test_utils::recording_log::LogGuard;
+        type Answer = Result<(Option<&'static str>, Option<u32>), (u16, &'static str)>;
+        let rows: [(&str, bool, Option<usize>, Answer); 4] = [
+            ("without sync, 12", false, Some(12), Ok((None, Some(12)))),
+            ("without sync, 8", false, Some(8), Ok((None, Some(8)))),
+            (
+                "with sync, 12",
+                true,
+                Some(12),
+                Ok((Some("the key"), Some(12))),
+            ),
+            (
+                "unreadable",
+                false,
+                None,
+                Err((
+                    400,
+                    "Bad request: `the password policy could not be read; try again`",
+                )),
+            ),
+        ];
+        let log = LogGuard::install_on_this_thread();
+        for (row, sync, min, expected) in rows {
+            let mut mock = MockTestBackendHandler::new();
+            mock.expect_get_user_details()
+                .with(eq(UserId::new("alice")))
+                .times(1)
+                .returning(move |_| Ok(alice(sync)));
+            mock.expect_password_min_length()
+                .with(eq(UserId::new("alice")))
+                .times(1)
+                .returning(move |_| {
+                    min.ok_or_else(|| DomainError::InternalError("down".to_owned()))
+                });
+            let start = start_response();
+            mock.expect_registration_start()
+                .times(usize::from(expected.is_ok()))
+                .returning(move |_| Ok(start.clone()));
+            let mut rng = rand::rngs::OsRng;
+            let request = registration::ClientRegistrationStartRequest {
+                username: UserId::new("alice"),
+                registration_start_request: opaque::client::registration::start_registration(
+                    b"s3cret-pass",
+                    &mut rng,
+                )
+                .unwrap()
+                .message,
+            };
+            let got = start_answer(&mock, request, KerberosState::Ready, || {
+                "the key".to_owned()
+            })
+            .await
+            .map(|answer| (answer.kerberos_envelope_key, answer.password_min_length))
+            .map_err(|e| {
+                let text = e.to_string();
+                (error_to_http_response(e).status().as_u16(), text)
+            });
+            let rows: Vec<_> = log
+                .recorder()
+                .take_events()
+                .into_iter()
+                .filter(|e| e.kind == LogKind::PasswordChange && !e.success)
+                .map(|e| (e.target, e.detail))
+                .collect();
+            let one_row = expected.is_err().then(|| {
+                (
+                    Some("alice".to_owned()),
+                    Some("the password policy could not be read; try again".to_owned()),
+                )
+            });
+            let expected = expected
+                .map(|(key, min)| (key.map(str::to_owned), min))
+                .map_err(|(status, text)| (status, text.to_owned()));
+            assert_eq!(
+                (got, rows),
+                (expected, one_row.into_iter().collect::<Vec<_>>()),
+                "{row}"
+            );
+        }
     }
 
     #[async_trait::async_trait]

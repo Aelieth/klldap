@@ -2,9 +2,10 @@
 # Phase: password length at each door. The directory minimum is 8 to 128.
 # Part A tries one character. A door that takes it is FINDING. A PASS names
 # the door's sentence, not any refusal. Part B: K1 refuses a Kerberos policy on a
-# directory user, 9 characters pass every door, pol-svc keeps its effect. add-pol is a
-# counted SKIP until min-length is an OU policy. The two kadmin rows are
-# re-scoped, see K1. The e-mail reset page follows after this revision has run.
+# directory user, 9 characters pass every door, pol-svc keeps its effect. The min-* rows
+# and add-pol: password-min-length 12 on an OU of its own; 11 characters are refused at
+# each door, 12 are taken. The two kadmin rows are re-scoped, see K1. The e-mail reset
+# page follows after this revision has run.
 # Part C: a password with U+0000 at each door, and each refusal's one failure row.
 
 D="$(phase_dir)"
@@ -93,7 +94,7 @@ w1_sentence_row() {
 w1_floor_row() {
     local name="$1" took="$2" answer="$3"
     if [ "$took" -eq 1 ] && [ "$CLASS" = both ]; then
-        w1_say "$name" PASS "$answer" "$FOUR | a directory user's password rules are the directory's: the floor of 8 now, OU policy later"
+        w1_say "$name" PASS "$answer" "$FOUR | a directory user's password rules are the directory's: the floor of 8 and the OU's password-min-length"
     else
         w1_say "$name" FAIL "$answer" "$FOUR"
     fi
@@ -131,7 +132,7 @@ w1_svc() {
     fi
     if grep -q "Password is too short" "$D/pol-svc.log" && [ -n "$kv" ] && [ "$now" = "$kv" ] \
         && [ "$old $new" = "yes incorrect" ]; then
-        w1_say pol-svc PASS "len=${#NINE_SVC} Password is too short" "kvno=$kv kinit-old=yes kinit-new=incorrect | $POL (min 12) on the unsynced $SVC; a directory user's password rules are the directory's (the floor of 8 now, OU policy later)"
+        w1_say pol-svc PASS "len=${#NINE_SVC} Password is too short" "kvno=$kv kinit-old=yes kinit-new=incorrect | $POL (min 12) on the unsynced $SVC; a directory user's password rules are the directory's (the floor of 8 and the OU's password-min-length)"
     else
         w1_say pol-svc FAIL "len=${#NINE_SVC} $(w1_file "$D/pol-svc.log")" "kvno=${kv:-none}->${now:-none} kinit-old=$old kinit-new=$new"
     fi
@@ -631,8 +632,284 @@ fi
 rm -f "$D/add-one.ldif" "$D/add-good.ldif"
 w1_drop_user "$ADD1"
 
-w1_say add-pol SKIP "min-length is not an OU policy yet"
 w1_drop_pol "$ADDPOL"
+
+MIN_OU="pwminou"
+MIN_USER="pwmin"
+MIN_ADD="pwminadd"
+MIN_SAID="the password must be at least 12 characters"
+MIN_PAGE="Invalid password. Min length: 12"
+MIN_TOOL="New password is too short, expected at least 12 characters"
+MIN_OLD="$(w1_gen 24)"
+MIN_POL="" MIN_MADE="" MIN_DN="" min_dir="" min_krb=""
+
+w1_min_secrets() {
+    DOOR_SECRETS="$(printf '%s\n' "$DOOR_SECRETS" "$@")"
+    export DOOR_SECRETS
+}
+w1_min_secrets "$MIN_OLD"
+
+w1_min_absent() {
+    lsearch -o ldif-wrap=no -b "$BASE_DN" -s sub "(uid=$1)" dn >"$2" 2>&1 && ! grep -q "^dn:" "$2"
+}
+
+# The doors' w1_user_absent and w1_drop_user look under ou=people only.
+w1_min_drop() {
+    local id="$1"
+    if ! w1_min_absent "$id" "$D/min-exists-${id}.txt"; then
+        w1_graphql "mutation(\$id: String!) { deleteUser(userId: \$id) { ok } }" \
+            '{"id": "'"$id"'"}' >"$D/min-delete-${id}.json" 2>&1 || p_bad "deleteUser ${id} failed"
+    fi
+    w1_min_absent "$id" "$D/min-gone-${id}.txt" || p_bad "directory user ${id} is still present (see min-gone-${id}.txt)"
+    if [ "$(w1_princ_state "$id" "$D/min-pregone-${id}.txt")" = present ] && ! w1_wait_gone "$id"; then
+        kadmin_q "delprinc -force $id" >"$D/min-delprinc-${id}.log" 2>&1 || true
+        w1_wait_gone "$id" || p_bad "principal ${id} survived deletion"
+    fi
+}
+
+w1_min_setup() {
+    local got
+    w1_graphql "mutation(\$n: String!) { createOu(name: \$n) { ok } }" '{"n": "'"$MIN_OU"'"}' \
+        >"$D/min-ou.json" 2>&1 || return 1
+    MIN_MADE=yes
+    w1_create "$MIN_USER" && w1_set "$MIN_USER" "$MIN_OLD" "$D/min-set.json" "$D/min-set.err" &&
+        w1_graphql "mutation(\$ids: [String!]!, \$ou: String!) { changeUserOu(userIds: \$ids, newOu: \$ou) { ok } }" \
+            '{"ids": ["'"$MIN_USER"'"], "ou": "'"$MIN_OU"'"}' >"$D/min-move.json" 2>&1 &&
+        MIN_POL="$(w1_graphql "mutation(\$n: String!, \$i: [PolicyItemInput!]) { createPolicy(name: \$n, items: \$i) { id } }" \
+            '{"n": "pwmin 12", "i": [{"key": "password-min-length", "value": "12"}]}' 2>"$D/min-policy.err" |
+            json_get createPolicy.id 2>>"$D/min-policy.err")" && [ -n "$MIN_POL" ] &&
+        w1_graphql "mutation(\$o: String!, \$p: Int!) { setOuPolicy(ou: \$o, policyId: \$p) { ok } }" \
+            '{"o": "'"$MIN_OU"'", "p": '"$MIN_POL"'}' >"$D/min-link.json" 2>&1 || return 1
+    got="$(w1_graphql "query(\$o: String!, \$u: String!) { effectivePolicyItems(ou: \$o) { key value } user(userId: \$u) { ou } }" \
+        '{"o": "'"$MIN_OU"'", "u": "'"$MIN_USER"'"}' 2>"$D/min-effective.err" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+items = {i["key"]: i["value"] for i in d["effectivePolicyItems"]}
+print(items.get("password-min-length"), d["user"]["ou"].lower())' 2>>"$D/min-effective.err")"
+    MIN_DN="$(lsearch -o ldif-wrap=no -b "$BASE_DN" -s sub "(uid=$MIN_USER)" dn 2>/dev/null | sed -n 's/^dn: //p' | head -1)"
+    w1_sides "$MIN_OLD" "$LONG" "$LONG" "$MIN_USER" "${MIN_DN:-none}" min-init
+    min_dir="$MIN_OLD" min_krb="$MIN_OLD"
+    if [ "$got" != "12 $MIN_OU" ] || [ -z "$MIN_DN" ] || [ "$CLASS" != both ]; then
+        note "min setup: effective '$got', want '12 $MIN_OU'; DN '${MIN_DN}'; $FOUR"
+        return 1
+    fi
+}
+
+w1_min_cleanup() {
+    w1_min_drop "$MIN_ADD"
+    w1_min_drop "$MIN_USER"
+    if [ -n "$MIN_POL" ]; then
+        w1_graphql "mutation(\$o: String!) { clearOuPolicy(ou: \$o) { ok } }" '{"o": "'"$MIN_OU"'"}' \
+            >"$D/min-clear.json" 2>&1 || p_bad "clearOuPolicy $MIN_OU failed (see min-clear.json)"
+        w1_graphql "mutation(\$p: Int!) { deletePolicy(policyId: \$p) { ok } }" '{"p": '"$MIN_POL"'}' \
+            >"$D/min-delete-policy.json" 2>&1 || p_bad "deletePolicy $MIN_POL failed (see min-delete-policy.json)"
+    fi
+    if [ -n "$MIN_MADE" ]; then
+        w1_graphql "mutation(\$n: String!) { deleteOu(name: \$n) { ok } }" '{"n": "'"$MIN_OU"'"}' \
+            >"$D/min-delete-ou.json" 2>&1 || p_bad "deleteOu $MIN_OU failed (see min-delete-ou.json)"
+    fi
+}
+
+w1_min_track() {
+    case "$CLASS" in
+    both) min_dir="$1"; min_krb="$1" ;;
+    kadmin) min_krb="$1" ;;
+    split) min_dir="$1" ;;
+    esac
+}
+
+# w1_min_verdict <rc> <rc wanted, or any> <marker> <file>: taken, refused (that rc, the marker and
+# the sentence in the answer), or other.
+w1_min_verdict() {
+    if [ "$1" -eq 0 ]; then
+        echo taken
+    elif { [ "$2" = any ] || [ "$1" -eq "$2" ]; } && grep -q -F "$3" "$4" && grep -q -F "$MIN_SAID" "$4"; then
+        echo refused
+    else
+        echo other
+    fi
+}
+
+w1_min_gql() {
+    local rc=0
+    w1_set "$MIN_USER" "$1" "$2.json" "$2" || rc=$?
+    w1_min_verdict "$rc" any "GraphQL error" "$2"
+}
+
+w1_min_modify() {
+    local rc=0
+    t ldappasswd -x -H "$(ldap_url)" -D "$(admin_dn)" -w "$ADMIN_PASS" -s "$1" "$MIN_DN" >"$2" 2>&1 || rc=$?
+    w1_min_verdict "$rc" any "Server is unwilling to perform (53)" "$2"
+}
+
+w1_min_replace() {
+    local rc=0
+    (umask 077 && printf 'dn: %s\nchangetype: modify\nreplace: userPassword\nuserPassword: %s\n' \
+        "$MIN_DN" "$1" >"$2.ldif")
+    lmodify -f "$2.ldif" >"$2" 2>&1 || rc=$?
+    rm -f "$2.ldif"
+    w1_min_verdict "$rc" 53 "Server is unwilling to perform (53)" "$2"
+}
+
+# The tool checks the start's number itself; with the check bypassed the server refuses.
+w1_min_tool() {
+    local rc=0 bypass=0
+    gexec /app/lldap_set_password --base-url http://127.0.0.1:17170 --token "$TOKEN" \
+        --username "$MIN_USER" --password "$1" >"$2" 2>&1 || rc=$?
+    if [ "$rc" -eq 0 ]; then
+        echo taken
+        return
+    fi
+    gexec /app/lldap_set_password --base-url http://127.0.0.1:17170 --token "$TOKEN" \
+        --username "$MIN_USER" --password "$1" --bypass-password-policy >>"$2" 2>&1 || bypass=$?
+    if [ "$bypass" -eq 0 ]; then
+        echo taken
+    elif grep -q -F "$MIN_TOOL" "$2"; then
+        w1_min_verdict "$bypass" any "400 Bad Request" "$2"
+    else
+        echo other
+    fi
+}
+
+w1_min_kadmin() {
+    local rc=0
+    kadmin_q "cpw -pw $1 $MIN_USER" >"$2" 2>&1 || rc=$?
+    if [ "$rc" -eq 0 ] && ! w1_kadmin_refused "$2"; then
+        echo taken
+    elif w1_kadmin_refused "$2" && grep -q -F "Password is too short" "$2"; then
+        echo refused
+    else
+        echo other
+    fi
+}
+
+# w1_min <name> <door>: 11 characters refused and nothing moves, then 12 taken on both sides.
+w1_min() {
+    local name="$1" door="$2" short long got first said four
+    short="$(w1_gen 11)" long="$(w1_gen 12)"
+    w1_min_secrets "$short" "$long"
+    if [ "${#short}" -ne 11 ] || [ "${#long}" -ne 12 ]; then
+        w1_say "$name" FAIL "generated password is empty or the wrong length"
+        return
+    fi
+    first="$("$door" "$short" "$D/${name}-11.log")"
+    said="$(w1_file "$D/${name}-11.log")"
+    w1_sides "$short" "$min_dir" "$min_krb" "$MIN_USER" "$MIN_DN" "${name}-11"
+    first="$first $CLASS" four="$FOUR"
+    w1_min_track "$short"
+    got="$("$door" "$long" "$D/${name}-12.log")"
+    w1_sides "$long" "$min_dir" "$min_krb" "$MIN_USER" "$MIN_DN" "${name}-12"
+    w1_min_track "$long"
+    if [ "$first $got $CLASS" = "refused stay taken both" ]; then
+        w1_say "$name" PASS "len=11 refused: $said; len=12 taken" "$four ; $FOUR"
+    else
+        w1_say "$name" FAIL "len=11 $first: $said; len=12 $got $CLASS $(w1_file "$D/${name}-12.log")" "$four ; $FOUR"
+    fi
+}
+
+# w1_min_page <name> <typed> <want> <sentence> <new> [swap <envelope>]: one page row, nothing moves.
+w1_min_page() {
+    local name="$1" typed="$2" want="$3" said="$4" new="$5"
+    shift 5
+    wire_page "$name" change "$MIN_USER" "$typed" "$@"
+    w1_sides "$new" "$min_dir" "$min_krb" "$MIN_USER" "$MIN_DN" "$name"
+    w1_min_track "$new"
+    if [ "$WIRE_LINE" = "$want" ] && [ "$CLASS" = stay ] && grep -q -F "$said" <<<"$WIRE_ALERT"; then
+        w1_say "$name" PASS "len=${#new} $WIRE_LINE alert: $WIRE_ALERT" "$FOUR"
+    else
+        w1_say "$name" FAIL "len=${#new} $WIRE_LINE ${WIRE_ALERT:+alert: $WIRE_ALERT}" "$FOUR"
+    fi
+}
+
+w1_min_web() {
+    local short long typed key sealed
+    if ! docker image inspect "$WIRE_IMAGE" >/dev/null 2>&1; then
+        w1_say min-web-page SKIP "browser image absent: $WIRE_IMAGE"
+        w1_say min-web-finish SKIP "browser image absent: $WIRE_IMAGE"
+        w1_say min-web-done SKIP "browser image absent: $WIRE_IMAGE"
+        return
+    fi
+    short="$(w1_gen 11)" typed="$(w1_gen 12)" long="$(w1_gen 12)"
+    w1_min_secrets "$short" "$typed" "$long"
+    w1_min_page min-web-page "$short" \
+        "WIRE start-key=yes finish-envelope=none rewrite=none finish-status=none graphql-seal=no create-sent=no page=stayed" \
+        "$MIN_PAGE" "$short"
+    key="$(graphql '{ kerberosInfo { publicKeyDerBase64 } }' 2>"$D/min-key.err" | json_get kerberosInfo.publicKeyDerBase64 2>>"$D/min-key.err")"
+    sealed=""
+    [ -z "$key" ] || sealed="$(printf '%s' "$short" | wire_seal_in "$key" "$MIN_USER")"
+    if [ -z "$sealed" ]; then
+        w1_say min-web-finish FAIL "not run: no transport key, or OpenSSL did not seal (see min-key.err, seal.err)"
+    else
+        w1_min_page min-web-finish "$typed" \
+            "WIRE start-key=yes finish-envelope=yes rewrite=swapped finish-status=400 graphql-seal=no create-sent=no page=stayed" \
+            "$MIN_SAID" "$short" swap "$sealed"
+    fi
+    wire_page min-web-done change "$MIN_USER" "$long"
+    w1_sides "$long" "$min_dir" "$min_krb" "$MIN_USER" "$MIN_DN" min-web-done
+    w1_min_track "$long"
+    if [ "$WIRE_LINE" = "WIRE start-key=yes finish-envelope=yes rewrite=none finish-status=200 graphql-seal=no create-sent=no page=done" ] \
+        && [ "$CLASS" = both ]; then
+        w1_say min-web-done PASS "len=${#long} $WIRE_LINE" "$FOUR"
+    else
+        w1_say min-web-done FAIL "len=${#long} $WIRE_LINE ${WIRE_ALERT:+alert: $WIRE_ALERT}" "$FOUR"
+    fi
+}
+
+w1_min_add_ldif() {
+    (umask 077 && cat >"$2" <<EOF
+dn: uid=${MIN_ADD},ou=${MIN_OU},${BASE_DN}
+changetype: add
+objectClass: inetOrgPerson
+objectClass: person
+uid: ${MIN_ADD}
+mail: ${MIN_ADD}@gate.test
+cn: ${MIN_ADD}
+sn: ${MIN_ADD}
+userPassword: $1
+kerberossync: 1
+EOF
+    )
+}
+
+# add-pol: an LDAP Add under the OU is held to the OU's minimum; the 11-character add makes nothing.
+w1_min_add() {
+    local short long rc=0 made=no b=no k=no dn="uid=${MIN_ADD},ou=${MIN_OU},${BASE_DN}" answer
+    short="$(w1_gen 11)" long="$(w1_gen 12)"
+    w1_min_secrets "$short" "$long"
+    w1_min_add_ldif "$short" "$D/min-add-11.ldif"
+    lmodify -f "$D/min-add-11.ldif" >"$D/min-add-11.log" 2>&1 || rc=$?
+    rm -f "$D/min-add-11.ldif"
+    answer="exit=${rc} len=${#short} $(w1_file "$D/min-add-11.log")"
+    if [ "$rc" -eq 53 ] && grep -q -F "$MIN_SAID" "$D/min-add-11.log" \
+        && w1_min_absent "$MIN_ADD" "$D/min-add-11-absent.txt" \
+        && [ "$(w1_princ_state "$MIN_ADD" "$D/min-add-11-princ.txt")" = absent ]; then
+        w1_min_add_ldif "$long" "$D/min-add-12.ldif"
+        if lmodify -f "$D/min-add-12.ldif" >"$D/min-add-12.log" 2>&1; then made=yes; fi
+        rm -f "$D/min-add-12.ldif"
+        w1_bind "$long" "$dn" && b=yes
+        w1_kinit "$long" "$MIN_ADD" "$D/kinit-min-add-12.log" && k=yes
+        if [ "$made $b $k" = "yes yes yes" ]; then
+            w1_say add-pol PASS "$answer" "len=${#long} added: bind=yes kinit=yes"
+        else
+            w1_say add-pol FAIL "$answer" "len=${#long} added=$made bind=$b kinit=$k (see min-add-12.log)"
+        fi
+    else
+        w1_say add-pol FAIL "$answer" "the 11-character add was not refused with 53 and the sentence, or left a user or a principal"
+    fi
+}
+
+if w1_min_setup; then
+    w1_min min-graphql w1_min_gql
+    w1_min min-modify w1_min_modify
+    w1_min min-replace w1_min_replace
+    w1_min min-tool w1_min_tool
+    w1_min min-kadmin w1_min_kadmin
+    w1_min_web
+    w1_min_add
+else
+    p_bad "password-min-length 12 on $MIN_OU with $MIN_USER in it could not be set up (see min-*.json, min-*.err)"
+fi
+w1_min_cleanup
 
 BROWSER_IMAGE="mcr.microsoft.com/playwright@sha256:766137e2d9caad4744187e53cdc89320ba6f2eb57cff097374020944b44dd0a9"
 BROWSER_CTN="klldap-pwpage-${RUNID}"
@@ -685,7 +962,7 @@ else
     w1_sides "$NINE_WEB" "$LONG_WEB" "$LONG_WEB" "$WEB" "$WEB_DN" web-pol
     if [ "$WIRE_LINE" = "WIRE start-key=yes finish-envelope=yes rewrite=none finish-status=200 graphql-seal=no create-sent=no page=done" ] \
         && [ "$CLASS" = both ]; then
-        w1_say web-pol PASS "len=${#NINE_WEB} $WIRE_LINE" "$FOUR | a directory user's password rules are the directory's: the floor of 8 now, OU policy later"
+        w1_say web-pol PASS "len=${#NINE_WEB} $WIRE_LINE" "$FOUR | a directory user's password rules are the directory's: the floor of 8 and the OU's password-min-length"
     else
         w1_say web-pol FAIL "len=${#NINE_WEB} $WIRE_LINE ${WIRE_ALERT:+alert: $WIRE_ALERT}" "$FOUR"
     fi
@@ -818,6 +1095,14 @@ w1_judge pol-tool
 w1_judge pol-kadmin
 w1_judge pol-svc
 w1_judge add-one
+w1_judge min-graphql
+w1_judge min-modify
+w1_judge min-replace
+w1_judge min-tool
+w1_judge min-kadmin
+w1_judge min-web-page
+w1_judge min-web-finish
+w1_judge min-web-done
 w1_judge add-pol
 if docker image inspect "$BROWSER_IMAGE" >/dev/null 2>&1; then
     w1_judge web-one

@@ -1,9 +1,13 @@
+use crate::handler::PolicyBackendHandler;
 use crate::kerberos::{
     CREATE_WITHOUT_SYNC, CommitError, Held, HostRow, KerberosState, KerberosSync, PasswordCommit,
     SYNC_CHANGED, SYNC_OFF_FIRST, kerberos_backend, settled_state, settled_state_of,
     while_disabled,
 };
 use crate::logging::{self, LogKind};
+use crate::policies::{
+    POLICY_ITEM_CATALOG, Setting, canonical_ou_key, resolve, resolve_effective_items,
+};
 use lldap_domain::requests::CreateUserRequest;
 use lldap_domain::types::UserId;
 use lldap_domain_model::error::DomainError;
@@ -17,25 +21,67 @@ pub const ANSWER_LOST: &str = "the answer was lost; the change had committed";
 pub const UNKNOWN_ROW: &str = "result unknown: the database did not answer";
 pub const UNREPORTED_ROW: &str = "result unknown: the change did not report";
 pub const PASSWORD_MIN_LENGTH: usize = 8;
-pub const PASSWORD_TOO_SHORT: &str = "the password must be at least 8 characters";
+pub const PASSWORD_MIN_LENGTH_CAP: usize = 128;
+pub const PASSWORD_MIN_LENGTH_ITEM: &str = "password-min-length";
+pub const PASSWORD_POLICY_UNREADABLE: &str = "the password policy could not be read; try again";
 pub const PASSWORD_HAS_NUL: &str = "the password must not contain a NUL character (U+0000)";
 pub const PASSWORD_NEEDS_THE_REALM: &str =
     "a password is changed only by the server that holds the Kerberos realm; try again";
 
-/// The directory's floor, in characters (Unicode scalar values), at every door.
-pub fn long_enough(password: &str) -> bool {
-    password.chars().count() >= PASSWORD_MIN_LENGTH
+pub struct PasswordMinLength;
+
+impl Setting for PasswordMinLength {
+    type Value = usize;
+    const KEY: &'static str = PASSWORD_MIN_LENGTH_ITEM;
+    fn parse(value: &str) -> usize {
+        let parsed = value.trim().parse::<usize>();
+        parsed.map_or(PASSWORD_MIN_LENGTH, |min| {
+            min.clamp(PASSWORD_MIN_LENGTH, PASSWORD_MIN_LENGTH_CAP)
+        })
+    }
 }
 
-/// What every door asks of a new password: no NUL character, and the floor.
-pub fn password_rules(password: &str) -> Result<(), PasswordChangeError> {
+/// What every door asks of a new password: no NUL character, then `min` characters (Unicode
+/// scalar values), never fewer than the floor.
+pub fn password_rules(password: &str, min: usize) -> Result<(), PasswordChangeError> {
     if password.contains('\0') {
         return Err(PasswordChangeError::HasNul);
     }
-    if !long_enough(password) {
-        return Err(PasswordChangeError::TooShort);
+    let min = min.max(PASSWORD_MIN_LENGTH);
+    if password.chars().count() < min {
+        return Err(PasswordChangeError::TooShort(min));
     }
     Ok(())
+}
+
+/// The user's `password-min-length`; one that cannot be read refuses the change, with its row.
+pub async fn min_length_of(
+    handler: &(impl PolicyBackendHandler + ?Sized),
+    user: &UserId,
+) -> Result<usize, PasswordChangeError> {
+    handler.password_min_length(user).await.map_err(|e| {
+        warn!("The password policy of {user} could not be read: {e}");
+        let refused = PasswordChangeError::PolicyUnreadable;
+        refused_with_row(LogKind::PasswordChange, user, refused)
+    })
+}
+
+/// The `password-min-length` of `ou`, for a user not made yet; unreadable refuses with its row.
+pub async fn min_length_in_ou(
+    handler: &(impl PolicyBackendHandler + ?Sized),
+    ou: &str,
+    user: &UserId,
+    kind: LogKind,
+) -> Result<usize, PasswordChangeError> {
+    let levels = handler
+        .get_policy_levels(&canonical_ou_key(ou))
+        .await
+        .map_err(|e| {
+            warn!("The password policy of OU {ou} for {user} could not be read: {e}");
+            refused_with_row(kind, user, PasswordChangeError::PolicyUnreadable)
+        })?;
+    let items = resolve_effective_items(POLICY_ITEM_CATALOG, &levels);
+    Ok(resolve::<PasswordMinLength>(None, &items).0)
 }
 
 #[cfg(feature = "kill-points")]
@@ -106,8 +152,9 @@ impl PasswordSync {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PasswordChangeError {
-    TooShort,
+    TooShort(usize),
     HasNul,
+    PolicyUnreadable,
     /// Kerberos refused the password or the name; nothing was written.
     Refused(String),
     InProgress,
@@ -122,8 +169,9 @@ pub enum PasswordChangeError {
 impl std::fmt::Display for PasswordChangeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::TooShort => f.write_str(PASSWORD_TOO_SHORT),
+            Self::TooShort(min) => write!(f, "the password must be at least {min} characters"),
             Self::HasNul => f.write_str(PASSWORD_HAS_NUL),
+            Self::PolicyUnreadable => f.write_str(PASSWORD_POLICY_UNREADABLE),
             Self::Refused(reason) => write!(f, "refused by Kerberos: {reason}"),
             Self::InProgress => f.write_str(PASSWORD_CHANGE_IN_PROGRESS),
             Self::Unavailable(cause) => write!(f, "Kerberos KDC unavailable: {cause}"),
@@ -203,17 +251,18 @@ pub async fn change_password_everywhere(
     user: &UserId,
     password: &str,
     sync: PasswordSync,
+    min: usize,
 ) -> Result<(), PasswordChangeError> {
     if sync == PasswordSync::Off {
         let kind = LogKind::PasswordChange;
         realm_ready(kind, user)?;
-        password_rules(password).map_err(|e| refused_with_row(kind, user, e))?;
+        password_rules(password, min).map_err(|e| refused_with_row(kind, user, e))?;
         let (_, request) = prepare_registration(handler, user.clone(), password.as_bytes())
             .await
             .map_err(|e| refused_with_row(kind, user, change_error(e)))?;
         return finish_plain(handler, user, request).await.map(drop);
     }
-    commit_synced(handler, user, password, None).await
+    commit_synced(handler, user, password, None, min).await
 }
 
 /// The one write of a password the switch keeps plain: upstream's `registration_finish`, held.
@@ -246,8 +295,9 @@ pub async fn finish_synced_registration(
     handler: &(impl OpaqueHandler + ?Sized),
     user: &UserId,
     password: &str,
+    min: usize,
 ) -> Result<(), PasswordChangeError> {
-    change_password_everywhere(handler, user, password, PasswordSync::On).await
+    change_password_everywhere(handler, user, password, PasswordSync::On, min).await
 }
 
 /// An LDAP Add with a password for a synced user: the user, its record and its principal in one
@@ -256,9 +306,10 @@ pub async fn create_synced_user(
     handler: &(impl OpaqueHandler + ?Sized),
     request: CreateUserRequest,
     password: &str,
+    min: usize,
 ) -> Result<(), PasswordChangeError> {
     let user = request.user_id.clone();
-    commit_synced(handler, &user, password, Some(request)).await
+    commit_synced(handler, &user, password, Some(request), min).await
 }
 
 async fn commit_synced(
@@ -266,6 +317,7 @@ async fn commit_synced(
     user: &UserId,
     password: &str,
     create: Option<CreateUserRequest>,
+    min: usize,
 ) -> Result<(), PasswordChangeError> {
     pause::here(user).await;
     let kind = match create {
@@ -273,7 +325,7 @@ async fn commit_synced(
         None => LogKind::PasswordChange,
     };
     let kerberos = kerberos_backend();
-    let answer = match prepare_change(handler, &*kerberos, user, password, create).await {
+    let answer = match prepare_change(handler, &*kerberos, user, password, create, min).await {
         Ok(rows) => {
             let change = PasswordCommit {
                 user: user.clone(),
@@ -303,13 +355,14 @@ async fn prepare_change(
     user: &UserId,
     password: &str,
     create: Option<CreateUserRequest>,
+    min: usize,
 ) -> Result<Vec<HostRow>, PasswordChangeError> {
     match settled_state_of(kerberos) {
         KerberosState::Disabled => return Err(disabled_answer(create.is_some())),
         KerberosState::NotReady(cause) => return Err(realm_not_ready(&cause)),
         KerberosState::Ready => {}
     }
-    password_rules(password)?;
+    password_rules(password, min)?;
     kerberos
         .check_password(user, password)
         .await
@@ -478,21 +531,23 @@ mod tests {
         set_kerberos_backend(std::sync::Arc::new(Starting(true)));
         let bob = UserId::new("bob");
         let refusals = [
-            ("pässwör", PasswordChangeError::TooShort),
-            ("a\0aaaaaaa", PasswordChangeError::HasNul),
+            ("pässwör", 8, PasswordChangeError::TooShort(8)),
+            ("a\0aaaaaaa", 8, PasswordChangeError::HasNul),
+            ("Eleven-11ch", 12, PasswordChangeError::TooShort(12)),
         ];
-        for (password, refused) in refusals {
+        for (password, min, refused) in refusals {
             let rows = std::sync::Arc::new(Rows::default());
             logging::set_log_sink(rows.clone());
-            let off =
-                change_password_everywhere(&Untouched, &bob, password, PasswordSync::Off).await;
-            let on = change_password_everywhere(&Untouched, &bob, password, PasswordSync::On).await;
-            let web = finish_synced_registration(&Untouched, &bob, password).await;
+            let off = PasswordSync::Off;
+            let off = change_password_everywhere(&Untouched, &bob, password, off, min).await;
+            let on = PasswordSync::On;
+            let on = change_password_everywhere(&Untouched, &bob, password, on, min).await;
+            let web = finish_synced_registration(&Untouched, &bob, password, min).await;
             let request = CreateUserRequest {
                 user_id: bob.clone(),
                 ..Default::default()
             };
-            let add = create_synced_user(&Untouched, request, password).await;
+            let add = create_synced_user(&Untouched, request, password, min).await;
             logging::set_log_sink(std::sync::Arc::new(logging::NoopLogSink));
             let logged: Vec<_> = rows
                 .0
@@ -529,12 +584,16 @@ mod tests {
         set_kerberos_backend(std::sync::Arc::new(NoopKerberos::default()));
         assert_eq!(
             (
-                PasswordChangeError::TooShort.to_string(),
-                PasswordChangeError::HasNul.to_string()
+                PasswordChangeError::TooShort(8).to_string(),
+                PasswordChangeError::HasNul.to_string(),
+                PasswordChangeError::TooShort(12).to_string(),
+                PasswordChangeError::PolicyUnreadable.to_string()
             ),
             (
                 "the password must be at least 8 characters".to_owned(),
-                "the password must not contain a NUL character (U+0000)".to_owned()
+                "the password must not contain a NUL character (U+0000)".to_owned(),
+                "the password must be at least 12 characters".to_owned(),
+                "the password policy could not be read; try again".to_owned()
             )
         );
     }
@@ -605,8 +664,10 @@ mod tests {
         use crate::kerberos::{NoopKerberos, set_kerberos_backend};
         set_kerberos_backend(std::sync::Arc::new(Starting(false)));
         let bob = UserId::new("bob");
-        let short = finish_synced_registration(&Untouched, &bob, "Short-7").await;
-        let nul = finish_synced_registration(&Untouched, &bob, "a\0aaaaaaa").await;
+        let short =
+            finish_synced_registration(&Untouched, &bob, "Short-7", PASSWORD_MIN_LENGTH).await;
+        let nul =
+            finish_synced_registration(&Untouched, &bob, "a\0aaaaaaa", PASSWORD_MIN_LENGTH).await;
         set_kerberos_backend(std::sync::Arc::new(NoopKerberos::default()));
         let starting = || {
             Err(realm_not_ready(
@@ -646,8 +707,14 @@ mod tests {
         let mut want = Vec::new();
         for (backend, cause) in backends {
             set_kerberos_backend(backend);
-            let door =
-                change_password_everywhere(&Untouched, &bob, "Short-7", PasswordSync::Off).await;
+            let door = change_password_everywhere(
+                &Untouched,
+                &bob,
+                "Short-7",
+                PasswordSync::Off,
+                PASSWORD_MIN_LENGTH,
+            )
+            .await;
             let finish = finish_plain(&web, &bob, upload.clone()).await;
             got.push((door, finish.map(drop)));
             want.push((Err(realm_not_ready(cause)), Err(realm_not_ready(cause))));
@@ -694,9 +761,22 @@ mod tests {
         set_kerberos_backend(Arc::new(Holding(None)));
         let key = lldap_auth::opaque::server::generate_random_private_key;
         let stored = Deriving(key(), Some("the disk is full"));
-        let store = change_password_everywhere(&stored, &bob, "Eight-88", PasswordSync::Off).await;
-        let derive =
-            change_password_everywhere(&Unstarted, &bob, "Eight-88", PasswordSync::Off).await;
+        let store = change_password_everywhere(
+            &stored,
+            &bob,
+            "Eight-88",
+            PasswordSync::Off,
+            PASSWORD_MIN_LENGTH,
+        )
+        .await;
+        let derive = change_password_everywhere(
+            &Unstarted,
+            &bob,
+            "Eight-88",
+            PasswordSync::Off,
+            PASSWORD_MIN_LENGTH,
+        )
+        .await;
         set_kerberos_backend(Arc::new(NoopKerberos::default()));
         logging::set_log_sink(Arc::new(logging::NoopLogSink));
         let logged: Vec<_> = rows
@@ -728,10 +808,17 @@ mod tests {
             ..Default::default()
         };
         let answers = [
-            finish_synced_registration(&Untouched, &bob, "Eight-88").await,
-            change_password_everywhere(&Untouched, &bob, "Short-7", PasswordSync::On).await,
-            create_synced_user(&Untouched, request(), "Eight-88").await,
-            create_synced_user(&Untouched, request(), "a\0aaaaaaa").await,
+            finish_synced_registration(&Untouched, &bob, "Eight-88", PASSWORD_MIN_LENGTH).await,
+            change_password_everywhere(
+                &Untouched,
+                &bob,
+                "Short-7",
+                PasswordSync::On,
+                PASSWORD_MIN_LENGTH,
+            )
+            .await,
+            create_synced_user(&Untouched, request(), "Eight-88", PASSWORD_MIN_LENGTH).await,
+            create_synced_user(&Untouched, request(), "a\0aaaaaaa", PASSWORD_MIN_LENGTH).await,
         ];
         logging::set_log_sink(std::sync::Arc::new(logging::NoopLogSink));
         let both_ways = "Kerberos is disabled on this server (kerberos_options.enabled is false): \
@@ -859,7 +946,13 @@ mod tests {
                 lldap_auth::opaque::server::generate_random_private_key(),
                 None,
             );
-            let off = change_password_everywhere(&handler, &bob, "Eight-88", PasswordSync::Off);
+            let off = change_password_everywhere(
+                &handler,
+                &bob,
+                "Eight-88",
+                PasswordSync::Off,
+                PASSWORD_MIN_LENGTH,
+            );
             answers.push(off.await);
         }
         set_kerberos_backend(std::sync::Arc::new(NoopKerberos::default()));
@@ -892,23 +985,39 @@ mod tests {
 
     #[test]
     fn test_the_rules_refuse_a_nul_anywhere_and_then_count_characters() {
+        use PasswordChangeError::{HasNul, TooShort};
         let rows = [
-            ("Eight-88", Ok(())),
-            ("pässwörd", Ok(())),
-            ("pässwör", Err(PasswordChangeError::TooShort)),
-            ("a\0aaaaaaa", Err(PasswordChangeError::HasNul)),
-            ("Eight-88\0", Err(PasswordChangeError::HasNul)),
-            ("\0", Err(PasswordChangeError::HasNul)),
+            ("Eight-88", 8, Ok(())),
+            ("pässwörd", 8, Ok(())),
+            ("pässwör", 8, Err(TooShort(8))),
+            ("a\0aaaaaaa", 8, Err(HasNul)),
+            ("Eight-88\0", 8, Err(HasNul)),
+            ("\0", 8, Err(HasNul)),
+            ("Eleven-11ch", 12, Err(TooShort(12))),
+            ("Twelve-12chr", 12, Ok(())),
+            ("pässwörd-äöü", 12, Ok(())),
+            ("\0", 12, Err(HasNul)),
+            ("Short-7", 5, Err(TooShort(8))),
+            ("Eight-88", 5, Ok(())),
         ];
         let got: Vec<_> = rows
             .iter()
-            .map(|(text, _)| (*text, password_rules(text)))
+            .map(|(text, min, _)| (*text, *min, password_rules(text, *min)))
             .collect();
         assert_eq!(got, rows.to_vec());
         assert_eq!(
-            "a\0aaaaaaa".chars().count(),
-            9,
-            "the NUL row passes the floor alone"
+            ["a\0aaaaaaa", "Eleven-11ch", "Twelve-12chr", "pässwörd-äöü"]
+                .map(|text| (text.chars().count(), text.len())),
+            [(9, 9), (11, 11), (12, 12), (12, 17)],
+            "the NUL row passes the floor alone; the rows count characters, not bytes"
+        );
+        assert_eq!(
+            [TooShort(8), TooShort(12), HasNul].map(|e| e.to_string()),
+            [
+                "the password must be at least 8 characters".to_owned(),
+                "the password must be at least 12 characters".to_owned(),
+                "the password must not contain a NUL character (U+0000)".to_owned()
+            ]
         );
     }
 
@@ -924,10 +1033,99 @@ mod tests {
         ];
         let got: Vec<_> = rows
             .iter()
-            .map(|(text, _)| (*text, long_enough(text)))
+            .map(|(text, _)| (*text, password_rules(text, PASSWORD_MIN_LENGTH).is_ok()))
             .collect();
         assert_eq!(got, rows.to_vec());
         assert_eq!(("pässwör".len(), PASSWORD_MIN_LENGTH), (9, 8));
+    }
+
+    #[test]
+    fn test_the_minimum_is_read_trimmed_and_held_between_8_and_128() {
+        let rows: [(&str, usize); 9] = [
+            ("12", 12),
+            ("7", 8),
+            ("129", 128),
+            ("x", 8),
+            (" 20 ", 20),
+            ("8", 8),
+            ("128", 128),
+            ("", 8),
+            ("-1", 8),
+        ];
+        let got = rows.map(|(value, _)| (value, PasswordMinLength::parse(value)));
+        assert_eq!(got, rows);
+        assert_eq!(PasswordMinLength::KEY, "password-min-length");
+    }
+
+    #[test]
+    fn test_the_minimum_comes_from_the_users_ou_else_eight() {
+        use crate::policies::{
+            AttachedPolicy, POLICY_ITEM_CATALOG, PolicyId, PolicyLevel, SettingSource, resolve,
+            resolve_effective_items,
+        };
+        let level = |ou: &str, blocked: bool, value: Option<&str>| PolicyLevel {
+            ou_key: ou.to_owned(),
+            blocked,
+            policy: value.map(|value| AttachedPolicy {
+                id: PolicyId(1),
+                name: format!("on {ou}"),
+                items: [("password-min-length".to_owned(), value.to_owned())].into(),
+            }),
+        };
+        type Row = (&'static str, Vec<PolicyLevel>, (usize, SettingSource));
+        let rows: Vec<Row> = vec![
+            ("no policy", vec![], (8, SettingSource::Default)),
+            (
+                "the OU sets 12",
+                vec![level("", false, None), level("labs", false, Some("12"))],
+                (12, SettingSource::Ou),
+            ),
+            (
+                "the parent sets 20, the child inherits",
+                vec![
+                    level("", false, None),
+                    level("labs", false, Some("20")),
+                    level("labs\\east", false, None),
+                ],
+                (20, SettingSource::Ou),
+            ),
+            (
+                "the child blocks the parent's 20",
+                vec![
+                    level("", false, None),
+                    level("labs", false, Some("20")),
+                    level("labs\\east", true, None),
+                ],
+                (8, SettingSource::Default),
+            ),
+            (
+                "the child's 12 over the parent's 20",
+                vec![
+                    level("", false, None),
+                    level("labs", false, Some("20")),
+                    level("labs\\east", false, Some("12")),
+                ],
+                (12, SettingSource::Ou),
+            ),
+            (
+                "a stored 500 is held to 128",
+                vec![level("", false, Some("500"))],
+                (128, SettingSource::Ou),
+            ),
+        ];
+        for (row, levels, expected) in rows {
+            let items = resolve_effective_items(POLICY_ITEM_CATALOG, &levels);
+            assert_eq!(
+                resolve::<PasswordMinLength>(None, &items),
+                expected,
+                "{row}"
+            );
+        }
+        assert_eq!(
+            resolve::<PasswordMinLength>(None, &[]),
+            (8, SettingSource::Default),
+            "no items at all, as for a user the directory does not have"
+        );
     }
 
     #[test]

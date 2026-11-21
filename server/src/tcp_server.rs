@@ -22,7 +22,9 @@ use lldap_access_control::{
     AccessControlledBackendHandler, ReadonlyBackendHandler, UserReadableBackendHandler,
 };
 use lldap_domain_handlers::enforcement::{mfa_can_be_on, policy_cache};
-use lldap_domain_handlers::handler::{BackendHandler, LoginHandler, MfaBackendHandler};
+use lldap_domain_handlers::handler::{
+    BackendHandler, LoginHandler, MfaBackendHandler, PolicyBackendHandler,
+};
 use lldap_domain_handlers::kerberos::{KerberosSync, domain_from_base_dn, kerberos_backend};
 use lldap_domain_handlers::logging::{RequestMeta, with_request};
 use lldap_domain_handlers::mfa::MfaPolicy;
@@ -272,7 +274,8 @@ impl<Backend: OpaqueHandler> AppState<Backend> {
 impl<Backend: BackendHandler + OpaqueHandler> AppState<Backend> {
     pub fn get_password_handler(
         &self,
-    ) -> &(impl OpaqueHandler + UserReadableBackendHandler + use<Backend>) {
+    ) -> &(impl OpaqueHandler + UserReadableBackendHandler + PolicyBackendHandler + use<Backend>)
+    {
         self.backend_handler.unsafe_get_handler()
     }
 }

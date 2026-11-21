@@ -59,18 +59,29 @@ Beyond LLDAP's users, groups, attributes and object classes, the schema exposes:
 anyone's, a password manager may set a non-admin's, and a user may set their own.
 The server runs the OPAQUE registration itself, so nothing but the OPAQUE record is
 stored, and the KDC principal is updated when the user has `kerberosSync` on. A
-password shorter than 8 characters is refused. Send
+password shorter than the user's minimum (8 by default) is refused. Send
 mutations by POST: a mutation sent by GET is refused. Queries may use GET. Use the
 API over HTTPS only.
 
-A new password must be at least 8 characters, with no NUL character (U+0000),
-wherever the server sees its text:
+A new password must have at least the user's minimum number of characters (8 by
+default; the OU policy item `password-min-length`, see [policies.md](policies.md#password-length)),
+with no NUL character (U+0000), wherever the server sees its text:
 `setUserPassword`, the LDAP password doors, and a synced user's web pages and
 `lldap_set_password`. A shorter one is refused and nothing is written. For a user
-without sync, the web pages and `lldap_set_password` check 8 themselves.
+without sync, the web pages and `lldap_set_password` check the user's minimum (8 by default)
+themselves.
 `lldap_set_password` needs a password, from `--password` or `LLDAP_USER_PASSWORD`, and
 refuses an empty one before it sends anything; `--bypass-password-policy` skips only the
 minimum length.
+
+The register start, `/auth/opaque/register/start`, answers the user's minimum in the optional
+field `password_min_length` (a number of characters), for every user, beside OPAQUE's own
+fields and, for a user with `kerberosSync`, `kerberos_envelope_key`. A script or client that
+sets a password through the start and the finish should refuse a shorter password before it
+sends the finish: for a user without sync the server never sees the password, so this check is
+the only one. A client that ignores the field keeps today's check of 8, so for a user without
+sync it lets a password under a higher minimum through. When the user's policy cannot be
+read, the start is refused (400) with "the password policy could not be read; try again".
 
 ### Getting a token
 

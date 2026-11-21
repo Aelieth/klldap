@@ -32,10 +32,11 @@ pp_gen() { python3 -c 'import secrets; print("Pp" + secrets.token_hex(10) + "!")
 pp_vars() { ID="$1" PW="$2" python3 -c 'import json,os; print(json.dumps({"id": os.environ["ID"], "pw": os.environ["PW"]}))'; }
 pp_dn() { printf 'uid=%s,ou=people,%s' "$1" "$BASE_DN"; }
 
-pp_bind() {
+pp_bind() { pp_bind_at "$(pp_dn "$1")" "$2"; }
+pp_bind_at() {
     local f="$PP_D/.bindpw" rc
     (umask 077 && printf '%s' "$2" >"$f")
-    t ldapwhoami -x -H "$(ldap_url)" -D "$(pp_dn "$1")" -y "$f" >/dev/null 2>&1
+    t ldapwhoami -x -H "$(ldap_url)" -D "$1" -y "$f" >/dev/null 2>&1
     rc=$?
     rm -f "$f"
     return "$rc"
@@ -340,6 +341,60 @@ pp_create_synced() {
     fi
 }
 
+# A user without sync in an OU at password-min-length 12: the change page refuses 11 characters
+# with the start's number, before the finish.
+pp_min_page() {
+    local row="U1.page-min-nosync" ou="${PP_RUN}ou" user="${PP_RUN}u" old new pol="" made="" dn="" got=""
+    local ready="" bn=no bo=no
+    local want="WIRE start-key=no finish-envelope=none rewrite=none finish-status=none graphql-seal=no create-sent=no page=stayed"
+    old="$(pp_gen)" new="$(python3 -c 'import secrets; print("Pp" + secrets.token_hex(4) + "!")')"
+    if graphql "mutation(\$n: String!) { createOu(name: \$n) { ok } }" '{"n": "'"$ou"'"}' >"$PP_D/min-ou.json" 2>&1; then
+        made=yes
+    fi
+    [ -n "$made" ] &&
+        graphql "mutation(\$u: CreateUserInput!) { createUser(user: \$u) { id } }" \
+            '{"u": {"id": "'"$user"'", "email": "'"$user"'@gate.test"}}' >"$PP_D/min-user.json" 2>&1 &&
+        graphql "$PP_SET" "$(pp_vars "$user" "$old")" >>"$PP_D/min-user.json" 2>&1 &&
+        graphql "mutation(\$ids: [String!]!, \$ou: String!) { changeUserOu(userIds: \$ids, newOu: \$ou) { ok } }" \
+            '{"ids": ["'"$user"'"], "ou": "'"$ou"'"}' >>"$PP_D/min-user.json" 2>&1 &&
+        pol="$(graphql "mutation(\$n: String!, \$i: [PolicyItemInput!]) { createPolicy(name: \$n, items: \$i) { id } }" \
+            '{"n": "'"$ou"' min 12", "i": [{"key": "password-min-length", "value": "12"}]}' 2>"$PP_D/min-policy.err" |
+            json_get createPolicy.id 2>>"$PP_D/min-policy.err")" && [ -n "$pol" ] &&
+        graphql "mutation(\$o: String!, \$p: Int!) { setOuPolicy(ou: \$o, policyId: \$p) { ok } }" \
+            '{"o": "'"$ou"'", "p": '"$pol"'}' >"$PP_D/min-link.json" 2>&1 &&
+        got="$(graphql "query(\$o: String!) { effectivePolicyItems(ou: \$o) { key value } }" '{"o": "'"$ou"'"}' 2>/dev/null |
+            python3 -c '
+import json, sys
+print({i["key"]: i["value"] for i in json.load(sys.stdin)["effectivePolicyItems"]}.get("password-min-length"))' 2>/dev/null)" &&
+        [ "$got" = 12 ] &&
+        dn="$(lsearch -o ldif-wrap=no -b "$BASE_DN" -s sub "(uid=$user)" dn 2>/dev/null | sed -n 's/^dn: //p' | head -1)" &&
+        [ -n "$dn" ] && pp_bind_at "$dn" "$old" && ready=yes
+    if [ -z "$ready" ] || [ "${#new}" -ne 11 ]; then
+        p_bad "[$row] $user in $ou at password-min-length 12 could not be set up, or its first password does not bind (see min-*.json, min-policy.err; minimum '${got:-unread}', DN '$dn')"
+    else
+        pp_wire min-nosync change "$user" "$new"
+        pp_bind_at "$dn" "$new" && bn=yes
+        pp_bind_at "$dn" "$old" && bo=yes
+        if [ "$PP_WIRE" = "$want" ] && [ "$bn $bo" = "no yes" ] &&
+            grep -qF "Invalid password. Min length: 12" <<<"$PP_ALERT"; then
+            p_ok "[$row] the change page for a user without sync in an OU at 12: an 11-character password is refused with '$PP_ALERT' before the finish, and the old password still binds"
+        else
+            p_bad "[$row] $PP_WIRE (alert: ${PP_ALERT:-none}); bind-new=$bn bind-old=$bo; want $want, 'Invalid password. Min length: 12', bind-new=no bind-old=yes"
+        fi
+    fi
+    graphql "mutation(\$u: String!) { deleteUser(userId: \$u) { ok } }" '{"u": "'"$user"'"}' >/dev/null 2>&1
+    if [ -n "$pol" ]; then
+        graphql "mutation(\$o: String!) { clearOuPolicy(ou: \$o) { ok } }" '{"o": "'"$ou"'"}' >/dev/null 2>&1 ||
+            p_bad "[$row-cleanup] clearOuPolicy $ou failed"
+        graphql "mutation(\$p: Int!) { deletePolicy(policyId: \$p) { ok } }" '{"p": '"$pol"'}' >/dev/null 2>&1 ||
+            p_bad "[$row-cleanup] deletePolicy $pol failed"
+    fi
+    if [ -n "$made" ]; then
+        graphql "mutation(\$n: String!) { deleteOu(name: \$n) { ok } }" '{"n": "'"$ou"'"}' >/dev/null 2>&1 ||
+            p_bad "[$row-cleanup] deleteOu $ou failed"
+    fi
+}
+
 pp_no_progress() {
     local hits
     hits="$(grep -il 'in progress' "$PP_D"/*-register.log "$PP_D"/wire-*.out 2>/dev/null | xargs -r -n1 basename | tr '\n' ' ')"
@@ -474,8 +529,8 @@ pp_krb_off() {
     esac
     got="$(pp_off_start "$plain" 2>&1)"
     case "$got" in
-    "200 start "*) p_ok "[$ctl] Kerberos disabled: register/start for $plain, without sync, answers 200 with upstream's answer (server_data, registration_response) and no kerberos_envelope_key" ;;
-    *) p_bad "[$ctl] register/start for $plain answered '$got'; want 200 and upstream's answer without a key" ;;
+    "200 start "*) p_ok "[$ctl] Kerberos disabled: register/start for $plain, without sync, answers 200 (server_data, registration_response) and no kerberos_envelope_key: the answer carries no key, only the minimum" ;;
+    *) p_bad "[$ctl] register/start for $plain answered '$got'; want 200, server_data and registration_response, and no key" ;;
     esac
 
     row="U1.krb-off-create-sync" FAIL_WHY=""
@@ -574,6 +629,7 @@ if pp_setup; then
         pp_swap_other
         pp_create_big
         pp_create_synced
+        pp_min_page
     else
         p_skip "[U1.pages-browser] browser image absent: ${PP_BROWSER_IMAGE}; the page rows did not run"
     fi

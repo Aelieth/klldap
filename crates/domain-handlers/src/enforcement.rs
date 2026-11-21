@@ -1234,10 +1234,12 @@ mod tests {
                 "lockout-duration-seconds",
                 "enable-mfa"
             ]),
-            "the lockout and enable-mfa are enforced; the other items are not yet"
+            "the lockout and enable-mfa are enforced at sign-in; the other items are not yet"
         );
+        let at_password_doors = crate::password::PASSWORD_MIN_LENGTH_ITEM;
         for spec in POLICY_ITEM_CATALOG {
-            assert_eq!(spec.enforced, checked.contains(spec.key), "{}", spec.key);
+            let enforced = checked.contains(spec.key) || spec.key == at_password_doors;
+            assert_eq!(spec.enforced, enforced, "{}", spec.key);
         }
         for key in checked {
             assert!(catalog_item(key).is_some(), "{key} is not a catalog item");
@@ -1861,6 +1863,9 @@ mod tests {
                     Ok((details, self.get_policy_levels(&ou_key).await?))
                 }
             }
+        }
+        async fn password_min_length(&self, _: &UserId) -> Result<usize> {
+            unimplemented!()
         }
         async fn read_proof_windows(
             &self,

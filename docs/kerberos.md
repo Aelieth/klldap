@@ -77,14 +77,16 @@ exec klldap /app/lldap healthcheck --config-file /data/lldap_config.toml`.
 `force_ldap_user_pass_reset` is the way back in, as in LLDAP: it resets the
 admin (`ldap_user_dn`) to `ldap_user_pass` at startup, once with `true` (the
 server then stops and asks to be started without it) or at every start with
-`"always"`. That password must be at least 8 characters, with no NUL character
-(U+0000), or the server refuses to start; so must the first start's admin
-password. With Kerberos enabled the reset waits until the realm has opened and
-runs before the KDC, kadmind, LDAP and HTTP answer anything; for an admin with
-`kerberosSync` it sets the Kerberos keys in the same transaction and logs
-"Reset the password and the Kerberos keys of `<admin>` from the
-configuration". When Kerberos cannot take part (disabled in the configuration,
-the realm does not open, reconcile or the start pass fails, or the reset with
+`"always"`. That password must be at least 8 characters long (characters, not
+bytes), with no NUL character (U+0000), or the server refuses to start; so must
+the first start's admin password. The admin's `password-min-length` does not
+apply to it; the start warns once when that minimum is higher
+([policies.md](policies.md#password-length)). With Kerberos enabled the reset
+waits until the realm has opened and runs before the KDC, kadmind, LDAP and
+HTTP answer anything; for an admin with `kerberosSync` it sets the Kerberos
+keys in the same transaction and logs "Reset the password and the Kerberos
+keys of `<admin>` from the configuration". When Kerberos cannot take part
+(disabled in the configuration, the realm does not open, reconcile or the start pass fails, or the reset with
 the realm fails), the reset runs without the realm: the directory password is
 the configured one, an admin with `kerberosSync` has the sync turned off in the
 same transaction, with one `kerberos_sync` row, and a warning at start says so.
@@ -245,15 +247,19 @@ ACL text, read at boot.
   a letter or a digit, and not `krbtgt`, `kadmin`, `kiprop` or `wellknown`) is
   refused with that rule, at `createUser` and `updateUser` alike. Both also
   refuse it for a user whose principal name is an alias of another principal.
-- A password shorter than 8 characters is refused wherever the server sees it,
-  for every user: `setUserPassword` (a GraphQL error: HTTP 200 with the
-  error), `ldappasswd`, LDAP Modify `userPassword` and LDAP ADD with
-  `userPassword` (53, unwillingToPerform), with "the password must be at least
-  8 characters". A password with a NUL character (U+0000) is refused at the
-  same doors with "the password must not contain a NUL character (U+0000)".
-  An LDAP ADD refused this way makes nothing, and each refusal writes one
-  failure row. kadmin `cpw` answers `PASS_Q_TOOSHORT`, and `PASS_Q_GENERIC` for
-  a NUL.
+- A password shorter than the user's minimum (`password-min-length`, 8 unless
+  the user's OU sets more; [policies.md](policies.md#password-length)) is
+  refused wherever the server sees it, for every user: `setUserPassword` (a
+  GraphQL error: HTTP 200 with the error), `ldappasswd`, LDAP Modify
+  `userPassword` and LDAP ADD with `userPassword` (53, unwillingToPerform; an
+  ADD is judged by the OU its DN names), with "the password must be at least N
+  characters", N being that minimum. A password with a NUL character (U+0000)
+  is refused at the same doors with "the password must not contain a NUL
+  character (U+0000)". A minimum that cannot be read refuses the change with
+  "the password policy could not be read; try again". An LDAP ADD refused this
+  way makes nothing, and each refusal writes one failure row. kadmin `cpw`
+  answers `PASS_Q_TOOSHORT` under the minimum, and `PASS_Q_GENERIC` for a NUL
+  or a minimum that cannot be read.
 - The read-only, admin-visible `krbPrincipalName` attribute shows the principal
   recorded for the user.
 - The web pages (change password, the e-mail reset, create user) and
@@ -268,13 +274,16 @@ ACL text, read at boot.
     for another user does not open (400). It then registers the password
     itself, ignoring the client's OPAQUE upload, and changes the directory
     record and the Kerberos keys in one transaction, as above. A password
-    shorter than 8 characters, or with a NUL character, is refused (400), and
-    nothing is written. With Kerberos disabled, the start refuses a user with
+    shorter than the user's minimum, or with a NUL character, is refused (400),
+    and nothing is written. With Kerberos disabled, the start refuses a user with
     `kerberosSync` (400, naming both ways on) and gives no key; with the realm
     not ready it answers 503. The finish refuses the same before it opens the
     envelope. Each refusal writes one `password_change` failure row.
   - A finish of a synced user without an envelope is refused (400, "reload the
     page and retry"): a page cached from an older version sends none.
+  - Every start answer carries `password_min_length`, the user's minimum, and
+    the pages and the tool refuse a shorter password before the finish
+    ([scripting.md](scripting.md)).
   - For any other user, the start answer has no key and the finish is LLDAP's.
     A finish that carries an envelope anyway is refused (400) and nothing is
     written; the envelope is not opened. The server never sees such a user's
@@ -314,7 +323,8 @@ KLLDAP answers each write to it:
 | kadmin command | What happens | kadmin reports |
 |---|---|---|
 | `cpw` | Carried out by KLLDAP. The keys and the directory password change in one transaction; then the principal's status follows `lldap_disabled` (an adopted principal is enabled). | success |
-| `cpw` with fewer than 8 characters | Refused. Characters are counted, not bytes. | `Password is too short` |
+| `cpw` with fewer characters than the user's `password-min-length` (8 by default) | Refused. Characters are counted, not bytes. The minimum is read when kadmind prepares the change, waiting at most 2 seconds, and the commit holds the password to that same number. The `access_denied` row names `PASS_Q_TOOSHORT`. | `Password is too short` |
+| `cpw` while the user's minimum cannot be read | Refused. The `access_denied` row says `PASS_Q_GENERIC: the password policy could not be read`. | `Unspecified password quality failure` |
 | `cpw` with a password that is not valid UTF-8, or with a NUL character | Refused | `Unspecified password quality failure` |
 | `cpw` kadmind could not prepare | Refused, before anything is derived or written; it can be tried again. The `access_denied` row says `PASS_Q_GENERIC: the change could not be prepared`. | `Unspecified password quality failure` |
 | `cpw -keepold`, `cpw -randkey`, `ktadd` | Refused | `Cannot change protected principal` |

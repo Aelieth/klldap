@@ -84,6 +84,14 @@ pub static POLICY_ITEM_CATALOG: &[PolicyItemSpec] = &[
         description: "How long a lockout lasts, in seconds; 0 holds it until an admin unlocks.",
     },
     PolicyItemSpec {
+        key: "password-min-length",
+        scope: PolicyScope::User,
+        value_type: PolicyValueType::Int { min: 8, max: 128 },
+        default_value: "8",
+        enforced: true,
+        description: "The fewest characters a new password may have, at every door that sees it; 8 to 128.",
+    },
+    PolicyItemSpec {
         key: "login-hours",
         scope: PolicyScope::User,
         value_type: PolicyValueType::String {
@@ -825,8 +833,34 @@ mod tests {
     }
 
     #[test]
+    fn test_the_minimum_length_takes_8_to_128_whole_numbers() {
+        let rows = [
+            ("7", Err("password-min-length: must be between 8 and 128")),
+            ("129", Err("password-min-length: must be between 8 and 128")),
+            ("0", Err("password-min-length: must be between 8 and 128")),
+            ("x", Err("password-min-length: must be a base-10 integer")),
+            (
+                "12.5",
+                Err("password-min-length: must be a base-10 integer"),
+            ),
+            ("8", Ok(())),
+            ("12", Ok(())),
+            ("128", Ok(())),
+        ];
+        for (value, expected) in rows {
+            let got = validate_items(&items(&[("password-min-length", value)]));
+            assert_eq!(got, expected.map_err(str::to_owned), "{value:?}");
+        }
+        let spec = catalog_item("password-min-length").unwrap();
+        assert_eq!(
+            (spec.scope, spec.default_value, spec.enforced),
+            (PolicyScope::User, "8", true)
+        );
+    }
+
+    #[test]
     fn test_catalog_v1_shape() {
-        assert_eq!(POLICY_ITEM_CATALOG.len(), 6);
+        assert_eq!(POLICY_ITEM_CATALOG.len(), 7);
         assert!(
             POLICY_ITEM_CATALOG
                 .iter()
@@ -842,7 +876,8 @@ mod tests {
             [
                 "enable-mfa",
                 "lockout-threshold",
-                "lockout-duration-seconds"
+                "lockout-duration-seconds",
+                "password-min-length"
             ]
         );
         for spec in POLICY_ITEM_CATALOG {

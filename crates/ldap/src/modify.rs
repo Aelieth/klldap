@@ -1296,10 +1296,14 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_a_short_password_is_refused_at_modify_and_password_modify() {
-        use lldap_domain_handlers::password::{PASSWORD_HAS_NUL, PASSWORD_TOO_SHORT};
+        use lldap_domain_handlers::password::PASSWORD_HAS_NUL;
         let dn = "uid=bob,ou=people,dc=example,dc=com";
         let refusals = [
-            ("Short-7", "pässwör", PASSWORD_TOO_SHORT),
+            (
+                "Short-7",
+                "pässwör",
+                "the password must be at least 8 characters",
+            ),
             ("a\0aaaaaaa", "b\0bbbbbbb", PASSWORD_HAS_NUL),
         ];
         for (synced, (replaced, sent, refusal)) in [false, true]
@@ -1348,6 +1352,99 @@ mod tests {
                     vec![]
                 ),
                 "synced {synced}, {sent:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_the_users_minimum_is_asked_at_modify_and_password_modify() {
+        use lldap_domain_handlers::logging::LogKind;
+        use lldap_test_utils::recording_log::LogGuard;
+        let dn = "uid=bob,ou=people,dc=example,dc=com";
+        let eleven = "Eleven-11ch";
+        let rows: [(bool, Option<usize>, &str); 4] = [
+            (
+                false,
+                Some(12),
+                "the password must be at least 12 characters",
+            ),
+            (
+                true,
+                Some(12),
+                "the password must be at least 12 characters",
+            ),
+            (
+                false,
+                None,
+                "the password policy could not be read; try again",
+            ),
+            (
+                true,
+                None,
+                "the password policy could not be read; try again",
+            ),
+        ];
+        assert_eq!(eleven.chars().count(), 11);
+        for (synced, min, refusal) in rows {
+            let guard = RecordingGuard::install();
+            let log = LogGuard::install_on_this_thread();
+            let mut mock = MockTestBackendHandler::new();
+            mock.expect_password_min_length()
+                .with(mockall::predicate::eq(UserId::new("bob")))
+                .times(2)
+                .returning(move |_| {
+                    min.ok_or_else(|| DomainError::InternalError("down".to_owned()))
+                });
+            if synced {
+                mock.expect_get_user_details()
+                    .returning(|uid| Ok(synced_user(uid)));
+            }
+            setup_default_ldap_mock(&mut mock);
+            mock.expect_registration_start().times(0);
+            mock.expect_registration_finish().times(0);
+            mock.expect_ensure_kerberos_principal_consistency().times(0);
+            let mut ldap_handler = setup_bound_admin_handler(mock).await;
+            let modify = LdapModifyRequest {
+                dn: dn.to_owned(),
+                changes: vec![LdapModify {
+                    operation: LdapModifyType::Replace,
+                    modification: ldap3_proto::LdapPartialAttribute {
+                        atype: "userPassword".to_string(),
+                        vals: vec![eleven.as_bytes().to_vec()],
+                    },
+                }],
+            };
+            let modified = ldap_handler.do_modify_request(&modify).await;
+            let extended = LdapOp::ExtendedRequest(
+                ldap3_proto::proto::LdapPasswordModifyRequest {
+                    user_identity: Some(dn.to_owned()),
+                    old_password: None,
+                    new_password: Some(eleven.to_owned()),
+                }
+                .into(),
+            );
+            let extended = ldap_handler.handle_ldap_message(extended).await;
+            let logged: Vec<_> = log
+                .recorder()
+                .take_events()
+                .into_iter()
+                .filter(|e| e.kind == LogKind::PasswordChange)
+                .map(|e| (e.target, e.success, e.detail))
+                .collect();
+            let row = || (Some("bob".to_owned()), false, Some(refusal.to_owned()));
+            assert_eq!(
+                (modified, extended, guard.recorder().take_ops(), logged),
+                (
+                    make_modify_failure_response(LdapResultCode::UnwillingToPerform, refusal),
+                    Some(vec![make_extended_response(
+                        LdapResultCode::UnwillingToPerform,
+                        refusal.to_owned()
+                    )]),
+                    vec![],
+                    vec![row(), row()]
+                ),
+                "synced {synced}, {refusal}"
             );
         }
     }

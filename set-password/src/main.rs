@@ -95,6 +95,17 @@ pub fn register_start(
     serde_json::from_str(&data).context("Could not parse response")
 }
 
+/// The user's minimum from the start's answer; an old server sends none.
+fn check_min_length(password: &str, min: Option<u32>, bypass: bool) -> Result<()> {
+    if let Some(min) = min.filter(|_| !bypass) {
+        ensure!(
+            password.chars().count() >= min as usize,
+            "New password is too short, expected at least {min} characters"
+        );
+    }
+    Ok(())
+}
+
 pub fn register_finish(
     base_url: &Url,
     token: &str,
@@ -145,7 +156,9 @@ fn main() -> Result<()> {
     let registration::ServerRegistrationStart {
         response: res,
         kerberos_envelope_key,
+        password_min_length,
     } = register_start(&opts.base_url, &token, start_request)?;
+    check_min_length(&password, password_min_length, opts.bypass_password_policy)?;
 
     let registration_finish = opaque::client::registration::finish_registration(
         registration_start_request.state,
@@ -169,4 +182,35 @@ fn main() -> Result<()> {
 
     println!("Successfully changed {}'s password", &opts.username);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_the_servers_minimum_stops_a_shorter_password_before_the_finish() {
+        const SEVEN: &str = "Seven-7";
+        const ELEVEN: &str = "Eleven-11ch";
+        const TWELVE: &str = "Twelve-12chr";
+        const ELEVEN_UMLAUTS: &str = "pässwörter1";
+        let too_short = "New password is too short, expected at least 12 characters";
+        let rows = [
+            (ELEVEN, Some(12), false, Err(too_short)),
+            (ELEVEN_UMLAUTS, Some(12), false, Err(too_short)),
+            (TWELVE, Some(12), false, Ok(())),
+            (ELEVEN, Some(12), true, Ok(())),
+            (ELEVEN, None, false, Ok(())),
+            (SEVEN, None, false, Ok(())),
+        ];
+        assert_eq!(
+            [SEVEN, ELEVEN, TWELVE, ELEVEN_UMLAUTS].map(|p| (p.chars().count(), p.len())),
+            [(7, 7), (11, 11), (12, 12), (11, 13)]
+        );
+        for (password, min, bypass, expected) in rows {
+            let got = check_min_length(password, min, bypass).map_err(|e| e.to_string());
+            let expected = expected.map_err(str::to_owned);
+            assert_eq!(got, expected, "{password} {min:?} {bypass}");
+        }
+    }
 }

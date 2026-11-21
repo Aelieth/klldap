@@ -253,7 +253,7 @@ policy_both() {
     if user_bind "$POL_DN" "$new" && ! user_bind "$POL_DN" "$old" \
         && kinit_pw "$POL_USER@$REALM" "$new" >"$D/kinit-policy-new-$via.log" 2>&1 \
         && kinit_refused "$POL_USER" "$old" "$D/kinit-policy-old-$via.log"; then
-        p_ok "$via: bind and kinit both take the ${#new}-character password and refuse the old one: a directory user's password rules are the directory's (the floor of 8 now, OU policy later)"
+        p_ok "$via: bind and kinit both take the ${#new}-character password and refuse the old one: a directory user's password rules are the directory's (the floor of 8 and the OU's password-min-length)"
     else
         p_bad "$via: bind and kinit did not both move to the ${#new}-character password (see kinit-policy-new-$via.log, kinit-policy-old-$via.log)"
     fi

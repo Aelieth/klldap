@@ -1,5 +1,5 @@
 use crate::components::fragments::attribute_order::attribute_priority;
-use crate::infra::opaque::{begin_registration, finish_registration};
+use crate::infra::opaque::{begin_registration, finish_registration, registration_started};
 use crate::infra::queries::{
     GetPosixConfig, GetUserAttributesSchema, ListOusQuery, get_posix_config,
     get_user_attributes_schema, list_ous_query,
@@ -249,7 +249,7 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
                 Ok(false)
             }
             Msg::RegistrationStartResponse(res) => {
-                let res = res.context("Could not initiate registration")?;
+                let res = registration_started(res)?;
                 let state = self
                     .opaque_data
                     .take()
@@ -258,7 +258,12 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
                     .user_id
                     .as_deref()
                     .context("Missing registration data")?;
-                let req = finish_registration(state, user_id, &self.form.model().password, *res)?;
+                let req = finish_registration(state, user_id, &self.form.model().password, *res)
+                    .map_err(|e| {
+                        anyhow!(
+                            "{e:#}. User {user_id} was created without a password; set one from the user's page"
+                        )
+                    })?;
                 self.common.call_backend(
                     ctx,
                     HostService::register_finish(req),

@@ -220,7 +220,9 @@ table that cannot be read refuses the attempt (`policy: unreadable`).
 have. Characters are counted, not bytes: `pässwört` has 8. Only new and changed passwords are
 held to it; a password already set is never judged, so a user moved under a higher minimum
 keeps signing in with the old password until it changes. A user's value comes from their
-OU, by the inheritance above. There is no server-wide setting.
+OU, by the inheritance above. There is no server-wide setting. A changed minimum applies to the
+next password change on every server at once, unlike the sign-in items, which follow within
+about 30 seconds: each change reads the user's minimum from the database, a few small reads.
 
 The server holds every password it sees to the user's minimum, and refuses a shorter one with
 "the password must be at least N characters", N being that minimum:

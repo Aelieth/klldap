@@ -2,12 +2,11 @@ use crate::sql_backend_handler::SqlBackendHandler;
 use crate::sql_lockout_handler::CountingStart;
 use crate::sql_mfa_windows::read_windows;
 use async_trait::async_trait;
-use lldap_domain::types::{User, UserId};
-use lldap_domain_handlers::enforcement::resolve_items;
-use lldap_domain_handlers::handler::PolicyBackendHandler;
+use lldap_domain::types::{User, UserId, user_ou};
+use lldap_domain_handlers::handler::{PolicyBackendHandler, UserBackendHandler};
 use lldap_domain_handlers::kdc_proof::ProofWindow;
 use lldap_domain_handlers::logging::{self, LogKind};
-use lldap_domain_handlers::password::PasswordMinLength;
+use lldap_domain_handlers::password::{PasswordMinLength, min_length_for_ou_key};
 use lldap_domain_handlers::policies::{
     AttachedPolicy, CreatePolicyRequest, OuPolicyState, Policy, PolicyId, PolicyLevel,
     UpdatePolicyRequest, canonical_ou_key, ou_chain, ou_display, resolve,
@@ -395,11 +394,14 @@ impl PolicyBackendHandler for SqlBackendHandler {
     }
 
     async fn password_min_length(&self, user_id: &UserId) -> Result<usize> {
-        match resolve_items(self, self.policy_cache, user_id).await {
-            Ok(items) => Ok(resolve::<PasswordMinLength>(None, &items).0),
-            Err(DomainError::EntityNotFound(_)) => Ok(resolve::<PasswordMinLength>(None, &[]).0),
-            Err(e) => Err(e),
-        }
+        let details = match self.get_user_details(user_id).await {
+            Err(DomainError::EntityNotFound(_)) => {
+                return Ok(resolve::<PasswordMinLength>(None, &[]).0);
+            }
+            details => details?,
+        };
+        let ou_key = canonical_ou_key(&user_ou(&details.attributes));
+        min_length_for_ou_key(self, &ou_key).await
     }
 
     async fn read_proof_windows(
@@ -515,11 +517,15 @@ mod tests {
             .unwrap();
     }
 
-    fn mfa_of(cache: &PolicyCache, user: &str) -> Option<String> {
+    fn held_item(cache: &PolicyCache, user: &str, key: &str) -> Option<String> {
         let entries = cache.get();
         let items = entries.items_of(&UserId::new(user))?;
-        let item = items.iter().find(|item| item.key == "enable-mfa")?;
+        let item = items.iter().find(|item| item.key == key)?;
         Some(item.value.clone())
+    }
+
+    fn mfa_of(cache: &PolicyCache, user: &str) -> Option<String> {
+        held_item(cache, user, "enable-mfa")
     }
 
     #[tokio::test]
@@ -815,10 +821,6 @@ mod tests {
         let id = doors::policy_on(&h, "e3bad", &[(PASSWORD_MIN_LENGTH_ITEM, "12")]).await;
         store_items(&h, id, "not json").await;
         let user = UserId::new("e3unread");
-        assert!(
-            h.policy_cache.get().items_of(&user).is_none(),
-            "the handler's cache holds no entry for the user, so the read below reaches the database"
-        );
         let _ = doors::rows(&log, &[]);
         let read = h.password_min_length(&user).await;
         let refused = min_length_of(&h, &user).await;
@@ -837,6 +839,98 @@ mod tests {
                     Some("the password policy could not be read; try again".to_owned())
                 )]
             )
+        );
+    }
+
+    const FIFTEEN: &str = "Fifteen-15chars";
+
+    type Raised = (
+        usize,
+        usize,
+        std::result::Result<(), PasswordChangeError>,
+        Vec<(LogKind, Option<String>, Option<String>)>,
+    );
+
+    async fn change_at_fifteen(log: &LogGuard, h: &SqlBackendHandler, user: &str) -> Raised {
+        let user = UserId::new(user);
+        let _ = doors::rows(log, &[]);
+        let read = h.password_min_length(&user).await.unwrap();
+        let min = min_length_of(h, &user).await.unwrap();
+        let changed = change_password_everywhere(h, &user, FIFTEEN, PasswordSync::Off, min).await;
+        (
+            read,
+            min,
+            changed,
+            doors::rows(log, &[LogKind::PasswordChange]),
+        )
+    }
+
+    fn refused_at_sixteen(user: &str) -> Raised {
+        let row = (
+            LogKind::PasswordChange,
+            Some(user.to_owned()),
+            Some("the password must be at least 16 characters".to_owned()),
+        );
+        (16, 16, Err(PasswordChangeError::TooShort(16)), vec![row])
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_raised_minimum_holds_at_the_next_change_though_the_cache_holds_the_old_one() {
+        let log = LogGuard::install_on_this_thread();
+        let h = doors::handler().await;
+        doors::user_in(&h, "e3stale", "e3ou").await;
+        let with_lockout = [
+            (PASSWORD_MIN_LENGTH_ITEM, "12"),
+            ("lockout-threshold", "5"),
+            ("lockout-duration-seconds", "0"),
+        ];
+        let id = doors::policy_on(&h, "e3ou", &with_lockout).await;
+        let held = || held_item(h.policy_cache, "e3stale", PASSWORD_MIN_LENGTH_ITEM);
+        let filled = (h.policy_cache.lockout_live(), held());
+        set_items(&h, id, &[(PASSWORD_MIN_LENGTH_ITEM, "12")]).await;
+        set_items(&h, id, &[(PASSWORD_MIN_LENGTH_ITEM, "16")]).await;
+        let raised = change_at_fifteen(&log, &h, "e3stale").await;
+        assert_eq!(
+            (
+                FIFTEEN.chars().count(),
+                filled,
+                (h.policy_cache.lockout_live(), held()),
+                raised
+            ),
+            (
+                15,
+                (true, Some("12".to_owned())),
+                (false, Some("12".to_owned())),
+                refused_at_sixteen("e3stale")
+            ),
+            "filled at 12 while a threshold was live; with nothing live no fill follows the raise, \
+             and the doors read 16"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_another_server_reads_a_raised_minimum_at_once_with_no_fill_between() {
+        let log = LogGuard::install_on_this_thread();
+        let (pool, key) = (get_initialized_db().await, generate_random_private_key());
+        let h = doors::own(SqlBackendHandler::new(key.clone(), pool.clone()));
+        let other = doors::own(SqlBackendHandler::new(key, pool));
+        doors::user_in(&h, "e3there", "e3ou").await;
+        let id = doors::policy_on(&h, "e3ou", &[(PASSWORD_MIN_LENGTH_ITEM, "12")]).await;
+        fill_policy_cache(&other, other.policy_cache).await.unwrap();
+        let held = || held_item(other.policy_cache, "e3there", PASSWORD_MIN_LENGTH_ITEM);
+        let filled = held();
+        set_items(&h, id, &[(PASSWORD_MIN_LENGTH_ITEM, "16")]).await;
+        let raised = change_at_fifteen(&log, &other, "e3there").await;
+        assert_eq!(
+            (filled, raised, held()),
+            (
+                Some("12".to_owned()),
+                refused_at_sixteen("e3there"),
+                Some("12".to_owned())
+            ),
+            "the other server's cache, filled at 12, is never refilled; its doors read 16 at once"
         );
     }
 

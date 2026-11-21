@@ -73,13 +73,19 @@ pub async fn min_length_in_ou(
     user: &UserId,
     kind: LogKind,
 ) -> Result<usize, PasswordChangeError> {
-    let levels = handler
-        .get_policy_levels(&canonical_ou_key(ou))
-        .await
-        .map_err(|e| {
-            warn!("The password policy of OU {ou} for {user} could not be read: {e}");
-            refused_with_row(kind, user, PasswordChangeError::PolicyUnreadable)
-        })?;
+    let ou_key = canonical_ou_key(ou);
+    min_length_for_ou_key(handler, &ou_key).await.map_err(|e| {
+        warn!("The password policy of OU {ou} for {user} could not be read: {e}");
+        refused_with_row(kind, user, PasswordChangeError::PolicyUnreadable)
+    })
+}
+
+/// The `password-min-length` an OU key resolves to, read from the database, never a cache.
+pub async fn min_length_for_ou_key(
+    handler: &(impl PolicyBackendHandler + ?Sized),
+    ou_key: &str,
+) -> Result<usize, DomainError> {
+    let levels = handler.get_policy_levels(ou_key).await?;
     let items = resolve_effective_items(POLICY_ITEM_CATALOG, &levels);
     Ok(resolve::<PasswordMinLength>(None, &items).0)
 }

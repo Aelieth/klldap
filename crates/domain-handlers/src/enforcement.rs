@@ -1239,7 +1239,13 @@ mod tests {
         let at_password_doors = crate::password::PASSWORD_MIN_LENGTH_ITEM;
         for spec in POLICY_ITEM_CATALOG {
             let enforced = checked.contains(spec.key) || spec.key == at_password_doors;
-            assert_eq!(spec.enforced, enforced, "{}", spec.key);
+            let why = if spec.key == at_password_doors {
+                "enforced without an ItemCheck: judged at a password change, read from the \
+                 database, never at sign-in"
+            } else {
+                "enforced exactly when an ItemCheck reads it"
+            };
+            assert_eq!(spec.enforced, enforced, "{}: {why}", spec.key);
         }
         for key in checked {
             assert!(catalog_item(key).is_some(), "{key} is not a catalog item");

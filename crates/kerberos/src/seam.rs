@@ -3417,6 +3417,96 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_a_kadmin_cpw_reads_a_raised_minimum_though_the_cache_holds_the_old_one() {
+        use lldap_domain_handlers::enforcement::{PolicyCache, fill_policy_cache};
+        use lldap_domain_handlers::password::PASSWORD_MIN_LENGTH_ITEM;
+        use lldap_domain_handlers::policies::{CreatePolicyRequest, UpdatePolicyRequest};
+        const FIFTEEN: &str = "Dora-Pass-15chr";
+        const SIXTEEN: &str = "Dora-Pass-16char";
+        let memory = |runtime: &Runtime| sqlite_one_connection("sqlite::memory:", runtime);
+        let cache: &'static PolicyCache = Box::leak(Box::new(PolicyCache::new()));
+        let (runtime, temp, committer, _pool, handler, host, store, embedded) =
+            wired_realm_with(&memory, &["dora"], Some(cache), None);
+        runtime
+            .block_on(synced(&embedded, &UserId::new("dora"), "Dora-Password-0"))
+            .unwrap();
+        let etypes: Vec<krb5_crypto::KeySalt> = temp
+            .settings
+            .supported_enctypes
+            .iter()
+            .map(|&e| e.into())
+            .collect();
+        let dora = name("dora");
+        let cpw = |password: &'static str| {
+            let fill = with_password(password, 0);
+            let intent = intent_of(Operation::ChangePassword, kadmin(false), &["dora"], &fill);
+            let edit = |s: &mut krb5_kdc::PrincipalStore| {
+                let bytes = password.as_bytes();
+                s.set_password_etypes_keepold_n_in(&dora, "EXAMPLE.COM", bytes, 0, ADMIN, &etypes)
+            };
+            match kadmin_try(&store, true, intent, &dora, &edit) {
+                Ok(()) => "written".to_owned(),
+                Err(StoreError::Host(KerberosStoreError::Denied(denial))) => {
+                    format!("{}: {}", code_name(denial.kadm5_code), denial.text)
+                }
+                Err(e) => e.to_string(),
+            }
+        };
+        let min = |value: &str| {
+            let key = PASSWORD_MIN_LENGTH_ITEM.to_owned();
+            std::collections::BTreeMap::from([(key, value.to_owned())])
+        };
+        let held = || -> Option<String> {
+            let entries = cache.get();
+            let items = entries.items_of(&UserId::new("dora"))?;
+            let item = items
+                .iter()
+                .find(|item| item.key == PASSWORD_MIN_LENGTH_ITEM)?;
+            Some(item.value.clone())
+        };
+        let filled = runtime.block_on(async {
+            let request = CreatePolicyRequest {
+                name: "min 12".to_owned(),
+                description: String::new(),
+                items: min("12"),
+            };
+            let id = handler.create_policy(request).await.unwrap();
+            handler.set_ou_policy("people", id).await.unwrap();
+            fill_policy_cache(&handler, cache).await.unwrap();
+            let filled = held();
+            let raise = UpdatePolicyRequest {
+                id,
+                name: None,
+                description: None,
+                items: Some(min("16")),
+            };
+            handler.update_policy(raise).await.unwrap();
+            filled
+        });
+        let before = held();
+        let answers = [cpw(FIFTEEN), cpw(SIXTEEN)];
+        assert_eq!(
+            (
+                (FIFTEEN.chars().count(), SIXTEEN.chars().count()),
+                (filled, before),
+                answers
+            ),
+            (
+                (15, 16),
+                (Some("12".to_owned()), Some("12".to_owned())),
+                [
+                    "PASS_Q_TOOSHORT: the password is shorter than 16 characters".to_owned(),
+                    "written".to_owned()
+                ]
+            ),
+            "the cache holds 12 and no fill follows the raise; kadmind's prepare reads 16"
+        );
+        drop((embedded, store, host, temp));
+        runtime.block_on(committer.shutdown());
+    }
+
+    #[test]
+    #[serial]
     fn test_the_commit_judges_the_minimum_its_prepare_read() {
         use lldap_test_utils::recording_log::LogGuard;
         let guard = LogGuard::install();

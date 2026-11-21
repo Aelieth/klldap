@@ -265,6 +265,8 @@
 
 - The policies page no longer fails on its first render while its data loads.
 - The password pages show the server's reason when setting a password fails.
+- A kadmin password change that kadmind could not prepare is refused and can be retried,
+  instead of being prepared while the KDC waits.
 - The verbose HTTP log records the request path without its query string.
 
 ## [0.8.0] - 2026-11-15

@@ -316,6 +316,7 @@ KLLDAP answers each write to it:
 | `cpw` | Carried out by KLLDAP. The keys and the directory password change in one transaction; then the principal's status follows `lldap_disabled` (an adopted principal is enabled). | success |
 | `cpw` with fewer than 8 characters | Refused. Characters are counted, not bytes. | `Password is too short` |
 | `cpw` with a password that is not valid UTF-8, or with a NUL character | Refused | `Unspecified password quality failure` |
+| `cpw` kadmind could not prepare | Refused, before anything is derived or written; it can be tried again. The `access_denied` row says `PASS_Q_GENERIC: the change could not be prepared`. | `Unspecified password quality failure` |
 | `cpw -keepold`, `cpw -randkey`, `ktadd` | Refused | `Cannot change protected principal` |
 | `ktadd -norandkey` | Refused by kerber-rust itself: the keys are never read out. No log row is written. | ```Operation requires ``extract-keys'' privilege``` |
 | `modprinc -unlock` alone | Carried out by KLLDAP as the directory's unlock, in the change's own transaction: the user's lock is cleared, stamped with the server's clock (the unlock time kadmin sends is not read). Only the failure count, the unlock time and the modification stamp change on the principal. The keys and the password stay. | success |

@@ -28,6 +28,7 @@ pub(crate) const KADM5_PASS_Q_TOOSHORT: u32 = 43_787_542;
 pub(crate) const KADM5_AUTH_ADD: u32 = 43_787_522;
 pub(crate) const KADM5_PASS_Q_GENERIC: u32 = 43_787_577;
 const DERIVE_WAIT: Duration = Duration::from_secs(30);
+const UNPREPARED: &str = "the change could not be prepared";
 const NO_FOLLOW: &str = "after kadmin change_password the status was not set from \
      lldap_disabled and stays as it was: no realm engine is wired to this host";
 const UNLOCK_ROW_BITS: u32 = kadm5_mask::TL_DATA | kadm5_mask::MOD_TIME | kadm5_mask::MOD_NAME;
@@ -432,21 +433,6 @@ pub(crate) fn code_name(code: u32) -> &'static str {
 }
 
 fn denied(intent: &WriteIntent, code: u32, named: &Named) -> KerberosStoreError {
-    let detail = format!(
-        "kadmin {} on {} by {}: {}{}",
-        operation_name(intent.operation),
-        named.principal,
-        client(&intent.caller),
-        code_name(code),
-        named.requested_as()
-    );
-    logging::record_kadmin(
-        client(&intent.caller),
-        LogKind::AccessDenied,
-        Some(&named.principal),
-        false,
-        Some(&detail),
-    );
     let text = match code {
         KADM5_PASS_Q_TOOSHORT => {
             format!("the password is shorter than {PASSWORD_MIN_LENGTH} characters")
@@ -463,6 +449,38 @@ fn denied(intent: &WriteIntent, code: u32, named: &Named) -> KerberosStoreError 
             named.principal
         ),
     };
+    logged_denial(intent, code, named, "", text)
+}
+
+/// A `cpw` whose commit came without the record `prepare` derived for its user.
+fn unprepared(intent: &WriteIntent, named: &Named) -> KerberosStoreError {
+    let why = format!(": {UNPREPARED}");
+    let text = format!("{UNPREPARED}; try again");
+    logged_denial(intent, KADM5_PASS_Q_GENERIC, named, &why, text)
+}
+
+fn logged_denial(
+    intent: &WriteIntent,
+    code: u32,
+    named: &Named,
+    why: &str,
+    text: String,
+) -> KerberosStoreError {
+    let detail = format!(
+        "kadmin {} on {} by {}: {}{why}{}",
+        operation_name(intent.operation),
+        named.principal,
+        client(&intent.caller),
+        code_name(code),
+        named.requested_as()
+    );
+    logging::record_kadmin(
+        client(&intent.caller),
+        LogKind::AccessDenied,
+        Some(&named.principal),
+        false,
+        Some(&detail),
+    );
     KerberosStoreError::Denied(Denial {
         kadm5_code: code,
         text,
@@ -743,16 +761,17 @@ impl SqlRealm {
             batch,
             ..
         } = change;
-        let (Some(user), Some(password)) = (named.user.clone(), &intent.password) else {
+        let (Some(user), Some(_)) = (named.user.clone(), &intent.password) else {
             return Err(denied(&intent, KADM5_PROTECT_PRINCIPAL, named));
         };
         let record = match prepared.and_then(|p| p.downcast::<PreparedRecord>().ok()) {
             Some(p) if p.user == user => p.record,
             _ => {
                 warn!(
-                    "kadmin change_password for {user}: deriving the record under the store's lock"
+                    "kadmin change_password for {user}: kadmind's commit came without its \
+                     prepared change and is refused, so nothing is derived under the store's lock"
                 );
-                self.records()?.derive(&user, password.as_slice())?
+                return Err(unprepared(&intent, named));
             }
         };
         let mut detail = format!("kadmin change_password by {}", client(&intent.caller));
@@ -3991,6 +4010,11 @@ mod tests {
         let by_bob = "kadmin change_password by bob@EXAMPLE.COM (self-service)".to_owned();
         let done = |label| (label, "written".to_owned(), (true, true), true, Vec::new());
         let kadmin_from = |client: &str| ("kadmin".to_owned(), Some(client.to_owned()));
+        let not_prepared = denial(
+            "bob@EXAMPLE.COM",
+            "change_password",
+            "PASS_Q_GENERIC: the change could not be prepared",
+        );
         assert_eq!(
             (
                 got,
@@ -4001,16 +4025,18 @@ mod tests {
                 vec![
                     done("an admin's cpw"),
                     done("a self-service cpw"),
-                    done("a cpw kadmind did not prepare"),
+                    (
+                        "a cpw kadmind did not prepare",
+                        "PASS_Q_GENERIC".to_owned(),
+                        (false, false),
+                        false,
+                        not_prepared
+                    ),
                 ],
-                vec![by_admin.clone(), by_bob, by_admin],
-                vec![
-                    kadmin_from(ADMIN),
-                    kadmin_from("bob@EXAMPLE.COM"),
-                    kadmin_from(ADMIN)
-                ],
+                vec![by_admin, by_bob],
+                vec![kadmin_from(ADMIN), kadmin_from("bob@EXAMPLE.COM")],
             ),
-            "carried out: the keys, the record and one row"
+            "carried out: the keys, the record and one row; a cpw kadmind did not prepare: refused"
         );
 
         let own_purge = |declared: bool| {
@@ -4485,7 +4511,7 @@ mod tests {
                 details(&pool, &runtime, "password_change").len(),
                 rows()
             ),
-            (false, true, true, true, 4, Vec::new()),
+            (false, true, true, true, 3, Vec::new()),
             "the realm was lost before the commit: nothing written, {lost}"
         );
         drop((embedded, store, host));
@@ -4499,6 +4525,197 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.join("k1.db").display());
         kadmin_rows_on(&|runtime| sqlite_one_connection(&url, runtime));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `Records`' deriver, counting each registration it starts.
+    fn counting_deriver(calls: Arc<AtomicUsize>) -> Arc<dyn OpaqueHandler> {
+        use lldap_auth::opaque::server::{generate_random_private_key, registration};
+        let setup = generate_random_private_key();
+        let mut deriver = lldap_test_utils::MockTestBackendHandler::new();
+        deriver
+            .expect_registration_start()
+            .returning(move |request| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let start = registration::start_registration(
+                    &setup,
+                    request.registration_start_request,
+                    &request.username,
+                )?;
+                Ok(
+                    lldap_opaque_handler::registration::ServerRegistrationStartResponse {
+                        server_data: String::new(),
+                        registration_response: start.message,
+                    },
+                )
+            });
+        Arc::new(deriver)
+    }
+
+    fn unprepared_rows_on(connect: Reconnect) {
+        use krb5_kdc::PrincipalStore;
+        use lldap_test_utils::recording_log::LogGuard;
+
+        let guard = LogGuard::install();
+        let runtime = runtime();
+        let temp = TempRealm::new();
+        let profile = boot::profile(&temp.settings);
+        let (committer, pool) = committer_on(connect, &runtime);
+        for user in ["bob", "alice"] {
+            add_user(&pool, &runtime, user);
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let records = Records {
+            handler: counting_deriver(Arc::clone(&calls)),
+            runtime: runtime.handle().clone(),
+        };
+        let host = Arc::new(SqlRealm::new(committer.store()).serving("EXAMPLE.COM", Some(records)));
+        host.start_pass_committed();
+        let store = krb5_kdc::shared_dump(
+            boot::open_store(&temp.settings, &profile, host.clone()).unwrap(),
+        );
+        let ready = Arc::new(AtomicBool::new(true));
+        let embedded = EmbeddedKerberos::new(store.clone(), &temp.settings, ready, host.clone());
+        runtime
+            .block_on(synced(&embedded, &UserId::new("bob"), "Bob-Password-1"))
+            .unwrap();
+        let bob = name("bob");
+        let etypes: Vec<krb5_crypto::KeySalt> = temp
+            .settings
+            .supported_enctypes
+            .iter()
+            .map(|&e| e.into())
+            .collect();
+        let kvno = || {
+            store
+                .read()
+                .unwrap()
+                .get_name(&bob)
+                .and_then(|p| p.top_kvno())
+        };
+        let keys = || -> Vec<Vec<u8>> {
+            let read = store.read().unwrap();
+            let keys = &read.get_name(&bob).unwrap().keys;
+            keys.iter().map(|k| k.key.as_bytes().to_vec()).collect()
+        };
+        let rows = || -> Rows {
+            let events = guard.recorder().take_events().into_iter();
+            events.map(|e| (e.kind, e.target, e.detail)).collect()
+        };
+        rows();
+
+        type Token<'a> = &'a dyn Fn(WriteIntent) -> (WriteIntent, Option<HostPrepared>);
+        let none = |intent: WriteIntent| (intent, None::<HostPrepared>);
+        let another_type = |intent: WriteIntent| (intent, Some(Box::new(7_u32) as HostPrepared));
+        let alices = |intent: WriteIntent| {
+            let alice = PreparedRecord {
+                user: UserId::new("alice"),
+                record: b"alice's record".to_vec(),
+            };
+            (intent, Some(Box::new(alice) as HostPrepared))
+        };
+        let declared = |intent: WriteIntent| {
+            krb5_kdc::declare_shared(&store, Some((&bob, "EXAMPLE.COM")), |_| intent).unwrap()
+        };
+        let runs: [(&'static str, &'static str, Token); 4] = [
+            ("no prepared change", "Bob-Password-2", &none),
+            (
+                "a prepared change of another type",
+                "Bob-Password-3",
+                &another_type,
+            ),
+            ("another user's prepared change", "Bob-Password-4", &alices),
+            ("its own prepared change", "Bob-Password-5", &declared),
+        ];
+        let warnings = Warnings::default();
+        let mut got = Vec::new();
+        for (label, text, token) in runs {
+            let fill = with_password(text, 0);
+            let intent = intent_of(Operation::ChangePassword, kadmin(false), &["bob"], &fill);
+            let (intent, prepared) = token(intent);
+            let held = keys();
+            let edit = |s: &mut PrincipalStore| {
+                let password = text.as_bytes();
+                s.set_password_etypes_keepold_n_in(&bob, "EXAMPLE.COM", password, 0, ADMIN, &etypes)
+            };
+            let done = tracing::subscriber::with_default(warnings.clone(), || {
+                store.write().unwrap().change_as(intent, prepared, edit)
+            });
+            let answer = match done.and_then(|done| done) {
+                Ok(()) => "written".to_owned(),
+                Err(StoreError::Host(KerberosStoreError::Denied(d))) => {
+                    format!("{}: {}", code_name(d.kadm5_code), d.text)
+                }
+                Err(e) => e.to_string(),
+            };
+            let warned: Vec<String> = std::mem::take(&mut *warnings.0.lock().unwrap())
+                .into_iter()
+                .filter(|line| line.starts_with("kadmin "))
+                .collect();
+            let record = record_of(&pool, &runtime, "bob").is_some();
+            let state = (kvno(), keys() == held, record);
+            got.push((
+                label,
+                answer,
+                calls.load(Ordering::SeqCst),
+                state,
+                rows(),
+                warned,
+            ));
+        }
+        let refused = |label: &'static str| {
+            (
+                label,
+                "PASS_Q_GENERIC: the change could not be prepared; try again".to_owned(),
+                0,
+                (Some(1), true, false),
+                vec![(
+                    LogKind::AccessDenied,
+                    Some("bob@EXAMPLE.COM".to_owned()),
+                    Some(
+                        "kadmin change_password on bob@EXAMPLE.COM by admin/admin@EXAMPLE.COM: \
+                         PASS_Q_GENERIC: the change could not be prepared"
+                            .to_owned(),
+                    ),
+                )],
+                vec![
+                    "kadmin change_password for bob: kadmind's commit came without its \
+                     prepared change and is refused, so nothing is derived under the store's lock"
+                        .to_owned(),
+                ],
+            )
+        };
+        assert_eq!(
+            (got, details(&pool, &runtime, "password_change")),
+            (
+                vec![
+                    refused("no prepared change"),
+                    refused("a prepared change of another type"),
+                    refused("another user's prepared change"),
+                    (
+                        "its own prepared change",
+                        "written".to_owned(),
+                        1,
+                        (Some(2), false, true),
+                        Vec::new(),
+                        Vec::new()
+                    ),
+                ],
+                vec!["kadmin change_password by admin/admin@EXAMPLE.COM".to_owned()],
+            ),
+            "a cpw commit without its own prepared change: refused, nothing derived or written"
+        );
+        drop((embedded, store, host));
+        runtime.block_on(committer.shutdown());
+    }
+
+    #[test]
+    #[serial]
+    fn test_a_cpw_kadmind_did_not_prepare_is_refused_before_anything_is_derived_on_sqlite() {
+        let dir = std::env::temp_dir().join(format!("klldap-unprepared-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.join("k1.db").display());
+        unprepared_rows_on(&|runtime| sqlite_one_connection(&url, runtime));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

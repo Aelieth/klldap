@@ -160,6 +160,13 @@ impl KdcVerdict {
         }
         self.lockout.carry_from_kdc(user, step);
     }
+
+    /// A ticket issued at AS is a sign-in for inactivity-days, with its own carry.
+    fn note_issued(&self, user: &UserId, n: &AsNotice) {
+        if n.reason == AsReason::Issued {
+            self.cache.carry_success_from_kdc(user, lock_clock());
+        }
+    }
 }
 
 pub(crate) fn ip_of(peer: &HostAddress) -> Option<IpAddr> {
@@ -279,6 +286,7 @@ impl HostAdmission for KdcVerdict {
         record_kdc_row(user.as_ref(), target, LogKind::Login, issued, peer, &detail);
         if let Some(user) = &user {
             self.count(user, &n, peer);
+            self.note_issued(user, &n);
         }
     }
 
@@ -345,11 +353,15 @@ pub(crate) mod tests {
     use lldap_auth::opaque::server::generate_random_private_key;
     use lldap_domain::requests::CreateUserRequest;
     use lldap_domain::types::Attribute;
-    use lldap_domain_handlers::enforcement::{Entries, fill_policy_cache, start_policy_cache};
+    use lldap_domain_handlers::enforcement::{
+        Entries, INACTIVITY_DAYS, ItemFlags, UserFacts, fill_policy_cache, start_policy_cache,
+    };
     use lldap_domain_handlers::handler::{PolicyBackendHandler, UserBackendHandler};
+    use lldap_domain_handlers::inactivity::{Recorded, Recording};
     use lldap_domain_handlers::kdc_proof::ProofSettings;
     use lldap_domain_handlers::kerberos::KerberosSync;
     use lldap_domain_handlers::logging::{Protocol, RequestMeta, with_request};
+    use lldap_domain_handlers::login_hours::LoginHoursCheck;
     use lldap_domain_handlers::mfa::{ENABLE_MFA, MfaPolicy};
     use lldap_domain_handlers::policies::{
         CreatePolicyRequest, EffectiveItem, PolicyScope, UpdatePolicyRequest,
@@ -368,6 +380,8 @@ pub(crate) mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
+
+    mod networks_rows;
 
     const REALM: &str = "EXAMPLE.COM";
     const PASSWORD: &str = "Kdc-Pass-1";
@@ -663,6 +677,10 @@ pub(crate) mod tests {
 
     /// The refused users sit in an OU whose value the check refuses.
     fn cached(refused: &[&str], allowed: &[&str]) {
+        cached_values(refused, allowed, ["refuse", "any"]);
+    }
+
+    fn cached_values(refused: &[&str], allowed: &[&str], [labs, people]: [&str; 2]) {
         let mut ous_of_users = HashMap::new();
         for (users, ou) in [(refused, "people\\labs"), (allowed, "people")] {
             for user in users {
@@ -670,8 +688,8 @@ pub(crate) mod tests {
             }
         }
         let items_of_ous = HashMap::from([
-            ("people\\labs".to_owned(), hours("refuse")),
-            ("people".to_owned(), hours("any")),
+            ("people\\labs".to_owned(), hours(labs)),
+            ("people".to_owned(), hours(people)),
         ]);
         policy_cache().replace(Entries {
             ous_of_users,
@@ -1403,6 +1421,137 @@ pub(crate) mod tests {
         );
     }
 
+    const DAYTIME: &str = "tue 08:00-18:00";
+    const EVENING: &str = "tue 22:00-23:00";
+
+    /// The real check for our users, its item on: 1_700_000_000 is Tuesday 22:13:20 UTC.
+    fn real_hours() -> EnforcementGuard {
+        let check = Arc::new(LoginHoursCheck::on(policy_cache()));
+        let guard = EnforcementGuard::judging(OURS, check);
+        policy_cache().set_item_flags(ItemFlags {
+            login_hours: true,
+            ..ItemFlags::default()
+        });
+        guard
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_login_hours_judge_the_as_a_renewal_and_a_service_ticket_at_the_kdcs_instant() {
+        let (a, b) = (REFUSED_USER, ALLOWED_USER);
+        let (_temp, _embedded, store) = realm(&[a, b]).await;
+        let log = LogGuard::install_on_this_thread();
+        let guard = real_hours();
+        cached_values(&[a], &[b], [DAYTIME, EVENING]);
+        let asked_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let reasoned = "policy: login-hours (outside login hours)";
+        let denied = vec![peered(row(LogKind::AccessDenied, false, a, reasoned))];
+        let revoked = Err(err::CLIENT_REVOKED);
+        type Row = (
+            &'static str,
+            &'static str,
+            Result<(), i32>,
+            Vec<KdcRow>,
+            Door,
+        );
+        let rows: [Row; 6] = [
+            ("the AS, outside", a, revoked, vec![], Door::KerberosAs),
+            ("the AS, inside", b, Ok(()), vec![], Door::KerberosAs),
+            (
+                "a renewal, outside",
+                a,
+                revoked,
+                denied.clone(),
+                Door::KerberosTgs,
+            ),
+            ("a renewal, inside", b, Ok(()), vec![], Door::KerberosTgs),
+            (
+                "a service ticket, outside",
+                a,
+                revoked,
+                denied,
+                Door::KerberosTgs,
+            ),
+            (
+                "a service ticket, inside",
+                b,
+                Ok(()),
+                vec![],
+                Door::KerberosTgs,
+            ),
+        ];
+        for (label, user, expected, rows, door) in rows {
+            let got = match label.split(',').next() {
+                Some("the AS") => as_asks(&store, user, false),
+                Some("a renewal") => tgs_asks(&store, Some(user), user, TgsKind::Renew),
+                _ => tgs_asks(&store, Some(user), user, TgsKind::Normal),
+            };
+            let seen = guard.take_seen().into_iter();
+            let seen: Vec<_> = seen
+                .map(|s| (s.user.as_str().to_owned(), s.door, s.now))
+                .collect();
+            assert_eq!(
+                (got, kdc_rows(&log), seen),
+                (expected, rows, vec![(user.to_owned(), door, asked_at)]),
+                "{label}: judged at the KDC's instant"
+            );
+        }
+        let renewed = asked_behind_a_service(&store, Some(a), &name(a), TgsKind::Renew);
+        assert_eq!(
+            (renewed, kdc_rows(&log)),
+            (
+                Err((err::CLIENT_REVOKED, None)),
+                vec![peered(row(LogKind::AccessDenied, false, a, reasoned))]
+            ),
+            "a renewal outside the hours: 18 with no text, the reason in the row"
+        );
+        assert_eq!(as_asks(&store, a, false), revoked);
+        KdcVerdict::new(REALM).as_notice(AsNotice {
+            client: format!("{a}@{REALM}"),
+            requested: format!("{a}@{REALM}"),
+            peer: Some(peer()),
+            time: 1_700_000_000,
+            code: err::CLIENT_REVOKED,
+            reason: AsReason::HostRefused,
+            mechanism: None,
+        });
+        assert_eq!(
+            kdc_rows(&log),
+            vec![peered(row(LogKind::Login, false, a, reasoned))],
+            "the AS's refusal is its notice's one row, with the reason; 18 with no text"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_s4u2self_and_s4u2proxy_are_not_judged_by_login_hours() {
+        let (a, unheld) = (REFUSED_USER, HERE_USER);
+        let (_temp, _embedded, store) = realm(&[a, unheld]).await;
+        let log = LogGuard::install_on_this_thread();
+        let guard = real_hours();
+        cached_values(&[a], &[], [DAYTIME, EVENING]);
+        for user in [a, unheld] {
+            let behind =
+                asked_behind_a_service(&store, Some(user), &name(user), TgsKind::S4u2Proxy);
+            let asked = [
+                as_asks(&store, user, true),
+                tgs_asks(&store, Some(user), user, TgsKind::S4u2Self),
+                tgs_asks(&store, Some(user), user, TgsKind::S4u2Proxy),
+                behind.map_err(|(code, _)| code),
+            ];
+            assert_eq!(
+                (asked, kdc_rows(&log), guard.take_seen().len()),
+                ([Ok(()); 4], vec![], 0),
+                "{user}: outside the hours, or not in the cache, a service is answered"
+            );
+        }
+        assert_eq!(
+            (as_asks(&store, unheld, false), guard.take_seen().len()),
+            (Err(err::CLIENT_REVOKED), 0),
+            "the user the cache lacks, at the AS: not loaded yet"
+        );
+    }
+
     fn proofs(same_address: bool) -> ProofSettings {
         ProofSettings::new(600, same_address, 3600)
     }
@@ -1593,7 +1742,14 @@ pub(crate) mod tests {
         at.enrol(enrolled).await;
         strict_labs(&at.handler).await;
         let registered: Vec<_> = item_checks().iter().map(|check| check.key()).collect();
-        assert_eq!(registered, [THRESHOLD, ENABLE_MFA], "the default checks");
+        let ordered = [
+            THRESHOLD,
+            "inactivity-days",
+            "allowed-networks",
+            ENABLE_MFA,
+            "login-hours",
+        ];
+        assert_eq!(registered, ordered, "the default checks");
         let log = LogGuard::install_on_this_thread();
         let refused = (PROOF_CODE, Some(PROOF_TEXT.to_owned()));
         let impersonated = |user: &str| -> Outcome {
@@ -2186,5 +2342,178 @@ pub(crate) mod tests {
         held.rollback().await.unwrap();
         assert_eq!(answers, (0, err::CLIENT_REVOKED, Err(err::CLIENT_REVOKED)));
         assert!(took < Duration::from_secs(1), "{took:?}");
+    }
+
+    fn idle_facts(name: &str, created: chrono::DateTime<Utc>) -> UserFacts {
+        UserFacts {
+            uuid: lldap_domain::types::Uuid::from_name_and_date(name, &created.naive_utc()),
+            enrolled: false,
+            exempt: false,
+            created,
+            recorded: Some(Recorded::default()),
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_inactivity_refuses_at_as_tgs_and_s4u_with_18_and_no_text() {
+        let (idle, fresh) = ("e6idle", "e6fresh");
+        let (temp, _embedded, store) = realm(&[idle, fresh]).await;
+        let svc = service(&temp, &store);
+        let _guard = EnforcementGuard::default_checks();
+        let cache: &'static PolicyCache = Box::leak(Box::new(PolicyCache::new()));
+        let counter: &'static Lockout = Box::leak(Box::default());
+        let long_ago = chrono::DateTime::from_timestamp(1_600_000_000, 0).unwrap();
+        let thirty = EffectiveItem {
+            key: INACTIVITY_DAYS.to_owned(),
+            scope: PolicyScope::User,
+            value: "30".to_owned(),
+            enforced: true,
+            source: None,
+        };
+        let (idle_id, fresh_id) = (UserId::new(idle), UserId::new(fresh));
+        cache.replace(Entries {
+            ous_of_users: HashMap::from([
+                (idle_id.clone(), "e6ou".to_owned()),
+                (fresh_id.clone(), "e6ou".to_owned()),
+            ]),
+            items_of_ous: HashMap::from([("e6ou".to_owned(), vec![thirty].into())]),
+            facts: HashMap::from([
+                (idle_id, idle_facts(idle, long_ago)),
+                (fresh_id, idle_facts(fresh, Utc::now())),
+            ]),
+            windows: HashMap::new(),
+            built_at: Utc::now(),
+        });
+        let flags = ItemFlags {
+            inactivity: true,
+            ..ItemFlags::default()
+        };
+        cache.set_item_flags(flags);
+        cache.set_recording(Recording::Since(long_ago));
+        let verdict = Arc::new(KdcVerdict::on(REALM, cache, counter));
+        store
+            .write()
+            .unwrap()
+            .policy
+            .plugins
+            .set_host_admission(verdict.clone());
+        let log = LogGuard::install_on_this_thread();
+        let asked = |user, kind| tgs_asks_of(&verdict, &store, Some(user), user, kind);
+        let answers = (
+            kinit(&store, idle, Some(PASSWORD)),
+            kinit(&store, fresh, Some(PASSWORD)),
+            asked(idle, TgsKind::Renew),
+            asked(idle, TgsKind::Normal),
+            asked(fresh, TgsKind::Renew),
+        );
+        let inactive = "policy: inactivity-days (inactive)";
+        assert_eq!(
+            (answers, kdc_rows(&log)),
+            (
+                (
+                    (err::CLIENT_REVOKED, None),
+                    (0, None),
+                    Err(err::CLIENT_REVOKED),
+                    Err(err::CLIENT_REVOKED),
+                    Ok(())
+                ),
+                vec![
+                    row(LogKind::Login, false, idle, inactive),
+                    row(
+                        LogKind::Login,
+                        true,
+                        fresh,
+                        "ticket issued (encrypted timestamp)"
+                    ),
+                    peered(row(LogKind::AccessDenied, false, idle, inactive)),
+                    peered(row(LogKind::AccessDenied, false, idle, inactive)),
+                ]
+            ),
+            "AS and TGS: code 18 with no text; the reason in the row only"
+        );
+        let asked_for = [TgsKind::S4u2Self, TgsKind::S4u2Proxy].map(|kind| asked(idle, kind));
+        let asked_rows = kdc_rows(&log);
+        let impersonated = s4u2self(&store, &svc, idle, false).map(drop);
+        let by = |request: &str, asker: &str| format!("{inactive} ({request} by {asker}@{REALM})");
+        let at_tgs = |request: &str| {
+            let detail = by(request, idle);
+            peered(row(LogKind::AccessDenied, false, idle, &detail))
+        };
+        let by_service = by("S4U2Self", SERVICE);
+        assert_eq!(
+            (asked_for, asked_rows, impersonated, kdc_rows(&log)),
+            (
+                [Err(err::CLIENT_REVOKED); 2],
+                vec![at_tgs("S4U2Self"), at_tgs("S4U2Proxy")],
+                Err((err::CLIENT_REVOKED, None)),
+                vec![row(LogKind::AccessDenied, false, idle, &by_service)]
+            ),
+            "a user refused everywhere is not impersonated: inactivity judges at S4U, and each \
+             row names the request and who asked"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
+    async fn test_an_issued_ticket_is_carried_as_a_success_and_owed_while_the_database_is_held() {
+        let b = "e6kdc";
+        let (_temp, _embedded, store) = realm(&[b]).await;
+        let guard = EnforcementGuard::default_checks();
+        let cache: &'static PolicyCache = Box::leak(Box::new(PolicyCache::new()));
+        let counter: &'static Lockout = Box::leak(Box::default());
+        let pool = memory_pool().await;
+        let handler = SqlBackendHandler::new(generate_random_private_key(), pool.clone())
+            .with_policy_cache(cache)
+            .with_lockout(counter);
+        directory_user(&handler, b, "e6kdcou").await;
+        let request = CreatePolicyRequest {
+            name: "e6 kdc".to_owned(),
+            description: String::new(),
+            items: [(INACTIVITY_DAYS.to_owned(), "30".to_owned())].into(),
+        };
+        let id = handler.create_policy(request).await.unwrap();
+        handler.set_ou_policy("e6kdcou", id).await.unwrap();
+        let verdict = Arc::new(KdcVerdict::on(REALM, cache, counter));
+        store
+            .write()
+            .unwrap()
+            .policy
+            .plugins
+            .set_host_admission(verdict);
+        cache.serve_successes(Arc::new(handler.clone()), tokio::runtime::Handle::current());
+        let user = UserId::new(b);
+        let stored = async || {
+            let rows = handler.read_activity(Some(&user)).await.unwrap();
+            rows.first().and_then(|(_, row)| row.last_success)
+        };
+        let start = lock_clock().and_utc();
+        let later = start + chrono::Duration::seconds(3_600);
+        guard.pin_clock(start);
+        let first = kinit(&store, b, Some(PASSWORD)).0;
+        let written = stored().await;
+        let held = pool.begin().await.unwrap();
+        guard.pin_clock(later);
+        let second = kinit(&store, b, Some(PASSWORD)).0;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let owed = cache.owed_successes();
+        let facts = cache.get().facts_of(&user).and_then(|facts| facts.recorded);
+        let in_memory = facts.and_then(|row| row.last_success);
+        held.rollback().await.unwrap();
+        let drained = (
+            cache.drain_successes(&handler).await,
+            cache.owed_successes(),
+        );
+        assert_eq!(
+            (first, written, second, owed, in_memory),
+            (0, Some(start), 0, 1, Some(later)),
+            "an issued ticket is written off the KDC's thread; with the database held it is owed, \
+             and this server's memory has it at once"
+        );
+        assert_eq!(
+            (drained, stored().await),
+            ((1, 0), Some(later)),
+            "the owed success lands once the database answers"
+        );
     }
 }

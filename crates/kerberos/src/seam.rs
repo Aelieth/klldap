@@ -6328,6 +6328,10 @@ mod tests {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
         let sources = [
             ("admission.rs", include_str!("admission.rs")),
+            (
+                "admission/tests/networks_rows.rs",
+                include_str!("admission/tests/networks_rows.rs"),
+            ),
             ("admission_test.rs", include_str!("admission_test.rs")),
             ("boot.rs", include_str!("boot.rs")),
             ("embedded.rs", include_str!("embedded.rs")),
@@ -6337,10 +6341,17 @@ mod tests {
             ("rotate.rs", include_str!("rotate.rs")),
             ("seam.rs", include_str!("seam.rs")),
         ];
-        let mut on_disk: Vec<String> = std::fs::read_dir(dir)
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
+        fn listed(dir: &std::path::Path, at: &str, out: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).unwrap().map(Result::unwrap) {
+                let name = format!("{at}{}", entry.file_name().to_string_lossy());
+                match entry.file_type().unwrap().is_dir() {
+                    true => listed(&entry.path(), &format!("{name}/"), out),
+                    false => out.push(name),
+                }
+            }
+        }
+        let mut on_disk = Vec::new();
+        listed(std::path::Path::new(dir), "", &mut on_disk);
         on_disk.sort();
         let scanned: Vec<String> = sources.iter().map(|(file, _)| (*file).to_owned()).collect();
         let banned = [

@@ -3,7 +3,10 @@ use crate::mutation::Success;
 use crate::query::policy::GraphQLPolicy;
 use anyhow::anyhow;
 use juniper::{FieldResult, GraphQLInputObject};
+use lldap_domain_handlers::enforcement::policy_cache;
 use lldap_domain_handlers::handler::{PolicyBackendHandler, SystemConfigBackendHandler};
+use lldap_domain_handlers::logging::current_request;
+use lldap_domain_handlers::networks::author_warnings;
 use lldap_domain_handlers::policies::{
     CreatePolicyRequest, PolicyId, ROOT_OU_KEY, UpdatePolicyRequest, canonical_ou_key,
     validate_items, validate_policy_name,
@@ -134,7 +137,9 @@ pub(super) async fn update_policy<Handler: FullHandler + OpaqueHandler>(
         .instrument(span)
         .await
         .map_err(|e| anyhow!("Failed to update policy: {e}"))?;
-    Ok(Success::new())
+    Ok(Success::with_warnings(
+        own_list_warnings(context, handler).await,
+    ))
 }
 
 pub(super) async fn delete_policy<Handler: FullHandler + OpaqueHandler>(
@@ -154,7 +159,9 @@ pub(super) async fn delete_policy<Handler: FullHandler + OpaqueHandler>(
         .instrument(span)
         .await
         .map_err(|e| anyhow!("Failed to delete policy: {e}"))?;
-    Ok(Success::new())
+    Ok(Success::with_warnings(
+        own_list_warnings(context, handler).await,
+    ))
 }
 
 pub(super) async fn set_ou_policy<Handler: FullHandler + OpaqueHandler>(
@@ -177,7 +184,19 @@ pub(super) async fn set_ou_policy<Handler: FullHandler + OpaqueHandler>(
         .instrument(span)
         .await
         .map_err(|e| anyhow!("Failed to set OU policy: {e}"))?;
-    Ok(Success::new())
+    Ok(Success::with_warnings(
+        own_list_warnings(context, handler).await,
+    ))
+}
+
+/// After the write: whether the author's own allowed-networks list now refuses the author.
+async fn own_list_warnings<Handler: FullHandler + OpaqueHandler>(
+    context: &Context<Handler>,
+    handler: &impl PolicyBackendHandler,
+) -> Vec<String> {
+    let author = &context.validation_result.user;
+    let address = current_request().client_address;
+    author_warnings(handler, policy_cache(), author, address).await
 }
 
 pub(super) async fn clear_ou_policy<Handler: FullHandler + OpaqueHandler>(
@@ -199,7 +218,9 @@ pub(super) async fn clear_ou_policy<Handler: FullHandler + OpaqueHandler>(
         .instrument(span)
         .await
         .map_err(|e| anyhow!("Failed to clear OU policy: {e}"))?;
-    Ok(Success::new())
+    Ok(Success::with_warnings(
+        own_list_warnings(context, handler).await,
+    ))
 }
 
 pub(super) async fn set_ou_policy_inheritance<Handler: FullHandler + OpaqueHandler>(
@@ -225,8 +246,13 @@ pub(super) async fn set_ou_policy_inheritance<Handler: FullHandler + OpaqueHandl
         .instrument(span)
         .await
         .map_err(|e| anyhow!("Failed to set OU inheritance: {e}"))?;
-    Ok(Success::new())
+    Ok(Success::with_warnings(
+        own_list_warnings(context, handler).await,
+    ))
 }
+
+#[cfg(test)]
+mod networks_rows;
 
 #[cfg(test)]
 mod tests {

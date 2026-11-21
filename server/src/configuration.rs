@@ -1,7 +1,8 @@
 use crate::{
     cli::{
         GeneralConfigOpts, HealthcheckOpts, LdapsOpts, LogOpts, OffEnabledAlways, PolicyUnlinkOpts,
-        RunOpts, SmtpEncryption, SmtpOpts, TestEmailOpts, TrueFalseAlways, UnlockOpts,
+        ReenableOpts, RunOpts, SmtpEncryption, SmtpOpts, TestEmailOpts, TrueFalseAlways,
+        UnlockOpts,
     },
     database_string::DatabaseUrl,
 };
@@ -21,6 +22,7 @@ use lldap_domain_handlers::{
     kdc_proof::ProofSettings,
     kerberos::{domain_from_base_dn, realm_from},
     mfa::MfaPolicy,
+    networks::{Net, parse_trusted},
 };
 use lldap_kerberos::boot::{RealmSettings, parse_enctypes};
 use lldap_sql_backend_handler::sql_tables::{
@@ -295,6 +297,8 @@ pub struct Configuration {
     pub enable_mfa: Option<OffEnabledAlways>,
     #[builder(default = r#"String::from("UTC")"#)]
     pub login_hours_timezone: String,
+    #[builder(default)]
+    pub trusted_proxies: String,
     #[builder(default = r#"DatabaseUrl::from("sqlite://users.db?mode=rwc")"#)]
     pub database_url: DatabaseUrl,
     #[builder(default)]
@@ -406,6 +410,11 @@ impl Configuration {
     /// Loaded once, by the start; an unknown name refuses it.
     pub fn login_hours_zone(&self) -> Result<LoadedZone> {
         load_zone(&self.login_hours_timezone).map_err(|refused| anyhow!(refused))
+    }
+
+    /// Read once, by the start; a bad entry refuses it.
+    pub fn trusted_proxy_nets(&self) -> Result<Vec<Net>> {
+        parse_trusted(&self.trusted_proxies).map_err(|refused| anyhow!(refused))
     }
 
     pub fn get_private_key_info(&self) -> PrivateKeyInfo {
@@ -697,6 +706,10 @@ impl ConfigOverrider for RunOpts {
             .as_ref()
             .inspect(|zone| config.login_hours_timezone = zone.to_string());
 
+        self.trusted_proxies
+            .as_ref()
+            .inspect(|proxies| config.trusted_proxies = proxies.to_string());
+
         self.smtp_opts.override_config(config);
         self.ldaps_opts.override_config(config);
         self.healthcheck_opts.override_config(config);
@@ -711,6 +724,18 @@ impl TopLevelCommandOpts for UnlockOpts {
 }
 
 impl ConfigOverrider for UnlockOpts {
+    fn override_config(&self, config: &mut Configuration) {
+        self.run.override_config(config);
+    }
+}
+
+impl TopLevelCommandOpts for ReenableOpts {
+    fn general_config(&self) -> &GeneralConfigOpts {
+        &self.run.general_config
+    }
+}
+
+impl ConfigOverrider for ReenableOpts {
     fn override_config(&self, config: &mut Configuration) {
         self.run.override_config(config);
     }
@@ -1104,6 +1129,8 @@ mod tests {
     use clap::Parser;
     use figment::Jail;
     use pretty_assertions::assert_eq;
+
+    mod networks_rows;
 
     #[test]
     fn test_loopback_url_detection() {

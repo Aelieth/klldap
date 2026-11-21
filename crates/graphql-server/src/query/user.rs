@@ -1,13 +1,15 @@
 use super::attribute::AttributeValue;
 use super::group::Group;
 use crate::api::Context;
-use chrono::TimeZone;
-use juniper::{FieldResult, graphql_object};
+use chrono::{DateTime, TimeZone, Utc};
+use juniper::{FieldResult, GraphQLObject, graphql_object};
 use lldap_access_control::UserReadableBackendHandler;
 use lldap_domain::types::{
     MFA_TYPE_TOTP, User as DomainUser, UserAndGroups as DomainUserAndGroups,
 };
-use lldap_domain_handlers::handler::{BackendHandler, MfaBackendHandler};
+use lldap_domain_handlers::handler::{
+    BackendHandler, LockoutBackendHandler, MfaBackendHandler, SignInState as DomainSignInState,
+};
 use lldap_domain_handlers::mfa::MfaPolicy;
 use lldap_opaque_handler::OpaqueHandler;
 use lldap_schema::PublicSchema;
@@ -22,6 +24,7 @@ pub struct User<Handler: BackendHandler> {
     attributes: Vec<AttributeValue<Handler>>,
     schema: Arc<PublicSchema>,
     groups: Option<Vec<Group<Handler>>>,
+    alone: bool,
     _phantom: std::marker::PhantomData<Box<Handler>>,
 }
 
@@ -33,8 +36,16 @@ impl<Handler: BackendHandler> User<Handler> {
             attributes,
             schema,
             groups: None,
+            alone: false,
             _phantom: std::marker::PhantomData,
         })
+    }
+
+    pub fn asked_alone(self) -> Self {
+        Self {
+            alone: true,
+            ..self
+        }
     }
 }
 
@@ -53,6 +64,30 @@ impl<Handler: BackendHandler> User<Handler> {
             );
         }
         Ok(user)
+    }
+}
+
+/// Whether the doors refuse a user now (admins only).
+#[derive(PartialEq, Eq, Debug, GraphQLObject)]
+pub struct SignInState {
+    /// Refused by the lockout now.
+    locked: bool,
+    /// The lock's end; null while it holds until an admin unlocks, or when not locked.
+    locked_until: Option<DateTime<Utc>>,
+    /// Refused by inactivity-days now.
+    inactive: bool,
+    /// When the idle time passed the limit; null when not inactive.
+    inactive_since: Option<DateTime<Utc>>,
+}
+
+impl From<DomainSignInState> for SignInState {
+    fn from(state: DomainSignInState) -> Self {
+        Self {
+            locked: state.locked,
+            locked_until: state.locked_until,
+            inactive: state.inactive_since.is_some(),
+            inactive_since: state.inactive_since,
+        }
     }
 }
 
@@ -162,6 +197,20 @@ impl<Handler: BackendHandler + OpaqueHandler> User<Handler> {
         }
         let mode = context.get_mfa_self_handler().mfa_mode(user).await;
         Some(mode.unwrap_or(MfaPolicy::Always).item().to_owned())
+    }
+
+    /// Whether the doors refuse the user now: the lock and inactivity (admins only, and only under `user(userId)`).
+    async fn sign_in_state(&self, context: &Context<Handler>) -> FieldResult<Option<SignInState>> {
+        let handler = context.get_admin_handler().filter(|_| self.alone);
+        let Some(handler) = handler else {
+            return Ok(None);
+        };
+        let span = debug_span!("[GraphQL query] user::sign_in_state");
+        let state = handler
+            .sign_in_state(&self.user.user_id)
+            .instrument(span)
+            .await?;
+        Ok(Some(state.into()))
     }
 
     /// User-defined attributes, including ou and sshpublickey for legacy clients.

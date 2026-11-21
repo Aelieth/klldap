@@ -321,6 +321,8 @@ mod tests {
             uuid: Uuid::from_name_and_date(name, &chrono::NaiveDateTime::default()),
             enrolled,
             exempt,
+            created: chrono::DateTime::default(),
+            recorded: None,
         }
     }
 

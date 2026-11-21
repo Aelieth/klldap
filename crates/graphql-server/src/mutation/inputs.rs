@@ -96,6 +96,10 @@ impl Success {
             warnings: Vec::new(),
         }
     }
+
+    pub fn with_warnings(warnings: Vec<String>) -> Self {
+        Self { ok: true, warnings }
+    }
 }
 
 impl Default for Success {

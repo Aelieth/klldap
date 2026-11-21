@@ -228,6 +228,19 @@ impl SqlBackendHandler {
             .map_err(|_| invalid_credentials(user))
     }
 
+    /// The items, judged when a web sign-in starts, before any password.
+    async fn admitted_at_start(&self, user: &UserId, now: NaiveDateTime) -> bool {
+        self.admit_at(user, Door::WebLogin, false, now)
+            .await
+            .is_ok()
+    }
+
+    /// After the proof verified: a proof that does not verify, answered at once. The finish's split
+    /// is already queued; the run loop writes it well inside the start's hold.
+    fn refuse_finish() -> DomainError {
+        opaque::AuthenticationError::failed_proof().into()
+    }
+
     /// While the realm is unavailable only admins get in; a refusal is the door's one row.
     async fn admit_while_degraded(&self, user: &UserId, door: Door) -> Result<()> {
         let unavailable = kerberos_backend().unavailable();
@@ -315,12 +328,14 @@ impl LoginHandler for SqlBackendHandler {
             self.count_failure(lock.as_ref(), door, now).await;
             return Err(invalid_credentials(&name));
         }
+        // Judged without the factor before any answer that only a right password gets.
+        self.admit_at(&name, door, false, now).await?;
         match (requirement, code) {
             (MfaRequirement::None, _) => {
-                self.admit_at(&name, door, false, now).await?;
                 self.admit_while_degraded(&name, door).await?;
                 logging::record_as(Some(&name), LogKind::Bind, None, true, None);
                 self.count_success(lock.as_ref(), door, now).await;
+                self.note_activity(&name, now).await;
                 Ok(())
             }
             (MfaRequirement::Enrollment, _) => {
@@ -356,6 +371,7 @@ impl LoginHandler for SqlBackendHandler {
                     let detail = with_proof("totp", stored);
                     logging::record_as(Some(&name), LogKind::Bind, None, true, Some(&detail));
                     self.count_success(lock.as_ref(), door, now).await;
+                    self.note_activity(&name, now).await;
                     Ok(())
                 }
                 Err(rejection) => {
@@ -423,11 +439,16 @@ impl OpaqueHandler for SqlOpaqueHandler {
                 .map_err(|e| Self::lock_unreadable(&user_id, LogKind::Login, e))?,
             None => None,
         };
-        // A locked user is answered as a name with no password file is.
+        // A locked user, and one the items refuse, is answered as a name with no password file is.
         let maybe_password_file = match lock {
             Some(lock) => {
                 let id = rand::RngCore::next_u64(&mut rng);
-                if lock.locked(now) || !self.lockout.start(&lock, id, now) {
+                if lock.locked(now) {
+                    self.refuse_locked(&user_id, LogKind::Login);
+                    None
+                } else if !self.admitted_at_start(&user_id, now).await {
+                    None
+                } else if !self.lockout.start(&lock, id, now) {
                     self.refuse_locked(&user_id, LogKind::Login);
                     None
                 } else {
@@ -435,7 +456,11 @@ impl OpaqueHandler for SqlOpaqueHandler {
                     maybe_password_file
                 }
             }
-            None => maybe_password_file,
+            None if maybe_password_file.is_some() => {
+                let admitted = self.admitted_at_start(&user_id, now).await;
+                maybe_password_file.filter(|_| admitted)
+            }
+            None => None,
         };
 
         let start_response = opaque::server::login::start_login(
@@ -525,7 +550,16 @@ impl OpaqueHandler for SqlOpaqueHandler {
             Some(id) => self.lockout.split(&username, id, false),
             None => Step::default(),
         };
-        let requirement = self.door_requirement(&username, LogKind::Login).await?;
+        let admitted = self.admit_at(&username, Door::WebLogin, false, now);
+        if admitted.await.is_err() {
+            return Err(Self::refuse_finish());
+        }
+        let requirement = match self.door_requirement(&username, LogKind::Login).await {
+            Err(DomainError::AuthenticationError(_)) => {
+                return Err(Self::refuse_finish());
+            }
+            requirement => requirement?,
+        };
         let (detail, mfa_enrollment_pending) = match requirement {
             MfaRequirement::None => (None, false),
             MfaRequirement::Enrollment => (Some("mfa enrollment pending"), true),
@@ -567,8 +601,14 @@ impl OpaqueHandler for SqlOpaqueHandler {
             },
         };
         let second_factor = detail == Some("totp");
-        self.admit_at(&username, Door::WebLogin, second_factor, now)
-            .await?;
+        if second_factor
+            && self
+                .admit_at(&username, Door::WebLogin, true, now)
+                .await
+                .is_err()
+        {
+            return Err(Self::refuse_finish());
+        }
         self.admit_while_degraded(&username, Door::WebLogin).await?;
         let stored = !second_factor || self.note_proof(&username, now_unix()).await;
         let detail = detail.map(|detail| with_proof(detail, stored));
@@ -581,6 +621,7 @@ impl OpaqueHandler for SqlOpaqueHandler {
             detail.as_deref(),
         );
         self.count_success(lock.as_ref(), Door::WebLogin, now).await;
+        self.note_activity(&username, now).await;
         if let Some(id) = foreign {
             let step = self.lockout.split(&username, id, true);
             self.lockout.carry(self, &username, step).await;
@@ -649,6 +690,12 @@ impl OpaqueHandler for SqlOpaqueHandler {
         self.registration_within_age(&request.server_data, chrono::Utc::now().timestamp())
     }
 }
+
+#[cfg(test)]
+mod networks_rows;
+
+#[cfg(test)]
+mod start_rows;
 
 #[cfg(test)]
 mod tests {
@@ -1608,14 +1655,15 @@ mod tests {
                     .collect();
                 let detail = refused.then(|| "policy: login-hours".to_owned());
                 let doors: Vec<_> = guard.take_seen().into_iter().map(|s| s.door).collect();
+                let judged = match (door, refused) {
+                    (Door::WebLogin, false) => vec![door; 2],
+                    _ => vec![door],
+                };
                 assert_eq!(
                     (answered.is_ok(), rows, doors),
-                    (
-                        !refused,
-                        vec![(kind, !refused, protocol, detail)],
-                        vec![door]
-                    ),
-                    "{label}, refused {refused}"
+                    (!refused, vec![(kind, !refused, protocol, detail)], judged),
+                    "{label}, refused {refused}: the web login is judged when the sign-in starts \
+                     and, admitted, again after the password"
                 );
             }
         }
@@ -1784,8 +1832,92 @@ mod tests {
         let refused = (LogKind::Bind, false, Some("policy: login-hours".to_owned()));
         assert_eq!(
             (answered.is_ok(), auth_rows(&log, peer), seen),
-            (false, vec![refused], vec![(Door::LdapBind, true)]),
-            "the code was right; the refusal is the one row and no success row"
+            (false, vec![refused], vec![(Door::LdapBind, false)]),
+            "judged once, without the factor, before the code is looked at: the refusal is the \
+             one row and no success row"
+        );
+        drop(guard);
+        let guard = EnforcementGuard::allowing(&["e0totp"], "login-hours");
+        let meta = RequestMeta::ldap(None, Some(peer.parse().unwrap()));
+        let request = bind_request("e0totp", &format!("e0totp00:{fresh}"));
+        let answered = with_request(meta, handler.bind(request)).await;
+        let seen = guard.take_seen().into_iter();
+        let seen: Vec<_> = seen.map(|s| (s.door, s.second_factor)).collect();
+        let rows = auth_rows(&log, peer).into_iter();
+        let rows: Vec<_> = rows.map(|(kind, success, _)| (kind, success)).collect();
+        assert_eq!(
+            (answered.is_ok(), rows, seen),
+            (
+                true,
+                vec![(LogKind::Bind, true)],
+                vec![(Door::LdapBind, false), (Door::LdapBind, true)]
+            ),
+            "admitted, with the same code: judged without the factor, then again with it; one \
+             success row"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_policy_refusal_at_the_web_login_leaves_its_totp_code_unspent() {
+        let _clock = pin_clock(AT as i64);
+        use lldap_test_utils::enforcement::EnforcementGuard;
+        let log = LogGuard::install_on_this_thread();
+        let peer = "10.77.1.10";
+        let handler = mfa_handler(MfaPolicy::Enrolled).await;
+        insert_user(&handler, "e0webcode", "e0webcode00").await;
+        let seed = enroll(&handler, "e0webcode", AT).await;
+        let (fresh, _) = fresh_and_wrong(&seed, AT);
+        let finish = || {
+            let meta = RequestMeta::http(Some(peer.parse().unwrap()), None);
+            let login = attempt_login(&handler, "e0webcode", "e0webcode00", Some(fresh.as_str()));
+            with_request(meta, login)
+        };
+        let guard = EnforcementGuard::refusing(&["e0webcode"], "login-hours");
+        let answered = finish().await.map_err(|e| e.to_string());
+        let seen = guard.take_seen().into_iter();
+        let seen: Vec<_> = seen.map(|s| (s.door, s.second_factor)).collect();
+        let refused = (answered, auth_rows(&log, peer), seen);
+        drop(guard);
+        let guard = EnforcementGuard::allowing(&["e0webcode"], "login-hours");
+        let meta = RequestMeta::http(Some(peer.parse().unwrap()), None);
+        let wrong = attempt_login(&handler, "e0webcode", "e0webcode-wrong", None);
+        let wrong = with_request(meta, wrong).await.map_err(|e| e.to_string());
+        guard.take_seen();
+        let row = (
+            LogKind::Login,
+            false,
+            Some("policy: login-hours".to_owned()),
+        );
+        assert!(wrong.is_err(), "{wrong:?}");
+        assert_eq!(
+            refused,
+            (wrong, vec![row], vec![(Door::WebLogin, false)]),
+            "judged once when the sign-in starts, without the factor, before the code is looked \
+             at: a wrong password's answer and the refusal as the one row"
+        );
+        let answered = finish().await.map_err(|e| e.to_string());
+        let seen = guard.take_seen().into_iter();
+        let seen: Vec<_> = seen.map(|s| (s.door, s.second_factor)).collect();
+        let rows = auth_rows(&log, peer).into_iter();
+        let rows: Vec<_> = rows.map(|(kind, success, _)| (kind, success)).collect();
+        let signed_in = LoginOutcome::Authenticated {
+            user_id: UserId::new("e0webcode"),
+            mfa_enrollment_pending: false,
+        };
+        assert_eq!(
+            (answered, rows, seen),
+            (
+                Ok(signed_in),
+                vec![(LogKind::Login, true)],
+                vec![
+                    (Door::WebLogin, false),
+                    (Door::WebLogin, false),
+                    (Door::WebLogin, true)
+                ]
+            ),
+            "admitted with the same code: judged when the sign-in starts, then without and with \
+             the factor; the code was never spent; one success row"
         );
     }
 
@@ -1929,5 +2061,676 @@ mod tests {
             wanted.push((label, answer, Vec::from_iter(row)));
         }
         assert_eq!(got, wanted, "per row: the answer and its one row");
+    }
+
+    fn instant(text: &str) -> chrono::DateTime<chrono::Utc> {
+        let at = chrono::DateTime::parse_from_rfc3339(text).unwrap();
+        at.with_timezone(&chrono::Utc)
+    }
+
+    /// One user under `mon 08:00-18:00` on its own OU, the real check judging only that user.
+    async fn under_hours(
+        user: &str,
+    ) -> (
+        SqlBackendHandler,
+        lldap_test_utils::enforcement::EnforcementGuard,
+    ) {
+        use crate::sql_lockout_handler::tests as doors;
+        use lldap_domain_handlers::enforcement::{ItemFlags, policy_cache};
+        use lldap_domain_handlers::login_hours::LoginHoursCheck;
+        use lldap_test_utils::enforcement::EnforcementGuard;
+        let handler = doors::handler().await;
+        doors::user_in(&handler, user, "h2ou").await;
+        doors::policy_on(&handler, "h2ou", &[("login-hours", "mon 08:00-18:00")]).await;
+        let check = std::sync::Arc::new(LoginHoursCheck::on(policy_cache()));
+        let guard = EnforcementGuard::judging(&[user], check);
+        policy_cache().set_item_flags(ItemFlags {
+            login_hours: true,
+            ..ItemFlags::default()
+        });
+        (handler, guard)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_login_hours_refuse_outside_and_admit_inside_at_each_directory_door() {
+        use crate::sql_lockout_handler::tests as doors;
+        use lldap_domain_handlers::logging::Protocol;
+        let log = LogGuard::install_on_this_thread();
+        let (handler, guard) = under_hours("h2door").await;
+        let rows = [
+            (
+                "the LDAP bind",
+                Door::LdapBind,
+                LogKind::Bind,
+                Protocol::Ldap,
+            ),
+            (
+                "the simple login",
+                Door::SimpleLogin,
+                LogKind::Bind,
+                Protocol::Http,
+            ),
+            (
+                "the web login",
+                Door::WebLogin,
+                LogKind::Login,
+                Protocol::Http,
+            ),
+        ];
+        let instants = [
+            ("2026-11-16T07:59:59Z", false),
+            ("2026-11-16T08:00:00Z", true),
+            ("2026-11-16T17:59:59Z", true),
+            ("2026-11-16T18:00:00Z", false),
+        ];
+        let outside = "policy: login-hours (outside login hours)";
+        for (label, door, kind, protocol) in rows {
+            for (at, inside) in instants {
+                guard.pin_clock(instant(at));
+                let meta = match protocol {
+                    Protocol::Ldap => RequestMeta::ldap(None, None),
+                    _ => RequestMeta::http(None, None),
+                };
+                let answered = with_request(meta, async {
+                    match door {
+                        Door::WebLogin => doors::web(&handler, "h2door", doors::RIGHT, None)
+                            .await
+                            .is_ok(),
+                        _ => doors::bind(&handler, "h2door", doors::RIGHT).await,
+                    }
+                })
+                .await;
+                let rows: Vec<_> = log
+                    .recorder()
+                    .take_events()
+                    .into_iter()
+                    .filter(|e| e.actor.as_deref() == Some("h2door"))
+                    .map(|e| (e.kind, e.success, e.detail))
+                    .collect();
+                let detail = (!inside).then(|| outside.to_owned());
+                let seen = guard.take_seen().into_iter();
+                let seen: Vec<_> = seen.map(|seen| (seen.door, seen.now)).collect();
+                let judged = match (door, inside) {
+                    (Door::WebLogin, true) => 2,
+                    _ => 1,
+                };
+                assert_eq!(
+                    (answered, rows, seen),
+                    (
+                        inside,
+                        vec![(kind, inside, detail)],
+                        vec![(door, instant(at)); judged]
+                    ),
+                    "{label} at {at}: judged at the pinned instant, the web login when the sign-in \
+                     starts and, admitted, again after the password; one row"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_outside_the_hours_a_right_password_is_answered_as_a_wrong_one_byte_for_byte() {
+        use crate::sql_lockout_handler::tests as doors;
+        let (handler, guard) = under_hours("h2same").await;
+        guard.pin_clock(instant("2026-11-16T18:00:00Z"));
+        let text = |e: DomainError| e.to_string();
+        let bind = async |password: &str| {
+            let bound = doors::bind_as(&handler, "h2same", password).await;
+            bound.map_err(text)
+        };
+        let both = async || (bind(doors::RIGHT).await, bind("Wrong-Pass-1").await);
+        let ldap = with_request(RequestMeta::ldap(None, None), both()).await;
+        let simple = with_request(RequestMeta::http(None, None), both()).await;
+        let web = async |password: &str| {
+            let signed_in = doors::web(&handler, "h2same", password, None);
+            with_request(RequestMeta::http(None, None), signed_in).await
+        };
+        let right = web(doors::RIGHT).await;
+        guard.pin_clock(instant("2026-11-16T12:00:00Z"));
+        let wrong = web("Wrong-Pass-1").await;
+        let invalid = Err(invalid_credentials(&UserId::new("h2same")).to_string());
+        assert_eq!(
+            (ldap, simple, right),
+            (
+                (invalid.clone(), invalid.clone()),
+                (invalid.clone(), invalid),
+                wrong
+            ),
+            "the LDAP bind and the simple login: the right password outside the hours, then a \
+             wrong one; the web login: the right password outside the hours fails as a wrong one \
+             inside them does"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_outside_the_hours_a_totp_users_right_password_gets_a_wrong_ones_answer_first() {
+        use crate::sql_lockout_handler::tests as doors;
+        use lldap_domain_handlers::enforcement::{ItemFlags, policy_cache};
+        use lldap_domain_handlers::lockout::{DURATION, THRESHOLD};
+        use lldap_domain_handlers::logging::Protocol;
+        use lldap_test_utils::enforcement::EnforcementGuard;
+        const USER: &str = "q31hours";
+        let _clock = pin_clock(AT as i64);
+        let log = LogGuard::install_on_this_thread();
+        let handler = doors::handler().await.with_mfa_policy(MfaPolicy::Enrolled);
+        doors::user_in(&handler, USER, "q31ou").await;
+        let items = [
+            ("login-hours", "mon 08:00-18:00"),
+            (THRESHOLD, "5"),
+            (DURATION, "0"),
+        ];
+        doors::policy_on(&handler, "q31ou", &items).await;
+        enroll(&handler, USER, AT).await;
+        let guard = EnforcementGuard::default_checks();
+        policy_cache().set_item_flags(ItemFlags {
+            login_hours: true,
+            ..ItemFlags::default()
+        });
+        let user = UserId::new(USER);
+        let answer = |e: DomainError| (std::mem::discriminant(&e), e.to_string());
+        let bind = async |protocol: Protocol, password: &str| {
+            let meta = match protocol {
+                Protocol::Ldap => RequestMeta::ldap(None, None),
+                _ => RequestMeta::http(None, None),
+            };
+            let bound = with_request(meta, doors::bind_as(&handler, USER, password)).await;
+            bound.map_err(answer)
+        };
+        let web = async |password: &str| {
+            let signed_in = with_request(RequestMeta::http(None, None), async {
+                let started = doors::start(&handler, USER, password).await;
+                match doors::finish_request(started, password, None) {
+                    Some(request) => Some(handler.login_finish(request).await.map_err(answer)),
+                    None => None,
+                }
+            });
+            signed_in.await
+        };
+        let right = async || {
+            let ldap = bind(Protocol::Ldap, doors::RIGHT).await;
+            let simple = bind(Protocol::Http, doors::RIGHT).await;
+            (ldap, simple, web(doors::RIGHT).await)
+        };
+        let rows = || -> Vec<(LogKind, bool, Option<String>)> {
+            let events = log.recorder().take_events().into_iter();
+            let ours = events.filter(|e| e.actor.as_deref() == Some(USER));
+            ours.map(|e| (e.kind, e.success, e.detail)).collect()
+        };
+        let counted = || {
+            handler
+                .lockout
+                .effective(&user)
+                .map_or(0, |row| row.fail_count)
+        };
+        log.recorder().take_events();
+        guard.pin_clock(instant("2026-11-16T12:00:00Z"));
+        let inside = (right().await, rows());
+        guard.pin_clock(instant("2026-11-16T18:00:00Z"));
+        let outside = (right().await, rows(), counted());
+        let wrong = (
+            bind(Protocol::Ldap, "Wrong-Pass-1").await,
+            bind(Protocol::Http, "Wrong-Pass-1").await,
+            counted(),
+        );
+        guard.pin_clock(instant("2026-11-16T12:00:00Z"));
+        let wrong_web = web("Wrong-Pass-1").await;
+        let code = format!(r#"{TOTP_CODE_REQUIRED} for user "{USER}""#);
+        let code = Err(answer(DomainError::AuthenticationError(code)));
+        let invalid = Err(answer(invalid_credentials(&user)));
+        let row = |kind, detail: &str| (kind, false, Some(detail.to_owned()));
+        let (asked, refused) = (
+            "totp code required",
+            "policy: login-hours (outside login hours)",
+        );
+        assert_eq!(
+            inside,
+            (
+                (code.clone(), code, Some(Ok(LoginOutcome::TotpRequired))),
+                vec![
+                    row(LogKind::Bind, asked),
+                    row(LogKind::Bind, asked),
+                    row(LogKind::Login, asked)
+                ]
+            ),
+            "inside the hours: the code step, as today"
+        );
+        assert_eq!(
+            outside,
+            (
+                (invalid.clone(), invalid.clone(), None),
+                vec![
+                    row(LogKind::Bind, refused),
+                    row(LogKind::Bind, refused),
+                    row(LogKind::Login, refused)
+                ],
+                0
+            ),
+            "outside, the right password and no code: a wrong password's answer, the refusal as \
+             the one row, nothing counted; at the web login the sign-in cannot finish"
+        );
+        assert_eq!(
+            (wrong, wrong_web),
+            ((invalid.clone(), invalid, 2), None),
+            "a wrong password at the LDAP bind and the simple login: the same answers, variant \
+             and text, and the wrong binds count; at the web login inside the hours, a wrong \
+             password cannot finish either"
+        );
+    }
+
+    type Said = (std::mem::Discriminant<DomainError>, String);
+    type Doors = (
+        std::result::Result<(), Said>,
+        std::result::Result<(), Said>,
+        Option<std::result::Result<LoginOutcome, Said>>,
+    );
+    type Rows = Vec<(LogKind, bool, Option<String>)>;
+
+    const HOURS: &str = "policy: login-hours (outside login hours)";
+
+    fn said(e: DomainError) -> Said {
+        (std::mem::discriminant(&e), e.to_string())
+    }
+
+    fn hours_on() -> lldap_domain_handlers::enforcement::ItemFlags {
+        lldap_domain_handlers::enforcement::ItemFlags {
+            login_hours: true,
+            ..Default::default()
+        }
+    }
+
+    /// A user on its own OU under `items` and a lockout of 5; the real checks, `flags` on.
+    async fn q31_user(
+        user: &str,
+        policy: MfaPolicy,
+        items: &[(&str, &str)],
+        flags: lldap_domain_handlers::enforcement::ItemFlags,
+    ) -> (
+        SqlBackendHandler,
+        lldap_test_utils::enforcement::EnforcementGuard,
+    ) {
+        use crate::sql_lockout_handler::tests as doors;
+        use lldap_domain_handlers::enforcement::policy_cache;
+        use lldap_domain_handlers::lockout::{DURATION, THRESHOLD};
+        use lldap_test_utils::enforcement::EnforcementGuard;
+        let handler = doors::handler().await.with_mfa_policy(policy);
+        let ou = format!("{user}ou");
+        doors::user_in(&handler, user, &ou).await;
+        let mut items = items.to_vec();
+        items.extend([(THRESHOLD, "5"), (DURATION, "0")]);
+        doors::policy_on(&handler, &ou, &items).await;
+        let guard = EnforcementGuard::default_checks();
+        policy_cache().set_item_flags(flags);
+        (handler, guard)
+    }
+
+    /// The right password, with `code` when given, at the LDAP bind, the simple login and the
+    /// web login; `None` there when the sign-in cannot finish.
+    async fn at_three_doors(handler: &SqlBackendHandler, user: &str, code: Option<&str>) -> Doors {
+        use crate::sql_lockout_handler::tests as doors;
+        let password = match code {
+            Some(code) => format!("{}:{code}", doors::RIGHT),
+            None => doors::RIGHT.to_owned(),
+        };
+        let ldap = doors::bind_as(handler, user, &password);
+        let ldap = with_request(RequestMeta::ldap(None, None), ldap).await;
+        let simple = doors::bind_as(handler, user, &password);
+        let simple = with_request(RequestMeta::http(None, None), simple).await;
+        let web = with_request(RequestMeta::http(None, None), async {
+            let started = doors::start(handler, user, doors::RIGHT).await;
+            match doors::finish_request(started, doors::RIGHT, code) {
+                Some(request) => Some(handler.login_finish(request).await.map_err(said)),
+                None => None,
+            }
+        });
+        (ldap.map_err(said), simple.map_err(said), web.await)
+    }
+
+    fn q31_rows(log: &LogGuard, user: &str) -> Rows {
+        let events = log.recorder().take_events().into_iter();
+        let ours = events.filter(|e| e.actor.as_deref() == Some(user));
+        ours.map(|e| (e.kind, e.success, e.detail)).collect()
+    }
+
+    fn three_rows(detail: &str) -> Rows {
+        let kinds = [LogKind::Bind, LogKind::Bind, LogKind::Login];
+        kinds
+            .map(|kind| (kind, false, Some(detail.to_owned())))
+            .to_vec()
+    }
+
+    fn counted(handler: &SqlBackendHandler, user: &str) -> u32 {
+        let row = handler.lockout.effective(&UserId::new(user));
+        row.map_or(0, |row| row.fail_count)
+    }
+
+    fn wrong_answers(user: &str) -> Doors {
+        let invalid = Err(said(invalid_credentials(&UserId::new(user))));
+        (invalid.clone(), invalid, None)
+    }
+
+    fn code_asked(user: &str) -> Doors {
+        let asked = format!(r#"{TOTP_CODE_REQUIRED} for user "{user}""#);
+        let asked = Err(said(DomainError::AuthenticationError(asked)));
+        (asked.clone(), asked, Some(Ok(LoginOutcome::TotpRequired)))
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_an_inactive_totp_users_right_password_gets_a_wrong_ones_answer_first() {
+        use lldap_domain_handlers::enforcement::{INACTIVITY_DAYS, ItemFlags, policy_cache};
+        use lldap_domain_handlers::inactivity::Recording;
+        const USER: &str = "q31idle";
+        let _clock = pin_clock(AT as i64);
+        let log = LogGuard::install_on_this_thread();
+        let flags = ItemFlags {
+            inactivity: true,
+            ..ItemFlags::default()
+        };
+        let idle = [(INACTIVITY_DAYS, "1")];
+        let (handler, guard) = q31_user(USER, MfaPolicy::Enrolled, &idle, flags).await;
+        enroll(&handler, USER, AT).await;
+        let since = chrono::Utc::now();
+        policy_cache().set_recording(Recording::Since(since));
+        q31_rows(&log, USER);
+        guard.pin_clock(since + chrono::Duration::hours(1));
+        let active = (
+            at_three_doors(&handler, USER, None).await,
+            q31_rows(&log, USER),
+        );
+        guard.pin_clock(since + chrono::Duration::days(3));
+        let doors = at_three_doors(&handler, USER, None).await;
+        let inactive = (doors, q31_rows(&log, USER), counted(&handler, USER));
+        assert_eq!(
+            active,
+            (code_asked(USER), three_rows("totp code required")),
+            "an hour after the item turned on: the code step, as today"
+        );
+        assert_eq!(
+            inactive,
+            (
+                wrong_answers(USER),
+                three_rows("policy: inactivity-days (inactive)"),
+                0
+            ),
+            "three days on, the right password and no code: a wrong password's answer, the \
+             refusal as the one row, nothing counted"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_an_item_refuses_a_user_who_must_enrol_with_a_wrong_passwords_answer() {
+        const USER: &str = "q31enrol";
+        let log = LogGuard::install_on_this_thread();
+        let hours = [("login-hours", "mon 08:00-18:00")];
+        let (handler, guard) = q31_user(USER, MfaPolicy::Always, &hours, hours_on()).await;
+        q31_rows(&log, USER);
+        guard.pin_clock(instant("2026-11-16T12:00:00Z"));
+        let inside = (
+            at_three_doors(&handler, USER, None).await,
+            q31_rows(&log, USER),
+        );
+        guard.pin_clock(instant("2026-11-16T18:00:00Z"));
+        let doors = at_three_doors(&handler, USER, None).await;
+        let outside = (doors, q31_rows(&log, USER), counted(&handler, USER));
+        let enrol = format!(r#"{MFA_ENROLLMENT_REQUIRED} for user "{USER}""#);
+        let enrol = Err(said(DomainError::AuthenticationError(enrol)));
+        let pending = LoginOutcome::Authenticated {
+            user_id: UserId::new(USER),
+            mfa_enrollment_pending: true,
+        };
+        let detail = |text: &str| Some(text.to_owned());
+        assert_eq!(
+            inside,
+            (
+                (enrol.clone(), enrol, Some(Ok(pending))),
+                vec![
+                    (LogKind::Bind, false, detail("mfa enrollment required")),
+                    (LogKind::Bind, false, detail("mfa enrollment required")),
+                    (LogKind::Login, true, detail("mfa enrollment pending"))
+                ]
+            ),
+            "inside the hours: enrolment required at the bind, admitted to enrol on the web"
+        );
+        assert_eq!(
+            outside,
+            (wrong_answers(USER), three_rows(HOURS), 0),
+            "outside the hours: a wrong password's answer, never \"enrollment required\""
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_refused_between_the_two_steps_the_code_step_answers_as_a_wrong_password() {
+        use crate::sql_lockout_handler::tests as doors;
+        const USER: &str = "q31late";
+        let _clock = pin_clock(AT as i64);
+        let log = LogGuard::install_on_this_thread();
+        let hours = [("login-hours", "mon 08:00-18:00")];
+        let (handler, guard) = q31_user(USER, MfaPolicy::Enrolled, &hours, hours_on()).await;
+        let seed = enroll(&handler, USER, AT).await;
+        let (fresh, wrong) = fresh_and_wrong(&seed, AT);
+        let bind = async |password: String| {
+            let bound = doors::bind_as(&handler, USER, &password);
+            with_request(RequestMeta::ldap(None, None), bound)
+                .await
+                .map_err(said)
+        };
+        let web = async |request: login::ClientLoginFinishRequest| {
+            let finished = handler.login_finish(request);
+            let finished = with_request(RequestMeta::http(None, None), finished).await;
+            finished.map_err(said)
+        };
+        q31_rows(&log, USER);
+        guard.pin_clock(instant("2026-11-16T17:59:59Z"));
+        let started = doors::start(&handler, USER, doors::RIGHT).await;
+        let kept = doors::finish_request(started, doors::RIGHT, None).unwrap();
+        let with_code = |code: &str| login::ClientLoginFinishRequest {
+            totp_code: Some(code.to_owned()),
+            ..kept.clone()
+        };
+        let first = (
+            bind(doors::RIGHT.to_owned()).await,
+            web(kept.clone()).await,
+            q31_rows(&log, USER),
+        );
+        guard.pin_clock(instant("2026-11-16T18:00:00Z"));
+        let answers = (
+            bind(format!("{}:{fresh}", doors::RIGHT)).await,
+            bind(format!("{}:{wrong}", doors::RIGHT)).await,
+            web(with_code(fresh.as_str())).await,
+            web(with_code(wrong.as_str())).await,
+        );
+        let second = (answers, q31_rows(&log, USER), counted(&handler, USER));
+        let (asked, _, _) = code_asked(USER);
+        let (invalid, _, _) = wrong_answers(USER);
+        let failed = Err(said(opaque::AuthenticationError::failed_proof().into()));
+        let row = |kind, detail: &str| (kind, false, Some(detail.to_owned()));
+        assert_eq!(
+            first,
+            (
+                asked,
+                Ok(LoginOutcome::TotpRequired),
+                vec![
+                    row(LogKind::Bind, "totp code required"),
+                    row(LogKind::Login, "totp code required")
+                ]
+            ),
+            "17:59:59, the right password: the code step"
+        );
+        assert_eq!(
+            second,
+            (
+                (invalid.clone(), invalid, failed.clone(), failed),
+                vec![
+                    row(LogKind::Bind, HOURS),
+                    row(LogKind::Bind, HOURS),
+                    row(LogKind::Login, HOURS),
+                    row(LogKind::Login, HOURS)
+                ],
+                0
+            ),
+            "18:00:00, the code step with a right code and with a wrong one: a wrong password's \
+             answer, never a wrong code's; one refusal row each; nothing counted"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_an_attempt_the_items_refuse_never_reaches_the_degraded_realms_answer() {
+        use crate::sql_lockout_handler::tests as doors;
+        use lldap_test_utils::recording_kerberos::{DEGRADED_CAUSE, DegradedGuard};
+        const USER: &str = "q31down";
+        let _clock = pin_clock(AT as i64);
+        let log = LogGuard::install_on_this_thread();
+        let hours = [("login-hours", "mon 08:00-18:00")];
+        let (handler, guard) = q31_user(USER, MfaPolicy::Enrolled, &hours, hours_on()).await;
+        let seed = enroll(&handler, USER, AT).await;
+        let (fresh, _) = fresh_and_wrong(&seed, AT);
+        let _kdc = DegradedGuard::install();
+        q31_rows(&log, USER);
+        guard.pin_clock(instant("2026-11-16T18:00:00Z"));
+        let outside = (
+            at_three_doors(&handler, USER, None).await,
+            at_three_doors(&handler, USER, Some(fresh.as_str())).await,
+            q31_rows(&log, USER),
+        );
+        guard.pin_clock(instant("2026-11-16T12:00:00Z"));
+        let password = format!("{}:{fresh}", doors::RIGHT);
+        let inside = doors::bind_as(&handler, USER, &password);
+        let inside = with_request(RequestMeta::ldap(None, None), inside).await;
+        let mut refused = three_rows(HOURS);
+        refused.extend(three_rows(HOURS));
+        assert_eq!(
+            outside,
+            (wrong_answers(USER), wrong_answers(USER), refused),
+            "outside the hours with the realm degraded, with no code and with a right one: a \
+             wrong password's answer, never the outage's"
+        );
+        assert_eq!(
+            inside.map_err(said),
+            Err(said(DomainError::KdcUnavailable(DEGRADED_CAUSE.to_owned()))),
+            "inside the hours the items admit, and the outage is told"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_totp_sign_in_writes_one_success_row_and_clears_the_count_once() {
+        use crate::sql_lockout_handler::tests as doors;
+        use lldap_domain_handlers::lockout::LockStore;
+        const USER: &str = "q31once";
+        let _clock = pin_clock(AT as i64);
+        let log = LogGuard::install_on_this_thread();
+        let hours = [("login-hours", "mon 08:00-18:00")];
+        let (handler, guard) = q31_user(USER, MfaPolicy::Enrolled, &hours, hours_on()).await;
+        let seed = enroll(&handler, USER, AT).await;
+        let code = |at: u64| format_code(totp_code(&seed, at).unwrap());
+        let noon = instant("2026-11-16T12:00:00Z");
+        guard.pin_clock(noon);
+        let wrong = doors::bind_as(&handler, USER, "Wrong-Pass-1");
+        let wrong = with_request(RequestMeta::ldap(None, None), wrong).await;
+        let failed = (wrong.is_err(), counted(&handler, USER));
+        q31_rows(&log, USER);
+        let stored = async || {
+            let row = handler.read_lock(&UserId::new(USER)).await.unwrap();
+            row.map(|row| (row.fail_count, row.last_success))
+        };
+        let successes = |rows: Rows| -> Vec<(LogKind, bool)> {
+            rows.into_iter()
+                .map(|(kind, success, _)| (kind, success))
+                .collect()
+        };
+        let password = format!("{}:{}", doors::RIGHT, code(AT - TOTP_STEP_SECS));
+        let bound = doors::bind_as(&handler, USER, &password);
+        let bound = with_request(RequestMeta::ldap(None, None), bound).await;
+        let bind = (
+            bound.is_ok(),
+            successes(q31_rows(&log, USER)),
+            counted(&handler, USER),
+            stored().await,
+        );
+        let late = code(AT + TOTP_STEP_SECS);
+        let started = doors::start(&handler, USER, doors::RIGHT).await;
+        let request = doors::finish_request(started, doors::RIGHT, Some(late.as_str())).unwrap();
+        let finished = handler.login_finish(request);
+        let finished = with_request(RequestMeta::http(None, None), finished).await;
+        let web = (
+            finished.is_ok(),
+            successes(q31_rows(&log, USER)),
+            counted(&handler, USER),
+            stored().await,
+        );
+        let cleared = Some((0, Some(noon.naive_utc())));
+        assert_eq!(failed, (true, 1), "a wrong password first: one count");
+        assert_eq!(
+            (bind, web),
+            (
+                (true, vec![(LogKind::Bind, true)], 0, cleared),
+                (true, vec![(LogKind::Login, true)], 0, cleared)
+            ),
+            "judged without and with the factor, the web login also when the sign-in starts; \
+             written once: one success row per sign-in, the count cleared at the sign-in's instant"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_an_unreadable_enable_mfa_value_answers_as_a_wrong_password_at_each_door() {
+        use crate::sql_lockout_handler::tests as doors;
+        const USER: &str = "q32lost";
+        let log = LogGuard::install_on_this_thread();
+        let handler = doors::handler().await;
+        doors::user_in(&handler, USER, "q32ou").await;
+        handler.policy_cache.set_mfa_item_unknown();
+        q31_rows(&log, USER);
+        let bind = async |meta: RequestMeta, password: &str| {
+            let bound = with_request(meta, doors::bind_as(&handler, USER, password)).await;
+            bound.map_err(said)
+        };
+        let binds = [
+            bind(RequestMeta::ldap(None, None), doors::RIGHT).await,
+            bind(RequestMeta::ldap(None, None), "Wrong-Pass-1").await,
+            bind(RequestMeta::http(None, None), doors::RIGHT).await,
+            bind(RequestMeta::http(None, None), "Wrong-Pass-1").await,
+        ];
+        let bind_rows = q31_rows(&log, USER);
+        let started = doors::start(&handler, USER, doors::RIGHT).await;
+        let right = doors::finish_request(started, doors::RIGHT, None).unwrap();
+        let started = doors::start(&handler, USER, doors::RIGHT).await;
+        let mut forged = doors::finish_request(started, doors::RIGHT, None).unwrap();
+        forged.credential_finalization = right.credential_finalization.clone();
+        let web = [
+            handler.login_finish(right).await.map(drop).map_err(said),
+            handler.login_finish(forged).await.map(drop).map_err(said),
+        ];
+        let web_rows = q31_rows(&log, USER);
+        let invalid = Err(said(invalid_credentials(&UserId::new(USER))));
+        let failed = Err(said(opaque::AuthenticationError::failed_proof().into()));
+        let row = |kind, detail: &str| (kind, false, Some(detail.to_owned()));
+        assert_eq!(
+            (binds, bind_rows),
+            (
+                [invalid.clone(), invalid.clone(), invalid.clone(), invalid],
+                vec![row(LogKind::Bind, "policy: unreadable"); 4]
+            ),
+            "the bind reads the value before the password: the right one and a wrong one get the \
+             same answer and the same row, as before"
+        );
+        assert_eq!(
+            (web, web_rows),
+            (
+                [failed.clone(), failed],
+                vec![
+                    row(LogKind::Login, "policy: unreadable"),
+                    row(LogKind::Login, "invalid credentials")
+                ]
+            ),
+            "the web finish reads it after the proof: the right proof gets the failed proof, as \
+             one that does not verify does; only the row tells them apart"
+        );
     }
 }

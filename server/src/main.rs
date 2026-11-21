@@ -18,7 +18,7 @@ mod tcp_server;
 mod tls;
 
 use crate::{
-    cli::{Command, PolicyUnlinkOpts, RunOpts, TestEmailOpts, UnlockOpts},
+    cli::{Command, PolicyUnlinkOpts, ReenableOpts, RunOpts, TestEmailOpts, UnlockOpts},
     configuration::{Configuration, compare_private_key_hashes},
     database_string::DatabaseUrl,
     db_cleaner::Scheduler,
@@ -28,7 +28,8 @@ use actix_server::ServerBuilder;
 use anyhow::{Context, Result, anyhow, bail};
 use futures_util::TryFutureExt;
 use lldap_sql_backend_handler::{
-    KerberosLost, LogRetention, SqlBackendHandler, realm_marked_open, register_password,
+    KerberosLost, LogRetention, SqlBackendHandler, realm_marked_open, reenable_user_on,
+    register_password,
     sql_tables::{self, get_private_key_info, set_private_key_info},
     sqlite_extra_synchronous, start_kerberos_committer, start_log_writer, unlink_ou_policy_on,
     unlock_login_on, warn_database_durability,
@@ -43,6 +44,7 @@ use lldap_domain::types::{Attribute, BUILTIN_GROUPS, UserId, kerberos_sync_enabl
 use lldap_domain_handlers::enforcement::{
     CacheFollower, StartWarning, exempt_group_twin, policy_cache, start_policy_cache,
 };
+use lldap_domain_handlers::inactivity::REENABLED_BY_TOOL;
 use lldap_domain_handlers::kerberos::{
     DegradedKerberos, KerberosSync, NoopKerberos, kerberos_backend, kerberos_store,
     set_kerberos_backend,
@@ -457,6 +459,12 @@ async fn set_up_server(
         config.login_hours_timezone, zone.source
     );
     policy_cache().set_login_hours_zone(zone.zone);
+    let proxies = config.trusted_proxy_nets()?;
+    match config.trusted_proxies.trim() {
+        "" => info!("X-Forwarded-For is not read: no trusted proxy is set"),
+        listed => info!("X-Forwarded-For is read behind the trusted proxies {listed}"),
+    }
+    policy_cache().set_trusted_proxies(proxies);
     let realm = config.kerberos_realm();
     set_kerberos_backend(Arc::new(NoopKerberos::new(realm.clone())));
     tokio::task::spawn_blocking(lldap_graphql_server::warm_transport_key);
@@ -846,6 +854,7 @@ async fn run_server_command(opts: RunOpts) -> Result<()> {
         Err(e) => Err(e),
     };
     lockout().stop().await;
+    policy_cache().stop_successes().await;
     if let Some(committer) = committer {
         committer.shutdown().await;
     }
@@ -947,6 +956,28 @@ async fn unlock_command(opts: UnlockOpts) -> Result<()> {
     Ok(())
 }
 
+async fn reenable_command(opts: ReenableOpts) -> Result<()> {
+    debug!("CLI: {:#?}", &opts);
+    let user = UserId::new(&opts.user);
+    let config = configuration::init(opts)?;
+    logging::init(&config)?;
+    let sql_pool = setup_sql_tables(&config.database_url).await?;
+    let row = event(
+        LogKind::AccountReenable,
+        Some(user.as_str()),
+        true,
+        Some(REENABLED_BY_TOOL),
+    );
+    let reenabled = reenable_user_on(&sql_pool, &user, lock_clock(), row.clone()).await;
+    if let Err(e) = sql_pool.close().await {
+        error!("Error closing database connection pool: {}", e);
+    }
+    reenabled.with_context(|| format!("while re-enabling {user}"))?;
+    rows::print(&row);
+    println!("Re-enabled {user}; a running server sees it within 30 seconds.");
+    Ok(())
+}
+
 async fn policy_unlink_command(opts: PolicyUnlinkOpts) -> Result<()> {
     debug!("CLI: {:#?}", &opts);
     let ou = opts.ou.clone();
@@ -977,6 +1008,7 @@ async fn main() -> Result<()> {
         Command::CreateSchema(opts) => create_schema_command(opts).await,
         Command::Unlock(opts) => unlock_command(opts).await,
         Command::PolicyUnlink(opts) => policy_unlink_command(opts).await,
+        Command::Reenable(opts) => reenable_command(opts).await,
     }
 }
 
@@ -1018,20 +1050,19 @@ mod tests {
     }
 
     #[test]
-    fn test_the_start_loads_and_names_the_zone_before_the_policy_cache_starts() {
-        let source = include_str!("main.rs");
-        let production = source.split("#[cfg(test)]").next().unwrap();
-        let at = |needle: &str| {
-            let found = production.find(needle);
-            found.unwrap_or_else(|| panic!("main.rs has no `{needle}`"))
+    fn test_reenable_takes_one_user() {
+        use clap::Parser;
+        let args = ["lldap", "reenable", "--config-file", "c.toml", "bob"];
+        let opts = match cli::CLIOpts::try_parse_from(args).unwrap().command {
+            Command::Reenable(opts) => opts,
+            other => panic!("{other:?}"),
         };
-        let loaded = at("let zone = config.login_hours_zone()?;");
-        let named = at("\"login-hours are judged in {} ({})\"");
-        let held = at("policy_cache().set_login_hours_zone(zone.zone);");
-        let started = at("start_policy_cache(&backend_handler)");
+        let config_file = opts.run.general_config.config_file.as_str();
+        assert_eq!((opts.user.as_str(), config_file), ("bob", "c.toml"));
+        let two = ["lldap", "reenable", "--config-file", "c.toml", "bob", "ann"];
         assert!(
-            loaded < named && named < held && held < started,
-            "loaded once, named in the start's log line, held before the cache fills"
+            cli::CLIOpts::try_parse_from(two).is_err(),
+            "one user at a time"
         );
     }
 

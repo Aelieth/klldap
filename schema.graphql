@@ -55,6 +55,7 @@ enum LogKind {
   POLICY_CHANGE
   ACCOUNT_LOCK
   ACCOUNT_UNLOCK
+  ACCOUNT_REENABLE
 }
 
 enum LogProtocol {
@@ -427,6 +428,7 @@ type Mutation {
   startMfaEnrollment(currentCode: String, enrollmentProof: String): MfaEnrollmentStart!
   finishMfaEnrollment(state: String!, code: String!): Success!
   unlockUser(userId: String!): Success!
+  reenableUser(userId: String!): Success!
 }
 
 type ObjectClassInfo {
@@ -494,6 +496,8 @@ type PushRealmResponse {
 
 type Query {
   apiVersion: String!
+  "The address allowed-networks judges for this request; null when it has none."
+  clientAddress: String
   user(userId: String!): User!
   users(where: RequestFilter, filters: RequestFilter): [User!]!
   groups: [Group!]!
@@ -534,6 +538,18 @@ type Schema {
   systemSchema: AttributeList!
 }
 
+"Whether the doors refuse a user now (admins only)."
+type SignInState {
+  "Refused by the lockout now."
+  locked: Boolean!
+  "The lock's end; null while it holds until an admin unlocks, or when not locked."
+  lockedUntil: DateTime
+  "Refused by inactivity-days now."
+  inactive: Boolean!
+  "When the idle time passed the limit; null when not inactive."
+  inactiveSince: DateTime
+}
+
 type Success {
   ok: Boolean!
   warnings: [String!]!
@@ -563,6 +579,8 @@ type User {
   mfaEnrolled: Boolean
   "The user's resolved enable_mfa: off, enabled or always (self)."
   mfaMode: String
+  "Whether the doors refuse the user now: the lock and inactivity (admins only, and only under `user(userId)`)."
+  signInState: SignInState
   "User-defined attributes, including ou and sshpublickey for legacy clients."
   attributes: [AttributeValue!]!
   "The groups to which this user belongs."

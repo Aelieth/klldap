@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 pub mod enforcement;
 pub mod handler;
+pub mod inactivity;
 pub mod kdc_proof;
 pub mod kerberos;
 pub mod lockout;

@@ -60,6 +60,7 @@ pub enum GraphQLLogKind {
     PolicyChange,
     AccountLock,
     AccountUnlock,
+    AccountReenable,
 }
 
 #[derive(

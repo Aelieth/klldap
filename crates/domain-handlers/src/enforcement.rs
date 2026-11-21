@@ -2,15 +2,21 @@ use crate::handler::{
     GroupBackendHandler, GroupListerBackendHandler, GroupRequestFilter, PolicyBackendHandler,
     UserBackendHandler, UserListerBackendHandler,
 };
+use crate::inactivity::{
+    ActivityBook, InactivityCheck, Recorded, active_since, cached_active_since, fill_activity,
+    idle_past_limit, read_user_activity,
+};
 use crate::kdc_proof::{ProofSettings, ProofWindow, Reread, WindowReader};
 use crate::kdc_proof::{fill_windows, proofs_live, take_user_windows};
 use crate::kerberos::{CommitError, HostRow};
 use crate::lockout::{self, LockRow, Lockout, LockoutCheck, lockout};
 use crate::logging::{self, LogKind, Protocol, RequestMeta};
+use crate::login_hours::{self, LoginHoursCheck};
 use crate::mfa::{
     ENABLE_MFA, EnableMfa, MFA_DISABLED_GROUP, MfaEnrollmentStatus, MfaPolicy, MfaRequirement,
     mfa_requirement,
 };
+use crate::networks::{NetworksBook, NetworksCheck};
 use crate::policies::{
     EffectiveItem, POLICY_ITEM_CATALOG, POLICY_READ_WAIT, Policy, PolicyValueType,
     canonical_ou_key, catalog_item, resolve, resolve_effective_items,
@@ -180,6 +186,8 @@ impl Refusal {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UserState {
     pub lock: Option<LockRow>,
+    /// The latest of inactivity's starting points; `None` while one is not read.
+    pub active_since: Option<DateTime<Utc>>,
 }
 
 pub trait ItemCheck: Send + Sync {
@@ -207,6 +215,14 @@ pub trait ItemCheck: Send + Sync {
     fn judges_at_s4u(&self) -> bool {
         true
     }
+    /// A value or a state the check cannot read refuses as `unreadable`.
+    fn readable(&self, _value: &str, _state: &UserState) -> bool {
+        true
+    }
+    /// Until what it judges with is held, a live check refuses as an unread item.
+    fn loaded(&self) -> bool {
+        true
+    }
     fn allows(&self, attempt: &Attempt<'_>, value: &str, state: &UserState) -> bool;
     fn allows_among(
         &self,
@@ -231,6 +247,13 @@ pub fn decide(
         let Some(item) = items.iter().find(|item| item.key == check.key()) else {
             continue;
         };
+        if !check.readable(&item.value, state) {
+            return Err(Refusal {
+                item: UNREADABLE,
+                door: attempt.door,
+                reason: None,
+            });
+        }
         if !check.allows_among(attempt, &item.value, items, state) {
             return Err(Refusal {
                 item: check.key(),
@@ -279,7 +302,13 @@ fn refusing(
 
 /// Each enforcing cell adds its item's check here and turns the item's `enforced` flag on.
 pub fn default_item_checks() -> ItemChecks {
-    let checks: Vec<Arc<dyn ItemCheck>> = vec![Arc::new(LockoutCheck), Arc::new(MfaItemCheck)];
+    let checks: Vec<Arc<dyn ItemCheck>> = vec![
+        Arc::new(LockoutCheck),
+        Arc::new(InactivityCheck),
+        Arc::new(NetworksCheck),
+        Arc::new(MfaItemCheck),
+        Arc::new(LoginHoursCheck::on(policy_cache())),
+    ];
     checks.into()
 }
 
@@ -304,6 +333,9 @@ pub struct UserFacts {
     pub uuid: Uuid,
     pub enrolled: bool,
     pub exempt: bool,
+    pub created: DateTime<Utc>,
+    /// inactivity-days' row; `None` until read.
+    pub recorded: Option<Recorded>,
 }
 
 impl UserFacts {
@@ -312,6 +344,8 @@ impl UserFacts {
             uuid: user.uuid.clone(),
             enrolled: user.mfa_type.as_deref() == Some(MFA_TYPE_TOTP),
             exempt: groups.any(|group| group.display_name.as_str() == MFA_DISABLED_GROUP),
+            created: user.creation_date.and_utc(),
+            recorded: None,
         }
     }
 
@@ -417,7 +451,9 @@ pub struct PolicyCache {
     mfa: RwLock<Option<MfaPolicy>>,
     mfa_item: AtomicU8,
     items: [AtomicU8; 3],
-    zone: RwLock<TimeZone>,
+    zone: RwLock<Option<TimeZone>>,
+    pub(crate) activity: ActivityBook,
+    pub(crate) networks: NetworksBook,
     pub(crate) proofs: RwLock<Option<ProofSettings>>,
     pub(crate) reader: RwLock<Option<WindowReader>>,
     pub(crate) rereads: Mutex<HashMap<UserId, Reread>>,
@@ -464,7 +500,9 @@ impl PolicyCache {
             mfa: RwLock::new(None),
             mfa_item: AtomicU8::new(FLAG_OFF),
             items: std::array::from_fn(|_| AtomicU8::new(FLAG_OFF)),
-            zone: RwLock::new(TimeZone::UTC),
+            zone: RwLock::new(None),
+            activity: ActivityBook::default(),
+            networks: NetworksBook::default(),
             proofs: RwLock::new(None),
             reader: RwLock::new(None),
             rereads: Mutex::default(),
@@ -499,8 +537,8 @@ impl PolicyCache {
         *self.mfa.write().unwrap_or_else(PoisonError::into_inner) = policy;
     }
 
-    /// The zone `login-hours` windows are read in, loaded once at start; UTC until then.
-    pub fn login_hours_zone(&self) -> TimeZone {
+    /// The zone `login-hours` windows are read in, loaded once at start; `None` until then.
+    pub fn login_hours_zone(&self) -> Option<TimeZone> {
         self.zone
             .read()
             .unwrap_or_else(PoisonError::into_inner)
@@ -508,7 +546,7 @@ impl PolicyCache {
     }
 
     pub fn set_login_hours_zone(&self, zone: TimeZone) {
-        *self.zone.write().unwrap_or_else(PoisonError::into_inner) = zone;
+        *self.zone.write().unwrap_or_else(PoisonError::into_inner) = Some(zone);
     }
 
     pub fn set_lockout_unknown(&self) {
@@ -567,13 +605,18 @@ impl PolicyCache {
         GATED.iter().any(|key| self.item_state(key) == FLAG_UNKNOWN)
     }
 
+    pub fn items_unread_besides(&self, key: &str) -> bool {
+        let unread = |gated: &&str| *gated != key && self.item_state(gated) == FLAG_UNKNOWN;
+        GATED.iter().any(unread)
+    }
+
     pub fn set_item_flags(&self, flags: ItemFlags) {
         for (key, on) in flags.keyed() {
             self.set_item(key, flag(on));
         }
     }
 
-    fn current(&self) -> Arc<Entries> {
+    pub(crate) fn current(&self) -> Arc<Entries> {
         self.current
             .read()
             .unwrap_or_else(PoisonError::into_inner)
@@ -747,6 +790,7 @@ where
         writers: Some(writers),
     };
     let mut entries = build_entries(handler).await?;
+    fill_activity(handler, cache, &mut entries).await;
     fill_windows(handler, cache, &mut entries).await;
     cache.replace(entries);
     take_marks(handler, cache).await;
@@ -891,11 +935,15 @@ impl ItemFlags {
     }
 }
 
-/// An item turning on fills the cache first and stays unread while that fails.
+/// An item turning on fills the cache first and stays unread while that fails. A live
+/// inactivity's missed read is filled again.
 pub async fn follow_items<H>(handler: &H, cache: &PolicyCache, policies: &[Policy]) -> Result<bool>
 where
     H: UserListerBackendHandler + UserBackendHandler + PolicyBackendHandler + ?Sized,
 {
+    for said in login_hours::UNPARSED.take(policies) {
+        warn!("{said}");
+    }
     let mut rising = Vec::new();
     for (key, on) in ItemFlags::of(policies).keyed() {
         match (on, cache.item_state(key)) {
@@ -905,6 +953,9 @@ where
         }
     }
     if rising.is_empty() {
+        if cache.activity_due() {
+            fill_policy_cache(handler, cache).await?;
+        }
         return Ok(false);
     }
     let mark = |state| rising.iter().for_each(|key| cache.set_item(key, state));
@@ -1023,7 +1074,10 @@ pub fn load_zone_from(dir: &Path, name: &str) -> std::result::Result<LoadedZone,
     let tree = ["right", "posix"]
         .iter()
         .any(|tree| first.eq_ignore_ascii_case(tree));
-    if tree || !name.split('/').all(part) {
+    let host = ["localtime", "posixrules"]
+        .iter()
+        .any(|own| name.eq_ignore_ascii_case(own));
+    if tree || host || !name.split('/').all(part) {
         return Err(refused("not an IANA time zone name"));
     }
     let path = dir.join(name);
@@ -1061,10 +1115,14 @@ where
             Err(e) => Err(e),
         };
         match entry {
-            Ok((ou_key, items, facts)) => {
+            Ok((ou_key, items, mut facts)) => {
+                let read = read_user_activity(handler, &user, &items, &mut facts).await;
+                if !read {
+                    facts.recorded = cache.current().facts_of(&user).and_then(|was| was.recorded);
+                }
                 cache.put_user(&user, &ou_key, items);
                 cache.put_facts(&user, facts);
-                if !take_user_windows(handler, cache, &user).await {
+                if !read || !take_user_windows(handler, cache, &user).await {
                     cache.note_read_failed();
                     continue;
                 }
@@ -1187,15 +1245,73 @@ where
     Ok(user_entry(handler, user).await?.1)
 }
 
+/// The items and inactivity's start; a user the cache lacks costs one bounded read for both.
+async fn resolve_entry<H>(
+    handler: &H,
+    cache: &PolicyCache,
+    user: &UserId,
+    activity: bool,
+) -> Result<(Arc<[EffectiveItem]>, Option<DateTime<Utc>>)>
+where
+    H: UserBackendHandler + PolicyBackendHandler + ?Sized,
+{
+    if !activity {
+        return Ok((resolve_items(handler, cache, user).await?, None));
+    }
+    let entries = cache.get();
+    let held = entries.ous_of_users.get(user);
+    if let Some(items) = held.and_then(|ou_key| entries.items_of_ous.get(ou_key)) {
+        return Ok((
+            items.clone(),
+            cached_active_since(cache, entries.facts_of(user)),
+        ));
+    }
+    let read = tokio::time::timeout(POLICY_READ_WAIT, handler.bounded_activity_entry(user));
+    let unanswered = DomainError::InternalError(POLICY_UNANSWERED.to_owned());
+    let (details, levels, recorded) = read.await.map_err(|_| unanswered)??;
+    let items = resolve_effective_items(POLICY_ITEM_CATALOG, &levels).into();
+    let created = details.creation_date.and_utc();
+    Ok((
+        items,
+        active_since(created, Some(recorded), cache.recording()),
+    ))
+}
+
+/// When the user's idle time passed their limit, judged as at the doors; `None` while admitted.
+pub async fn inactive_since<H>(
+    handler: &H,
+    cache: &PolicyCache,
+    user: &UserId,
+    now: DateTime<Utc>,
+) -> Result<Option<DateTime<Utc>>>
+where
+    H: UserBackendHandler + PolicyBackendHandler + ?Sized,
+{
+    if cache.item_off(INACTIVITY_DAYS) {
+        return Ok(None);
+    }
+    let unread = || DomainError::InternalError(format!("{INACTIVITY_DAYS}: {UNREADABLE}"));
+    if cache.item_unread(INACTIVITY_DAYS) {
+        return Err(unread());
+    }
+    let (items, since) = resolve_entry(handler, cache, user, true).await?;
+    let value = items
+        .iter()
+        .find(|item| item.key == INACTIVITY_DAYS)
+        .map_or("0", |item| item.value.as_str());
+    idle_past_limit(value, since, now).ok_or_else(unread)
+}
+
 fn unread_item(
     cache: &PolicyCache,
     attempt: &Attempt<'_>,
     checks: &[Arc<dyn ItemCheck>],
 ) -> Option<&'static str> {
+    let unread = |check: &&Arc<dyn ItemCheck>| {
+        cache.item_unread(check.key()) || (!check.loaded() && check.live(cache))
+    };
     let judging = checks.iter().filter(|check| judges_attempt(check, attempt));
-    judging
-        .map(|check| check.key())
-        .find(|key| cache.item_unread(key))
+    judging.filter(unread).map(|check| check.key()).next()
 }
 
 /// Until an item it judges is read, a user is refused as when a policy is unreadable.
@@ -1246,12 +1362,20 @@ where
     if checks.is_empty() {
         return Ok(());
     }
-    let decision = match resolve_items(handler, cache, attempt.user).await {
-        Ok(items) => {
+    let activity = checks.iter().any(|check| check.key() == INACTIVITY_DAYS);
+    let decision = match resolve_entry(handler, cache, attempt.user, activity).await {
+        Ok((items, active_since)) => {
+            let state = UserState {
+                active_since,
+                ..state
+            };
             let decided = decide(attempt, &items, &state, &checks);
             let locked = matches!(&decided, Err(refusal) if refusal.item == lockout::THRESHOLD);
             if locked && lockout().confirm(attempt.user).await {
-                let state = lockout().user_state(attempt.user);
+                let state = UserState {
+                    active_since,
+                    ..lockout().user_state(attempt.user)
+                };
                 decide(attempt, &items, &state, &checks)
             } else {
                 decided
@@ -1300,7 +1424,9 @@ pub fn admit_at_kdc_with(
         }
         None => {}
     }
-    let (state, checks) = refusing(checks, cache, lockout, attempt.user);
+    let at_door = checks.iter().filter(|check| judges_attempt(check, attempt));
+    let at_door: Vec<_> = at_door.cloned().collect();
+    let (state, checks) = refusing(&at_door, cache, lockout, attempt.user);
     if checks.is_empty() {
         return Ok(());
     }
@@ -1308,6 +1434,10 @@ pub fn admit_at_kdc_with(
     let Some(items) = entries.items_of(attempt.user) else {
         cache.poke_fill();
         return Err(refused(NOT_LOADED));
+    };
+    let state = UserState {
+        active_since: cached_active_since(cache, entries.facts_of(attempt.user)),
+        ..state
     };
     decide(attempt, items, &state, &checks)
 }
@@ -1335,10 +1465,12 @@ pub fn record_kdc_row(
 mod tests {
     use super::*;
     use crate::handler::{ReadSchemaBackendHandler, UserRequestFilter};
+    use crate::inactivity::Recording;
+    use crate::inactivity::tests::turn;
     use crate::lockout::{LockStore, LockWrite, SplitMark, StoredLock, Written, first_follow};
     use crate::policies::{
-        CreatePolicyRequest, ItemSource, OuPolicyState, Policy, PolicyId, PolicyLevel, PolicyScope,
-        UpdatePolicyRequest, catalog_item,
+        AttachedPolicy, CreatePolicyRequest, ItemSource, OuPolicyState, Policy, PolicyId,
+        PolicyLevel, PolicyScope, UpdatePolicyRequest, catalog_item,
     };
     use chrono::NaiveDateTime;
     use lldap_domain::requests::{CreateUserRequest, UpdateGroupRequest};
@@ -1498,9 +1630,13 @@ mod tests {
             HashSet::from([
                 "lockout-threshold",
                 "lockout-duration-seconds",
-                "enable-mfa"
+                "enable-mfa",
+                "inactivity-days",
+                "login-hours",
+                "allowed-networks"
             ]),
-            "the lockout and enable-mfa are enforced at sign-in; the other items are not yet"
+            "the lockout, enable-mfa, inactivity-days, allowed-networks and login-hours are enforced \
+             at sign-in"
         );
         let at_password_doors = crate::password::PASSWORD_MIN_LENGTH_ITEM;
         for spec in POLICY_ITEM_CATALOG {
@@ -1982,6 +2118,14 @@ mod tests {
         entry_reads: AtomicU64,
         watching: Mutex<Option<(&'static PolicyCache, &'static Lockout)>>,
         verdicts: Mutex<Vec<(bool, std::result::Result<(), Refusal>)>>,
+        watching_idle: Mutex<Option<(&'static PolicyCache, &'static Lockout)>>,
+        levels: Vec<PolicyLevel>,
+        activity_rows: Mutex<Vec<(UserId, Recorded)>>,
+        activity_down: AtomicBool,
+        activity_reads: AtomicU64,
+        activity_entry_reads: AtomicU64,
+        recording_down: AtomicBool,
+        successes: Mutex<Vec<(UserId, NaiveDateTime)>>,
     }
 
     impl Directory {
@@ -2045,6 +2189,14 @@ mod tests {
                 let checks: Vec<Arc<dyn ItemCheck>> = vec![Arc::new(HoursLive)];
                 let verdict = admit_at_kdc_with(cache, counter, &attempt, &checks);
                 let flag = !cache.item_off(LOGIN_HOURS);
+                self.verdicts.lock().unwrap().push((flag, verdict));
+            }
+            if let Some((cache, counter)) = *self.watching_idle.lock().unwrap() {
+                let late = UserId::new(LATE);
+                let attempt = Attempt::at_kdc(&late, Door::KerberosAs, None, 1_700_000_000);
+                let checks: Vec<Arc<dyn ItemCheck>> = vec![Arc::new(InactivityCheck)];
+                let verdict = admit_at_kdc_with(cache, counter, &attempt, &checks);
+                let flag = !cache.item_off(INACTIVITY_DAYS);
                 self.verdicts.lock().unwrap().push((flag, verdict));
             }
             if self.users_down.load(Ordering::Relaxed) {
@@ -2132,7 +2284,7 @@ mod tests {
             unimplemented!()
         }
         async fn get_policy_levels(&self, _: &str) -> Result<Vec<PolicyLevel>> {
-            Ok(Vec::new())
+            Ok(self.levels.clone())
         }
         async fn delete_ou_policy_state(&self, _: &str) -> Result<()> {
             unimplemented!()
@@ -2164,6 +2316,27 @@ mod tests {
             let rows = self.proof_rows.iter();
             let theirs = rows.filter(|(owner, _)| user.is_none_or(|user| owner == user));
             Ok(theirs.cloned().collect())
+        }
+        async fn read_activity(&self, user: Option<&UserId>) -> Result<Vec<(UserId, Recorded)>> {
+            self.activity_reads.fetch_add(1, Ordering::Relaxed);
+            if self.activity_down.load(Ordering::Relaxed) {
+                return Err(DomainError::InternalError("down".to_owned()));
+            }
+            let rows = self.activity_rows.lock().unwrap().clone().into_iter();
+            Ok(rows
+                .filter(|(owner, _)| user.is_none_or(|user| owner == user))
+                .collect())
+        }
+        async fn bounded_activity_entry(
+            &self,
+            user: &UserId,
+        ) -> Result<(User, Vec<PolicyLevel>, Recorded)> {
+            self.activity_entry_reads.fetch_add(1, Ordering::Relaxed);
+            let details = self.get_user_details(user).await?;
+            let rows = self.activity_rows.lock().unwrap().clone().into_iter();
+            let theirs = rows.into_iter().find(|(owner, _)| owner == user);
+            let recorded = theirs.map(|(_, recorded)| recorded).unwrap_or_default();
+            Ok((details, self.levels.clone(), recorded))
         }
     }
 
@@ -2226,6 +2399,16 @@ mod tests {
                 period,
                 ..Written::default()
             })
+        }
+        async fn read_recording(&self) -> Result<Option<NaiveDateTime>> {
+            match self.recording_down.load(Ordering::Relaxed) {
+                true => Err(DomainError::InternalError("down".to_owned())),
+                false => Ok(None),
+            }
+        }
+        async fn write_success(&self, user: &UserId, at: NaiveDateTime) -> Result<()> {
+            self.successes.lock().unwrap().push((user.clone(), at));
+            Ok(())
         }
     }
 
@@ -3260,6 +3443,308 @@ mod tests {
         assert_eq!(utc, Ok(TimeZone::UTC));
     }
 
+    #[test]
+    fn test_the_hosts_own_zone_files_are_refused_as_zone_names_where_they_exist() {
+        let dir = std::env::temp_dir().join(format!("klldap-zones-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let chicago = std::fs::read(format!("{ZONE_FILES}/America/Chicago")).unwrap();
+        let names = ["localtime", "posixrules", "Localtime", "Copied"];
+        let loaded = names.map(|name| {
+            std::fs::write(dir.join(name), &chicago).unwrap();
+            load_zone_from(&dir, name).map(|loaded| loaded.source)
+        });
+        let copied = dir.join("Copied").display().to_string();
+        std::fs::remove_dir_all(&dir).unwrap();
+        let refused = |name: &str| {
+            let text = "is refused: not an IANA time zone name";
+            Err(format!("login_hours_timezone \"{name}\" {text}"))
+        };
+        assert_eq!(
+            loaded,
+            [
+                refused("localtime"),
+                refused("posixrules"),
+                refused("Localtime"),
+                Ok(copied)
+            ],
+            "the same zone file is refused under the host's own names, before it is read, and \
+             loads under a zone's name"
+        );
+    }
+
+    #[test]
+    fn test_the_registered_checks_refuse_in_the_ruled_order() {
+        const RULED: [&str; 4] = [
+            "lockout-threshold",
+            "inactivity-days",
+            "allowed-networks",
+            "login-hours",
+        ];
+        let checks = default_item_checks();
+        let keys = checks.iter().map(|check| check.key());
+        let registered: Vec<&str> = keys.filter(|key| RULED.contains(key)).collect();
+        let ruled: Vec<&str> = RULED
+            .into_iter()
+            .filter(|key| registered.contains(key))
+            .collect();
+        assert_eq!(registered, ruled);
+        assert!(registered.contains(&INACTIVITY_DAYS));
+        let bob = UserId::new("bob");
+        let attempt = Attempt {
+            user: &bob,
+            door: Door::LdapBind,
+            peer: None,
+            now: at(2 * 86_400),
+            second_factor: false,
+        };
+        let items = [
+            item("lockout-threshold", "1"),
+            item("lockout-duration-seconds", "0"),
+            item(INACTIVITY_DAYS, "1"),
+        ];
+        let locked = LockRow {
+            fail_count: 1,
+            last_failed: Some(at(0).naive_utc()),
+            ..LockRow::default()
+        };
+        let both = UserState {
+            lock: Some(locked),
+            active_since: Some(at(0)),
+        };
+        let idle = UserState {
+            lock: None,
+            ..both.clone()
+        };
+        let named =
+            |state: &UserState| decide(&attempt, &items, state, &checks).map_err(|r| r.item);
+        assert_eq!(
+            (named(&both), named(&idle)),
+            (Err("lockout-threshold"), Err(INACTIVITY_DAYS)),
+            "a locked user who is also inactive is named locked"
+        );
+    }
+
+    #[test]
+    fn test_a_check_that_cannot_read_its_value_refuses_as_unreadable() {
+        struct Picky;
+        impl ItemCheck for Picky {
+            fn key(&self) -> &'static str {
+                "login-hours"
+            }
+            fn readable(&self, value: &str, _: &UserState) -> bool {
+                value != "garbled"
+            }
+            fn allows(&self, _: &Attempt<'_>, _: &str, _: &UserState) -> bool {
+                false
+            }
+        }
+        let bob = UserId::new("bob");
+        let attempt = Attempt::at_kdc(&bob, Door::KerberosTgs, None, 1_700_000_000);
+        let checks: Vec<Arc<dyn ItemCheck>> = vec![Arc::new(Picky)];
+        let rows = [("garbled", UNREADABLE), ("mon 08:00-09:00", "login-hours")];
+        for (value, refused) in rows {
+            let items = [item("login-hours", value)];
+            let got = decide(&attempt, &items, &UserState::default(), &checks);
+            let refusal = Refusal {
+                item: refused,
+                door: Door::KerberosTgs,
+                reason: None,
+            };
+            assert_eq!(got, Err(refusal), "{value}");
+        }
+    }
+
+    fn idle_level(value: &str) -> Vec<PolicyLevel> {
+        let policy = AttachedPolicy {
+            id: PolicyId(6),
+            name: "idle".to_owned(),
+            items: BTreeMap::from([(INACTIVITY_DAYS.to_owned(), value.to_owned())]),
+        };
+        let level = PolicyLevel {
+            ou_key: String::new(),
+            blocked: false,
+            policy: Some(policy),
+        };
+        vec![level]
+    }
+
+    #[tokio::test]
+    async fn test_the_fill_reads_the_activity_once_and_only_while_an_ou_sets_the_item() {
+        let (late, other) = (UserId::new(LATE), UserId::new(OTHER));
+        let seen = Recorded {
+            last_success: Some(at(0)),
+            reenabled_at: None,
+        };
+        let epoch = DateTime::from_timestamp(0, 0).unwrap();
+        for (label, value, reads, read) in [("not set", "0", 0, false), ("set", "30", 1, true)] {
+            let cache = PolicyCache::new();
+            let mut directory = Directory::knowing(&[LATE]).listing(&[LATE, OTHER]);
+            directory.levels = idle_level(value);
+            *directory.activity_rows.lock().unwrap() = vec![(late.clone(), seen)];
+            fill_policy_cache(&directory, &cache).await.unwrap();
+            let held = cache.get();
+            let facts = |user: &UserId| held.facts_of(user).map(|f| (f.created, f.recorded));
+            let recorded = |row: Recorded| read.then_some(row);
+            assert_eq!(
+                (
+                    directory.activity_reads.load(Ordering::Relaxed),
+                    facts(&late),
+                    facts(&other)
+                ),
+                (
+                    reads,
+                    Some((epoch, recorded(seen))),
+                    Some((epoch, recorded(Recorded::default())))
+                ),
+                "{label}: the creation from the fill's own rows; one read for every user's row"
+            );
+        }
+        let cache = PolicyCache::new();
+        let mut directory = Directory::knowing(&[LATE, OTHER]).listing(&[LATE]);
+        directory.levels = idle_level("30");
+        fill_policy_cache(&directory, &cache).await.unwrap();
+        *directory.activity_rows.lock().unwrap() = vec![(late.clone(), seen)];
+        cache.mark(&late);
+        take_marks(&directory, &cache).await;
+        let taken = |cache: &PolicyCache| cache.get().facts_of(&late).and_then(|f| f.recorded);
+        assert_eq!(
+            (
+                directory.activity_reads.load(Ordering::Relaxed),
+                taken(&cache),
+                cache.marked(&late)
+            ),
+            (2, Some(seen), false),
+            "a marked user reads their own row again"
+        );
+        directory.activity_down.store(true, Ordering::Relaxed);
+        cache.mark(&late);
+        take_marks(&directory, &cache).await;
+        assert_eq!(
+            (taken(&cache), cache.marked(&late), cache.failed_read()),
+            (Some(seen), true, true),
+            "a read that failed keeps what was read, and the user stays marked"
+        );
+        cache.mark(&other);
+        take_marks(&directory, &cache).await;
+        let first = cache.get().facts_of(&other).map(|f| f.recorded);
+        assert_eq!(
+            (first, cache.marked(&other)),
+            (Some(None), true),
+            "a user the cache did not hold has nothing to keep: unread, never as never signed in"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_the_activity_is_read_before_the_inactivity_flag_lets_the_kdc_judge() {
+        let cache: &'static PolicyCache = Box::leak(Box::new(PolicyCache::new()));
+        let counter: &'static Lockout = Box::leak(Box::default());
+        let mut directory = Directory::knowing(&[LATE]).listing(&[LATE]);
+        directory.policies = vec![linked(INACTIVITY_DAYS, "30", &[LABS])];
+        directory.levels = idle_level("30");
+        *directory.watching_idle.lock().unwrap() = Some((cache, counter));
+        counter.follow_policies(&directory, cache).await.unwrap();
+        let at_each_fill = directory.verdicts.lock().unwrap().clone();
+        let read = cache.get().facts_of(&UserId::new(LATE)).map(|f| f.recorded);
+        assert_eq!(
+            (
+                at_each_fill,
+                read,
+                directory.activity_reads.load(Ordering::Relaxed)
+            ),
+            (
+                vec![(false, Ok(())), (true, Ok(()))],
+                Some(Some(Recorded::default())),
+                2
+            ),
+            "each fill reads the activity, the first one with the flag still off: the KDC never \
+             answers `unreadable` for a user it knows"
+        );
+        let late = UserId::new(LATE);
+        let attempt = Attempt::at_kdc(&late, Door::KerberosAs, None, 1_700_000_000);
+        let checks: Vec<Arc<dyn ItemCheck>> = vec![Arc::new(InactivityCheck)];
+        let reads = cache.reads();
+        assert_eq!(
+            (
+                admit_at_kdc_with(cache, counter, &attempt, &checks),
+                cache.reads() - reads
+            ),
+            (Ok(()), 1),
+            "after the flip the KDC judges the user from memory"
+        );
+    }
+
+    /// The real inactivity check alone, live on the process's cache; put back on drop.
+    struct Idle;
+
+    impl Idle {
+        fn since(recording: DateTime<Utc>) -> Self {
+            let checks: Vec<Arc<dyn ItemCheck>> = vec![Arc::new(InactivityCheck)];
+            set_item_checks(checks.into());
+            turn(policy_cache(), true);
+            policy_cache().set_recording(Recording::Since(recording));
+            policy_cache().replace(Entries::default());
+            Self
+        }
+    }
+
+    impl Drop for Idle {
+        fn drop(&mut self) {
+            set_item_checks(default_item_checks());
+            turn(policy_cache(), false);
+            policy_cache().reset_activity_reads();
+            policy_cache().replace(Entries::default());
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_a_door_reads_a_missing_users_activity_in_its_one_bounded_read() {
+        let late = UserId::new(LATE);
+        let mut directory = Directory::knowing(&[LATE]).listing(&[LATE]);
+        directory.levels = idle_level("1");
+        let reads = |d: &Directory| {
+            let count = |n: &AtomicU64| n.load(Ordering::Relaxed);
+            let (joined, alone) = (&d.activity_entry_reads, &d.entry_reads);
+            [count(joined), count(alone), count(&d.activity_reads)]
+        };
+        let now = Utc::now();
+        let ago = |seconds: i64| now - chrono::Duration::seconds(seconds);
+        let inactive = Err("policy: inactivity-days (inactive)".to_owned());
+        let rows = [
+            ("active since the recording began", 3_600, None, Ok(())),
+            ("idle past one day", 2 * 86_400, None, inactive),
+            ("a success an hour ago", 2 * 86_400, Some(3_600), Ok(())),
+        ];
+        for (label, since, success, expected) in rows {
+            let _idle = Idle::since(ago(since));
+            let row = Recorded {
+                last_success: success.map(ago),
+                reenabled_at: None,
+            };
+            *directory.activity_rows.lock().unwrap() = vec![(late.clone(), row)];
+            let before = reads(&directory);
+            let attempt = Attempt::new(&late, Door::LdapBind);
+            let got = admit(&directory, &attempt).await.map_err(|r| r.detail());
+            let after = reads(&directory);
+            let read = [0_usize, 1, 2].map(|n| after[n] - before[n]);
+            assert_eq!(
+                (got, read),
+                (expected, [1, 0, 0]),
+                "{label}: the cache lacks the user; one bounded read, the activity joined"
+            );
+        }
+        let _idle = Idle::since(ago(3_600));
+        fill_policy_cache(&directory, policy_cache()).await.unwrap();
+        let before = reads(&directory);
+        let attempt = Attempt::new(&late, Door::LdapBind);
+        let got = admit(&directory, &attempt).await;
+        assert_eq!(
+            (got, reads(&directory)),
+            (Ok(()), before),
+            "the cache holds the user: no read at the door"
+        );
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn test_an_item_whose_fill_fails_at_its_flip_refuses_as_unread_until_a_fill_succeeds() {
@@ -3341,6 +3826,419 @@ mod tests {
             (failed, during, filled, after),
             (true, (true, unread), true, (true, Ok(()))),
             "a failed fill as counting turns on: unread until the next good fill"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_inactivity_turning_on_with_a_read_unanswered_refuses_its_users_until_both_read() {
+        let now = Utc::now();
+        let _idle = Idle::since(now);
+        let (cache, counter) = (policy_cache(), Lockout::default());
+        let mut directory = Directory::knowing(&[LATE]).listing(&[LATE]);
+        directory.policies = vec![linked(INACTIVITY_DAYS, "30", &[LABS])];
+        directory.levels = idle_level("30");
+        let late = UserId::new(LATE);
+        let checks: Vec<Arc<dyn ItemCheck>> = vec![Arc::new(InactivityCheck)];
+        let seconds = u32::try_from(now.timestamp()).unwrap();
+        let detail = |verdict: std::result::Result<(), Refusal>| verdict.map_err(|r| r.detail());
+        let verdicts = async || {
+            let door = admit(&directory, &Attempt::new(&late, Door::LdapBind)).await;
+            let _ = poked(cache).await;
+            let attempt = Attempt::at_kdc(&late, Door::KerberosAs, None, seconds);
+            let kdc = admit_at_kdc_with(cache, &counter, &attempt, &checks);
+            let unread = cache.item_unread(INACTIVITY_DAYS);
+            (unread, detail(door), detail(kdc), poked(cache).await)
+        };
+        let rows = [
+            (
+                "a start, the users' rows",
+                Recording::Unknown,
+                &directory.activity_down,
+            ),
+            (
+                "a start, recording_since",
+                Recording::Unknown,
+                &directory.recording_down,
+            ),
+            (
+                "linked later, the users' rows",
+                Recording::Off,
+                &directory.activity_down,
+            ),
+            (
+                "linked later, recording_since",
+                Recording::Off,
+                &directory.recording_down,
+            ),
+        ];
+        let unreadable = Err("policy: unreadable".to_owned());
+        for (label, recording, down) in rows {
+            turn(cache, false);
+            cache.set_recording(recording);
+            cache.replace(Entries::default());
+            down.store(true, Ordering::Relaxed);
+            let _ = counter.follow_policies(&directory, cache).await;
+            let during = verdicts().await;
+            down.store(false, Ordering::Relaxed);
+            counter.follow_policies(&directory, cache).await.unwrap();
+            let after = verdicts().await;
+            assert_eq!(
+                (during, after),
+                (
+                    (false, unreadable.clone(), unreadable.clone(), false),
+                    (false, Ok(()), Ok(()), false)
+                ),
+                "{label}: the policies read, its own data not: on, and a user under its limit is \
+                 refused at the door and at the KDC; the next follow that reads both judges them"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_while_inactivitys_own_data_is_unread_a_user_under_0_or_no_limit_is_admitted() {
+        let now = Utc::now();
+        let _idle = Idle::since(now);
+        let (cache, counter) = (policy_cache(), Lockout::default());
+        let late = UserId::new(LATE);
+        let checks: Vec<Arc<dyn ItemCheck>> = vec![Arc::new(InactivityCheck)];
+        let seconds = u32::try_from(now.timestamp()).unwrap();
+        let detail = |verdict: std::result::Result<(), Refusal>| verdict.map_err(|r| r.detail());
+        let unreadable = Err("policy: unreadable".to_owned());
+        let rows = [
+            ("a limit of 30", idle_level("30"), unreadable),
+            ("a limit of 0", idle_level("0"), Ok(())),
+            ("no value", Vec::new(), Ok(())),
+        ];
+        for (label, levels, expected) in rows {
+            let mut directory = Directory::knowing(&[LATE]).listing(&[LATE]);
+            directory.policies = vec![linked(INACTIVITY_DAYS, "30", &[LABS])];
+            directory.levels = levels;
+            turn(cache, false);
+            cache.set_recording(Recording::Unknown);
+            cache.replace(Entries::default());
+            directory.recording_down.store(true, Ordering::Relaxed);
+            let _ = counter.follow_policies(&directory, cache).await;
+            let door = admit(&directory, &Attempt::new(&late, Door::LdapBind)).await;
+            let attempt = Attempt::at_kdc(&late, Door::KerberosAs, None, seconds);
+            let kdc = admit_at_kdc_with(cache, &counter, &attempt, &checks);
+            assert_eq!(
+                (cache.activity_due(), detail(door), detail(kdc)),
+                (true, expected.clone(), expected),
+                "{label}: the policies read, recording_since not: only a user the item judges is \
+                 refused, at the door and at the KDC"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_a_relink_whose_recording_since_read_fails_judges_no_one_on_an_older_time() {
+        let (cache, counter) = (PolicyCache::new(), Lockout::default());
+        let mut directory = Directory::knowing(&[LATE]).listing(&[LATE]);
+        directory.policies = vec![linked(INACTIVITY_DAYS, "30", &[LABS])];
+        directory.levels = idle_level("30");
+        let late = UserId::new(LATE);
+        let checks: Vec<Arc<dyn ItemCheck>> = vec![Arc::new(InactivityCheck)];
+        let kdc = |cache: &PolicyCache| {
+            let attempt = Attempt::at_kdc(&late, Door::KerberosAs, None, 1_700_000_000);
+            let verdict = admit_at_kdc_with(cache, &counter, &attempt, &checks);
+            verdict.map_err(|r| r.detail())
+        };
+        cache.set_recording(Recording::Since(at(-40 * 86_400)));
+        directory.recording_down.store(true, Ordering::Relaxed);
+        let failed = counter.follow_policies(&directory, &cache).await.is_err();
+        let during = (cache.recording(), cache.activity_due(), kdc(&cache));
+        directory.recording_down.store(false, Ordering::Relaxed);
+        counter.follow_policies(&directory, &cache).await.unwrap();
+        let older = at(-40 * 86_400);
+        let read = matches!(cache.recording(), Recording::Since(since) if since != older);
+        assert_eq!(
+            (failed, during, (read, kdc(&cache))),
+            (
+                true,
+                (
+                    Recording::Unknown,
+                    true,
+                    Err("policy: unreadable".to_owned())
+                ),
+                (true, Ok(()))
+            ),
+            "off with an older time still held, linked again while recording_since is unread: \
+             the older time is dropped and the user refused as unread, never judged inactive on \
+             it; the next read takes the stored time"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_a_refill_that_misses_the_activity_keeps_what_was_read_and_refuses_no_one() {
+        let now = Utc::now();
+        let _idle = Idle::since(now - chrono::Duration::days(40));
+        let (cache, counter) = (policy_cache(), Lockout::default());
+        let mut directory = Directory::knowing(&[LATE, OTHER]).listing(&[LATE, OTHER]);
+        directory.policies = vec![linked(INACTIVITY_DAYS, "30", &[LABS])];
+        directory.levels = idle_level("30");
+        let (late, other) = (UserId::new(LATE), UserId::new(OTHER));
+        let seen = Recorded {
+            last_success: Some(now - chrono::Duration::hours(1)),
+            reenabled_at: None,
+        };
+        *directory.activity_rows.lock().unwrap() = vec![(late.clone(), seen)];
+        let checks: Vec<Arc<dyn ItemCheck>> = vec![Arc::new(InactivityCheck)];
+        let seconds = u32::try_from(now.timestamp()).unwrap();
+        let verdicts = async || {
+            let mut got = Vec::new();
+            for user in [&late, &other] {
+                let door = admit(&directory, &Attempt::new(user, Door::LdapBind)).await;
+                let attempt = Attempt::at_kdc(user, Door::KerberosAs, None, seconds);
+                let kdc = admit_at_kdc_with(cache, &counter, &attempt, &checks);
+                got.push((door.map_err(|r| r.detail()), kdc.map_err(|r| r.detail())));
+            }
+            got
+        };
+        fill_policy_cache(&directory, cache).await.unwrap();
+        let read = verdicts().await;
+        directory.activity_down.store(true, Ordering::Relaxed);
+        fill_policy_cache(&directory, cache).await.unwrap();
+        let kept = (
+            verdicts().await,
+            cache.item_unread(INACTIVITY_DAYS),
+            cache.activity_due(),
+        );
+        directory.activity_down.store(false, Ordering::Relaxed);
+        let reads = directory.activity_reads.load(Ordering::Relaxed);
+        counter.follow_policies(&directory, cache).await.unwrap();
+        let again = (
+            directory.activity_reads.load(Ordering::Relaxed) - reads,
+            cache.activity_due(),
+        );
+        let inactive = Err("policy: inactivity-days (inactive)".to_owned());
+        let judged = vec![(Ok(()), Ok(())), (inactive.clone(), inactive)];
+        assert_eq!(
+            read, judged,
+            "read: Late signed in an hour ago, Other never in 40 days under 30"
+        );
+        assert_eq!(
+            (kept, again),
+            ((judged, false, true), (1, false)),
+            "a refill that cannot read the users' rows keeps what was read: each judged as before \
+             at the door and at the KDC, the item on; the next follow reads them again"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_while_inactivity_has_a_read_unanswered_the_run_loop_follows_every_second() {
+        let rows = [
+            ("the flip, the users' rows", true, false, false),
+            ("the flip, recording_since", false, true, false),
+            ("a refill, the users' rows", true, false, true),
+        ];
+        for (label, rows_down, recording_down, refill) in rows {
+            let cache: &'static PolicyCache = Box::leak(Box::new(PolicyCache::new()));
+            let counter: &'static Lockout = Box::leak(Box::default());
+            let mut directory = Directory::knowing(&[LATE]).listing(&[LATE]);
+            directory.policies = vec![linked(INACTIVITY_DAYS, "30", &[LABS])];
+            directory.levels = idle_level("30");
+            let directory = Arc::new(directory);
+            let fail = |on: bool| {
+                directory
+                    .activity_down
+                    .store(on && rows_down, Ordering::Relaxed);
+                directory
+                    .recording_down
+                    .store(on && recording_down, Ordering::Relaxed);
+            };
+            if refill {
+                counter.follow_policies(&*directory, cache).await.unwrap();
+                fail(true);
+                fill_policy_cache(&*directory, cache).await.unwrap();
+            } else {
+                fail(true);
+                let _ = counter.follow_policies(&*directory, cache).await;
+            }
+            let state = || {
+                let follows = directory.policy_reads.load(Ordering::Relaxed);
+                (
+                    follows,
+                    cache.item_unread(INACTIVITY_DAYS),
+                    cache.activity_due(),
+                )
+            };
+            let before = state();
+            let running = counter.run(directory.clone(), cache);
+            tokio::time::sleep(Duration::from_millis(3_900)).await;
+            let during = state();
+            fail(false);
+            tokio::time::sleep(Duration::from_millis(1_250)).await;
+            let healed = state();
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            let later = state();
+            running.abort();
+            assert_eq!(
+                [before, during, healed, later],
+                [
+                    (1, false, true),
+                    (4, false, true),
+                    (5, false, false),
+                    (5, false, false)
+                ],
+                "{label}: a follow each second while a read is unanswered; the next one reads it, \
+                 then none until the next tick"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_inactivitys_unread_follow_waits_five_seconds_after_ten_tries_until_one_reads() {
+        let rows = [
+            ("the flip, the users' rows", true, false, false),
+            ("the flip, recording_since", false, true, false),
+            ("a refill, the users' rows", true, false, true),
+        ];
+        for (label, rows_down, recording_down, refill) in rows {
+            let cache: &'static PolicyCache = Box::leak(Box::new(PolicyCache::new()));
+            let counter: &'static Lockout = Box::leak(Box::default());
+            let mut directory = Directory::knowing(&[LATE]).listing(&[LATE]);
+            directory.policies = vec![linked(INACTIVITY_DAYS, "30", &[LABS])];
+            directory.levels = idle_level("30");
+            let directory = Arc::new(directory);
+            let fail = |users: bool, recording: bool| {
+                directory.activity_down.store(users, Ordering::Relaxed);
+                directory.recording_down.store(recording, Ordering::Relaxed);
+            };
+            if refill {
+                counter.follow_policies(&*directory, cache).await.unwrap();
+                fail(rows_down, recording_down);
+                fill_policy_cache(&*directory, cache).await.unwrap();
+            } else {
+                fail(rows_down, recording_down);
+                let _ = counter.follow_policies(&*directory, cache).await;
+            }
+            let follows = || directory.policy_reads.load(Ordering::Relaxed);
+            let (start, mut seen, mut at) = (tokio::time::Instant::now(), follows(), Vec::new());
+            let running = counter.run(directory.clone(), cache);
+            for step in 0..120 {
+                let sample = Duration::from_millis(100 + 250 * step);
+                tokio::time::sleep_until(start + sample).await;
+                if follows() == seen {
+                    continue;
+                }
+                seen = follows();
+                at.push(sample.as_millis() - 100);
+                match at.len() {
+                    11 | 13 => fail(false, false),
+                    12 => {
+                        fail(true, false);
+                        fill_policy_cache(&*directory, cache).await.unwrap();
+                    }
+                    _ => {}
+                }
+            }
+            running.abort();
+            let state = (cache.item_unread(INACTIVITY_DAYS), cache.activity_due());
+            assert_eq!(
+                (at, state),
+                (
+                    vec![
+                        1_250, 2_500, 3_750, 5_000, 6_250, 7_500, 8_750, 10_000, 11_250, 12_500,
+                        17_500, 22_500, 23_750, 25_000
+                    ],
+                    (false, false)
+                ),
+                "{label}: tries 1 to 10 a tick apart, the 11th and 12th five seconds apart; the \
+                 12th reads it; a refill then misses the users' rows, and the next try comes a \
+                 tick later"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_the_run_loop_writes_at_most_one_batch_of_owed_successes_a_tick() {
+        let cache: &'static PolicyCache = Box::leak(Box::new(PolicyCache::new()));
+        let counter: &'static Lockout = Box::leak(Box::default());
+        let directory = Arc::new(Directory::default());
+        turn(cache, true);
+        for n in 0..300 {
+            let user = UserId::new(&format!("e6owed{n}"));
+            cache.carry_success_from_kdc(&user, at(0).naive_utc());
+        }
+        let owed = cache.owed_successes();
+        let running = counter.run(directory.clone(), cache);
+        let mut ticks = Vec::new();
+        for wait in [1_900, 1_250] {
+            tokio::time::sleep(Duration::from_millis(wait)).await;
+            let written = directory.successes.lock().unwrap().len();
+            ticks.push((written, cache.owed_successes()));
+        }
+        running.abort();
+        assert_eq!(
+            (owed, ticks),
+            (300, vec![(256, 44), (300, 0)]),
+            "256 a tick, the rest at the next"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_an_unread_item_goes_off_once_no_linked_policy_sets_it() {
+        let rows = [
+            (LOGIN_HOURS, "mon-fri 08:00-18:00"),
+            (ALLOWED_NETWORKS, "10.0.0.0/8"),
+            (INACTIVITY_DAYS, "30"),
+        ];
+        let (late, checks) = (UserId::new(LATE), default_item_checks());
+        for (key, value) in rows {
+            let (cache, counter) = (PolicyCache::new(), Lockout::default());
+            let mut set = Directory::knowing(&[LATE]).listing(&[LATE]);
+            set.policies = vec![linked(key, value, &[LABS])];
+            set.users_down.store(true, Ordering::Relaxed);
+            let kdc = |cache: &PolicyCache| {
+                let attempt = Attempt::at_kdc(&late, Door::KerberosAs, None, 1_700_000_000);
+                let verdict = admit_at_kdc_with(cache, &counter, &attempt, &checks);
+                let flags = (cache.item_off(key), cache.item_unread(key));
+                (flags, verdict.map_err(|r| r.detail()))
+            };
+            let failed = counter.follow_policies(&set, &cache).await.is_err();
+            let unread = kdc(&cache);
+            let unlinked = Directory::knowing(&[LATE]).listing(&[LATE]);
+            counter.follow_policies(&unlinked, &cache).await.unwrap();
+            let off = kdc(&cache);
+            assert_eq!(
+                (failed, unread, off),
+                (
+                    true,
+                    ((false, true), Err("policy: not loaded yet".to_owned())),
+                    ((true, false), Ok(()))
+                ),
+                "{key}: on but unread, then unlinked: off, and the KDC admits"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_fill_forgets_the_hourly_write_of_a_user_it_no_longer_lists() {
+        let cache = PolicyCache::new();
+        turn(&cache, true);
+        let directory = Directory::knowing(&[LATE]).listing(&[LATE]);
+        let (late, other) = (UserId::new(LATE), UserId::new(OTHER));
+        let success = |seconds: i64| at(seconds).naive_utc();
+        for user in [&late, &other] {
+            cache.note_success(&directory, user, success(0)).await;
+        }
+        fill_policy_cache(&directory, &cache).await.unwrap();
+        for user in [&late, &other] {
+            cache.note_success(&directory, user, success(60)).await;
+        }
+        let written = directory.successes.lock().unwrap().clone();
+        assert_eq!(
+            written,
+            vec![
+                (late, success(0)),
+                (other.clone(), success(0)),
+                (other, success(60))
+            ],
+            "the fill lists Late alone: Other's last write is forgotten, so the next one writes"
         );
     }
 }

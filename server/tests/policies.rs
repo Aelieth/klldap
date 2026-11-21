@@ -102,7 +102,10 @@ fn test_policy_lifecycle_over_graphql() {
             "enable-mfa",
             "lockout-threshold",
             "lockout-duration-seconds",
-            "password-min-length"
+            "password-min-length",
+            "login-hours",
+            "allowed-networks",
+            "inactivity-days"
         ],
         "{catalog}"
     );

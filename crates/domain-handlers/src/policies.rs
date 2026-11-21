@@ -1,5 +1,4 @@
 use std::collections::BTreeMap;
-use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::Duration;
 
 pub const ROOT_OU_KEY: &str = "";
@@ -98,8 +97,8 @@ pub static POLICY_ITEM_CATALOG: &[PolicyItemSpec] = &[
             validate: validate_login_hours,
         },
         default_value: "",
-        enforced: false,
-        description: "When logins are allowed; empty means always. Not yet enforced.",
+        enforced: true,
+        description: "When logins are allowed, in the server's login_hours_timezone; empty means always.",
     },
     PolicyItemSpec {
         key: "allowed-networks",
@@ -108,16 +107,16 @@ pub static POLICY_ITEM_CATALOG: &[PolicyItemSpec] = &[
             validate_element: validate_cidr,
         },
         default_value: "",
-        enforced: false,
-        description: "Source CIDRs that may authenticate; empty means any. Not yet enforced.",
+        enforced: true,
+        description: "Source CIDRs that may authenticate; empty means any.",
     },
     PolicyItemSpec {
         key: "inactivity-days",
         scope: PolicyScope::User,
         value_type: PolicyValueType::Int { min: 0, max: 3650 },
         default_value: "0",
-        enforced: false,
-        description: "Days without a login before the account is disabled; 0 disables. Not yet enforced.",
+        enforced: true,
+        description: "Refuses sign-in to a user with no successful sign-in for this many days; 0 turns it off. An admin re-enables the user.",
     },
 ];
 
@@ -399,77 +398,11 @@ fn validate_value(value_type: &PolicyValueType, value: &str) -> Result<(), Strin
 }
 
 pub fn validate_cidr(value: &str) -> Result<(), String> {
-    let (addr, prefix) = value
-        .split_once('/')
-        .ok_or_else(|| "CIDR must include an explicit prefix".to_owned())?;
-    if prefix.is_empty() || !prefix.bytes().all(|b| b.is_ascii_digit()) {
-        return Err("CIDR prefix must be a number".to_owned());
-    }
-    let prefix: u32 = prefix
-        .parse()
-        .map_err(|_| "CIDR prefix must be a number".to_owned())?;
-    if addr.parse::<Ipv4Addr>().is_ok() {
-        if prefix > 32 {
-            return Err("IPv4 prefix must be 0-32".to_owned());
-        }
-        Ok(())
-    } else if addr.parse::<Ipv6Addr>().is_ok() {
-        if prefix > 128 {
-            return Err("IPv6 prefix must be 0-128".to_owned());
-        }
-        Ok(())
-    } else {
-        Err("CIDR address is not a valid IP".to_owned())
-    }
+    crate::networks::Net::parse(value).map(drop)
 }
-
-const DAYS: &[&str] = &["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
 
 pub fn validate_login_hours(value: &str) -> Result<(), String> {
-    if value.is_empty() {
-        return Ok(());
-    }
-    for part in value.split(';') {
-        let part = part.trim();
-        if part.is_empty() {
-            return Err("login-hours entries cannot be empty".to_owned());
-        }
-        let Some((days, times)) = part.rsplit_once(' ') else {
-            return Err("login-hours entries must be DAY[-DAY] HH:MM-HH:MM".to_owned());
-        };
-        for day in days.split('-') {
-            if !DAYS.iter().any(|d| d.eq_ignore_ascii_case(day)) {
-                return Err(format!("unknown day '{day}'"));
-            }
-        }
-        if days.split('-').count() > 2 {
-            return Err("day range must be DAY or DAY-DAY".to_owned());
-        }
-        let Some((start, end)) = times.split_once('-') else {
-            return Err("time range must be HH:MM-HH:MM".to_owned());
-        };
-        let start_mins = parse_hhmm(start)?;
-        let end_mins = parse_hhmm(end)?;
-        if start_mins >= end_mins {
-            return Err("time range start must be before end".to_owned());
-        }
-    }
-    Ok(())
-}
-
-fn parse_hhmm(value: &str) -> Result<u16, String> {
-    let (hour, minute) = value
-        .split_once(':')
-        .ok_or_else(|| "time must be HH:MM".to_owned())?;
-    if hour.len() != 2 || minute.len() != 2 {
-        return Err("time must be HH:MM".to_owned());
-    }
-    let hour: u16 = hour.parse().map_err(|_| "invalid hour".to_owned())?;
-    let minute: u16 = minute.parse().map_err(|_| "invalid minute".to_owned())?;
-    if hour > 23 || minute > 59 {
-        return Err("hour must be 00-23 and minute 00-59".to_owned());
-    }
-    Ok(hour * 60 + minute)
+    crate::login_hours::parse(value).map(drop)
 }
 
 #[cfg(test)]
@@ -877,12 +810,28 @@ mod tests {
                 "enable-mfa",
                 "lockout-threshold",
                 "lockout-duration-seconds",
-                "password-min-length"
+                "password-min-length",
+                "login-hours",
+                "allowed-networks",
+                "inactivity-days"
             ]
         );
         for spec in POLICY_ITEM_CATALOG {
             let says_not_yet = spec.description.contains("Not yet enforced");
             assert_eq!(says_not_yet, !spec.enforced, "{}", spec.key);
         }
+        assert_eq!(
+            catalog_item("login-hours").map(|spec| spec.description),
+            Some(
+                "When logins are allowed, in the server's login_hours_timezone; empty means always."
+            )
+        );
+        assert_eq!(
+            catalog_item("inactivity-days").map(|spec| spec.description),
+            Some(
+                "Refuses sign-in to a user with no successful sign-in for this many days; 0 turns \
+                 it off. An admin re-enables the user."
+            )
+        );
     }
 }

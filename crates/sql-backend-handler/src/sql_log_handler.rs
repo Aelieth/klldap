@@ -1423,6 +1423,35 @@ mod tests {
     }
 
     #[test]
+    fn test_a_sign_in_refused_by_an_item_or_the_lock_is_kept_every_time() {
+        let base = at(1, 9, 0);
+        let refused = |protocol, detail: &str| LogEvent {
+            kind: LogKind::Login,
+            protocol,
+            target: Some("bob".to_owned()),
+            detail: Some(detail.to_owned()),
+            ..unknown_bind("bob", "10.0.0.1", base)
+        };
+        let rows = [
+            refused(Protocol::Http, "policy: login-hours (outside login hours)"),
+            refused(Protocol::Http, "policy: unreadable"),
+            refused(Protocol::Http, "locked out"),
+            refused(
+                Protocol::Kerberos,
+                "policy: allowed-networks (address not allowed)",
+            ),
+        ];
+        for class in [FloodClass::UnknownBind, FloodClass::AccessDenied] {
+            let mut flood = FloodCoalescer::new(class, FLOOD_IDLE_SECONDS);
+            for row in &rows {
+                let kept: Vec<bool> = (0..20).map(|_| flood.keep(row)).collect();
+                assert_eq!(kept, vec![true; 20], "{row}");
+            }
+            assert!(flood.flush(base, true).is_empty());
+        }
+    }
+
+    #[test]
     fn test_binds_with_no_password_coalesce_as_unknown_names_do() {
         let mut flood = FloodCoalescer::new(FloodClass::UnknownBind, FLOOD_IDLE_SECONDS);
         let base = at(1, 9, 0);

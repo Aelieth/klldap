@@ -80,6 +80,7 @@ pub enum LogKind {
     PolicyChange,
     AccountLock,
     AccountUnlock,
+    AccountReenable,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

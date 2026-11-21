@@ -1,3 +1,6 @@
+use crate::sql_activity_handler::{
+    move_recording, recording_in, reenable_user_on, success_statement,
+};
 use crate::sql_backend_handler::SqlBackendHandler;
 use crate::sql_log_handler::to_active_model;
 use crate::sql_opaque_handler::invalid_credentials;
@@ -6,8 +9,9 @@ use crate::sql_tables::DbConnection;
 use async_trait::async_trait;
 use chrono::NaiveDateTime;
 use lldap_domain::types::{UserId, Uuid};
-use lldap_domain_handlers::enforcement::{Door, UNREADABLE};
-use lldap_domain_handlers::handler::LockoutBackendHandler;
+use lldap_domain_handlers::enforcement::{Door, UNREADABLE, inactive_since};
+use lldap_domain_handlers::handler::{LockoutBackendHandler, SignInState};
+use lldap_domain_handlers::inactivity::REENABLED_BY_ADMIN;
 use lldap_domain_handlers::lockout::{
     BATCH_LIMIT, LOCKED_OUT, LockRow, LockState, LockStore, LockWrite, SplitMark, Step, StoredLock,
     UNLOCKED_BY_ADMIN, Written, lock_clock, record_account_lock, sets_threshold,
@@ -61,7 +65,7 @@ fn values(row: &LockRow) -> [Value; 5] {
     ]
 }
 
-fn quoted(backend: DbBackend) -> (&'static str, &'static str, &'static str) {
+pub(crate) fn quoted(backend: DbBackend) -> (&'static str, &'static str, &'static str) {
     match backend {
         DbBackend::MySql => ("`key`", "`value`", " FROM DUAL"),
         DbBackend::Postgres | DbBackend::Sqlite => ("\"key\"", "\"value\"", ""),
@@ -370,6 +374,26 @@ impl LockStore for SqlBackendHandler {
         self.prune_totp_steps().await
     }
 
+    async fn read_recording(&self) -> Result<Option<NaiveDateTime>> {
+        recording_in(&self.sql_pool).await
+    }
+
+    async fn write_recording(
+        &self,
+        live: bool,
+        at: NaiveDateTime,
+    ) -> Result<Option<NaiveDateTime>> {
+        move_recording(&self.sql_pool, live, at).await
+    }
+
+    async fn write_success(&self, user: &UserId, at: NaiveDateTime) -> Result<()> {
+        let backend = self.sql_pool.get_database_backend();
+        self.sql_pool
+            .execute(success_statement(backend, user, at))
+            .await?;
+        Ok(())
+    }
+
     /// What was stored is told by reading it back: an affected-row count says nothing about a
     /// kept row on every backend.
     async fn write_locks(&self, period: &str, writes: &[LockWrite]) -> Result<Written> {
@@ -471,6 +495,38 @@ impl LockoutBackendHandler for SqlBackendHandler {
         self.lockout.unlocked(user_id, at);
         Ok(())
     }
+
+    async fn reenable_user(&self, user_id: &UserId) -> Result<()> {
+        let detail = Some(REENABLED_BY_ADMIN);
+        let row = logging::event(
+            LogKind::AccountReenable,
+            Some(user_id.as_str()),
+            true,
+            detail,
+        );
+        reenable_user_on(&self.sql_pool, user_id, lock_clock(), row.clone()).await?;
+        logging::print(&row);
+        self.user_written(user_id).await;
+        Ok(())
+    }
+
+    async fn note_sign_in(&self, user_id: &UserId) {
+        self.note_activity(user_id, lock_clock()).await;
+    }
+
+    async fn sign_in_state(&self, user_id: &UserId) -> Result<SignInState> {
+        let now = lock_clock();
+        let lock = self.lock_state(user_id).await?;
+        let lock = lock.filter(|lock| lock.locked(now));
+        let idle = inactive_since(self, self.policy_cache, user_id, now.and_utc()).await?;
+        Ok(SignInState {
+            locked: lock.is_some(),
+            locked_until: lock
+                .and_then(|lock| lock.row.lock_end(lock.policy))
+                .map(|end| end.and_utc()),
+            inactive_since: idle,
+        })
+    }
 }
 
 impl SqlBackendHandler {
@@ -536,8 +592,8 @@ pub(crate) mod tests {
     use lldap_domain::requests::{CreateUserRequest, UpdateUserRequest};
     use lldap_domain::types::{Attribute, LoginOutcome};
     use lldap_domain_handlers::enforcement::{
-        Attempt, PolicyCache, Refusal, admit, admit_at_kdc_with, default_item_checks,
-        fill_policy_cache,
+        Attempt, INACTIVITY_DAYS, PolicyCache, Refusal, admit, admit_at_kdc_with,
+        default_item_checks, fill_policy_cache,
     };
     use lldap_domain_handlers::handler::{
         BindRequest, LoginHandler, MfaBackendHandler, PolicyBackendHandler, UserBackendHandler,
@@ -672,12 +728,12 @@ pub(crate) mod tests {
         row.map_or(0, |row| row.fail_count)
     }
 
-    type Started = (
+    pub(crate) type Started = (
         opaque::client::login::ClientLogin,
         login::ServerLoginStartResponse,
     );
 
-    async fn start(handler: &SqlBackendHandler, user: &str, password: &str) -> Started {
+    pub(crate) async fn start(handler: &SqlBackendHandler, user: &str, password: &str) -> Started {
         let start = opaque::client::login::start_login(password, &mut rand::rngs::OsRng).unwrap();
         let request = login::ClientLoginStartRequest {
             username: UserId::new(user),
@@ -687,7 +743,7 @@ pub(crate) mod tests {
     }
 
     /// None when the client cannot finish, as for a wrong password: the web app sends nothing.
-    fn finish_request(
+    pub(crate) fn finish_request(
         (state, started): Started,
         password: &str,
         code: Option<&str>,
@@ -1060,6 +1116,80 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial]
+    async fn test_a_refusal_after_a_good_code_on_another_server_settles_the_first_servers_start() {
+        use lldap_domain_handlers::enforcement::{ItemCheck, UserState, set_item_checks};
+        use lldap_domain_handlers::lockout::LockoutCheck;
+        struct RefusedWithTheCode;
+        impl ItemCheck for RefusedWithTheCode {
+            fn key(&self) -> &'static str {
+                "login-hours"
+            }
+            fn allows(&self, attempt: &Attempt<'_>, _: &str, _: &UserState) -> bool {
+                !attempt.second_factor
+            }
+        }
+        let (_clock, at) = pinned();
+        let pool = get_initialized_db().await;
+        let (a, b) = servers(&pool);
+        let (a, b) = (
+            a.with_mfa_policy(MfaPolicy::Enrolled),
+            b.with_mfa_policy(MfaPolicy::Enrolled),
+        );
+        let users = ["q33settled", "q33counted"];
+        for user in users {
+            user_in(&a, user, "q33ou").await;
+        }
+        let items = [
+            (THRESHOLD, "3"),
+            (DURATION, "0"),
+            ("login-hours", "mon 08:00-18:00"),
+        ];
+        policy_on(&a, "q33ou", &items).await;
+        follow(&b).await;
+        let seeds = [
+            enroll(&a, users[0], at).await,
+            enroll(&a, users[1], at).await,
+        ];
+        let _guard = EnforcementGuard::default_checks();
+        let checks: Vec<Arc<dyn ItemCheck>> =
+            vec![Arc::new(LockoutCheck), Arc::new(RefusedWithTheCode)];
+        set_item_checks(checks.into());
+        let refused_on_b = async |user: &str, seed: &[u8]| {
+            let ([code, _], _) = codes(seed, at);
+            let started = start(&a, user, RIGHT).await;
+            let request = finish_request(started, RIGHT, Some(code.as_str())).unwrap();
+            let answered = b.login_finish(request).await.map(drop);
+            (
+                answered.map_err(|e| e.to_string()),
+                b.lockout.pending(&UserId::new(user)),
+            )
+        };
+        let settled = refused_on_b(users[0], &seeds[0][..]).await;
+        b.lockout.drain(&b).await;
+        a.lockout.write_all_now(&a).await;
+        let counted = refused_on_b(users[1], &seeds[1][..]).await;
+        a.lockout.write_all_now(&a).await;
+        b.lockout.drain(&b).await;
+        let failed =
+            Err(DomainError::from(opaque::AuthenticationError::failed_proof()).to_string());
+        assert_eq!(
+            (settled, counted),
+            ((failed.clone(), true), (failed, true)),
+            "the second server answers the failed proof at once, its split owed to the run loop"
+        );
+        assert_eq!(
+            (
+                stored(&a, users[0]).await.unwrap_or(0),
+                stored(&a, users[1]).await
+            ),
+            (0, Some(1)),
+            "written before the first server folds its start: nothing counted; written after: \
+             the start counts as any start no finish took"
+        );
+    }
+
+    #[tokio::test]
     async fn test_a_write_queued_behind_the_zeroing_on_sqlites_one_connection_stores_nothing() {
         period_overlap_lane(&get_initialized_db().await).await;
     }
@@ -1172,6 +1302,66 @@ pub(crate) mod tests {
                 && binds(&mysql) == 5,
             "{}",
             mysql.sql
+        );
+    }
+
+    async fn sign_in_states(h: &SqlBackendHandler, users: &[&str]) -> Vec<SignInState> {
+        let mut states = Vec::new();
+        for user in users {
+            states.push(h.sign_in_state(&UserId::new(user)).await.unwrap());
+        }
+        states
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_the_sign_in_state_says_locked_until_inactive_since_or_neither() {
+        let guard = EnforcementGuard::default_checks();
+        let h = handler().await;
+        let users = ["e7lock", "e7hold", "e7idle"];
+        for user in users {
+            user_in(&h, user, &format!("{user}ou")).await;
+        }
+        let t = chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp() + 60, 0).unwrap();
+        guard.pin_clock(t);
+        policy_on(&h, "e7lockou", &[(THRESHOLD, "2"), (DURATION, "600")]).await;
+        policy_on(&h, "e7holdou", &[(THRESHOLD, "1"), (DURATION, "0")]).await;
+        policy_on(&h, "e7idleou", &[(INACTIVITY_DAYS, "1")]).await;
+        for (user, wrong) in [("e7lock", 2), ("e7hold", 1)] {
+            for _ in 0..wrong {
+                assert!(!bind(&h, user, "nope-7").await, "{user}");
+            }
+        }
+        let at_t = sign_in_states(&h, &users).await;
+        guard.pin_clock(t + chrono::Duration::days(2));
+        let two_days_on = sign_in_states(&h, &users).await;
+        h.unlock_user(&UserId::new("e7hold")).await.unwrap();
+        h.reenable_user(&UserId::new("e7idle")).await.unwrap();
+        let after_both = sign_in_states(&h, &users).await;
+        let neither = SignInState::default();
+        let locked = |seconds: Option<i64>| SignInState {
+            locked: true,
+            locked_until: seconds.map(|seconds| t + chrono::Duration::seconds(seconds)),
+            ..neither
+        };
+        let inactive = SignInState {
+            inactive_since: Some(t + chrono::Duration::days(1)),
+            ..neither
+        };
+        assert_eq!(
+            (at_t, two_days_on, after_both),
+            (
+                vec![locked(Some(600)), locked(None), neither],
+                vec![neither, locked(None), inactive],
+                vec![neither, neither, neither],
+            ),
+            "a lock ends 600 s after the last failure or holds until an unlock; inactive one day \
+             after the item went live; each admin action clears its state"
+        );
+        let nobody = h.sign_in_state(&UserId::new("e7nobody")).await;
+        assert!(
+            matches!(nobody, Err(DomainError::EntityNotFound(_))),
+            "{nobody:?}"
         );
     }
 

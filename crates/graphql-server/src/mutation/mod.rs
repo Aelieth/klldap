@@ -785,6 +785,19 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             .await?;
         Ok(Success::new())
     }
+
+    async fn reenable_user(context: &Context<Handler>, user_id: String) -> FieldResult<Success> {
+        let span = debug_span!("[GraphQL mutation] reenable_user");
+        span.in_scope(|| debug!(?user_id));
+        let user_id = UserId::new(&user_id);
+        context
+            .get_admin_handler()
+            .ok_or_else(field_error_callback(&span, "Unauthorized user re-enable"))?
+            .reenable_user(&user_id)
+            .instrument(span)
+            .await?;
+        Ok(Success::new())
+    }
 }
 fn validate_new_attribute_name(
     name: &str,
@@ -1425,6 +1438,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_create_user_answers_no_sign_in_state_and_reads_none() {
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_get_schema()
+            .returning(|| Ok(make_test_schema()));
+        mock.expect_create_user().times(1).returning(|_| Ok(()));
+        mock.expect_get_user_details()
+            .with(eq(UserId::new("bob")))
+            .returning(|_| Ok(sample_user("bob", vec![])));
+        mock.expect_sign_in_state().times(0);
+        let context = admin_context(mock);
+        let query = r#"mutation { createUser(user: {id: "bob", email: "bob@example.com"}) {
+            id signInState { locked } } }"#;
+        let (value, errors) = execute(query, None, &root_schema(), &Variables::new(), &context)
+            .await
+            .unwrap();
+        assert_eq!(
+            (value, errors.len()),
+            (
+                graphql_value!({"createUser": {"id": "bob", "signInState": None}}),
+                0
+            ),
+            "the new user's answer carries no sign-in state and reads none: {errors:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_set_posix_settings_range() {
         let context = admin_context(MockTestBackendHandler::new());
         let (_, errors) = execute(
@@ -1486,6 +1525,7 @@ mod tests {
             r#"mutation { clearOuPolicy(ou: "") { ok } }"#,
             r#"mutation { setOuPolicyInheritance(ou: "people", blocked: true) { ok } }"#,
             r#"mutation { unlockUser(userId: "bob") { ok } }"#,
+            r#"mutation { reenableUser(userId: "bob") { ok } }"#,
         ] {
             let context = regular_context(MockTestBackendHandler::new());
             let (_, errors) = execute(query, None, &root_schema(), &Variables::new(), &context)
@@ -1535,6 +1575,22 @@ mod tests {
                 .unwrap();
             assert_eq!((errors.len(), value), (0, expected), "{query}");
         }
+    }
+
+    #[tokio::test]
+    async fn test_reenable_user_reaches_the_handler_for_an_admin() {
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_reenable_user()
+            .withf(|user| user.as_str() == "bob")
+            .times(1)
+            .returning(|_| Ok(()));
+        let context = admin_context(mock);
+        let query = r#"mutation { reenableUser(userId: "Bob") { ok } }"#;
+        let (value, errors) = execute(query, None, &root_schema(), &Variables::new(), &context)
+            .await
+            .unwrap();
+        assert_eq!(errors.len(), 0, "{errors:?}");
+        assert_eq!(value, graphql_value!({"reenableUser": {"ok": true}}));
     }
 
     #[tokio::test]

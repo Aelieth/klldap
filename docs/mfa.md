@@ -108,7 +108,10 @@ given` before the name is looked up, whoever the user is: LDAP answers 53
 | LDAP simple bind | `invalidCredentials`, diagnostic *TOTP code required: append ':' and the code* | `invalidCredentials`, empty diagnostic | `invalidCredentials`, *TOTP code already used, wait for the next one* / *Too many TOTP attempts, wait for the next one* |
 
 Every diagnostic comes after the password verified; a wrong password stays a plain
-`invalidCredentials`, so a password guess learns nothing about the factor.
+`invalidCredentials`, so a password guess learns nothing about the factor. Each also comes only
+after the OU's policy items admitted the attempt ([policies.md](policies.md)): an attempt they
+refuse (outside its login hours, say) gets the wrong-password answer instead, and its code is
+not looked at.
 
 **A password check without a session.** `/auth/opaque/login/finish` takes an optional
 `"session": false`. That finish does what any finish does: it verifies the password, checks

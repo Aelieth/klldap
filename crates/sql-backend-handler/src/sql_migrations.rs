@@ -2,6 +2,7 @@ use crate::sql_tables::{DbConnection, LAST_SCHEMA_VERSION, SchemaVersion};
 use base64::{Engine as _, engine::general_purpose};
 use itertools::Itertools;
 use lldap_domain::types::{AttributeType, Avatar, GroupId, Serialized, UserId, Uuid};
+use lldap_domain_handlers::inactivity::{RECORDING_KEY, RECORDING_OFF};
 use lldap_domain_handlers::policies::rename_items;
 use lldap_schema::PublicSchema;
 use sea_orm::{
@@ -187,6 +188,14 @@ pub(crate) enum LoginLockouts {
     LastAdminUnlock,
     LockLogged,
     SplitStart,
+}
+
+#[derive(DeriveIden, Clone, Copy)]
+pub(crate) enum UserActivity {
+    Table,
+    UserId,
+    LastSuccess,
+    ReenabledAt,
 }
 
 #[derive(DeriveIden, Clone, Copy)]
@@ -2051,10 +2060,12 @@ pub(crate) async fn ensure_v13_additions(pool: &DbConnection) -> Result<(), DbEr
     ensure_renamed_items(&transaction, backend).await?;
     ensure_kerberos(&transaction, backend).await?;
     ensure_login_lockouts(&transaction, backend).await?;
+    ensure_user_activity(&transaction, backend).await?;
     ensure_totp_steps(&transaction, backend).await?;
     ensure_mfa_used_proofs(&transaction, backend).await?;
     ensure_mfa_windows(&transaction, backend).await?;
     ensure_lockout_period(&transaction, backend).await?;
+    ensure_inactivity_recording(&transaction, backend).await?;
     transaction.commit().await
 }
 
@@ -2104,6 +2115,70 @@ async fn ensure_lockout_period(
                         OnConflict::column(Alias::new("key"))
                             .do_nothing_on([Alias::new("key")])
                             .to_owned(),
+                    ),
+            ),
+        )
+        .await?;
+    Ok(())
+}
+
+/// inactivity-days: off until a follow sees the item live.
+async fn ensure_inactivity_recording(
+    transaction: &DatabaseTransaction,
+    backend: sea_orm::DbBackend,
+) -> Result<(), DbErr> {
+    transaction
+        .execute(
+            backend.build(
+                Query::insert()
+                    .into_table(Alias::new("system_config"))
+                    .columns([Alias::new("key"), Alias::new("value")])
+                    .values_panic([RECORDING_KEY.into(), RECORDING_OFF.into()])
+                    .on_conflict(
+                        OnConflict::column(Alias::new("key"))
+                            .do_nothing_on([Alias::new("key")])
+                            .to_owned(),
+                    ),
+            ),
+        )
+        .await?;
+    Ok(())
+}
+
+/// inactivity-days: each user's last recorded success and last re-enable.
+async fn ensure_user_activity(
+    transaction: &DatabaseTransaction,
+    backend: sea_orm::DbBackend,
+) -> Result<(), DbErr> {
+    if !relation_missing(transaction, backend, UserActivity::Table.into_iden()).await? {
+        return Ok(());
+    }
+    let stamp = |column| {
+        fractional_time(ColumnDef::new(column), backend)
+            .null()
+            .to_owned()
+    };
+    transaction
+        .execute(
+            backend.build(
+                Table::create()
+                    .table(UserActivity::Table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(UserActivity::UserId)
+                            .string_len(255)
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(stamp(UserActivity::LastSuccess))
+                    .col(stamp(UserActivity::ReenabledAt))
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("UserActivityUserForeignKey")
+                            .from(UserActivity::Table, UserActivity::UserId)
+                            .to(Users::Table, Users::UserId)
+                            .on_delete(ForeignKeyAction::Cascade)
+                            .on_update(ForeignKeyAction::Cascade),
                     ),
             ),
         )

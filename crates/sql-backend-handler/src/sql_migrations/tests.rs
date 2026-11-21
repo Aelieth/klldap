@@ -2440,6 +2440,7 @@ async fn drop_lockout_tables(pool: &DbConnection) {
     let backend = pool.get_database_backend();
     for table in [
         "login_lockouts",
+        "user_activity",
         "totp_steps",
         "mfa_used_proofs",
         "mfa_windows",
@@ -2457,6 +2458,17 @@ async fn drop_lockout_tables(pool: &DbConnection) {
     ))
     .await
     .expect("delete the period row");
+    pool.execute(sea_orm::Statement::from_string(
+        backend,
+        recording_key_sql(backend, "DELETE"),
+    ))
+    .await
+    .expect("delete the recording row");
+}
+
+fn recording_key_sql(backend: DbBackend, statement: &str) -> String {
+    let period = period_key_sql(backend, statement);
+    period.replace("'lockout_period'", "'inactivity_recording_since'")
 }
 
 async fn expect_lockout_tables(pool: &DbConnection) {
@@ -2467,6 +2479,12 @@ async fn expect_lockout_tables(pool: &DbConnection) {
     ))
     .await
     .expect("login_lockouts restored");
+    pool.execute(sea_orm::Statement::from_string(
+        backend,
+        "SELECT user_id, last_success, reenabled_at FROM user_activity LIMIT 1".to_owned(),
+    ))
+    .await
+    .expect("user_activity restored");
     pool.execute(sea_orm::Statement::from_string(
         backend,
         "SELECT user_id, step, failures, used FROM totp_steps LIMIT 1".to_owned(),
@@ -2495,6 +2513,16 @@ async fn expect_lockout_tables(pool: &DbConnection) {
         .expect("the period row restored");
     let value: String = period.try_get_by_index(0).expect("value");
     assert_eq!(value, "0");
+    let recording = pool
+        .query_one(sea_orm::Statement::from_string(
+            backend,
+            recording_key_sql(backend, "SELECT value"),
+        ))
+        .await
+        .expect("recording query")
+        .expect("the recording row restored");
+    let value: String = recording.try_get_by_index(0).expect("value");
+    assert_eq!(value, "off");
 }
 
 async fn expect_kept_user(pool: &DbConnection) {
@@ -3814,6 +3842,105 @@ async fn test_init_repairs_the_login_lockouts_table_and_keeps_its_rows() {
     ensure_v13_additions(&pool).await.unwrap();
     let all = r#"SELECT COUNT(*) as c FROM login_lockouts"#;
     assert_eq!(count(&pool, all).await, 0, "a missing table is made again");
+}
+
+#[tokio::test]
+async fn test_init_repairs_the_user_activity_table_and_keeps_its_rows() {
+    let pool = get_in_memory_db().await;
+    init_table(&pool).await.unwrap();
+    insert_directory_user(&pool, "kept", "44444444-4444-4444-4444-444444444444").await;
+    pool.execute(raw_statement(
+        "INSERT INTO user_activity (user_id, reenabled_at) VALUES ('kept', '2026-11-21 10:00:00')",
+    ))
+    .await
+    .unwrap();
+    init_table(&pool).await.unwrap();
+    let kept = r#"SELECT COUNT(*) as c FROM user_activity WHERE reenabled_at IS NOT NULL"#;
+    assert_eq!(count(&pool, kept).await, 1, "re-init keeps the rows");
+    #[derive(FromQueryResult)]
+    struct FkRow {
+        dest: String,
+        on_delete: String,
+    }
+    let fks = FkRow::find_by_statement(raw_statement(
+        r#"SELECT "table" as dest, on_delete FROM pragma_foreign_key_list('user_activity')"#,
+    ))
+    .all(&pool)
+    .await
+    .unwrap();
+    let fks: Vec<_> = fks.into_iter().map(|fk| (fk.dest, fk.on_delete)).collect();
+    assert_eq!(fks, vec![("users".to_owned(), "CASCADE".to_owned())]);
+    pool.execute(raw_statement("DROP TABLE user_activity"))
+        .await
+        .unwrap();
+    ensure_v13_additions(&pool).await.unwrap();
+    let all = r#"SELECT COUNT(*) as c FROM user_activity"#;
+    assert_eq!(count(&pool, all).await, 0, "a missing table is made again");
+}
+
+#[tokio::test]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_user_activity_statements() {
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres().await else {
+        return;
+    };
+    crate::sql_activity_handler::tests::activity_lane(&pool).await;
+}
+
+#[tokio::test]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_user_activity_statements() {
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql().await else {
+        return;
+    };
+    crate::sql_activity_handler::tests::activity_lane(&pool).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_two_servers_share_the_user_activity_and_recording_since() {
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres().await else {
+        return;
+    };
+    crate::sql_activity_handler::tests::two_servers_lane(&pool).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_two_servers_share_the_user_activity_and_recording_since() {
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql().await else {
+        return;
+    };
+    crate::sql_activity_handler::tests::two_servers_lane(&pool).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_a_held_activity_table_refuses_sign_ins_within_the_bound_and_keeps_the_pool()
+{
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres_sized(6).await else {
+        return;
+    };
+    crate::sql_policy_read::tests::held_activity_lane(&pool).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_a_held_activity_table_refuses_sign_ins_within_the_bound_and_keeps_the_pool() {
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql_sized(6).await else {
+        return;
+    };
+    crate::sql_policy_read::tests::held_activity_lane(&pool).await;
 }
 
 #[tokio::test]

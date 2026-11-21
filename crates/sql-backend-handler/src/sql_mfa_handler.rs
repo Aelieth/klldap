@@ -2155,4 +2155,58 @@ pub(crate) mod tests {
     async fn test_a_protected_case_twin_renamed_to_the_exempt_groups_name_exempts_its_members() {
         exempt_rename_lane(&get_initialized_db().await).await;
     }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_any_rename_to_the_exempt_groups_name_counts_its_members_and_refills_the_cache() {
+        use lldap_domain_handlers::enforcement::fill_policy_cache;
+        use lldap_domain_handlers::kdc_proof::ProofSettings;
+        let log = LogGuard::install_on_this_thread();
+        let (_clock, at) = doors::pinned();
+        let h = SqlBackendHandler::new(generate_random_private_key(), get_initialized_db().await);
+        let h = doors::own(h).with_mfa_setting(Some(MfaPolicy::Always));
+        let h = h.with_proofs(Some(ProofSettings::new(600, false, 3600)));
+        doors::user_in(&h, "n8dan", "n8ou").await;
+        doors::enroll(&h, "n8dan", at).await;
+        let family = insert_group(&h, "n8family").await;
+        insert_membership(&h, family, "n8dan").await;
+        fill_policy_cache(&h, h.policy_cache).await.unwrap();
+        let rename = |name: &str| UpdateGroupRequest {
+            group_id: family,
+            display_name: Some(name.into()),
+            delete_attributes: vec![],
+            insert_attributes: vec![],
+        };
+        let _ = doors::rows(&log, &[]);
+        let mut steps = Vec::new();
+        for name in ["n8kin", MFA_DISABLED_GROUP] {
+            h.update_group(rename(name)).await.unwrap();
+            let rows = doors::rows(&log, &[LogKind::GroupUpdate]);
+            steps.push((rows, standing(&h, "n8dan").await));
+        }
+        let row = |from: &str, detail: &str| {
+            let row = (
+                LogKind::GroupUpdate,
+                Some(from.to_owned()),
+                Some(detail.to_owned()),
+            );
+            vec![row]
+        };
+        let totp = Some(MFA_TYPE_TOTP.to_owned());
+        assert_eq!(
+            steps,
+            vec![
+                (
+                    row("n8family", "display_name"),
+                    (totp.clone(), MfaRequirement::Totp, Some(false))
+                ),
+                (
+                    row("n8kin", "display_name; members exempt from MFA: 1"),
+                    (totp, MfaRequirement::None, Some(true))
+                ),
+            ],
+            "a group that is no twin renamed to the exempt group's name: the rename's one row \
+             counts its members, and this server's cache exempts them at once"
+        );
+    }
 }

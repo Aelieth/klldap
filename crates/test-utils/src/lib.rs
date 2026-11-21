@@ -17,8 +17,8 @@ use lldap_domain_handlers::handler::{
     BackendHandler, BindRequest, GroupBackendHandler, GroupListerBackendHandler,
     GroupRequestFilter, LockoutBackendHandler, LogBackendHandler, LoginHandler, MfaBackendHandler,
     PolicyBackendHandler, PosixBackendHandler, PosixSettings, ReadSchemaBackendHandler,
-    SchemaBackendHandler, SystemConfigBackendHandler, UserBackendHandler, UserListerBackendHandler,
-    UserRequestFilter,
+    SchemaBackendHandler, SignInState, SystemConfigBackendHandler, UserBackendHandler,
+    UserListerBackendHandler, UserRequestFilter,
 };
 use lldap_domain_handlers::logging::{
     LogActivity, LogBucket, LogCursor, LogDimension, LogFilter, LogKind, LogRecord,
@@ -114,6 +114,8 @@ mockall::mock! {
     #[async_trait]
     impl LockoutBackendHandler for TestBackendHandler {
         async fn unlock_user(&self, user_id: &UserId) -> Result<()>;
+        async fn reenable_user(&self, user_id: &UserId) -> Result<()>;
+        async fn sign_in_state(&self, user_id: &UserId) -> Result<SignInState>;
     }
     #[async_trait]
     impl BackendHandler for TestBackendHandler {}

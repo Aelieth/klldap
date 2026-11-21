@@ -1,3 +1,4 @@
+use crate::inactivity::Recorded;
 use crate::kdc_proof::ProofWindow;
 use crate::logging::{
     LogActivity, LogBucket, LogCursor, LogDimension, LogFilter, LogKind, LogRecord,
@@ -7,6 +8,7 @@ use crate::policies::{
     CreatePolicyRequest, OuPolicyState, Policy, PolicyId, PolicyLevel, UpdatePolicyRequest,
 };
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use ldap3_proto::proto::LdapSubstringFilter;
 use lldap_domain::{
     requests::{
@@ -264,12 +266,37 @@ pub trait PolicyBackendHandler: Send + Sync {
     ) -> Result<Vec<(UserId, ProofWindow)>> {
         Ok(Vec::new())
     }
+    /// inactivity-days' rows, the user's or everyone's.
+    async fn read_activity(&self, _user: Option<&UserId>) -> Result<Vec<(UserId, Recorded)>> {
+        Ok(Vec::new())
+    }
+    /// `bounded_policy_entry` with the user's activity row, in the same bounded read.
+    async fn bounded_activity_entry(
+        &self,
+        user: &UserId,
+    ) -> Result<(User, Vec<PolicyLevel>, Recorded)> {
+        let (details, levels) = self.bounded_policy_entry(user).await?;
+        Ok((details, levels, Recorded::default()))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SignInState {
+    pub locked: bool,
+    pub locked_until: Option<DateTime<Utc>>,
+    pub inactive_since: Option<DateTime<Utc>>,
 }
 
 #[async_trait]
 pub trait LockoutBackendHandler: Send + Sync {
     /// Clears the user's count; the next failure counts from 1. Unknown users are an error.
     async fn unlock_user(&self, user_id: &UserId) -> Result<()>;
+    /// Restarts the user's inactivity count now. Unknown users are an error.
+    async fn reenable_user(&self, user_id: &UserId) -> Result<()>;
+    /// The lock and inactivity as the doors judge them now; an error when either is unread.
+    async fn sign_in_state(&self, user_id: &UserId) -> Result<SignInState>;
+    /// A sign-in at a door outside the handler, kept for inactivity-days.
+    async fn note_sign_in(&self, _user_id: &UserId) {}
 }
 
 #[async_trait]

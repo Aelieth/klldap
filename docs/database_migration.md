@@ -52,8 +52,9 @@ the dump (`DELETE FROM system_config;`), or the insert stops on the duplicate
 `allowedous` key.
 
 The script also dumps `policies`, `ou_policies`, `kerberos_policies`,
-`kerberos_realm`, `kerberos_principals`, `login_lockouts` and `mfa_windows` (the
-windows a second factor opened for Kerberos). It leaves out `totp_steps`
+`kerberos_realm`, `kerberos_principals`, `login_lockouts`, `user_activity` (each user's last
+successful sign-in and re-enable, for `inactivity-days`) and `mfa_windows` (the windows a
+second factor opened for Kerberos). It leaves out `totp_steps`
 and `mfa_used_proofs`: their rows live minutes, and a moved database starts without them.
 The three `kerberos_*`
 tables are the Kerberos realm. **The master-key file `.k5.<REALM>` in `kerberos_options.data_dir` must

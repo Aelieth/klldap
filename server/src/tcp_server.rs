@@ -28,12 +28,14 @@ use lldap_domain_handlers::handler::{
 use lldap_domain_handlers::kerberos::{KerberosSync, domain_from_base_dn, kerberos_backend};
 use lldap_domain_handlers::logging::{RequestMeta, with_request};
 use lldap_domain_handlers::mfa::MfaPolicy;
+use lldap_domain_handlers::networks::resolve_client;
 use lldap_domain_model::error::DomainError;
 use lldap_kerberos::boot::with_port_hint;
 use lldap_keycloak::KeycloakSettings;
 use lldap_opaque_handler::OpaqueHandler;
 use sha2::Sha512;
 use std::collections::HashSet;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 use tracing::{info, warn};
@@ -48,11 +50,20 @@ async fn log_request_scope(
         .filter_map(|value| value.to_str().ok())
         .collect::<Vec<_>>()
         .join(", ");
-    let meta = RequestMeta::http(
-        req.peer_addr().map(|addr| addr.ip()),
-        (!forwarded_for.is_empty()).then_some(forwarded_for),
-    );
+    let peer = req.peer_addr().map(|addr| addr.ip());
+    let mut meta = RequestMeta::http(peer, (!forwarded_for.is_empty()).then_some(forwarded_for));
+    meta.client_address = client_address(&req, peer);
     with_request(meta, next.call(req)).await
+}
+
+/// The address allowed-networks judges; an unreadable header line is an entry that is no address.
+fn client_address(req: &ServiceRequest, peer: Option<IpAddr>) -> Option<IpAddr> {
+    let lines: Vec<&str> = req
+        .headers()
+        .get_all("x-forwarded-for")
+        .map(|value| value.to_str().unwrap_or_default())
+        .collect();
+    resolve_client(peer, &lines, &policy_cache().trusted_proxies())
 }
 
 async fn index<Backend>(data: web::Data<AppState<Backend>>) -> actix_web::Result<impl Responder> {
@@ -164,6 +175,10 @@ async fn get_settings<Backend>(data: web::Data<AppState<Backend>>) -> HttpRespon
         mfa_required: data.mfa_policy == Some(MfaPolicy::Always),
         mfa_server_wide: data.mfa_policy.map(|policy| policy.item().to_owned()),
         domain: data.domain.clone(),
+        login_hours_timezone: policy_cache()
+            .login_hours_zone()
+            .and_then(|zone| zone.iana_name().map(str::to_owned))
+            .unwrap_or_default(),
     })
 }
 
@@ -364,6 +379,9 @@ where
 }
 
 #[cfg(test)]
+mod networks_rows;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use actix_web::body::to_bytes;
@@ -378,6 +396,38 @@ mod tests {
             let got_body = to_bytes(response.into_body()).await.unwrap();
             assert_eq!((got_status, &got_body[..]), (status, body.as_bytes()));
         }
+    }
+
+    #[actix_web::test]
+    async fn test_the_settings_name_the_login_hours_zone_and_an_old_answer_still_parses() {
+        use crate::auth_service::tests::{ONE_BACKEND, app_state};
+        use lldap_domain_handlers::enforcement::{ZONE_FILES, load_zone_from};
+        use lldap_test_utils::MockTestBackendHandler;
+        let _backend = ONE_BACKEND.lock().await;
+        let named = async |name: &str| {
+            let loaded = load_zone_from(std::path::Path::new(ZONE_FILES), name).unwrap();
+            policy_cache().set_login_hours_zone(loaded.zone);
+            let response = get_settings(app_state(MockTestBackendHandler::new())).await;
+            let body = to_bytes(response.into_body()).await.unwrap();
+            let settings: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            settings["login_hours_timezone"].clone()
+        };
+        let got = (named("America/Chicago").await, named("utc").await);
+        assert_eq!(
+            got,
+            (
+                serde_json::json!("America/Chicago"),
+                serde_json::json!("UTC")
+            ),
+            "the zone the cache holds, by name only"
+        );
+        let old = r#"{"password_reset_enabled":false,"mfa_enabled":false,"mfa_required":false,"mfa_server_wide":null,"domain":"example.com"}"#;
+        let parsed: lldap_frontend_options::Options = serde_json::from_str(old).unwrap();
+        assert_eq!(
+            (parsed.domain, parsed.login_hours_timezone),
+            ("example.com".to_owned(), String::new()),
+            "an answer without the field still parses"
+        );
     }
 
     #[actix_web::test]

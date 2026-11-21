@@ -455,6 +455,20 @@ At the prompt, type the password, a colon and the current code.
   need a proof is refused, and every other user gets today's kinit.
 - **Later:** a path that asks the code inside Kerberos itself, in one exchange, is planned.
 
+## Inactivity and kinit
+
+Under an OU's `inactivity-days` ([policies.md](policies.md#inactivity)), a ticket issued by
+kinit counts as a sign-in; a renewal or a service ticket does not, because the KDC reports no
+success there. Give a client that only renews its tickets a limit longer than `renew_lifetime`.
+An inactive user is refused at kinit, at a renewal, at a service ticket, and when a service asks
+a ticket for them (S4U2Self, S4U2Proxy), with code 18 and no text, before the password is
+checked: kinit prints "Client's credentials have been revoked", as for any policy refusal,
+and the `login` or `access_denied` row says `policy: inactivity-days (inactive)`. The refusal
+comes before the password, so a request for a user's name shows whether some directory policy
+refuses that user. Tickets already issued run out by themselves. The sign-in is written off the
+KDC's thread within a quarter of a second; one that does not land is kept while this server runs
+and written once the database answers (a restart loses it; at most 65,536 are kept).
+
 ## Ports and clients
 
 The KDC listens on 1088 and is published as `88:1088` (tcp and udp).

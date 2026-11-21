@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 pub(crate) mod logging;
+pub(crate) mod sql_activity_handler;
 pub(crate) mod sql_backend_handler;
 pub(crate) mod sql_durability;
 pub(crate) mod sql_group_backend_handler;
@@ -19,6 +20,7 @@ pub(crate) mod sql_used_proofs;
 pub(crate) mod sql_user_backend_handler;
 pub use lldap_domain_handlers::handler::PosixSettings;
 pub use lldap_opaque_handler::register_password;
+pub use sql_activity_handler::reenable_user_on;
 pub use sql_backend_handler::SqlBackendHandler;
 pub use sql_durability::{sqlite_extra_synchronous, warn_database_durability};
 pub use sql_kerberos_committer::{

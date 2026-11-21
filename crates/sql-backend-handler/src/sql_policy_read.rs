@@ -1,8 +1,10 @@
+use crate::sql_activity_handler::read_activity_on;
 use crate::sql_backend_handler::SqlBackendHandler;
 use crate::sql_policy_handler::policy_levels_on;
 use async_trait::async_trait;
 use lldap_domain::types::{User, UserId, user_ou};
 use lldap_domain_handlers::enforcement::POLICY_UNANSWERED;
+use lldap_domain_handlers::inactivity::Recorded;
 use lldap_domain_handlers::policies::{POLICY_READ_WAIT, PolicyLevel, canonical_ou_key};
 use lldap_domain_model::error::{DomainError, Result};
 use sea_orm::sea_query::Values;
@@ -23,18 +25,20 @@ pub(crate) const SERVER_BOUND: Duration =
 const READS_ONLY: &str = "a bounded read's session runs reads only";
 
 type Entry = (User, Vec<PolicyLevel>);
-type Found = (Option<User>, Vec<PolicyLevel>);
+type Found = (Option<User>, Vec<PolicyLevel>, Option<Recorded>);
 
-/// What one bounded read reads: a user and its OU's levels, or one OU's levels.
+/// What one bounded read reads: a user and its OU's levels, with the user's activity row or
+/// without, or one OU's levels.
 #[derive(Clone, Copy)]
 enum Read<'a> {
     User(&'a UserId),
+    Active(&'a UserId),
     Ou(&'a str),
 }
 
 async fn read_on(db: &impl ConnectionTrait, read: Read<'_>) -> Result<Found> {
     let (details, ou_key) = match read {
-        Read::User(user) => {
+        Read::User(user) | Read::Active(user) => {
             let details = SqlBackendHandler::user_details_on(db, user).await?;
             let ou_key = canonical_ou_key(&user_ou(&details.attributes));
             (Some(details), ou_key)
@@ -42,7 +46,19 @@ async fn read_on(db: &impl ConnectionTrait, read: Read<'_>) -> Result<Found> {
         Read::Ou(ou_key) => (None, ou_key.to_owned()),
     };
     let levels = policy_levels_on(db, &ou_key).await?;
-    Ok((details, levels))
+    let recorded = match read {
+        Read::Active(user) => {
+            let rows = read_activity_on(db, Some(user)).await?;
+            Some(
+                rows.into_iter()
+                    .next()
+                    .map(|(_, row)| row)
+                    .unwrap_or_default(),
+            )
+        }
+        Read::User(_) | Read::Ou(_) => None,
+    };
+    Ok((details, levels, recorded))
 }
 
 /// PostgreSQL's lock and statement timeouts; MySQL's lock wait and statement time; MariaDB's.
@@ -63,8 +79,18 @@ fn bound_reached_by(err: &DbErr) -> bool {
 impl SqlBackendHandler {
     pub(crate) async fn bounded_entry(&self, user: &UserId) -> Result<Entry> {
         match self.bounded(Read::User(user)).await? {
-            (Some(details), levels) => Ok((details, levels)),
-            (None, _) => Err(DomainError::EntityNotFound(user.to_string())),
+            (Some(details), levels, _) => Ok((details, levels)),
+            (None, _, _) => Err(DomainError::EntityNotFound(user.to_string())),
+        }
+    }
+
+    pub(crate) async fn bounded_active_entry(
+        &self,
+        user: &UserId,
+    ) -> Result<(User, Vec<PolicyLevel>, Recorded)> {
+        match self.bounded(Read::Active(user)).await? {
+            (Some(details), levels, row) => Ok((details, levels, row.unwrap_or_default())),
+            (None, _, _) => Err(DomainError::EntityNotFound(user.to_string())),
         }
     }
 
@@ -214,11 +240,12 @@ pub(crate) mod tests {
     use lldap_domain::requests::CreateUserRequest;
     use lldap_domain::types::Attribute;
     use lldap_domain_handlers::enforcement::{
-        Attempt, Door, NOT_LOADED, PolicyCache, Refusal, UNREADABLE, admit, admit_at_kdc_with,
-        default_item_checks, fill_policy_cache, gave_up, item_checks, resolve_items,
-        start_policy_filler, user_written,
+        Attempt, Door, Entries, INACTIVITY_DAYS, NOT_LOADED, PolicyCache, Refusal, UNREADABLE,
+        admit, admit_at_kdc_with, default_item_checks, fill_policy_cache, gave_up, item_checks,
+        policy_cache, resolve_items, start_policy_filler, user_written,
     };
     use lldap_domain_handlers::handler::{PolicyBackendHandler, UserBackendHandler};
+    use lldap_domain_handlers::inactivity::live;
     use lldap_domain_handlers::lockout::{DURATION, Lockout, THRESHOLD, lock_clock};
     use lldap_domain_handlers::logging::LogKind;
     use lldap_domain_handlers::password::{
@@ -574,6 +601,40 @@ pub(crate) mod tests {
             want.push((table, refused_within_the_bound(), true, (6, 6)));
         }
         assert_eq!(got, want);
+    }
+
+    /// PostgreSQL and MySQL lanes, a pool of six: one holds `user_activity`, five serve the
+    /// sign-ins of users the cache lacks, whose activity joins the bounded read.
+    pub(crate) async fn held_activity_lane(pool: &DbConnection) {
+        init_table(pool).await.unwrap();
+        let _guard = EnforcementGuard::default_checks();
+        let handler = SqlBackendHandler::new(generate_random_private_key(), pool.clone());
+        for name in SIGN_INS {
+            user_in(&handler, name).await;
+        }
+        let request = CreatePolicyRequest {
+            name: "e6idle".to_owned(),
+            description: String::new(),
+            items: [(INACTIVITY_DAYS.to_owned(), "30".to_owned())].into(),
+        };
+        let id = handler.create_policy(request).await.unwrap();
+        handler.set_ou_policy(OU, id).await.unwrap();
+        let followed = live(policy_cache());
+        policy_cache().replace(Entries::default());
+        let holder = Holder::take(pool, "user_activity").await;
+        let answers = seven_at_once(&handler).await;
+        let next = Instant::now();
+        let unrelated = handler.get_user_details(&UserId::new(SIGN_INS[0])).await;
+        let at_once = unrelated.is_ok() && next.elapsed() < AT_ONCE;
+        holder.release().await;
+        let defaults = pooled_defaults(pool, 6).await;
+        let user = UserId::new(SIGN_INS[0]);
+        let free = admit(&handler, &Attempt::new(&user, Door::LdapBind)).await;
+        assert_eq!(
+            (followed, answers, at_once, defaults, free),
+            (true, refused_within_the_bound(), true, (6, 6), Ok(())),
+            "the activity table held: each sign-in refused at the bound; free again: admitted"
+        );
     }
 
     type Changed = (&'static str, std::result::Result<(), String>, bool);

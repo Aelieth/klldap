@@ -105,6 +105,101 @@
   read; try again"; kadmin `PASS_Q_GENERIC`). The configuration's admin password is still
   checked against 8 only, and the start warns once, naming the minimum and never the
   password's length, when the admin's minimum is higher or cannot be read.
+- `login-hours` is enforced. An OU's value (entries `DAY[-DAY] HH:MM-HH:MM` separated by `;`,
+  empty for always) is judged at every sign-in door: LDAP bind, `/auth/simple/login`, the web
+  login, token refresh and use, kinit, renewals and service tickets. A range may wrap
+  (`fri-mon`), `mon-mon` is Monday alone, and `24:00` may end a window. The moment of the
+  attempt is read on the wall clock of `login_hours_timezone`; a window admits from its start up
+  to its end, to the second, on the wall clock's weekday, and across a change of the clocks only
+  the wall-clock times that happen count: a window inside the skipped hour admits at no moment,
+  one over the repeated hour admits during both passes. At LDAP bind and `/auth/simple/login`
+  it is judged after the password and answered as a wrong password is (LDAP 49,
+  `/auth/simple/login` 401 with the same body); the web login judges it when the sign-in starts,
+  and a refused user's sign-in fails as a wrong password's does. The KDC refuses before the password
+  is checked, with error 18 and no text, so a request for a user's name shows whether some directory
+  policy refuses that user. S4U2Self and S4U2Proxy are not judged by it. A refusal is one row,
+  `policy: login-hours (outside login hours)`; a stored value that does not parse refuses as
+  `policy: unreadable`, with one server warning naming the policy. A web session is refused at every
+  API request while the rule refuses and works again when it no longer does; an LDAP connection is
+  judged at its bind only. Where no OU sets it, it costs nothing at any door.
+- `login_hours_timezone` (default `UTC`; `LLDAP_LOGIN_HOURS_TIMEZONE`,
+  `--login-hours-timezone`): the zone `login-hours` is read in, an IANA name read once at start
+  from the system's zone files (the directory `TZDIR` names, else `/usr/share/zoneinfo`); `TZ`
+  is never read. A name under `right/` or `posix/`, `localtime`, `posixrules`, an unknown name,
+  or a file that is not a zone file refuses the start, naming it; the start's log line names the
+  zone and its file. A host
+  install needs tzdata, and a tzdata update takes effect at the next start. `/settings` gives
+  the zone's name as `login_hours_timezone`.
+- The host tool `lldap policy-unlink --config-file <config> <ou>` removes one OU's policy link
+  (the root is `(root)` or `""`), with one `policy_change` row, `policy cleared: <name> (lldap
+  policy-unlink)`, in the same transaction; a running server sees it within 30 seconds. It is
+  the way back in when an OU's policy refuses everyone who could change it.
+- The GraphQL `Success` type has the field `warnings: [String!]!`; a client that does not ask
+  for it is unaffected.
+- `inactivity-days` per OU is enforced: the policy item (0 to 3650, default 0, by the OU
+  policies' inheritance) refuses a user with no successful sign-in for that many days, at every
+  door (LDAP bind, `/auth/simple/login`, the web login, token refresh and use, kinit, renewals,
+  service tickets, S4U2Self and S4U2Proxy). Nobody is exempt. A sign-in counts at the LDAP bind,
+  `/auth/simple/login`, the web login's finish, a token refresh and a ticket issued by kinit; a
+  renewal or a service ticket does not, so a client that only renews needs a limit longer than
+  `renew_lifetime`. The idle time runs from the latest of the last sign-in, the user's creation,
+  the moment the item last went from off to on (kept in `system_config`), and the last
+  re-enable. Sign-ins are kept in the new table `user_activity` (made at start, removed with its
+  user), at most one write an hour per user on each server, and only while some OU sets the
+  item; a ticket's sign-in is written off the KDC's thread within 250 ms, or owed: kept while
+  this server runs (at most 65,536) and written once the database answers. LDAP bind and
+  `/auth/simple/login` refuse only after the password is right, and answer exactly as for a
+  wrong password; the web login judges every policy item when the sign-in starts, and a refused
+  user's sign-in fails as a wrong password's does; Kerberos answers error 18 with no text. The row
+  says `policy: inactivity-days (inactive)`. A rule that cannot be read (a value that does not
+  parse, with one warning in the server log, or `inactivity_recording_since` or `user_activity` that
+  cannot be read as the server starts or the item is linked) refuses with `policy: unreadable` every
+  sign-in it would judge; a user whose OU sets 0 or nothing signs in as usual. The server reads
+  again about every second, every five seconds after ten failed tries, and `lldap policy-unlink`
+  takes the rule off from the host.
+- Re-enabling: GraphQL `reenableUser(userId)` (admins) and the host tool `lldap reenable
+  --config-file <config> <user>` restart a user's inactivity count now. Each writes one row of
+  the new log kind `account_reenable` (`ACCOUNT_REENABLE` in GraphQL), detail `reenableUser` or
+  `lldap reenable`, in its own transaction. A running server sees the host tool's re-enable
+  within 30 seconds.
+- `allowed-networks` per OU is enforced: the policy item (comma-separated CIDRs, empty = any, by
+  the OU policies' inheritance) refuses a sign-in from outside the list at the LDAP bind,
+  `/auth/simple/login`, the web login, token refresh and use, kinit, renewals and service tickets;
+  a service's S4U2Self or S4U2Proxy request for the user is not judged by it. Host bits of an entry
+  are ignored, an IPv4 address seen over IPv6 counts as IPv4, and a request with no address is
+  refused under a non-empty list. LDAP and Kerberos judge their socket's peer, HTTP its TCP peer
+  or, behind a listed proxy, the forwarded address. LDAP bind and `/auth/simple/login` refuse
+  only after the password is right, and answer exactly as for a wrong password; the web login
+  judges it when the sign-in starts, and a refused user's sign-in fails as a wrong password's
+  does. Kerberos refuses before the password is checked, with
+  error 18 and no text, so a request for a user's name shows whether some directory policy
+  refuses that user. The row says `policy: allowed-networks (address not allowed)` and keeps
+  `peer` and `forwarded_for` as they came; a value that cannot be read refuses with
+  `policy: unreadable` and one warning in the server log.
+- `trusted_proxies` (`LLDAP_TRUSTED_PROXIES`, `--trusted-proxies`; empty by default): one string
+  of comma-separated CIDRs naming the reverse proxies whose `X-Forwarded-For` the
+  `allowed-networks` item believes, read from the right to the first address that is no listed
+  proxy; an entry on the way that is not a bare address leaves the client's address unknown, which
+  a non-empty list refuses, and a listed proxy that sends no header is itself the client. The
+  `Forwarded` header is not read. A bad entry refuses the start, naming it.
+- GraphQL `clientAddress`, for any signed-in user: the address the server judges for that request,
+  after `trusted_proxies`, or null when it has none.
+- `updatePolicy`, `setOuPolicy`, `setOuPolicyInheritance`, `clearOuPolicy` and `deletePolicy`
+  return `warnings` (a new field of `Success`, empty for every other mutation): one warning when,
+  after the write, the author's own `allowed-networks` list refuses the address the server sees the
+  author as (`unknown` when it has none). The warning names the way back,
+  `lldap policy-unlink --config-file <config> '<ou>'` with the OU whose policy sets that list. The
+  write is never refused for it.
+- The web app's policy and user pages. The policy editor shows the zone `login-hours` is judged in
+  and the address the server sees the admin as (`unknown` when it has none). A save shows its
+  `warnings` under the success line, and when the page's next request is then refused, one line
+  says so and names `lldap policy-unlink` as the way back. The inactivity item reads "Inactivity
+  limit (days)", and a limit of 0 reads `off`. On a user's page an admin sees "Locked until …" or
+  "Inactive since …", with an Unlock or a Re-enable button only for that state, read from the new
+  admin-only GraphQL field `User.signInState` (`locked`, `lockedUntil`, `inactive`,
+  `inactiveSince`; answered under `user(userId)` only, null in a list of users and for every
+  other asker, read-only admins included). When that read fails,
+  both buttons show. The result line ("Unlocked …", "Re-enabled …") lasts until the next action.
 
 ### Removed
 
@@ -291,6 +386,21 @@
   (unwillingToPerform), and the simple login answers as any failed sign-in; `lldap_set_password`
   and the pages refuse an empty password.
 - A password-reset finish registers only the reset token's own user.
+- The exempt group `lldap_mfa_disabled` is compared by its exact name at every door, in the
+  policy cache and at its creation, on every database. A group whose name differs from it only
+  by case exempts nobody, `lldap_mfa_disabled` is not made beside it, and every start warns that
+  while it exists nobody is exempt. While protected, such a group takes one rename only: to
+  exactly `lldap_mfa_disabled`, after which its members are exempt; that rename's `group_update`
+  row says how many (`members exempt from MFA: <n>`).
+- A service's S4U2Self and S4U2Proxy requests, at the AS and at the TGS, are judged at one door,
+  shown as `kerberos S4U`; a refusal there names the asking service, `(S4U2Self by <service>)`
+  or `(S4U2Proxy by <service>)`.
+- When an OU policy turns the lockout on and its first read fails, the doors the lockout judges
+  refuse until a read succeeds.
+- After a right password, the OU policy items are judged before a second factor or an enrolment
+  is asked for, at the LDAP bind, `/auth/simple/login` and the web login, and again with the
+  code. An attempt they refuse gets the wrong-password answer and its one refusal row, and is not
+  counted toward the lockout.
 
 ### Fixed
 

@@ -1,13 +1,15 @@
 use crate::enforcement::{
-    Attempt, Door, ItemCheck, POLICY_REFILL, PolicyCache, UserState, cached_mfa_policy, door_clock,
-    ensure_exempt_group, fill_policy_cache, follow_items, follow_mfa_item, item_checks,
-    resolve_items,
+    Attempt, Door, INACTIVITY_DAYS, ItemCheck, POLICY_REFILL, PolicyCache, UserState,
+    cached_mfa_policy, door_clock, ensure_exempt_group, fill_policy_cache, follow_items,
+    follow_mfa_item, item_checks, resolve_items,
 };
 use crate::handler::{
     GroupBackendHandler, GroupListerBackendHandler, PolicyBackendHandler, UserBackendHandler,
     UserListerBackendHandler,
 };
+use crate::inactivity::follow_recording;
 use crate::logging::{self, LogKind};
+use crate::networks::warn_unreadable;
 use crate::policies::{EffectiveItem, Policy, catalog_item};
 use async_trait::async_trait;
 use chrono::NaiveDateTime;
@@ -37,9 +39,12 @@ pub const CONFIRM_EVERY: Duration = Duration::from_secs(1);
 pub const RETRY_AFTER: Duration = Duration::from_secs(1);
 pub const DRAIN_EVERY: Duration = Duration::from_secs(1);
 pub const DRAIN_GAP: Duration = Duration::from_millis(250);
+pub const ACTIVITY_TRIES: u32 = 10;
+pub const ACTIVITY_BACKOFF: Duration = Duration::from_secs(5);
 pub const STOP_BOUND: Duration = Duration::from_secs(1);
 pub const QUEUE_LIMIT: usize = 65_536;
 pub const BATCH_LIMIT: usize = 256;
+pub const SUCCESS_BUDGET: Duration = Duration::from_secs(2);
 pub const NOT_READ_YET: &str = "the lockout's state is not read yet";
 const REREAD_MARGIN_SECS: i64 = 60;
 
@@ -114,6 +119,14 @@ impl LockRow {
         let duration = chrono::Duration::seconds(i64::from(policy.duration_seconds));
         self.last_failed
             .is_some_and(|failed| failed + duration > now)
+    }
+
+    /// The end of the lock `locked` reports; `None` while it holds until an admin unlocks.
+    pub fn lock_end(&self, policy: LockoutPolicy) -> Option<NaiveDateTime> {
+        let duration = chrono::Duration::seconds(i64::from(policy.duration_seconds));
+        self.last_failed
+            .filter(|_| policy.duration_seconds > 0)
+            .map(|failed| failed + duration)
     }
 
     pub fn failed(self, at: NaiveDateTime) -> Self {
@@ -236,6 +249,22 @@ pub trait LockStore: Send + Sync {
     /// The second factor's spent steps and used enrollment proofs, pruned on this tick.
     async fn prune_codes(&self) -> Result<u64> {
         Ok(0)
+    }
+    /// When inactivity-days last went live, as stored; `None` while it is off.
+    async fn read_recording(&self) -> Result<Option<NaiveDateTime>> {
+        Ok(None)
+    }
+    /// One conditional write, from off to `at` while live or to off when not; the value after.
+    async fn write_recording(
+        &self,
+        live: bool,
+        at: NaiveDateTime,
+    ) -> Result<Option<NaiveDateTime>> {
+        Ok(live.then_some(at))
+    }
+    /// The later of the stored success and `at`, for a user who exists.
+    async fn write_success(&self, _user: &UserId, _at: NaiveDateTime) -> Result<()> {
+        Ok(())
     }
 }
 
@@ -759,6 +788,7 @@ impl Lockout {
     pub fn user_state(&self, user: &UserId) -> UserState {
         UserState {
             lock: self.effective(user),
+            ..UserState::default()
         }
     }
 
@@ -1415,12 +1445,15 @@ impl Lockout {
         let policies = handler.list_policies().await?;
         let mfa = follow_mfa_item(handler, cache, &policies).await;
         let lockout = self.follow_threshold(handler, cache, &policies).await;
+        let recorded = follow_recording(handler, cache, &policies, lock_clock()).await;
+        warn_unreadable(cache, &policies);
         let items = follow_items(handler, cache, &policies).await;
         if cache.mfa_item_live()
             && let Err(e) = ensure_exempt_group(handler).await
         {
             warn!("The exempt group was not made: {e}");
         }
+        recorded?;
         Ok(mfa? | lockout? | items?)
     }
 
@@ -1487,6 +1520,7 @@ impl Lockout {
     {
         tokio::spawn(async move {
             let mut followed = Instant::now();
+            let (mut tried, mut tries) = (tokio::time::Instant::now(), 0_u32);
             loop {
                 tokio::select! {
                     () = self.ready.notified() => {}
@@ -1494,15 +1528,25 @@ impl Lockout {
                 }
                 tokio::time::sleep(DRAIN_GAP).await;
                 while self.drain(&*store).await == BATCH_LIMIT {}
+                cache
+                    .drain_successes_up_to(&*store, BATCH_LIMIT, SUCCESS_BUDGET)
+                    .await;
+                let pending = cache.activity_pending();
+                if !pending {
+                    tries = 0;
+                }
+                let waiting = tries >= ACTIVITY_TRIES && tried.elapsed() < ACTIVITY_BACKOFF;
                 let due = followed.elapsed() >= POLICY_REFILL
                     || cache.lockout_unknown()
                     || cache.mfa_item_unknown()
-                    || cache.items_unread()
+                    || cache.items_unread_besides(INACTIVITY_DAYS)
+                    || (pending && !waiting)
                     || self.stale.load(Ordering::Acquire);
                 if !due {
                     continue;
                 }
                 followed = Instant::now();
+                tried = tokio::time::Instant::now();
                 let refreshed = match self.follow_policies(&*store, cache).await {
                     Ok(false) if cache.lockout_live() => self.refresh(&*store).await.map(drop),
                     other => other.map(drop),
@@ -1510,6 +1554,8 @@ impl Lockout {
                 if let Err(e) = refreshed {
                     warn!("The lockout view was not refreshed: {e}");
                 }
+                let missed = pending && cache.activity_pending();
+                tries = if missed { tries.saturating_add(1) } else { 0 };
                 prune_spent_steps(&*store).await;
             }
         })
@@ -1567,6 +1613,7 @@ where
     let store = Arc::new(store.clone());
     lockout.serve_kdc(store.clone(), tokio::runtime::Handle::current());
     cache.serve_windows(store.clone(), tokio::runtime::Handle::current());
+    cache.serve_successes(store.clone(), tokio::runtime::Handle::current());
     lockout.run(store, cache)
 }
 
@@ -1665,6 +1712,30 @@ mod tests {
         }
         if let Some(owed) = book.owed.get_mut(user) {
             owed.ready_at = now;
+        }
+    }
+
+    #[test]
+    fn test_a_locks_end_agrees_with_the_lock_rule() {
+        let rows = [
+            (
+                "600 seconds after the last failure",
+                policy(3, 600),
+                Some(at(700)),
+            ),
+            ("0 holds until an unlock", policy(3, 0), None),
+        ];
+        for (label, policy, end) in rows {
+            let locked_row = row(3, Some(100), None);
+            assert_eq!(locked_row.lock_end(policy), end, "{label}");
+            for now in [99, 100, 699, 700, 701, 100_000] {
+                let open = end.is_some_and(|end| end <= at(now));
+                assert_eq!(
+                    locked_row.locked(policy, at(now)),
+                    !open,
+                    "{label} at {now}"
+                );
+            }
         }
     }
 
@@ -1837,6 +1908,7 @@ mod tests {
         };
         let locked = UserState {
             lock: Some(row(3, Some(0), None)),
+            ..UserState::default()
         };
         let rows = [
             ("no row", UserState::default(), &items[..], 1, true),
@@ -1869,7 +1941,13 @@ mod tests {
                 "{label}"
             );
         }
-        let may = |lock| LockoutCheck.may_refuse(&UserState { lock });
+        let may = |lock| {
+            let state = UserState {
+                lock,
+                ..UserState::default()
+            };
+            LockoutCheck.may_refuse(&state)
+        };
         assert_eq!(
             (
                 may(None),

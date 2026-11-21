@@ -119,6 +119,18 @@
 ## Env variable: LLDAP_LOGIN_HOURS_TIMEZONE
 # login_hours_timezone = "UTC"
 
+## Reverse proxies whose X-Forwarded-For header the OUs' allowed-networks believe: one
+## string of comma-separated CIDRs. Only a request whose socket peer is inside one of them
+## is judged by the header, read from the right: the first address that is not itself a
+## listed proxy is the client's. An entry on the way that is not a bare address (a port,
+## brackets, a name, an empty element) leaves the client unknown, which a non-empty list
+## refuses; a listed proxy that sends no header is itself the client. List a proxy only if
+## it appends the address it saw. Empty, as here, the header is never read for a decision.
+## The Forwarded header is not read. A bad entry refuses the start, naming it. LDAP and
+## Kerberos always judge their socket peer. See docs/allowed-networks.md.
+## Env variable: LLDAP_TRUSTED_PROXIES
+# trusted_proxies = "10.0.0.2/32, 2001:db8::2/128"
+
 ## Database URL.
 ## This encodes the type of database (SQlite, MySQL, or PostgreSQL)
 ## , the path, the user, password, and sometimes the mode (when

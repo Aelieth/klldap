@@ -17,7 +17,9 @@ use lldap_domain_handlers::handler::{
 };
 use lldap_domain_handlers::kerberos::require_kdc_ready;
 use lldap_domain_handlers::logging::{self, LogKind};
-use lldap_domain_handlers::mfa::{MfaPolicy, allowed_rename, is_protected_group};
+use lldap_domain_handlers::mfa::{
+    MFA_DISABLED_GROUP, MfaPolicy, allowed_rename, is_protected_group,
+};
 use lldap_domain_model::{
     error::{DomainError, Result},
     model::{self, GroupColumn, MembershipColumn, codec},
@@ -318,12 +320,13 @@ impl GroupBackendHandler for SqlBackendHandler {
             })?;
         let mfa = mfa_can_be_on(self.mfa_policy, self.policy_cache);
         let new_name = request.display_name.as_ref().map(|name| name.as_str());
-        let exempting = new_name.is_some_and(|new| allowed_rename(&current_name, new));
-        if new_name.is_some() && is_protected_group(&current_name, mfa) && !exempting {
+        let allowed = new_name.is_some_and(|new| allowed_rename(&current_name, new));
+        if new_name.is_some() && is_protected_group(&current_name, mfa) && !allowed {
             return Err(DomainError::InternalError(format!(
                 "Cannot rename built-in group '{current_name}'"
             )));
         }
+        let exempting = new_name == Some(MFA_DISABLED_GROUP);
         let changes = describe_changes(
             &request.insert_attributes,
             &request.delete_attributes,

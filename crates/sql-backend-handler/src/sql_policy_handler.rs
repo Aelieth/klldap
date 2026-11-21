@@ -1,3 +1,4 @@
+use crate::sql_activity_handler::read_activity_on;
 use crate::sql_backend_handler::SqlBackendHandler;
 use crate::sql_lockout_handler::CountingStart;
 use crate::sql_log_handler::to_active_model;
@@ -6,6 +7,7 @@ use crate::sql_tables::DbConnection;
 use async_trait::async_trait;
 use lldap_domain::types::{User, UserId};
 use lldap_domain_handlers::handler::PolicyBackendHandler;
+use lldap_domain_handlers::inactivity::Recorded;
 use lldap_domain_handlers::kdc_proof::ProofWindow;
 use lldap_domain_handlers::logging::{self, LogEvent, LogKind};
 use lldap_domain_handlers::policies::{
@@ -442,6 +444,18 @@ impl PolicyBackendHandler for SqlBackendHandler {
         user: Option<&UserId>,
     ) -> Result<Vec<(UserId, ProofWindow)>> {
         read_windows(&self.sql_pool, user).await
+    }
+
+    async fn read_activity(&self, user: Option<&UserId>) -> Result<Vec<(UserId, Recorded)>> {
+        read_activity_on(&self.sql_pool, user).await
+    }
+
+    #[instrument(skip_all, level = "debug", err(level = "debug"))]
+    async fn bounded_activity_entry(
+        &self,
+        user: &UserId,
+    ) -> Result<(User, Vec<PolicyLevel>, Recorded)> {
+        self.bounded_active_entry(user).await
     }
 }
 

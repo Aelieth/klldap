@@ -13,4 +13,7 @@ pub struct Options {
     pub mfa_server_wide: Option<String>,
     #[serde(default)]
     pub domain: String,
+    /// The zone the OUs' `login-hours` are read in; empty from a server that does not say.
+    #[serde(default)]
+    pub login_hours_timezone: String,
 }

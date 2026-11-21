@@ -180,6 +180,7 @@ where
     };
     let token = create_jwt(data.get_tcp_handler(), jwt_key, &user, groups, false).await;
     logging::record_as(Some(&user), LogKind::TokenRefresh, None, true, None);
+    handler.note_sign_in(&user).await;
     Ok(HttpResponse::Ok()
         .cookie(
             Cookie::build("token", token.as_str())
@@ -1145,6 +1146,9 @@ pub(crate) mod tests {
     use pretty_assertions::assert_eq;
     use std::cell::Cell;
 
+    mod networks_rows;
+    mod start_rows;
+
     pub(crate) static ONE_BACKEND: std::sync::LazyLock<tokio::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
@@ -1955,7 +1959,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn app_state<B: BackendHandler + lldap_opaque_handler::OpaqueHandler>(
+    pub(crate) fn app_state<B: BackendHandler + lldap_opaque_handler::OpaqueHandler>(
         backend: B,
     ) -> web::Data<AppState<B>> {
         use hmac::Mac;
@@ -2287,10 +2291,15 @@ pub(crate) mod tests {
         let state = app_state(handler);
         let user = UserId::new("e0route");
         let rows = [
-            ("the simple login", "192.0.2.61", LogKind::Bind),
-            ("the web login", "192.0.2.62", LogKind::Login),
+            ("the simple login", "192.0.2.61", LogKind::Bind, (401, None)),
+            (
+                "the web login",
+                "192.0.2.62",
+                LogKind::Login,
+                (200, Some(false)),
+            ),
         ];
-        for (label, peer, kind) in rows {
+        for (label, peer, kind, answer) in rows {
             let meta = RequestMeta::http(Some(peer.parse().unwrap()), None);
             let status = with_request(meta, async {
                 if kind == LogKind::Bind {
@@ -2300,34 +2309,11 @@ pub(crate) mod tests {
                         enrollment_proof: None,
                     };
                     let response = simple_login_handler(state.clone(), web::Json(request)).await;
-                    return response.status().as_u16();
+                    return (response.status().as_u16(), None);
                 }
-                let mut rng = rand::rngs::OsRng;
-                let start = opaque::client::login::start_login(PASSWORD, &mut rng).unwrap();
-                let started = state
-                    .get_opaque_handler()
-                    .login_start(login::ClientLoginStartRequest {
-                        username: user.clone(),
-                        login_start_request: start.message,
-                    })
-                    .await
-                    .unwrap();
-                let finish = opaque::client::login::finish_login(
-                    start.state,
-                    PASSWORD.as_bytes(),
-                    started.credential_response,
-                    &mut rng,
-                )
-                .unwrap();
-                let request = login::ClientLoginFinishRequest {
-                    server_data: started.server_data,
-                    credential_finalization: finish.message,
-                    totp_code: None,
-                    enrollment_proof: None,
-                    session: None,
-                };
-                let response = opaque_login_finish_handler(state.clone(), web::Json(request)).await;
-                response.status().as_u16()
+                let (status, _, finishes) =
+                    login_start_answer(&state, user.as_str(), PASSWORD).await;
+                (status, Some(finishes))
             })
             .await;
             let rows: Vec<_> = log
@@ -2343,7 +2329,11 @@ pub(crate) mod tests {
                 Some(peer.to_owned()),
                 Some("policy: login-hours".to_owned()),
             );
-            assert_eq!((status, rows), (401, vec![refused]), "{label}");
+            assert_eq!(
+                (status, rows),
+                (answer, vec![refused]),
+                "{label}: the route's status, whether the sign-in can finish, the one row"
+            );
         }
     }
 
@@ -2387,6 +2377,34 @@ pub(crate) mod tests {
             totp_code: None,
             enrollment_proof: None,
             session: None,
+        }
+    }
+
+    /// The start route's status and body keys, and whether the sign-in can then finish.
+    async fn login_start_answer<B: BackendHandler + OpaqueHandler + 'static>(
+        state: &web::Data<AppState<B>>,
+        user: &str,
+        password: &str,
+    ) -> (u16, Vec<String>, bool) {
+        let mut rng = rand::rngs::OsRng;
+        let start = opaque::client::login::start_login(password, &mut rng).unwrap();
+        let request = login::ClientLoginStartRequest {
+            username: UserId::new(user),
+            login_start_request: start.message,
+        };
+        match opaque_login_start(state.clone(), web::Json(request)).await {
+            actix_web::Either::Left(web::Json(started)) => {
+                let body = serde_json::to_value(&started).unwrap();
+                let keys = body.as_object().unwrap().keys().cloned().collect();
+                let finished = opaque::client::login::finish_login(
+                    start.state,
+                    password.as_bytes(),
+                    started.credential_response,
+                    &mut rng,
+                );
+                (200, keys, finished.is_ok())
+            }
+            actix_web::Either::Right(response) => (response.status().as_u16(), vec![], false),
         }
     }
 
@@ -2808,6 +2826,457 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    fn hours_level() -> lldap_domain_handlers::policies::PolicyLevel {
+        use lldap_domain_handlers::policies::{AttachedPolicy, PolicyId, PolicyLevel};
+        let items = [("login-hours".to_owned(), "mon 08:00-18:00".to_owned())];
+        PolicyLevel {
+            ou_key: String::new(),
+            blocked: false,
+            policy: Some(AttachedPolicy {
+                id: PolicyId(1),
+                name: "Hours".to_owned(),
+                items: items.into(),
+            }),
+        }
+    }
+
+    /// The real check, judging only `user`, its item on in the cache.
+    fn real_hours(user: &str) -> EnforcementGuard {
+        use lldap_domain_handlers::enforcement::{ItemFlags, policy_cache};
+        use lldap_domain_handlers::login_hours::LoginHoursCheck;
+        let check = std::sync::Arc::new(LoginHoursCheck::on(policy_cache()));
+        let guard = EnforcementGuard::judging(&[user], check);
+        policy_cache().set_item_flags(ItemFlags {
+            login_hours: true,
+            ..ItemFlags::default()
+        });
+        guard
+    }
+
+    fn instant(text: &str) -> chrono::DateTime<Utc> {
+        let at = chrono::DateTime::parse_from_rfc3339(text).unwrap();
+        at.with_timezone(&Utc)
+    }
+
+    #[tokio::test]
+    async fn test_login_hours_refuse_outside_and_admit_inside_at_the_refresh_and_token_use() {
+        use lldap_test_utils::recording_log::LogGuard;
+        let _backend = ONE_BACKEND.lock().await;
+        let log = LogGuard::install_on_this_thread();
+        let guard = real_hours("h2http");
+        let instants = [
+            ("2026-11-16T07:59:59Z", false),
+            ("2026-11-16T08:00:00Z", true),
+            ("2026-11-16T17:59:59Z", true),
+            ("2026-11-16T18:00:00Z", false),
+        ];
+        let outside = "policy: login-hours (outside login hours)";
+        for (n, door) in [Door::Refresh, Door::TokenUse].into_iter().enumerate() {
+            for (m, (at, inside)) in instants.into_iter().enumerate() {
+                guard.pin_clock(instant(at));
+                let mut mock = MockTestBackendHandler::new();
+                mock.expect_get_user_groups()
+                    .returning(|_| Ok(HashSet::new()));
+                mock.expect_bounded_policy_entry()
+                    .with(eq(UserId::new("h2http")))
+                    .times(1)
+                    .returning(|_| Ok((alice(false), vec![hours_level()])));
+                mock.expect_mfa_requirement()
+                    .returning(|_| Ok(MfaRequirement::None));
+                let state = app_state(mock);
+                let peer = format!("192.0.2.{}", 120 + 4 * n + m);
+                let meta = RequestMeta::http(Some(peer.parse().unwrap()), None);
+                let status = with_request(meta, async {
+                    if door == Door::Refresh {
+                        let request = actix_web::test::TestRequest::get()
+                            .insert_header(("refresh-token", "h2-refresh+h2http"))
+                            .to_http_request();
+                        return get_refresh_handler(state, request).await.status().as_u16();
+                    }
+                    let token = session_token(&state.jwt_key, "h2http");
+                    match check_if_token_is_valid(&state, &token).await {
+                        Ok(_) => 200,
+                        Err(e) => e.as_response_error().status_code().as_u16(),
+                    }
+                })
+                .await;
+                let rows: Vec<_> = log
+                    .recorder()
+                    .take_events()
+                    .into_iter()
+                    .filter(|e| e.peer.as_deref() == Some(peer.as_str()))
+                    .map(|e| (e.kind, e.success, e.detail))
+                    .collect();
+                let expected = match (door, inside) {
+                    (_, false) => vec![(door.log_kind(), false, Some(outside.to_owned()))],
+                    (Door::Refresh, true) => vec![(LogKind::TokenRefresh, true, None)],
+                    _ => vec![],
+                };
+                let seen = guard.take_seen().into_iter();
+                let seen: Vec<_> = seen.map(|s| (s.door, s.now)).collect();
+                assert_eq!(
+                    (status, rows, seen),
+                    (
+                        if inside { 200 } else { 401 },
+                        expected,
+                        vec![(door, instant(at))]
+                    ),
+                    "{door:?} at {at}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_outside_the_hours_the_login_routes_answer_a_right_password_as_a_wrong_one() {
+        use lldap_domain_handlers::enforcement::{Entries, policy_cache};
+        use lldap_domain_handlers::policies::{EffectiveItem, PolicyScope};
+        const PASSWORD: &str = "h2route-pass-1";
+        let _backend = ONE_BACKEND.lock().await;
+        let handler = sql_handler_with(&[("h2route", PASSWORD)]).await;
+        let guard = real_hours("h2route");
+        let hours = EffectiveItem {
+            key: "login-hours".to_owned(),
+            scope: PolicyScope::User,
+            value: "mon 08:00-18:00".to_owned(),
+            enforced: true,
+            source: None,
+        };
+        policy_cache().replace(Entries {
+            ous_of_users: [(UserId::new("h2route"), "h2ou".to_owned())].into(),
+            items_of_ous: [("h2ou".to_owned(), vec![hours].into())].into(),
+            ..Entries::default()
+        });
+        guard.pin_clock(instant("2026-11-16T18:00:00Z"));
+        let state = app_state(handler);
+        let answer = async |response: HttpResponse| {
+            let status = response.status().as_u16();
+            let body = actix_web::body::to_bytes(response.into_body()).await;
+            (status, body.unwrap().to_vec())
+        };
+        let simple = async |password: &str| {
+            let request = login::ClientSimpleLoginRequest {
+                username: UserId::new("h2route"),
+                password: password.to_owned(),
+                enrollment_proof: None,
+            };
+            answer(simple_login_handler(state.clone(), web::Json(request)).await).await
+        };
+        let meta = || RequestMeta::http(Some("192.0.2.140".parse().unwrap()), None);
+        let simple = with_request(meta(), async {
+            (simple(PASSWORD).await, simple("h2route-wrong-1").await)
+        })
+        .await;
+        let right = with_request(meta(), login_start_answer(&state, "h2route", PASSWORD)).await;
+        let judged = guard.take_seen().len();
+        guard.pin_clock(instant("2026-11-16T12:00:00Z"));
+        let wrong = login_start_answer(&state, "h2route", "h2route-wrong-1");
+        let wrong = with_request(meta(), wrong).await;
+        assert_eq!(
+            (simple.0.0, right.0, right.2, judged),
+            (401, 200, false, 2),
+            "both refused by the hours, the web login when the sign-in starts"
+        );
+        assert_eq!(
+            (simple.0, right),
+            (simple.1, wrong),
+            "the simple login: the right password outside the hours and a wrong one, status and \
+             body alike; the web login: the right password outside the hours fails as a wrong one \
+             inside them does, the start's status and body keys alike"
+        );
+    }
+
+    async fn idle_after(handler: &lldap_sql_backend_handler::SqlBackendHandler, days: &str) {
+        use lldap_domain_handlers::enforcement::INACTIVITY_DAYS;
+        use lldap_domain_handlers::policies::CreatePolicyRequest;
+        let request = CreatePolicyRequest {
+            name: "e6 idle".to_owned(),
+            description: String::new(),
+            items: [(INACTIVITY_DAYS.to_owned(), days.to_owned())].into(),
+        };
+        let id = handler.create_policy(request).await.unwrap();
+        handler.set_ou_policy("", id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_a_refresh_writes_a_success_and_a_token_use_does_not() {
+        let _backend = ONE_BACKEND.lock().await;
+        let _guard = EnforcementGuard::default_checks();
+        let handler = sql_handler_with(&[("e6refresh", "e6refresh-pass-1")]).await;
+        idle_after(&handler, "30").await;
+        let user = UserId::new("e6refresh");
+        let (refresh, _) = handler.create_refresh_token(&user).await.unwrap();
+        let state = app_state(handler.clone());
+        let stored = async || handler.read_activity(Some(&user)).await.unwrap().len();
+        let token = session_token(&state.jwt_key, "e6refresh");
+        let used = check_if_token_is_valid(&state, &token).await.is_ok();
+        let after_use = stored().await;
+        let request = actix_web::test::TestRequest::get()
+            .insert_header(("refresh-token", format!("{refresh}+e6refresh")))
+            .to_http_request();
+        let refreshed = get_refresh_handler(state, request).await.status().as_u16();
+        let after_refresh = stored().await;
+        handler.clear_ou_policy("").await.unwrap();
+        assert_eq!(
+            (used, after_use, refreshed, after_refresh),
+            (true, 0, 200, 1),
+            "a token's use writes nothing; the refresh writes the success"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_reset_token_of_an_inactive_user_is_refused_where_register_start_checks_it() {
+        use lldap_test_utils::recording_log::LogGuard;
+        let _backend = ONE_BACKEND.lock().await;
+        let log = LogGuard::install_on_this_thread();
+        let guard = EnforcementGuard::default_checks();
+        let handler = sql_handler_with(&[("e6reset", "e6reset-pass-1")]).await;
+        idle_after(&handler, "1").await;
+        guard.pin_clock(Utc::now() + chrono::Duration::days(3));
+        let state = app_state(handler.clone());
+        let _ = log.recorder().take_events();
+        let token = reset_token(&state.jwt_key, "e6reset");
+        let checked = check_if_token_is_valid(&state, &token).await;
+        let status = checked
+            .map(drop)
+            .map_err(|e| e.as_response_error().status_code());
+        let rows: Vec<_> = log
+            .recorder()
+            .take_events()
+            .into_iter()
+            .filter(|e| e.actor.as_deref() == Some("e6reset"))
+            .map(|e| (e.kind, e.success, e.detail))
+            .collect();
+        handler.clear_ou_policy("").await.unwrap();
+        let inactive = Some("policy: inactivity-days (inactive)".to_owned());
+        assert_eq!(
+            (status.map_err(|code| code.as_u16()), rows),
+            (Err(401), vec![(LogKind::AccessDenied, false, inactive)]),
+            "a reset mail's token is a token's use: an inactive user is refused before \
+             register/start"
+        );
+    }
+
+    async fn answered(response: HttpResponse) -> (u16, Vec<u8>) {
+        let status = response.status().as_u16();
+        let bytes = actix_web::body::to_bytes(response.into_body());
+        (status, bytes.await.unwrap().to_vec())
+    }
+
+    #[tokio::test]
+    async fn test_an_inactive_users_right_password_gets_a_wrong_ones_body_byte_for_byte() {
+        const PASSWORD: &str = "e6http-pass-1";
+        let _backend = ONE_BACKEND.lock().await;
+        let guard = EnforcementGuard::default_checks();
+        let handler = sql_handler_with(&[("e6http", PASSWORD)]).await;
+        idle_after(&handler, "1").await;
+        let state = app_state(handler.clone());
+        let simple = async |password: &str| {
+            let request = login::ClientSimpleLoginRequest {
+                username: UserId::new("e6http"),
+                password: password.to_owned(),
+                enrollment_proof: None,
+            };
+            answered(simple_login_handler(state.clone(), web::Json(request)).await).await
+        };
+        let active = simple(PASSWORD).await.0;
+        let wrong_while_active = login_start_answer(&state, "e6http", "e6http-wrong-1").await;
+        guard.pin_clock(Utc::now() + chrono::Duration::days(3));
+        let simple = (simple(PASSWORD).await, simple("e6http-wrong-1").await);
+        let right = login_start_answer(&state, "e6http", PASSWORD).await;
+        handler.clear_ou_policy("").await.unwrap();
+        assert_eq!(active, 200, "the same password while the user is active");
+        assert_eq!(
+            simple.0.0,
+            401,
+            "{:?}",
+            String::from_utf8_lossy(&simple.0.1)
+        );
+        assert_eq!(
+            simple.0, simple.1,
+            "the simple login: the right password and a wrong one"
+        );
+        assert_eq!((right.0, right.2), (200, false), "{right:?}");
+        assert_eq!(
+            right, wrong_while_active,
+            "the web login: the right password of the inactive user fails as a wrong one did \
+             while active, the start's status and body keys alike"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_outside_the_hours_a_totp_users_right_password_gets_a_wrong_ones_body_first() {
+        use lldap_domain_handlers::enforcement::{Entries, policy_cache};
+        use lldap_domain_handlers::policies::{EffectiveItem, PolicyScope};
+        const PASSWORD: &str = "q31http-pass-1";
+        struct EnrolmentClock;
+        impl Drop for EnrolmentClock {
+            fn drop(&mut self) {
+                lldap_sql_backend_handler::set_enrollment_clock(None);
+            }
+        }
+        let _backend = ONE_BACKEND.lock().await;
+        let handler = sql_handler_with(&[("q31http", PASSWORD)])
+            .await
+            .with_mfa_policy(lldap_domain_handlers::mfa::MfaPolicy::Enrolled);
+        let now = Utc::now().timestamp();
+        lldap_sql_backend_handler::set_enrollment_clock(Some(now));
+        let _clock = EnrolmentClock;
+        let user = UserId::new("q31http");
+        let proof = handler.seal_enrollment_proof(&user).await.unwrap().unwrap();
+        let start = handler
+            .start_totp_enrollment(&user, None, Some(proof))
+            .await
+            .unwrap();
+        let seed = lldap_mfa::seed_from_base32(&start.secret_base32).unwrap();
+        let spent = lldap_mfa::format_code(lldap_mfa::totp_code(&seed, now as u64).unwrap());
+        handler
+            .finish_totp_enrollment(&user, &start.state, &spent)
+            .await
+            .unwrap();
+        let guard = real_hours("q31http");
+        let hours = EffectiveItem {
+            key: "login-hours".to_owned(),
+            scope: PolicyScope::User,
+            value: "mon 08:00-18:00".to_owned(),
+            enforced: true,
+            source: None,
+        };
+        policy_cache().replace(Entries {
+            ous_of_users: [(user.clone(), "q31ou".to_owned())].into(),
+            items_of_ous: [("q31ou".to_owned(), vec![hours].into())].into(),
+            ..Entries::default()
+        });
+        let state = app_state(handler);
+        let simple = async |password: &str| {
+            let request = login::ClientSimpleLoginRequest {
+                username: UserId::new("q31http"),
+                password: password.to_owned(),
+                enrollment_proof: None,
+            };
+            answered(simple_login_handler(state.clone(), web::Json(request)).await).await
+        };
+        let finish = async |request: login::ClientLoginFinishRequest| {
+            answered(opaque_login_finish_handler(state.clone(), web::Json(request)).await).await
+        };
+        guard.pin_clock(instant("2026-11-16T12:00:00Z"));
+        let asked = (
+            simple(PASSWORD).await,
+            finish(login_finish_request(&state, "q31http", PASSWORD).await).await,
+        );
+        let wrong_inside = login_start_answer(&state, "q31http", "q31http-wrong-1").await;
+        guard.pin_clock(instant("2026-11-16T18:00:00Z"));
+        let simple = (simple(PASSWORD).await, simple("q31http-wrong-1").await);
+        let right = login_start_answer(&state, "q31http", PASSWORD).await;
+        let text = |body: &[u8]| String::from_utf8_lossy(body).into_owned();
+        assert_eq!(
+            (
+                asked.0.0,
+                text(&asked.0.1).contains("TOTP code required"),
+                asked.1.0
+            ),
+            (401, true, 200),
+            "inside the hours: the code step, as today ({})",
+            text(&asked.1.1)
+        );
+        assert_eq!(simple.0.0, 401, "{}", text(&simple.0.1));
+        assert_eq!(
+            simple.0, simple.1,
+            "outside, the simple login: the right password and no code, then a wrong password"
+        );
+        assert_eq!((right.0, right.2), (200, false), "{right:?}");
+        assert_eq!(
+            right, wrong_inside,
+            "outside, the web login: the right password and no code fails as a wrong password \
+             inside the hours does, the start's status and body keys alike"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_an_unreadable_enable_mfa_value_gets_a_wrong_passwords_body_at_the_web_finish() {
+        use lldap_domain_handlers::enforcement::PolicyCache;
+        const PASSWORD: &str = "q32http-pass-1";
+        let _backend = ONE_BACKEND.lock().await;
+        let cache: &'static PolicyCache = Box::leak(Box::new(PolicyCache::new()));
+        let handler = sql_handler_with(&[("q32http", PASSWORD)])
+            .await
+            .with_policy_cache(cache);
+        cache.set_mfa_item_unknown();
+        let state = app_state(handler);
+        let right = login_finish_request(&state, "q32http", PASSWORD).await;
+        let mut forged = login_finish_request(&state, "q32http", PASSWORD).await;
+        forged.credential_finalization = right.credential_finalization.clone();
+        let finish = async |request: login::ClientLoginFinishRequest| {
+            answered(opaque_login_finish_handler(state.clone(), web::Json(request)).await).await
+        };
+        let finished = (finish(right).await, finish(forged).await);
+        let text = |body: &[u8]| String::from_utf8_lossy(body).into_owned();
+        assert_eq!(finished.0.0, 401, "{}", text(&finished.0.1));
+        assert_eq!(
+            finished.0, finished.1,
+            "the enable-mfa value unreadable: the right proof and a proof that does not verify \
+             get the same status and body"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_an_attempt_the_items_refuse_never_reaches_the_enrolment_read_at_the_web_finish() {
+        use lldap_domain_handlers::enforcement::{Entries, PolicyCache, policy_cache};
+        use lldap_domain_handlers::policies::{EffectiveItem, PolicyScope};
+        use sea_orm::ConnectionTrait;
+        const PASSWORD: &str = "q34http-pass-1";
+        let _backend = ONE_BACKEND.lock().await;
+        let cache: &'static PolicyCache = Box::leak(Box::new(PolicyCache::new()));
+        let handler = sql_handler_with(&[("q34http", PASSWORD)])
+            .await
+            .with_policy_cache(cache)
+            .with_mfa_policy(lldap_domain_handlers::mfa::MfaPolicy::Enrolled);
+        let pool = handler.pool().clone();
+        let guard = real_hours("q34http");
+        let hours = EffectiveItem {
+            key: "login-hours".to_owned(),
+            scope: PolicyScope::User,
+            value: "mon 08:00-18:00".to_owned(),
+            enforced: true,
+            source: None,
+        };
+        policy_cache().replace(Entries {
+            ous_of_users: [(UserId::new("q34http"), "q34ou".to_owned())].into(),
+            items_of_ous: [("q34ou".to_owned(), vec![hours].into())].into(),
+            ..Entries::default()
+        });
+        let state = app_state(handler);
+        guard.pin_clock(instant("2026-11-16T12:00:00Z"));
+        let right = login_finish_request(&state, "q34http", PASSWORD).await;
+        let mut forged = login_finish_request(&state, "q34http", PASSWORD).await;
+        forged.credential_finalization = right.credential_finalization.clone();
+        let admitted = login_finish_request(&state, "q34http", PASSWORD).await;
+        pool.execute_unprepared("ALTER TABLE users RENAME TO users_away")
+            .await
+            .unwrap();
+        let finish = async |request: login::ClientLoginFinishRequest| {
+            answered(opaque_login_finish_handler(state.clone(), web::Json(request)).await).await
+        };
+        guard.pin_clock(instant("2026-11-16T18:00:00Z"));
+        let refused = (finish(right).await, finish(forged).await);
+        guard.pin_clock(instant("2026-11-16T12:00:00Z"));
+        let outage = finish(admitted).await.0;
+        pool.execute_unprepared("ALTER TABLE users_away RENAME TO users")
+            .await
+            .unwrap();
+        let text = |body: &[u8]| String::from_utf8_lossy(body).into_owned();
+        assert_eq!(refused.0.0, 401, "{}", text(&refused.0.1));
+        assert_eq!(
+            refused.0, refused.1,
+            "started inside the hours, finished outside them, the enrolment read failing: the \
+             right proof and a proof that does not verify get the same status and body"
+        );
+        assert_eq!(
+            outage, 500,
+            "inside the hours the items admit, and the failing read is answered as an outage"
+        );
     }
 
     #[tokio::test]

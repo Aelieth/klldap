@@ -161,6 +161,11 @@ pub enum Command {
         about = "Remove the policy link of one OU, the root as (root) or \"\"; a running server sees it within 30 seconds"
     )]
     PolicyUnlink(PolicyUnlinkOpts),
+    #[clap(
+        name = "reenable",
+        about = "Restart a user's inactivity count now; a running server sees it within 30 seconds"
+    )]
+    Reenable(ReenableOpts),
 }
 
 #[derive(Debug, Parser, Clone)]
@@ -169,6 +174,15 @@ pub struct UnlockOpts {
     pub run: RunOpts,
 
     #[clap(help = "The user to unlock")]
+    pub user: String,
+}
+
+#[derive(Debug, Parser, Clone)]
+pub struct ReenableOpts {
+    #[clap(flatten)]
+    pub run: RunOpts,
+
+    #[clap(help = "The user to re-enable")]
     pub user: String,
 }
 
@@ -287,6 +301,13 @@ pub struct RunOpts {
         help = "The time zone the OUs' login-hours windows are read in: an IANA name (\"America/Chicago\") from the system's zone files, read once at start; an unknown name refuses the start. Default: UTC"
     )]
     pub login_hours_timezone: Option<String>,
+
+    #[clap(
+        long,
+        env = "LLDAP_TRUSTED_PROXIES",
+        help = "Reverse proxies whose X-Forwarded-For the OUs' allowed-networks believe: comma-separated CIDRs (\"10.0.0.2/32, 2001:db8::/64\"). Only a request whose socket peer is inside one of them is judged by the header's right-most address that is no listed proxy. Empty by default: the header is ignored. A bad entry refuses the start"
+    )]
+    pub trusted_proxies: Option<String>,
 
     #[clap(flatten)]
     pub smtp_opts: SmtpOpts,

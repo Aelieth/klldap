@@ -28,6 +28,7 @@ use lldap_domain_handlers::handler::{
     BackendHandler, PosixBackendHandler, ReadSchemaBackendHandler, SystemConfigBackendHandler,
 };
 use lldap_domain_handlers::kerberos::kerberos_backend;
+use lldap_domain_handlers::logging::current_request;
 use lldap_keycloak::{KeycloakConfig, SUGGESTED_HOSTNAME};
 use lldap_opaque_handler::OpaqueHandler;
 use lldap_schema::PublicSchema;
@@ -100,6 +101,12 @@ impl<Handler: FullHandler + OpaqueHandler> Query<Handler> {
         "1.0"
     }
 
+    /// The address allowed-networks judges for this request; null when it has none.
+    fn client_address() -> Option<String> {
+        let address = current_request().client_address;
+        address.map(|address| address.to_string())
+    }
+
     pub async fn user(
         &self,
         context: &Context<Handler>,
@@ -121,7 +128,7 @@ impl<Handler: FullHandler + OpaqueHandler> Query<Handler> {
                 ))?;
         let schema = Arc::new(self.get_schema(context, span.clone()).await?);
         let user = handler.get_user_details(&user_id).instrument(span).await?;
-        User::<Handler>::from_user(user, schema)
+        User::<Handler>::from_user(user, schema).map(User::asked_alone)
     }
 
     async fn users(
@@ -384,16 +391,18 @@ mod tests {
     use lldap_auth::access_control::{Permission, ValidationResults};
     use lldap_domain::types::{Attribute as DomainAttribute, GroupDetails, User as DomainUser};
     use lldap_domain::types::{AttributeName, AttributeType};
+    use lldap_domain_handlers::handler::SignInState as DomainSignInState;
     use lldap_domain_handlers::logging::{
         LOGIN_KINDS, LogActivity as DomainLogActivity, LogBucket as DomainLogBucket, LogCursor,
         LogDimension, LogEvent, LogFilter, LogKind, LogRecord, Protocol,
     };
+    use lldap_domain_model::error::DomainError;
     use lldap_domain_model::model::UserColumn;
     use lldap_schema::{
         AttributeList, AttributeSchema as DomainAttributeSchema,
         PosixSettings as DomainPosixSettings, Schema,
     };
-    use lldap_test_utils::{MockTestBackendHandler, setup_default_schema};
+    use lldap_test_utils::{MockTestBackendHandler, setup_default_schema, user_named};
     use mockall::predicate::eq;
     use pretty_assertions::assert_eq;
     use serial_test::serial;
@@ -552,6 +561,206 @@ mod tests {
         let schema = schema(Query::<MockTestBackendHandler>::new());
         let result = execute(QUERY, None, &schema, &Variables::new(), &context).await;
         assert!(result.is_ok(), "Query failed: {:?}", result);
+    }
+
+    fn bob_with(answer: Option<Result<DomainSignInState, DomainError>>) -> MockTestBackendHandler {
+        let mut mock = MockTestBackendHandler::new();
+        setup_default_schema(&mut mock);
+        mock.expect_get_user_details()
+            .with(eq(UserId::new("bob")))
+            .returning(|_| Ok(user_named(&UserId::new("bob"))));
+        match answer {
+            Some(answer) => {
+                mock.expect_sign_in_state()
+                    .with(eq(UserId::new("bob")))
+                    .times(1)
+                    .return_once(move |_| answer);
+            }
+            None => {
+                mock.expect_sign_in_state().times(0);
+            }
+        }
+        mock
+    }
+
+    #[tokio::test]
+    async fn test_only_an_admin_reads_a_users_sign_in_state() {
+        const QUERY: &str = r#"{ user(userId: "bob") { id signInState { locked lockedUntil inactive inactiveSince } } }"#;
+        let until = chrono::Utc.timestamp_opt(1_800_000_600, 0).unwrap();
+        let since = chrono::Utc.timestamp_opt(1_799_913_600, 0).unwrap();
+        let state = |locked, locked_until, inactive_since| DomainSignInState {
+            locked,
+            locked_until,
+            inactive_since,
+        };
+        let unread = DomainError::InternalError("inactivity-days: unreadable".to_owned());
+        let rows = [
+            (
+                "an admin, locked",
+                Permission::Admin,
+                "admin",
+                Some(Ok(state(true, Some(until), None))),
+                graphql_value!({"user": {"id": "bob", "signInState": {
+                    "locked": true, "lockedUntil": "2027-01-15T08:10:00Z",
+                    "inactive": false, "inactiveSince": None}}}),
+                0,
+            ),
+            (
+                "an admin, locked until an unlock",
+                Permission::Admin,
+                "admin",
+                Some(Ok(state(true, None, None))),
+                graphql_value!({"user": {"id": "bob", "signInState": {
+                    "locked": true, "lockedUntil": None,
+                    "inactive": false, "inactiveSince": None}}}),
+                0,
+            ),
+            (
+                "an admin, inactive",
+                Permission::Admin,
+                "admin",
+                Some(Ok(state(false, None, Some(since)))),
+                graphql_value!({"user": {"id": "bob", "signInState": {
+                    "locked": false, "lockedUntil": None,
+                    "inactive": true, "inactiveSince": "2027-01-14T08:00:00Z"}}}),
+                0,
+            ),
+            (
+                "an admin, neither",
+                Permission::Admin,
+                "admin",
+                Some(Ok(DomainSignInState::default())),
+                graphql_value!({"user": {"id": "bob", "signInState": {
+                    "locked": false, "lockedUntil": None,
+                    "inactive": false, "inactiveSince": None}}}),
+                0,
+            ),
+            (
+                "an admin, the read fails: null and one error, the user intact",
+                Permission::Admin,
+                "admin",
+                Some(Err(unread)),
+                graphql_value!({"user": {"id": "bob", "signInState": None}}),
+                1,
+            ),
+            (
+                "a read-only admin",
+                Permission::Readonly,
+                "viewer",
+                None,
+                graphql_value!({"user": {"id": "bob", "signInState": None}}),
+                0,
+            ),
+            (
+                "a password manager",
+                Permission::PasswordManager,
+                "keeper",
+                None,
+                graphql_value!({"user": {"id": "bob", "signInState": None}}),
+                0,
+            ),
+            (
+                "the user themself",
+                Permission::Regular,
+                "bob",
+                None,
+                graphql_value!({"user": {"id": "bob", "signInState": None}}),
+                0,
+            ),
+        ];
+        let schema = schema(Query::<MockTestBackendHandler>::new());
+        for (label, permission, asker, answer, expected, failed) in rows {
+            let context = Context::<MockTestBackendHandler>::new_for_tests(
+                bob_with(answer),
+                ValidationResults {
+                    user: UserId::new(asker),
+                    permission,
+                },
+            );
+            let (value, errors) = execute(QUERY, None, &schema, &Variables::new(), &context)
+                .await
+                .unwrap();
+            assert_eq!(
+                (value, errors.len()),
+                (expected, failed),
+                "{label}: {errors:?}"
+            );
+        }
+        let context = Context::<MockTestBackendHandler>::new_for_tests(
+            bob_with(None),
+            ValidationResults {
+                user: UserId::new("alice"),
+                permission: Permission::Regular,
+            },
+        );
+        let (_, errors) = execute(QUERY, None, &schema, &Variables::new(), &context)
+            .await
+            .unwrap();
+        assert!(
+            errors.iter().any(|e| e
+                .error()
+                .message()
+                .contains("Unauthorized access to user data")),
+            "another user's page is refused whole: {errors:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_list_of_users_answers_no_sign_in_state_and_reads_none() {
+        let mut mock = MockTestBackendHandler::new();
+        setup_default_schema(&mut mock);
+        mock.expect_list_users().returning(|_, _| {
+            Ok(vec![lldap_domain::types::UserAndGroups {
+                user: user_named(&UserId::new("bob")),
+                groups: None,
+            }])
+        });
+        mock.expect_get_group_details()
+            .with(eq(GroupId(3)))
+            .returning(|_| {
+                Ok(GroupDetails {
+                    group_id: GroupId(3),
+                    display_name: "Bobbersons".into(),
+                    creation_date: chrono::Utc.timestamp_nanos(42).naive_utc(),
+                    uuid: lldap_domain::types::Uuid::from_name_and_date(
+                        "Bobbersons",
+                        &chrono::Utc.timestamp_nanos(42).naive_utc(),
+                    ),
+                    attributes: Vec::new(),
+                    modified_date: chrono::Utc.timestamp_nanos(42).naive_utc(),
+                })
+            });
+        mock.expect_sign_in_state().times(0);
+        let context = Context::<MockTestBackendHandler>::new_for_tests(
+            mock,
+            ValidationResults {
+                user: UserId::new("admin"),
+                permission: Permission::Admin,
+            },
+        );
+        let schema = schema(Query::<MockTestBackendHandler>::new());
+        let rows = [
+            (
+                "users",
+                r#"{ users { id signInState { locked } } }"#,
+                graphql_value!({"users": [{"id": "bob", "signInState": None}]}),
+            ),
+            (
+                "a group's users",
+                r#"{ group(groupId: 3) { users { id signInState { locked } } } }"#,
+                graphql_value!({"group": {"users": [{"id": "bob", "signInState": None}]}}),
+            ),
+        ];
+        for (label, query, expected) in rows {
+            let (value, errors) = execute(query, None, &schema, &Variables::new(), &context)
+                .await
+                .unwrap();
+            assert_eq!(
+                (value, errors.len()),
+                (expected, 0),
+                "{label}: an admin's list answers null for each user and reads nothing: {errors:?}"
+            );
+        }
     }
 
     #[tokio::test]

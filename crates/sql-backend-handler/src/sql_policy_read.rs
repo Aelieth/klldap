@@ -23,10 +23,24 @@ pub(crate) const SERVER_BOUND: Duration =
 const READS_ONLY: &str = "a bounded read's session runs reads only";
 
 type Entry = (User, Vec<PolicyLevel>);
+type Found = (Option<User>, Vec<PolicyLevel>);
 
-async fn entry_on(db: &impl ConnectionTrait, user: &UserId) -> Result<Entry> {
-    let details = SqlBackendHandler::user_details_on(db, user).await?;
-    let ou_key = canonical_ou_key(&user_ou(&details.attributes));
+/// What one bounded read reads: a user and its OU's levels, or one OU's levels.
+#[derive(Clone, Copy)]
+enum Read<'a> {
+    User(&'a UserId),
+    Ou(&'a str),
+}
+
+async fn read_on(db: &impl ConnectionTrait, read: Read<'_>) -> Result<Found> {
+    let (details, ou_key) = match read {
+        Read::User(user) => {
+            let details = SqlBackendHandler::user_details_on(db, user).await?;
+            let ou_key = canonical_ou_key(&user_ou(&details.attributes));
+            (Some(details), ou_key)
+        }
+        Read::Ou(ou_key) => (None, ou_key.to_owned()),
+    };
     let levels = policy_levels_on(db, &ou_key).await?;
     Ok((details, levels))
 }
@@ -48,11 +62,22 @@ fn bound_reached_by(err: &DbErr) -> bool {
 
 impl SqlBackendHandler {
     pub(crate) async fn bounded_entry(&self, user: &UserId) -> Result<Entry> {
-        let read = match self.sql_pool.get_database_backend() {
-            DbBackend::MySql => self.mysql_entry(user).await,
-            _ => self.transaction_entry(user).await,
+        match self.bounded(Read::User(user)).await? {
+            (Some(details), levels) => Ok((details, levels)),
+            (None, _) => Err(DomainError::EntityNotFound(user.to_string())),
+        }
+    }
+
+    pub(crate) async fn bounded_levels(&self, ou_key: &str) -> Result<Vec<PolicyLevel>> {
+        Ok(self.bounded(Read::Ou(ou_key)).await?.1)
+    }
+
+    async fn bounded(&self, read: Read<'_>) -> Result<Found> {
+        let answer = match self.sql_pool.get_database_backend() {
+            DbBackend::MySql => self.mysql_read(read).await,
+            _ => self.transaction_read(read).await,
         };
-        read.map_err(|e| match e {
+        answer.map_err(|e| match e {
             DomainError::DatabaseError(db) if bound_reached_by(&db) => {
                 DomainError::InternalError(POLICY_UNANSWERED.to_owned())
             }
@@ -60,7 +85,7 @@ impl SqlBackendHandler {
         })
     }
 
-    async fn transaction_entry(&self, user: &UserId) -> Result<Entry> {
+    async fn transaction_read(&self, read: Read<'_>) -> Result<Found> {
         let txn = self.sql_pool.begin().await?;
         if txn.get_database_backend() == DbBackend::Postgres {
             for bound in ["lock_timeout", "statement_timeout"] {
@@ -68,12 +93,12 @@ impl SqlBackendHandler {
                 txn.execute_unprepared(&set).await?;
             }
         }
-        let read = entry_on(&txn, user).await;
+        let answer = read_on(&txn, read).await;
         let _ = txn.rollback().await;
-        read
+        answer
     }
 
-    async fn mysql_entry(&self, user: &UserId) -> Result<Entry> {
+    async fn mysql_read(&self, read: Read<'_>) -> Result<Found> {
         let pool = self.sql_pool.get_mysql_connection_pool();
         let conn = pool.acquire().await.map_err(conn_failed)?;
         let mut session = BoundSession {
@@ -93,14 +118,14 @@ impl SqlBackendHandler {
             SERVER_BOUND.as_secs().max(1)
         );
         session.execute_unprepared(&bound).await?;
-        let read = entry_on(&session, user).await;
+        let answer = read_on(&session, read).await;
         let restore = format!(
             "SET SESSION lock_wait_timeout = @klldap_lock_wait, \
              SESSION {statement} = @klldap_statement_wait"
         );
         session.execute_unprepared(&restore).await?;
         session.put_back = true;
-        read
+        answer
     }
 }
 
@@ -183,17 +208,23 @@ impl ConnectionTrait for BoundSession {
 pub(crate) mod tests {
     use super::*;
     use crate::sql_backend_handler::tests::get_initialized_db;
+    use crate::sql_lockout_handler::tests as doors;
     use crate::sql_tables::{DbConnection, init_table};
     use lldap_auth::opaque::server::generate_random_private_key;
     use lldap_domain::requests::CreateUserRequest;
     use lldap_domain::types::Attribute;
     use lldap_domain_handlers::enforcement::{
         Attempt, Door, NOT_LOADED, PolicyCache, Refusal, UNREADABLE, admit, admit_at_kdc_with,
-        gave_up, item_checks, resolve_items, start_policy_filler, user_written,
+        default_item_checks, fill_policy_cache, gave_up, item_checks, resolve_items,
+        start_policy_filler, user_written,
     };
     use lldap_domain_handlers::handler::{PolicyBackendHandler, UserBackendHandler};
-    use lldap_domain_handlers::lockout::Lockout;
+    use lldap_domain_handlers::lockout::{DURATION, Lockout, THRESHOLD, lock_clock};
     use lldap_domain_handlers::logging::LogKind;
+    use lldap_domain_handlers::password::{
+        PasswordChangeError, PasswordSync, change_password_everywhere, min_length_for_ou_key,
+        min_length_for_user, min_length_in_ou, min_length_of,
+    };
     use lldap_domain_handlers::policies::CreatePolicyRequest;
     use lldap_test_utils::enforcement::EnforcementGuard;
     use lldap_test_utils::recording_log::LogGuard;
@@ -216,6 +247,7 @@ pub(crate) mod tests {
     const ACQUIRE: Duration = Duration::from_secs(10);
     const PG_DEFAULTS: &str = "SELECT bool_and(setting = reset_val) FROM pg_settings \
                                WHERE name IN ('lock_timeout', 'statement_timeout')";
+    const POLICY_UNREAD: &str = "the password policy could not be read; try again";
 
     type Answer = (&'static str, std::result::Result<(), Refusal>, bool);
     type Round = (&'static str, Vec<Answer>, bool, (usize, usize));
@@ -331,6 +363,77 @@ pub(crate) mod tests {
             (read.ok(), next < AT_ONCE),
             (Some(user), true),
             "the refused read left nothing held"
+        );
+    }
+
+    fn timed(took: Duration) -> (bool, bool) {
+        (took >= POLICY_READ_WAIT, took < WITHIN)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_minimum_read_waiting_for_sqlites_one_connection_is_refused_within_the_bound() {
+        type Row = (
+            &'static str,
+            std::result::Result<usize, String>,
+            (bool, bool),
+        );
+        let log = LogGuard::install_on_this_thread();
+        let pool = get_initialized_db().await;
+        let handler = signing_in(&pool, &["e3lite"]).await;
+        let (held, holding) = tokio::sync::oneshot::channel();
+        let holder = tokio::spawn(async move {
+            let txn = pool.begin().await.unwrap();
+            held.send(()).unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            txn.rollback().await.unwrap();
+        });
+        holding.await.unwrap();
+        let user = UserId::new("e3lite");
+        let _ = doors::rows(&log, &[]);
+        let mut got: Vec<Row> = Vec::new();
+        let started = Instant::now();
+        let changed = min_length_of(&handler, &user).await;
+        got.push((
+            "user",
+            changed.map_err(|e| e.to_string()),
+            timed(started.elapsed()),
+        ));
+        let started = Instant::now();
+        let added = min_length_in_ou(&handler, OU, &user, LogKind::UserCreate).await;
+        got.push((
+            "OU",
+            added.map_err(|e| e.to_string()),
+            timed(started.elapsed()),
+        ));
+        let written = doors::rows(&log, &[LogKind::PasswordChange, LogKind::UserCreate]);
+        holder.await.unwrap();
+        let next = Instant::now();
+        let read = min_length_for_user(&handler, &user).await.ok();
+        let next = next.elapsed();
+        let refused = || Err(POLICY_UNREAD.to_owned());
+        let row = |kind| {
+            (
+                kind,
+                Some("e3lite".to_owned()),
+                Some(POLICY_UNREAD.to_owned()),
+            )
+        };
+        assert_eq!(
+            (got, written),
+            (
+                vec![
+                    ("user", refused(), (true, true)),
+                    ("OU", refused(), (true, true))
+                ],
+                vec![row(LogKind::PasswordChange), row(LogKind::UserCreate)]
+            ),
+            "the one connection held: each minimum refused at the bound, with its door's one row"
+        );
+        assert_eq!(
+            (read, next < AT_ONCE),
+            (Some(8), true),
+            "the refused reads left nothing held"
         );
     }
 
@@ -471,19 +574,204 @@ pub(crate) mod tests {
         assert_eq!(got, want);
     }
 
-    /// PostgreSQL and MySQL lanes: the bounded read on an unlocked database, 100 times.
+    type Changed = (&'static str, std::result::Result<(), String>, bool);
+
+    /// GraphQL `setUserPassword`'s path: the user's minimum, then the change.
+    async fn set_user_password(
+        handler: &SqlBackendHandler,
+        user: &UserId,
+    ) -> std::result::Result<(), PasswordChangeError> {
+        let min = min_length_of(handler, user).await?;
+        change_password_everywhere(handler, user, "Changed-Pass-1", PasswordSync::Off, min).await
+    }
+
+    async fn seven_changes(handler: &SqlBackendHandler) -> Vec<Changed> {
+        let started = Instant::now();
+        let at_once = |name: &'static str| {
+            let handler = handler.clone();
+            tokio::spawn(async move {
+                let changed = set_user_password(&handler, &UserId::new(name)).await;
+                (
+                    name,
+                    changed.map_err(|e| e.to_string()),
+                    started.elapsed() < WITHIN,
+                )
+            })
+        };
+        let tasks: Vec<_> = SIGN_INS.into_iter().map(at_once).collect();
+        let mut answers = Vec::new();
+        for task in tasks {
+            answers.push(task.await.unwrap());
+        }
+        answers
+    }
+
+    /// PostgreSQL and MySQL lanes, a pool of six: one holds a policy table, five serve.
+    pub(crate) async fn held_minimum_lane(pool: &DbConnection) {
+        type Added = (std::result::Result<usize, String>, bool);
+        type Held = (&'static str, Vec<Changed>, Added, bool, (usize, usize));
+        init_table(pool).await.unwrap();
+        let handler = signing_in(pool, &SIGN_INS).await;
+        let added_by = UserId::new("k2add");
+        let (mut got, mut want): (Vec<Held>, Vec<Held>) = (Vec::new(), Vec::new());
+        for table in ["ou_policies", "policies"] {
+            let holder = Holder::take(pool, table).await;
+            let changes = seven_changes(&handler).await;
+            let started = Instant::now();
+            let added = min_length_in_ou(&handler, OU, &added_by, LogKind::UserCreate).await;
+            let added = (added.map_err(|e| e.to_string()), started.elapsed() < WITHIN);
+            let next = Instant::now();
+            let unrelated = handler.get_user_details(&UserId::new(SIGN_INS[0])).await;
+            let at_once = unrelated.is_ok() && next.elapsed() < AT_ONCE;
+            holder.release().await;
+            got.push((
+                table,
+                changes,
+                added,
+                at_once,
+                pooled_defaults(pool, 6).await,
+            ));
+            let refused = SIGN_INS.map(|name| (name, Err(POLICY_UNREAD.to_owned()), true));
+            let added = (Err(POLICY_UNREAD.to_owned()), true);
+            want.push((table, refused.to_vec(), added, true, (6, 6)));
+        }
+        assert_eq!(got, want);
+    }
+
+    async fn slowest<F: std::future::Future<Output = bool>>(
+        read: impl Fn() -> F,
+    ) -> (Duration, usize) {
+        let (mut largest, mut answered) = (Duration::ZERO, 0);
+        for _ in 0..100 {
+            let started = Instant::now();
+            answered += usize::from(read().await);
+            largest = largest.max(started.elapsed());
+        }
+        (largest, answered)
+    }
+
+    /// PostgreSQL and MySQL lanes: each bounded read on an unlocked database, 100 times.
     pub(crate) async fn bounded_read_timing_lane(pool: &DbConnection) {
         init_table(pool).await.unwrap();
         let handler = signing_in(pool, &["k2timed"]).await;
         let (user, cache) = (UserId::new("k2timed"), PolicyCache::new());
-        let mut largest = Duration::ZERO;
-        for _ in 0..100 {
-            let started = Instant::now();
-            resolve_items(&handler, &cache, &user).await.unwrap();
-            largest = largest.max(started.elapsed());
+        let (h, c, u) = (&handler, &cache, &user);
+        let reads = [
+            (
+                "sign-in",
+                slowest(|| async move { resolve_items(h, c, u).await.is_ok() }).await,
+            ),
+            (
+                "password minimum, user",
+                slowest(|| async move { matches!(min_length_for_user(h, u).await, Ok(8)) }).await,
+            ),
+            (
+                "password minimum, OU",
+                slowest(|| async move { matches!(min_length_for_ou_key(h, OU).await, Ok(8)) })
+                    .await,
+            ),
+        ];
+        for (label, (largest, answered)) in reads {
+            eprintln!("bounded-read max: {largest:?} ({label}, {answered} of 100 answered)");
         }
-        eprintln!("bounded-read max: {largest:?}");
-        assert!(largest < SERVER_BOUND, "bounded-read max: {largest:?}");
+        let below =
+            reads.map(|(label, (largest, answered))| (label, largest < SERVER_BOUND, answered));
+        assert_eq!(
+            below,
+            [
+                ("sign-in", true, 100),
+                ("password minimum, user", true, 100),
+                ("password minimum, OU", true, 100),
+            ]
+        );
+    }
+
+    async fn fill_waits(pool: &DbConnection) -> bool {
+        let backend = pool.get_database_backend();
+        let sql = match backend {
+            DbBackend::MySql => {
+                "SELECT COUNT(*) FROM information_schema.PROCESSLIST \
+                 WHERE STATE LIKE 'Waiting for table%' AND DB = DATABASE() \
+                 AND ID <> CONNECTION_ID()"
+            }
+            _ => {
+                "SELECT COUNT(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' \
+                 AND datname = current_database() AND query LIKE '%ou_policies%' \
+                 AND pid <> pg_backend_pid()"
+            }
+        };
+        for _ in 0..100 {
+            let row = pool.query_one(Statement::from_string(backend, sql)).await;
+            let waiting: i64 = row
+                .ok()
+                .flatten()
+                .map_or(0, |row| row.try_get_by_index(0).unwrap_or(0));
+            if waiting > 0 {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    }
+
+    /// PostgreSQL and MySQL lanes: a user made while a cache fill waits on the held
+    /// `ou_policies`; the KDC's count and verdict are called as `KdcVerdict` calls them.
+    pub(crate) async fn held_fill_lane(pool: &DbConnection) {
+        init_table(pool).await.unwrap();
+        let key = generate_random_private_key();
+        let h = doors::own(SqlBackendHandler::new(key, pool.clone()));
+        doors::user_in(&h, "e3held", "e3fillou").await;
+        doors::policy_on(&h, "e3fillou", &[(THRESHOLD, "3"), (DURATION, "0")]).await;
+        let flags = (
+            h.policy_cache.lockout_live(),
+            h.policy_cache.lockout_unknown(),
+        );
+        let holder = Holder::take(pool, "ou_policies").await;
+        let filler = h.clone();
+        let filling =
+            tokio::spawn(async move { fill_policy_cache(&filler, filler.policy_cache).await });
+        let waited = fill_waits(pool).await;
+        doors::user_in(&h, "e3fill", "e3fillou").await;
+        let user = UserId::new("e3fill");
+        let verdict = || {
+            let now = lock_clock().and_utc().timestamp() as u32;
+            let attempt = Attempt::at_kdc(&user, Door::KerberosAs, None, now);
+            let judged =
+                admit_at_kdc_with(h.policy_cache, h.lockout, &attempt, &default_item_checks());
+            judged.map_err(|refusal| (refusal.door, refusal.detail()))
+        };
+        let before = verdict();
+        let lock = h.lockout.kdc_state(h.policy_cache, &user);
+        let step = lock
+            .as_ref()
+            .map(|lock| h.lockout.failure(lock, lock_clock()));
+        let counted = h.lockout.row(&user).map_or(0, |row| row.fail_count);
+        let during = (verdict(), h.policy_cache.marked(&user));
+        holder.release().await;
+        let filled = tokio::time::timeout(ACQUIRE, filling).await;
+        let filled = matches!(filled, Ok(Ok(Ok(()))));
+        let after = (verdict(), h.policy_cache.marked(&user));
+        let signed_in = doors::bind(&h, "e3fill", doors::RIGHT).await;
+        assert_eq!(
+            (flags, waited, before, step.is_some(), counted, during),
+            (
+                (true, false),
+                true,
+                Ok(()),
+                true,
+                1,
+                (
+                    Err((Door::KerberosAs, "policy: not loaded yet".to_owned())),
+                    true
+                )
+            ),
+            "during the hold: the fill waits; one wrong password counts, then the user is not loaded"
+        );
+        assert_eq!(
+            (filled, after, signed_in),
+            (true, (Ok(()), false), true),
+            "after the hold: the fill ends with the user in it, the KDC admits it, it signs in"
+        );
     }
 
     /// MySQL lane, a pool of two: one holds `ou_policies`, the other serves every read.

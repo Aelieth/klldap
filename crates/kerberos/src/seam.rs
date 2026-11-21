@@ -17,8 +17,9 @@ use lldap_domain_handlers::lockout::{UNLOCKED_BY_KADMIN, lock_clock, lockout};
 use lldap_domain_handlers::logging::{self, LogKind};
 use lldap_domain_handlers::password::{
     PASSWORD_LENGTH_UNIT, PASSWORD_MIN_LENGTH, PASSWORD_POLICY_UNREADABLE, PasswordChangeError,
-    password_rules,
+    min_length_for_user, password_rules,
 };
+use lldap_domain_handlers::policies::POLICY_READ_WAIT;
 use lldap_opaque_handler::{OpaqueHandler, prepare_registration};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -34,7 +35,6 @@ pub(crate) const KADM5_AUTH_ADD: u32 = 43_787_522;
 pub(crate) const KADM5_PASS_Q_GENERIC: u32 = 43_787_577;
 const DERIVE_WAIT: Duration = Duration::from_secs(30);
 const UNPREPARED: &str = "the change could not be prepared";
-const MIN_WAIT: Duration = Duration::from_secs(2);
 const POLICY_UNREAD: &str = "the password policy could not be read";
 const NO_FOLLOW: &str = "after kadmin change_password the status was not set from \
      lldap_disabled and stays as it was: no realm engine is wired to this host";
@@ -69,8 +69,8 @@ fn answer_within<T: Send + 'static>(
 impl Records {
     fn min_length(&self, user: &UserId) -> Result<usize, String> {
         let (policies, user) = (Arc::clone(&self.policies), user.clone());
-        let read = async move { policies.password_min_length(&user).await };
-        answer_within(&self.runtime, MIN_WAIT, read)?.map_err(|e| e.to_string())
+        let read = async move { min_length_for_user(&*policies, &user).await };
+        answer_within(&self.runtime, POLICY_READ_WAIT, read)?.map_err(|e| e.to_string())
     }
 
     fn hold(
@@ -3086,10 +3086,10 @@ mod tests {
         let asked = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&asked);
         let mut mock = lldap_test_utils::MockTestBackendHandler::new();
-        mock.expect_password_min_length().returning(move |_| {
+        mock.expect_bounded_policy_entry().returning(move |user| {
             let at = count.fetch_add(1, Ordering::SeqCst);
             match answers.get(at).copied().flatten() {
-                Some(min) => Ok(min),
+                Some(min) => Ok(lldap_test_utils::minimum_entry(user, min)),
                 None => Err(sea_orm::DbErr::Custom("the policy store is down".to_owned()).into()),
             }
         });
@@ -3351,7 +3351,9 @@ mod tests {
             "the minimum not read within its bound: the generic refusal, the record unchanged"
         );
         assert!(
-            still_held && took >= MIN_WAIT && took < MIN_WAIT + Duration::from_secs(3),
+            still_held
+                && took >= POLICY_READ_WAIT
+                && took < POLICY_READ_WAIT + Duration::from_secs(3),
             "the cpw was answered after {took:?}, the database still held: {still_held}"
         );
         drop((embedded, store, host, temp));
@@ -3399,7 +3401,8 @@ mod tests {
                 Err(e) => ("another answer".to_owned(), e.to_string()),
             };
             let took = started.elapsed();
-            let bounded = took >= MIN_WAIT && took < MIN_WAIT + Duration::from_secs(3);
+            let bounded =
+                took >= POLICY_READ_WAIT && took < POLICY_READ_WAIT + Duration::from_secs(3);
             (answer, asked.load(Ordering::SeqCst), bounded)
         };
         let got = [

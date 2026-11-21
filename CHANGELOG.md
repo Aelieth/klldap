@@ -100,7 +100,7 @@
   finish (*Invalid password. Min length: N*), the only check for a user without sync; a client
   that ignores the field keeps checking 8. The pages and the tool also refuse a password with a
   NUL character, and `lldap_set_password --bypass-password-policy` skips the minimum length
-  only, never the NUL check. A policy that cannot be read, or a stored
+  only, never the NUL check. A policy that cannot be read within 2 seconds, or a stored
   value that is not a whole number, refuses the change ("the password policy could not be
   read; try again"; kadmin `PASS_Q_GENERIC`). The configuration's admin password is still
   checked against 8 only, and the start warns once, naming the minimum and never the

@@ -3717,6 +3717,50 @@ async fn test_mysql_a_bounded_policy_read_leaves_its_connection_with_the_pools_d
     crate::sql_policy_read::tests::mysql_put_back_lane(&pool).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_a_held_policy_table_refuses_new_passwords_in_the_bound_and_keeps_the_pool() {
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres_sized(6).await else {
+        return;
+    };
+    crate::sql_policy_read::tests::held_minimum_lane(&pool).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_a_user_made_during_a_held_fill_is_counted_then_not_loaded_then_admitted() {
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres_sized(6).await else {
+        return;
+    };
+    crate::sql_policy_read::tests::held_fill_lane(&pool).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_a_held_policy_table_refuses_new_passwords_in_the_bound_and_keeps_the_pool() {
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql_sized(6).await else {
+        return;
+    };
+    crate::sql_policy_read::tests::held_minimum_lane(&pool).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_a_user_made_during_a_held_fill_is_counted_then_not_loaded_then_admitted() {
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql_sized(6).await else {
+        return;
+    };
+    crate::sql_policy_read::tests::held_fill_lane(&pool).await;
+}
+
 #[tokio::test]
 async fn test_init_repairs_the_login_lockouts_table_and_keeps_its_rows() {
     let pool = get_in_memory_db().await;

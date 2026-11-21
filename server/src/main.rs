@@ -51,7 +51,7 @@ use lldap_domain_handlers::lockout::{UNLOCKED_BY_TOOL, lock_clock, lockout, star
 use lldap_domain_handlers::logging::{self as rows, LogKind, event, record};
 use lldap_domain_handlers::password::{
     PASSWORD_MIN_LENGTH, PasswordChangeError, PasswordSync, change_password_everywhere,
-    password_rules,
+    min_length_for_user, password_rules,
 };
 use lldap_kerberos::boot::{RealmSettings, client_address};
 use lldap_kerberos::embedded::{EmbeddedKerberos, FOLLOW_EVERY, Opened, RealmThreads, Records};
@@ -303,7 +303,7 @@ fn admin_min_length_warning(password: &str, min: Result<usize, String>) -> Optio
 }
 
 async fn warn_admin_min_length(handler: &SqlBackendHandler, config: &Configuration) {
-    let min = handler.password_min_length(&config.ldap_user_dn).await;
+    let min = min_length_for_user(handler, &config.ldap_user_dn).await;
     let min = min.map_err(|e| e.to_string());
     if let Some(text) = admin_min_length_warning(admin_password(config), min) {
         warn!("{text}");
@@ -1207,19 +1207,24 @@ mod tests {
         const UNREAD: &str = "The admin's password-min-length could not be read (Database \
              error: `the policy store is down`): the configuration's password is checked against \
              8 only";
+        const UNANSWERED: &str = "The admin's password-min-length could not be read (Internal \
+             error: `the policy read did not answer within its bound`): the configuration's \
+             password is checked against 8 only";
         type Row = (
             &'static str,
             Result<usize, &'static str>,
             Option<&'static str>,
         );
         let down = "Database error: `the policy store is down`";
-        let rows: [Row; 6] = [
+        let late = "Internal error: `the policy read did not answer within its bound`";
+        let rows: [Row; 7] = [
             ("Nine-9999", Ok(12), Some(SHORT_12)),
             ("pässwörter", Ok(12), Some(SHORT_12)),
             ("Twelve-12chr", Ok(12), None),
             ("Twenty-characters-20", Ok(8), None),
             ("Nine-9999", Err(down), Some(UNREAD)),
             ("Twenty-characters-20", Err(down), Some(UNREAD)),
+            ("Twenty-characters-20", Err(late), Some(UNANSWERED)),
         ];
         for (password, min, expected) in rows {
             let min = min.map_err(str::to_owned);

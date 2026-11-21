@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 # Phase: lockout at LDAP bind, simple login, TOTP, Kerberos pre-auth and S4U2Self: no threshold counts, an OU threshold locks.
-# Also the refusal rows' peer at both login doors, and a kinit of a user created during a held cache fill.
+# Also the refusal rows' peer at both login doors, and the answers while ou_policies is held.
 
 LK_D="$(phase_dir)"
 LK_N=0 LK_P=0 LK_F=0 LK_K=0 LK_X=0 LK_FIND=()
@@ -17,7 +17,7 @@ LK_PASS="$(python3 -c 'import secrets; print("Lk" + secrets.token_hex(10) + "!")
 LK_ONE="${CONTAINER}-one" LK_ONE_VOL="${CONTAINER}-one-data"
 LK_TWO="${CONTAINER}-two" LK_TWO_VOL="${CONTAINER}-two-data"
 LK_SECRET="" LK_MADE=0
-LK_PEER_CTN="klldap-lkpeer-${RUNID}" LK_FILL="${LK_RUN}-f" LK_FILL_TRIED=0
+LK_PEER_CTN="klldap-lkpeer-${RUNID}" LK_HELD="${LK_RUN}-h" LK_HELD_TRIED=0
 LK_TCC="/tmp/${LK_RUN}tgs.cc" LK_ONE_OU="${LK_RUN}one" LK_ONE_POLICY="" LK_PAGE_USERS=()
 EXTRA_CONTAINERS+=("$LK_ONE" "$LK_TWO" "$LK_PEER_CTN")
 EXTRA_VOLUMES+=("$LK_ONE_VOL" "$LK_TWO_VOL")
@@ -708,67 +708,56 @@ lk_peer_rows() {
 
 lk_pg() { gexec_in "$PG_CONTAINER" psql -U klldap -d klldap -tAc "$1" 2>/dev/null | tr -d '[:space:]'; }
 lk_pg_held() { lk_pg "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation WHERE c.relname = 'ou_policies' AND l.mode = 'AccessExclusiveLock' AND l.granted"; }
-# The fill reads each OU's row by key; the lockout's own follow reads the linked rows instead.
-lk_pg_fill_waits() {
-    local n
-    n="$(lk_pg "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%\"ou_key\" IN (%'")"
-    [ "${n:-0}" -ge 1 ] 2>/dev/null
-}
+lk_ms() { date +%s%3N; }
+lk_set_pw() { lk_gql 'mutation($id: String!, $pw: String!) { setUserPassword(userId: $id, password: $pw) { ok } }' "$(lk_pw_vars "$1")" >/dev/null; }
+LK_HELD_MS=3000
 
-# Postgres only: the gate holds ou_policies until a cache fill waits on it, then creates a user in it.
-lk_fill_kinit() {
-    local hold held=0 seen=0 waited=0 made=0 mark w during rows got="" secs=0
+# Postgres only: while ou_policies is held, a user is made, then a password change is refused
+# within the bound; after the release both kinds answer.
+lk_held_policy() {
+    local hold held=0 mark t0 made=0 made_ms=0 refused=0 set_ms=0 why="" still="" rows after=0 hers=0 login
+    local unread="the password policy could not be read; try again"
     if [ "$GATE_DB" != postgres ]; then
-        lk_note "[L1.fill-kinit-counted-user] the gate holds a running cache fill only on postgres (a table lock whose waiter it can see); on $GATE_DB not run"
+        lk_note "[L1.held-policy-answers] the gate holds ou_policies only on postgres (a table lock it can see); on $GATE_DB not run"
         return 0
     fi
+    mark="$(lk_mark)"
     timeout 120 docker exec -e PGAPPNAME=lkhold "$PG_CONTAINER" psql -U klldap -d klldap -c \
-        "BEGIN; LOCK TABLE ou_policies IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(100); COMMIT;" >"$LK_D/hold.out" 2>&1 &
+        "BEGIN; LOCK TABLE ou_policies IN ACCESS EXCLUSIVE MODE; SELECT pg_sleep(60); COMMIT;" >"$LK_D/hold.out" 2>&1 &
     hold=$!
     for _ in $(seq 1 20); do
         [ "$(lk_pg_held)" = 1 ] && held=1 && break
         sleep 0.5
     done
-    while [ "$held" = 1 ] && [ "$waited" -le 45 ]; do
-        lk_pg_fill_waits && seen=1 && break
-        sleep 1
-        waited=$((waited + 1))
-    done
-    if [ "$seen" = 1 ]; then
-        LK_FILL_TRIED=1
+    if [ "$held" = 1 ]; then
+        LK_HELD_TRIED=1
+        t0="$(lk_ms)"
         lk_gql 'mutation($u: CreateUserInput!) { createUser(user: $u) { id } }' \
-            '{"u": {"id": "'"$LK_FILL"'", "email": "'"$LK_FILL"'@gate.test", "attributes": [{"name": "kerberossync", "value": ["1"]}]}}' >/dev/null &&
-            lk_gql 'mutation($id: String!, $pw: String!) { setUserPassword(userId: $id, password: $pw) { ok } }' "$(lk_pw_vars "$LK_FILL")" >/dev/null &&
-            made=1
-        mark="$(lk_mark)"
-        w="$(lk_kinit_as "$LK_FILL" "wrong-f1-$LK_RUN")"
-        during="$(lk_kinit_as "$LK_FILL" pass)"
-        rows="$(lk_one "kind = 'login' AND protocol = 'kerberos' AND NOT success AND detail LIKE 'policy: not loaded yet%' AND $(lk_who "$LK_FILL")" "$mark")"
+            '{"u": {"id": "'"$LK_HELD"'", "email": "'"$LK_HELD"'@gate.test"}}' >/dev/null && made=1
+        made_ms=$(($(lk_ms) - t0))
+        t0="$(lk_ms)"
+        if ! lk_set_pw "$LK_USER" && grep -qF "$unread" "$LK_D/last.err"; then
+            refused=1
+        fi
+        set_ms=$(($(lk_ms) - t0))
+        why="$(head -c 200 "$LK_D/last.err")"
+        still="$(lk_pg_held)"
     fi
     lk_pg "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'lkhold'" >/dev/null
     wait "$hold" 2>/dev/null
     if [ "$held" = 0 ]; then
-        lk_note "[L1.fill-kinit-counted-user] the gate could not hold ou_policies (see hold.out); not run"
-        return 0
-    elif [ "$seen" = 0 ]; then
-        lk_note "[L1.fill-kinit-counted-user] no cache fill waited on the held ou_policies within 45 s; this run cannot tell"
-        return 0
-    elif [ "$made" = 0 ]; then
-        lk_finding "[L1.fill-kinit-counted-user] with a cache fill held (it waited on ou_policies after ${waited} s), creating $LK_FILL with Kerberos sync did not answer: $(head -c 200 "$LK_D/last.err")"
+        lk_note "[L1.held-policy-answers] the gate could not hold ou_policies (see hold.out); not run"
         return 0
     fi
-    while [ "$secs" -le 20 ]; do
-        got="$(lk_kinit_as "$LK_FILL" pass)"
-        [ "$got" = ok ] && break
-        sleep 1
-        secs=$((secs + 1))
-    done
-    if [ "$during" = ok ]; then
-        lk_note "[L1.fill-kinit-counted-user] $LK_FILL reached the cache while ou_policies was held, so what waited was no fill holding the cache; this run cannot tell"
-    elif [ "$w $during" = "incorrect revoked" ] && lk_is "$rows" 1 && [ "$got" = ok ]; then
-        lk_pass_read "[L1.fill-kinit-counted-user] postgres: a cache fill held on ou_policies (it waited after ${waited} s); $LK_FILL created with Kerberos sync during it, one wrong kinit, then the right password refused while the fill was held ('credentials have been revoked', one 'policy: not loaded yet' row); the hold released, the right password gets a ticket after ${secs} s"
+    rows="$(lk_one "kind = 'password_change' AND NOT success AND detail = '$unread' AND $(lk_who "$LK_USER")" "$mark")"
+    lk_set_pw "$LK_USER" && after=1
+    lk_set_pw "$LK_HELD" && hers=1
+    login="$(lk_simple "$LK_HELD" pass)"
+    if [ "$made $refused $still" = "1 1 1" ] && [ "$made_ms" -le "$LK_HELD_MS" ] && [ "$set_ms" -le "$LK_HELD_MS" ] &&
+        lk_is "$rows" 1 && [ "$after $hers" = "1 1" ] && [ "$login" = "200 token" ]; then
+        lk_pass_read "[L1.held-policy-answers] postgres, ou_policies held ACCESS EXCLUSIVE: createUser $LK_HELD answered in $made_ms ms; setUserPassword for $LK_USER was refused '$unread' in $set_ms ms (one password_change row), the table still held; after the release setUserPassword answered for $LK_USER and $LK_HELD, and $LK_HELD signs in at /auth/simple/login"
     else
-        lk_finding "[L1.fill-kinit-counted-user] created during a held fill: the wrong kinit '$w' (want incorrect), the right password while held '$during' (want revoked), 'policy: not loaded yet' rows $rows (want 1); after the release the right password gave '$got' for ${secs} s (want ok)"
+        lk_finding "[L1.held-policy-answers] during the hold: createUser $LK_HELD made $made in $made_ms ms, setUserPassword for $LK_USER refused as unreadable $refused in $set_ms ms (want 1 and 1, each within $LK_HELD_MS ms; it answered '$why'), still held '$still' (want 1), password_change rows $rows (want 1); after the release setUserPassword $after for $LK_USER and $hers for $LK_HELD (want 1 and 1), the simple login '$login' (want 200 token)"
     fi
 }
 
@@ -993,9 +982,9 @@ lk_cleanup() {
     docker volume rm "$LK_ONE_VOL" "$LK_TWO_VOL" >/dev/null 2>&1
     lk_policy_gone && gone=1
     lk_unlock "$LK_LOCK" >/dev/null 2>&1
-    if [ "$LK_FILL_TRIED" = 1 ]; then
+    if [ "$LK_HELD_TRIED" = 1 ]; then
         lk_pg "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'lkhold'" >/dev/null
-        lk_gql 'mutation($u: String!) { deleteUser(userId: $u) { ok } }' '{"u": "'"$LK_FILL"'"}' >/dev/null
+        lk_gql 'mutation($u: String!) { deleteUser(userId: $u) { ok } }' '{"u": "'"$LK_HELD"'"}' >/dev/null
     fi
     for u in "${LK_PAGE_USERS[@]}"; do
         lk_gql 'mutation($u: String!) { deleteUser(userId: $u) { ok } }' '{"u": "'"$u"'"}' >/dev/null
@@ -1035,9 +1024,9 @@ if lk_setup; then
     lk_peer_rows
     lk_pages_threshold_one
     lk_totp && lk_kerberos
-    lk_fill_kinit
+    lk_held_policy
 fi
 lk_cleanup
 note "lockout-facts FINDING ids: ${LK_FIND[*]:-none}"
 note "lockout-facts: $LK_N rows, $LK_P pass, $LK_F FINDING, $LK_K NOTE, $LK_X FAIL"
-note "lockout-facts: a correct product gives 34 rows, 0 FINDING, 0 FAIL: 34 pass on postgres; 31 pass and 3 NOTE ([L1.totp-two-servers], [L1.totp-used-two-servers], [L1.fill-kinit-counted-user]) on sqlite"
+note "lockout-facts: a correct product gives 34 rows, 0 FINDING, 0 FAIL: 34 pass on postgres; 31 pass and 3 NOTE ([L1.totp-two-servers], [L1.totp-used-two-servers], [L1.held-policy-answers]) on sqlite"

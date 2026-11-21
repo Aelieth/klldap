@@ -826,8 +826,8 @@ mod tests {
     };
     use lldap_domain_handlers::mfa::MfaPolicy;
     use lldap_schema::{AttributeList, PublicSchema, Schema, schema::PosixSettings};
-    use lldap_test_utils::MockTestBackendHandler;
     use lldap_test_utils::recording_kerberos::{KerberosOp, RecordingGuard};
+    use lldap_test_utils::{MockTestBackendHandler, minimum_entry};
     use mockall::predicate::eq;
     use pretty_assertions::assert_eq;
     use serial_test::serial;
@@ -1662,8 +1662,8 @@ mod tests {
 
     fn expect_the_floor(mock: &mut MockTestBackendHandler) {
         use lldap_domain_handlers::password::PASSWORD_MIN_LENGTH;
-        mock.expect_password_min_length()
-            .returning(|_| Ok(PASSWORD_MIN_LENGTH));
+        mock.expect_bounded_policy_entry()
+            .returning(|uid| Ok(minimum_entry(uid, PASSWORD_MIN_LENGTH)));
     }
 
     fn alice_committed() -> KerberosOp {
@@ -1917,11 +1917,12 @@ mod tests {
         assert_eq!(eleven.chars().count(), 11);
         for (synced, min, refusal) in rows {
             let mut mock = MockTestBackendHandler::new();
-            mock.expect_password_min_length()
+            mock.expect_bounded_policy_entry()
                 .with(eq(UserId::new("alice")))
                 .times(1)
-                .returning(move |_| {
-                    min.ok_or_else(|| DomainError::InternalError("down".to_owned()))
+                .returning(move |uid| {
+                    let entry = min.map(|min| minimum_entry(uid, min));
+                    entry.ok_or_else(|| DomainError::InternalError("down".to_owned()))
                 });
             if synced {
                 synced_alice(&mut mock, std::collections::HashSet::new());

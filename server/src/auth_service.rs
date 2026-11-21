@@ -1138,9 +1138,9 @@ pub(crate) mod tests {
     use lldap_domain_handlers::logging::{Protocol, RequestMeta, with_request};
     use lldap_domain_handlers::password::PASSWORD_MIN_LENGTH;
     use lldap_domain_model::error::{DomainError, Result as DomainResult};
-    use lldap_test_utils::MockTestBackendHandler;
     use lldap_test_utils::enforcement::{EnforcementGuard, SeenAttempt};
     use lldap_test_utils::recording_kerberos::{KerberosOp, RecordingGuard};
+    use lldap_test_utils::{MockTestBackendHandler, minimum_entry};
     use mockall::predicate::eq;
     use pretty_assertions::assert_eq;
     use std::cell::Cell;
@@ -1629,8 +1629,8 @@ pub(crate) mod tests {
             mock.expect_registration_finish()
                 .times(usize::from(upstream))
                 .returning(|_| Ok(UserId::new("alice")));
-            mock.expect_password_min_length()
-                .returning(|_| Ok(PASSWORD_MIN_LENGTH));
+            mock.expect_bounded_policy_entry()
+                .returning(|uid| Ok(minimum_entry(uid, PASSWORD_MIN_LENGTH)));
             let start = start_response();
             mock.expect_registration_start()
                 .times(usize::from(committed))
@@ -1789,11 +1789,12 @@ pub(crate) mod tests {
                 .with(eq(UserId::new("alice")))
                 .times(1)
                 .returning(|_| Ok(alice(true)));
-            mock.expect_password_min_length()
+            mock.expect_bounded_policy_entry()
                 .with(eq(UserId::new("alice")))
                 .times(1)
-                .returning(move |_| {
-                    min.ok_or_else(|| DomainError::InternalError("down".to_owned()))
+                .returning(move |uid| {
+                    let entry = min.map(|min| minimum_entry(uid, min));
+                    entry.ok_or_else(|| DomainError::InternalError("down".to_owned()))
                 });
             mock.expect_registration_finish().times(0);
             let start = start_response();
@@ -1866,11 +1867,12 @@ pub(crate) mod tests {
                 .with(eq(UserId::new("alice")))
                 .times(1)
                 .returning(move |_| Ok(alice(sync)));
-            mock.expect_password_min_length()
+            mock.expect_bounded_policy_entry()
                 .with(eq(UserId::new("alice")))
                 .times(1)
-                .returning(move |_| {
-                    min.ok_or_else(|| DomainError::InternalError("down".to_owned()))
+                .returning(move |uid| {
+                    let entry = min.map(|min| minimum_entry(uid, min));
+                    entry.ok_or_else(|| DomainError::InternalError("down".to_owned()))
                 });
             let start = start_response();
             mock.expect_registration_start()

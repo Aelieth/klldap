@@ -2,11 +2,10 @@ use crate::sql_backend_handler::SqlBackendHandler;
 use crate::sql_lockout_handler::CountingStart;
 use crate::sql_mfa_windows::read_windows;
 use async_trait::async_trait;
-use lldap_domain::types::{User, UserId, user_ou};
-use lldap_domain_handlers::handler::{PolicyBackendHandler, UserBackendHandler};
+use lldap_domain::types::{User, UserId};
+use lldap_domain_handlers::handler::PolicyBackendHandler;
 use lldap_domain_handlers::kdc_proof::ProofWindow;
 use lldap_domain_handlers::logging::{self, LogKind};
-use lldap_domain_handlers::password::{min_length_for_ou_key, min_length_in};
 use lldap_domain_handlers::policies::{
     AttachedPolicy, CreatePolicyRequest, OuPolicyState, Policy, PolicyId, PolicyLevel,
     UpdatePolicyRequest, canonical_ou_key, ou_chain, ou_display,
@@ -393,15 +392,9 @@ impl PolicyBackendHandler for SqlBackendHandler {
         self.bounded_entry(user).await
     }
 
-    async fn password_min_length(&self, user_id: &UserId) -> Result<usize> {
-        let details = match self.get_user_details(user_id).await {
-            Err(DomainError::EntityNotFound(_)) => {
-                return min_length_in(&[]);
-            }
-            details => details?,
-        };
-        let ou_key = canonical_ou_key(&user_ou(&details.attributes));
-        min_length_for_ou_key(self, &ou_key).await
+    #[instrument(skip_all, level = "debug", err(level = "debug"))]
+    async fn bounded_policy_levels(&self, ou: &str) -> Result<Vec<PolicyLevel>> {
+        self.bounded_levels(ou).await
     }
 
     async fn read_proof_windows(
@@ -429,7 +422,7 @@ mod tests {
     use lldap_domain_handlers::logging::{LogKind, RequestMeta, with_request};
     use lldap_domain_handlers::password::{
         PASSWORD_MIN_LENGTH, PASSWORD_MIN_LENGTH_ITEM, PasswordChangeError, PasswordSync,
-        change_password_everywhere, min_length_of,
+        change_password_everywhere, min_length_for_user, min_length_of,
     };
     use lldap_test_utils::enforcement::EnforcementGuard;
     use lldap_test_utils::recording_log::LogGuard;
@@ -735,12 +728,12 @@ mod tests {
         doors::policy_on(&h, "e3ou", &[(PASSWORD_MIN_LENGTH_ITEM, "12")]).await;
         let mut got = Vec::new();
         for user in ["e3long", "e3east", "e3plain", "e3nobody"] {
-            got.push(h.password_min_length(&UserId::new(user)).await.unwrap());
+            got.push(min_length_for_user(&h, &UserId::new(user)).await.unwrap());
         }
         h.set_ou_policy_inheritance("e3ou\\east", true)
             .await
             .unwrap();
-        let blocked = h.password_min_length(&UserId::new("e3east")).await;
+        let blocked = min_length_for_user(&h, &UserId::new("e3east")).await;
         assert_eq!(
             (got, blocked.unwrap()),
             (vec![12, 12, 8, 8], 8),
@@ -836,7 +829,7 @@ mod tests {
         assert_eq!(
             (
                 "Nine-99ch".chars().count(),
-                h.password_min_length(&user).await.unwrap(),
+                min_length_for_user(&h, &user).await.unwrap(),
                 doors::bind(&h, "e3old", "Nine-99ch").await,
                 matches!(web, Ok(LoginOutcome::Authenticated { .. }))
             ),
@@ -855,7 +848,7 @@ mod tests {
         store_items(&h, id, "not json").await;
         let user = UserId::new("e3unread");
         let _ = doors::rows(&log, &[]);
-        let read = h.password_min_length(&user).await;
+        let read = min_length_for_user(&h, &user).await;
         let refused = min_length_of(&h, &user).await;
         assert_eq!(
             (
@@ -919,8 +912,7 @@ mod tests {
             let stored = format!("{{\"{PASSWORD_MIN_LENGTH_ITEM}\":\"{value}\"}}");
             store_items(&h, id, &stored).await;
             let _ = doors::rows(&log, &[]);
-            let read = h
-                .password_min_length(&user)
+            let read = min_length_for_user(&h, &user)
                 .await
                 .map_err(|e| e.to_string());
             let refused = min_length_of(&h, &user).await;
@@ -959,7 +951,7 @@ mod tests {
     async fn change_at_fifteen(log: &LogGuard, h: &SqlBackendHandler, user: &str) -> Raised {
         let user = UserId::new(user);
         let _ = doors::rows(log, &[]);
-        let read = h.password_min_length(&user).await.unwrap();
+        let read = min_length_for_user(h, &user).await.unwrap();
         let min = min_length_of(h, &user).await.unwrap();
         let changed = change_password_everywhere(h, &user, FIFTEEN, PasswordSync::Off, min).await;
         (

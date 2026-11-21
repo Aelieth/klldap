@@ -24,9 +24,10 @@ use lldap_domain_handlers::logging::{
     LogActivity, LogBucket, LogCursor, LogDimension, LogFilter, LogKind, LogRecord,
 };
 use lldap_domain_handlers::mfa::{MfaPolicy, MfaRequirement, MfaResetReason};
-use lldap_domain_handlers::password::PASSWORD_MIN_LENGTH;
+use lldap_domain_handlers::password::{PASSWORD_MIN_LENGTH, PASSWORD_MIN_LENGTH_ITEM};
 use lldap_domain_handlers::policies::{
-    CreatePolicyRequest, OuPolicyState, Policy, PolicyId, PolicyLevel, UpdatePolicyRequest,
+    AttachedPolicy, CreatePolicyRequest, OuPolicyState, Policy, PolicyId, PolicyLevel,
+    UpdatePolicyRequest,
 };
 use lldap_domain_model::error::Result;
 use lldap_opaque_handler::{OpaqueHandler, login, registration};
@@ -108,7 +109,7 @@ mockall::mock! {
         async fn get_policy_levels(&self, ou: &str) -> Result<Vec<PolicyLevel>>;
         async fn delete_ou_policy_state(&self, ou: &str) -> Result<()>;
         async fn bounded_policy_entry(&self, user: &UserId) -> Result<(User, Vec<PolicyLevel>)>;
-        async fn password_min_length(&self, user_id: &UserId) -> Result<usize>;
+        async fn bounded_policy_levels(&self, ou: &str) -> Result<Vec<PolicyLevel>>;
     }
     #[async_trait]
     impl LockoutBackendHandler for TestBackendHandler {
@@ -168,27 +169,45 @@ pub fn setup_default_ldap_mock(mock: &mut MockTestBackendHandler) {
     mock.expect_get_allowed_ous()
         .returning(|| Ok(vec!["people".to_string(), "groups".to_string()]));
 
-    mock.expect_get_user_details().returning(|uid| {
-        Ok(User {
-            user_id: uid.clone(),
-            email: format!("{}@example.com", uid.as_str()).into(),
-            display_name: None,
-            creation_date: chrono::Utc::now().naive_utc(),
-            modified_date: chrono::Utc::now().naive_utc(),
-            password_modified_date: chrono::Utc::now().naive_utc(),
-            uuid: lldap_domain::types::Uuid::from_name_and_date(
-                uid.as_str(),
-                &chrono::Utc::now().naive_utc(),
-            ),
-            attributes: vec![],
-            krb_principal_name: None,
-            mfa_type: None,
-        })
-    });
+    mock.expect_get_user_details()
+        .returning(|uid| Ok(user_named(uid)));
 
     mock.expect_get_user_groups()
         .returning(|_| Ok(HashSet::new()));
 
-    mock.expect_password_min_length()
-        .returning(|_| Ok(PASSWORD_MIN_LENGTH));
+    mock.expect_bounded_policy_entry()
+        .returning(|uid| Ok(minimum_entry(uid, PASSWORD_MIN_LENGTH)));
+}
+
+pub fn user_named(uid: &UserId) -> User {
+    User {
+        user_id: uid.clone(),
+        email: format!("{}@example.com", uid.as_str()).into(),
+        display_name: None,
+        creation_date: chrono::Utc::now().naive_utc(),
+        modified_date: chrono::Utc::now().naive_utc(),
+        password_modified_date: chrono::Utc::now().naive_utc(),
+        uuid: lldap_domain::types::Uuid::from_name_and_date(
+            uid.as_str(),
+            &chrono::Utc::now().naive_utc(),
+        ),
+        attributes: vec![],
+        krb_principal_name: None,
+        mfa_type: None,
+    }
+}
+
+/// The bounded read's answer for a user whose OU sets `password-min-length` to `min`.
+pub fn minimum_entry(uid: &UserId, min: usize) -> (User, Vec<PolicyLevel>) {
+    let policy = AttachedPolicy {
+        id: PolicyId(1),
+        name: "minimum".to_owned(),
+        items: [(PASSWORD_MIN_LENGTH_ITEM.to_owned(), min.to_string())].into(),
+    };
+    let level = PolicyLevel {
+        ou_key: String::new(),
+        blocked: false,
+        policy: Some(policy),
+    };
+    (user_named(uid), vec![level])
 }

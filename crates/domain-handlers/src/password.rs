@@ -1,3 +1,4 @@
+use crate::enforcement::POLICY_UNANSWERED;
 use crate::handler::PolicyBackendHandler;
 use crate::kerberos::{
     CREATE_WITHOUT_SYNC, CommitError, Held, HostRow, KerberosState, KerberosSync, PasswordCommit,
@@ -6,7 +7,8 @@ use crate::kerberos::{
 };
 use crate::logging::{self, LogKind};
 use crate::policies::{
-    EffectiveItem, POLICY_ITEM_CATALOG, Setting, canonical_ou_key, resolve, resolve_effective_items,
+    EffectiveItem, POLICY_ITEM_CATALOG, POLICY_READ_WAIT, Setting, canonical_ou_key, resolve,
+    resolve_effective_items,
 };
 pub use lldap_auth::{
     PASSWORD_HAS_NUL, PASSWORD_LENGTH_UNIT, PASSWORD_MIN_LENGTH, PasswordShapeError,
@@ -65,7 +67,7 @@ pub async fn min_length_of(
     handler: &(impl PolicyBackendHandler + ?Sized),
     user: &UserId,
 ) -> Result<usize, PasswordChangeError> {
-    handler.password_min_length(user).await.map_err(|e| {
+    min_length_for_user(handler, user).await.map_err(|e| {
         warn!("The password policy of {user} could not be read: {e}");
         let refused = PasswordChangeError::PolicyUnreadable;
         refused_with_row(LogKind::PasswordChange, user, refused)
@@ -85,12 +87,33 @@ pub async fn min_length_in_ou(
     })
 }
 
+/// The user's minimum, 8 for a user the directory does not have.
+pub async fn min_length_for_user(
+    handler: &(impl PolicyBackendHandler + ?Sized),
+    user: &UserId,
+) -> Result<usize, DomainError> {
+    let levels = match within_the_bound(handler.bounded_policy_entry(user)).await {
+        Err(DomainError::EntityNotFound(_)) => Vec::new(),
+        entry => entry?.1,
+    };
+    min_length_in(&resolve_effective_items(POLICY_ITEM_CATALOG, &levels))
+}
+
 pub async fn min_length_for_ou_key(
     handler: &(impl PolicyBackendHandler + ?Sized),
     ou_key: &str,
 ) -> Result<usize, DomainError> {
-    let levels = handler.get_policy_levels(ou_key).await?;
+    let levels = within_the_bound(handler.bounded_policy_levels(ou_key)).await?;
     min_length_in(&resolve_effective_items(POLICY_ITEM_CATALOG, &levels))
+}
+
+async fn within_the_bound<T>(
+    read: impl std::future::Future<Output = Result<T, DomainError>>,
+) -> Result<T, DomainError> {
+    let unanswered = || DomainError::InternalError(POLICY_UNANSWERED.to_owned());
+    tokio::time::timeout(POLICY_READ_WAIT, read)
+        .await
+        .map_err(|_| unanswered())?
 }
 
 pub fn min_length_in(items: &[EffectiveItem]) -> Result<usize, DomainError> {
@@ -1248,6 +1271,148 @@ mod tests {
             (Some(8), SettingSource::Default),
             "no items at all, as for a user the directory does not have"
         );
+    }
+
+    mod stalled {
+        use crate::enforcement::POLICY_UNANSWERED;
+        use crate::handler::PolicyBackendHandler;
+        use crate::policies::{
+            CreatePolicyRequest, OuPolicyState, Policy, PolicyId, PolicyLevel, UpdatePolicyRequest,
+        };
+        use async_trait::async_trait;
+        use lldap_domain::types::{User, UserId};
+        use lldap_domain_model::error::{DomainError, Result};
+
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub(super) enum Answer {
+            Never,
+            ItsOwnBound,
+            Down,
+        }
+
+        /// A policy store whose bounded reads never answer, or answer an error at once.
+        pub(super) struct Stalled(pub(super) Answer);
+
+        impl Stalled {
+            async fn answer(&self) -> DomainError {
+                let detail = match self.0 {
+                    Answer::Never => std::future::pending().await,
+                    Answer::ItsOwnBound => POLICY_UNANSWERED,
+                    Answer::Down => "down",
+                };
+                DomainError::InternalError(detail.to_owned())
+            }
+        }
+
+        #[async_trait]
+        impl PolicyBackendHandler for Stalled {
+            async fn list_policies(&self) -> Result<Vec<Policy>> {
+                unimplemented!()
+            }
+            async fn get_policy(&self, _: PolicyId) -> Result<Policy> {
+                unimplemented!()
+            }
+            async fn create_policy(&self, _: CreatePolicyRequest) -> Result<PolicyId> {
+                unimplemented!()
+            }
+            async fn update_policy(&self, _: UpdatePolicyRequest) -> Result<()> {
+                unimplemented!()
+            }
+            async fn delete_policy(&self, _: PolicyId) -> Result<()> {
+                unimplemented!()
+            }
+            async fn set_ou_policy(&self, _: &str, _: PolicyId) -> Result<()> {
+                unimplemented!()
+            }
+            async fn clear_ou_policy(&self, _: &str) -> Result<()> {
+                unimplemented!()
+            }
+            async fn set_ou_policy_inheritance(&self, _: &str, _: bool) -> Result<()> {
+                unimplemented!()
+            }
+            async fn list_ou_policy_states(&self) -> Result<Vec<OuPolicyState>> {
+                unimplemented!()
+            }
+            async fn get_policy_levels(&self, _: &str) -> Result<Vec<PolicyLevel>> {
+                unimplemented!()
+            }
+            async fn delete_ou_policy_state(&self, _: &str) -> Result<()> {
+                unimplemented!()
+            }
+            async fn bounded_policy_entry(&self, _: &UserId) -> Result<(User, Vec<PolicyLevel>)> {
+                Err(self.answer().await)
+            }
+            async fn bounded_policy_levels(&self, _: &str) -> Result<Vec<PolicyLevel>> {
+                Err(self.answer().await)
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum Caller {
+        Change,
+        AddByOu,
+        Read,
+    }
+
+    async fn ask(caller: Caller, store: &stalled::Stalled) -> Result<usize, String> {
+        let user = UserId::new("e3slow");
+        match caller {
+            Caller::Change => min_length_of(store, &user).await.map_err(|e| e.to_string()),
+            Caller::AddByOu => {
+                let min = min_length_in_ou(store, "people", &user, LogKind::UserCreate).await;
+                min.map_err(|e| e.to_string())
+            }
+            Caller::Read => {
+                let min = min_length_for_user(store, &user).await;
+                min.map_err(|e| e.to_string())
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn test_a_minimum_read_past_its_bound_refuses_each_door_with_its_one_row() {
+        use stalled::Answer::{Down, ItsOwnBound, Never};
+        const UNREADABLE: &str = "the password policy could not be read; try again";
+        const UNANSWERED: &str =
+            "Internal error: `the policy read did not answer within its bound`";
+        const DOWN: &str = "Internal error: `down`";
+        const WITHIN: std::time::Duration = std::time::Duration::from_secs(4);
+        type Door = (&'static str, Caller, Option<LogKind>);
+        let doors: [Door; 7] = [
+            ("A", Caller::Change, Some(LogKind::PasswordChange)),
+            ("B/C", Caller::Change, Some(LogKind::PasswordChange)),
+            ("G", Caller::Change, Some(LogKind::PasswordChange)),
+            ("F/H/I", Caller::Change, Some(LogKind::PasswordChange)),
+            ("D/E", Caller::AddByOu, Some(LogKind::UserCreate)),
+            ("J/K", Caller::Read, None),
+            ("L", Caller::Read, None),
+        ];
+        let rows = std::sync::Arc::new(Rows::default());
+        logging::set_log_sink(rows.clone());
+        let (mut got, mut want) = (Vec::new(), Vec::new());
+        for (door, caller, kind) in doors {
+            for answer in [Never, ItsOwnBound, Down] {
+                let started = tokio::time::Instant::now();
+                let answered = ask(caller, &stalled::Stalled(answer)).await;
+                let took = started.elapsed();
+                let events = std::mem::take(&mut *rows.0.lock().unwrap());
+                let row = |e: logging::LogEvent| (e.kind, e.success, e.detail);
+                let written: Vec<_> = events.into_iter().map(row).collect();
+                let bound = (took >= POLICY_READ_WAIT, took < WITHIN);
+                got.push((door, answer, answered, written, bound));
+                let (text, written) = match (kind, answer) {
+                    (Some(kind), _) => (UNREADABLE, vec![(kind, false, Some(UNREADABLE.into()))]),
+                    (None, Down) => (DOWN, vec![]),
+                    (None, _) => (UNANSWERED, vec![]),
+                };
+                let waited = (answer == Never, true);
+                want.push((door, answer, Err(text.to_owned()), written, waited));
+            }
+        }
+        logging::set_log_sink(std::sync::Arc::new(logging::NoopLogSink));
+        assert_eq!(got, want);
     }
 
     #[test]

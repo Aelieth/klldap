@@ -1391,11 +1391,12 @@ mod tests {
             let guard = RecordingGuard::install();
             let log = LogGuard::install_on_this_thread();
             let mut mock = MockTestBackendHandler::new();
-            mock.expect_password_min_length()
+            mock.expect_bounded_policy_entry()
                 .with(mockall::predicate::eq(UserId::new("bob")))
                 .times(2)
-                .returning(move |_| {
-                    min.ok_or_else(|| DomainError::InternalError("down".to_owned()))
+                .returning(move |uid| {
+                    let entry = min.map(|min| lldap_test_utils::minimum_entry(uid, min));
+                    entry.ok_or_else(|| DomainError::InternalError("down".to_owned()))
                 });
             if synced {
                 mock.expect_get_user_details()

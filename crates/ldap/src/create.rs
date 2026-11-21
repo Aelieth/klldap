@@ -958,7 +958,7 @@ mod tests {
         for (label, synced, with_password) in cases {
             let one_transaction = synced && with_password;
             let mut mock = MockTestBackendHandler::new();
-            mock.expect_get_policy_levels()
+            mock.expect_bounded_policy_levels()
                 .times(usize::from(with_password))
                 .returning(|_| Ok(vec![]));
             mock.expect_get_user_details()
@@ -1016,7 +1016,8 @@ mod tests {
         for (kdc, code, message) in kdc_rows() {
             let (guard, _offline, reached) = install(kdc.clone());
             let mut mock = MockTestBackendHandler::new();
-            mock.expect_get_policy_levels().returning(|_| Ok(vec![]));
+            mock.expect_bounded_policy_levels()
+                .returning(|_| Ok(vec![]));
             mock.expect_get_user_details()
                 .returning(|u| Err(DomainError::EntityNotFound(u.to_string())));
             mock.expect_create_user().times(0);
@@ -1070,7 +1071,8 @@ mod tests {
         {
             let guard = RecordingGuard::install();
             let mut mock = MockTestBackendHandler::new();
-            mock.expect_get_policy_levels().returning(|_| Ok(vec![]));
+            mock.expect_bounded_policy_levels()
+                .returning(|_| Ok(vec![]));
             mock.expect_get_user_details()
                 .returning(|u| Err(DomainError::EntityNotFound(u.to_string())));
             mock.expect_create_user().times(0);
@@ -1113,7 +1115,8 @@ mod tests {
         use lldap_test_utils::recording_kerberos::{DEGRADED_CAUSE, DegradedGuard};
         use lldap_test_utils::recording_log::LogGuard;
         let mut mock = MockTestBackendHandler::new();
-        mock.expect_get_policy_levels().returning(|_| Ok(vec![]));
+        mock.expect_bounded_policy_levels()
+            .returning(|_| Ok(vec![]));
         mock.expect_get_user_details()
             .returning(|u| Err(DomainError::EntityNotFound(u.to_string())));
         mock.expect_create_user().times(0);
@@ -1154,7 +1157,8 @@ mod tests {
     async fn test_a_synced_add_with_kerberos_disabled_makes_nothing() {
         use lldap_domain_handlers::kerberos::CREATE_WITHOUT_SYNC;
         let mut mock = MockTestBackendHandler::new();
-        mock.expect_get_policy_levels().returning(|_| Ok(vec![]));
+        mock.expect_bounded_policy_levels()
+            .returning(|_| Ok(vec![]));
         mock.expect_get_user_details()
             .returning(|u| Err(DomainError::EntityNotFound(u.to_string())));
         mock.expect_create_user().times(0);
@@ -1177,7 +1181,8 @@ mod tests {
     async fn test_create_synced_user_that_exists_is_refused_as_before() {
         let guard = RecordingGuard::install();
         let mut mock = MockTestBackendHandler::new();
-        mock.expect_get_policy_levels().returning(|_| Ok(vec![]));
+        mock.expect_bounded_policy_levels()
+            .returning(|_| Ok(vec![]));
         mock.expect_get_user_details().returning(|u| {
             Ok(User {
                 user_id: u.clone(),
@@ -1250,7 +1255,7 @@ mod tests {
             };
             let made = refusal.is_none();
             let mut mock = MockTestBackendHandler::new();
-            mock.expect_get_policy_levels()
+            mock.expect_bounded_policy_levels()
                 .withf(|ou| ou == "people\\sales")
                 .times(1)
                 .return_once(move |_| levels);
@@ -1339,7 +1344,7 @@ mod tests {
             }];
             let made = refusal.is_none();
             let mut mock = MockTestBackendHandler::new();
-            mock.expect_get_policy_levels()
+            mock.expect_bounded_policy_levels()
                 .withf(|ou| ou.is_empty())
                 .times(1)
                 .return_once(move |_| Ok(levels));

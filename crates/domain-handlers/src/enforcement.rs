@@ -1870,7 +1870,7 @@ mod tests {
                 }
             }
         }
-        async fn password_min_length(&self, _: &UserId) -> Result<usize> {
+        async fn bounded_policy_levels(&self, _: &str) -> Result<Vec<PolicyLevel>> {
             unimplemented!()
         }
         async fn read_proof_windows(

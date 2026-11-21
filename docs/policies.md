@@ -252,17 +252,19 @@ the NUL check.
 When the user's policy cannot be read, or the stored value is not a whole number, every door
 above refuses the change with "the password policy could not be read; try again", never
 holding it to 8 instead (a stored number out of range is held to 8 to 128); kadmin `cpw`
-answers `PASS_Q_GENERIC`, which kadmin shows as *Unspecified password quality failure*, and
-waits at most 2 seconds for the read. The register start is refused the same way (400) for
-every user, and the pages show the sentence.
+answers `PASS_Q_GENERIC`, which kadmin shows as *Unspecified password quality failure*. A
+minimum whose read has not answered within 2 seconds (while `ou_policies` or `policies` is
+locked, say) is refused the same way at every door, and the database ends that read's own wait.
+The register start is refused the same way (400) for every user, and the pages show the
+sentence.
 
 The configuration's admin password (`ldap_user_pass`) is checked against 8 only, at the first
 start and at a forced reset (`force_ldap_user_pass_reset`). When that password is shorter than
 the admin's minimum, the start logs one warning that names the minimum, never the password's
 length: *The admin password in ldap_user_pass is shorter than the admin's password-min-length
 of 12: the configuration's password is checked against 8 only, and a change of it is held to
-12*. When the admin's minimum cannot be read, the start logs one warning that says so. Any
-other change of the admin's password is held to the minimum.
+12*. When the admin's minimum cannot be read within 2 seconds, the start logs one warning that
+says so and goes on. Any other change of the admin's password is held to the minimum.
 
 A synced user's password crosses the web pages and `lldap_set_password` in an envelope of at
 most 318 bytes, so there a high minimum cannot be met in letters of several bytes each: 128

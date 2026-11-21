@@ -156,6 +156,11 @@ pub enum Command {
         about = "Clear a user's failed logins and lock; a running server sees it within 30 seconds"
     )]
     Unlock(UnlockOpts),
+    #[clap(
+        name = "policy-unlink",
+        about = "Remove the policy link of one OU, the root as (root) or \"\"; a running server sees it within 30 seconds"
+    )]
+    PolicyUnlink(PolicyUnlinkOpts),
 }
 
 #[derive(Debug, Parser, Clone)]
@@ -165,6 +170,17 @@ pub struct UnlockOpts {
 
     #[clap(help = "The user to unlock")]
     pub user: String,
+}
+
+#[derive(Debug, Parser, Clone)]
+pub struct PolicyUnlinkOpts {
+    #[clap(flatten)]
+    pub run: RunOpts,
+
+    #[clap(
+        help = "The OU whose policy link is removed (people\\labs); the root is (root) or \"\""
+    )]
+    pub ou: String,
 }
 
 #[derive(Debug, Parser, Clone)]
@@ -264,6 +280,13 @@ pub struct RunOpts {
         help = "Second factor (TOTP) for every user, overriding the OU policies: off, enabled = only users who enrolled present a code, always = every user must enroll (0.8.0's false and true still work). Unset, each OU's enable-mfa decides. Members of lldap_mfa_disabled are exempt"
     )]
     pub enable_mfa: Option<OffEnabledAlways>,
+
+    #[clap(
+        long,
+        env = "LLDAP_LOGIN_HOURS_TIMEZONE",
+        help = "The time zone the OUs' login-hours windows are read in: an IANA name (\"America/Chicago\") from the system's zone files, read once at start; an unknown name refuses the start. Default: UTC"
+    )]
+    pub login_hours_timezone: Option<String>,
 
     #[clap(flatten)]
     pub smtp_opts: SmtpOpts,

@@ -31,5 +31,6 @@ pub use sql_lockout_handler::unlock_login_on;
 pub use sql_log_handler::{LogRetention, LogWriterHandle, enforce_log_retention, start_log_writer};
 #[cfg(feature = "test-clock")]
 pub use sql_mfa_handler::set_enrollment_clock;
+pub use sql_policy_handler::{UNLINKED_BY_TOOL, unlink_ou_policy_on};
 pub mod sql_migrations;
 pub mod sql_tables;

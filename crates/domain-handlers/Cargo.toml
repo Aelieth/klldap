@@ -22,6 +22,7 @@ test-backend-scope = []
 async-trait = { workspace = true }
 base64 = { workspace = true }
 chrono = { workspace = true }
+jiff = { workspace = true }
 ldap3_proto = { workspace = true }
 strum = { workspace = true }
 tokio = { workspace = true }

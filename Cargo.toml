@@ -105,6 +105,11 @@ tag = "v1.2.3"
 git = "https://github.com/Aelieth/kerber-rust"
 tag = "v1.2.3"
 
+[workspace.dependencies.jiff]
+version = "1.0.1"
+default-features = false
+features = ["std"]
+
 [workspace.dependencies.krb5-types]
 git = "https://github.com/Aelieth/kerber-rust"
 tag = "v1.2.3"

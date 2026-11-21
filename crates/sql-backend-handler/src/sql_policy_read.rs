@@ -352,6 +352,7 @@ pub(crate) mod tests {
         let refusal = Refusal {
             item: UNREADABLE,
             door: Door::LdapBind,
+            reason: None,
         };
         let row = (LogKind::Bind, false, Some("policy: unreadable".to_owned()));
         assert_eq!(
@@ -497,6 +498,7 @@ pub(crate) mod tests {
             let refusal = Refusal {
                 item: UNREADABLE,
                 door,
+                reason: None,
             };
             (name, Err(refusal), true)
         };
@@ -836,6 +838,7 @@ pub(crate) mod tests {
         let not_loaded = Refusal {
             item: NOT_LOADED,
             door: Door::KerberosAs,
+            reason: None,
         };
         assert_eq!(
             (held, before, after, cache.marked(&user)),

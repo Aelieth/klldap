@@ -12,16 +12,18 @@ use crate::mfa::{
     mfa_requirement,
 };
 use crate::policies::{
-    EffectiveItem, POLICY_ITEM_CATALOG, POLICY_READ_WAIT, Policy, canonical_ou_key, resolve,
-    resolve_effective_items,
+    EffectiveItem, POLICY_ITEM_CATALOG, POLICY_READ_WAIT, Policy, PolicyValueType,
+    canonical_ou_key, catalog_item, resolve, resolve_effective_items,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use jiff::tz::TimeZone;
 use lldap_domain::requests::{CreateGroupRequest, UpdateUserRequest};
 use lldap_domain::types::{Attribute, GroupDetails, MFA_TYPE_TOTP, User, UserId, Uuid, user_ou};
 use lldap_domain_model::error::{DomainError, Result};
 use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, PoisonError, RwLock};
 use std::time::Duration;
@@ -37,6 +39,12 @@ const FLAG_UNKNOWN: u8 = 2;
 pub const UNREADABLE: &str = "unreadable";
 pub const NOT_LOADED: &str = "not loaded yet";
 pub const POLICY_UNANSWERED: &str = "the policy read did not answer within its bound";
+pub const LOGIN_HOURS: &str = "login-hours";
+pub const ALLOWED_NETWORKS: &str = "allowed-networks";
+pub const INACTIVITY_DAYS: &str = "inactivity-days";
+const GATED: [&str; 3] = [LOGIN_HOURS, ALLOWED_NETWORKS, INACTIVITY_DAYS];
+pub const ZONE_FILES: &str = "/usr/share/zoneinfo";
+pub const BUILT_IN: &str = "built in";
 
 /// A read that gave up within its bound, by the client's timer or the database's own.
 pub fn gave_up(e: &DomainError) -> bool {
@@ -82,11 +90,11 @@ impl Door {
             Self::LdapBind => "ldap bind",
             Self::KerberosAs => "kerberos",
             Self::KerberosTgs => "kerberos service ticket",
-            Self::KerberosS4u => "kerberos S4U2Self",
+            Self::KerberosS4u => "kerberos S4U",
         }
     }
 
-    /// A login counts toward a lock; a renewal, a service ticket or an S4U2Self does not.
+    /// A login counts toward a lock; a renewal, a service ticket or an S4U request does not.
     pub fn is_login(self) -> bool {
         matches!(
             self,
@@ -104,13 +112,36 @@ pub struct Attempt<'a> {
     pub second_factor: bool,
 }
 
+#[cfg(any(test, feature = "test-backend-scope"))]
+static TEST_CLOCK: RwLock<Option<DateTime<Utc>>> = RwLock::new(None);
+
+/// For tests only, through test-utils' `EnforcementGuard`: the doors' clock until it is reset.
+#[cfg(any(test, feature = "test-backend-scope"))]
+pub fn set_test_clock(now: Option<DateTime<Utc>>) {
+    *TEST_CLOCK.write().unwrap_or_else(PoisonError::into_inner) = now;
+}
+
+#[cfg(any(test, feature = "test-backend-scope"))]
+fn pinned_clock() -> Option<DateTime<Utc>> {
+    *TEST_CLOCK.read().unwrap_or_else(PoisonError::into_inner)
+}
+
+#[cfg(not(any(test, feature = "test-backend-scope")))]
+fn pinned_clock() -> Option<DateTime<Utc>> {
+    None
+}
+
+pub fn door_clock() -> DateTime<Utc> {
+    pinned_clock().unwrap_or_else(Utc::now)
+}
+
 impl<'a> Attempt<'a> {
     pub fn new(user: &'a UserId, door: Door) -> Self {
         Self {
             user,
             door,
             peer: logging::current_request().peer,
-            now: Utc::now(),
+            now: door_clock(),
             second_factor: false,
         }
     }
@@ -131,6 +162,7 @@ impl<'a> Attempt<'a> {
 pub struct Refusal {
     pub item: &'static str,
     pub door: Door,
+    pub reason: Option<&'static str>,
 }
 
 impl Refusal {
@@ -138,7 +170,10 @@ impl Refusal {
         if self.item == lockout::THRESHOLD {
             return lockout::LOCKED_OUT.to_owned();
         }
-        format!("policy: {}", self.item)
+        match self.reason {
+            Some(reason) => format!("policy: {} ({reason})", self.item),
+            None => format!("policy: {}", self.item),
+        }
     }
 }
 
@@ -164,6 +199,14 @@ pub trait ItemCheck: Send + Sync {
     fn may_refuse(&self, _state: &UserState) -> bool {
         true
     }
+    /// Said after the key in the refusal's row: `policy: <key> (<reason>)`.
+    fn reason(&self) -> Option<&'static str> {
+        None
+    }
+    /// Whether it judges a user a service asks for (S4U2Self, S4U2Proxy).
+    fn judges_at_s4u(&self) -> bool {
+        true
+    }
     fn allows(&self, attempt: &Attempt<'_>, value: &str, state: &UserState) -> bool;
     fn allows_among(
         &self,
@@ -184,7 +227,7 @@ pub fn decide(
     state: &UserState,
     checks: &[Arc<dyn ItemCheck>],
 ) -> std::result::Result<(), Refusal> {
-    for check in checks.iter().filter(|check| check.judges(attempt.user)) {
+    for check in checks.iter().filter(|check| judges_attempt(check, attempt)) {
         let Some(item) = items.iter().find(|item| item.key == check.key()) else {
             continue;
         };
@@ -192,10 +235,16 @@ pub fn decide(
             return Err(Refusal {
                 item: check.key(),
                 door: attempt.door,
+                reason: check.reason(),
             });
         }
     }
     Ok(())
+}
+
+fn judges_attempt(check: &Arc<dyn ItemCheck>, attempt: &Attempt<'_>) -> bool {
+    let at_s4u = attempt.door == Door::KerberosS4u;
+    check.judges(attempt.user) && (!at_s4u || check.judges_at_s4u())
 }
 
 pub fn judged(checks: &[Arc<dyn ItemCheck>], user: &UserId) -> bool {
@@ -244,6 +293,7 @@ pub fn item_checks() -> ItemChecks {
 }
 
 /// For tests only, through test-utils' `EnforcementGuard`.
+#[cfg(any(test, feature = "test-backend-scope"))]
 pub fn set_item_checks(checks: ItemChecks) {
     *CHECKS.write().unwrap_or_else(PoisonError::into_inner) = checks;
 }
@@ -366,6 +416,8 @@ pub struct PolicyCache {
     lockout: AtomicU8,
     mfa: RwLock<Option<MfaPolicy>>,
     mfa_item: AtomicU8,
+    items: [AtomicU8; 3],
+    zone: RwLock<TimeZone>,
     pub(crate) proofs: RwLock<Option<ProofSettings>>,
     pub(crate) reader: RwLock<Option<WindowReader>>,
     pub(crate) rereads: Mutex<HashMap<UserId, Reread>>,
@@ -411,6 +463,8 @@ impl PolicyCache {
             lockout: AtomicU8::new(FLAG_OFF),
             mfa: RwLock::new(None),
             mfa_item: AtomicU8::new(FLAG_OFF),
+            items: std::array::from_fn(|_| AtomicU8::new(FLAG_OFF)),
+            zone: RwLock::new(TimeZone::UTC),
             proofs: RwLock::new(None),
             reader: RwLock::new(None),
             rereads: Mutex::default(),
@@ -445,6 +499,18 @@ impl PolicyCache {
         *self.mfa.write().unwrap_or_else(PoisonError::into_inner) = policy;
     }
 
+    /// The zone `login-hours` windows are read in, loaded once at start; UTC until then.
+    pub fn login_hours_zone(&self) -> TimeZone {
+        self.zone
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn set_login_hours_zone(&self, zone: TimeZone) {
+        *self.zone.write().unwrap_or_else(PoisonError::into_inner) = zone;
+    }
+
     pub fn set_lockout_unknown(&self) {
         self.lockout.store(FLAG_UNKNOWN, Ordering::Release);
     }
@@ -469,6 +535,42 @@ impl PolicyCache {
 
     pub fn set_mfa_item_unknown(&self) {
         self.mfa_item.store(FLAG_UNKNOWN, Ordering::Release);
+    }
+
+    fn item_state(&self, key: &str) -> u8 {
+        let at = GATED.iter().position(|gated| *gated == key);
+        let flag = at.and_then(|at| self.items.get(at));
+        flag.map_or(FLAG_OFF, |flag| flag.load(Ordering::Acquire))
+    }
+
+    fn set_item(&self, key: &str, state: u8) {
+        let at = GATED.iter().position(|gated| *gated == key);
+        if let Some(flag) = at.and_then(|at| self.items.get(at)) {
+            flag.store(state, Ordering::Release);
+        }
+    }
+
+    /// Whether no OU's linked policy sets the item off its default: one atomic read.
+    pub fn item_off(&self, key: &str) -> bool {
+        self.item_state(key) == FLAG_OFF
+    }
+
+    /// The lockout before its first follow, or an item whose fill failed as it turned on.
+    pub fn item_unread(&self, key: &str) -> bool {
+        match key {
+            lockout::THRESHOLD => self.lockout_unknown(),
+            _ => self.item_state(key) == FLAG_UNKNOWN,
+        }
+    }
+
+    pub fn items_unread(&self) -> bool {
+        GATED.iter().any(|key| self.item_state(key) == FLAG_UNKNOWN)
+    }
+
+    pub fn set_item_flags(&self, flags: ItemFlags) {
+        for (key, on) in flags.keyed() {
+            self.set_item(key, flag(on));
+        }
     }
 
     fn current(&self) -> Arc<Entries> {
@@ -570,6 +672,10 @@ impl PolicyCache {
     pub async fn poked(&self) {
         self.fill.notified().await;
     }
+}
+
+fn flag(live: bool) -> u8 {
+    if live { FLAG_ON } else { FLAG_OFF }
 }
 
 static CACHE: LazyLock<PolicyCache> = LazyLock::new(PolicyCache::new);
@@ -738,6 +844,82 @@ fn asks_mfa(policy: &Policy) -> bool {
     !policy.linked_ous.is_empty() && value.is_some_and(|value| value != "off")
 }
 
+/// Whether an OU's linked policy sets the item at a value other than the catalog's default.
+pub fn item_set(policies: &[Policy], key: &str) -> bool {
+    let Some(spec) = catalog_item(key) else {
+        return false;
+    };
+    let off_default = |value: &String| match spec.value_type {
+        PolicyValueType::Int { .. } => value.parse::<i64>().ok() != spec.default_value.parse().ok(),
+        _ => value != spec.default_value,
+    };
+    let linked = policies
+        .iter()
+        .filter(|policy| !policy.linked_ous.is_empty());
+    linked
+        .filter_map(|policy| policy.items.get(key))
+        .any(off_default)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ItemFlags {
+    pub login_hours: bool,
+    pub networks: bool,
+    pub inactivity: bool,
+}
+
+impl ItemFlags {
+    pub fn of(policies: &[Policy]) -> Self {
+        Self {
+            login_hours: item_set(policies, LOGIN_HOURS),
+            networks: item_set(policies, ALLOWED_NETWORKS),
+            inactivity: item_set(policies, INACTIVITY_DAYS),
+        }
+    }
+
+    pub fn held(cache: &PolicyCache) -> Self {
+        Self {
+            login_hours: !cache.item_off(LOGIN_HOURS),
+            networks: !cache.item_off(ALLOWED_NETWORKS),
+            inactivity: !cache.item_off(INACTIVITY_DAYS),
+        }
+    }
+
+    fn keyed(self) -> [(&'static str, bool); 3] {
+        let on = [self.login_hours, self.networks, self.inactivity];
+        [0, 1, 2].map(|at| (GATED[at], on[at]))
+    }
+}
+
+/// An item turning on fills the cache first and stays unread while that fails.
+pub async fn follow_items<H>(handler: &H, cache: &PolicyCache, policies: &[Policy]) -> Result<bool>
+where
+    H: UserListerBackendHandler + UserBackendHandler + PolicyBackendHandler + ?Sized,
+{
+    let mut rising = Vec::new();
+    for (key, on) in ItemFlags::of(policies).keyed() {
+        match (on, cache.item_state(key)) {
+            (false, _) => cache.set_item(key, FLAG_OFF),
+            (true, FLAG_ON) => {}
+            (true, _) => rising.push(key),
+        }
+    }
+    if rising.is_empty() {
+        return Ok(false);
+    }
+    let mark = |state| rising.iter().for_each(|key| cache.set_item(key, state));
+    let flipped = async {
+        fill_policy_cache(handler, cache).await?;
+        mark(FLAG_ON);
+        fill_policy_cache(handler, cache).await
+    };
+    if let Err(e) = flipped.await {
+        mark(FLAG_UNKNOWN);
+        return Err(e);
+    }
+    Ok(true)
+}
+
 /// The OUs whose policy turns the factor on with no explicit server-wide value over them.
 pub fn ous_asking_mfa(server: Option<MfaPolicy>, policies: &[Policy]) -> usize {
     let asking = policies.iter().filter(|policy| asks_mfa(policy));
@@ -768,13 +950,15 @@ impl StartWarning {
     }
 }
 
-/// Made by whichever server first sees the item apply; one of that name is kept.
+/// Made by whichever server first sees the item apply; a name held in any case is kept.
 pub async fn ensure_exempt_group<H>(handler: &H) -> Result<()>
 where
     H: GroupListerBackendHandler + GroupBackendHandler + ?Sized,
 {
     let filter = GroupRequestFilter::DisplayName(MFA_DISABLED_GROUP.into());
-    if !handler.list_groups(Some(filter)).await?.is_empty() {
+    let named = handler.list_groups(Some(filter)).await?;
+    let holds = |name: &str| name.to_lowercase() == MFA_DISABLED_GROUP;
+    if named.iter().any(|group| holds(group.display_name.as_str())) {
         return Ok(());
     }
     let ou = Attribute {
@@ -786,6 +970,68 @@ where
         attributes: vec![ou],
     };
     handler.create_group(request).await.map(drop)
+}
+
+pub async fn exempt_group_twin<H>(handler: &H) -> Result<Option<String>>
+where
+    H: GroupListerBackendHandler + ?Sized,
+{
+    let filter = GroupRequestFilter::DisplayName(MFA_DISABLED_GROUP.into());
+    let named = handler.list_groups(Some(filter)).await?;
+    let twin = named.into_iter().find_map(|group| {
+        let name = group.display_name.into_string();
+        let twin = name != MFA_DISABLED_GROUP && name.to_lowercase() == MFA_DISABLED_GROUP;
+        twin.then_some(name)
+    });
+    Ok(twin.map(|name| {
+        format!(
+            "The group {name} is not the exempt group {MFA_DISABLED_GROUP}, whose name it takes \
+             in another case: while it exists, nobody is exempt"
+        )
+    }))
+}
+
+#[derive(Clone, Debug)]
+pub struct LoadedZone {
+    pub zone: TimeZone,
+    pub source: String,
+}
+
+/// The system's zone files only, under `TZDIR` when set; the process's own zone is never read.
+pub fn load_zone(name: &str) -> std::result::Result<LoadedZone, String> {
+    let dir = std::env::var_os("TZDIR").filter(|dir| !dir.is_empty());
+    load_zone_from(
+        &dir.map_or_else(|| PathBuf::from(ZONE_FILES), PathBuf::from),
+        name,
+    )
+}
+
+pub fn load_zone_from(dir: &Path, name: &str) -> std::result::Result<LoadedZone, String> {
+    if name.eq_ignore_ascii_case("UTC") {
+        let source = BUILT_IN.to_owned();
+        return Ok(LoadedZone {
+            zone: TimeZone::UTC,
+            source,
+        });
+    }
+    let refused = |cause: &str| format!("login_hours_timezone \"{name}\" is refused: {cause}");
+    let part = |part: &str| {
+        let named = |c: char| c.is_ascii_alphanumeric() || "_+-".contains(c);
+        !part.is_empty() && part != "." && part != ".." && part.chars().all(named)
+    };
+    let first = name.split('/').next().unwrap_or_default();
+    let tree = ["right", "posix"]
+        .iter()
+        .any(|tree| first.eq_ignore_ascii_case(tree));
+    if tree || !name.split('/').all(part) {
+        return Err(refused("not an IANA time zone name"));
+    }
+    let path = dir.join(name);
+    let unread = |e: &dyn std::fmt::Display| refused(&format!("{}: {e}", path.display()));
+    let data = std::fs::read(&path).map_err(|e| unread(&e))?;
+    let zone = TimeZone::tzif(name, &data).map_err(|e| unread(&e))?;
+    let source = path.display().to_string();
+    Ok(LoadedZone { zone, source })
 }
 
 pub async fn policy_changed<H>(handler: &H, cache: &PolicyCache)
@@ -941,18 +1187,27 @@ where
     Ok(user_entry(handler, user).await?.1)
 }
 
-/// Until the lockout's state is read, a user it judges is refused as when a policy is unreadable.
+fn unread_item(
+    cache: &PolicyCache,
+    attempt: &Attempt<'_>,
+    checks: &[Arc<dyn ItemCheck>],
+) -> Option<&'static str> {
+    let judging = checks.iter().filter(|check| judges_attempt(check, attempt));
+    judging
+        .map(|check| check.key())
+        .find(|key| cache.item_unread(key))
+}
+
+/// Until an item it judges is read, a user is refused as when a policy is unreadable.
 fn not_read_yet(
     cache: &PolicyCache,
     attempt: &Attempt<'_>,
     checks: &[Arc<dyn ItemCheck>],
 ) -> Option<Refusal> {
-    let judges = |check: &Arc<dyn ItemCheck>| {
-        check.key() == lockout::THRESHOLD && check.judges(attempt.user)
-    };
-    (cache.lockout_unknown() && checks.iter().any(judges)).then_some(Refusal {
+    unread_item(cache, attempt, checks).map(|_| Refusal {
         item: UNREADABLE,
         door: attempt.door,
+        reason: None,
     })
 }
 
@@ -961,6 +1216,7 @@ pub fn refuse_unreadable(user: &UserId, door: Door) -> Refusal {
     let refusal = Refusal {
         item: UNREADABLE,
         door,
+        reason: None,
     };
     record_refusal(user, &refusal);
     refusal
@@ -1009,6 +1265,7 @@ where
             Err(Refusal {
                 item: UNREADABLE,
                 door: attempt.door,
+                reason: None,
             })
         }
     };
@@ -1030,8 +1287,18 @@ pub fn admit_at_kdc_with(
     attempt: &Attempt<'_>,
     checks: &[Arc<dyn ItemCheck>],
 ) -> std::result::Result<(), Refusal> {
-    if let Some(refusal) = not_read_yet(cache, attempt, checks) {
-        return Err(refusal);
+    let refused = |item| Refusal {
+        item,
+        door: attempt.door,
+        reason: None,
+    };
+    match unread_item(cache, attempt, checks) {
+        Some(lockout::THRESHOLD) => return Err(refused(UNREADABLE)),
+        Some(_) => {
+            cache.poke_fill();
+            return Err(refused(NOT_LOADED));
+        }
+        None => {}
     }
     let (state, checks) = refusing(checks, cache, lockout, attempt.user);
     if checks.is_empty() {
@@ -1040,10 +1307,7 @@ pub fn admit_at_kdc_with(
     let entries = cache.get();
     let Some(items) = entries.items_of(attempt.user) else {
         cache.poke_fill();
-        return Err(Refusal {
-            item: NOT_LOADED,
-            door: attempt.door,
-        });
+        return Err(refused(NOT_LOADED));
     };
     decide(attempt, items, &state, &checks)
 }
@@ -1059,6 +1323,7 @@ pub fn record_kdc_row(
     let meta = RequestMeta {
         protocol: Protocol::Kerberos,
         peer,
+        client_address: peer,
         ..RequestMeta::default()
     };
     logging::with_request_sync(meta, || {
@@ -1166,6 +1431,7 @@ mod tests {
             Err(Refusal {
                 item,
                 door: Door::LdapBind,
+                reason: None,
             })
         };
         let rows = [
@@ -1417,7 +1683,7 @@ mod tests {
                 Door::KerberosS4u,
                 LogKind::AccessDenied,
                 false,
-                "kerberos S4U2Self",
+                "kerberos S4U",
             ),
         ];
         for (door, kind, login, name) in rows {
@@ -1452,6 +1718,7 @@ mod tests {
         let refused = Err(Refusal {
             item: "lockout-threshold",
             door: Door::KerberosAs,
+            reason: None,
         });
         let rows = [
             ("no threshold anywhere", false, &counted, Ok(()), 0),
@@ -1472,12 +1739,14 @@ mod tests {
             Err(Refusal {
                 item: UNREADABLE,
                 door: Door::KerberosAs,
+                reason: None,
             }),
             "until the policies are read, every user the lockout judges is refused"
         );
         let refusal = Refusal {
             item: "lockout-threshold",
             door: Door::LdapBind,
+            reason: None,
         };
         assert_eq!(refusal.detail(), "locked out");
     }
@@ -1586,6 +1855,7 @@ mod tests {
             Err(Refusal {
                 item,
                 door: Door::KerberosAs,
+                reason: None,
             })
         };
         let rows = [
@@ -1710,6 +1980,8 @@ mod tests {
         proof_reads: AtomicU64,
         policy_read: AtomicU8,
         entry_reads: AtomicU64,
+        watching: Mutex<Option<(&'static PolicyCache, &'static Lockout)>>,
+        verdicts: Mutex<Vec<(bool, std::result::Result<(), Refusal>)>>,
     }
 
     impl Directory {
@@ -1767,6 +2039,14 @@ mod tests {
             _: bool,
         ) -> Result<Vec<UserAndGroups>> {
             self.user_lists.fetch_add(1, Ordering::Relaxed);
+            if let Some((cache, counter)) = *self.watching.lock().unwrap() {
+                let late = UserId::new(LATE);
+                let attempt = Attempt::at_kdc(&late, Door::KerberosAs, None, 1_700_000_000);
+                let checks: Vec<Arc<dyn ItemCheck>> = vec![Arc::new(HoursLive)];
+                let verdict = admit_at_kdc_with(cache, counter, &attempt, &checks);
+                let flag = !cache.item_off(LOGIN_HOURS);
+                self.verdicts.lock().unwrap().push((flag, verdict));
+            }
             if self.users_down.load(Ordering::Relaxed) {
                 return Err(DomainError::InternalError("down".to_owned()));
             }
@@ -2459,6 +2739,7 @@ mod tests {
             let refusal = Refusal {
                 item: UNREADABLE,
                 door,
+                reason: None,
             };
             let row = (kind, false, Some("policy: unreadable".to_owned()));
             want.push((door, answer, Err(refusal), vec![row], 1, (waits, true)));
@@ -2522,6 +2803,7 @@ mod tests {
         let not_loaded = Err(Refusal {
             item: NOT_LOADED,
             door: Door::KerberosAs,
+            reason: None,
         });
         type Row = (&'static str, u8, bool, bool);
         let rows: [Row; 3] = [
@@ -2601,6 +2883,464 @@ mod tests {
             (reads() - before, marks()),
             (3, 0),
             "with the table free, the next pass takes every mark"
+        );
+    }
+
+    struct HoursLive;
+
+    impl ItemCheck for HoursLive {
+        fn key(&self) -> &'static str {
+            LOGIN_HOURS
+        }
+        fn live(&self, cache: &PolicyCache) -> bool {
+            !cache.item_off(LOGIN_HOURS)
+        }
+        fn allows(&self, _: &Attempt<'_>, _: &str, _: &UserState) -> bool {
+            true
+        }
+    }
+
+    struct Outside;
+
+    impl ItemCheck for Outside {
+        fn key(&self) -> &'static str {
+            LOGIN_HOURS
+        }
+        fn reason(&self) -> Option<&'static str> {
+            Some("outside login hours")
+        }
+        fn judges_at_s4u(&self) -> bool {
+            false
+        }
+        fn allows(&self, _: &Attempt<'_>, _: &str, _: &UserState) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn test_a_refusal_names_the_checks_reason_after_the_key() {
+        let bob = UserId::new("bob");
+        let items = [item(LOGIN_HOURS, "mon 08:00-09:00")];
+        let reasoned: Vec<Arc<dyn ItemCheck>> = vec![Arc::new(Outside)];
+        let scripted = vec![check(LOGIN_HOURS, |_, _| false)];
+        let attempt = Attempt::at_kdc(&bob, Door::LdapBind, None, 1_700_000_000);
+        let rows = [
+            (
+                &reasoned,
+                Some("outside login hours"),
+                "policy: login-hours (outside login hours)",
+            ),
+            (&scripted, None, "policy: login-hours"),
+        ];
+        for (checks, reason, detail) in rows {
+            let refused = decide(&attempt, &items, &UserState::default(), checks).unwrap_err();
+            assert_eq!(
+                (refused.reason, refused.detail()),
+                (reason, detail.to_owned())
+            );
+        }
+        assert_eq!((LockoutCheck.reason(), MfaItemCheck.reason()), (None, None));
+    }
+
+    #[test]
+    fn test_a_check_that_does_not_judge_at_s4u_is_left_out_there_only() {
+        let bob = UserId::new("bob");
+        let items = [item(LOGIN_HOURS, "mon 08:00-09:00")];
+        let present: Vec<Arc<dyn ItemCheck>> = vec![Arc::new(Outside)];
+        let everywhere = vec![check(LOGIN_HOURS, |_, _| false)];
+        let outside = Some("outside login hours");
+        let refused = |door, reason| {
+            Err(Refusal {
+                item: LOGIN_HOURS,
+                door,
+                reason,
+            })
+        };
+        let rows = [
+            (&present, Door::KerberosS4u, Ok(())),
+            (
+                &present,
+                Door::KerberosTgs,
+                refused(Door::KerberosTgs, outside),
+            ),
+            (
+                &present,
+                Door::KerberosAs,
+                refused(Door::KerberosAs, outside),
+            ),
+            (&present, Door::LdapBind, refused(Door::LdapBind, outside)),
+            (
+                &everywhere,
+                Door::KerberosS4u,
+                refused(Door::KerberosS4u, None),
+            ),
+        ];
+        for (checks, door, expected) in rows {
+            let attempt = Attempt::at_kdc(&bob, door, None, 1_700_000_000);
+            let got = decide(&attempt, &items, &UserState::default(), checks);
+            assert_eq!(got, expected, "{door:?}");
+        }
+        assert!(
+            LockoutCheck.judges_at_s4u() && MfaItemCheck.judges_at_s4u(),
+            "the lockout and enable-mfa judge there"
+        );
+    }
+
+    fn linked(key: &str, value: &str, ous: &[&str]) -> Policy {
+        Policy {
+            id: PolicyId(1),
+            name: "p".to_owned(),
+            description: String::new(),
+            items: BTreeMap::from([(key.to_owned(), value.to_owned())]),
+            linked_ous: ous.iter().map(|ou| ou.to_string()).collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_each_gated_item_is_live_only_while_a_linked_policy_sets_it_off_its_default() {
+        let flags = |login_hours, networks, inactivity| ItemFlags {
+            login_hours,
+            networks,
+            inactivity,
+        };
+        let off = flags(false, false, false);
+        let hours = "mon-fri 08:00-18:00";
+        let nets = "10.0.0.0/8";
+        type Row = (&'static str, Vec<Policy>, ItemFlags);
+        let rows: [Row; 10] = [
+            ("nothing set", vec![], off),
+            (
+                "set but not linked",
+                vec![linked(LOGIN_HOURS, hours, &[])],
+                off,
+            ),
+            (
+                "linked at the default value",
+                vec![
+                    linked(LOGIN_HOURS, "", &["people"]),
+                    linked(ALLOWED_NETWORKS, "", &["people"]),
+                    linked(INACTIVITY_DAYS, "0", &["people"]),
+                ],
+                off,
+            ),
+            (
+                "the default written another way",
+                vec![linked(INACTIVITY_DAYS, "00", &["people"])],
+                off,
+            ),
+            (
+                "another item only",
+                vec![linked("lockout-duration-seconds", "60", &["people"])],
+                off,
+            ),
+            (
+                "login-hours linked",
+                vec![linked(LOGIN_HOURS, hours, &["people"])],
+                flags(true, false, false),
+            ),
+            (
+                "allowed-networks linked",
+                vec![linked(ALLOWED_NETWORKS, nets, &["people"])],
+                flags(false, true, false),
+            ),
+            (
+                "inactivity-days linked",
+                vec![linked(INACTIVITY_DAYS, "90", &["people"])],
+                flags(false, false, true),
+            ),
+            (
+                "linked to the root",
+                vec![linked(LOGIN_HOURS, hours, &[""])],
+                flags(true, false, false),
+            ),
+            (
+                "all three linked",
+                vec![
+                    linked(LOGIN_HOURS, hours, &["a"]),
+                    linked(ALLOWED_NETWORKS, nets, &["b"]),
+                    linked(INACTIVITY_DAYS, "90", &[""]),
+                ],
+                flags(true, true, true),
+            ),
+        ];
+        for (label, policies, expected) in rows {
+            let (cache, counter) = (PolicyCache::new(), Lockout::default());
+            let directory = Directory {
+                policies,
+                ..Directory::default()
+            };
+            counter.follow_policies(&directory, &cache).await.unwrap();
+            let filled = directory.user_lists.load(Ordering::Relaxed) > 0;
+            assert_eq!(
+                (ItemFlags::held(&cache), filled),
+                (expected, expected != off),
+                "{label}: a flag that turns on fills the cache first"
+            );
+            if expected == off {
+                assert_eq!(cache.reads(), 0, "{label}: no fill and no read");
+            }
+        }
+        let (cache, counter) = (PolicyCache::new(), Lockout::default());
+        let set = Directory {
+            policies: vec![linked(INACTIVITY_DAYS, "90", &["people"])],
+            ..Directory::default()
+        };
+        counter.follow_policies(&set, &cache).await.unwrap();
+        counter
+            .follow_policies(&Directory::default(), &cache)
+            .await
+            .unwrap();
+        assert_eq!(
+            ItemFlags::held(&cache),
+            off,
+            "an item unset turns off at the next follow"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_gated_item_fills_the_cache_before_its_flag_lets_the_kdc_judge() {
+        let cache: &'static PolicyCache = Box::leak(Box::new(PolicyCache::new()));
+        let counter: &'static Lockout = Box::leak(Box::default());
+        let mut directory = Directory::knowing(&[LATE]).listing(&[LATE]);
+        directory.policies = vec![linked(LOGIN_HOURS, "mon-fri 08:00-18:00", &[LABS])];
+        *directory.watching.lock().unwrap() = Some((cache, counter));
+        counter.follow_policies(&directory, cache).await.unwrap();
+        let at_each_fill = directory.verdicts.lock().unwrap().clone();
+        assert_eq!(
+            at_each_fill,
+            vec![(false, Ok(())), (true, Ok(()))],
+            "the flag turns on only after a fill: the KDC never answers `not loaded yet` for a \
+             user it knows"
+        );
+        let late = UserId::new(LATE);
+        let attempt = Attempt::at_kdc(&late, Door::KerberosAs, None, 1_700_000_000);
+        let checks: Vec<Arc<dyn ItemCheck>> = vec![Arc::new(HoursLive)];
+        let reads = cache.reads();
+        assert_eq!(
+            (
+                admit_at_kdc_with(cache, counter, &attempt, &checks),
+                cache.reads() - reads
+            ),
+            (Ok(()), 1),
+            "after the flip the KDC judges the user from memory"
+        );
+    }
+
+    #[test]
+    fn test_without_a_pinned_clock_an_attempt_takes_the_time_of_the_moment() {
+        let bob = UserId::new("bob");
+        let before = Utc::now();
+        let now = Attempt::new(&bob, Door::LdapBind).now;
+        let took = (now - before).num_milliseconds();
+        assert!((0..1_000).contains(&took), "{took} ms");
+        let lock = lockout::lock_clock().and_utc();
+        let apart = (lock - now).num_milliseconds();
+        assert!(apart.abs() < 1_000, "the lockout's clock: {apart} ms");
+    }
+
+    #[test]
+    fn test_only_the_exact_name_makes_a_member_exempt_in_the_cache() {
+        let epoch = DateTime::from_timestamp(0, 0).unwrap().naive_utc();
+        let group = |name: &str| GroupDetails {
+            group_id: GroupId(1),
+            display_name: name.into(),
+            creation_date: epoch,
+            uuid: Uuid::from_name_and_date(name, &epoch),
+            attributes: vec![],
+            modified_date: epoch,
+        };
+        let rows = [
+            (MFA_DISABLED_GROUP, true),
+            ("LLDAP_MFA_DISABLED", false),
+            ("Lldap_Mfa_Disabled", false),
+            ("lldap_disabled", false),
+        ];
+        for (name, exempt) in rows {
+            let groups = [group(name)];
+            let facts = UserFacts::of(&user(LATE), groups.iter());
+            assert_eq!(facts.exempt, exempt, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_the_start_names_a_group_that_differs_from_the_exempt_group_only_by_case() {
+        const TWIN: &str = "LLDAP_MFA_DISABLED";
+        let warning = format!(
+            "The group {TWIN} is not the exempt group {MFA_DISABLED_GROUP}, whose name it takes \
+             in another case: while it exists, nobody is exempt"
+        );
+        type Row = (
+            &'static str,
+            &'static [&'static str],
+            Option<String>,
+            &'static [&'static str],
+        );
+        let rows: [Row; 4] = [
+            ("no group", &[], None, &[MFA_DISABLED_GROUP]),
+            (
+                "the group itself",
+                &[MFA_DISABLED_GROUP],
+                None,
+                &[MFA_DISABLED_GROUP],
+            ),
+            ("a case twin", &[TWIN], Some(warning), &[TWIN]),
+            (
+                "another group",
+                &["staff"],
+                None,
+                &["staff", MFA_DISABLED_GROUP],
+            ),
+        ];
+        for (label, present, warned, after) in rows {
+            let directory = Directory::default();
+            for name in present {
+                let request = CreateGroupRequest {
+                    display_name: (*name).into(),
+                    attributes: vec![],
+                };
+                directory.create_group(request).await.unwrap();
+            }
+            let mut said = None;
+            for _start in 0..2 {
+                said = exempt_group_twin(&directory).await.unwrap();
+                ensure_exempt_group(&directory).await.unwrap();
+                assert_eq!(said, warned, "{label}: every start says the same");
+            }
+            assert_eq!(
+                (said, directory.group_names()),
+                (
+                    warned,
+                    after
+                        .iter()
+                        .map(|name| name.to_string())
+                        .collect::<Vec<_>>()
+                ),
+                "{label}: the start's warning, then what creation leaves"
+            );
+        }
+    }
+
+    #[test]
+    fn test_the_login_hours_zone_is_utc_built_in_or_one_zone_file_of_the_system() {
+        let dir = Path::new(ZONE_FILES);
+        let chicago = format!("{ZONE_FILES}/America/Chicago");
+        let loaded = |name: &str| {
+            let loaded = load_zone_from(dir, name)?;
+            let zone = loaded.zone.iana_name().map(str::to_owned);
+            Ok::<_, String>((zone, loaded.source))
+        };
+        let rows = [
+            ("UTC", Some(("UTC", BUILT_IN))),
+            ("utc", Some(("UTC", BUILT_IN))),
+            (
+                "America/Chicago",
+                Some(("America/Chicago", chicago.as_str())),
+            ),
+            ("America/Nowhere", None),
+            ("right/America/Chicago", None),
+            ("posix/America/Chicago", None),
+            ("../../etc/passwd", None),
+            ("/etc/localtime", None),
+            ("", None),
+        ];
+        for (name, expected) in rows {
+            match (loaded(name), expected) {
+                (Ok(got), Some((zone, source))) => {
+                    let want = (Some(zone.to_owned()), source.to_owned());
+                    assert_eq!(got, want, "{name}");
+                }
+                (Err(text), None) => {
+                    let named = format!("login_hours_timezone \"{name}\"");
+                    assert!(text.starts_with(&named), "{name}: {text}");
+                }
+                (got, _) => panic!("{name}: {got:?}"),
+            }
+        }
+        let utc = load_zone_from(dir, "UTC").map(|loaded| loaded.zone);
+        assert_eq!(utc, Ok(TimeZone::UTC));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_an_item_whose_fill_fails_at_its_flip_refuses_as_unread_until_a_fill_succeeds() {
+        let _judging = Judging::only(&[LATE]);
+        let (cache, counter) = (policy_cache(), Lockout::default());
+        let mut directory = Directory::knowing(&[LATE]).listing(&[LATE]);
+        directory.policies = vec![linked(LOGIN_HOURS, "mon-fri 08:00-18:00", &[LABS])];
+        let late = UserId::new(LATE);
+        let verdicts = async || {
+            let door = admit(&directory, &Attempt::new(&late, Door::LdapBind)).await;
+            let attempt = Attempt::at_kdc(&late, Door::KerberosAs, None, 1_700_000_000);
+            let kdc = admit_at_kdc_with(cache, &counter, &attempt, &item_checks());
+            (
+                cache.item_off(LOGIN_HOURS),
+                cache.item_unread(LOGIN_HOURS),
+                door,
+                kdc,
+            )
+        };
+        let refused = |item, door| {
+            Err(Refusal {
+                item,
+                door,
+                reason: None,
+            })
+        };
+        directory.users_down.store(true, Ordering::Relaxed);
+        let failed = counter.follow_policies(&directory, cache).await.is_err();
+        let during = verdicts().await;
+        let due = cache.items_unread();
+        directory.users_down.store(false, Ordering::Relaxed);
+        let filled = counter.follow_policies(&directory, cache).await.is_ok();
+        let after = verdicts().await;
+        cache.set_item_flags(ItemFlags::default());
+        cache.replace(Entries::default());
+        assert_eq!(
+            (failed, during, due),
+            (
+                true,
+                (
+                    false,
+                    true,
+                    refused(UNREADABLE, Door::LdapBind),
+                    refused(NOT_LOADED, Door::KerberosAs)
+                ),
+                true
+            ),
+            "the fill failed at the flip: the item is on and unread, the doors refuse it"
+        );
+        assert_eq!(
+            (filled, after),
+            (true, (false, false, Ok(()), Ok(()))),
+            "the next good fill: judged as usual"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_lockout_whose_fill_fails_at_its_flip_refuses_as_unread_until_a_fill_succeeds() {
+        let (cache, counter) = (PolicyCache::new(), Lockout::default());
+        let mut directory = Directory::knowing(&[LATE]).listing(&[LATE]);
+        directory.policies = vec![linked(lockout::THRESHOLD, "3", &[LABS])];
+        let (late, checks) = (UserId::new(LATE), default_item_checks());
+        let kdc = |cache: &PolicyCache| {
+            let attempt = Attempt::at_kdc(&late, Door::KerberosAs, None, 1_700_000_000);
+            admit_at_kdc_with(cache, &counter, &attempt, &checks)
+        };
+        directory.users_down.store(true, Ordering::Relaxed);
+        let failed = counter.follow_policies(&directory, &cache).await.is_err();
+        let during = (cache.lockout_unknown(), kdc(&cache));
+        directory.users_down.store(false, Ordering::Relaxed);
+        let filled = counter.follow_policies(&directory, &cache).await.is_ok();
+        let after = (cache.lockout_live(), kdc(&cache));
+        let unread = Err(Refusal {
+            item: UNREADABLE,
+            door: Door::KerberosAs,
+            reason: None,
+        });
+        assert_eq!(
+            (failed, during, filled, after),
+            (true, (true, unread), true, (true, Ok(()))),
+            "a failed fill as counting turns on: unread until the next good fill"
         );
     }
 }

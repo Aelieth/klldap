@@ -88,6 +88,8 @@ pub struct RequestMeta {
     pub protocol: Protocol,
     pub peer: Option<IpAddr>,
     pub forwarded_for: Option<String>,
+    /// The client's address as the networks check judges it; the socket peer when filled.
+    pub client_address: Option<IpAddr>,
 }
 
 impl RequestMeta {
@@ -97,6 +99,7 @@ impl RequestMeta {
             protocol: Protocol::Http,
             peer,
             forwarded_for,
+            client_address: peer,
         }
     }
 
@@ -106,6 +109,7 @@ impl RequestMeta {
             protocol: Protocol::Ldap,
             peer,
             forwarded_for: None,
+            client_address: peer,
         }
     }
 
@@ -673,6 +677,34 @@ mod tests {
         assert_eq!(inner.peer, meta.peer);
         assert_eq!(inner.forwarded_for.as_deref(), Some("10.1.1.1"));
         assert_eq!(current_request(), RequestMeta::default());
+    }
+
+    #[tokio::test]
+    async fn test_the_client_address_starts_as_the_socket_peer_wherever_a_request_is_filled() {
+        let peer: IpAddr = "192.0.2.10".parse().unwrap();
+        let forwarded = Some("203.0.113.9".to_owned());
+        let http = RequestMeta::http(Some(peer), forwarded.clone());
+        let bob = Some(UserId::new("bob"));
+        let with_bob = with_request(
+            http.clone(),
+            with_actor(bob.clone(), async { current_request() }),
+        )
+        .await;
+        let rows = [
+            ("http", http),
+            ("ldap", RequestMeta::ldap(bob, Some(peer))),
+            ("a web start", as_start(Some(peer), current_request)),
+            ("an actor added", with_bob),
+        ];
+        for (label, meta) in rows {
+            assert_eq!(
+                (meta.peer, meta.client_address),
+                (Some(peer), Some(peer)),
+                "{label}"
+            );
+        }
+        let without = RequestMeta::http(None, forwarded);
+        assert_eq!(without.client_address, None, "no peer, no address");
     }
 
     #[tokio::test]

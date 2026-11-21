@@ -5,6 +5,8 @@ pub mod kdc_proof;
 pub mod kerberos;
 pub mod lockout;
 pub mod logging;
+pub mod login_hours;
 pub mod mfa;
+pub mod networks;
 pub mod password;
 pub mod policies;

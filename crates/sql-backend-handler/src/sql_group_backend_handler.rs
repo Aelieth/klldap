@@ -17,14 +17,14 @@ use lldap_domain_handlers::handler::{
 };
 use lldap_domain_handlers::kerberos::require_kdc_ready;
 use lldap_domain_handlers::logging::{self, LogKind};
-use lldap_domain_handlers::mfa::{MfaPolicy, is_protected_group};
+use lldap_domain_handlers::mfa::{MfaPolicy, allowed_rename, is_protected_group};
 use lldap_domain_model::{
     error::{DomainError, Result},
     model::{self, GroupColumn, MembershipColumn, codec},
 };
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder,
-    QuerySelect, QueryTrait, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, DatabaseTransaction, EntityTrait, PaginatorTrait, QueryFilter,
+    QueryOrder, QuerySelect, QueryTrait, Set, TransactionTrait,
     sea_query::{Alias, Cond, Expr, Func, IntoCondition, OnConflict, SimpleExpr},
 };
 use tracing::instrument;
@@ -317,7 +317,9 @@ impl GroupBackendHandler for SqlBackendHandler {
                 DomainError::EntityNotFound(format!("No such group: '{:?}'", request.group_id))
             })?;
         let mfa = mfa_can_be_on(self.mfa_policy, self.policy_cache);
-        if request.display_name.is_some() && is_protected_group(&current_name, mfa) {
+        let new_name = request.display_name.as_ref().map(|name| name.as_str());
+        let exempting = new_name.is_some_and(|new| allowed_rename(&current_name, new));
+        if new_name.is_some() && is_protected_group(&current_name, mfa) && !exempting {
             return Err(DomainError::InternalError(format!(
                 "Cannot rename built-in group '{current_name}'"
             )));
@@ -327,15 +329,29 @@ impl GroupBackendHandler for SqlBackendHandler {
             &request.delete_attributes,
             &[("display_name", request.display_name.is_some())],
         );
-
-        self.sql_pool
-            .transaction::<_, (), DomainError>(|transaction| {
-                Box::pin(
-                    async move { Self::update_group_with_transaction(request, transaction).await },
-                )
+        let group_id = request.group_id;
+        let members = self
+            .sql_pool
+            .transaction::<_, u64, DomainError>(|transaction| {
+                Box::pin(async move {
+                    Self::update_group_with_transaction(request, transaction).await?;
+                    if !exempting {
+                        return Ok(0);
+                    }
+                    let members =
+                        model::Membership::find().filter(MembershipColumn::GroupId.eq(group_id));
+                    Ok(members.count(transaction).await?)
+                })
             })
             .await?;
+        let changes = match exempting {
+            true => format!("{changes}; members exempt from MFA: {members}"),
+            false => changes,
+        };
         logging::record(LogKind::GroupUpdate, Some(&current_name), Some(&changes));
+        if exempting {
+            enforcement::policy_changed(self, self.policy_cache).await;
+        }
         Ok(())
     }
 

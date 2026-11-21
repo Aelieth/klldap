@@ -1,7 +1,7 @@
 use crate::{
     cli::{
-        GeneralConfigOpts, HealthcheckOpts, LdapsOpts, LogOpts, OffEnabledAlways, RunOpts,
-        SmtpEncryption, SmtpOpts, TestEmailOpts, TrueFalseAlways, UnlockOpts,
+        GeneralConfigOpts, HealthcheckOpts, LdapsOpts, LogOpts, OffEnabledAlways, PolicyUnlinkOpts,
+        RunOpts, SmtpEncryption, SmtpOpts, TestEmailOpts, TrueFalseAlways, UnlockOpts,
     },
     database_string::DatabaseUrl,
 };
@@ -17,6 +17,7 @@ use lldap_auth::opaque::{
 };
 use lldap_domain::types::{AttributeName, UserId};
 use lldap_domain_handlers::{
+    enforcement::{LoadedZone, load_zone},
     kdc_proof::ProofSettings,
     kerberos::{domain_from_base_dn, realm_from},
     mfa::MfaPolicy,
@@ -292,6 +293,8 @@ pub struct Configuration {
     pub force_update_private_key: bool,
     #[builder(default)]
     pub enable_mfa: Option<OffEnabledAlways>,
+    #[builder(default = r#"String::from("UTC")"#)]
+    pub login_hours_timezone: String,
     #[builder(default = r#"DatabaseUrl::from("sqlite://users.db?mode=rwc")"#)]
     pub database_url: DatabaseUrl,
     #[builder(default)]
@@ -398,6 +401,11 @@ impl Configuration {
             OffEnabledAlways::Enabled => MfaPolicy::Enrolled,
             OffEnabledAlways::Always => MfaPolicy::Always,
         })
+    }
+
+    /// Loaded once, by the start; an unknown name refuses it.
+    pub fn login_hours_zone(&self) -> Result<LoadedZone> {
+        load_zone(&self.login_hours_timezone).map_err(|refused| anyhow!(refused))
     }
 
     pub fn get_private_key_info(&self) -> PrivateKeyInfo {
@@ -685,6 +693,10 @@ impl ConfigOverrider for RunOpts {
         self.enable_mfa
             .inspect(|&enable_mfa| config.enable_mfa = Some(enable_mfa));
 
+        self.login_hours_timezone
+            .as_ref()
+            .inspect(|zone| config.login_hours_timezone = zone.to_string());
+
         self.smtp_opts.override_config(config);
         self.ldaps_opts.override_config(config);
         self.healthcheck_opts.override_config(config);
@@ -699,6 +711,18 @@ impl TopLevelCommandOpts for UnlockOpts {
 }
 
 impl ConfigOverrider for UnlockOpts {
+    fn override_config(&self, config: &mut Configuration) {
+        self.run.override_config(config);
+    }
+}
+
+impl TopLevelCommandOpts for PolicyUnlinkOpts {
+    fn general_config(&self) -> &GeneralConfigOpts {
+        &self.run.general_config
+    }
+}
+
+impl ConfigOverrider for PolicyUnlinkOpts {
     fn override_config(&self, config: &mut Configuration) {
         self.run.override_config(config);
     }
@@ -1477,6 +1501,108 @@ mod tests {
             assert_eq!(config.log_options.max_entries, 7);
             assert_eq!(config.log_options.bind_coalesce_seconds, 0);
             assert_eq!(config.mfa_policy(), Some(MfaPolicy::Disabled));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_the_login_hours_zone_is_utc_unless_set_and_the_environment_beats_the_file() {
+        Jail::expect_with(|jail| {
+            jail.clear_env();
+            jail.set_env("LLDAP_JWT_SECRET", "secret");
+            let config = init(default_run_opts()).unwrap();
+            let zone = config.login_hours_zone().unwrap();
+            assert_eq!(
+                (config.login_hours_timezone.as_str(), zone.source.as_str()),
+                ("UTC", "built in"),
+                "the default"
+            );
+
+            jail.create_file(
+                "lldap_config.toml",
+                "login_hours_timezone = \"America/Nowhere\"\n",
+            )?;
+            let config = init(default_run_opts()).unwrap();
+            let refused = config.login_hours_zone().unwrap_err().to_string();
+            assert!(
+                refused.starts_with("login_hours_timezone \"America/Nowhere\" is refused: "),
+                "an unknown name refuses the start, named: {refused}"
+            );
+
+            jail.set_env("LLDAP_LOGIN_HOURS_TIMEZONE", "UTC");
+            let config = init(default_run_opts()).unwrap();
+            assert_eq!(
+                config.login_hours_timezone, "UTC",
+                "the environment beats the file"
+            );
+
+            let mut opts = default_run_opts();
+            opts.login_hours_timezone = Some("Etc/UTC".to_owned());
+            let config = init(opts).unwrap();
+            assert_eq!(
+                config.login_hours_timezone, "Etc/UTC",
+                "the command line beats both"
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn test_the_zone_never_reads_tz_reads_tzdir_and_refuses_what_is_no_plain_zone_file() {
+        Jail::expect_with(|jail| {
+            jail.clear_env();
+            jail.set_env("LLDAP_JWT_SECRET", "secret");
+            jail.set_env("TZ", "Asia/Tokyo");
+            jail.set_env("LLDAP_LOGIN_HOURS_TIMEZONE", "America/Chicago");
+            let config = init(default_run_opts()).unwrap();
+            let zone = config.login_hours_zone().unwrap();
+            assert_eq!(
+                (zone.zone.iana_name(), zone.source.as_str()),
+                (
+                    Some("America/Chicago"),
+                    "/usr/share/zoneinfo/America/Chicago"
+                ),
+                "TZ names another zone and changes nothing"
+            );
+
+            let zones = jail.directory().join("zones");
+            std::fs::create_dir_all(zones.join("Test")).unwrap();
+            let chicago = std::fs::read("/usr/share/zoneinfo/America/Chicago").unwrap();
+            std::fs::write(zones.join("Test/Copied"), chicago).unwrap();
+            std::fs::write(zones.join("Test/Text"), "not a zone\n").unwrap();
+            jail.set_env("TZDIR", zones.display());
+            let rows = [
+                (
+                    "Test/Copied",
+                    Ok(zones.join("Test/Copied").display().to_string()),
+                ),
+                (
+                    "Test/Text",
+                    Err(zones.join("Test/Text").display().to_string()),
+                ),
+                (
+                    "right/America/Chicago",
+                    Err("not an IANA time zone name".to_owned()),
+                ),
+                (
+                    "posix/America/Chicago",
+                    Err("not an IANA time zone name".to_owned()),
+                ),
+            ];
+            for (name, expected) in rows {
+                jail.set_env("LLDAP_LOGIN_HOURS_TIMEZONE", name);
+                let config = init(default_run_opts()).unwrap();
+                let refused = format!("login_hours_timezone \"{name}\" is refused: ");
+                match (config.login_hours_zone(), expected) {
+                    (Ok(zone), Ok(source)) => assert_eq!(zone.source, source, "{name}"),
+                    (Err(e), Err(named)) => {
+                        let text = e.to_string();
+                        let said = text.strip_prefix(&refused).unwrap_or_default();
+                        assert!(said.starts_with(&named), "{name}: {text}");
+                    }
+                    (got, _) => panic!("{name}: {:?}", got.map(|zone| zone.source)),
+                }
+            }
             Ok(())
         });
     }

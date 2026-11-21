@@ -49,6 +49,7 @@ fn proof_detail(door: Door) -> String {
     let refusal = Refusal {
         item: ENABLE_MFA,
         door,
+        reason: None,
     };
     format!("{} ({NO_FRESH_PROOF})", refusal.detail())
 }
@@ -56,6 +57,19 @@ fn proof_detail(door: Door) -> String {
 /// A renewal, a validation, a service ticket or user-to-user: the user is the one asking.
 fn present(kind: TgsKind) -> bool {
     !matches!(kind, TgsKind::S4u2Self | TgsKind::S4u2Proxy)
+}
+
+/// The service a refused request was made by follows the detail: `(S4U2Proxy by <service>)`.
+fn on_behalf(detail: String, request: &str, service: Option<String>) -> String {
+    let by = service.map_or_else(String::new, |service| format!(" by {service}"));
+    format!("{detail} ({request}{by})")
+}
+
+fn tgs_door(kind: TgsKind) -> Door {
+    match present(kind) {
+        true => Door::KerberosTgs,
+        false => Door::KerberosS4u,
+    }
 }
 
 thread_local! {
@@ -229,14 +243,9 @@ impl HostAdmission for KdcVerdict {
             }
         };
         if q.s4u2self {
-            let by = q
-                .request
-                .sname
-                .as_ref()
-                .map_or_else(String::new, |service| {
-                    format!(" by {}", service.unparse_with_realm_lossy(&self.realm))
-                });
-            let detail = format!("{detail} (S4U2Self{by})");
+            let service = q.request.sname.as_ref();
+            let service = service.map(|service| service.unparse_with_realm_lossy(&self.realm));
+            let detail = on_behalf(detail, "S4U2Self", service);
             record_kdc_row(
                 Some(&user),
                 user.as_str(),
@@ -286,7 +295,7 @@ impl HostAdmission for KdcVerdict {
         let Some(user) = user_of(client, &self.realm) else {
             return Ok(());
         };
-        let door = Door::KerberosTgs;
+        let door = tgs_door(q.kind);
         let (detail, answer) = match self.judge_items(&user, door, peer, q.now) {
             Err(refusal) => (refusal.detail(), REFUSED),
             Ok(()) if !present(q.kind) => return Ok(()),
@@ -294,6 +303,15 @@ impl HostAdmission for KdcVerdict {
                 Some(detail) => (detail, proof_refusal()),
                 None => return Ok(()),
             },
+        };
+        let by = || {
+            let realm = String::from_utf8_lossy(q.ticket.crealm.as_bytes());
+            Some(q.ticket.cname.unparse_with_realm_lossy(&realm))
+        };
+        let detail = match q.kind {
+            TgsKind::S4u2Self => on_behalf(detail, "S4U2Self", by()),
+            TgsKind::S4u2Proxy => on_behalf(detail, "S4U2Proxy", by()),
+            _ => detail,
         };
         record_kdc_row(
             Some(&user),
@@ -355,6 +373,7 @@ pub(crate) mod tests {
     const PASSWORD: &str = "Kdc-Pass-1";
     const SERVICE: &str = "HTTP/svc.example.com";
     const PEER: &str = "192.0.2.7";
+    const OUTSIDE: &str = "outside login hours";
     const REFUSED_USER: &str = "e0refused";
     const ALLOWED_USER: &str = "e0allowed";
     const DISABLED_USER: &str = "e0disabled";
@@ -1238,7 +1257,7 @@ pub(crate) mod tests {
                 vec![],
                 vec![
                     (b.to_owned(), Door::KerberosS4u),
-                    (b.to_owned(), Door::KerberosTgs),
+                    (b.to_owned(), Door::KerberosS4u),
                 ],
             ),
             (
@@ -1269,6 +1288,118 @@ pub(crate) mod tests {
         assert!(
             !Door::KerberosS4u.is_login(),
             "an S4U2Self counts no attempt"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_each_tgs_kind_is_judged_at_its_door() {
+        let (_temp, _embedded, store) = realm(&[ALLOWED_USER]).await;
+        let guard = deciding();
+        cached(&[], &[ALLOWED_USER]);
+        let b = ALLOWED_USER;
+        let rows = [
+            (TgsKind::Normal, Door::KerberosTgs),
+            (TgsKind::Renew, Door::KerberosTgs),
+            (TgsKind::Validate, Door::KerberosTgs),
+            (TgsKind::U2u, Door::KerberosTgs),
+            (TgsKind::S4u2Self, Door::KerberosS4u),
+            (TgsKind::S4u2Proxy, Door::KerberosS4u),
+        ];
+        for (kind, door) in rows {
+            let asked = tgs_asks(&store, Some(b), b, kind);
+            assert_eq!(
+                (tgs_door(kind), asked, doors(&guard)),
+                (door, Ok(()), vec![(b.to_owned(), door)]),
+                "{kind:?}"
+            );
+        }
+        assert_eq!(
+            (as_asks(&store, b, true), doors(&guard)),
+            (Ok(()), vec![(b.to_owned(), Door::KerberosS4u)]),
+            "an AS asked with s4u2self"
+        );
+        assert_eq!(Door::KerberosS4u.name(), "kerberos S4U");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_checks_reason_reaches_the_row_and_the_kdc_still_answers_18_with_no_text() {
+        let (_temp, _embedded, store) = realm(&[REFUSED_USER]).await;
+        let log = LogGuard::install_on_this_thread();
+        let allow = |value: &str| value != "refuse";
+        let _guard = EnforcementGuard::deciding_with_reason(OURS, "login-hours", OUTSIDE, allow);
+        cached(&[REFUSED_USER], &[]);
+        let a = REFUSED_USER;
+        let reasoned = "policy: login-hours (outside login hours)";
+        let by = format!("{reasoned} (S4U2Self by {SERVICE}@{REALM})");
+        assert_eq!(
+            (kinit(&store, a, Some(PASSWORD)), kdc_rows(&log)),
+            (
+                (err::CLIENT_REVOKED, None),
+                vec![row(LogKind::Login, false, a, reasoned)]
+            ),
+            "kinit: 18 with no text, the reason in the row"
+        );
+        assert_eq!(
+            (as_asks(&store, a, true), kdc_rows(&log)),
+            (
+                Err(err::CLIENT_REVOKED),
+                vec![peered(row(LogKind::AccessDenied, false, a, &by))]
+            ),
+            "an S4U2Self at the AS: the reason, then the service"
+        );
+        assert_eq!(
+            (tgs_asks(&store, Some(a), a, TgsKind::Renew), kdc_rows(&log)),
+            (
+                Err(err::CLIENT_REVOKED),
+                vec![peered(row(LogKind::AccessDenied, false, a, reasoned))]
+            ),
+            "a renewal"
+        );
+        let rows = [
+            (TgsKind::S4u2Self, "S4U2Self"),
+            (TgsKind::S4u2Proxy, "S4U2Proxy"),
+        ];
+        for (kind, named) in rows {
+            let asked = asked_behind_a_service(&store, Some(a), &name(a), kind);
+            let by = format!("{reasoned} ({named} by {SERVICE}@{REALM})");
+            assert_eq!(
+                (asked.map_err(|(code, _)| code), kdc_rows(&log)),
+                (
+                    Err(err::CLIENT_REVOKED),
+                    vec![peered(row(LogKind::AccessDenied, false, a, &by))]
+                ),
+                "{kind:?} at the TGS"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_an_s4u2proxy_refusal_names_the_asking_service_as_an_s4u2self_does() {
+        let (_temp, _embedded, store) = realm(&[REFUSED_USER, ALLOWED_USER]).await;
+        let log = LogGuard::install_on_this_thread();
+        let _guard = deciding();
+        cached(&[REFUSED_USER], &[ALLOWED_USER]);
+        let (a, b) = (REFUSED_USER, ALLOWED_USER);
+        let by = format!("policy: login-hours (S4U2Proxy by {SERVICE}@{REALM})");
+        let proxied = |user: &str| {
+            let asked = asked_behind_a_service(&store, Some(user), &name(user), TgsKind::S4u2Proxy);
+            asked.map_err(|(code, _)| code)
+        };
+        assert_eq!(
+            (proxied(a), kdc_rows(&log)),
+            (
+                Err(err::CLIENT_REVOKED),
+                vec![peered(row(LogKind::AccessDenied, false, a, &by))]
+            ),
+            "refused: the item, then the service that asked for the user"
+        );
+        assert_eq!(
+            (proxied(b), kdc_rows(&log)),
+            (Ok(()), vec![]),
+            "allowed: no row"
         );
     }
 

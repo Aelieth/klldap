@@ -536,6 +536,7 @@ type Schema {
 
 type Success {
   ok: Boolean!
+  warnings: [String!]!
 }
 
 type TestKeycloakConnectionResponse {

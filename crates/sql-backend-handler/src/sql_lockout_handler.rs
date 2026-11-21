@@ -1228,6 +1228,78 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    #[serial]
+    fn test_the_guards_clock_reaches_every_attempt_and_the_lockout_until_it_drops() {
+        let bob = UserId::new("q7clock");
+        let pinned = chrono::DateTime::from_timestamp(4_102_444_800, 0).unwrap();
+        let guard = EnforcementGuard::none();
+        guard.pin_clock(pinned);
+        let held = (Attempt::new(&bob, Door::LdapBind).now, lock_clock());
+        drop(guard);
+        let now = chrono::Utc::now();
+        let after = (Attempt::new(&bob, Door::LdapBind).now - now).num_milliseconds();
+        assert_eq!(
+            held,
+            (pinned, pinned.naive_utc()),
+            "pinned: the attempt and the lockout read it"
+        );
+        assert!(
+            (0..1_000).contains(&after),
+            "dropped: the time of the moment, {after} ms"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_the_guard_turns_the_three_item_flags_off_when_it_drops() {
+        use lldap_domain_handlers::enforcement::{ItemFlags, policy_cache};
+        let on = ItemFlags {
+            login_hours: true,
+            networks: true,
+            inactivity: true,
+        };
+        let guard = EnforcementGuard::none();
+        policy_cache().set_item_flags(on);
+        let held = ItemFlags::held(policy_cache());
+        drop(guard);
+        assert_eq!(
+            (held, ItemFlags::held(policy_cache())),
+            (on, ItemFlags::default())
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_the_bind_judges_the_items_and_the_lockout_at_one_instant() {
+        let h = handler().await;
+        user_in(&h, "q7bind", "q7ou").await;
+        threshold(&h, "q7ou", "3").await;
+        follow(&h).await;
+        lldap_domain_handlers::enforcement::policy_cache().set_lockout_live(false);
+        let guard = EnforcementGuard::allowing(&["q7bind"], THRESHOLD);
+        let user = UserId::new("q7bind");
+        let pinned = chrono::DateTime::from_timestamp(4_102_444_800, 0).unwrap();
+        for pin in [None, Some(pinned)] {
+            if let Some(at) = pin {
+                guard.pin_clock(at);
+            }
+            assert!(!bind(&h, "q7bind", "Wrong-Pass-1").await, "{pin:?}");
+            assert!(bind(&h, "q7bind", RIGHT).await, "{pin:?}");
+            let seen = guard.take_seen().into_iter();
+            let judged: Vec<_> = seen.map(|seen| seen.now.naive_utc()).collect();
+            let row = h.read_lock(&user).await.unwrap().unwrap();
+            assert_eq!(
+                judged,
+                vec![row.last_success.unwrap()],
+                "{pin:?}: the items are judged at the instant the lockout's success is written"
+            );
+            if let Some(at) = pin {
+                assert_eq!(judged, vec![at.naive_utc()], "the pinned instant");
+            }
+        }
+    }
+
     #[tokio::test]
     #[serial]
     async fn test_bind_counts_refuses_a_locked_user_before_the_password_and_a_success_clears() {
@@ -1414,6 +1486,7 @@ pub(crate) mod tests {
         let refused = Err(Refusal {
             item: THRESHOLD,
             door: Door::KerberosAs,
+            reason: None,
         });
         assert_eq!(
             (

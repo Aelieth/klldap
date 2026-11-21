@@ -49,6 +49,15 @@ wrong password — use the bare password. At LDAP simple bind and `/auth/simple/
 alone (`:123456`) is refused as no password given, for them too. Put service accounts there,
 and keep one admin exempt or unenrolled as the break-glass.
 
+A group whose name differs from `lldap_mfa_disabled` only by case (`LLDAP_MFA_DISABLED`) is
+not the exempt group, at any door and on any database. While it exists, `lldap_mfa_disabled`
+cannot be made beside it, so nobody is exempt; every start says so in one warning that names
+it. While a value can turn the factor on, that group is protected as the exempt group is, with
+one change allowed: an admin may rename it to exactly `lldap_mfa_disabled`. It is then the
+exempt group, and its members are exempt as members added to it are (an enrolled member keeps
+the factor, unused). The rename's `group_update` row says so: `display_name; members exempt
+from MFA: <n>`. Any other new name, and deleting it, are refused as for the exempt group.
+
 ## Enrollment
 
 From your profile page, **Set up two-factor** opens the enrollment page. It first asks

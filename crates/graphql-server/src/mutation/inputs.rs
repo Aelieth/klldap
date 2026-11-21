@@ -86,11 +86,15 @@ pub struct UpdateGroupInput {
 #[derive(PartialEq, Eq, Debug, GraphQLObject)]
 pub struct Success {
     ok: bool,
+    warnings: Vec<String>,
 }
 
 impl Success {
     pub fn new() -> Self {
-        Self { ok: true }
+        Self {
+            ok: true,
+            warnings: Vec::new(),
+        }
     }
 }
 

@@ -1,13 +1,15 @@
 use crate::sql_backend_handler::SqlBackendHandler;
 use crate::sql_lockout_handler::CountingStart;
+use crate::sql_log_handler::to_active_model;
 use crate::sql_mfa_windows::read_windows;
+use crate::sql_tables::DbConnection;
 use async_trait::async_trait;
 use lldap_domain::types::{User, UserId};
 use lldap_domain_handlers::handler::PolicyBackendHandler;
 use lldap_domain_handlers::kdc_proof::ProofWindow;
-use lldap_domain_handlers::logging::{self, LogKind};
+use lldap_domain_handlers::logging::{self, LogEvent, LogKind};
 use lldap_domain_handlers::policies::{
-    AttachedPolicy, CreatePolicyRequest, OuPolicyState, Policy, PolicyId, PolicyLevel,
+    AttachedPolicy, CreatePolicyRequest, OuPolicyState, Policy, PolicyId, PolicyLevel, ROOT_OU_KEY,
     UpdatePolicyRequest, canonical_ou_key, ou_chain, ou_display,
 };
 use lldap_domain_model::{
@@ -64,6 +66,44 @@ impl SqlBackendHandler {
             .await?
             .rows_affected)
     }
+}
+
+pub const UNLINKED_BY_TOOL: &str = "lldap policy-unlink";
+
+/// The host tool's unlink, the link and its row in one transaction; the root is `(root)` or `""`.
+pub async fn unlink_ou_policy_on(pool: &DbConnection, ou: &str) -> Result<LogEvent> {
+    let ou_key = match ou == ou_display(ROOT_OU_KEY) {
+        true => ROOT_OU_KEY.to_owned(),
+        false => canonical_ou_key(ou),
+    };
+    let transaction = pool.begin().await?;
+    let existing = model::OuPolicies::find_by_id(&ou_key)
+        .one(&transaction)
+        .await?;
+    let linked = existing.and_then(|row| row.policy_id.map(|id| (row, id)));
+    let Some((existing, policy_id)) = linked else {
+        return Err(DomainError::EntityNotFound(format!(
+            "no policy set on OU {}",
+            ou_display(&ou_key)
+        )));
+    };
+    let name = model::Policies::find_by_id(policy_id)
+        .one(&transaction)
+        .await?
+        .map(|p| p.name)
+        .unwrap_or_else(|| policy_id.to_string());
+    let mut active: model::ou_policies::ActiveModel = existing.into();
+    active.policy_id = Set(None);
+    active.update(&transaction).await?;
+    SqlBackendHandler::normalize_empty_ou_rows(&transaction).await?;
+    let detail = format!("policy cleared: {name} ({UNLINKED_BY_TOOL})");
+    let target = Some(ou_display(&ou_key));
+    let row = logging::event(LogKind::PolicyChange, target, true, Some(&detail));
+    model::Logs::insert(to_active_model(row.clone()))
+        .exec_without_returning(&transaction)
+        .await?;
+    transaction.commit().await?;
+    Ok(row)
 }
 
 async fn attached_by_id_on(
@@ -682,9 +722,58 @@ mod tests {
         );
     }
 
+    async fn policy_rows(pool: &DbConnection) -> Vec<(Option<String>, Option<String>, bool)> {
+        let rows = model::Logs::find()
+            .filter(model::LogsColumn::Kind.eq("policy_change"))
+            .order_by_asc(model::LogsColumn::Id)
+            .all(pool)
+            .await
+            .unwrap();
+        let row = |row: model::logs::Model| (row.target, row.detail, row.success);
+        rows.into_iter().map(row).collect()
+    }
+
+    #[tokio::test]
+    async fn test_the_host_tool_unlinks_one_ou_with_its_one_row() {
+        let handler = handler().await;
+        let id = policy(&handler, "Hours", &[]).await;
+        let pool = handler.pool().clone();
+        let detail = "policy cleared: Hours (lldap policy-unlink)";
+        type Row = (&'static str, Option<&'static str>, Option<&'static str>);
+        let rows: [Row; 5] = [
+            ("people", Some("people"), Some("people")),
+            ("People", Some("people"), Some("people")),
+            ("(root)", Some(""), Some("(root)")),
+            ("", Some(""), Some("(root)")),
+            ("people", None, None),
+        ];
+        for (named, link, target) in rows {
+            if let Some(ou) = link {
+                handler.set_ou_policy(ou, id).await.unwrap();
+            }
+            let before = policy_rows(&pool).await.len();
+            let unlinked = unlink_ou_policy_on(&pool, named).await;
+            let written = policy_rows(&pool).await.split_off(before);
+            let states = handler.list_ou_policy_states().await.unwrap();
+            let linked = states.iter().any(|state| state.policy_id.is_some());
+            let Some(target) = target else {
+                assert!(unlinked.is_err(), "{named:?}: an OU with no link");
+                assert!(written.is_empty(), "{named:?}: no row, {written:?}");
+                continue;
+            };
+            let one = (Some(target.to_owned()), Some(detail.to_owned()), true);
+            let row = unlinked.unwrap();
+            assert_eq!(
+                ((row.target, row.detail, row.success), written, linked),
+                (one.clone(), vec![one], false),
+                "{named:?}: the link gone, its one row in the table and printed"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_each_policy_write_swaps_the_cache() {
-        let handler = handler().await;
+        let handler = handler().await.with_policy_cache(own_cache());
         let mut seen = handler.policy_changes();
         let mut swapped = |handler: &SqlBackendHandler| {
             let now = handler.policy_changes();
@@ -1045,6 +1134,7 @@ mod tests {
         let unreadable = Refusal {
             item: UNREADABLE,
             door: Door::WebLogin,
+            reason: None,
         };
         for (row, check, expected) in [
             ("no check", false, Ok(())),

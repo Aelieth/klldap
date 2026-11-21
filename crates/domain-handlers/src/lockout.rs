@@ -1,6 +1,7 @@
 use crate::enforcement::{
-    Attempt, Door, ItemCheck, POLICY_REFILL, PolicyCache, UserState, cached_mfa_policy,
-    ensure_exempt_group, fill_policy_cache, follow_mfa_item, item_checks, resolve_items,
+    Attempt, Door, ItemCheck, POLICY_REFILL, PolicyCache, UserState, cached_mfa_policy, door_clock,
+    ensure_exempt_group, fill_policy_cache, follow_items, follow_mfa_item, item_checks,
+    resolve_items,
 };
 use crate::handler::{
     GroupBackendHandler, GroupListerBackendHandler, PolicyBackendHandler, UserBackendHandler,
@@ -43,7 +44,7 @@ pub const NOT_READ_YET: &str = "the lockout's state is not read yet";
 const REREAD_MARGIN_SECS: i64 = 60;
 
 pub fn lock_clock() -> NaiveDateTime {
-    let now = chrono::Utc::now();
+    let now = door_clock();
     chrono::DateTime::from_timestamp_micros(now.timestamp_micros())
         .unwrap_or(now)
         .naive_utc()
@@ -1399,7 +1400,7 @@ impl Lockout {
         self.reread(store, false).await
     }
 
-    /// One at a time, one read for both flags, neither part stopping the other; true when filled.
+    /// One at a time, one read for every flag, no part stopping another; true when filled.
     pub async fn follow_policies<H>(&self, handler: &H, cache: &PolicyCache) -> Result<bool>
     where
         H: UserListerBackendHandler
@@ -1414,12 +1415,13 @@ impl Lockout {
         let policies = handler.list_policies().await?;
         let mfa = follow_mfa_item(handler, cache, &policies).await;
         let lockout = self.follow_threshold(handler, cache, &policies).await;
+        let items = follow_items(handler, cache, &policies).await;
         if cache.mfa_item_live()
             && let Err(e) = ensure_exempt_group(handler).await
         {
             warn!("The exempt group was not made: {e}");
         }
-        Ok(mfa? | lockout?)
+        Ok(mfa? | lockout? | items?)
     }
 
     /// A threshold that first takes effect, or a counting period that moved on, drops all in
@@ -1442,12 +1444,18 @@ impl Lockout {
         let stale = self.stale.swap(false, Ordering::AcqRel);
         let moved = stale || period != self.period();
         if live && (moved || !cache.lockout_live()) {
-            fill_policy_cache(handler, cache).await?;
-            self.forget_all().await;
-            self.reread(handler, true).await?;
-            self.set_period(period);
-            cache.set_lockout_live(true);
-            fill_policy_cache(handler, cache).await?;
+            let flipped = async {
+                fill_policy_cache(handler, cache).await?;
+                self.forget_all().await;
+                self.reread(handler, true).await?;
+                self.set_period(period);
+                cache.set_lockout_live(true);
+                fill_policy_cache(handler, cache).await
+            };
+            if let Err(e) = flipped.await {
+                cache.set_lockout_unknown();
+                return Err(e);
+            }
             return Ok(true);
         }
         if !live && !cache.lockout_off() {
@@ -1489,6 +1497,7 @@ impl Lockout {
                 let due = followed.elapsed() >= POLICY_REFILL
                     || cache.lockout_unknown()
                     || cache.mfa_item_unknown()
+                    || cache.items_unread()
                     || self.stale.load(Ordering::Acquire);
                 if !due {
                     continue;

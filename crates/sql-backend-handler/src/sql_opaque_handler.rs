@@ -4,8 +4,9 @@ use crate::sql_mfa_handler::{TotpRejection, now_unix};
 use crate::sql_mfa_windows::with_proof;
 use async_trait::async_trait;
 use base64::Engine;
+use chrono::NaiveDateTime;
 use lldap_auth::opaque;
-use lldap_domain::types::{LoginOutcome, UserId};
+use lldap_domain::types::{GroupId, LoginOutcome, UserId};
 use lldap_domain_handlers::enforcement::{Attempt, Door, admit};
 use lldap_domain_handlers::handler::{BindRequest, LoginHandler};
 use lldap_domain_handlers::kerberos::{
@@ -129,6 +130,14 @@ impl SqlBackendHandler {
     pub(crate) async fn is_member_of(&self, user_id: &UserId, group_name: &str) -> Result<bool> {
         Ok(member_of(&self.sql_pool, user_id, group_name).await?)
     }
+
+    pub(crate) async fn is_member_of_exactly(
+        &self,
+        user_id: &UserId,
+        group_name: &str,
+    ) -> Result<bool> {
+        Ok(member_of_exactly(&self.sql_pool, user_id, group_name).await?)
+    }
 }
 
 /// `is_user_disabled` on any connection.
@@ -144,7 +153,7 @@ async fn member_of(
     user_id: &UserId,
     group_name: &str,
 ) -> std::result::Result<bool, DbErr> {
-    use lldap_domain_model::model::{groups, memberships};
+    use lldap_domain_model::model::groups;
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
     let Some(group) = groups::Entity::find()
@@ -154,9 +163,42 @@ async fn member_of(
     else {
         return Ok(false);
     };
+    in_group(db, user_id, group.group_id).await
+}
+
+/// The group of exactly this name, whatever the database's collation makes of `=`.
+async fn member_of_exactly(
+    db: &impl ConnectionTrait,
+    user_id: &UserId,
+    group_name: &str,
+) -> std::result::Result<bool, DbErr> {
+    use lldap_domain_model::model::groups;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+    let named = groups::Entity::find()
+        .filter(groups::Column::DisplayName.eq(group_name))
+        .all(db)
+        .await?;
+    let exact = named
+        .into_iter()
+        .find(|g| g.display_name.as_str() == group_name);
+    match exact {
+        Some(group) => in_group(db, user_id, group.group_id).await,
+        None => Ok(false),
+    }
+}
+
+async fn in_group(
+    db: &impl ConnectionTrait,
+    user_id: &UserId,
+    group_id: GroupId,
+) -> std::result::Result<bool, DbErr> {
+    use lldap_domain_model::model::memberships;
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
     Ok(memberships::Entity::find()
         .filter(memberships::Column::UserId.eq(user_id.as_str()))
-        .filter(memberships::Column::GroupId.eq(group.group_id))
+        .filter(memberships::Column::GroupId.eq(group_id))
         .one(db)
         .await?
         .is_some())
@@ -168,10 +210,17 @@ pub(crate) fn invalid_credentials(user_id: &UserId) -> DomainError {
 
 impl SqlBackendHandler {
     /// After the credentials and before the door's row: a refusal is that row, and answers as
-    /// the wrong-credentials error.
-    async fn admit_at(&self, user: &UserId, door: Door, second_factor: bool) -> Result<()> {
+    /// the wrong-credentials error. The items are judged at the instant the lockout was.
+    async fn admit_at(
+        &self,
+        user: &UserId,
+        door: Door,
+        second_factor: bool,
+        now: NaiveDateTime,
+    ) -> Result<()> {
         let attempt = Attempt {
             second_factor,
+            now: now.and_utc(),
             ..Attempt::new(user, door)
         };
         admit(self, &attempt)
@@ -268,7 +317,7 @@ impl LoginHandler for SqlBackendHandler {
         }
         match (requirement, code) {
             (MfaRequirement::None, _) => {
-                self.admit_at(&name, door, false).await?;
+                self.admit_at(&name, door, false, now).await?;
                 self.admit_while_degraded(&name, door).await?;
                 logging::record_as(Some(&name), LogKind::Bind, None, true, None);
                 self.count_success(lock.as_ref(), door, now).await;
@@ -301,7 +350,7 @@ impl LoginHandler for SqlBackendHandler {
             }
             (MfaRequirement::Totp, Some(code)) => match self.verify_user_totp(&name, code).await? {
                 Ok(()) => {
-                    self.admit_at(&name, door, true).await?;
+                    self.admit_at(&name, door, true, now).await?;
                     self.admit_while_degraded(&name, door).await?;
                     let stored = self.note_proof(&name, now_unix()).await;
                     let detail = with_proof("totp", stored);
@@ -518,7 +567,7 @@ impl OpaqueHandler for SqlOpaqueHandler {
             },
         };
         let second_factor = detail == Some("totp");
-        self.admit_at(&username, Door::WebLogin, second_factor)
+        self.admit_at(&username, Door::WebLogin, second_factor, now)
             .await?;
         self.admit_while_degraded(&username, Door::WebLogin).await?;
         let stored = !second_factor || self.note_proof(&username, now_unix()).await;

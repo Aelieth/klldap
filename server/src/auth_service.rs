@@ -2796,15 +2796,13 @@ pub(crate) mod tests {
                     rows, expected,
                     "{label}: one row, never a success beside a refusal"
                 );
-                let seen = allow.map(|_| SeenAttempt {
-                    user: user.clone(),
-                    door,
-                    peer: Some(peer.parse().unwrap()),
-                    second_factor: false,
-                    value: String::new(),
+                let seen = allow.map(|_| {
+                    let peer = peer.parse::<std::net::IpAddr>().ok();
+                    (user.clone(), door, peer, false, String::new())
                 });
+                let attempt = |s: SeenAttempt| (s.user, s.door, s.peer, s.second_factor, s.value);
                 assert_eq!(
-                    guard.seen(),
+                    guard.seen().into_iter().map(attempt).collect::<Vec<_>>(),
                     seen.into_iter().collect::<Vec<_>>(),
                     "{label}"
                 );

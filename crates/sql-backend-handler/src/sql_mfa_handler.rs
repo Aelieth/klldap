@@ -225,7 +225,9 @@ impl SqlBackendHandler {
         };
         Ok(Some(MfaEnrollmentStatus {
             enrolled: user.mfa_type.as_deref() == Some(MFA_TYPE_TOTP),
-            exempt: self.is_member_of(user_id, MFA_DISABLED_GROUP).await?,
+            exempt: self
+                .is_member_of_exactly(user_id, MFA_DISABLED_GROUP)
+                .await?,
         }))
     }
 
@@ -2027,5 +2029,130 @@ pub(crate) mod tests {
             doors::bind(&h, "e2lost", doors::RIGHT).await,
             "read again: no factor, none asked"
         );
+    }
+
+    /// Every database: with a case twin nobody is exempt, nothing is made, every start warns.
+    pub(crate) async fn exempt_twin_lane(pool: &DbConnection) {
+        use lldap_domain_handlers::enforcement::{
+            build_entries, ensure_exempt_group, exempt_group_twin,
+        };
+        const TWIN: &str = "LLDAP_MFA_DISABLED";
+        init_table(pool).await.expect("init");
+        let h = SqlBackendHandler::new(generate_random_private_key(), pool.clone());
+        let h = doors::own(h).with_mfa_setting(Some(MfaPolicy::Always));
+        insert_user_no_password(&h, "w16bob").await;
+        let twin = insert_group(&h, TWIN).await;
+        insert_membership(&h, twin, "w16bob").await;
+        let mut starts = Vec::new();
+        for _start in 0..2 {
+            let started = h.exempt_group_at_start().await.is_ok();
+            let warned = exempt_group_twin(&h).await.unwrap();
+            starts.push((started, warned.is_some_and(|text| text.contains(TWIN))));
+        }
+        ensure_exempt_group(&h).await.unwrap();
+        let bob = UserId::new("w16bob");
+        let door = h.mfa_enrollment_status(&bob).await.unwrap();
+        let entries = build_entries(&h).await.unwrap();
+        let cache = entries.facts_of(&bob).map(|facts| facts.exempt);
+        let filter = GroupRequestFilter::DisplayName(MFA_DISABLED_GROUP.into());
+        let listed = h.list_groups(Some(filter)).await.unwrap().into_iter();
+        let named: Vec<_> = listed.map(|g| g.display_name.into_string()).collect();
+        assert_eq!(
+            (starts, door.map(|status| status.exempt), cache, named),
+            (
+                vec![(true, true); 2],
+                Some(false),
+                Some(false),
+                vec![TWIN.to_owned()]
+            ),
+            "each start goes on and warns; the door and the cache exempt nobody; nothing is made"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_with_a_case_twin_nobody_is_exempt_nothing_is_made_and_every_start_warns() {
+        exempt_twin_lane(&get_initialized_db().await).await;
+    }
+
+    type Standing = (Option<String>, MfaRequirement, Option<bool>);
+
+    async fn standing(h: &SqlBackendHandler, name: &str) -> Standing {
+        let user = UserId::new(name);
+        let factor = h.get_user_details(&user).await.unwrap().mfa_type;
+        let required = h.mfa_requirement(&user).await.unwrap();
+        let cached = h
+            .policy_cache
+            .get()
+            .facts_of(&user)
+            .map(|facts| facts.exempt);
+        (factor, required, cached)
+    }
+
+    /// Every database: a protected case twin takes the exempt group's own name, and its members
+    /// then stand as members added to the exempt group do.
+    pub(crate) async fn exempt_rename_lane(pool: &DbConnection) {
+        use lldap_domain::requests::UpdateGroupRequest;
+        use lldap_domain_handlers::enforcement::{exempt_group_twin, fill_policy_cache};
+        use lldap_domain_handlers::kdc_proof::ProofSettings;
+        const TWIN: &str = "LLDAP_MFA_DISABLED";
+        init_table(pool).await.expect("init");
+        let log = LogGuard::install_on_this_thread();
+        let (_clock, at) = doors::pinned();
+        let h = SqlBackendHandler::new(generate_random_private_key(), pool.clone());
+        let h = doors::own(h).with_mfa_setting(Some(MfaPolicy::Always));
+        let h = h.with_proofs(Some(ProofSettings::new(600, false, 3600)));
+        for name in ["w16amy", "w16cal"] {
+            doors::user_in(&h, name, "w16ou").await;
+            doors::enroll(&h, name, at).await;
+        }
+        let twin = insert_group(&h, TWIN).await;
+        insert_membership(&h, twin, "w16amy").await;
+        fill_policy_cache(&h, h.policy_cache).await.unwrap();
+        let rename = |name: &str| UpdateGroupRequest {
+            group_id: twin,
+            display_name: Some(name.into()),
+            delete_attributes: vec![],
+            insert_attributes: vec![],
+        };
+        let refused = [
+            h.update_group(rename("Lldap_Mfa_Disabled")).await.is_err(),
+            h.update_group(rename("w16other")).await.is_err(),
+            h.delete_group(twin).await.is_err(),
+        ];
+        let before = standing(&h, "w16amy").await;
+        let _ = doors::rows(&log, &[]);
+        h.update_group(rename(MFA_DISABLED_GROUP)).await.unwrap();
+        let renamed = doors::rows(&log, &[LogKind::GroupUpdate]);
+        let amy = standing(&h, "w16amy").await;
+        insert_membership(&h, twin, "w16cal").await;
+        let cal = standing(&h, "w16cal").await;
+        let warned = exempt_group_twin(&h).await.unwrap();
+        let totp = Some(MFA_TYPE_TOTP.to_owned());
+        let detail = "display_name; members exempt from MFA: 1";
+        assert_eq!(
+            (refused, before),
+            ([true; 3], (totp.clone(), MfaRequirement::Totp, Some(false))),
+            "another name, the name in another case and a delete are refused; no one exempt"
+        );
+        assert_eq!(
+            (renamed, amy, cal.clone(), warned),
+            (
+                vec![(
+                    LogKind::GroupUpdate,
+                    Some(TWIN.to_owned()),
+                    Some(detail.to_owned())
+                )],
+                cal,
+                (totp, MfaRequirement::None, Some(true)),
+                None
+            ),
+            "the rename's one row; a renamed-in member stands as an added one; no warning"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_protected_case_twin_renamed_to_the_exempt_groups_name_exempts_its_members() {
+        exempt_rename_lane(&get_initialized_db().await).await;
     }
 }

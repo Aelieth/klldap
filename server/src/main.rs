@@ -18,7 +18,7 @@ mod tcp_server;
 mod tls;
 
 use crate::{
-    cli::{Command, RunOpts, TestEmailOpts, UnlockOpts},
+    cli::{Command, PolicyUnlinkOpts, RunOpts, TestEmailOpts, UnlockOpts},
     configuration::{Configuration, compare_private_key_hashes},
     database_string::DatabaseUrl,
     db_cleaner::Scheduler,
@@ -30,8 +30,8 @@ use futures_util::TryFutureExt;
 use lldap_sql_backend_handler::{
     KerberosLost, LogRetention, SqlBackendHandler, realm_marked_open, register_password,
     sql_tables::{self, get_private_key_info, set_private_key_info},
-    sqlite_extra_synchronous, start_kerberos_committer, start_log_writer, unlock_login_on,
-    warn_database_durability,
+    sqlite_extra_synchronous, start_kerberos_committer, start_log_writer, unlink_ou_policy_on,
+    unlock_login_on, warn_database_durability,
 };
 use sea_orm::{Database, DatabaseConnection};
 use std::{net::IpAddr, sync::Arc, time::Duration};
@@ -41,7 +41,7 @@ use lldap_auth::PASSWORD_LENGTH_UNIT;
 use lldap_domain::requests::{CreateGroupRequest, CreateUserRequest};
 use lldap_domain::types::{Attribute, BUILTIN_GROUPS, UserId, kerberos_sync_enabled};
 use lldap_domain_handlers::enforcement::{
-    CacheFollower, StartWarning, policy_cache, start_policy_cache,
+    CacheFollower, StartWarning, exempt_group_twin, policy_cache, start_policy_cache,
 };
 use lldap_domain_handlers::kerberos::{
     DegradedKerberos, KerberosSync, NoopKerberos, kerberos_backend, kerberos_store,
@@ -362,6 +362,14 @@ async fn warn_ous_asking_mfa(handler: &SqlBackendHandler, server: Option<MfaPoli
     }
 }
 
+async fn warn_exempt_group_twin(handler: &SqlBackendHandler) {
+    match exempt_group_twin(handler).await {
+        Ok(Some(text)) => warn!("{text}"),
+        Ok(None) => {}
+        Err(e) => warn!("The groups were not read for a case twin of the exempt group: {e}"),
+    }
+}
+
 async fn ensure_group_exists(handler: &SqlBackendHandler, group_name: &str) -> Result<()> {
     if handler
         .list_groups(Some(GroupRequestFilter::DisplayName(group_name.into())))
@@ -443,6 +451,12 @@ async fn set_up_server(
     mut config: Configuration,
     sql_pool: DatabaseConnection,
 ) -> Result<(ServerBuilder, Option<RealmThreads>)> {
+    let zone = config.login_hours_zone()?;
+    info!(
+        "login-hours are judged in {} ({})",
+        config.login_hours_timezone, zone.source
+    );
+    policy_cache().set_login_hours_zone(zone.zone);
     let realm = config.kerberos_realm();
     set_kerberos_backend(Arc::new(NoopKerberos::new(realm.clone())));
     tokio::task::spawn_blocking(lldap_graphql_server::warm_transport_key);
@@ -547,6 +561,7 @@ async fn set_up_server(
         .exempt_group_at_start()
         .await
         .context("while creating the lldap_mfa_disabled group")?;
+    warn_exempt_group_twin(&backend_handler).await;
     warn_ous_asking_mfa(&backend_handler, config.mfa_policy()).await;
     let (realm_threads, embedded) = match config.kerberos_options.enabled {
         false => (None, None),
@@ -932,6 +947,23 @@ async fn unlock_command(opts: UnlockOpts) -> Result<()> {
     Ok(())
 }
 
+async fn policy_unlink_command(opts: PolicyUnlinkOpts) -> Result<()> {
+    debug!("CLI: {:#?}", &opts);
+    let ou = opts.ou.clone();
+    let config = configuration::init(opts)?;
+    logging::init(&config)?;
+    let sql_pool = setup_sql_tables(&config.database_url).await?;
+    let unlinked = unlink_ou_policy_on(&sql_pool, &ou).await;
+    if let Err(e) = sql_pool.close().await {
+        error!("Error closing database connection pool: {}", e);
+    }
+    let row = unlinked.with_context(|| format!("while removing the policy link of {ou:?}"))?;
+    rows::print(&row);
+    let target = row.target.as_deref().unwrap_or_default();
+    println!("Removed the policy link of {target}; a running server sees it within 30 seconds.");
+    Ok(())
+}
+
 #[actix::main]
 async fn main() -> Result<()> {
     let cli_opts = cli::init();
@@ -944,6 +976,7 @@ async fn main() -> Result<()> {
         Command::SendTestEmail(opts) => send_test_email_command(opts).await,
         Command::CreateSchema(opts) => create_schema_command(opts).await,
         Command::Unlock(opts) => unlock_command(opts).await,
+        Command::PolicyUnlink(opts) => policy_unlink_command(opts).await,
     }
 }
 
@@ -967,6 +1000,38 @@ mod tests {
         assert!(
             made < installed && installed < serving,
             "the cache's follower is installed before the realm engine takes requests"
+        );
+    }
+
+    #[test]
+    fn test_policy_unlink_takes_one_ou_and_the_root_both_ways() {
+        use clap::Parser;
+        for ou in ["people\\labs", "(root)", ""] {
+            let args = ["lldap", "policy-unlink", "--config-file", "c.toml", ou];
+            let opts = match cli::CLIOpts::try_parse_from(args).unwrap().command {
+                Command::PolicyUnlink(opts) => opts,
+                other => panic!("{ou:?}: {other:?}"),
+            };
+            let config_file = opts.run.general_config.config_file.as_str();
+            assert_eq!((opts.ou.as_str(), config_file), (ou, "c.toml"));
+        }
+    }
+
+    #[test]
+    fn test_the_start_loads_and_names_the_zone_before_the_policy_cache_starts() {
+        let source = include_str!("main.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap();
+        let at = |needle: &str| {
+            let found = production.find(needle);
+            found.unwrap_or_else(|| panic!("main.rs has no `{needle}`"))
+        };
+        let loaded = at("let zone = config.login_hours_zone()?;");
+        let named = at("\"login-hours are judged in {} ({})\"");
+        let held = at("policy_cache().set_login_hours_zone(zone.zone);");
+        let started = at("start_policy_cache(&backend_handler)");
+        assert!(
+            loaded < named && named < held && held < started,
+            "loaded once, named in the start's log line, held before the cache fills"
         );
     }
 

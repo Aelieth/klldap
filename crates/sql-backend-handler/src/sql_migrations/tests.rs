@@ -3643,6 +3643,27 @@ async fn test_mysql_policy_store() {
     policy_store_lane(&pool).await;
 }
 
+#[tokio::test]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_with_a_case_twin_nobody_is_exempt_nothing_is_made_and_every_start_warns() {
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql().await else {
+        return;
+    };
+    crate::sql_mfa_handler::tests::exempt_twin_lane(&pool).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_a_protected_case_twin_renamed_to_the_exempt_groups_name_exempts_its_members() {
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql().await else {
+        return;
+    };
+    crate::sql_mfa_handler::tests::exempt_rename_lane(&pool).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial_test::serial]
 #[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]

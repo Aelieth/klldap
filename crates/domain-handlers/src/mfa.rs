@@ -72,6 +72,12 @@ pub fn is_protected_group(name: &str, mfa_can_be_on: bool) -> bool {
     is_builtin_group(name) || (mfa_can_be_on && name.eq_ignore_ascii_case(MFA_DISABLED_GROUP))
 }
 
+/// The one change a protected case twin of the exempt group takes: the exempt group's own name.
+pub fn allowed_rename(current: &str, new: &str) -> bool {
+    let twin = current != MFA_DISABLED_GROUP && current.eq_ignore_ascii_case(MFA_DISABLED_GROUP);
+    twin && new == MFA_DISABLED_GROUP
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MfaResetReason {
     Administrative,
@@ -242,6 +248,24 @@ mod tests {
             for name in ["lldap_mfa_disabled", "LLDAP_MFA_DISABLED"] {
                 assert_eq!(is_protected_group(name, on), on, "{name} {on}");
             }
+        }
+    }
+
+    #[test]
+    fn test_a_protected_case_twin_takes_only_the_exempt_groups_own_name() {
+        let rows = [
+            ("LLDAP_MFA_DISABLED", "lldap_mfa_disabled", true),
+            ("Lldap_Mfa_Disabled", "lldap_mfa_disabled", true),
+            ("LLDAP_MFA_DISABLED", "Lldap_Mfa_Disabled", false),
+            ("LLDAP_MFA_DISABLED", "family", false),
+            ("lldap_mfa_disabled", "lldap_mfa_disabled", false),
+            ("lldap_mfa_disabled", "family", false),
+            ("family", "lldap_mfa_disabled", false),
+            ("LLDAP_ADMIN", "lldap_admin", false),
+            ("lldap_admin", "lldap_mfa_disabled", false),
+        ];
+        for (current, new, allowed) in rows {
+            assert_eq!(allowed_rename(current, new), allowed, "{current} -> {new}");
         }
     }
 }

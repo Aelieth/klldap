@@ -140,7 +140,8 @@ with no threshold of their own are counted too, so a threshold added to another 
 under one, applies at once to the failures already counted. The lock is computed, so lowering
 or raising a threshold applies at once. Removing the last threshold stops counting. Until a
 starting server has read the policies once, every door refuses the users the lockout judges
-(`policy: unreadable`), and the server reads them again every second.
+(`policy: unreadable`), and the server reads them again every second. The same holds when the
+reads that turn counting on fail: from that change until they succeed.
 
 While locked, LDAP bind and `/auth/simple/login` answer as for a wrong password (49, 401),
 whether the password given is right or wrong, but at once: a locked user's bind skips the
@@ -286,9 +287,27 @@ created, and its password may not have been set; set one from the user's page*.
 
 `policy_change` rows: creating/updating/deleting a policy (target = name; detail
 `created` / `updated: {field names}` / `deleted`), attaching or clearing an OU
-(target = the OU, or `(root)`; detail `policy set: {name}` / `policy cleared: {name}`),
+(target = the OU, or `(root)`; detail `policy set: {name}` / `policy cleared: {name}`, and
+`policy cleared: {name} (lldap policy-unlink)` from the host tool),
 inheritance toggles, and dropping state when an OU is deleted (`ou removed`). A
 no-op inheritance toggle is not logged.
+
+## Getting back in from the host
+
+When a rule refuses everyone who could change it, admins included, the host tool works on the
+database directly, with the server running or stopped:
+
+| Locked out | Run |
+|---|---|
+| by the lockout | `lldap unlock --config-file <config> <user>` |
+| by this rule: any item of an OU's policy | `lldap policy-unlink --config-file <config> <ou>` |
+
+`lldap policy-unlink` removes the policy link of one OU. `<ou>` is the OU's key
+(`people\labs`); the root is `(root)` or `""`. It writes one `policy_change` row, `policy
+cleared: <name> (lldap policy-unlink)` with the OU as target (`(root)` for the root), in the
+same transaction, and prints it. An OU with no link is an error and writes nothing. A running
+server sees it within 30 seconds. The policy itself is kept: fix it and link it again from the
+page.
 
 ## Configuration
 
@@ -299,6 +318,15 @@ server-wide, which overrides it. `lldap_mfa_disabled` is made
 at start when `enable_mfa` is set server-wide to `enabled` or `always`; otherwise by
 whichever server first reads an OU's `enable-mfa` above `off` (at the change, or at its
 30-second read), never while the policies are not read.
+
+`login_hours_timezone` (default `UTC`; `LLDAP_LOGIN_HOURS_TIMEZONE`, `--login-hours-timezone`)
+is the zone `login-hours` windows are read in: an IANA name such as `America/Chicago`, read
+once at start from the system's zone files (`/usr/share/zoneinfo`, or the directory `TZDIR`
+names). `UTC` is built in, and the process's own zone (`TZ`) is never read. Name the zone
+itself: a name under `right/` (whose files count leap seconds and would move every window by
+about half a minute) or `posix/` is refused. An unknown name, or a file that is not a zone
+file, refuses the start, naming it. The start's log line names the zone and its file. A
+tzdata update takes effect at the next start; a host install needs tzdata.
 
 ## Limitations
 

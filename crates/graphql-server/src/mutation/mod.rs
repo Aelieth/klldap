@@ -38,7 +38,7 @@ use lldap_domain::{
 use lldap_domain_handlers::handler::{
     BackendHandler, LockoutBackendHandler, ReadSchemaBackendHandler, UserRequestFilter,
 };
-use lldap_domain_handlers::mfa::is_protected_group;
+use lldap_domain_handlers::mfa::{allowed_rename, is_protected_group};
 use lldap_domain_handlers::password::{PasswordSync, change_password_everywhere, min_length_of};
 use lldap_opaque_handler::OpaqueHandler;
 use lldap_schema::schema::AttributeList;
@@ -276,9 +276,10 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
                     .map(|attr| attr.value[0].clone())
             })
         });
-        if new_display_name.is_some()
+        if let Some(new_name) = &new_display_name
             && let Ok(details) = handler.get_group_details(GroupId(group.id)).await
             && is_protected_group(details.display_name.as_str(), context.mfa_group_protected)
+            && !allowed_rename(details.display_name.as_str(), new_name)
         {
             span.in_scope(|| debug!("Cannot rename built-in group '{}'", details.display_name));
             return Err(format!("Cannot rename built-in group '{}'", details.display_name).into());
@@ -1511,6 +1512,98 @@ mod tests {
             .and_then(|o| o.get_field_value(field))
             .expect(field);
         assert_eq!(inner, &graphql_value!({ "success": true }));
+    }
+
+    #[tokio::test]
+    async fn test_a_success_carries_no_warnings_and_a_client_without_the_field_still_reads_it() {
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_unlock_user().times(2).returning(|_| Ok(()));
+        let context = admin_context(mock);
+        let rows = [
+            (
+                r#"mutation { unlockUser(userId: "bob") { ok } }"#,
+                graphql_value!({"unlockUser": {"ok": true}}),
+            ),
+            (
+                r#"mutation { unlockUser(userId: "bob") { ok warnings } }"#,
+                graphql_value!({"unlockUser": {"ok": true, "warnings": []}}),
+            ),
+        ];
+        for (query, expected) in rows {
+            let (value, errors) = execute(query, None, &root_schema(), &Variables::new(), &context)
+                .await
+                .unwrap();
+            assert_eq!((errors.len(), value), (0, expected), "{query}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_protected_case_twin_takes_only_the_exempt_groups_own_name() {
+        use lldap_domain_handlers::mfa::MFA_DISABLED_GROUP;
+        const TWIN: &str = "LLDAP_MFA_DISABLED";
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_get_group_details().returning(|_| {
+            Ok(GroupDetails {
+                group_id: GroupId(7),
+                display_name: GroupName::from(TWIN),
+                creation_date: epoch(),
+                uuid: Uuid::from_name_and_date(TWIN, &epoch()),
+                attributes: vec![],
+                modified_date: epoch(),
+            })
+        });
+        mock.expect_get_schema()
+            .returning(|| Ok(make_test_schema()));
+        mock.expect_update_group()
+            .withf(|req| {
+                let named = req.display_name.as_ref().map(GroupName::as_str);
+                req.group_id == GroupId(7) && named == Some(MFA_DISABLED_GROUP)
+            })
+            .times(1)
+            .returning(|_| Ok(()));
+        let admin = ValidationResults {
+            user: UserId::new("admin"),
+            permission: Permission::Admin,
+        };
+        let context = Context::new_for_tests_with_policy(mock, admin, MfaPolicy::Always, false);
+        let renamed =
+            r#"mutation { updateGroup(group: {id: 7, displayName: "lldap_mfa_disabled"}) { ok } }"#;
+        let rename = format!("Cannot rename built-in group '{TWIN}'");
+        let rows = [
+            (renamed, None),
+            (
+                r#"mutation { updateGroup(group: {id: 7, displayName: "Lldap_Mfa_Disabled"}) { ok } }"#,
+                Some(rename.clone()),
+            ),
+            (
+                r#"mutation { updateGroup(group: {id: 7, displayName: "family"}) { ok } }"#,
+                Some(rename),
+            ),
+            (
+                r#"mutation { deleteGroup(groupId: 7) { ok } }"#,
+                Some(format!("Cannot delete built-in group '{TWIN}'")),
+            ),
+        ];
+        for (query, refused) in rows {
+            let (_, errors) = execute(query, None, &root_schema(), &Variables::new(), &context)
+                .await
+                .unwrap();
+            let said: Vec<_> = errors
+                .iter()
+                .map(|e| e.error().message().to_owned())
+                .collect();
+            assert_eq!(said, refused.into_iter().collect::<Vec<_>>(), "{query}");
+        }
+        let regular = ValidationResults {
+            user: UserId::new("bob"),
+            permission: Permission::Regular,
+        };
+        let mock = MockTestBackendHandler::new();
+        let context = Context::new_for_tests_with_policy(mock, regular, MfaPolicy::Always, false);
+        let (_, errors) = execute(renamed, None, &root_schema(), &Variables::new(), &context)
+            .await
+            .unwrap();
+        assert_unauthorized(&errors, renamed);
     }
 
     #[tokio::test]

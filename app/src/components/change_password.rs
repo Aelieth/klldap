@@ -1,6 +1,6 @@
 use crate::infra::opaque::{
     FinishFor, LoginState, begin_login, begin_registration, finish_login, finish_registration,
-    registration_started,
+    new_password_at_the_floor, registration_started,
 };
 use crate::{
     components::{
@@ -41,7 +41,7 @@ pub struct FormModel {
         message = "Password should be longer than 8 characters"
     ))]
     old_password: String,
-    #[validate(length(min = 8, message = "Invalid password. Min length: 8"))]
+    #[validate(custom(function = "new_password_at_the_floor"))]
     password: String,
     #[validate(must_match(other = "password", message = "Passwords must match"))]
     confirm_password: String,

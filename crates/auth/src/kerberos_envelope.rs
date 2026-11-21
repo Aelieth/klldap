@@ -70,6 +70,7 @@ mod tests {
     use rsa::pkcs1::EncodeRsaPublicKey;
 
     const STAPLE: &str = "correct horse battery staple";
+    const SPACED: &str = "  Cafe\u{301}-Pass-12  ";
 
     fn raw_seal(key: &PrivateKey, label: &str, plain: &[u8]) -> String {
         let padding = Oaep::<Sha256>::new_with_label(label.as_bytes().to_vec());
@@ -96,6 +97,11 @@ mod tests {
                 "sealed for alice",
                 seal_kerberos_envelope(&key, "alice", STAPLE).unwrap(),
                 Ok(STAPLE),
+            ),
+            (
+                "spaces and a combining mark, opened byte for byte: not trimmed, not composed",
+                seal_kerberos_envelope(&key, "alice", SPACED).unwrap(),
+                Ok("  Cafe\u{301}-Pass-12  "),
             ),
             (
                 "sealed for bob",

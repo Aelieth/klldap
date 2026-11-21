@@ -244,19 +244,24 @@ register start's answer carries the user's minimum (`password_min_length`, see
 finish. The pages say *Invalid password. Min length: N*, and the tool says *New password is
 too short, expected at least N characters*. They check the same number for a synced user, so
 the server's 400 is seen only by a client that skips the check. A client older than the field
-keeps checking 8.
+keeps checking 8. The pages and the tool apply the server's rule, so a password with a NUL
+character is refused there too, with "the password must not contain a NUL character
+(U+0000)". `lldap_set_password --bypass-password-policy` skips the minimum length only, never
+the NUL check.
 
-When the user's policy cannot be read, every door above refuses the change with "the
-password policy could not be read; try again", never holding it to 8 instead; kadmin `cpw`
+When the user's policy cannot be read, or the stored value is not a whole number, every door
+above refuses the change with "the password policy could not be read; try again", never
+holding it to 8 instead (a stored number out of range is held to 8 to 128); kadmin `cpw`
 answers `PASS_Q_GENERIC`, which kadmin shows as *Unspecified password quality failure*, and
 waits at most 2 seconds for the read. The register start is refused the same way (400) for
 every user, and the pages show the sentence.
 
 The configuration's admin password (`ldap_user_pass`) is checked against 8 only, at the first
-start and at a forced reset (`force_ldap_user_pass_reset`). When the admin's minimum is higher
-than that password's length, the start logs one warning with the two numbers: *The admin
-password in ldap_user_pass has 9 characters; the admin's password-min-length is 12: the
-configuration's password is checked against 8 only, and a change of it is held to 12*. Any
+start and at a forced reset (`force_ldap_user_pass_reset`). When that password is shorter than
+the admin's minimum, the start logs one warning that names the minimum, never the password's
+length: *The admin password in ldap_user_pass is shorter than the admin's password-min-length
+of 12: the configuration's password is checked against 8 only, and a change of it is held to
+12*. When the admin's minimum cannot be read, the start logs one warning that says so. Any
 other change of the admin's password is held to the minimum.
 
 A synced user's password crosses the web pages and `lldap_set_password` in an envelope of at
@@ -265,10 +270,15 @@ characters of 3 bytes are 384 bytes. The pages and the tool refuse such a passwo
 password with Kerberos sync can be at most 318 bytes long*. `setUserPassword` and LDAP have no
 such bound.
 
-The create-user page makes the user first and sets the password after. When the OU's minimum
-refuses the password, the user stays created without a password, and the page says so:
-*Invalid password. Min length: 12. User bob was created without a password; set one from the
-user's page*.
+The create-user page makes the user first and sets the password after. When the password stops
+before the finish is sent (the register start refused, or the OU's minimum not met), the user
+stays created without a password, and the page says so after the cause. Only the minimum's
+cause names N: *Invalid password. Min length: 12. User bob was created without a password; set
+one from the user's page*. A refused start reads, for example, *the password policy could not
+be read; try again. User bob was created without a password; set one from the user's page*.
+When the server refuses the finish itself, the user was created and its password may not have
+been set, and the page says that after the cause: *Failed to set new password: … User bob was
+created, and its password may not have been set; set one from the user's page*.
 
 ## What is recorded
 

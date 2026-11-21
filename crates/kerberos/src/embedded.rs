@@ -1242,7 +1242,6 @@ fn create_owned(
     )
 }
 
-/// Marks a principal the directory did not make and clears its Kerberos password policy.
 fn mark(
     s: &mut PrincipalStore,
     name: &PrincipalName,
@@ -1596,8 +1595,7 @@ fn swept_rows(part: &[Swept], realm: &str) -> Vec<logging::LogEvent> {
     rows
 }
 
-/// Marked principals still bound to a Kerberos policy, found or not, lose it, `chunk` per change;
-/// a change that fails leaves the rest to the next start, and the start goes on.
+/// Marked principals lose their Kerberos policy, `chunk` per change, failures at the next start.
 fn clear_policies(own: &Own, chunk: usize) -> usize {
     let bound = own.store.read().map(|s| bound_principals(&s, &own.realm));
     let Ok(bound) = bound else {
@@ -4159,6 +4157,55 @@ pub(crate) mod tests {
     fn cleared_from(user: &str, policy: &str) -> (Option<String>, Option<String>) {
         let detail = policy_cleared(policy, &format!("{user}@EXAMPLE.COM"));
         (Some(user.to_owned()), Some(detail))
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_the_bytes_judged_are_the_bytes_keyed() {
+        use krb5_types::err::PREAUTH_FAILED;
+        use lldap_auth::opaque::server::generate_random_private_key;
+        use lldap_auth::password_length;
+        use lldap_domain_handlers::kerberos::{NoopKerberos, set_kerberos_backend};
+        use lldap_domain_handlers::password::{PasswordSync, change_password_everywhere};
+        const TYPED: &str = "  Cafe\u{301}-Pass-12  ";
+        const TRIMMED: &str = "Cafe\u{301}-Pass-12";
+        const COMPOSED: &str = "  Caf\u{e9}-Pass-12  ";
+        const LOWERED: &str = "  cafe\u{301}-pass-12  ";
+        assert_eq!(
+            [TYPED, TRIMMED, COMPOSED, LOWERED].map(|p| (password_length(p), p.len())),
+            [(17, 18), (13, 14), (16, 17), (17, 18)]
+        );
+        let temp = TempRealm::new();
+        let (embedded, store) = temp.embedded();
+        temp.host.set_sync("bob", true);
+        let pool = sea_orm::Database::connect("sqlite::memory:").await.unwrap();
+        let handler =
+            lldap_sql_backend_handler::SqlBackendHandler::new(generate_random_private_key(), pool);
+        set_kerberos_backend(Arc::new(embedded));
+        let changed = change_password_everywhere(
+            &handler,
+            &bob(),
+            TYPED,
+            PasswordSync::On,
+            PASSWORD_MIN_LENGTH,
+        )
+        .await;
+        set_kerberos_backend(Arc::new(NoopKerberos::default()));
+        let tried = [TYPED, TRIMMED, COMPOSED, LOWERED].map(|p| (p, kinit_code(&store, "bob", p)));
+        assert_eq!(
+            (changed, temp.host.password_record(&bob()).is_some(), tried),
+            (
+                Ok(()),
+                true,
+                [
+                    (TYPED, 0),
+                    (TRIMMED, PREAUTH_FAILED),
+                    (COMPOSED, PREAUTH_FAILED),
+                    (LOWERED, PREAUTH_FAILED)
+                ]
+            ),
+            "the synced change keys the bytes as typed: not trimmed, not composed, not lowered"
+        );
     }
 
     #[tokio::test]

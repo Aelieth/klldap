@@ -37,6 +37,7 @@ use sea_orm::{Database, DatabaseConnection};
 use std::{net::IpAddr, sync::Arc, time::Duration};
 use tracing::{Instrument, Level, debug, error, info, instrument, span, warn};
 
+use lldap_auth::PASSWORD_LENGTH_UNIT;
 use lldap_domain::requests::{CreateGroupRequest, CreateUserRequest};
 use lldap_domain::types::{Attribute, BUILTIN_GROUPS, UserId, kerberos_sync_enabled};
 use lldap_domain_handlers::enforcement::{
@@ -67,10 +68,6 @@ const ADMIN_PASSWORD_MISSING_ERROR: &str = "The LDAP admin password must be init
 
 const RESTART_WITHOUT_FORCE: &str = "Restart the server without --force-update-private-key or \
                                      --force-ldap-user-pass-reset to continue.";
-
-const RESET_TOO_SHORT: &str = "The forced reset of the admin's password \
-    (force_ldap_user_pass_reset) needs at least 8 characters in ldap_user_pass. Set a longer \
-    password, or take the forced reset out of the configuration.";
 
 const RESET_HAS_NUL: &str = "The forced reset of the admin's password \
     (force_ldap_user_pass_reset) cannot take a NUL character (U+0000) in ldap_user_pass. Set \
@@ -193,10 +190,14 @@ async fn before_serve(
     Ok(None)
 }
 
-fn reset_refused(e: PasswordChangeError) -> &'static str {
+fn reset_refused(e: PasswordChangeError) -> String {
     match e {
-        PasswordChangeError::HasNul => RESET_HAS_NUL,
-        _ => RESET_TOO_SHORT,
+        PasswordChangeError::HasNul => RESET_HAS_NUL.to_owned(),
+        _ => format!(
+            "The forced reset of the admin's password (force_ldap_user_pass_reset) needs at \
+             least 8 {PASSWORD_LENGTH_UNIT} in ldap_user_pass. Set a longer password, or take \
+             the forced reset out of the configuration."
+        ),
     }
 }
 
@@ -268,33 +269,43 @@ async fn reset_with_realm(
     finish_reset(handler, config, detail).await
 }
 
-/// The first start's floor of 8, counted in characters as every other check counts.
 fn first_start_floor(password: &str) -> Result<(), String> {
-    let pass_length = password.chars().count();
-    match pass_length >= 8 {
-        true => Ok(()),
-        false => Err(format!(
-            "Minimum password length is 8 characters, got {pass_length} characters"
+    match password_rules(password, PASSWORD_MIN_LENGTH) {
+        Err(PasswordChangeError::TooShort(min)) => Err(format!(
+            "The admin password in ldap_user_pass is shorter than the minimum of {min} \
+             {PASSWORD_LENGTH_UNIT}"
         )),
+        _ => Ok(()),
     }
 }
 
-fn admin_min_length_warning(len: usize, min: usize) -> Option<String> {
-    (len < min).then(|| {
+fn admin_min_length_warning(password: &str, min: Result<usize, String>) -> Option<String> {
+    let min = match min {
+        Ok(min) => min,
+        Err(e) => {
+            return Some(format!(
+                "The admin's password-min-length could not be read ({e}): the configuration's \
+                 password is checked against 8 only"
+            ));
+        }
+    };
+    let short = matches!(
+        password_rules(password, min),
+        Err(PasswordChangeError::TooShort(_))
+    );
+    short.then(|| {
         format!(
-            "The admin password in ldap_user_pass has {len} characters; the admin's \
-             password-min-length is {min}: the configuration's password is checked against 8 \
+            "The admin password in ldap_user_pass is shorter than the admin's \
+             password-min-length of {min}: the configuration's password is checked against 8 \
              only, and a change of it is held to {min}"
         )
     })
 }
 
-/// One warning, on the starts that apply the configuration's password; an unread minimum, none.
 async fn warn_admin_min_length(handler: &SqlBackendHandler, config: &Configuration) {
-    let len = admin_password(config).chars().count();
-    if let Ok(min) = handler.password_min_length(&config.ldap_user_dn).await
-        && let Some(text) = admin_min_length_warning(len, min)
-    {
+    let min = handler.password_min_length(&config.ldap_user_dn).await;
+    let min = min.map_err(|e| e.to_string());
+    if let Some(text) = admin_min_length_warning(admin_password(config), min) {
         warn!("{text}");
     }
 }
@@ -939,6 +950,7 @@ async fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lldap_auth::password_length;
     use pretty_assertions::assert_eq;
 
     #[test]
@@ -964,10 +976,16 @@ mod tests {
         let nul = reset_refused(PasswordChangeError::HasNul);
         let off = sync_turned_off(KERBEROS_OFF);
         let rows = [
-            (floor, "at least 8 characters"),
-            (floor, "take the forced reset out of the configuration"),
-            (nul, "cannot take a NUL character (U+0000)"),
-            (nul, "take the forced reset out of the configuration"),
+            (floor.as_str(), "at least 8 characters"),
+            (
+                floor.as_str(),
+                "take the forced reset out of the configuration",
+            ),
+            (nul.as_str(), "cannot take a NUL character (U+0000)"),
+            (
+                nul.as_str(),
+                "take the forced reset out of the configuration",
+            ),
             (
                 off.as_str(),
                 "Kerberos sync turned off by the forced reset of the admin's password",
@@ -1159,15 +1177,13 @@ mod tests {
 
     #[test]
     fn test_the_first_start_counts_the_admin_password_in_characters() {
-        let short = |n: usize| {
-            Err(format!(
-                "Minimum password length is 8 characters, got {n} characters"
-            ))
-        };
+        const SHORT: &str =
+            "The admin password in ldap_user_pass is shorter than the minimum of 8 characters";
         let rows = [
-            ("pässwö", (6, 8), short(6)),
-            ("pässwör", (7, 9), short(7)),
-            ("Seven-7", (7, 7), short(7)),
+            ("pässwö", (6, 8), Err(SHORT)),
+            ("pässwör", (7, 9), Err(SHORT)),
+            ("Seven-7", (7, 7), Err(SHORT)),
+            ("", (0, 0), Err(SHORT)),
             ("pässwört", (8, 10), Ok(())),
             ("Eight-88", (8, 8), Ok(())),
         ];
@@ -1177,7 +1193,7 @@ mod tests {
                     (password.chars().count(), password.len()),
                     first_start_floor(password)
                 ),
-                (counts, expected),
+                (counts, expected.map_err(str::to_owned)),
                 "{password}"
             );
         }
@@ -1185,24 +1201,185 @@ mod tests {
 
     #[test]
     fn test_one_warning_when_the_admins_minimum_is_above_the_configured_password() {
-        let rows = [
-            (
-                (9, 12),
-                Some(
-                    "The admin password in ldap_user_pass has 9 characters; the admin's \
-                     password-min-length is 12: the configuration's password is checked against \
-                     8 only, and a change of it is held to 12",
-                ),
-            ),
-            ((12, 12), None),
-            ((20, 8), None),
+        const SHORT_12: &str = "The admin password in ldap_user_pass is shorter than the \
+             admin's password-min-length of 12: the configuration's password is checked against \
+             8 only, and a change of it is held to 12";
+        const UNREAD: &str = "The admin's password-min-length could not be read (Database \
+             error: `the policy store is down`): the configuration's password is checked against \
+             8 only";
+        type Row = (
+            &'static str,
+            Result<usize, &'static str>,
+            Option<&'static str>,
+        );
+        let down = "Database error: `the policy store is down`";
+        let rows: [Row; 6] = [
+            ("Nine-9999", Ok(12), Some(SHORT_12)),
+            ("pässwörter", Ok(12), Some(SHORT_12)),
+            ("Twelve-12chr", Ok(12), None),
+            ("Twenty-characters-20", Ok(8), None),
+            ("Nine-9999", Err(down), Some(UNREAD)),
+            ("Twenty-characters-20", Err(down), Some(UNREAD)),
         ];
-        for ((len, min), expected) in rows {
+        for (password, min, expected) in rows {
+            let min = min.map_err(str::to_owned);
+            let text = admin_min_length_warning(password, min.clone());
+            assert_eq!(text.as_deref(), expected, "{password} {min:?}");
+            let length = password_length(password).to_string();
+            let named = text.is_some_and(|text| text.contains(&format!(" {length} ")));
+            assert!(!named, "{password}: no text names the password's length");
+        }
+    }
+
+    #[test]
+    fn test_the_start_counts_the_admin_password_as_password_length() {
+        use PasswordChangeError::{HasNul, TooShort};
+        type Row = (
+            &'static str,
+            (usize, usize),
+            Result<(), &'static str>,
+            Result<(), PasswordChangeError>,
+        );
+        const SHORT: &str =
+            "The admin password in ldap_user_pass is shorter than the minimum of 8 characters";
+        let rows: [Row; 6] = [
+            ("ääää", (4, 8), Err(SHORT), Err(TooShort(8))),
+            ("äääääää", (7, 14), Err(SHORT), Err(TooShort(8))),
+            ("e\u{301}e\u{301}e\u{301}e\u{301}", (8, 12), Ok(()), Ok(())),
+            ("ääääääää", (8, 16), Ok(()), Ok(())),
+            ("", (0, 0), Err(SHORT), Err(TooShort(8))),
+            ("a\0aaaaaaa", (9, 9), Ok(()), Err(HasNul)),
+        ];
+        let got = rows.clone().map(|(text, ..)| {
+            let floor = first_start_floor(text);
+            let rules = password_rules(text, PASSWORD_MIN_LENGTH);
+            (text, (password_length(text), text.len()), floor, rules)
+        });
+        let want = rows.clone().map(|(text, counts, floor, rules)| {
+            (text, counts, floor.map_err(str::to_owned), rules)
+        });
+        assert_eq!(got, want);
+        for (text, _, floor, rules) in rows.into_iter().filter(|row| !row.0.contains('\0')) {
             assert_eq!(
-                admin_min_length_warning(len, min).as_deref(),
-                expected,
-                "{len} {min}"
+                (floor.is_err(), rules.is_err()),
+                (password_length(text) < 8, password_length(text) < 8),
+                "{text:?}: the first start and the forced reset count alike"
             );
         }
+    }
+
+    #[test]
+    fn test_no_door_counts_a_new_password_but_password_length() {
+        const DOORS: [&str; 18] = [
+            "crates/auth/src/lib.rs",
+            "crates/auth/src/kerberos_envelope.rs",
+            "crates/domain-handlers/src/password.rs",
+            "crates/kerberos/src/seam.rs",
+            "crates/kerberos/src/embedded.rs",
+            "crates/ldap/src/create.rs",
+            "crates/ldap/src/modify.rs",
+            "crates/ldap/src/password.rs",
+            "crates/graphql-server/src/mutation/mod.rs",
+            "crates/graphql-server/src/kerberos_transport.rs",
+            "server/src/main.rs",
+            "server/src/auth_service.rs",
+            "app/src/infra/opaque.rs",
+            "app/src/infra/encrypt.rs",
+            "app/src/components/change_password.rs",
+            "app/src/components/create_user.rs",
+            "app/src/components/reset_password_step2.rs",
+            "set-password/src/main.rs",
+        ];
+        fn field_name(line: &str) -> Option<&str> {
+            let line = line.strip_prefix("pub ").unwrap_or(line);
+            let (name, _) = line.strip_suffix(',')?.split_once(": ")?;
+            let plain = name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+            plain.then_some(name)
+        }
+        fn counts_by_len(line: &str, page: bool) -> bool {
+            let calls = line.match_indices(".len()");
+            calls
+                .chain(line.match_indices(".bytes().count()"))
+                .any(|(at, _)| {
+                    let cut = |c: char| c.is_whitespace() || "!&|,{[=".contains(c);
+                    let receiver = line[..at].rsplit(cut).next().unwrap_or_default();
+                    page || receiver.to_ascii_lowercase().contains("pass")
+                })
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let (mut counted, mut shaped, mut nul, mut pages) = (vec![], vec![], vec![], vec![]);
+        for file in DOORS {
+            let source =
+                std::fs::read_to_string(root.join(file)).unwrap_or_else(|e| panic!("{file}: {e}"));
+            let production = source.split("#[cfg(test)]").next().unwrap_or_default();
+            let page = file.starts_with("app/src/components/");
+            let calls = production.matches("password_shape(").count();
+            if calls > 0 {
+                shaped.push(format!("{file}: {calls}"));
+            }
+            let (mut validated, mut attribute) = (None, None);
+            for line in production.lines().map(str::trim) {
+                if line.starts_with("#[validate(") {
+                    validated = line.contains("length(").then_some(line);
+                    attribute = Some(line);
+                } else if let Some(field) = field_name(line) {
+                    if let Some(attribute) = attribute.take()
+                        && page
+                        && field == "password"
+                    {
+                        pages.push(format!("{file}: {attribute}"));
+                    }
+                    if let Some(attribute) = validated.take()
+                        && field.contains("password")
+                    {
+                        counted.push(format!("{file}: {attribute}"));
+                    }
+                }
+                if line.contains(".chars().count()") || counts_by_len(line, page) {
+                    counted.push(format!("{file}: {line}"));
+                }
+                if line.contains("'\\0'") || line.contains("\"\\0\"") {
+                    nul.push(format!("{file}: {line}"));
+                }
+            }
+        }
+        assert_eq!(
+            (shaped, nul, pages),
+            (
+                [
+                    "crates/auth/src/lib.rs: 1",
+                    "crates/domain-handlers/src/password.rs: 1",
+                    "app/src/infra/opaque.rs: 1",
+                    "set-password/src/main.rs: 1",
+                ]
+                .map(str::to_owned)
+                .to_vec(),
+                vec!["crates/auth/src/lib.rs: if password.contains('\\0') {".to_owned()],
+                [
+                    "app/src/components/change_password.rs: \
+                     #[validate(custom(function = \"new_password_at_the_floor\"))]",
+                    "app/src/components/create_user.rs: \
+                     #[validate(custom(function = \"new_user_password_at_the_floor\"))]",
+                    "app/src/components/reset_password_step2.rs: \
+                     #[validate(custom(function = \"new_password_at_the_floor\"))]",
+                ]
+                .map(str::to_owned)
+                .to_vec(),
+            ),
+            "the shared rule's one definition and its callers, its one NUL check, and the pages' \
+             new-password validators, which call it in opaque.rs"
+        );
+        assert_eq!(
+            counted,
+            [
+                "crates/auth/src/lib.rs: password.chars().count()",
+                "crates/auth/src/lib.rs: password.len() <= KERBEROS_ENVELOPE_MAX_BYTES",
+                "app/src/components/change_password.rs: if value.is_empty() || value.len() >= 8 {",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            "password_length's body, the envelope's byte cap and the old password's presence \
+             check; any other count of a new password here is a door counting by other means"
+        );
     }
 }

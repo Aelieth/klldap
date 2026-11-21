@@ -5,7 +5,10 @@ use std::env;
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
 use lldap_auth::kerberos_envelope::seal_kerberos_envelope;
-use lldap_auth::{opaque, registration};
+use lldap_auth::{
+    PASSWORD_LENGTH_UNIT, PASSWORD_MIN_LENGTH, PasswordShapeError, opaque, password_shape,
+    registration,
+};
 use reqwest::Url;
 use serde::Serialize;
 
@@ -36,7 +39,7 @@ pub struct CliOpts {
 
     #[clap(
         long,
-        help = "Skip the minimum length check. An empty password is still refused. Unsafe"
+        help = "Skip the minimum password length only (8, and the user's minimum from the server). An empty password, or one with a NUL character, is still refused. Unsafe"
     )]
     pub bypass_password_policy: bool,
 }
@@ -95,15 +98,23 @@ pub fn register_start(
     serde_json::from_str(&data).context("Could not parse response")
 }
 
-/// The user's minimum from the start's answer; an old server sends none.
-fn check_min_length(password: &str, min: Option<u32>, bypass: bool) -> Result<()> {
-    if let Some(min) = min.filter(|_| !bypass) {
-        ensure!(
-            password.chars().count() >= min as usize,
-            "New password is too short, expected at least {min} characters"
-        );
+/// The bypass skips the minimum only, never the empty or NUL check.
+fn check_shape(password: &str, min: usize, bypass: bool) -> Result<()> {
+    match password_shape(password, if bypass { 0 } else { min }) {
+        Ok(()) => Ok(()),
+        Err(PasswordShapeError::TooShort(_)) => {
+            bail!("New password is too short, expected at least {min} {PASSWORD_LENGTH_UNIT}")
+        }
+        Err(other) => bail!("{other}"),
     }
-    Ok(())
+}
+
+fn check_min_length(password: &str, min: Option<u32>, bypass: bool) -> Result<()> {
+    check_shape(password, min.map_or(0, |min| min as usize), bypass)
+}
+
+fn check_floor(password: &str, bypass: bool) -> Result<()> {
+    check_shape(password, PASSWORD_MIN_LENGTH, bypass)
 }
 
 pub fn register_finish(
@@ -126,13 +137,9 @@ fn main() -> Result<()> {
     let password = opts
         .password
         .or_else(|| env::var("LLDAP_USER_PASSWORD").ok())
-        .filter(|password| !password.is_empty())
         .context("no password given: pass --password or set LLDAP_USER_PASSWORD")?;
 
-    ensure!(
-        opts.bypass_password_policy || password.chars().count() >= 8,
-        "New password is too short, expected at least 8 characters"
-    );
+    check_floor(&password, opts.bypass_password_policy)?;
     ensure!(
         opts.base_url.scheme() == "http" || opts.base_url.scheme() == "https",
         "Base URL should start with `http://` or `https://`"
@@ -187,6 +194,108 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lldap_auth::password_length;
+
+    #[test]
+    fn test_the_tool_counts_a_new_password_as_password_length() {
+        const SHORT_8: &str = "New password is too short, expected at least 8 characters";
+        const SHORT_12: &str = "New password is too short, expected at least 12 characters";
+        const EMPTY: &str = "the password must not be empty";
+        type Row = (
+            &'static str,
+            u32,
+            (usize, usize),
+            Result<(), &'static str>,
+            Result<(), &'static str>,
+            Result<(), &'static str>,
+        );
+        let rows: [Row; 5] = [
+            ("ääääääää", 12, (8, 16), Ok(()), Err(SHORT_12), Ok(())),
+            ("ääää", 8, (4, 8), Err(SHORT_8), Err(SHORT_8), Ok(())),
+            ("äääääää", 12, (7, 14), Err(SHORT_8), Err(SHORT_12), Ok(())),
+            (
+                "e\u{301}e\u{301}e\u{301}e\u{301}",
+                8,
+                (8, 12),
+                Ok(()),
+                Ok(()),
+                Ok(()),
+            ),
+            ("", 8, (0, 0), Err(EMPTY), Err(EMPTY), Err(EMPTY)),
+        ];
+        let text = |checked: Result<()>| checked.map_err(|e| e.to_string());
+        let got = rows.map(|(password, min, ..)| {
+            (
+                password,
+                min,
+                (password_length(password), password.len()),
+                text(check_floor(password, false)),
+                text(check_min_length(password, Some(min), false)),
+                (
+                    text(check_floor(password, true)),
+                    text(check_min_length(password, Some(min), true)),
+                ),
+            )
+        });
+        let want = rows.map(|(password, min, counts, floor, minimum, bypassed)| {
+            let owned = |r: Result<(), &str>| r.map_err(str::to_owned);
+            let bypassed = (owned(bypassed), owned(bypassed));
+            (
+                password,
+                min,
+                counts,
+                owned(floor),
+                owned(minimum),
+                bypassed,
+            )
+        });
+        assert_eq!(got, want);
+        for (password, min, _, floor, minimum, _) in rows {
+            let length = password_length(password);
+            assert_eq!(
+                (floor.is_err(), minimum.is_err()),
+                (length < 8, length < min as usize),
+                "{password:?}: the floor and the server's minimum count alike"
+            );
+        }
+    }
+
+    #[test]
+    fn test_the_bypass_skips_the_minimum_only_never_the_nul_check() {
+        const SHORT_8: &str = "New password is too short, expected at least 8 characters";
+        const SHORT_12: &str = "New password is too short, expected at least 12 characters";
+        const NUL: &str = "the password must not contain a NUL character (U+0000)";
+        const EMPTY: &str = "the password must not be empty";
+        type Row = (
+            &'static str,
+            bool,
+            Result<(), &'static str>,
+            Result<(), &'static str>,
+        );
+        let rows: [Row; 10] = [
+            ("abc", true, Ok(()), Ok(())),
+            ("abc", false, Err(SHORT_8), Err(SHORT_12)),
+            ("", false, Err(EMPTY), Err(EMPTY)),
+            ("", true, Err(EMPTY), Err(EMPTY)),
+            ("\0", true, Err(NUL), Err(NUL)),
+            ("a\0b", true, Err(NUL), Err(NUL)),
+            ("a\0b", false, Err(NUL), Err(NUL)),
+            ("Twelve-12chr\0", false, Err(NUL), Err(NUL)),
+            ("Twelve-12chr", false, Ok(()), Ok(())),
+            ("Twelve-12chr", true, Ok(()), Ok(())),
+        ];
+        let text = |checked: Result<()>| checked.map_err(|e| e.to_string());
+        let got = rows.map(|(password, bypass, ..)| {
+            let floor = text(check_floor(password, bypass));
+            let minimum = text(check_min_length(password, Some(12), bypass));
+            (password, bypass, floor, minimum)
+        });
+        let want = rows.map(|(password, bypass, floor, minimum)| {
+            let owned = |r: Result<(), &str>| r.map_err(str::to_owned);
+            (password, bypass, owned(floor), owned(minimum))
+        });
+        assert_eq!(got, want);
+    }
 
     #[test]
     fn test_the_servers_minimum_stops_a_shorter_password_before_the_finish() {
@@ -195,6 +304,7 @@ mod tests {
         const TWELVE: &str = "Twelve-12chr";
         const ELEVEN_UMLAUTS: &str = "pässwörter1";
         let too_short = "New password is too short, expected at least 12 characters";
+        let empty = "the password must not be empty";
         let rows = [
             (ELEVEN, Some(12), false, Err(too_short)),
             (ELEVEN_UMLAUTS, Some(12), false, Err(too_short)),
@@ -202,6 +312,8 @@ mod tests {
             (ELEVEN, Some(12), true, Ok(())),
             (ELEVEN, None, false, Ok(())),
             (SEVEN, None, false, Ok(())),
+            ("", None, false, Err(empty)),
+            ("", None, true, Err(empty)),
         ];
         assert_eq!(
             [SEVEN, ELEVEN, TWELVE, ELEVEN_UMLAUTS].map(|p| (p.chars().count(), p.len())),

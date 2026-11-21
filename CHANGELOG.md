@@ -98,10 +98,13 @@
   (`PASS_Q_TOOSHORT`). The register start answers the user's minimum in the new optional field
   `password_min_length`, and the pages and the tool refuse a shorter password before the
   finish (*Invalid password. Min length: N*), the only check for a user without sync; a client
-  that ignores the field keeps checking 8. A policy that cannot be read refuses the change
-  ("the password policy could not be read; try again"; kadmin `PASS_Q_GENERIC`). The
-  configuration's admin password is still checked against 8 only, and the start warns once
-  when the admin's minimum is higher.
+  that ignores the field keeps checking 8. The pages and the tool also refuse a password with a
+  NUL character, and `lldap_set_password --bypass-password-policy` skips the minimum length
+  only, never the NUL check. A policy that cannot be read, or a stored
+  value that is not a whole number, refuses the change ("the password policy could not be
+  read; try again"; kadmin `PASS_Q_GENERIC`). The configuration's admin password is still
+  checked against 8 only, and the start warns once, naming the minimum and never the
+  password's length, when the admin's minimum is higher or cannot be read.
 
 ### Removed
 

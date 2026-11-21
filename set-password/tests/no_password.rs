@@ -1,6 +1,7 @@
 use std::process::Command;
 
 const NO_PASSWORD: &str = "Error: no password given: pass --password or set LLDAP_USER_PASSWORD\n";
+const EMPTY: &str = "Error: the password must not be empty\n";
 const TOO_SHORT: &str = "Error: New password is too short, expected at least 8 characters\n";
 
 /// The tool against a port nothing listens on: any request it sends fails with a connection
@@ -29,19 +30,19 @@ fn test_no_password_is_an_error_before_anything_is_sent() {
             "an empty --password, the policy bypassed",
             &["--bypass-password-policy", "--password", ""],
             None,
-            NO_PASSWORD,
+            EMPTY,
         ),
         (
             "an empty LLDAP_USER_PASSWORD, the policy bypassed",
             &["--bypass-password-policy"],
             Some(""),
-            NO_PASSWORD,
+            EMPTY,
         ),
         (
             "an empty --password over a set LLDAP_USER_PASSWORD, the policy bypassed",
             &["--bypass-password-policy", "--password", ""],
             Some("Env-Password-1"),
-            NO_PASSWORD,
+            EMPTY,
         ),
         ("no password", &[], None, NO_PASSWORD),
         (

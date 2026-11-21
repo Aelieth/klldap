@@ -6,7 +6,11 @@ use crate::kerberos::{
 };
 use crate::logging::{self, LogKind};
 use crate::policies::{
-    POLICY_ITEM_CATALOG, Setting, canonical_ou_key, resolve, resolve_effective_items,
+    EffectiveItem, POLICY_ITEM_CATALOG, Setting, canonical_ou_key, resolve, resolve_effective_items,
+};
+pub use lldap_auth::{
+    PASSWORD_HAS_NUL, PASSWORD_LENGTH_UNIT, PASSWORD_MIN_LENGTH, PasswordShapeError,
+    password_length, password_shape,
 };
 use lldap_domain::requests::CreateUserRequest;
 use lldap_domain::types::UserId;
@@ -20,41 +24,43 @@ pub const RESULT_UNKNOWN: &str = "the result is unknown: try the new password";
 pub const ANSWER_LOST: &str = "the answer was lost; the change had committed";
 pub const UNKNOWN_ROW: &str = "result unknown: the database did not answer";
 pub const UNREPORTED_ROW: &str = "result unknown: the change did not report";
-pub const PASSWORD_MIN_LENGTH: usize = 8;
 pub const PASSWORD_MIN_LENGTH_CAP: usize = 128;
 pub const PASSWORD_MIN_LENGTH_ITEM: &str = "password-min-length";
 pub const PASSWORD_POLICY_UNREADABLE: &str = "the password policy could not be read; try again";
-pub const PASSWORD_HAS_NUL: &str = "the password must not contain a NUL character (U+0000)";
 pub const PASSWORD_NEEDS_THE_REALM: &str =
     "a password is changed only by the server that holds the Kerberos realm; try again";
+
+const MIN_LENGTH_NOT_A_NUMBER: &str = "the stored password-min-length is not a number";
 
 pub struct PasswordMinLength;
 
 impl Setting for PasswordMinLength {
-    type Value = usize;
+    type Value = Option<usize>;
     const KEY: &'static str = PASSWORD_MIN_LENGTH_ITEM;
-    fn parse(value: &str) -> usize {
-        let parsed = value.trim().parse::<usize>();
-        parsed.map_or(PASSWORD_MIN_LENGTH, |min| {
-            min.clamp(PASSWORD_MIN_LENGTH, PASSWORD_MIN_LENGTH_CAP)
-        })
+    fn parse(value: &str) -> Option<usize> {
+        let (floor, cap) = (PASSWORD_MIN_LENGTH as i64, PASSWORD_MIN_LENGTH_CAP as i64);
+        let value = value.trim();
+        let (beyond, digits) = match value.strip_prefix('-') {
+            Some(digits) => (floor, digits),
+            None => (cap, value.strip_prefix('+').unwrap_or(value)),
+        };
+        let whole = !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
+        let min = value.parse::<i64>().ok().or(whole.then_some(beyond))?;
+        Some(min.clamp(floor, cap) as usize)
     }
 }
 
-/// What every door asks of a new password: no NUL character, then `min` characters (Unicode
-/// scalar values), never fewer than the floor.
+/// What every door asks of a new password: no NUL character, and the floor.
 pub fn password_rules(password: &str, min: usize) -> Result<(), PasswordChangeError> {
-    if password.contains('\0') {
-        return Err(PasswordChangeError::HasNul);
-    }
     let min = min.max(PASSWORD_MIN_LENGTH);
-    if password.chars().count() < min {
-        return Err(PasswordChangeError::TooShort(min));
-    }
-    Ok(())
+    password_shape(password, min).map_err(|e| match e {
+        PasswordShapeError::HasNul => PasswordChangeError::HasNul,
+        PasswordShapeError::Empty | PasswordShapeError::TooShort(_) => {
+            PasswordChangeError::TooShort(min)
+        }
+    })
 }
 
-/// The user's `password-min-length`; one that cannot be read refuses the change, with its row.
 pub async fn min_length_of(
     handler: &(impl PolicyBackendHandler + ?Sized),
     user: &UserId,
@@ -66,7 +72,6 @@ pub async fn min_length_of(
     })
 }
 
-/// The `password-min-length` of `ou`, for a user not made yet; unreadable refuses with its row.
 pub async fn min_length_in_ou(
     handler: &(impl PolicyBackendHandler + ?Sized),
     ou: &str,
@@ -80,14 +85,17 @@ pub async fn min_length_in_ou(
     })
 }
 
-/// The `password-min-length` an OU key resolves to, read from the database, never a cache.
 pub async fn min_length_for_ou_key(
     handler: &(impl PolicyBackendHandler + ?Sized),
     ou_key: &str,
 ) -> Result<usize, DomainError> {
     let levels = handler.get_policy_levels(ou_key).await?;
-    let items = resolve_effective_items(POLICY_ITEM_CATALOG, &levels);
-    Ok(resolve::<PasswordMinLength>(None, &items).0)
+    min_length_in(&resolve_effective_items(POLICY_ITEM_CATALOG, &levels))
+}
+
+pub fn min_length_in(items: &[EffectiveItem]) -> Result<usize, DomainError> {
+    let min = resolve::<PasswordMinLength>(None, items).0;
+    min.ok_or_else(|| DomainError::InternalError(MIN_LENGTH_NOT_A_NUMBER.to_owned()))
 }
 
 #[cfg(feature = "kill-points")]
@@ -175,7 +183,7 @@ pub enum PasswordChangeError {
 impl std::fmt::Display for PasswordChangeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::TooShort(min) => write!(f, "the password must be at least {min} characters"),
+            Self::TooShort(min) => write!(f, "{}", PasswordShapeError::TooShort(*min)),
             Self::HasNul => f.write_str(PASSWORD_HAS_NUL),
             Self::PolicyUnreadable => f.write_str(PASSWORD_POLICY_UNREADABLE),
             Self::Refused(reason) => write!(f, "refused by Kerberos: {reason}"),
@@ -540,6 +548,7 @@ mod tests {
             ("pässwör", 8, PasswordChangeError::TooShort(8)),
             ("a\0aaaaaaa", 8, PasswordChangeError::HasNul),
             ("Eleven-11ch", 12, PasswordChangeError::TooShort(12)),
+            ("", 8, PasswordChangeError::TooShort(8)),
         ];
         for (password, min, refused) in refusals {
             let rows = std::sync::Arc::new(Rows::default());
@@ -1027,6 +1036,61 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_each_door_here_counts_a_new_password_as_password_length() {
+        use crate::kerberos::{NoopKerberos, set_kerberos_backend};
+        use PasswordChangeError::{Failed, TooShort};
+        use std::sync::Arc;
+        type Row = (&'static str, usize, (usize, usize), Option<usize>);
+        let rows: [Row; 3] = [
+            ("ääääääää", 12, (8, 16), Some(12)),
+            ("ääää", 8, (4, 8), Some(8)),
+            ("e\u{301}e\u{301}e\u{301}e\u{301}", 8, (8, 12), None),
+        ];
+        set_kerberos_backend(Arc::new(Holding(None)));
+        let bob = UserId::new("bob");
+        let key = lldap_auth::opaque::server::generate_random_private_key;
+        let handler = Deriving(key(), Some("stored"));
+        let request = || CreateUserRequest {
+            user_id: bob.clone(),
+            ..Default::default()
+        };
+        let (mut got, mut want) = (Vec::new(), Vec::new());
+        for (text, min, counts, short) in rows {
+            let off = change_password_everywhere(&handler, &bob, text, PasswordSync::Off, min);
+            let on = change_password_everywhere(&handler, &bob, text, PasswordSync::On, min);
+            let doors = (
+                password_rules(text, min),
+                off.await,
+                on.await,
+                finish_synced_registration(&handler, &bob, text, min).await,
+                create_synced_user(&handler, request(), text, min).await,
+            );
+            let counted = (password_length(text), text.len());
+            let judged = (password_length(text) < min).then_some(min);
+            got.push((text, counted, judged, doors));
+            let past = |failed: &str| -> Result<(), PasswordChangeError> {
+                Err(short.map_or_else(|| Failed(failed.to_owned()), TooShort))
+            };
+            let committed = "this Kerberos backend cannot commit a password";
+            let doors = (
+                short.map_or(Ok(()), |m| Err(TooShort(m))),
+                past("Internal error: `stored`"),
+                past(committed),
+                past(committed),
+                past(committed),
+            );
+            want.push((text, counts, short, doors));
+        }
+        set_kerberos_backend(Arc::new(NoopKerberos::default()));
+        assert_eq!(
+            got, want,
+            "fewer characters than the minimum, though not fewer bytes, is refused at each door; \
+             a combining mark is a character: past the rules, to the store or the commit"
+        );
+    }
+
     #[test]
     fn test_the_floor_counts_characters() {
         let rows = [
@@ -1043,24 +1107,67 @@ mod tests {
             .collect();
         assert_eq!(got, rows.to_vec());
         assert_eq!(("pässwör".len(), PASSWORD_MIN_LENGTH), (9, 8));
+        let empty = [0, 12].map(|min| password_rules("", min).map_err(|e| e.to_string()));
+        assert_eq!(
+            empty,
+            [
+                Err("the password must be at least 8 characters".to_owned()),
+                Err("the password must be at least 12 characters".to_owned()),
+            ],
+            "the server's doors answer an empty password with the minimum's text"
+        );
     }
 
     #[test]
     fn test_the_minimum_is_read_trimmed_and_held_between_8_and_128() {
-        let rows: [(&str, usize); 9] = [
-            ("12", 12),
-            ("7", 8),
-            ("129", 128),
-            ("x", 8),
-            (" 20 ", 20),
-            ("8", 8),
-            ("128", 128),
-            ("", 8),
-            ("-1", 8),
+        let rows: [(&str, Option<usize>); 15] = [
+            ("12", Some(12)),
+            ("7", Some(8)),
+            ("129", Some(128)),
+            ("x", None),
+            (" 20 ", Some(20)),
+            ("8", Some(8)),
+            ("128", Some(128)),
+            ("", None),
+            ("-1", Some(8)),
+            ("12.5", None),
+            ("12x", None),
+            ("99999999999999999999", Some(128)),
+            ("-99999999999999999999", Some(8)),
+            ("99999999999999999999x", None),
+            ("-", None),
         ];
         let got = rows.map(|(value, _)| (value, PasswordMinLength::parse(value)));
         assert_eq!(got, rows);
         assert_eq!(PasswordMinLength::KEY, "password-min-length");
+        assert_eq!(
+            [
+                min_length_in(&[]).map_err(|e| e.to_string()),
+                min_length_in(&[item_of("x")]).map_err(|e| e.to_string()),
+                min_length_in(&[item_of("500")]).map_err(|e| e.to_string()),
+            ],
+            [
+                Ok(8),
+                Err("Internal error: `the stored password-min-length is not a number`".to_owned()),
+                Ok(128),
+            ],
+            "no item is the default 8; a stored value that is not a number is unreadable"
+        );
+    }
+
+    fn item_of(value: &str) -> crate::policies::EffectiveItem {
+        use crate::policies::{EffectiveItem, ItemSource, PolicyId, PolicyScope};
+        EffectiveItem {
+            key: PASSWORD_MIN_LENGTH_ITEM.to_owned(),
+            scope: PolicyScope::User,
+            value: value.to_owned(),
+            enforced: true,
+            source: Some(ItemSource {
+                policy_id: PolicyId(1),
+                policy_name: "p".to_owned(),
+                ou_key: "labs".to_owned(),
+            }),
+        }
     }
 
     #[test]
@@ -1078,13 +1185,17 @@ mod tests {
                 items: [("password-min-length".to_owned(), value.to_owned())].into(),
             }),
         };
-        type Row = (&'static str, Vec<PolicyLevel>, (usize, SettingSource));
+        type Row = (
+            &'static str,
+            Vec<PolicyLevel>,
+            (Option<usize>, SettingSource),
+        );
         let rows: Vec<Row> = vec![
-            ("no policy", vec![], (8, SettingSource::Default)),
+            ("no policy", vec![], (Some(8), SettingSource::Default)),
             (
                 "the OU sets 12",
                 vec![level("", false, None), level("labs", false, Some("12"))],
-                (12, SettingSource::Ou),
+                (Some(12), SettingSource::Ou),
             ),
             (
                 "the parent sets 20, the child inherits",
@@ -1093,7 +1204,7 @@ mod tests {
                     level("labs", false, Some("20")),
                     level("labs\\east", false, None),
                 ],
-                (20, SettingSource::Ou),
+                (Some(20), SettingSource::Ou),
             ),
             (
                 "the child blocks the parent's 20",
@@ -1102,7 +1213,7 @@ mod tests {
                     level("labs", false, Some("20")),
                     level("labs\\east", true, None),
                 ],
-                (8, SettingSource::Default),
+                (Some(8), SettingSource::Default),
             ),
             (
                 "the child's 12 over the parent's 20",
@@ -1111,12 +1222,17 @@ mod tests {
                     level("labs", false, Some("20")),
                     level("labs\\east", false, Some("12")),
                 ],
-                (12, SettingSource::Ou),
+                (Some(12), SettingSource::Ou),
             ),
             (
                 "a stored 500 is held to 128",
                 vec![level("", false, Some("500"))],
-                (128, SettingSource::Ou),
+                (Some(128), SettingSource::Ou),
+            ),
+            (
+                "a stored x is not a number",
+                vec![level("", false, Some("x"))],
+                (None, SettingSource::Ou),
             ),
         ];
         for (row, levels, expected) in rows {
@@ -1129,7 +1245,7 @@ mod tests {
         }
         assert_eq!(
             resolve::<PasswordMinLength>(None, &[]),
-            (8, SettingSource::Default),
+            (Some(8), SettingSource::Default),
             "no items at all, as for a user the directory does not have"
         );
     }

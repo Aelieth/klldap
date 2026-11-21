@@ -1,3 +1,4 @@
+use lldap_auth::PASSWORD_LENGTH_UNIT;
 use std::collections::{HashMap, HashSet};
 
 pub const ROOT_OU: &str = "All";
@@ -202,7 +203,7 @@ pub fn format_item_value(key: &str, value: &str) -> String {
         "lockout-threshold" if value == "0" => "off".to_owned(),
         "lockout-threshold" => format!("{value} tries"),
         "lockout-duration-seconds" => format!("{value} s"),
-        "password-min-length" => format!("{value} characters"),
+        "password-min-length" => format!("{value} {PASSWORD_LENGTH_UNIT}"),
         _ => value.to_owned(),
     }
 }

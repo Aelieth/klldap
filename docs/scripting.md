@@ -69,10 +69,13 @@ with no NUL character (U+0000), wherever the server sees its text:
 `setUserPassword`, the LDAP password doors, and a synced user's web pages and
 `lldap_set_password`. A shorter one is refused and nothing is written. For a user
 without sync, the web pages and `lldap_set_password` check the user's minimum (8 by default)
-themselves.
+themselves, and refuse a password with a NUL character.
 `lldap_set_password` needs a password, from `--password` or `LLDAP_USER_PASSWORD`, and
-refuses an empty one before it sends anything; `--bypass-password-policy` skips only the
-minimum length.
+refuses an empty one before it sends anything. `--bypass-password-policy` skips the minimum
+length only (8, and the user's minimum from the register start), never the empty or NUL
+check. For a user with `kerberosSync` the server still refuses a shorter password at the
+finish; for a user without sync, the minimum is checked by the web pages and
+`lldap_set_password` only.
 
 The register start, `/auth/opaque/register/start`, answers the user's minimum in the optional
 field `password_min_length` (a number of characters), for every user, beside OPAQUE's own

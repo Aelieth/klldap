@@ -6,10 +6,10 @@ use lldap_domain::types::{User, UserId, user_ou};
 use lldap_domain_handlers::handler::{PolicyBackendHandler, UserBackendHandler};
 use lldap_domain_handlers::kdc_proof::ProofWindow;
 use lldap_domain_handlers::logging::{self, LogKind};
-use lldap_domain_handlers::password::{PasswordMinLength, min_length_for_ou_key};
+use lldap_domain_handlers::password::{min_length_for_ou_key, min_length_in};
 use lldap_domain_handlers::policies::{
     AttachedPolicy, CreatePolicyRequest, OuPolicyState, Policy, PolicyId, PolicyLevel,
-    UpdatePolicyRequest, canonical_ou_key, ou_chain, ou_display, resolve,
+    UpdatePolicyRequest, canonical_ou_key, ou_chain, ou_display,
 };
 use lldap_domain_model::{
     error::{DomainError, Result},
@@ -396,7 +396,7 @@ impl PolicyBackendHandler for SqlBackendHandler {
     async fn password_min_length(&self, user_id: &UserId) -> Result<usize> {
         let details = match self.get_user_details(user_id).await {
             Err(DomainError::EntityNotFound(_)) => {
-                return Ok(resolve::<PasswordMinLength>(None, &[]).0);
+                return min_length_in(&[]);
             }
             details => details?,
         };
@@ -791,6 +791,39 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn test_the_bytes_judged_are_the_bytes_stored() {
+        const TYPED: &str = "  Cafe\u{301}-Pass-12  ";
+        const TRIMMED: &str = "Cafe\u{301}-Pass-12";
+        const COMPOSED: &str = "  Caf\u{e9}-Pass-12  ";
+        const LOWERED: &str = "  cafe\u{301}-pass-12  ";
+        let h = doors::handler().await;
+        doors::user_in(&h, "e3bytes", "e3ou").await;
+        let user = UserId::new("e3bytes");
+        let floor = PASSWORD_MIN_LENGTH;
+        let set = change_password_everywhere(&h, &user, TYPED, PasswordSync::Off, floor).await;
+        let mut tried = Vec::new();
+        for typed in [TYPED, TRIMMED, COMPOSED, LOWERED] {
+            let web = doors::web(&h, "e3bytes", typed, None).await;
+            let web = web.map(|outcome| matches!(outcome, LoginOutcome::Authenticated { .. }));
+            tried.push((typed, doors::bind(&h, "e3bytes", typed).await, web));
+        }
+        assert_eq!(
+            (set, tried),
+            (
+                Ok(()),
+                vec![
+                    (TYPED, true, Ok(true)),
+                    (TRIMMED, false, Err("client")),
+                    (COMPOSED, false, Err("client")),
+                    (LOWERED, false, Err("client")),
+                ]
+            ),
+            "the record is made of the bytes as typed: not trimmed, not composed, not lowered"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_a_password_set_before_the_minimum_rose_still_signs_in() {
         let h = doors::handler().await;
         doors::user_in(&h, "e3old", "e3ou").await;
@@ -839,6 +872,78 @@ mod tests {
                     Some("the password policy could not be read; try again".to_owned())
                 )]
             )
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_stored_minimum_that_is_not_a_number_refuses_the_change_never_eight() {
+        const NAN: &str = "Internal error: `the stored password-min-length is not a number`";
+        const UNREADABLE: &str = "the password policy could not be read; try again";
+        type Row = (
+            &'static str,
+            std::result::Result<usize, &'static str>,
+            std::result::Result<usize, PasswordChangeError>,
+            bool,
+        );
+        let rows: [Row; 6] = [
+            (
+                "x",
+                Err(NAN),
+                Err(PasswordChangeError::PolicyUnreadable),
+                true,
+            ),
+            (
+                "",
+                Err(NAN),
+                Err(PasswordChangeError::PolicyUnreadable),
+                true,
+            ),
+            (
+                "12.5",
+                Err(NAN),
+                Err(PasswordChangeError::PolicyUnreadable),
+                true,
+            ),
+            ("500", Ok(128), Ok(128), false),
+            ("-1", Ok(8), Ok(8), false),
+            ("12", Ok(12), Ok(12), false),
+        ];
+        let log = LogGuard::install_on_this_thread();
+        let h = doors::handler().await;
+        doors::user_in(&h, "e3nan", "e3nan").await;
+        let id = doors::policy_on(&h, "e3nan", &[(PASSWORD_MIN_LENGTH_ITEM, "12")]).await;
+        let user = UserId::new("e3nan");
+        let mut got = Vec::new();
+        for (value, ..) in rows.clone() {
+            let stored = format!("{{\"{PASSWORD_MIN_LENGTH_ITEM}\":\"{value}\"}}");
+            store_items(&h, id, &stored).await;
+            let _ = doors::rows(&log, &[]);
+            let read = h
+                .password_min_length(&user)
+                .await
+                .map_err(|e| e.to_string());
+            let refused = min_length_of(&h, &user).await;
+            let written = doors::rows(&log, &[LogKind::PasswordChange]);
+            got.push((value, read, refused, written));
+        }
+        let want: Vec<_> = rows
+            .into_iter()
+            .map(|(value, read, refused, row)| {
+                let written = match row {
+                    true => vec![(
+                        LogKind::PasswordChange,
+                        Some("e3nan".to_owned()),
+                        Some(UNREADABLE.to_owned()),
+                    )],
+                    false => Vec::new(),
+                };
+                (value, read.map_err(str::to_owned), refused, written)
+            })
+            .collect();
+        assert_eq!(
+            got, want,
+            "a stored value that is not a number is unreadable, never 8"
         );
     }
 

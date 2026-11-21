@@ -1,5 +1,7 @@
 use crate::components::fragments::attribute_order::attribute_priority;
-use crate::infra::opaque::{begin_registration, finish_registration, registration_started};
+use crate::infra::opaque::{
+    begin_registration, finish_registration, new_user_password_at_the_floor, registration_started,
+};
 use crate::infra::queries::{
     GetPosixConfig, GetUserAttributesSchema, ListOusQuery, get_posix_config,
     get_user_attributes_schema, list_ous_query,
@@ -87,7 +89,7 @@ pub struct CreateUserForm {
 pub struct CreateUserModel {
     #[validate(length(min = 1, message = "Username is required"))]
     username: String,
-    #[validate(length(min = 8, message = "Password must be at least 8 characters"))]
+    #[validate(custom(function = "new_user_password_at_the_floor"))]
     password: String,
     #[validate(must_match(other = "password", message = "Passwords must match"))]
     confirm_password: String,
@@ -239,7 +241,8 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
             Msg::CreateUserResponse(res) => {
                 let user_id = res?.create_user.id;
                 self.user_id = Some(user_id.clone());
-                let (state, req) = begin_registration(&user_id, &self.form.model().password)?;
+                let (state, req) = begin_registration(&user_id, &self.form.model().password)
+                    .map_err(|e| created_without_password(&user_id, &e.to_string()))?;
                 self.opaque_data = Some(state);
                 self.common.call_backend(
                     ctx,
@@ -249,21 +252,18 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
                 Ok(false)
             }
             Msg::RegistrationStartResponse(res) => {
-                let res = registration_started(res)?;
-                let state = self
-                    .opaque_data
-                    .take()
-                    .context("Missing registration data")?;
                 let user_id = self
                     .user_id
                     .as_deref()
                     .context("Missing registration data")?;
+                let res = registration_started(res)
+                    .map_err(|e| created_without_password(user_id, &e.to_string()))?;
+                let state = self
+                    .opaque_data
+                    .take()
+                    .context("Missing registration data")?;
                 let req = finish_registration(state, user_id, &self.form.model().password, *res)
-                    .map_err(|e| {
-                        anyhow!(
-                            "{e:#}. User {user_id} was created without a password; set one from the user's page"
-                        )
-                    })?;
+                    .map_err(|e| created_without_password(user_id, &format!("{e:#}")))?;
                 self.common.call_backend(
                     ctx,
                     HostService::register_finish(req),
@@ -272,7 +272,11 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
                 Ok(false)
             }
             Msg::RegistrationFinishResponse(response) => {
-                response.map_err(|e| anyhow!("Failed to set new password: {e:#}"))?;
+                let user_id = self
+                    .user_id
+                    .as_deref()
+                    .context("Missing registration data")?;
+                response.map_err(|e| password_may_be_unset(user_id, &format!("{e:#}")))?;
                 self.handle_msg(ctx, Msg::SuccessfulCreation)
             }
             Msg::SuccessfulCreation => {
@@ -428,6 +432,17 @@ impl Component for CreateUserForm {
     }
 }
 
+fn created_without_password(user_id: &str, cause: &str) -> anyhow::Error {
+    anyhow!("{cause}. User {user_id} was created without a password; set one from the user's page")
+}
+
+fn password_may_be_unset(user_id: &str, cause: &str) -> anyhow::Error {
+    anyhow!(
+        "Failed to set new password: {cause}. User {user_id} was created, and its password may \
+         not have been set; set one from the user's page"
+    )
+}
+
 fn sent_sync(kerberos_enabled: Option<bool>, switch: bool) -> Option<bool> {
     (kerberos_enabled != Some(false)).then_some(switch)
 }
@@ -494,6 +509,56 @@ fn get_custom_attribute_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::infra::opaque::finish_refusal;
+
+    #[test]
+    fn test_the_page_says_a_user_was_created_without_a_password_and_names_n_only_for_the_minimum() {
+        const WITHOUT: &str =
+            "User bob was created without a password; set one from the user's page";
+        let refused_start = |failure: &str| {
+            let refused = registration_started::<()>(Err(anyhow!("{failure}")));
+            refused.unwrap_err().to_string()
+        };
+        let rows = [
+            (
+                refused_start(
+                    "Could not start registration: [400 Bad Request]: Bad request: `the password \
+                     policy could not be read; try again`",
+                ),
+                "the password policy could not be read; try again",
+            ),
+            (
+                refused_start("Could not start registration: [500 Internal Server Error]: down"),
+                "Could not initiate registration",
+            ),
+            (
+                finish_refusal("Eleven-11ch", Some(12)).unwrap(),
+                "Invalid password. Min length: 12",
+            ),
+            (
+                finish_refusal("Eleven-11ch\0", Some(12)).unwrap(),
+                "the password must not contain a NUL character (U+0000)",
+            ),
+        ];
+        for (cause, shown) in rows {
+            assert_eq!(
+                created_without_password("bob", &cause).to_string(),
+                format!("{shown}. {WITHOUT}"),
+                "{cause}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_refused_finish_says_the_user_was_created_and_its_password_may_not_be_set() {
+        let cause = "Could not finish registration: [400 Bad Request]: Bad request: `refused`";
+        assert_eq!(
+            password_may_be_unset("bob", cause).to_string(),
+            "Failed to set new password: Could not finish registration: [400 Bad Request]: Bad \
+             request: `refused`. User bob was created, and its password may not have been set; \
+             set one from the user's page"
+        );
+    }
 
     #[test]
     fn test_the_request_carries_kerberossync_only_where_kerberos_runs() {

@@ -1,4 +1,6 @@
-use crate::infra::opaque::{begin_registration, finish_registration, registration_started};
+use crate::infra::opaque::{
+    begin_registration, finish_registration, new_password_at_the_floor, registration_started,
+};
 use crate::{
     components::{
         form::{field::Field, submit::Submit},
@@ -20,7 +22,7 @@ use yew_router::{prelude::History, scope_ext::RouterScopeExt};
 
 #[derive(Model, Validate, PartialEq, Eq, Clone, Default)]
 pub struct FormModel {
-    #[validate(length(min = 8, message = "Invalid password. Min length: 8"))]
+    #[validate(custom(function = "new_password_at_the_floor"))]
     password: String,
     #[validate(must_match(other = "password", message = "Passwords must match"))]
     confirm_password: String,

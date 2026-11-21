@@ -680,7 +680,6 @@ where
     .await
 }
 
-/// The start's answer: the sealing key for a synced user, and every user's minimum length.
 async fn start_answer(
     handler: &(impl OpaqueHandler + UserReadableBackendHandler + PolicyBackendHandler),
     request: registration::ClientRegistrationStartRequest,

@@ -1849,6 +1849,7 @@ mod tests {
         let refusals = [
             ("pässwör", "the password must be at least 8 characters"),
             ("a\0aaaaaaa", PASSWORD_HAS_NUL),
+            ("", "the password must be at least 8 characters"),
         ];
         for (synced, (password, refusal)) in [false, true]
             .into_iter()

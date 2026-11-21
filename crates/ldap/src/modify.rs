@@ -1305,6 +1305,7 @@ mod tests {
                 "the password must be at least 8 characters",
             ),
             ("a\0aaaaaaa", "b\0bbbbbbb", PASSWORD_HAS_NUL),
+            ("", "", "the password must be at least 8 characters"),
         ];
         for (synced, (replaced, sent, refusal)) in [false, true]
             .into_iter()

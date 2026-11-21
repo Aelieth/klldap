@@ -16,10 +16,12 @@ use lldap_domain_handlers::kerberos::{
 use lldap_domain_handlers::lockout::{UNLOCKED_BY_KADMIN, lock_clock, lockout};
 use lldap_domain_handlers::logging::{self, LogKind};
 use lldap_domain_handlers::password::{
-    PASSWORD_MIN_LENGTH, PASSWORD_POLICY_UNREADABLE, PasswordChangeError, password_rules,
+    PASSWORD_LENGTH_UNIT, PASSWORD_MIN_LENGTH, PASSWORD_POLICY_UNREADABLE, PasswordChangeError,
+    password_rules,
 };
 use lldap_opaque_handler::{OpaqueHandler, prepare_registration};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::warn;
@@ -38,7 +40,7 @@ const NO_FOLLOW: &str = "after kadmin change_password the status was not set fro
      lldap_disabled and stays as it was: no realm engine is wired to this host";
 const UNLOCK_ROW_BITS: u32 = kadm5_mask::TL_DATA | kadm5_mask::MOD_TIME | kadm5_mask::MOD_NAME;
 
-/// What derives a kadmin `cpw`'s OPAQUE record and reads its minimum: the server's handlers.
+/// What derives a kadmin `cpw`'s OPAQUE record: the server's handler, on the server's runtime.
 #[derive(Clone)]
 pub struct Records {
     pub handler: Arc<dyn OpaqueHandler>,
@@ -46,18 +48,29 @@ pub struct Records {
     pub runtime: tokio::runtime::Handle,
 }
 
+/// kadmind's thread waits at most `wait`, whether or not the runtime ever polls the task.
+fn answer_within<T: Send + 'static>(
+    runtime: &tokio::runtime::Handle,
+    wait: Duration,
+    work: impl std::future::Future<Output = T> + Send + 'static,
+) -> Result<T, String> {
+    let (answer, answered) = mpsc::sync_channel(1);
+    let task = runtime.spawn(async move {
+        let _ = answer.send(work.await);
+    });
+    let got = answered.recv_timeout(wait);
+    task.abort();
+    got.map_err(|e| match e {
+        RecvTimeoutError::Timeout => format!("no answer within {wait:?}"),
+        RecvTimeoutError::Disconnected => "the task ended without an answer".to_owned(),
+    })
+}
+
 impl Records {
     fn min_length(&self, user: &UserId) -> Result<usize, String> {
         let (policies, user) = (Arc::clone(&self.policies), user.clone());
-        let task = self.runtime.spawn(async move {
-            tokio::time::timeout(MIN_WAIT, policies.password_min_length(&user)).await
-        });
-        match self.runtime.block_on(task) {
-            Ok(Ok(Ok(min))) => Ok(min),
-            Ok(Ok(Err(e))) => Err(e.to_string()),
-            Ok(Err(_)) => Err(format!("no answer within {MIN_WAIT:?}")),
-            Err(e) => Err(e.to_string()),
-        }
+        let read = async move { policies.password_min_length(&user).await };
+        answer_within(&self.runtime, MIN_WAIT, read)?.map_err(|e| e.to_string())
     }
 
     fn hold(
@@ -77,18 +90,15 @@ impl Records {
     fn derive(&self, user: &UserId, password: &[u8]) -> Result<Vec<u8>, KerberosStoreError> {
         let (handler, user) = (Arc::clone(&self.handler), user.clone());
         let password = Zeroizing::new(password.to_vec());
-        let task = self.runtime.spawn(async move {
-            let derived = prepare_registration(&*handler, user, password.as_slice());
-            tokio::time::timeout(DERIVE_WAIT, derived).await
-        });
+        let derived =
+            async move { prepare_registration(&*handler, user, password.as_slice()).await };
         let failed = |why: String| {
             KerberosStoreError::Failed(format!("the password record was not derived: {why}"))
         };
-        match self.runtime.block_on(task) {
-            Ok(Ok(Ok((record, _)))) => Ok(record),
-            Ok(Ok(Err(e))) => Err(failed(e.to_string())),
-            Ok(Err(_)) => Err(failed(format!("no answer within {DERIVE_WAIT:?}"))),
-            Err(e) => Err(failed(e.to_string())),
+        match answer_within(&self.runtime, DERIVE_WAIT, derived) {
+            Ok(Ok((record, _))) => Ok(record),
+            Ok(Err(e)) => Err(failed(e.to_string())),
+            Err(why) => Err(failed(why)),
         }
     }
 }
@@ -467,7 +477,6 @@ pub(crate) fn code_name(code: u32) -> &'static str {
     }
 }
 
-/// Why a kadmin write is denied: its code, a password under a minimum, or no minimum read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Refusal {
     Code(u32),
@@ -478,7 +487,6 @@ enum Refusal {
 const PROTECTED: Refusal = Refusal::Code(KADM5_PROTECT_PRINCIPAL);
 
 impl Refusal {
-    /// A verdict's code: its TOOSHORT is the floor's.
     fn of(code: u32) -> Self {
         match code {
             KADM5_PASS_Q_TOOSHORT => Self::TooShort(PASSWORD_MIN_LENGTH),
@@ -502,7 +510,9 @@ fn denied(intent: &WriteIntent, refusal: Refusal, named: &Named) -> KerberosStor
         _ => String::new(),
     };
     let text = match refusal {
-        Refusal::TooShort(min) => format!("the password is shorter than {min} characters"),
+        Refusal::TooShort(min) => {
+            format!("the password is shorter than {min} {PASSWORD_LENGTH_UNIT}")
+        }
         Refusal::PolicyUnread => PASSWORD_POLICY_UNREADABLE.to_owned(),
         Refusal::Code(KADM5_PASS_Q_GENERIC) => {
             "the password must be valid UTF-8 without a NUL character (U+0000)".to_owned()
@@ -519,7 +529,6 @@ fn denied(intent: &WriteIntent, refusal: Refusal, named: &Named) -> KerberosStor
     logged_denial(intent, code, named, &cause, text)
 }
 
-/// A `cpw` whose commit came without the record `prepare` derived for its user.
 fn unprepared(intent: &WriteIntent, named: &Named) -> KerberosStoreError {
     let why = format!(": {UNPREPARED}");
     let text = format!("{UNPREPARED}; try again");
@@ -3347,6 +3356,87 @@ mod tests {
         );
         drop((embedded, store, host, temp));
         runtime.block_on(committer.shutdown());
+    }
+
+    #[test]
+    #[serial]
+    fn test_kadminds_wait_for_the_minimum_ends_at_its_bound_on_a_runtime_that_never_runs_it() {
+        type Answer = ((String, String), usize, bool);
+        const PASSWORD: &[u8] = b"Dora-Pass-12";
+        let idle = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let busy = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let (blocked_tx, blocked) = std::sync::mpsc::channel();
+        busy.spawn(async move {
+            blocked_tx.send(()).unwrap();
+            let _ = released.recv_timeout(Duration::from_secs(20));
+        });
+        blocked.recv().unwrap();
+        let named = Named::of("dora@EXAMPLE.COM", "EXAMPLE.COM");
+        let mut intent = WriteIntent::new(Operation::ChangePassword, Caller::Embedder);
+        intent.password = Some(Zeroizing::new(PASSWORD.to_vec()));
+        intent.keepold = Some(0);
+        let held = |runtime: &tokio::runtime::Handle| -> Answer {
+            let (policies, asked) = minimums(&[Some(8)]);
+            let records = Records {
+                handler: Arc::new(lldap_test_utils::MockTestBackendHandler::new()),
+                policies,
+                runtime: runtime.clone(),
+            };
+            let started = std::time::Instant::now();
+            let answer = match records.hold(&intent, &named, &UserId::new("dora"), PASSWORD) {
+                Ok(min) => (format!("held to {min}"), String::new()),
+                Err(KerberosStoreError::Denied(denial)) => {
+                    (code_name(denial.kadm5_code).to_owned(), denial.text)
+                }
+                Err(e) => ("another answer".to_owned(), e.to_string()),
+            };
+            let took = started.elapsed();
+            let bounded = took >= MIN_WAIT && took < MIN_WAIT + Duration::from_secs(3);
+            (answer, asked.load(Ordering::SeqCst), bounded)
+        };
+        let got = [
+            ("current_thread, never driven", held(idle.handle())),
+            ("one worker, blocked", held(busy.handle())),
+        ];
+        let _ = release.send(());
+        let refused = (
+            (
+                "PASS_Q_GENERIC".to_owned(),
+                "the password policy could not be read; try again".to_owned(),
+            ),
+            0,
+            true,
+        );
+        assert_eq!(
+            got,
+            [
+                ("current_thread, never driven", refused.clone()),
+                ("one worker, blocked", refused),
+            ],
+            "the unreadable refusal at the bound, the read never run"
+        );
+        let short = Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let derived = answer_within(idle.handle(), short, async { 7 });
+        let took = started.elapsed();
+        let driven = answer_within(busy.handle(), Duration::from_secs(10), async { 7 });
+        assert_eq!(
+            (
+                derived,
+                took >= short && took < short + Duration::from_secs(3),
+                driven
+            ),
+            (Err("no answer within 200ms".to_owned()), true, Ok(7)),
+            "the derive's wait has the same bound: {took:?}"
+        );
     }
 
     #[test]
@@ -6394,6 +6484,87 @@ mod tests {
             Ok("ask carl@EXAMPLE.COM as carl, onto bobby@EXAMPLE.COM".to_owned()),
             "an alias row: its target is asked of the directory, and followed in its rows"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn test_kadmin_counts_a_new_password_as_password_length() {
+        use lldap_auth::password_length;
+        const MEETS: &str = "meets the minimum";
+        type Row = (
+            &'static str,
+            usize,
+            (usize, usize),
+            &'static str,
+            &'static str,
+        );
+        let rows: [Row; 5] = [
+            (
+                "ääääääää",
+                12,
+                (8, 16),
+                "password bob@EXAMPLE.COM",
+                "the password is shorter than 12 characters",
+            ),
+            (
+                "ääää",
+                8,
+                (4, 8),
+                "PASS_Q_TOOSHORT",
+                "the password is shorter than 8 characters",
+            ),
+            (
+                "e\u{301}e\u{301}e\u{301}e\u{301}",
+                8,
+                (8, 12),
+                "password bob@EXAMPLE.COM",
+                MEETS,
+            ),
+            (
+                "",
+                8,
+                (0, 0),
+                "PASS_Q_TOOSHORT",
+                "the password is shorter than 8 characters",
+            ),
+            (
+                "a\0aaaaaaa",
+                8,
+                (9, 9),
+                "PASS_Q_GENERIC",
+                "the password must be valid UTF-8 without a NUL character (U+0000)",
+            ),
+        ];
+        let named = || Named::of("bob@EXAMPLE.COM", "EXAMPLE.COM");
+        let judged = |text: &'static str, min: usize| {
+            let mut intent = WriteIntent::new(Operation::ChangePassword, Caller::Embedder);
+            intent.password = Some(Zeroizing::new(text.as_bytes().to_vec()));
+            intent.keepold = Some(0);
+            let verdict = match password_verdict(&intent, named()) {
+                Verdict::Password(to) => format!("password {}", to.principal),
+                Verdict::Deny { code, .. } => code_name(code).to_owned(),
+                other => format!("{other:?}"),
+            };
+            let held = match held_to(&intent, &named(), text.as_bytes(), min) {
+                Ok(()) => MEETS.to_owned(),
+                Err(KerberosStoreError::Denied(denial)) => denial.text,
+                Err(e) => e.to_string(),
+            };
+            let counted = (password_length(text), text.len());
+            (text, min, counted, verdict, held)
+        };
+        let got = rows.map(|(text, min, ..)| judged(text, min));
+        let want = rows.map(|(text, min, counts, verdict, held)| {
+            (text, min, counts, verdict.to_owned(), held.to_owned())
+        });
+        assert_eq!(got, want);
+        for (text, min, _, verdict, held) in rows.into_iter().filter(|row| !row.0.contains('\0')) {
+            assert_eq!(
+                (verdict == "PASS_Q_TOOSHORT", held != MEETS),
+                (password_length(text) < 8, password_length(text) < min),
+                "{text:?}: the verdict holds the floor and the commit the minimum, as counted"
+            );
+        }
     }
 
     #[test]

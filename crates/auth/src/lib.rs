@@ -11,6 +11,53 @@ pub mod access_control;
 pub mod kerberos_envelope;
 pub mod opaque;
 
+pub const PASSWORD_LENGTH_UNIT: &str = "characters";
+pub const PASSWORD_HAS_NUL: &str = "the password must not contain a NUL character (U+0000)";
+pub const PASSWORD_EMPTY: &str = "the password must not be empty";
+pub const PASSWORD_MIN_LENGTH: usize = 8;
+
+pub fn password_length(password: &str) -> usize {
+    password.chars().count()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PasswordShapeError {
+    Empty,
+    HasNul,
+    TooShort(usize),
+}
+
+impl fmt::Display for PasswordShapeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Empty => f.write_str(PASSWORD_EMPTY),
+            Self::HasNul => f.write_str(PASSWORD_HAS_NUL),
+            Self::TooShort(min) => {
+                write!(
+                    f,
+                    "the password must be at least {min} {PASSWORD_LENGTH_UNIT}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for PasswordShapeError {}
+
+/// Every door's rule for a new password: not empty, no NUL character, then `min`.
+pub fn password_shape(password: &str, min: usize) -> Result<(), PasswordShapeError> {
+    if password.is_empty() {
+        return Err(PasswordShapeError::Empty);
+    }
+    if password.contains('\0') {
+        return Err(PasswordShapeError::HasNul);
+    }
+    if password_length(password) < min {
+        return Err(PasswordShapeError::TooShort(min));
+    }
+    Ok(())
+}
+
 pub mod login {
     use super::{types::UserId, *};
 
@@ -324,4 +371,62 @@ pub struct JWTClaims {
     // Defaulted so tokens issued before this field existed still parse.
     #[serde(default)]
     pub password_reset: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_a_password_length_counts_characters_not_bytes() {
+        type Row = (&'static str, usize, usize);
+        let rows: [Row; 7] = [
+            ("", 0, 0),
+            ("Eight-88", 8, 8),
+            ("ääää", 4, 8),
+            ("ääääääää", 8, 16),
+            ("e\u{301}e\u{301}e\u{301}e\u{301}", 8, 12),
+            ("  Cafe\u{301}-Pass-12  ", 17, 18),
+            ("  Caf\u{e9}-Pass-12  ", 16, 17),
+        ];
+        let got = rows.map(|(text, ..)| (text, password_length(text), text.len()));
+        assert_eq!(got, rows);
+        assert_eq!(PASSWORD_LENGTH_UNIT, "characters");
+    }
+
+    #[test]
+    fn test_the_shared_rule_refuses_a_nul_at_any_minimum_then_counts_characters() {
+        use PasswordShapeError::{Empty, HasNul, TooShort};
+        type Row = (&'static str, usize, Result<(), PasswordShapeError>);
+        let rows: [Row; 15] = [
+            ("", 0, Err(Empty)),
+            ("", 1, Err(Empty)),
+            ("", 8, Err(Empty)),
+            ("", 128, Err(Empty)),
+            ("\0", 0, Err(HasNul)),
+            ("\0", 8, Err(HasNul)),
+            ("a\0aaaaaaa", 8, Err(HasNul)),
+            ("aaaaaaaaaaaa\0", 0, Err(HasNul)),
+            ("abc", 0, Ok(())),
+            (" ", 0, Ok(())),
+            ("ääää", 8, Err(TooShort(8))),
+            ("ääääääää", 8, Ok(())),
+            ("ääääääää", 9, Err(TooShort(9))),
+            ("e\u{301}e\u{301}e\u{301}e\u{301}", 8, Ok(())),
+            ("Twelve-12chr", 12, Ok(())),
+        ];
+        let got = rows.map(|(text, min, _)| (text, min, password_shape(text, min)));
+        assert_eq!(got, rows);
+        let texts = [Empty, HasNul, TooShort(8), TooShort(12)].map(|e| e.to_string());
+        assert_eq!(
+            texts,
+            [
+                "the password must not be empty",
+                "the password must not contain a NUL character (U+0000)",
+                "the password must be at least 8 characters",
+                "the password must be at least 12 characters",
+            ]
+        );
+        assert_eq!(PASSWORD_MIN_LENGTH, 8);
+    }
 }

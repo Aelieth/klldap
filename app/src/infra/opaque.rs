@@ -4,8 +4,12 @@
 //! component field between the start and finish steps.
 
 use crate::infra::encrypt::seal_kerberos_envelope;
-use anyhow::{Context, Result, bail, ensure};
-use lldap_auth::{login, opaque, registration};
+use anyhow::{Context, Result, bail};
+use lldap_auth::{
+    PASSWORD_LENGTH_UNIT, PASSWORD_MIN_LENGTH, PasswordShapeError, login, opaque, password_shape,
+    registration,
+};
+use validator::ValidationError;
 
 pub type RegistrationState = opaque::client::registration::ClientRegistration;
 pub type LoginState = opaque::client::login::ClientLogin;
@@ -13,7 +17,6 @@ pub type LoginState = opaque::client::login::ClientLogin;
 const START_FAILED: &str = "Could not initiate registration";
 const POLICY_UNREADABLE: &str = "the password policy could not be read; try again";
 
-/// The line a failed start shows: the server's sentence only for the unreadable-policy 400.
 pub fn start_failure_message(failure: &str) -> &'static str {
     if failure.contains("[400 ") && failure.contains(POLICY_UNREADABLE) {
         POLICY_UNREADABLE
@@ -38,7 +41,9 @@ pub fn begin_registration(
     RegistrationState,
     registration::ClientRegistrationStartRequest,
 )> {
-    ensure!(!password.is_empty(), "a password is required");
+    if let Some(refused) = refusal(password, 0, min_length_message) {
+        bail!("{refused}");
+    }
     let mut rng = rand::rngs::OsRng;
     let start = opaque::client::registration::start_registration(password.as_bytes(), &mut rng)
         .context(START_FAILED)?;
@@ -49,9 +54,40 @@ pub fn begin_registration(
     Ok((start.state, request))
 }
 
-/// The user's `password-min-length` from the start's answer when `password` is shorter.
-pub fn unmet_min_length(password: &str, min: Option<u32>) -> Option<u32> {
-    min.filter(|&min| password.chars().count() < min as usize)
+fn refusal(password: &str, min: usize, too_short: fn(usize) -> String) -> Option<String> {
+    match password_shape(password, min) {
+        Ok(()) => None,
+        Err(PasswordShapeError::TooShort(_)) => Some(too_short(min)),
+        Err(other) => Some(other.to_string()),
+    }
+}
+
+pub fn finish_refusal(password: &str, min: Option<u32>) -> Option<String> {
+    let min = min.map_or(0, |min| min as usize);
+    refusal(password, min, min_length_message)
+}
+
+pub fn min_length_message(min: usize) -> String {
+    format!("Invalid password. Min length: {min}")
+}
+
+fn below_the_floor(password: &str, text: fn(usize) -> String) -> Result<(), ValidationError> {
+    let Some(refused) = refusal(password, PASSWORD_MIN_LENGTH, text) else {
+        return Ok(());
+    };
+    let mut error = ValidationError::new("password");
+    error.message = Some(refused.into());
+    Err(error)
+}
+
+pub fn new_password_at_the_floor(password: &str) -> Result<(), ValidationError> {
+    below_the_floor(password, min_length_message)
+}
+
+pub fn new_user_password_at_the_floor(password: &str) -> Result<(), ValidationError> {
+    below_the_floor(password, |min| {
+        format!("Password must be at least {min} {PASSWORD_LENGTH_UNIT}")
+    })
 }
 
 /// Completes registration from the stashed state and the server's start
@@ -67,8 +103,8 @@ pub fn finish_registration(
         kerberos_envelope_key,
         password_min_length,
     } = start;
-    if let Some(min) = unmet_min_length(password, password_min_length) {
-        bail!("Invalid password. Min length: {min}");
+    if let Some(refused) = finish_refusal(password, password_min_length) {
+        bail!("{refused}");
     }
     let mut rng = rand::rngs::OsRng;
     let finish = opaque::client::registration::finish_registration(
@@ -155,6 +191,7 @@ pub fn finish_login(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lldap_auth::password_length;
 
     #[test]
     fn test_a_password_shorter_than_the_servers_minimum_is_not_finished() {
@@ -162,13 +199,15 @@ mod tests {
         const ELEVEN: &str = "Eleven-11ch";
         const TWELVE: &str = "Twelve-12chr";
         const ELEVEN_UMLAUTS: &str = "pässwörter1";
+        const MIN_12: &str = "Invalid password. Min length: 12";
         let rows = [
-            (ELEVEN, Some(12), Some(12)),
-            (ELEVEN_UMLAUTS, Some(12), Some(12)),
+            (ELEVEN, Some(12), Some(MIN_12)),
+            (ELEVEN_UMLAUTS, Some(12), Some(MIN_12)),
             (TWELVE, Some(12), None),
             (TWELVE, Some(8), None),
             (ELEVEN, None, None),
             (SEVEN, None, None),
+            ("", None, Some("the password must not be empty")),
         ];
         assert_eq!(
             [SEVEN, ELEVEN, TWELVE, ELEVEN_UMLAUTS].map(|p| (p.chars().count(), p.len())),
@@ -176,11 +215,123 @@ mod tests {
         );
         for (password, min, expected) in rows {
             assert_eq!(
-                unmet_min_length(password, min),
+                finish_refusal(password, min).as_deref(),
                 expected,
                 "{password} {min:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_the_pages_count_a_new_password_as_password_length() {
+        const PAGE: &str = "Invalid password. Min length: 8";
+        const CREATE: &str = "Password must be at least 8 characters";
+        const MIN_12: &str = "Invalid password. Min length: 12";
+        const EMPTY: &str = "the password must not be empty";
+        type Row = (
+            &'static str,
+            u32,
+            (usize, usize),
+            Option<&'static str>,
+            Option<&'static str>,
+            Option<&'static str>,
+        );
+        let rows: [Row; 5] = [
+            ("ääääääää", 12, (8, 16), Some(MIN_12), None, None),
+            ("ääää", 8, (4, 8), Some(PAGE), Some(PAGE), Some(CREATE)),
+            (
+                "äääääää",
+                12,
+                (7, 14),
+                Some(MIN_12),
+                Some(PAGE),
+                Some(CREATE),
+            ),
+            (
+                "e\u{301}e\u{301}e\u{301}e\u{301}",
+                8,
+                (8, 12),
+                None,
+                None,
+                None,
+            ),
+            ("", 8, (0, 0), Some(EMPTY), Some(EMPTY), Some(EMPTY)),
+        ];
+        let shown = |checked: Result<(), ValidationError>| {
+            checked
+                .err()
+                .and_then(|e| e.message)
+                .map(|text| text.into_owned())
+        };
+        let got = rows.map(|(text, min, ..)| {
+            (
+                text,
+                min,
+                (password_length(text), text.len()),
+                finish_refusal(text, Some(min)),
+                shown(new_password_at_the_floor(text)),
+                shown(new_user_password_at_the_floor(text)),
+            )
+        });
+        let want = rows.map(|(text, min, counts, unmet, page, create)| {
+            let owned = |text: Option<&str>| text.map(str::to_owned);
+            (text, min, counts, owned(unmet), owned(page), owned(create))
+        });
+        assert_eq!(got, want);
+        for (text, min, _, unmet, page, _) in rows {
+            let length = password_length(text);
+            assert_eq!(
+                (unmet.is_some(), page.is_some()),
+                (length < min as usize, length < 8),
+                "{text:?}: the finish and the pages count alike"
+            );
+        }
+        assert_eq!(min_length_message(12), "Invalid password. Min length: 12");
+    }
+
+    #[test]
+    fn test_the_pages_refuse_a_nul_in_the_shared_words_and_an_empty_password_at_the_floor() {
+        const PAGE: &str = "Invalid password. Min length: 8";
+        const CREATE: &str = "Password must be at least 8 characters";
+        const MIN_12: &str = "Invalid password. Min length: 12";
+        const NUL: &str = "the password must not contain a NUL character (U+0000)";
+        const EMPTY: &str = "the password must not be empty";
+        type Row = (
+            &'static str,
+            Option<&'static str>,
+            Option<&'static str>,
+            Option<&'static str>,
+        );
+        let rows: [Row; 7] = [
+            ("", Some(EMPTY), Some(EMPTY), Some(EMPTY)),
+            ("\0", Some(NUL), Some(NUL), Some(NUL)),
+            ("a\0aaaaaaa", Some(NUL), Some(NUL), Some(NUL)),
+            ("Twelve-12chr\0", Some(NUL), Some(NUL), Some(NUL)),
+            ("\0Twelve-12chr", Some(NUL), Some(NUL), Some(NUL)),
+            ("Seven-7", Some(PAGE), Some(CREATE), Some(MIN_12)),
+            ("Twelve-12chr", None, None, None),
+        ];
+        let shown = |checked: Result<(), ValidationError>| {
+            checked.err().and_then(|e| e.message).map(String::from)
+        };
+        let got = rows.map(|(text, ..)| {
+            (
+                text,
+                shown(new_password_at_the_floor(text)),
+                shown(new_user_password_at_the_floor(text)),
+                finish_refusal(text, Some(12)),
+            )
+        });
+        let want = rows.map(|(text, page, create, finish)| {
+            let owned = |text: Option<&str>| text.map(str::to_owned);
+            (text, owned(page), owned(create), owned(finish))
+        });
+        assert_eq!(got, want);
+        assert_eq!(
+            [finish_refusal("", None), finish_refusal("a\0b", None)],
+            [Some(EMPTY.to_owned()), Some(NUL.to_owned())],
+            "no minimum from the server: the shared rule still applies"
+        );
     }
 
     #[test]
@@ -261,7 +412,7 @@ mod tests {
         };
         assert_eq!(
             (started(""), started("Bob-Password-1")),
-            (Err("a password is required".to_owned()), Ok(()))
+            (Err("the password must not be empty".to_owned()), Ok(()))
         );
     }
 }

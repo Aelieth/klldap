@@ -8,6 +8,7 @@ use crate::{
         remove_user_from_group::RemoveUserFromGroupComponent,
         reset_mfa::ResetMfa,
         router::{AppRoute, Link},
+        sign_in_actions::SignInActions,
         user_details_form::UserDetailsForm,
     },
     infra::{
@@ -50,6 +51,7 @@ pub struct UserDetails {
     common: CommonComponentParts<Self>,
     user_and_schema: Option<(User, Vec<AttributeSchema>)>,
     lldap_disabled_group_id: Option<i64>,
+    sign_in_result: Option<String>,
 }
 
 impl UserDetails {
@@ -64,6 +66,8 @@ pub enum Msg {
     OnUserAddedToGroup(Group),
     OnUserRemovedFromGroup((String, i64)),
     OnMfaReset,
+    OnSignInAction(String),
+    OnSignInActionStarted,
     Refresh,
     AddToLldapDisabled,
     AddToLldapDisabledResponse(Result<add_user_to_group::ResponseData>),
@@ -87,6 +91,10 @@ pub fn blocks_own_reset(is_self: bool, mfa_mode: Option<&str>) -> bool {
 
 pub fn offers_enrolment(mfa_mode: Option<&str>) -> bool {
     matches!(mfa_mode, Some("enabled" | "always"))
+}
+
+pub fn keeps_sign_in_result(msg: &Msg) -> bool {
+    matches!(msg, Msg::OnSignInAction(_))
 }
 
 impl CommonComponent<UserDetails> for UserDetails {
@@ -114,6 +122,10 @@ impl CommonComponent<UserDetails> for UserDetails {
                 }
             },
             Msg::OnError(e) => return Err(e),
+            Msg::OnSignInAction(result) => {
+                self.sign_in_result = Some(result);
+            }
+            Msg::OnSignInActionStarted => {}
             Msg::OnUserAddedToGroup(group) => {
                 self.mut_groups().push(group);
             }
@@ -243,6 +255,7 @@ impl Component for UserDetails {
             common: CommonComponentParts::<Self>::create(),
             user_and_schema: None,
             lldap_disabled_group_id: None,
+            sign_in_result: None,
         };
         component.get_user_details(ctx);
         component.common.call_graphql::<GetGroupList, _>(
@@ -255,6 +268,9 @@ impl Component for UserDetails {
     }
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
+        if !keeps_sign_in_result(&msg) {
+            self.sign_in_result = None;
+        }
         CommonComponentParts::<Self>::update(self, ctx, msg)
     }
 
@@ -292,6 +308,11 @@ impl Component for UserDetails {
                         >
                             {label}
                         </button>
+                        <SignInActions
+                            username={u.id.clone()}
+                            on_start={link.callback(|_| Msg::OnSignInActionStarted)}
+                            on_done={link.callback(Msg::OnSignInAction)}
+                            on_error={link.callback(Msg::OnError)} />
                         </div>
                     }
                 } else {
@@ -302,6 +323,9 @@ impl Component for UserDetails {
                   <>
                   <h3>{u.id.to_string()}</h3>
                   {toggle_row}
+                  { if let Some(result) = &self.sign_in_result {
+                    html! { <div class="alert alert-success" id="sign-in-action-result">{result}</div> }
+                  } else { html! {} }}
                   <div class="d-flex flex-row-reverse">
                   { if can_change_password {
                     html! {
@@ -475,6 +499,25 @@ impl UserDetails {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_the_result_line_lasts_until_the_next_action() {
+        let rows = [
+            (
+                "its own result",
+                Msg::OnSignInAction("Unlocked bob".to_owned()),
+                true,
+            ),
+            ("a sign-in action starts", Msg::OnSignInActionStarted, false),
+            ("the disable toggle", Msg::AddToLldapDisabled, false),
+            ("a refresh", Msg::Refresh, false),
+            ("a two-factor reset", Msg::OnMfaReset, false),
+            ("an error", Msg::OnError(anyhow!("refused")), false),
+        ];
+        for (label, msg, kept) in rows {
+            assert_eq!(keeps_sign_in_result(&msg), kept, "{label}");
+        }
+    }
 
     #[test]
     fn test_the_buttons_follow_the_users_resolved_mode() {

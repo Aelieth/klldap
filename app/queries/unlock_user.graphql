@@ -1,0 +1,5 @@
+mutation UnlockUser($user: String!) {
+  unlockUser(userId: $user) {
+    ok
+  }
+}

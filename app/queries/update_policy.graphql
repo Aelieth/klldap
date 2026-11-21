@@ -1,5 +1,6 @@
 mutation UpdatePolicy($policyId: Int!, $name: String, $description: String, $items: [PolicyItemInput!]) {
   updatePolicy(policyId: $policyId, name: $name, description: $description, items: $items) {
     ok
+    warnings
   }
 }

@@ -54,6 +54,7 @@ pub struct App {
     mfa_enrollment_pending: bool,
     mfa_server_wide: Option<String>,
     domain: Option<String>,
+    login_hours_timezone: Option<String>,
 }
 
 // Session state the routes need, kept together so dispatch_route keeps a readable signature.
@@ -63,6 +64,7 @@ struct SessionRouting {
     mfa_enrollment_pending: bool,
     mfa_server_wide: Option<String>,
     domain: Option<String>,
+    login_hours_timezone: Option<String>,
 }
 
 pub enum Msg {
@@ -98,6 +100,7 @@ impl Component for App {
             mfa_enrollment_pending: false,
             mfa_server_wide: None,
             domain: None,
+            login_hours_timezone: None,
         };
         ctx.link()
             .send_future(async move { Msg::SettingsReceived(HostService::get_settings().await) });
@@ -142,6 +145,8 @@ impl Component for App {
                 self.mfa_enabled = Some(settings.mfa_enabled);
                 self.mfa_server_wide = settings.mfa_server_wide;
                 self.domain = Some(settings.domain).filter(|d| !d.is_empty());
+                self.login_hours_timezone =
+                    Some(settings.login_hours_timezone).filter(|zone| !zone.is_empty());
             }
             Msg::SettingsReceived(Err(err)) => {
                 error!(err.to_string());
@@ -171,6 +176,7 @@ impl Component for App {
             mfa_enrollment_pending: self.mfa_enrollment_pending,
             mfa_server_wide: self.mfa_server_wide.clone(),
             domain: self.domain.clone(),
+            login_hours_timezone: self.login_hours_timezone.clone(),
         };
         html! {
           <div>
@@ -289,7 +295,10 @@ impl App {
                 }
             }
             AppRoute::ListPolicies => html! {
-                <PolicyWorkbench domain={domain.clone()} mfa_server_wide={session.mfa_server_wide.clone()} />
+                <PolicyWorkbench
+                    domain={domain.clone()}
+                    mfa_server_wide={session.mfa_server_wide.clone()}
+                    login_hours_timezone={session.login_hours_timezone.clone()} />
             },
             AppRoute::ListUserSchema => html! {
                 <ListUserSchema />

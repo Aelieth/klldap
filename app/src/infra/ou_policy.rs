@@ -184,7 +184,11 @@ pub fn catalog_text(key: &str) -> Option<CatalogText> {
             "CIDRs with explicit prefix, comma-separated · empty = any",
             "10.0.0.0/8, 2001:db8::/32",
         ),
-        "inactivity-days" => ("Disable after inactivity (days)", "0 = never disable", ""),
+        "inactivity-days" => (
+            "Inactivity limit (days)",
+            "Refuses sign-in to a user with no successful sign-in for this many days; 0 turns it off. An admin re-enables the user.",
+            "",
+        ),
         _ => return None,
     };
     Some(CatalogText {
@@ -194,11 +198,54 @@ pub fn catalog_text(key: &str) -> Option<CatalogText> {
     })
 }
 
+pub fn zone_note(zone: Option<&str>) -> Option<String> {
+    zone.map(str::trim)
+        .filter(|zone| !zone.is_empty())
+        .map(|zone| format!("judged in {zone}"))
+}
+
+pub fn seen_as_note(address: Option<&str>) -> String {
+    format!("The server sees you as {}", address.unwrap_or("unknown"))
+}
+
+pub const SAVED_CLASS: &str = "alert alert-success mt-3";
+pub const SAVE_WARNING_CLASS: &str = "alert alert-warning mt-3 wb-save-warning";
+
+/// A warning does not undo the save: the success line stays, each warning follows it.
+pub fn after_save(message: String, warnings: Vec<String>) -> Vec<(&'static str, String)> {
+    std::iter::once((SAVED_CLASS, message))
+        .chain(
+            warnings
+                .into_iter()
+                .map(|warning| (SAVE_WARNING_CLASS, warning)),
+        )
+        .collect()
+}
+
+pub const REFUSED_CLASS: &str = "alert alert-warning mt-3 wb-save-refused";
+pub const REFUSED_AFTER_WARNING: &str = "The server refused the next request: this session is outside the list now. The way back is on the host: lldap policy-unlink, as the warning above names it.";
+
+/// A 401 right after a warned save is the warning come true: said in words, not as an error.
+pub fn note_refusal(saved: &mut Vec<(&'static str, String)>, error: &str) -> bool {
+    let warned = saved.iter().any(|(class, _)| *class == SAVE_WARNING_CLASS);
+    if !warned || !error.contains("[401 ") {
+        return false;
+    }
+    if !saved.iter().any(|(class, _)| *class == REFUSED_CLASS) {
+        saved.push((REFUSED_CLASS, REFUSED_AFTER_WARNING.to_owned()));
+    }
+    true
+}
+
+pub fn kept_error<E>(shown: Option<E>, late: Option<E>) -> Option<E> {
+    shown.or(late)
+}
+
 pub fn format_item_value(key: &str, value: &str) -> String {
     match key {
         "login-hours" if value.is_empty() => "always".to_owned(),
         "allowed-networks" if value.is_empty() => "any network".to_owned(),
-        "inactivity-days" if value == "0" => "never".to_owned(),
+        "inactivity-days" if value == "0" => "off".to_owned(),
         "inactivity-days" => format!("{value} days"),
         "lockout-threshold" if value == "0" => "off".to_owned(),
         "lockout-threshold" => format!("{value} tries"),
@@ -402,6 +449,120 @@ mod tests {
     }
 
     #[test]
+    fn test_the_inactivity_item_is_worded_as_the_catalog_says() {
+        let text = catalog_text("inactivity-days").unwrap();
+        assert_eq!(
+            (text.label, text.help, text.placeholder),
+            (
+                "Inactivity limit (days)",
+                "Refuses sign-in to a user with no successful sign-in for this many days; 0 turns it off. An admin re-enables the user.",
+                "",
+            )
+        );
+    }
+
+    #[test]
+    fn test_the_login_hours_field_names_the_servers_zone() {
+        for (zone, expected) in [
+            (Some("UTC"), Some("judged in UTC")),
+            (Some("Europe/Berlin"), Some("judged in Europe/Berlin")),
+            (Some(""), None),
+            (Some("  "), None),
+            (None, None),
+        ] {
+            assert_eq!(zone_note(zone).as_deref(), expected, "{zone:?}");
+        }
+    }
+
+    #[test]
+    fn test_the_page_says_which_address_the_server_sees() {
+        for (address, expected) in [
+            (Some("172.17.0.1"), "The server sees you as 172.17.0.1"),
+            (Some("2001:db8::7"), "The server sees you as 2001:db8::7"),
+            (None, "The server sees you as unknown"),
+        ] {
+            assert_eq!(seen_as_note(address), expected, "{address:?}");
+        }
+    }
+
+    #[test]
+    fn test_a_save_shows_its_warnings_after_the_success_line() {
+        let warned = "allowed-networks: the list that now applies to you does not contain the address the server sees you as (172.17.0.1). The way back, on the host: lldap policy-unlink --config-file <config> 'people'";
+        assert_eq!(
+            after_save("Policy saved".to_owned(), vec![warned.to_owned()]),
+            vec![
+                ("alert alert-success mt-3", "Policy saved".to_owned()),
+                (
+                    "alert alert-warning mt-3 wb-save-warning",
+                    warned.to_owned()
+                ),
+            ]
+        );
+        assert_eq!(
+            after_save("Policy Desk set on people".to_owned(), Vec::new()),
+            vec![(
+                "alert alert-success mt-3",
+                "Policy Desk set on people".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn test_a_refusal_after_a_warned_save_is_said_with_the_way_back() {
+        let warned = "allowed-networks: the list that now applies to you does not contain the address the server sees you as (unknown). The way back, on the host: lldap policy-unlink --config-file <config> '(root)'";
+        let refused =
+            "Error trying to fetch effective policy items[401 Unauthorized]: Access refused";
+        let failed =
+            "Error trying to fetch effective policy items[500 Internal Server Error]: down";
+        let said = "The server refused the next request: this session is outside the list now. The way back is on the host: lldap policy-unlink, as the warning above names it.";
+        let saved = || after_save("Policy saved".to_owned(), vec![warned.to_owned()]);
+        let mut lines = saved();
+        let first = note_refusal(&mut lines, refused);
+        let again = note_refusal(&mut lines, refused);
+        assert_eq!(
+            (first, again, lines),
+            (
+                true,
+                true,
+                vec![
+                    ("alert alert-success mt-3", "Policy saved".to_owned()),
+                    (
+                        "alert alert-warning mt-3 wb-save-warning",
+                        warned.to_owned()
+                    ),
+                    ("alert alert-warning mt-3 wb-save-refused", said.to_owned()),
+                ]
+            ),
+            "the warning stays, one line says the refusal and the way back"
+        );
+        let unwarned = after_save("Policy saved".to_owned(), Vec::new());
+        for (label, mut lines, error) in [
+            ("another failure after a warning", saved(), failed),
+            ("a refusal after a save with no warning", unwarned, refused),
+        ] {
+            let before = lines.clone();
+            assert_eq!(
+                (note_refusal(&mut lines, error), lines),
+                (false, before),
+                "{label} stays an error"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_late_answer_keeps_the_error_already_shown() {
+        assert_eq!(
+            [
+                kept_error(Some("refused"), None),
+                kept_error(Some("refused"), Some("late")),
+                kept_error(None, Some("late")),
+                kept_error(None, None),
+            ],
+            [Some("refused"), Some("refused"), Some("late"), None]
+        );
+    }
+
+    #[test]
     fn test_format_item_value() {
         for (name, key, value, expected) in [
             ("mfa token verbatim", "enable-mfa", "always", "always"),
@@ -424,7 +585,7 @@ mod tests {
                 "10.0.0.0/8",
                 "10.0.0.0/8",
             ),
-            ("zero inactivity is never", "inactivity-days", "0", "never"),
+            ("zero inactivity is off", "inactivity-days", "0", "off"),
             ("inactivity gets a unit", "inactivity-days", "90", "90 days"),
             ("zero threshold is off", "lockout-threshold", "0", "off"),
             ("threshold gets tries", "lockout-threshold", "5", "5 tries"),

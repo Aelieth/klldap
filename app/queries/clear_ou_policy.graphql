@@ -1,5 +1,6 @@
 mutation ClearOuPolicyQuery($ou: String!) {
   clearOuPolicy(ou: $ou) {
     ok
+    warnings
   }
 }

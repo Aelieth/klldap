@@ -1,0 +1,10 @@
+query GetSignInState($id: String!) {
+  user(userId: $id) {
+    signInState {
+      locked
+      lockedUntil
+      inactive
+      inactiveSince
+    }
+  }
+}

@@ -39,6 +39,7 @@ pub mod reset_password_step2;
 pub mod router;
 pub mod search;
 pub mod select;
+pub mod sign_in_actions;
 pub mod status_modal;
 pub mod table_action_bar;
 pub mod table_bulk_selection;

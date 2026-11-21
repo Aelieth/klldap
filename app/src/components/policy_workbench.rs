@@ -7,8 +7,9 @@ use crate::infra::{
     form_utils::{input_checked, input_value, select_value},
     modal::ModalHandle,
     ou_policy::{
-        DraftEntry, OuRow, ROOT_OU_WIRE, catalog_text, flatten_ou_rows, format_item_value,
-        governing_policy, ou_display_name, policy_color, validate_draft_items,
+        DraftEntry, OuRow, ROOT_OU_WIRE, after_save, catalog_text, flatten_ou_rows,
+        format_item_value, governing_policy, kept_error, note_refusal, ou_display_name,
+        policy_color, seen_as_note, validate_draft_items, zone_note,
     },
     queries::{ListOusQuery, list_ous_query},
     schema::{PolicyScope, PolicyValueKind},
@@ -110,6 +111,15 @@ pub struct ClearOuPolicyQuery;
 )]
 pub struct SetOuPolicyInheritanceQuery;
 
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "../schema.graphql",
+    query_path = "queries/get_client_address.graphql",
+    response_derives = "Debug",
+    custom_scalars_module = "crate::infra::graphql"
+)]
+pub struct GetClientAddress;
+
 pub type Policy = get_policy_list::GetPolicyListPolicies;
 type PolicyItem = get_policy_list::GetPolicyListPoliciesItems;
 type CatalogRow = get_policy_item_catalog::GetPolicyItemCatalogPolicyItemCatalog;
@@ -147,6 +157,8 @@ pub struct Props {
     pub domain: Option<String>,
     #[prop_or_default]
     pub mfa_server_wide: Option<String>,
+    #[prop_or_default]
+    pub login_hours_timezone: Option<String>,
 }
 
 pub fn server_wide_line(value: &str) -> String {
@@ -169,11 +181,13 @@ pub struct PolicyWorkbench {
     draft: Option<PolicyDraft>,
     pending_update: Option<PendingUpdate>,
     modal: ModalHandle,
-    success_message: Option<String>,
+    saved: Vec<(&'static str, String)>,
+    client_address: Option<Option<String>>,
 }
 
 pub enum Msg {
     OusResponse(Result<list_ous_query::ResponseData>),
+    ClientAddressResponse(Result<get_client_address::ResponseData>),
     PoliciesResponse(Result<get_policy_list::ResponseData>),
     CatalogResponse(Result<get_policy_item_catalog::ResponseData>),
     StatesResponse(Result<get_ou_policy_states::ResponseData>),
@@ -222,6 +236,17 @@ impl CommonComponent<PolicyWorkbench> for PolicyWorkbench {
         match msg {
             Msg::OusResponse(response) => {
                 self.ous = Some(response?.list_ous);
+                // Asked only after an admin-only read: its answer would clear a refusal.
+                self.common.call_graphql::<GetClientAddress, _>(
+                    ctx,
+                    get_client_address::Variables {},
+                    Msg::ClientAddressResponse,
+                    "Error trying to fetch the address the server sees",
+                );
+                Ok(true)
+            }
+            Msg::ClientAddressResponse(response) => {
+                self.client_address = Some(response?.client_address);
                 Ok(true)
             }
             Msg::PoliciesResponse(response) => {
@@ -247,8 +272,17 @@ impl CommonComponent<PolicyWorkbench> for PolicyWorkbench {
                 Ok(true)
             }
             Msg::EffectiveResponse(ou, response) => {
-                self.effective.insert(ou, response?.effective_policy_items);
-                Ok(true)
+                let error = match response {
+                    Ok(data) => {
+                        self.effective.insert(ou, data.effective_policy_items);
+                        return Ok(true);
+                    }
+                    Err(error) => error,
+                };
+                if note_refusal(&mut self.saved, &error.to_string()) {
+                    return Ok(true);
+                }
+                Err(error)
             }
             Msg::SelectOu(ou) => {
                 if !self.effective.contains_key(&ou) {
@@ -339,13 +373,13 @@ impl CommonComponent<PolicyWorkbench> for PolicyWorkbench {
                         "Error trying to set OU policy",
                     );
                 } else {
-                    self.finish_mutation(ctx, format!("Policy {name} created"));
+                    self.finish_mutation(ctx, format!("Policy {name} created"), Vec::new());
                 }
                 Ok(true)
             }
             Msg::UpdateResponse(id, response) => {
                 let pending = self.pending_update.take();
-                response?;
+                let warnings = response?.update_policy.warnings;
                 if let (Some(pending), Some(policies)) =
                     (pending.filter(|p| p.id == id), self.policies.as_mut())
                 {
@@ -362,7 +396,7 @@ impl CommonComponent<PolicyWorkbench> for PolicyWorkbench {
                         *name = pending.name.clone();
                     }
                 }
-                self.finish_mutation(ctx, "Policy saved".to_owned());
+                self.finish_mutation(ctx, "Policy saved".to_owned(), warnings);
                 Ok(true)
             }
             Msg::UsePolicy(id) => {
@@ -387,10 +421,10 @@ impl CommonComponent<PolicyWorkbench> for PolicyWorkbench {
                     // resync instead of guessing.
                     self.refetch_states_and_policies(ctx);
                 }
-                response?;
+                let warnings = response?.set_ou_policy.warnings;
                 self.direct.insert(ou.clone(), (id, name.clone()));
                 let display = ou_display_name(&ou, ctx.props().domain.as_deref());
-                self.finish_mutation(ctx, format!("Policy {name} set on {display}"));
+                self.finish_mutation(ctx, format!("Policy {name} set on {display}"), warnings);
                 Ok(true)
             }
             Msg::RemovePolicy => {
@@ -405,14 +439,18 @@ impl CommonComponent<PolicyWorkbench> for PolicyWorkbench {
                 Ok(true)
             }
             Msg::ClearResponse(ou, response) => {
-                response?;
+                let warnings = response?.clear_ou_policy.warnings;
                 let name = self
                     .direct
                     .remove(&ou)
                     .map(|(_, name)| name)
                     .unwrap_or_default();
                 let display = ou_display_name(&ou, ctx.props().domain.as_deref());
-                self.finish_mutation(ctx, format!("Policy {name} removed from {display}"));
+                self.finish_mutation(
+                    ctx,
+                    format!("Policy {name} removed from {display}"),
+                    warnings,
+                );
                 Ok(true)
             }
             Msg::ToggleBlock(blocked) => {
@@ -427,7 +465,7 @@ impl CommonComponent<PolicyWorkbench> for PolicyWorkbench {
                 Ok(true)
             }
             Msg::BlockResponse(ou, blocked, response) => {
-                response?;
+                let warnings = response?.set_ou_policy_inheritance.warnings;
                 let display = ou_display_name(&ou, ctx.props().domain.as_deref());
                 let message = if blocked {
                     self.blocked.insert(ou);
@@ -436,7 +474,7 @@ impl CommonComponent<PolicyWorkbench> for PolicyWorkbench {
                     self.blocked.remove(&ou);
                     format!("Rules from above now inherited for {display}")
                 };
-                self.finish_mutation(ctx, message);
+                self.finish_mutation(ctx, message, warnings);
                 Ok(true)
             }
             Msg::ClickedDeletePolicy => {
@@ -461,13 +499,13 @@ impl CommonComponent<PolicyWorkbench> for PolicyWorkbench {
                 Ok(true)
             }
             Msg::DeleteResponse(id, response) => {
-                response?;
+                let warnings = response?.delete_policy.warnings;
                 let name = self.policy_name(id).unwrap_or_default();
                 if let Some(policies) = &mut self.policies {
                     policies.retain(|p| p.id != id);
                 }
                 self.direct.retain(|_, (pid, _)| *pid != id);
-                self.finish_mutation(ctx, format!("Policy {name} deleted"));
+                self.finish_mutation(ctx, format!("Policy {name} deleted"), warnings);
                 Ok(true)
             }
         }
@@ -497,7 +535,8 @@ impl Component for PolicyWorkbench {
             draft: None,
             pending_update: None,
             modal: ModalHandle::new(),
-            success_message: None,
+            saved: Vec::new(),
+            client_address: None,
         };
         page.common.call_graphql::<ListOusQuery, _>(
             ctx,
@@ -534,10 +573,16 @@ impl Component for PolicyWorkbench {
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
         // The effective refetch chained after every mutation must not wipe the
         // freshly set success banner.
-        if !matches!(msg, Msg::EffectiveResponse(..)) {
-            self.success_message = None;
+        let late = matches!(msg, Msg::ClientAddressResponse(..));
+        if !late && !matches!(msg, Msg::EffectiveResponse(..)) {
+            self.saved.clear();
         }
-        CommonComponentParts::<Self>::update(self, ctx, msg)
+        let shown = if late { self.common.error.take() } else { None };
+        let render = CommonComponentParts::<Self>::update(self, ctx, msg);
+        if late {
+            self.common.error = kept_error(shown, self.common.error.take());
+        }
+        render
     }
 
     fn view(&self, ctx: &Context<Self>) -> Html {
@@ -585,9 +630,9 @@ impl Component for PolicyWorkbench {
                 { if let Some(e) = &self.common.error {
                     html! { <div class="alert alert-danger mt-3">{"Error: "}{e.to_string()}</div> }
                 } else { html! {} } }
-                { if let Some(message) = &self.success_message {
-                    html! { <div class="alert alert-success mt-3">{message}</div> }
-                } else { html! {} } }
+                { for self.saved.iter().map(|(class, text)| html! {
+                    <div class={*class}>{text}</div>
+                }) }
                 {self.view_delete_modal(ctx)}
             </div>
         }
@@ -620,8 +665,8 @@ impl PolicyWorkbench {
         );
     }
 
-    fn finish_mutation(&mut self, ctx: &Context<Self>, message: String) {
-        self.success_message = Some(message);
+    fn finish_mutation(&mut self, ctx: &Context<Self>, message: String, warnings: Vec<String>) {
+        self.saved = after_save(message, warnings);
         self.mode = Mode::View;
         self.draft = None;
         self.effective.clear();
@@ -1350,6 +1395,15 @@ impl PolicyWorkbench {
         } else {
             "border rounded px-3 py-2 d-flex align-items-center flex-wrap gap-2"
         };
+        let note = match entry.key.as_str() {
+            "login-hours" => zone_note(ctx.props().login_hours_timezone.as_deref()),
+            "allowed-networks" => self
+                .client_address
+                .as_ref()
+                .map(|address| seen_as_note(address.as_deref())),
+            _ => None,
+        };
+        let note_id = format!("wb-note-{}", entry.key);
         let checkbox_id = format!("wb-rule-{}", entry.key);
         html! {
             <div class={row_class}>
@@ -1366,6 +1420,9 @@ impl PolicyWorkbench {
                     <span class="font-monospace small text-muted">{&entry.key}</span>
                 </label>
                 {control}
+                { note.map_or_else(|| html! {}, |note| html! {
+                    <span class="small text-nowrap" id={note_id}>{note}</span>
+                }) }
                 <span class="small text-muted" style="flex: 1; min-width: 150px">{help}</span>
             </div>
         }
@@ -1431,6 +1488,69 @@ impl PolicyWorkbench {
                     </div>
                 </div>
             </div>
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_each_policy_write_hands_its_warnings_to_the_page() {
+        let warned = "allowed-networks: the list that now applies to you does not contain the address the server sees you as (172.17.0.1). The way back, on the host: lldap policy-unlink --config-file <config> 'people'";
+        let warnings = vec![warned.to_owned()];
+        let update: update_policy::ResponseData = serde_json::from_value(serde_json::json!(
+            {"updatePolicy": {"ok": true, "warnings": [warned]}}
+        ))
+        .unwrap();
+        assert_eq!(update.update_policy.warnings, warnings);
+        let set: set_ou_policy_query::ResponseData = serde_json::from_value(serde_json::json!(
+            {"setOuPolicy": {"ok": true, "warnings": [warned]}}
+        ))
+        .unwrap();
+        assert_eq!(set.set_ou_policy.warnings, warnings);
+        let clear: clear_ou_policy_query::ResponseData = serde_json::from_value(serde_json::json!(
+            {"clearOuPolicy": {"ok": true, "warnings": [warned]}}
+        ))
+        .unwrap();
+        assert_eq!(clear.clear_ou_policy.warnings, warnings);
+        let block: set_ou_policy_inheritance_query::ResponseData = serde_json::from_value(
+            serde_json::json!({"setOuPolicyInheritance": {"ok": true, "warnings": []}}),
+        )
+        .unwrap();
+        assert!(block.set_ou_policy_inheritance.warnings.is_empty());
+        let delete: delete_policy_query::ResponseData = serde_json::from_value(serde_json::json!(
+            {"deletePolicy": {"ok": true, "warnings": [warned]}}
+        ))
+        .unwrap();
+        assert_eq!(delete.delete_policy.warnings, warnings);
+        assert_eq!(
+            after_save("Policy saved".to_owned(), update.update_policy.warnings),
+            vec![
+                ("alert alert-success mt-3", "Policy saved".to_owned()),
+                (
+                    "alert alert-warning mt-3 wb-save-warning",
+                    warned.to_owned()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_the_address_answer_reads_with_a_value_and_with_null() {
+        for (answer, expected) in [
+            (
+                serde_json::json!({"clientAddress": "172.17.0.1"}),
+                "The server sees you as 172.17.0.1",
+            ),
+            (
+                serde_json::json!({"clientAddress": null}),
+                "The server sees you as unknown",
+            ),
+        ] {
+            let data: get_client_address::ResponseData = serde_json::from_value(answer).unwrap();
+            assert_eq!(seen_as_note(data.client_address.as_deref()), expected);
         }
     }
 }

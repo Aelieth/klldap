@@ -3692,6 +3692,7 @@ dependencies = [
  "pretty_assertions",
  "rand 0.8.6",
  "sea-orm",
+ "sea-query-binder",
  "serde",
  "serde_json",
  "serial_test",

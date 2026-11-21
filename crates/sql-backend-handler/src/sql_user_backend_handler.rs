@@ -762,31 +762,41 @@ impl SqlBackendHandler {
     }
 }
 
-#[async_trait]
-impl UserBackendHandler for SqlBackendHandler {
-    #[instrument(skip_all, level = "debug", err(level = "debug"), fields(user_id = ?user_id.as_str()))]
-    async fn get_user_details(&self, user_id: &UserId) -> Result<User> {
-        let mut user = User::from(
-            model::User::find_by_id(user_id.to_owned())
-                .one(&self.sql_pool)
-                .await?
-                .ok_or_else(|| DomainError::EntityNotFound(user_id.to_string()))?,
-        );
+type UserRows = (model::users::Model, Vec<model::user_attributes::Model>);
 
+impl SqlBackendHandler {
+    async fn user_rows_on(db: &impl ConnectionTrait, user_id: &UserId) -> Result<UserRows> {
+        let user = model::User::find_by_id(user_id.to_owned())
+            .one(db)
+            .await?
+            .ok_or_else(|| DomainError::EntityNotFound(user_id.to_string()))?;
         let attributes = model::UserAttributes::find()
             .filter(model::UserAttributesColumn::UserId.eq(user_id))
             .order_by_asc(model::UserAttributesColumn::AttributeName)
-            .all(&self.sql_pool)
+            .all(db)
             .await?;
+        Ok((user, attributes))
+    }
 
-        let schema = self.get_schema().await?;
+    /// `get_user_details` with every read on `db`, the schema's too.
+    pub(crate) async fn user_details_on(
+        db: &impl ConnectionTrait,
+        user_id: &UserId,
+    ) -> Result<User> {
+        let rows = Self::user_rows_on(db, user_id).await?;
+        let schema = Self::get_schema_with_transaction(db).await?;
+        Self::user_of(rows, &schema)
+    }
+
+    fn user_of((user, attributes): UserRows, schema: &PublicSchema) -> Result<User> {
+        let mut user = User::from(user);
         user.attributes = attributes
             .into_iter()
             .map(|a| {
                 let mut attr =
                     codec::decode_attribute(a.attribute_name, &a.value, schema.user_attributes())?;
 
-                attr.name = Self::canonical_user_attribute_name(&schema, attr.name.as_str());
+                attr.name = Self::canonical_user_attribute_name(schema, attr.name.as_str());
 
                 if attr.name.as_str() == "avatar" {
                     debug!("GET_USER_DETAILS: avatar attribute found in EAV");
@@ -797,6 +807,15 @@ impl UserBackendHandler for SqlBackendHandler {
 
         user.materialize_protected_fields();
         Ok(user)
+    }
+}
+
+#[async_trait]
+impl UserBackendHandler for SqlBackendHandler {
+    #[instrument(skip_all, level = "debug", err(level = "debug"), fields(user_id = ?user_id.as_str()))]
+    async fn get_user_details(&self, user_id: &UserId) -> Result<User> {
+        let rows = Self::user_rows_on(&self.sql_pool, user_id).await?;
+        Self::user_of(rows, &self.get_schema().await?)
     }
 
     #[instrument(skip_all, level = "debug", err, fields(user_id = ?user_id.as_str()))]

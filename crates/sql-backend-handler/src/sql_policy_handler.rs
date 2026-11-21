@@ -2,7 +2,7 @@ use crate::sql_backend_handler::SqlBackendHandler;
 use crate::sql_lockout_handler::CountingStart;
 use crate::sql_mfa_windows::read_windows;
 use async_trait::async_trait;
-use lldap_domain::types::UserId;
+use lldap_domain::types::{User, UserId};
 use lldap_domain_handlers::handler::PolicyBackendHandler;
 use lldap_domain_handlers::kdc_proof::ProofWindow;
 use lldap_domain_handlers::logging::{self, LogKind};
@@ -15,8 +15,8 @@ use lldap_domain_model::{
     model::{self, OuPoliciesColumn, PoliciesColumn},
 };
 use sea_orm::{
-    ActiveModelTrait, ActiveValue, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set,
-    TransactionTrait,
+    ActiveModelTrait, ActiveValue, ColumnTrait, ConnectionTrait, EntityTrait, QueryFilter,
+    QueryOrder, Set, TransactionTrait,
     sea_query::{Expr, OnConflict},
 };
 use std::collections::{BTreeMap, HashMap};
@@ -64,28 +64,57 @@ impl SqlBackendHandler {
             .await?
             .rows_affected)
     }
+}
 
-    async fn attached_by_id(&self, ids: &[i32]) -> Result<HashMap<i32, AttachedPolicy>> {
-        if ids.is_empty() {
-            return Ok(HashMap::new());
-        }
-        let mut map = HashMap::new();
-        for row in model::Policies::find()
-            .filter(PoliciesColumn::Id.is_in(ids.iter().copied()))
-            .all(&self.sql_pool)
-            .await?
-        {
-            map.insert(
-                row.id,
-                AttachedPolicy {
-                    id: PolicyId(row.id),
-                    name: row.name,
-                    items: decode_items(&row.items)?,
-                },
-            );
-        }
-        Ok(map)
+async fn attached_by_id_on(
+    db: &impl ConnectionTrait,
+    ids: &[i32],
+) -> Result<HashMap<i32, AttachedPolicy>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
     }
+    let mut map = HashMap::new();
+    for row in model::Policies::find()
+        .filter(PoliciesColumn::Id.is_in(ids.iter().copied()))
+        .all(db)
+        .await?
+    {
+        map.insert(
+            row.id,
+            AttachedPolicy {
+                id: PolicyId(row.id),
+                name: row.name,
+                items: decode_items(&row.items)?,
+            },
+        );
+    }
+    Ok(map)
+}
+
+/// Root-first levels for `ou`, every read on `db`.
+pub(crate) async fn policy_levels_on(
+    db: &impl ConnectionTrait,
+    ou: &str,
+) -> Result<Vec<PolicyLevel>> {
+    let keys = ou_chain(ou);
+    let rows = model::OuPolicies::find()
+        .filter(OuPoliciesColumn::OuKey.is_in(keys.clone()))
+        .all(db)
+        .await?;
+    let by_key: HashMap<_, _> = rows.into_iter().map(|r| (r.ou_key.clone(), r)).collect();
+    let ids: Vec<i32> = by_key.values().filter_map(|r| r.policy_id).collect();
+    let attached = attached_by_id_on(db, &ids).await?;
+    Ok(keys
+        .into_iter()
+        .map(|key| {
+            let row = by_key.get(&key);
+            PolicyLevel {
+                blocked: row.is_some_and(|r| r.block_inheritance),
+                policy: row.and_then(|r| r.policy_id.and_then(|id| attached.get(&id).cloned())),
+                ou_key: key,
+            }
+        })
+        .collect())
 }
 
 #[async_trait]
@@ -321,7 +350,7 @@ impl PolicyBackendHandler for SqlBackendHandler {
             .all(&self.sql_pool)
             .await?;
         let ids: Vec<i32> = rows.iter().filter_map(|r| r.policy_id).collect();
-        let attached = self.attached_by_id(&ids).await?;
+        let attached = attached_by_id_on(&self.sql_pool, &ids).await?;
         Ok(rows
             .into_iter()
             .map(|row| {
@@ -338,25 +367,7 @@ impl PolicyBackendHandler for SqlBackendHandler {
 
     #[instrument(skip_all, level = "debug", err(level = "debug"))]
     async fn get_policy_levels(&self, ou: &str) -> Result<Vec<PolicyLevel>> {
-        let keys = ou_chain(ou);
-        let rows = model::OuPolicies::find()
-            .filter(OuPoliciesColumn::OuKey.is_in(keys.clone()))
-            .all(&self.sql_pool)
-            .await?;
-        let by_key: HashMap<_, _> = rows.into_iter().map(|r| (r.ou_key.clone(), r)).collect();
-        let ids: Vec<i32> = by_key.values().filter_map(|r| r.policy_id).collect();
-        let attached = self.attached_by_id(&ids).await?;
-        Ok(keys
-            .into_iter()
-            .map(|key| {
-                let row = by_key.get(&key);
-                PolicyLevel {
-                    blocked: row.is_some_and(|r| r.block_inheritance),
-                    policy: row.and_then(|r| r.policy_id.and_then(|id| attached.get(&id).cloned())),
-                    ou_key: key,
-                }
-            })
-            .collect())
+        policy_levels_on(&self.sql_pool, ou).await
     }
 
     #[instrument(skip_all, level = "debug", err(level = "debug"))]
@@ -374,6 +385,11 @@ impl PolicyBackendHandler for SqlBackendHandler {
             );
         }
         Ok(())
+    }
+
+    #[instrument(skip_all, level = "debug", err(level = "debug"))]
+    async fn bounded_policy_entry(&self, user: &UserId) -> Result<(User, Vec<PolicyLevel>)> {
+        self.bounded_entry(user).await
     }
 
     async fn read_proof_windows(

@@ -266,6 +266,10 @@
 
 ### Fixed
 
+- A read of a user's OU policy that has not answered within 2 seconds (a locked `ou_policies`
+  or `policies` table, say) no longer waits for as long as the lock lasts while holding one of
+  the server's database connections: a sign-in, token refresh or token use is refused as
+  `policy: unreadable`, and the policy cache takes a user's change at its next read instead.
 - The policies page no longer fails on its first render while its data loads.
 - The password pages show the server's reason when setting a password fails.
 - A kadmin password change that kadmind could not prepare is refused and can be retried,

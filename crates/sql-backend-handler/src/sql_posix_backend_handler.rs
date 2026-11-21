@@ -13,8 +13,8 @@ use lldap_domain_model::{
     model::{self, system_config},
 };
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseTransaction, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, Set, TransactionTrait, sea_query::query::OnConflict,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseTransaction, EntityTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, Set, TransactionTrait, sea_query::query::OnConflict,
 };
 use tracing::instrument;
 
@@ -243,7 +243,7 @@ impl PosixBackendHandler for SqlBackendHandler {
 
 impl SqlBackendHandler {
     pub(crate) async fn get_posix_settings_with_transaction(
-        transaction: &DatabaseTransaction,
+        transaction: &impl ConnectionTrait,
     ) -> Result<PosixSettings> {
         let config = system_config::Entity::find()
             .filter(system_config::Column::Key.eq("posix_settings"))

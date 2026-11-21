@@ -12,9 +12,7 @@ use lldap_domain_model::{
     model,
 };
 use lldap_schema::{AttributeSchema, PublicSchema};
-use sea_orm::{
-    ActiveModelTrait, DatabaseTransaction, EntityTrait, QueryOrder, Set, TransactionTrait,
-};
+use sea_orm::{ActiveModelTrait, ConnectionTrait, EntityTrait, QueryOrder, Set, TransactionTrait};
 
 #[async_trait]
 impl ReadSchemaBackendHandler for SqlBackendHandler {
@@ -165,7 +163,7 @@ impl SchemaBackendHandler for SqlBackendHandler {
 
 impl SqlBackendHandler {
     pub(crate) async fn get_schema_with_transaction(
-        transaction: &DatabaseTransaction,
+        transaction: &impl ConnectionTrait,
     ) -> Result<PublicSchema> {
         let mut full = PublicSchema::get().0; // inner Schema
 
@@ -237,7 +235,7 @@ impl SqlBackendHandler {
     }
 
     async fn get_user_attributes(
-        transaction: &DatabaseTransaction,
+        transaction: &impl ConnectionTrait,
     ) -> Result<Vec<AttributeSchema>> {
         Ok(model::UserAttributeSchema::find()
             .order_by_asc(model::UserAttributeSchemaColumn::AttributeName)
@@ -258,7 +256,7 @@ impl SqlBackendHandler {
     }
 
     async fn get_group_attributes(
-        transaction: &DatabaseTransaction,
+        transaction: &impl ConnectionTrait,
     ) -> Result<Vec<AttributeSchema>> {
         Ok(model::GroupAttributeSchema::find()
             .order_by_asc(model::GroupAttributeSchemaColumn::AttributeName)
@@ -279,7 +277,7 @@ impl SqlBackendHandler {
     }
 
     async fn get_user_object_classes(
-        transaction: &DatabaseTransaction,
+        transaction: &impl ConnectionTrait,
     ) -> Result<Vec<LdapObjectClass>> {
         Ok(model::UserObjectClasses::find()
             .order_by_asc(model::UserObjectClassesColumn::ObjectClass)
@@ -291,7 +289,7 @@ impl SqlBackendHandler {
     }
 
     async fn get_group_object_classes(
-        transaction: &DatabaseTransaction,
+        transaction: &impl ConnectionTrait,
     ) -> Result<Vec<LdapObjectClass>> {
         Ok(model::GroupObjectClasses::find()
             .order_by_asc(model::GroupObjectClassesColumn::ObjectClass)

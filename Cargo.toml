@@ -149,6 +149,10 @@ version = "1.1.20"
 default-features = false
 features = ["macros", "with-chrono", "with-uuid"]
 
+[workspace.dependencies.sea-query-binder]
+version = "0.7.0"
+default-features = false
+
 [workspace.dependencies.secstr]
 version = "0"
 features = ["serde"]

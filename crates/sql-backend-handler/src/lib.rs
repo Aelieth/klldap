@@ -11,6 +11,7 @@ pub(crate) mod sql_mfa_handler;
 pub(crate) mod sql_mfa_windows;
 pub(crate) mod sql_opaque_handler;
 pub(crate) mod sql_policy_handler;
+pub(crate) mod sql_policy_read;
 pub(crate) mod sql_posix_backend_handler;
 pub(crate) mod sql_schema_backend_handler;
 pub(crate) mod sql_totp_steps;

@@ -63,6 +63,10 @@ features = [
     "runtime-actix-rustls",
 ]
 
+[dependencies.sea-query-binder]
+workspace = true
+features = ["sqlx-mysql"]
+
 [dependencies.serde]
 workspace = true
 

@@ -12,7 +12,8 @@ use crate::mfa::{
     mfa_requirement,
 };
 use crate::policies::{
-    EffectiveItem, POLICY_ITEM_CATALOG, Policy, canonical_ou_key, resolve, resolve_effective_items,
+    EffectiveItem, POLICY_ITEM_CATALOG, POLICY_READ_WAIT, Policy, canonical_ou_key, resolve,
+    resolve_effective_items,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -35,6 +36,12 @@ const FLAG_ON: u8 = 1;
 const FLAG_UNKNOWN: u8 = 2;
 pub const UNREADABLE: &str = "unreadable";
 pub const NOT_LOADED: &str = "not loaded yet";
+pub const POLICY_UNANSWERED: &str = "the policy read did not answer within its bound";
+
+/// A read that gave up within its bound, by the client's timer or the database's own.
+pub fn gave_up(e: &DomainError) -> bool {
+    matches!(e, DomainError::InternalError(detail) if detail == POLICY_UNANSWERED)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Door {
@@ -521,6 +528,14 @@ impl PolicyCache {
         self.read_failed.store(true, Ordering::Release);
     }
 
+    pub fn failed_read(&self) -> bool {
+        self.read_failed.load(Ordering::Acquire)
+    }
+
+    pub fn marked(&self, user: &UserId) -> bool {
+        self.marks().users.contains_key(user)
+    }
+
     fn marks(&self) -> std::sync::MutexGuard<'_, Marks> {
         self.marked.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -577,9 +592,11 @@ async fn user_entry<H>(handler: &H, user: &UserId) -> Result<UserEntry>
 where
     H: UserBackendHandler + PolicyBackendHandler + ?Sized,
 {
-    let details = handler.get_user_details(user).await?;
+    let read = tokio::time::timeout(POLICY_READ_WAIT, handler.bounded_policy_entry(user));
+    let unanswered = DomainError::InternalError(POLICY_UNANSWERED.to_owned());
+    let (details, levels) = read.await.map_err(|_| unanswered)??;
     let ou_key = canonical_ou_key(&user_ou(&details.attributes));
-    let items = ou_items(handler, &ou_key).await?;
+    let items = resolve_effective_items(POLICY_ITEM_CATALOG, &levels).into();
     Ok((ou_key, items, details))
 }
 
@@ -784,7 +801,8 @@ where
     }
 }
 
-/// One pass over the marks present now; a mark leaves the set only once its entry is stored.
+/// One pass over the marks present now, ending at the first read that gave up; a mark leaves the
+/// set only once its entry is stored.
 async fn take_marks<H>(handler: &H, cache: &PolicyCache)
 where
     H: UserBackendHandler + PolicyBackendHandler + ?Sized,
@@ -806,6 +824,10 @@ where
                 }
             }
             Err(DomainError::EntityNotFound(_)) => cache.remove_user(&user),
+            Err(e) if gave_up(&e) => {
+                warn!("The policy cache did not take {user}'s change within its bound: {e}");
+                break;
+            }
             Err(e) => {
                 warn!("The policy cache did not take {user}'s change: {e}");
                 cache.read_failed.store(true, Ordering::Release);
@@ -1631,6 +1653,12 @@ mod tests {
     const OTHER: &str = "e0other";
     const SLOW: &str = "e0slow";
     const LABS: &str = "people\\labs";
+    const STALLED: &str = "k2stalled";
+    const HELD: &str = "k2held";
+    const NO_ANSWER: u8 = 1;
+    const LOCK_ERROR: u8 = 2;
+    const DOWN: u8 = 3;
+    const WITHIN: Duration = Duration::from_secs(4);
 
     fn user(name: &str) -> User {
         user_in(name, LABS)
@@ -1672,6 +1700,8 @@ mod tests {
         proof_rows: Vec<(UserId, ProofWindow)>,
         proofs_down: AtomicBool,
         proof_reads: AtomicU64,
+        policy_read: AtomicU8,
+        entry_reads: AtomicU64,
     }
 
     impl Directory {
@@ -1818,6 +1848,19 @@ mod tests {
         }
         async fn delete_ou_policy_state(&self, _: &str) -> Result<()> {
             unimplemented!()
+        }
+        async fn bounded_policy_entry(&self, user: &UserId) -> Result<(User, Vec<PolicyLevel>)> {
+            self.entry_reads.fetch_add(1, Ordering::Relaxed);
+            match self.policy_read.load(Ordering::Relaxed) {
+                NO_ANSWER => std::future::pending().await,
+                LOCK_ERROR => Err(DomainError::InternalError(POLICY_UNANSWERED.to_owned())),
+                DOWN => Err(DomainError::InternalError("down".to_owned())),
+                _ => {
+                    let details = self.get_user_details(user).await?;
+                    let ou_key = canonical_ou_key(&user_ou(&details.attributes));
+                    Ok((details, self.get_policy_levels(&ou_key).await?))
+                }
+            }
         }
         async fn read_proof_windows(
             &self,
@@ -2351,6 +2394,202 @@ mod tests {
             (ou_of(cache, &late), cache.marks().users.len()),
             (Some("people".to_owned()), 0),
             "the next pass stores the newer state"
+        );
+    }
+
+    struct Rows(Mutex<Vec<logging::LogEvent>>);
+
+    impl logging::LogSink for Rows {
+        fn record(&self, event: logging::LogEvent) {
+            if matches!(event.actor.as_deref(), Some(STALLED | HELD)) {
+                self.0.lock().unwrap().push(event);
+            }
+        }
+    }
+
+    impl Rows {
+        fn take(&self) -> Vec<(LogKind, bool, Option<String>)> {
+            let rows = std::mem::take(&mut *self.0.lock().unwrap());
+            let row = |e: logging::LogEvent| (e.kind, e.success, e.detail);
+            rows.into_iter().map(row).collect()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn test_a_policy_read_past_its_bound_refuses_each_sign_in_door_with_its_one_row() {
+        type Row = (Door, u8, LogKind, bool);
+        let rows: [Row; 10] = [
+            (Door::LdapBind, NO_ANSWER, LogKind::Bind, true),
+            (Door::LdapBind, LOCK_ERROR, LogKind::Bind, false),
+            (Door::SimpleLogin, NO_ANSWER, LogKind::Bind, true),
+            (Door::SimpleLogin, LOCK_ERROR, LogKind::Bind, false),
+            (Door::WebLogin, NO_ANSWER, LogKind::Login, true),
+            (Door::WebLogin, LOCK_ERROR, LogKind::Login, false),
+            (Door::Refresh, NO_ANSWER, LogKind::TokenRefresh, true),
+            (Door::Refresh, LOCK_ERROR, LogKind::TokenRefresh, false),
+            (Door::TokenUse, NO_ANSWER, LogKind::AccessDenied, true),
+            (Door::TokenUse, LOCK_ERROR, LogKind::AccessDenied, false),
+        ];
+        let _judging = Judging::only(&[STALLED, HELD]);
+        let sink = Arc::new(Rows(Mutex::default()));
+        logging::set_log_sink(sink.clone());
+        let directory = Directory::knowing(&[STALLED, HELD]);
+        let (stalled, held) = (UserId::new(STALLED), UserId::new(HELD));
+        let reads = || directory.entry_reads.load(Ordering::Relaxed);
+        let (mut got, mut want) = (Vec::new(), Vec::new());
+        for (door, answer, kind, waits) in rows {
+            directory.policy_read.store(answer, Ordering::Relaxed);
+            let (before, started) = (reads(), tokio::time::Instant::now());
+            let answered = admit(&directory, &Attempt::new(&stalled, door)).await;
+            let took = started.elapsed();
+            let bound = (took >= POLICY_READ_WAIT, took < WITHIN);
+            got.push((door, answer, answered, sink.take(), reads() - before, bound));
+            let refusal = Refusal {
+                item: UNREADABLE,
+                door,
+            };
+            let row = (kind, false, Some("policy: unreadable".to_owned()));
+            want.push((door, answer, Err(refusal), vec![row], 1, (waits, true)));
+        }
+        policy_cache().put_user(&held, LABS, Vec::new().into());
+        for (door, answer, _, _) in rows {
+            directory.policy_read.store(answer, Ordering::Relaxed);
+            let (before, started) = (reads(), tokio::time::Instant::now());
+            let answered = admit(&directory, &Attempt::new(&held, door)).await;
+            let took = started.elapsed();
+            let bound = (took >= POLICY_READ_WAIT, took < WITHIN);
+            got.push((door, answer, answered, sink.take(), reads() - before, bound));
+            want.push((door, answer, Ok(()), vec![], 0, (false, true)));
+        }
+        policy_cache().remove_user(&held);
+        logging::set_log_sink(Arc::new(logging::NoopLogSink));
+        assert_eq!(got, want);
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn test_the_lockouts_read_past_its_bound_is_its_existing_error() {
+        let (cache, counter) = (PolicyCache::new(), Lockout::default());
+        cache.set_lockout_live(true);
+        let directory = Directory::knowing(&[STALLED]);
+        let stalled = UserId::new(STALLED);
+        let rows = [
+            (NO_ANSWER, POLICY_UNANSWERED, true),
+            (LOCK_ERROR, POLICY_UNANSWERED, false),
+            (DOWN, "down", false),
+        ];
+        for (answer, error, waits) in rows {
+            directory.policy_read.store(answer, Ordering::Relaxed);
+            let started = tokio::time::Instant::now();
+            let state = counter.state(&directory, &cache, &stalled).await;
+            let took = started.elapsed();
+            assert_eq!(
+                (
+                    state.map(drop).map_err(|e| e.to_string()),
+                    took >= POLICY_READ_WAIT,
+                    took < WITHIN
+                ),
+                (Err(format!("Internal error: `{error}`")), waits, true),
+                "{answer}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn test_a_mark_pass_that_gives_up_within_the_bound_keeps_the_mark_and_flags_no_failure() {
+        let _judging = Judging::only(&[STALLED]);
+        let cache: &'static PolicyCache = Box::leak(Box::new(PolicyCache::new()));
+        let (counter, checks) = (Lockout::default(), item_checks());
+        let directory = Directory::knowing(&[STALLED]);
+        let stalled = UserId::new(STALLED);
+        let kdc = || {
+            let attempt = Attempt::at_kdc(&stalled, Door::KerberosAs, None, 1_700_000_000);
+            admit_at_kdc_with(cache, &counter, &attempt, &checks)
+        };
+        let not_loaded = Err(Refusal {
+            item: NOT_LOADED,
+            door: Door::KerberosAs,
+        });
+        type Row = (&'static str, u8, bool, bool);
+        let rows: [Row; 3] = [
+            ("a read that never answers", NO_ANSWER, true, false),
+            ("the database's own bound", LOCK_ERROR, false, false),
+            ("another error", DOWN, false, true),
+        ];
+        for (label, answer, waits, failed) in rows {
+            directory.policy_read.store(answer, Ordering::Relaxed);
+            cache.read_failed.store(false, Ordering::Release);
+            poked(cache).await;
+            let started = tokio::time::Instant::now();
+            user_written(&directory, cache, &stalled).await;
+            let took = started.elapsed();
+            let handed = poked(cache).await;
+            let left = (cache.marked(&stalled), cache.failed_read(), handed);
+            assert_eq!(
+                (left, kdc(), took >= POLICY_READ_WAIT, took < WITHIN),
+                ((true, failed, true), not_loaded, waits, true),
+                "{label}: the mark stays and goes to the filler"
+            );
+        }
+        directory.policy_read.store(0, Ordering::Relaxed);
+        let filler = start_policy_filler(directory, cache);
+        let mut verdict = kdc();
+        for _ in 0..100 {
+            if verdict.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            verdict = kdc();
+        }
+        filler.abort();
+        assert_eq!(
+            (verdict, cache.marked(&stalled)),
+            (Ok(()), false),
+            "the filler's next pass loads the user, with no other write"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn test_a_mark_pass_leaves_at_the_first_read_that_gave_up_and_keeps_every_mark() {
+        const MARKED: [&str; 3] = [STALLED, "k2stalled2", "k2stalled3"];
+        let _judging = Judging::only(&MARKED);
+        let cache: &'static PolicyCache = Box::leak(Box::new(PolicyCache::new()));
+        let directory = Directory::knowing(&MARKED);
+        let users = MARKED.map(UserId::new);
+        let reads = || directory.entry_reads.load(Ordering::Relaxed);
+        let marks = || users.iter().filter(|user| cache.marked(user)).count();
+        let rows: [(&str, u8, bool); 2] = [
+            ("a read that never answers", NO_ANSWER, true),
+            ("the database's own bound", LOCK_ERROR, false),
+        ];
+        for (label, answer, waits) in rows {
+            directory.policy_read.store(answer, Ordering::Relaxed);
+            users.iter().for_each(|user| cache.mark(user));
+            let (before, started) = (reads(), tokio::time::Instant::now());
+            user_written(&directory, cache, &users[0]).await;
+            let took = started.elapsed();
+            assert_eq!(
+                (
+                    reads() - before,
+                    marks(),
+                    cache.failed_read(),
+                    took >= POLICY_READ_WAIT,
+                    took < POLICY_READ_WAIT * 2,
+                ),
+                (1, 3, false, waits, true),
+                "{label}: one bounded read for the pass, every mark kept"
+            );
+        }
+        directory.policy_read.store(0, Ordering::Relaxed);
+        let before = reads();
+        user_written(&directory, cache, &users[0]).await;
+        assert_eq!(
+            (reads() - before, marks()),
+            (3, 0),
+            "with the table free, the next pass takes every mark"
         );
     }
 }

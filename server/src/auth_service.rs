@@ -2529,13 +2529,10 @@ pub(crate) mod tests {
                 let mut mock = MockTestBackendHandler::new();
                 mock.expect_get_user_groups()
                     .returning(|_| Ok(HashSet::new()));
-                mock.expect_get_user_details()
+                mock.expect_bounded_policy_entry()
+                    .with(eq(UserId::new("e0http")))
                     .times(reads)
-                    .returning(|_| Ok(alice(false)));
-                mock.expect_get_policy_levels()
-                    .withf(|ou| ou == "people")
-                    .times(reads)
-                    .returning(|_| Ok(vec![]));
+                    .returning(|_| Ok((alice(false), vec![])));
                 mock.expect_mfa_requirement()
                     .returning(|_| Ok(MfaRequirement::None));
                 let state = app_state(mock);
@@ -2596,6 +2593,59 @@ pub(crate) mod tests {
                     "{label}"
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_policy_read_error_refuses_the_refresh_and_the_token_with_one_row() {
+        use lldap_domain_handlers::enforcement::POLICY_UNANSWERED;
+        use lldap_test_utils::recording_log::LogGuard;
+        let _backend = ONE_BACKEND.lock().await;
+        let log = LogGuard::install_on_this_thread();
+        let _guard = EnforcementGuard::allowing(&["k2http"], "login-hours");
+        let rows = [
+            (Door::Refresh, "canceling statement due to lock timeout"),
+            (Door::TokenUse, POLICY_UNANSWERED),
+        ];
+        for (n, (door, cause)) in rows.into_iter().enumerate() {
+            let mut mock = MockTestBackendHandler::new();
+            mock.expect_get_user_groups()
+                .returning(|_| Ok(HashSet::new()));
+            mock.expect_bounded_policy_entry()
+                .with(eq(UserId::new("k2http")))
+                .times(1)
+                .returning(move |_| Err(DomainError::InternalError(cause.to_owned())));
+            let state = app_state(mock);
+            let peer = format!("192.0.2.{}", 80 + n);
+            let meta = RequestMeta::http(Some(peer.parse().unwrap()), None);
+            let status = with_request(meta, async {
+                if door == Door::Refresh {
+                    let request = actix_web::test::TestRequest::get()
+                        .insert_header(("refresh-token", "k2-refresh+k2http"))
+                        .to_http_request();
+                    return get_refresh_handler(state, request).await.status().as_u16();
+                }
+                let token = session_token(&state.jwt_key, "k2http");
+                match check_if_token_is_valid(&state, &token).await {
+                    Ok(_) => 200,
+                    Err(e) => e.as_response_error().status_code().as_u16(),
+                }
+            })
+            .await;
+            let rows: Vec<_> = log
+                .recorder()
+                .take_events()
+                .into_iter()
+                .filter(|e| e.peer.as_deref() == Some(peer.as_str()))
+                .map(|e| (e.kind, e.success, e.target, e.detail))
+                .collect();
+            let refused = (
+                door.log_kind(),
+                false,
+                Some("k2http".to_owned()),
+                Some("policy: unreadable".to_owned()),
+            );
+            assert_eq!((status, rows), (401, vec![refused]), "{door:?}");
         }
     }
 

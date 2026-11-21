@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 use std::net::{Ipv4Addr, Ipv6Addr};
+use std::time::Duration;
 
 pub const ROOT_OU_KEY: &str = "";
+/// A policy read with no answer within this is refused as unreadable.
+pub const POLICY_READ_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(
     Clone,

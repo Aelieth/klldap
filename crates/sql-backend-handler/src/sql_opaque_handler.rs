@@ -1573,6 +1573,54 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn test_a_policy_read_that_fails_refuses_each_bind_door_with_its_one_row() {
+        use lldap_domain_handlers::logging::{Protocol, RequestMeta, with_request};
+        use lldap_test_utils::enforcement::EnforcementGuard;
+        const DROPPED: &str = "DROP TABLE ou_policies";
+        let log = LogGuard::install_on_this_thread();
+        let rows = [
+            (Door::LdapBind, LogKind::Bind, Protocol::Ldap),
+            (Door::SimpleLogin, LogKind::Bind, Protocol::Http),
+            (Door::WebLogin, LogKind::Login, Protocol::Http),
+        ];
+        for (door, kind, protocol) in rows {
+            let handler =
+                SqlOpaqueHandler::new(generate_random_private_key(), get_initialized_db().await);
+            insert_user(&handler, "k2door", "k2door00").await;
+            let pool = &handler.sql_pool;
+            pool.execute_unprepared(DROPPED).await.unwrap();
+            let _guard = EnforcementGuard::allowing(&["k2door"], "login-hours");
+            let meta = match protocol {
+                Protocol::Ldap => RequestMeta::ldap(None, None),
+                _ => RequestMeta::http(None, None),
+            };
+            log.recorder().take_events();
+            let answered = with_request(meta, async {
+                match door {
+                    Door::WebLogin => attempt_login(&handler, "k2door", "k2door00", None)
+                        .await
+                        .map(drop),
+                    _ => handler
+                        .bind(bind_request("k2door", "k2door00"))
+                        .await
+                        .map(drop),
+                }
+            })
+            .await;
+            let rows: Vec<_> = log
+                .recorder()
+                .take_events()
+                .into_iter()
+                .filter(|e| e.actor.as_deref() == Some("k2door"))
+                .map(|e| (e.kind, e.success, e.protocol, e.detail))
+                .collect();
+            let row = (kind, false, protocol, Some("policy: unreadable".to_owned()));
+            assert_eq!((answered.is_ok(), rows), (false, vec![row]), "{door:?}");
+        }
+    }
+
+    #[tokio::test]
     #[serial]
     async fn test_a_degraded_realm_refusal_is_the_doors_one_row_with_no_success_row() {
         use lldap_domain_handlers::kerberos::{ADMINS_ONLY, LDAP_ADMINS_ONLY};

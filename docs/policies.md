@@ -102,9 +102,12 @@ before, another server resolves every user to `off` until its read sees the chan
 to those 30 seconds. Until a starting server has read the item once, and whenever a user's policy cannot
 be read, the directory's doors refuse the users whose value an OU could set (`policy:
 unreadable`), token refresh and use among them, and the server reads the policies again every
-second until it can. With `enable_mfa` set server-wide the OUs' item takes no part in the
-decision and nothing is refused for it; where Kerberos is on, the memory described above is
-still kept for the KDC.
+second until it can. A user the policy cache does not hold yet is read from the database at the
+sign-in, and a read that has not answered within 2 seconds (while `ou_policies` or `policies` is
+locked, say) is refused the same way, at every directory door and for the lockout too, and the
+database ends that read's own wait, so a long lock does not use up the server's connections.
+With `enable_mfa` set server-wide the OUs' item takes no part in the decision and nothing is
+refused for it; where Kerberos is on, the memory described above is still kept for the KDC.
 
 At start the server warns once with the number of OUs that set `enable-mfa` to `enabled` or
 `always` while nothing is set server-wide; the warning names no OU.

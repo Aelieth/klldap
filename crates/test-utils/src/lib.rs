@@ -106,6 +106,7 @@ mockall::mock! {
         async fn list_ou_policy_states(&self) -> Result<Vec<OuPolicyState>>;
         async fn get_policy_levels(&self, ou: &str) -> Result<Vec<PolicyLevel>>;
         async fn delete_ou_policy_state(&self, ou: &str) -> Result<()>;
+        async fn bounded_policy_entry(&self, user: &UserId) -> Result<(User, Vec<PolicyLevel>)>;
     }
     #[async_trait]
     impl LockoutBackendHandler for TestBackendHandler {

@@ -4,7 +4,7 @@
 # so the release build links against the same glibc as the containers.
 #
 # One builder per platform: linux/amd64/v2 builds the x86_64 tarball and the web app, linux/arm64
-# (emulated where the host is x86_64) the aarch64 tarball. KLLDAP 0.8.0 is 64-bit only.
+# (emulated where the host is x86_64) the aarch64 tarball. KLLDAP is 64-bit only.
 # x86-64-v2, how: this base's v2 build has gcc default to -march=x86-64-v2, and prepare-release.sh
 # also sets it for rustc and gcc, then checks the built binary for any instruction outside x86-64-v2.
 #

@@ -4,7 +4,7 @@ set -e
 set -x
 
 # The machine (or emulated platform) this runs on decides the tarball: x86_64 or aarch64.
-# KLLDAP 0.8.0 is 64-bit only.
+# KLLDAP is 64-bit only.
 ARCH=$(uname -m)
 
 # Build the binary server. On x86_64 for the x86-64-v2 instruction set, so it runs

@@ -1,14 +1,14 @@
 <h1 align="center">KLLDAP - Light LDAP with an integrated Kerberos KDC</h1>
 
-0.8.0 is a pre-release. The new policies and the front end have not yet had thorough testing. Further testing, verification and code review come before it is promoted.
+0.8.1 is a pre-release. The new policies and the front end have not yet had thorough testing. Further testing, verification and code review come before it is promoted.
 
 
 <p align="center">
-  <a href="https://github.com/Aelieth/klldap/actions/workflows/rust.yml?query=branch%3A0.8.0">
-    <img src="https://github.com/Aelieth/klldap/actions/workflows/rust.yml/badge.svg?branch=0.8.0" alt="Build"/>
+  <a href="https://github.com/Aelieth/klldap/actions/workflows/rust.yml?query=branch%3A0.8.1">
+    <img src="https://github.com/Aelieth/klldap/actions/workflows/rust.yml/badge.svg?branch=0.8.1" alt="Build"/>
   </a>
-  <a href="https://github.com/Aelieth/klldap/actions/workflows/gate.yml?query=branch%3A0.8.0">
-    <img src="https://github.com/Aelieth/klldap/actions/workflows/gate.yml/badge.svg?branch=0.8.0" alt="Gate"/>
+  <a href="https://github.com/Aelieth/klldap/actions/workflows/gate.yml?query=branch%3A0.8.1">
+    <img src="https://github.com/Aelieth/klldap/actions/workflows/gate.yml/badge.svg?branch=0.8.1" alt="Gate"/>
   </a>
 </p>
 
@@ -23,7 +23,7 @@
 ## About
 
 KLLDAP is a hard fork of [LLDAP](https://github.com/lldap/lldap), the lightweight
-LDAP authentication server. In 0.8.0 the KDC and kadmin are kerber-rust (v1.2.3)
+LDAP authentication server. In 0.8.1 the KDC and kadmin are kerber-rust (v1.2.3)
 inside the `lldap` process, and MIT's KDC is no longer in the image's running system.
 Users, groups and passwords are managed once, through the web UI, LDAP or
 GraphQL; the KDC follows.
@@ -69,7 +69,7 @@ under emulation and is not tested by us.
 
 The rootless image is the `Dockerfile`'s `rootless` target, named `aelieth/klldap:0.8.1-rootless`, for the same platforms as the default image.
 
-KLLDAP 0.8.0 is 64-bit only (x86_64 and arm64); there is no 32-bit or ARMv7 build.
+KLLDAP 0.8.1 is 64-bit only (x86_64 and arm64); there is no 32-bit or ARMv7 build.
 
 ## Usage
 

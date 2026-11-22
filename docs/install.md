@@ -18,7 +18,7 @@ v1.2.3 among them from GitHub, so it needs the network. The
 under emulation and is not tested by us. To install without building, use the
 [release tarball](#install-from-the-release-tarball).
 
-KLLDAP 0.8.0 is 64-bit only (x86_64 and arm64); there is no 32-bit or ARMv7 build.
+KLLDAP 0.8.1 is 64-bit only (x86_64 and arm64); there is no 32-bit or ARMv7 build.
 
 **Set a restart policy. If a Kerberos thread dies, or the server gives the
 Kerberos realm up because its writes stopped reaching the database, the process
@@ -48,7 +48,7 @@ still work, and they win when both names are set. A root start repairs ownership
 `/data`, `/app` and the KDC directory, then `gosu` runs the server as that user.
 `tini` is the init. The rootless image starts as user `lldap` and does not change
 ownership; `/data` must already be writable by that user. `--user` on the standard
-image fails, because `gosu` cannot switch user without root. Use `aelieth/klldap:0.8.0-rootless`,
+image fails, because `gosu` cannot switch user without root. Use `aelieth/klldap:0.8.1-rootless`,
 and the compose `user:` field in place of `UID` and `GID`.
 
 The KDC listens on 1088 and kadmin on `127.0.0.1:1749`. Publish the KDC as `88:1088`
@@ -75,7 +75,7 @@ volumes:
 
 services:
   klldap:
-    image: aelieth/klldap:0.8.0
+    image: aelieth/klldap:0.8.1
     container_name: klldap
     restart: unless-stopped
     ports:

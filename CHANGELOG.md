@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.8.1] - Unreleased
+## [0.8.1] - 2026-11-23
 
 0.8.1 is a pre-release. The new policies and the front end have not yet had thorough testing. Further testing, verification and code review come before it is promoted.
 

@@ -209,8 +209,8 @@ pub(crate) fn invalid_credentials(user_id: &UserId) -> DomainError {
 }
 
 impl SqlBackendHandler {
-    /// After the credentials and before the door's row: a refusal is that row, and answers as
-    /// the wrong-credentials error. The items are judged at the instant the lockout was.
+    /// A refusal is the door's one row and answers as the wrong-credentials error. The items are
+    /// judged at the instant the lockout was.
     async fn admit_at(
         &self,
         user: &UserId,

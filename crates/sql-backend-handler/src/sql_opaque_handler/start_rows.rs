@@ -64,8 +64,7 @@ async fn test_the_items_are_judged_when_a_web_sign_in_starts() {
             vec![(Door::WebLogin, false)],
             wrong
         ),
-        "refused: its one row when the sign-in starts, and the right password goes no further \
-         than a wrong one"
+        "refused: its one row when the sign-in starts, and the same answer as a wrong password gets"
     );
     assert_eq!(
         (admitted, seen(&guard)),

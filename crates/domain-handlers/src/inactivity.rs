@@ -185,6 +185,7 @@ impl PolicyCache {
         self.activity.rows_failed.store(false, Ordering::Release);
     }
 
+    #[cfg(any(test, feature = "test-backend-scope"))]
     pub fn owed_successes(&self) -> usize {
         held(&self.activity.owed).len()
     }

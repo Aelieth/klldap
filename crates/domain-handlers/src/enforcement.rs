@@ -601,6 +601,7 @@ impl PolicyCache {
         }
     }
 
+    #[cfg(any(test, feature = "test-backend-scope"))]
     pub fn items_unread(&self) -> bool {
         GATED.iter().any(|key| self.item_state(key) == FLAG_UNKNOWN)
     }
@@ -610,6 +611,7 @@ impl PolicyCache {
         GATED.iter().any(unread)
     }
 
+    #[cfg(any(test, feature = "test-backend-scope"))]
     pub fn set_item_flags(&self, flags: ItemFlags) {
         for (key, on) in flags.keyed() {
             self.set_item(key, flag(on));
@@ -717,6 +719,7 @@ impl PolicyCache {
     }
 }
 
+#[cfg(any(test, feature = "test-backend-scope"))]
 fn flag(live: bool) -> u8 {
     if live { FLAG_ON } else { FLAG_OFF }
 }
@@ -921,6 +924,7 @@ impl ItemFlags {
         }
     }
 
+    #[cfg(any(test, feature = "test-backend-scope"))]
     pub fn held(cache: &PolicyCache) -> Self {
         Self {
             login_hours: !cache.item_off(LOGIN_HOURS),

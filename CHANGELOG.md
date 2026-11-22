@@ -448,6 +448,8 @@
   aarch64 builds compile jiff and jiff-core only: jiff-static serves jiff features that are
   not turned on, and portable-atomic and portable-atomic-util serve only targets without
   pointer-sized atomics.
+- actix-http 3.21.3 and lettre 0.11.24, for the RustSec advisories published for both in
+  November 2026.
 
 ## [0.8.0] - 2026-11-15
 

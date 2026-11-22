@@ -41,4 +41,5 @@ ignore = [
     { id = "RUSTSEC-2016-0007", reason = "jwt: unmaintained, no upgrade offered; as upstream" },
     { id = "RUSTSEC-2024-0370", reason = "proc-macro-error: unmaintained, build-time only in the browser app; as upstream" },
     { id = "RUSTSEC-2023-0071", reason = "sqlx-mysql's client copy; KLLDAP's own use is on rsa 0.10" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono: unmaintained, no upgrade offered; through juniper, sqlx, cron and tracing-forest and in our own code" },
 ]

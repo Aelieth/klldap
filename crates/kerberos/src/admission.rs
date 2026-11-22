@@ -355,6 +355,7 @@ pub(crate) mod tests {
     use lldap_domain::types::Attribute;
     use lldap_domain_handlers::enforcement::{
         Entries, INACTIVITY_DAYS, ItemFlags, UserFacts, fill_policy_cache, start_policy_cache,
+        start_policy_filler,
     };
     use lldap_domain_handlers::handler::{PolicyBackendHandler, UserBackendHandler};
     use lldap_domain_handlers::inactivity::{Recorded, Recording};
@@ -2002,12 +2003,15 @@ pub(crate) mod tests {
             .expect("a check is registered");
         let code = |user| kinit(&store, user, Some(PASSWORD)).0;
         assert_eq!(code(ALLOWED_USER), 0, "filled at start");
+        filler.abort();
+        let _ = filler.await;
         directory_user(&handler, here, "people").await;
         assert_eq!(
             code(here),
             0,
             "a user created on this server is found at once"
         );
+        let filler = start_policy_filler(handler.clone(), policy_cache());
         directory_user(&other, elsewhere, "people").await;
         assert_eq!(code(elsewhere), err::CLIENT_REVOKED, "a miss refuses");
         let deadline = Instant::now() + Duration::from_secs(1);

@@ -311,10 +311,12 @@ ACL text, read at boot.
     that comes before it is ready waits for it. The `kerberosInfo` query
     returns the same key, and `enabled`, false when the configuration disables
     Kerberos. The create-user page reads it: with Kerberos disabled it shows no
-    Kerberos switch and sends no `kerberosSync`; otherwise the switch starts on. RSA-OAEP with SHA-256 seals at most 318 bytes, so
-    the pages and the tool refuse a longer password of a synced user before
-    the finish, and nothing is written; the create-user page refuses it before
-    it creates the user. LDAP and `setUserPassword` have no such bound.
+    Kerberos switch and sends no `kerberosSync` (if the page cannot read it, it
+    shows the switch, and the server refuses a create with sync); otherwise the
+    switch starts on. RSA-OAEP with SHA-256 seals at most 318 bytes, so the
+    pages and the tool refuse a longer password of a synced user before the
+    finish, and nothing is written; the create-user page refuses it before it
+    creates the user. LDAP and `setUserPassword` have no such bound.
 
 kadmin listens on the container's loopback. The image sets
 `KRB5_CONFIG=/data/krb5.conf`, so `docker exec` does not pass it:
@@ -460,6 +462,8 @@ At the prompt, type the password, a colon and the current code.
 Under an OU's `inactivity-days` ([policies.md](policies.md#inactivity)), a ticket issued by
 kinit counts as a sign-in; a renewal or a service ticket does not, because the KDC reports no
 success there. Give a client that only renews its tickets a limit longer than `renew_lifetime`.
+A service's request for a user (S4U2Self, S4U2Proxy) never counts either, so a user who comes in
+only through such a service is refused once the limit passes.
 An inactive user is refused at kinit, at a renewal, at a service ticket, and when a service asks
 a ticket for them (S4U2Self, S4U2Proxy), with code 18 and no text, before the password is
 checked: kinit prints "Client's credentials have been revoked", as for any policy refusal,
@@ -648,7 +652,7 @@ does not answer "try again"), waits out the watch, then exits and names the
 cause. A forced reset configured on it runs, without the realm, after the
 watch and before the exit.
 
-Every server on one database has the same `kerberos_options.enabled`. A
+Every server on one database needs the same `kerberos_options.enabled`. A
 server started with Kerberos disabled on a database whose realm is marked
 open logs one warning at start that says so. Beside a holder, its
 `lldap_disabled` changes, deletes and sync changes reach the realm's
@@ -687,8 +691,7 @@ created first is reported as "another server created the realm first"; the
 realm does not open and the process exits non-zero.
 
 To upgrade, stop every server that uses the database before the first start
-of the new version. 0.8.0 watches for thirty seconds and 0.8.1 for
-thirty-five, so the two side by side have no slack.
+of the new version.
 
 ## Upgrading from 0.7.2
 
@@ -730,9 +733,10 @@ Podman follows the steps below. Those steps are what the script does.
    that realm, including when 0.7.2's `realm_name` in `kerberos_config.toml`
    was not the name the base DN gives. `LLDAP_KEYCLOAK_ADMIN_PASS` is ignored;
    set `LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS`. Name the image `aelieth/klldap:0.8.1`
-   to get 0.8.1. `aelieth/klldap:latest` is still 0.7.2.
+   to get 0.8.1. 0.8.1's images are not published to a registry: build that image
+   first ([install.md](install.md)). `aelieth/klldap:latest` is still 0.7.2.
    A configuration that does not set `kerberos_options.enabled` now starts a
-   realm; set `enabled = false` to stay without one. Pull that tag and start it.
+   realm; set `enabled = false` to stay without one. Start the image you built.
 
 4. The start logs `Loaded N Kerberos principals from …` and `Migrated the MIT
    realm; its files are kept in …`. Then list the principals and take a ticket

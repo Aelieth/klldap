@@ -12,9 +12,9 @@ Requires=lldap-db.service
 Restart=on-failure
 
 [Container]
-AutoUpdate=registry
+# The image is built first (see docs/install.md); podman keeps a locally built image under localhost/.
 ContainerName=lldap
-Image=docker.io/aelieth/klldap:0.8.0
+Image=localhost/aelieth/klldap:0.8.1
 
 # /data holds the config, keytabs and (for sqlite) the database; the KDC database has
 # its own volume. Both must persist.

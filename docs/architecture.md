@@ -105,11 +105,14 @@ OPAQUE record and the keys from it in one transaction and drops it when the requ
 ends. For any other user the web UI sends no seal, so the server never sees the
 password. KLLDAP keeps no copy; the KDC stores its own keys in its own database.
 
-The optional TOTP second factor ([mfa.md](mfa.md)) is checked by the same login handler
-that checks the password: `SqlBackendHandler::bind` splits `password:code`, and
-`login_finish` takes the code the web page sends in its second step (`totp_code`); both
-verify it the same way, so the three doors share one decision and the event log sees one
-row per login.
+The optional TOTP second factor ([mfa.md](mfa.md)) is checked in the login handler:
+`SqlBackendHandler::bind` splits `password:code`, and `login_finish` takes the code the web
+page sends in its second step (`totp_code`); both verify it the same way, so the three doors
+share one decision and the event log sees one row per login. The OU policy items
+([policies.md](policies.md#resolution)) are judged in the same handler, through
+`enforcement::admit`: at the LDAP bind and `/auth/simple/login` after a right password, before
+a code or an enrolment is asked for, and again with the code; at the web login when the
+sign-in starts (`login_start`), and a refused user's sign-in fails as a wrong password's does.
 
 ### JWTs and refresh tokens
 

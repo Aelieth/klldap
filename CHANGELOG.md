@@ -2,6 +2,8 @@
 
 ## [0.8.1] - Unreleased
 
+0.8.1 is a pre-release. The new policies and the front end have not yet had thorough testing. Further testing, verification and code review come before it is promoted.
+
 ### Security
 
 - A first two-factor enrollment proves the password to the server. **API change for
@@ -11,8 +13,8 @@
   in the body of `/auth/simple/login` or `/auth/opaque/login/finish` returns `enrollmentProof`
   in the answer, for a user with no factor yet. It is valid for five minutes and used once on
   every server that shares the database (its random id is kept in the new table
-  `mfa_used_proofs` until a minute past its expiry). Replacing a factor still takes `currentCode`
-  and ignores a proof.
+  `mfa_used_proofs` at least until a minute past its expiry). Replacing a factor still takes
+  `currentCode` and ignores a proof.
 - A second factor's attempts and used codes are kept in the database (the new table
   `totp_steps`, no code stored): a code is accepted once and five attempts per 30-second step
   are counted on every server that shares the database, and a restart keeps both. Servers on
@@ -32,10 +34,11 @@
   the policy cache only while some OU sets it and nothing is set server-wide; every server reads
   the policies once every 30 seconds, one small read shared with the lockout, and while they
   are not read the directory's doors it concerns refuse (`policy: unreadable`, token refresh
-  and use among them) and the read is tried again every second. A change applies at once on
-  the server that made it and within 30 seconds on the others. Where `enable_mfa` is set server-wide, the policy page says that it overrides
-  the OUs (`/settings` gives it as `mfa_server_wide`).
-- `/auth/opaque/login/finish` takes an optional `"session": false`: the finish verifies the
+  and use among them) and the read is tried again every second. A policy change applies at once
+  on the server that made it and within 30 seconds on the others. Where `enable_mfa` is set
+  server-wide, the policy page says that it overrides the OUs (`/settings` gives it as
+  `mfa_server_wide`).
+- `/auth/opaque/login/finish` takes an optional `"session": false`: the finish confirms the
   password (and a code sent with it), admits or refuses the user as any finish does, and
   makes no session: no token, no refresh token, no cookie. A verified one answers
   `{"verified": true}`, with `enrollmentProof` when one was asked for. Every row it writes
@@ -56,8 +59,9 @@
   sends is counted. Counting starts, for all users and from zero, when the first OU policy
   with a threshold takes effect: that change clears every stored count and logged lock in its
   own transaction and starts a new counting period. From then on users with no threshold are
-  counted too, so a threshold added to another OU, or a move under one, applies at once to the
-  failures already counted; the lock is computed, so lowering or raising it applies at once.
+  counted too, so a threshold added to another OU, or a move under one, applies at once (or when
+  a refill in progress ends) to the failures already counted; the lock is computed, so lowering
+  or raising it applies at once.
 - A web start counts at once at every door, beside the stored count, so unfinished starts lock
   as they come; a verified finish, with a session or without, removes its own start's count
   once and changes nothing else, a completed sign-in drops the user's earlier starts on that
@@ -66,12 +70,15 @@
   by a finish on another server; with two servers a sign-in whose steps start and finish on
   either never counts against the user. At most 32 starts per user are held; one beyond
   joins the count at once.
-- Unlocking: GraphQL `unlockUser(userId)` (admins), the host tool `lldap unlock <user>`, and
+- Unlocking: GraphQL `unlockUser(userId)` (admins), the host tool
+  `lldap unlock --config-file <config> <user>`, and
   kadmin `modprinc -unlock` on a directory user's principal, which now clears the directory's
   lock at the server's clock. Each writes an `account_unlock` row; a lock writes one
-  `account_lock` row, and each refusal a `locked out` row. An unlock by the host tool or by
-  another server takes effect at a server's next sign-in attempt at the directory's doors, and
-  for Kerberos within a moment of the next attempt.
+  `account_lock` row, and each refusal a `locked out` row (refusals of the same kind from one
+  peer coalesce in a flood, see `docs/logging.md`). An unlock by the host tool or by another
+  server takes effect at the directory's doors within a second (a server looks at a held lock
+  again at most once a second for each user), and for Kerberos within a moment of the next
+  attempt.
 - Under a threshold a count is written before the door answers; the door, and the KDC, wait at
   most 250 ms for it in all, and a slower write is owed and tried again. Other counts, and a
   web start's after its 10 seconds, are owed and written within about a second. A clean stop
@@ -80,9 +87,10 @@
   last 10 seconds of web starts. Each write carries the user's state as it stands, never an
   increment; it stores nothing for a user who is gone or replaced under the same name, or
   from an earlier counting period, and
-  a write the database refuses is retried until it is taken. With several servers on one
-  database each counts what it sees exactly, they agree within 30 seconds, and a guesser
-  spread over N servers gets at most N times the threshold.
+  a write the database refuses is retried until it is taken (for up to 65,536 users; past that
+  the oldest are let go). With several servers on one database each counts what it sees
+  exactly, they agree within 30 seconds, and a guesser spread over N servers gets at most N
+  times the threshold.
 - With no threshold set in any OU, the lockout costs nothing at any door: no read, no write and
   no cache fill. The first threshold set loads what the doors need before it takes effect.
   Until a starting server has read the policies once, the doors refuse (`policy: unreadable`).
@@ -117,11 +125,13 @@
   `/auth/simple/login` 401 with the same body); the web login judges it when the sign-in starts,
   and a refused user's sign-in fails as a wrong password's does. The KDC refuses before the password
   is checked, with error 18 and no text, so a request for a user's name shows whether some directory
-  policy refuses that user. S4U2Self and S4U2Proxy are not judged by it. A refusal is one row,
-  `policy: login-hours (outside login hours)`; a stored value that does not parse refuses as
-  `policy: unreadable`, with one server warning naming the policy. A web session is refused at every
-  API request while the rule refuses and works again when it no longer does; an LDAP connection is
-  judged at its bind only. Where no OU sets it, it costs nothing at any door.
+  policy refuses that user. S4U2Self and S4U2Proxy are not judged by it. A refusal at a sign-in door
+  is one row, `policy: login-hours (outside login hours)`; a stored value that does not parse
+  refuses as `policy: unreadable`, with one server warning naming the policy. A web session is
+  refused at every API request while the rule refuses and works again when it no longer does; an
+  LDAP connection is judged at its bind only. Where no OU sets it, it costs nothing at any door.
+  When a linked policy first sets it, the doors that judge it refuse every user (`policy:
+  unreadable`, at the KDC `not loaded yet`) until the policy cache's fill for it succeeds.
 - `login_hours_timezone` (default `UTC`; `LLDAP_LOGIN_HOURS_TIMEZONE`,
   `--login-hours-timezone`): the zone `login-hours` is read in, an IANA name read once at start
   from the system's zone files (the directory `TZDIR` names, else `/usr/share/zoneinfo`); `TZ`
@@ -130,10 +140,14 @@
   zone and its file. A host
   install needs tzdata, and a tzdata update takes effect at the next start. `/settings` gives
   the zone's name as `login_hours_timezone`.
-- The host tool `lldap policy-unlink --config-file <config> <ou>` removes one OU's policy link
-  (the root is `(root)` or `""`), with one `policy_change` row, `policy cleared: <name> (lldap
-  policy-unlink)`, in the same transaction; a running server sees it within 30 seconds. It is
-  the way back in when an OU's policy refuses everyone who could change it.
+- The host tool `lldap policy-unlink --config-file <config> '<ou>'` removes one OU's policy link
+  (the root is `'(root)'` or `""`; quote the key in a shell, as `'people\labs'`), with one
+  `policy_change` row, `policy cleared: <name> (lldap policy-unlink)`, in the same transaction; a
+  running server sees it within 30 seconds. It is the way back in when an OU's policy refuses
+  everyone who could change it: unlink the OU whose policy sets the item, which can be a parent of
+  the user's OU or the root. Run the host tools (`lldap unlock`, `lldap reenable`,
+  `lldap policy-unlink`) as the user the server runs as, with its configuration
+  ([policies.md](docs/policies.md#getting-back-in-from-the-host)).
 - The GraphQL `Success` type has the field `warnings: [String!]!`; a client that does not ask
   for it is unaffected.
 - `inactivity-days` per OU is enforced: the policy item (0 to 3650, default 0, by the OU
@@ -158,10 +172,10 @@
   again about every second, every five seconds after ten failed tries, and `lldap policy-unlink`
   takes the rule off from the host.
 - Re-enabling: GraphQL `reenableUser(userId)` (admins) and the host tool `lldap reenable
-  --config-file <config> <user>` restart a user's inactivity count now. Each writes one row of
-  the new log kind `account_reenable` (`ACCOUNT_REENABLE` in GraphQL), detail `reenableUser` or
-  `lldap reenable`, in its own transaction. A running server sees the host tool's re-enable
-  within 30 seconds.
+  --config-file <config> <user>` restart a user's inactivity count now (or when a refill in
+  progress ends). Each writes one row of the new log kind `account_reenable`
+  (`ACCOUNT_REENABLE` in GraphQL), detail `reenableUser` or `lldap reenable`, in its own
+  transaction. A running server sees the host tool's re-enable within 30 seconds.
 - `allowed-networks` per OU is enforced: the policy item (comma-separated CIDRs, empty = any, by
   the OU policies' inheritance) refuses a sign-in from outside the list at the LDAP bind,
   `/auth/simple/login`, the web login, token refresh and use, kinit, renewals and service tickets;
@@ -175,7 +189,12 @@
   error 18 and no text, so a request for a user's name shows whether some directory policy
   refuses that user. The row says `policy: allowed-networks (address not allowed)` and keeps
   `peer` and `forwarded_for` as they came; a value that cannot be read refuses with
-  `policy: unreadable` and one warning in the server log.
+  `policy: unreadable` and one warning in the server log. When a linked policy first sets a list,
+  the doors that judge it refuse every user (`policy: unreadable`, at the KDC `not loaded yet`)
+  until the policy cache's fill for it succeeds. Behind Docker's published ports the server may
+  see one address, the bridge gateway, for every client, and a list then admits everyone or no
+  one: check `clientAddress` (shown on the policies page) before you save a list
+  ([allowed-networks.md](docs/allowed-networks.md#behind-dockers-published-ports)).
 - `trusted_proxies` (`LLDAP_TRUSTED_PROXIES`, `--trusted-proxies`; empty by default): one string
   of comma-separated CIDRs naming the reverse proxies whose `X-Forwarded-For` the
   `allowed-networks` item believes, read from the right to the first address that is no listed
@@ -208,6 +227,13 @@
 
 ### Changed
 
+- Upgrading from the 0.8.0 pre-release: stop every server that uses the database before the
+  first 0.8.1 start, and do not run the two side by side
+  ([install.md](docs/install.md#upgrading-from-klldap-080)); at that start, policies stored with
+  `require-mfa` are carried over as `enable-mfa` (`enrolled` becomes `enabled`) and enforced from
+  then on, the start warns once with how many OUs set it to `enabled` or `always` with no
+  server-wide `enable_mfa` over them, and 0.8.0's `enable_mfa` values `false` and `true` still
+  read as `off` and `enabled`.
 - **kinit needs a fresh proof under `enabled` and `always`.** A directory user who must
   give a second factor at the directory's doors gets a Kerberos ticket only within
   `kerberos_options.mfa_proof_window` (default 10 minutes) after a sign-in at a directory
@@ -222,15 +248,13 @@
   and renewable lifetimes and an hour, and end with a reset or a replacement of the factor;
   `kerberos_options.mfa_proof_same_address` ties a kinit to the address the code was given
   from.
-- `enable_mfa` takes `off`, `enabled` or `always`; 0.8.0's `false` and `true` still work.
-  A value written in the file, the environment or the command line is explicit and overrides
-  every OU's `enable-mfa`, so **an explicit `false` now keeps every OU from turning the factor
-  on**: remove the line to let the OUs decide. Left unset, it is `off` until an OU says
-  otherwise.
+- `enable_mfa` takes `off`, `enabled` or `always`. A value written in the file, the environment
+  or the command line is explicit and overrides every OU's `enable-mfa`, so **an explicit `false`
+  now keeps every OU from turning the factor on**: remove the line to let the OUs decide. Left
+  unset, it is `off` until an OU says otherwise.
 - The policy item `require-mfa` (`off`, `enrolled`, `always`) is now `enable-mfa` (`off`,
-  `enabled`, `always`). Policies stored by the 0.8.0 pre-release are carried over at start
-  (`enrolled` becomes `enabled`) and are enforced from then on. `createPolicy` and
-  `updatePolicy` given `require-mfa` are refused with a message naming `enable-mfa`.
+  `enabled`, `always`). `createPolicy` and `updatePolicy` given `require-mfa` are refused with a
+  message naming `enable-mfa`.
 - `lldap_mfa_disabled` is created the first time a value is known to turn the factor on: at
   start for a server-wide `enabled` or `always`; otherwise by whichever server first reads an
   OU's `enable-mfa` above `off` (at start, at the policy change, or at its 30-second read),
@@ -241,12 +265,11 @@
   field no longer takes `password:code` (that text fails as a wrong password, and the page
   says the code is asked next). LDAP binds and `/auth/simple/login` still take
   `password:code`.
-- The enrollment, reset-two-factor and change-password pages have the server check the
-  password with a finish that makes no session, and each finishes every login it starts.
+- The enrollment, reset-two-factor and change-password pages confirm the password with a
+  finish that makes no session, and each finishes every login it starts.
   The change-password page checks the current password as typed, once: it no longer splits
   off a trailing `:` and six digits as a code.
-- A web login in flight across the upgrade fails once; the retry works.
-- kadmin's unlock row reads `kadmin unlock by <client>`.
+- kadmin's unlock writes its `kerberos_sync` row as `kadmin unlock by <client>`.
 - A deleted user's Kerberos ticket requests are refused for every kind of request, delegation and
   user-to-user included; renewals and service tickets keep their answer (code 18,
   `CLIENT_NOT_FOUND`).
@@ -265,9 +288,10 @@
   before it creates the user.
 - `lldap_set_password` prints the server's answer when a call fails.
 - A password with a NUL character (U+0000) is refused at every door that checks its length:
-  GraphQL, LDAP (53), the web finish and `lldap_set_password` (400), kadmin `cpw`
-  (`PASS_Q_GENERIC`), the forced reset and the first start's admin password. Each refused
-  change writes one failure row, the web finish's envelope refusals included.
+  GraphQL, LDAP (53), the web finish (400), `lldap_set_password` (before it sends), kadmin
+  `cpw` (`PASS_Q_GENERIC`), the forced reset and the first start's admin password (the
+  start is refused). Each change refused at GraphQL, LDAP, the web finish or kadmin writes
+  one failure row, the web finish's envelope refusals included.
 - A `kerberossync` change, a delete and a synced user's password change check the switch in the
   transaction that writes; one that finds it changed writes nothing and answers "the user's
   Kerberos sync changed; try again". A password change of a user without sync waits for the
@@ -280,14 +304,15 @@
   first") are refused. With the realm not ready, every change that needs it answers "retry
   shortly", and the web finish refuses before it opens the envelope.
 - The create-user page shows no Kerberos switch and sends no `kerberossync` when the server has
-  Kerberos disabled (`kerberosInfo { enabled }`, new).
-- An adopted principal keeps its fields; its keys are replaced with random ones, the old ones
-  dropped, and it is marked and disabled. A create with the switch on adopts the principal of
-  its name too; an LDAP ADD with a password sets both forms and marks it. Right after a kadmin
-  `cpw`, a change of its own sets the principal's status from `lldap_disabled`: an adopted
-  principal is enabled then, unless its user is in `lldap_disabled`. Deleting a user without
-  sync touches no principal. Sync on at `createUser` is refused for a name that is an alias, as
-  at `updateUser`.
+  Kerberos disabled (if the page cannot read that, it shows the switch, and the server refuses
+  a create with sync; `kerberosInfo { enabled }`, new).
+- An adopted principal keeps its fields except its Kerberos password policy, which is cleared
+  (next entry); its keys are replaced with random ones, the old ones dropped, and it is marked
+  and disabled. A create with the switch on adopts the principal of its name too; an LDAP ADD
+  with a password sets both forms and marks it. Right after a kadmin `cpw`, a change of its own
+  sets the principal's status from `lldap_disabled`: an adopted principal is enabled then,
+  unless its user is in `lldap_disabled`. Deleting a user without sync touches no principal.
+  Sync on at `createUser` is refused for a name that is an alias, as at `updateUser`.
 - **For a directory user, the OU policy's `password-min-length` is the rule; a Kerberos password
   policy no longer applies on top.** An adoption (sync turned on, a create with sync, an LDAP
   ADD with a password, the start's mark) clears the principal's Kerberos policy in the same
@@ -345,7 +370,7 @@
   next status pass (within a minute), the next password change, a kadmin `cpw` or the next
   opening of the realm; its random keys take no password. Turning it on when it is already on
   changes nothing.
-- Every server on one database has the same `kerberos_options.enabled`; a server started with
+- Every server on one database needs the same `kerberos_options.enabled`; a server started with
   Kerberos disabled beside a realm marked open logs one warning saying what that means, and that
   it is harmless on a lone server.
 - The user details page shows the Kerberos switch, while the server has Kerberos disabled, only
@@ -365,8 +390,8 @@
   values of a Modify or an ADD, and the encoded value of an `ldappasswd`. The copies the LDAP
   library makes while it decodes a request, and the buffers the LDAP and HTTP libraries fill
   while reading one, are not wiped.
-- The policies page's notice lists the rules that are not enforced yet, read from the
-  catalog, and names the build's version.
+- Every item of the policy catalog is enforced, so the policies page no longer shows a notice
+  that values are not enforced yet.
 - A read-only admin can read policies, the item catalog, effective items and OU policy
   states. Every policy write stays admin-only.
 - `clearOuPolicy` and `effectivePolicyItems` refuse an OU that is not registered
@@ -374,9 +399,7 @@
 - The Kerberos realm's watch is thirty-five seconds (thirty in 0.8.0). A server that finds
   the realm left open watches it that long before it takes it over, and a holder gives the
   realm up within thirty seconds of the start of its last write that reached the database,
-  then exits. **Before the first 0.8.1 start, stop every server that uses the database; do
-  not run 0.8.0 and 0.8.1 side by side**
-  ([install.md](docs/install.md#upgrading-from-klldap-080)).
+  then exits.
 - A lost answer to the realm's first commit is probed: the server inserts the realm row's key
   in a transaction it rolls back, for sixty seconds (about seventy-five from the commit's
   start). The commit counts as landed only when the row holds this server's own realm and
@@ -398,9 +421,9 @@
 - When an OU policy turns the lockout on and its first read fails, the doors the lockout judges
   refuse until a read succeeds.
 - After a right password, the OU policy items are judged before a second factor or an enrolment
-  is asked for, at the LDAP bind, `/auth/simple/login` and the web login, and again with the
-  code. An attempt they refuse gets the wrong-password answer and its one refusal row, and is not
-  counted toward the lockout.
+  is asked for, at the LDAP bind and `/auth/simple/login`, and again with the code; the web login
+  judges them when the sign-in starts. An attempt they refuse gets the wrong-password answer and
+  its one refusal row, and is not counted toward the lockout.
 
 ### Fixed
 

@@ -114,8 +114,9 @@
 ## The time zone the OUs' login-hours windows are read in: an IANA name such as
 ## "America/Chicago", read once at start from the system's zone files
 ## (/usr/share/zoneinfo, or TZDIR when it is set); "UTC" is built in. Name the zone
-## itself: names under right/ or posix/ are refused. An unknown name, or a file that
-## is not a zone file, refuses the start. A tzdata update takes effect at the next start.
+## itself: names under right/ or posix/, localtime and posixrules are refused. An unknown
+## name, or a file that is not a zone file, refuses the start. A tzdata update takes effect
+## at the next start.
 ## Env variable: LLDAP_LOGIN_HOURS_TIMEZONE
 # login_hours_timezone = "UTC"
 

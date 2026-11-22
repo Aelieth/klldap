@@ -22,6 +22,18 @@ Example: root policy sets `enable-mfa=off`, `people\labs` sets `enable-mfa=alway
 user in `people\labs` sees `always` with source `people\labs`. If `people\labs` blocks
 inheritance, root's other items no longer apply there.
 
+**How a sign-in is judged.** At the LDAP bind and `/auth/simple/login` a member of
+`lldap_disabled` is refused, then a locked user, before the password is checked. Then the
+password. After a right password the OU's items are judged in this order: the lockout,
+`inactivity-days`, `allowed-networks`, `login-hours` (an item not read yet refuses first, as
+`policy: unreadable`). The first that refuses is the one the log row names, and the answer is a
+wrong password's. Only then is a code or an enrolment asked for, and with the code the items are
+judged again. Last, while the realm is degraded, only members of `lldap_admin` are let in
+([kerberos.md](kerberos.md#when-the-realm-cannot-open)). At the web login the items are judged in
+the same order when the sign-in starts, and a refused user's sign-in fails as a wrong password's
+does. At Kerberos every item is judged before the password (error 18), then the second factor's
+window (error 12). A refusal by an item neither counts toward the lockout nor clears its count.
+
 ## Using it
 
 GraphQL: admins and read-only admins read, admins write. `clearOuPolicy` and
@@ -69,7 +81,9 @@ Beside the `login-hours` rule the editor shows the zone it is judged in (*judged
 `/settings`); beside `allowed-networks` it shows the address the server sees you as (*The server
 sees you as 172.17.0.1*, or *unknown*): check it before you save a list. A save's `warnings` show
 under its success line; when the page's next request is then refused, one line says so and names
-`lldap policy-unlink` on the host as the way back. An `inactivity-days` of 0 shows as *off*.
+`lldap policy-unlink` on the host as the way back. Only `allowed-networks` is checked against you at
+a save: a `login-hours` value that applies to you and leaves out the present moment gives no
+warning, and refuses your next request. An `inactivity-days` of 0 shows as *off*.
 
 On a user's page an admin sees whether the doors refuse that user now, from the admin-only GraphQL
 field `User.signInState`, answered under `user(userId)` only (null in a list of users, and for
@@ -113,8 +127,8 @@ threshold, the doors themselves read nothing for either. With Kerberos on and `e
 set server-wide to `enabled` or `always`, every server also keeps each user's factor and
 group in memory, refilled about every 30 seconds, because the KDC judges from memory alone.
 Linking, editing or removing a policy, and moving a user to another OU, apply at the user's
-next sign-in: at once on the server that made the change, within about 30 seconds on the
-others. Where no OU set the item
+next sign-in: at once on the server that made the change (or when a refill in progress ends),
+within about 30 seconds on the others. Where no OU set the item
 before, another server resolves every user to `off` until its read sees the change, for up
 to those 30 seconds. Until a starting server has read the item once, and whenever a user's policy cannot
 be read, the directory's doors refuse the users whose value an OU could set (`policy:
@@ -153,16 +167,17 @@ starts a new counting period, and touches nothing an administrator set. Before t
 counted: where no OU sets a threshold, no door reads or writes anything for the lockout; each
 server reads the policies once every 30 seconds. Once counting is on, the failures of users
 with no threshold of their own are counted too, so a threshold added to another OU, or a move
-under one, applies at once to the failures already counted. The lock is computed, so lowering
-or raising a threshold applies at once. Removing the last threshold stops counting. Until a
-starting server has read the policies once, every door refuses the users the lockout judges
-(`policy: unreadable`), and the server reads them again every second. The same holds when the
-reads that turn counting on fail: from that change until they succeed.
+under one, applies at once (or when a refill in progress ends) to the failures already
+counted. The lock is computed, so lowering or raising a threshold applies at once. Removing
+the last threshold stops counting. Until a starting server has read the policies once, every
+door refuses the users the lockout judges (`policy: unreadable`), and the server reads them
+again every second. The same holds when the reads that turn counting on fail: from that change
+until they succeed.
 
 While locked, LDAP bind and `/auth/simple/login` answer as for a wrong password (49, 401),
 whether the password given is right or wrong, but at once: a locked user's bind skips the
 password work a wrong password takes, so the time to answer shows the lock. The web login's
-first step answers as for a name with no password, so the browser fails as for a wrong
+first step answers as for a name with no password, so the sign-in fails as for a wrong
 password, and the finish of a start made before the lock answers as a proof that does not
 verify. A token refresh or use is refused. kinit, a renewal, a service ticket and an
 S4U2Self for the user get error 18 (`CLIENT_REVOKED`, "Client's credentials have been
@@ -176,10 +191,10 @@ the lock is read, locked or not: LDAP answers 53 (*unwillingToPerform*), `/auth/
 401 as for a wrong password, with one `bind` row `no password given` and no `locked out` row;
 it is never counted.
 
-The web login counts each attempt when it starts: an attempt with a wrong password goes no
-further. The start's +1 is kept beside the user's stored count, never in
-it, and counts at every door at once, so starts that are never finished lock the user as they
-come; such a lock gets its `account_lock` row when the starts join the stored count, about 10
+The web login counts each attempt when it starts. The start's +1 is kept beside the user's
+stored count, never in it, and counts at every door at once, so starts that are never finished
+lock the user as they come; such a lock gets its `account_lock` row when the starts join the
+stored count, about 10
 seconds after they began. A finish whose proof
 verifies removes its own start's +1, once, and changes nothing else; the same finish sent
 again finds nothing to remove. A sign-in that completes (the password and every factor
@@ -207,9 +222,10 @@ button on the user's page while the user is locked ([Pages](#pages)), the host t
 on the user's principal.
 Each writes one `account_unlock` row in the unlock's transaction, stamped with the clock of the
 server, or of the host tool's own process. A password change does not unlock. An unlock by the
-host tool or by another server takes effect at this server's next sign-in attempt at the
-directory's doors, and for Kerberos within a moment of the next attempt. Such an unlock wins
-over every failure counted before it, also the ones this server had not written yet.
+host tool or by another server takes effect at this server's directory doors within a second
+(it looks at a held lock again at most once a second for each user), and for Kerberos within a
+moment of the next attempt. Such an unlock wins over every failure counted before it, also the
+ones this server had not written yet.
 
 Under a threshold, each count is written before the door answers, and the door waits at most
 250 ms for that write in all. When the database takes longer, the door answers anyway and the
@@ -306,6 +322,8 @@ created, and its password may not have been set; set one from the user's page*.
 
 `login-hours` says when a user may sign in. A user's value comes from their OU, by the
 inheritance above; there is no server-wide setting, and empty (the default) means always.
+Nobody is exempt, admins included: hours set on the root, or on the admins' OU, refuse the admins
+outside them too.
 
 The value is entries separated by `;`, each `DAY[-DAY] HH:MM-HH:MM`:
 
@@ -318,7 +336,8 @@ The value is entries separated by `;`, each `DAY[-DAY] HH:MM-HH:MM`:
   `fri 22:00-24:00;sat 00:00-06:00`.
 
 A sign-in is judged at the moment it is made, read on the wall clock of the server's one zone,
-`login_hours_timezone` ([Configuration](#configuration)), and compared with the windows:
+`login_hours_timezone`, which is `UTC` unless you set it ([Configuration](#configuration)), and
+compared with the windows:
 
 - A window admits from its start up to, not including, its end, to the second: `08:00-18:00`
   admits 08:00:00 to 17:59:59.
@@ -350,28 +369,30 @@ that answer shows that some rule refuses the user at that moment; it does not sa
 answers the same). Tickets already issued run out by themselves. S4U2Self and S4U2Proxy are not
 judged by the hours: a service asking for a user is not the user at a keyboard.
 
-Each refusal is one row of the door's kind with the detail `policy: login-hours (outside login
-hours)` ([logging.md](logging.md)). A stored value that does not parse (one written to the
-database by hand, say) refuses the users it applies to as `policy: unreadable` at the doors
-that judge the hours, and the server logs one warning naming the policy and the item, again
-only when the value changes.
+Each refusal at a sign-in door is one row of the door's kind with the detail `policy:
+login-hours (outside login hours)` ([logging.md](logging.md)). A stored value that does not
+parse (one written to the database by hand, say) refuses the users it applies to as `policy:
+unreadable` at the doors that judge the hours, and the server logs one warning naming the
+policy and the item, again only when the value changes.
 
 Sessions and connections:
 
 - A web session is refused at every API request while the rule refuses, and works again when
   it no longer does; nothing is revoked.
 - An LDAP connection is judged at its bind only.
-- A forwarded TGT asks from the server's address.
 
 What it costs: where no OU sets the item, the doors read nothing for it and the policy cache is
 not filled for it; the item is followed with the policies' one read every 30 seconds. When a
 linked policy first sets it, the cache is filled before the doors judge with it; until that
-fill succeeds the doors that judge the hours refuse (`policy: unreadable`, at the KDC `not
-loaded yet`). A change applies at once on the server that made it and within about 30 seconds
-on the others.
+fill succeeds the doors that judge the hours refuse every user, whatever their OU, admins
+included, token refresh and use among them (`policy: unreadable`, at the KDC `not loaded yet`).
+The server tries again every second, and unlinking every OU whose policy sets the item ends it.
+A policy change applies at once on the server that made it and within about 30 seconds on the
+others.
 
-Locked out by this rule: run `lldap policy-unlink --config-file <config> <ou>` as the user the
-server runs as ([Getting back in from the host](#getting-back-in-from-the-host)).
+Locked out by this rule: run `lldap policy-unlink --config-file <config> '<ou>'` as the user the
+server runs as, for the OU whose policy sets the hours
+([Getting back in from the host](#getting-back-in-from-the-host)).
 
 ## Inactivity
 
@@ -386,7 +407,10 @@ admit counts, a page's password check (a web login finish with `"session": false
 It is written beside the door's success row, after the last check that could still refuse, so a
 refused attempt, a wrong password and a refusal while Kerberos is unavailable write nothing. A
 token's use writes nothing (its refresh does), and neither does a renewal or a service ticket:
-give a client that only renews its tickets a limit longer than `renew_lifetime`. Each server
+give a client that only renews its tickets a limit longer than `renew_lifetime`. A service's
+request for a user (S4U2Self, S4U2Proxy) is judged but never counts, so a user who comes in only
+through such a service is refused once the limit passes; give that OU no limit, or re-enable such
+users. Each server
 writes at most one sign-in an hour for each user, into the table `user_activity`; the first after
 a start always writes. Nothing is written while no OU sets the item.
 
@@ -409,8 +433,9 @@ user truly idle past the new limit is refused at once; the way back is `reenable
 
 **The answer:** at the LDAP bind and `/auth/simple/login`, the door's ordinary refusal, byte for
 byte the answer to a wrong password (LDAP 49 and the HTTP 401 body of a wrong password), and it
-comes only after the password was right, so nobody learns a user's state there without their
-password. The web login judges it when the sign-in starts, and a refused user's sign-in fails as
+comes only after the password was right and before a code or an enrolment is asked for (and
+again with the code), so nobody learns a user's state there without their password. The web
+login judges it when the sign-in starts, and a refused user's sign-in fails as
 a wrong password's does; there too nobody learns a user's state without their password. Kerberos
 refuses before the password is checked, with code 18 and no text, as for every policy refusal: kinit
 prints "Client's credentials have been revoked", and a request for a user's name shows whether some
@@ -439,8 +464,10 @@ asks with the mail's token, which is refused as any token's use is.
 
 **Re-enable:** an admin's `reenableUser(userId)` over GraphQL (the **Re-enable after
 inactivity** button on the user's page while the user is inactive, [Pages](#pages)), or
-`lldap reenable` on the host, run as the user the server runs as, restarts the user's count now. Each writes one `account_reenable` row in its own transaction.
-A running server takes a re-enable made elsewhere within 30 seconds.
+`lldap reenable` on the host, run as the user the server runs as, restarts the user's
+count now (or when a refill in progress ends). Each writes one `account_reenable` row
+in its own transaction. A running server takes a re-enable made elsewhere within 30
+seconds.
 
 **Servers:** the sign-ins are kept in the database and shared; another server sees one at its
 next read of the policy cache (about every 30 seconds), far inside a limit counted in days. A
@@ -455,18 +482,23 @@ it, and at most 65,536 users' sign-ins are kept.
 sign-in from outside the list, at every door: LDAP bind, `/auth/simple/login`, the web login, token
 refresh, token use, kinit, renewals and service tickets. A service asking for the user (S4U2Self,
 S4U2Proxy) is not judged by it. Nobody is exempt, admins included. At the LDAP bind and
-`/auth/simple/login` it is judged after the password, and the answer is a wrong password's; the
-web login judges it when the sign-in starts, and a refused user's sign-in fails as a wrong
-password's does. Kerberos refuses before the password is checked,
-with code 18 and no text, and a request for a user's name shows whether some directory policy
-refuses that user. The row says `policy: allowed-networks (address not allowed)`. LDAP and
-Kerberos judge their socket's peer; HTTP judges its TCP peer, or behind a proxy listed in
-`trusted_proxies` the forwarded address. Behind Docker's published ports
-the server may see the bridge gateway for every client: GraphQL `clientAddress` shows the address
-the server judges for you, and a policy write warns when your own list would refuse you. Locked
-out by this rule: run `lldap policy-unlink --config-file <config> <ou>` as the user the server runs
-as. The matcher, the proxies, the measured addresses and the sessions are in
-[allowed-networks.md](allowed-networks.md).
+`/auth/simple/login` it is judged after the password and before a code or an enrolment is asked
+for (and again with the code), and the answer is a wrong password's; the web login judges it when
+the sign-in starts, and a refused user's sign-in fails as a wrong password's does. Kerberos refuses
+before the password is checked, with code 18 and no text, and a request for a user's name shows
+whether some directory policy refuses that user. The row says
+`policy: allowed-networks (address not allowed)`. A list that cannot be read refuses with
+`policy: unreadable`. LDAP and Kerberos judge their socket's peer; HTTP judges its TCP peer, or
+behind a proxy listed in `trusted_proxies` the forwarded address. Behind Docker's published ports
+the server may see the bridge gateway for every client. A list then admits every client or none.
+Behind a reverse proxy that is not in `trusted_proxies`, every web request comes from the proxy's
+address, with the same result. GraphQL `clientAddress` shows the address the server judges for
+you, and a policy write warns when your own list would refuse you. A ticket-granting ticket
+forwarded to a server asks for service tickets from that server's address, so that server must be
+inside the user's list. Locked out by this rule: run
+`lldap policy-unlink --config-file <config> '<ou>'` as the user the server runs as, for the OU
+whose policy sets the list (the warning names it). The matcher, the proxies, the measured
+addresses and the sessions are in [allowed-networks.md](allowed-networks.md).
 
 ## What is recorded
 
@@ -481,19 +513,31 @@ no-op inheritance toggle is not logged.
 
 When a rule refuses everyone who could change it, admins included, the host tool works on the
 database directly, with the server running or stopped. Run it as the user the server runs as, so
-what it writes keeps the server's owner; in the image that is
+what it writes keeps the server's owner, and give it the server's configuration: the same file and
+the same `LLDAP_` variables (on a host install, those the unit or its drop-in sets; `docker exec`
+already has the container's). Without them it stops for want of `jwt_secret`, or opens the
+database the file alone names (`users.db` in the directory it runs in, when it names none), which
+need not be the server's. In the image, run it as
 `docker exec -u <UID> <container> /app/lldap <command> --config-file /data/lldap_config.toml …`,
-with the uid the image runs the server as (`UID`, or `LLDAP_UID` when set; 1000 by default):
+with the uid the image runs the server as (`UID`, or `LLDAP_UID` when set; 1000 by default).
+
+A `policy: unreadable` row names no item. A value that does not parse is named in the server
+log's warning, with its policy and item; a read that failed is logged as a warning with its cause
+(*The policy cache was not refilled*, *The users' activity was not read*, for example).
 
 | Locked out | Run |
 |---|---|
 | by the lockout | `lldap unlock --config-file <config> <user>` |
 | by this rule: `inactivity-days` | `lldap reenable --config-file <config> <user>` |
-| by `inactivity-days` as `policy: unreadable` (its value, `inactivity_recording_since` or the table `user_activity` cannot be read; a re-enable does not help) | `lldap policy-unlink --config-file <config> <ou>` |
-| by this rule: any item of an OU's policy | `lldap policy-unlink --config-file <config> <ou>` |
+| by `inactivity-days` as `policy: unreadable` (its value, `inactivity_recording_since` or the table `user_activity` cannot be read; a re-enable does not help) | `lldap policy-unlink --config-file <config> '<ou>'` |
+| by this rule: any item of an OU's policy | `lldap policy-unlink --config-file <config> '<ou>'` |
 
 `lldap policy-unlink` removes the policy link of one OU. `<ou>` is the OU's key
-(`people\labs`); the root is `(root)` or `""`. It writes one `policy_change` row, `policy
+(`people\labs`); the root is `(root)` or `""`. In a shell, quote the key:
+`lldap policy-unlink --config-file <config> 'people\labs'`, `'(root)'` for the root. Unlink the OU
+whose policy sets the item, which can be a parent of the user's OU or the root, not always the
+user's own. If an OU above it on the user's chain also sets the item, that value applies next, so
+unlink each OU on the chain whose policy sets it. It writes one `policy_change` row, `policy
 cleared: <name> (lldap policy-unlink)` with the OU as target (`(root)` for the root), in the
 same transaction, and prints it. An OU with no link is an error and writes nothing. A running
 server sees it within 30 seconds. The policy itself is kept: fix it and link it again from the
@@ -532,7 +576,17 @@ entry refuses the start, naming it.
 
 ## Limitations
 
-- `login-hours` has one zone for the whole server, not one per OU.
+- `login-hours` has one zone for the whole server, not one per OU; servers that share a database
+  each judge in their own, so give them the same `login_hours_timezone`.
+- Some reads of the policies have no 2-second bound: the admin's policies page, the policy cache's
+  refresh, and the server's start. While `ou_policies` or `policies` is locked, they wait as long
+  as the database lets them.
+- On MySQL and MariaDB the 2-second bound is set by a different setting on each, chosen by the
+  text of `SELECT VERSION()`: text that contains `mariadb`, in any case, is taken for MariaDB, any
+  other for MySQL. On a MariaDB whose version text lacks `mariadb`, or a MySQL whose version text
+  contains it, every bounded read fails: a sign-in that reads a user the policy cache does not
+  hold yet is refused (`policy: unreadable`), a password change is refused ("the password policy
+  could not be read; try again"), and a save gives no `allowed-networks` warning.
 - A lock's duration runs from the last counted attempt, and a web start counts as one until
   its finish takes it back, so the duration can run from a start that then succeeded.
 - Kerberos already tells whether a principal exists (an unknown one gets a different error);
@@ -543,6 +597,9 @@ entry refuses the start, naming it.
 
 ## What builds on it
 
-`PolicyBackendHandler::get_policy_levels` plus `resolve_effective_items` is the seam
-each later enforcement pass consumes (per-OU MFA, lockout, login hours, networks,
-inactivity).
+`resolve_effective_items` over an OU's levels is the seam every item's enforcement reads:
+per-OU MFA, the lockout, password length, login hours, allowed networks and inactivity. The
+levels come from `PolicyBackendHandler::get_policy_levels` for the policy cache and the policies
+page, and from the bounded reads (`bounded_policy_entry`, `bounded_activity_entry`,
+`bounded_policy_levels`) for a user the cache does not hold and for a password change. A sign-in
+item also adds its check to `default_item_checks`.

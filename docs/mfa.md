@@ -47,7 +47,10 @@ group. Members are exempt whatever their value: they authenticate with the passw
 even if enrolled. The combined `password:code` string is not split for them, so it is a
 wrong password â€” use the bare password. At LDAP simple bind and `/auth/simple/login` a code
 alone (`:123456`) is refused as no password given, for them too. Put service accounts there,
-and keep one admin exempt or unenrolled as the break-glass.
+and keep one admin exempt or unenrolled as the break-glass. The group exempts from the second
+factor only: its members are still judged by the OU's lockout, login hours, allowed networks and
+inactivity, and when those refuse every admin the way back is on the host
+([policies.md](policies.md#getting-back-in-from-the-host)).
 
 A group whose name differs from `lldap_mfa_disabled` only by case (`LLDAP_MFA_DISABLED`) is
 not the exempt group, at any door and on any database. While it exists, `lldap_mfa_disabled`
@@ -114,7 +117,7 @@ refuse (outside its login hours, say) gets the wrong-password answer instead, an
 not looked at.
 
 **A password check without a session.** `/auth/opaque/login/finish` takes an optional
-`"session": false`. That finish does what any finish does: it verifies the password, checks
+`"session": false`. That finish does what any finish does: it confirms the password, checks
 a code sent in `totp_code`, admits or refuses the user (while Kerberos is unavailable only
 admins are admitted, answered `503`), and mints a proof when asked. It makes no session: no
 token, no refresh token, no cookie. It writes one row at the door, the `login` success row
@@ -238,10 +241,10 @@ enrollment, a 90-second replay window, five attempts per step, issuer `KLLDAP` â
   same proof. Under `always` that door refuses a user who has not enrolled, and the proof
   comes from the OPAQUE finish, which is the door that admits them.
 - A proof is used once, on every server that shares the database: its random id is kept in
-  the table `mfa_used_proofs` with its expiry (no user, nothing else) until a minute after it
-  expires, so a restart or another server refuses it too. There is no cap. When that table
-  cannot be read or written, a first enrollment is refused (*Password proof unreadable*, an
-  `mfa_enroll` row `proof: unreadable`) and the proof is not used up.
+  the table `mfa_used_proofs` with its expiry (no user, nothing else) at least until a minute
+  after it expires, so a restart or another server refuses it too. There is no cap. When that
+  table cannot be read or written, a first enrollment is refused (*Password proof
+  unreadable*, an `mfa_enroll` row `proof: unreadable`) and the proof is not used up.
 - Servers that share a database need synchronised clocks. A server accepts a proof whose
   expiry is up to 60 seconds further away than its own clock allows, and no more.
 - The used codes, the attempts and the used proofs are kept in the database, shared by
@@ -254,7 +257,7 @@ enrollment, a 90-second replay window, five attempts per step, issuer `KLLDAP` â
   second factor and whether they proved it within the window.
 - Sessions and refresh tokens minted before an enrollment stay valid until they expire.
 - Administrators can exempt themselves through `lldap_mfa_disabled` â€” the deliberate
-  break-glass.
+  break-glass, for the second factor only; the OU's other items still judge them.
 - Turning a user's value back to `off` strands the combined format: the whole string is the
   password again, and enrolled users must sign in with the password alone. The same is
   true of `lldap_mfa_disabled` members who are still enrolled.

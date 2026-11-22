@@ -2,7 +2,10 @@
 
 The OU policy item `allowed-networks` ([policies.md](policies.md)) limits where a user may sign
 in from: a comma-separated list of networks in CIDR form, each with an explicit prefix
-(`10.0.0.0/8, 2001:db8::/32`). Empty, the default, admits any address.
+(`10.0.0.0/8, 2001:db8::/32`). Empty, the default, admits any address. Behind Docker's published
+ports the server may see one address, the bridge gateway, for every client, and a list then admits
+everyone or no one: check `clientAddress` (shown on the policies page) before you save a list
+([Behind Docker's published ports](#behind-dockers-published-ports)).
 
 ## The rule
 
@@ -15,7 +18,11 @@ in from: a comma-separated list of networks in CIDR form, each with an explicit 
 - **No address:** under a non-empty list, a request that carries no address is refused.
 - **A value that cannot be read** (stored before a validator change, or written to the database
   by hand) refuses with `policy: unreadable`, and the server logs one warning naming the policy
-  and the item, until the value changes.
+  and the item, until the value changes. When a linked policy first sets a list, the policy cache
+  is filled before the doors judge with it; until that fill succeeds the doors that judge the list
+  refuse every user, whatever their OU, admins included, token refresh and use among them
+  (`policy: unreadable`, at the KDC `not loaded yet`). The server tries again every second, and
+  unlinking every OU whose policy sets the item ends it.
 - **Doors:** the LDAP bind, `/auth/simple/login`, the web login, token refresh, token use, kinit,
   renewals and service tickets. A service asking a ticket for the user (S4U2Self, S4U2Proxy) is
   not judged by this item: the user is not at a keyboard there and has no address. Nobody is
@@ -57,6 +64,8 @@ server believes. As in the item, an entry written as an IPv4-mapped IPv6 network
 - A listed proxy that sends no `X-Forwarded-For` at all is itself the client: that is a request
   made on the proxy's own host.
 - With the list empty, the header is never read for a decision.
+- A request through a reverse proxy that is not listed is judged at the proxy's address: every
+  web request through it comes from that one address, and a list admits all of them or none.
 - A bad entry refuses the start, naming it. The start's log line says which proxies are believed.
 
 List only your own proxies: anyone connecting from a listed address can name any client address.
@@ -97,7 +106,7 @@ docker run -d --name klldap-addr-cell --network bridge \
   -v klldap-addr-cell-data:/data -v klldap-addr-cell-kdc:/var/kerberos/krb5kdc \
   -e LLDAP_LDAP_BASE_DN=dc=example,dc=com -e LLDAP_VERBOSE=true \
   -e LLDAP_LDAP_USER_PASS -e LLDAP_JWT_SECRET -e LLDAP_KEY_SEED \
-  klldap-e3a
+  aelieth/klldap:0.8.1
 ```
 
 The container's address was 172.17.0.3 and its gateway 172.17.0.1. The address is the peer on
@@ -116,8 +125,7 @@ the server's own log row:
 | inside, the container's own listeners | http | 127.0.0.1 | loopback |
 
 None of the nine is the client's address. A client on the same Docker network as the server,
-talking to the container's own address, is seen as itself: gate phase 73 measures that case, not
-the run above.
+talking to the container's own address, is seen as itself.
 
 The same holds for `mfa_proof_same_address` ([kerberos.md](kerberos.md#a-second-factor-and-kinit)): behind published ports
 the directory's sign-in and the kinit both come from the gateway, so the two addresses are then
@@ -151,7 +159,9 @@ allowed-networks: the list that now applies to you does not contain the address 
 It is never a refusal: an admin may be setting a rule for others from elsewhere. Your own next
 request is refused, though, as any request from outside the list is. A policy that does not reach
 you gives none. Other writes give none, moving your own user to another OU included: check
-`clientAddress` first.
+`clientAddress` first. Only this item is checked against you at a save: a `login-hours` value
+that applies to you and leaves out the present moment gives no warning, and refuses your next
+request.
 
 The policies page shows the warning under the save's success line. When the page's next request is
 then refused, it says so in one line, with `lldap policy-unlink` as the way back, instead of an
@@ -163,9 +173,12 @@ When a list refuses everyone who could change it, run on the host, as the user t
 with the server running or stopped:
 
 ```
-lldap policy-unlink --config-file <config> <ou>
+lldap policy-unlink --config-file <config> '<ou>'
 ```
 
-`<ou>` is the OU the policy is linked to (`people\labs`), or `(root)` for the root. It removes that
-link and writes one `policy_change` row; a running server sees it within 30 seconds
+`<ou>` is the key of the OU whose policy sets the list (`'people\labs'`), or `'(root)'` for the
+root; in a shell, quote it as shown. That OU can be a parent of the user's OU or the root, not
+always the user's own: it is the OU a save's warning names. If an OU above it on the user's chain
+also sets a list, that list applies next, so unlink each OU on the chain whose policy sets one. It
+removes that link and writes one `policy_change` row; a running server sees it within 30 seconds
 ([policies.md](policies.md#getting-back-in-from-the-host)). Fix the list and link it again.

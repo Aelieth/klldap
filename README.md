@@ -42,6 +42,8 @@ On top of LLDAP it adds:
 - POSIX accounts and groups (`uidNumber`, `gidNumber`, `homeDirectory`,
   `loginShell`), assignable automatically, for SSSD and PAM,
 - admin-controlled organizational units,
+- a TOTP second factor, server-wide or per OU, and OU policies for account lockout, password
+  length, login hours, allowed networks and inactivity ([docs/policies.md](docs/policies.md)),
 - LDAP writes: `ldapadd` users and groups, `ldapmodify` attributes and passwords,
 - a Federation tab that sets up a Keycloak realm against KLLDAP (LDAP + Kerberos
   SPNEGO) and exports its keytab,
@@ -56,13 +58,16 @@ move to KLLDAP with their data (users set a new password), see the
 
 ## Installation
 
-KLLDAP ships as a Docker image, `aelieth/klldap`, because the KDC lives in the
-container. See [docs/install.md](docs/install.md). A 0.7.2 install follows
-[Upgrading from 0.7.2](docs/kerberos.md#upgrading-from-072) before it pulls.
+KLLDAP runs from a Docker image, `aelieth/klldap`, that you build, or from the release
+tarball on a host. See [docs/install.md](docs/install.md). A 0.7.2 install follows
+[Upgrading from 0.7.2](docs/kerberos.md#upgrading-from-072) before its first 0.8.1 start.
 
-Images are amd64 and arm64, `aelieth/klldap:0.8.0`. The arm64 image is built under emulation and is not tested by us.
+0.8.1 is a pre-release, and its images are not published to a registry. Build the image from
+the `Dockerfile` at the `v0.8.1` tag and name it `aelieth/klldap:0.8.1`, the name the examples
+use ([docs/install.md](docs/install.md)). It builds for amd64 and arm64; the arm64 image is built
+under emulation and is not tested by us.
 
-The rootless image is published under `aelieth/klldap:0.8.0-rootless`, for the same platforms as the default image.
+The rootless image is the `Dockerfile`'s `rootless` target, named `aelieth/klldap:0.8.1-rootless`, for the same platforms as the default image.
 
 KLLDAP 0.8.0 is 64-bit only (x86_64 and arm64); there is no 32-bit or ARMv7 build.
 
@@ -124,6 +129,8 @@ read from a file instead by appending `_FILE` to the variable name
 | `LLDAP_FORCE_LDAP_USER_PASS_RESET` | `false` | Reset the admin password from `LLDAP_LDAP_USER_PASS` (`true` once, `always`) |
 | `LLDAP_FORCE_UPDATE_PRIVATE_KEY` | `false` | Accept a changed private key (invalidates every password) |
 | `LLDAP_ENABLE_MFA` | unset | TOTP second factor for every user, overriding the OUs' `enable-mfa`: `off`, `enabled` for users who enroll, `always` for everyone (0.8.0's `false` / `true` still work; `lldap_mfa_disabled` members exempt). Unset, each OU's policy decides. See [docs/mfa.md](docs/mfa.md) |
+| `LLDAP_LOGIN_HOURS_TIMEZONE` | `UTC` | The zone the OUs' `login-hours` windows are read in: an IANA name (`America/Chicago`) read once at start from the system's zone files; an unknown name refuses the start. See [docs/policies.md](docs/policies.md#configuration) |
+| `LLDAP_TRUSTED_PROXIES` | empty | The reverse proxies whose `X-Forwarded-For` the OUs' `allowed-networks` believe, as one string of comma-separated CIDRs; empty, the header is never read for a decision. See [docs/allowed-networks.md](docs/allowed-networks.md#whose-address) |
 | `LLDAP_LDAPS_OPTIONS__ENABLED` / `__PORT` / `__CERT_FILE` / `__KEY_FILE` | `false` / `6360` | LDAPS |
 | `LLDAP_SMTP_OPTIONS__ENABLE_PASSWORD_RESET`, `__SERVER`, `__PORT`, `__SMTP_ENCRYPTION`, `__USER`, `__PASSWORD`, `__FROM`, `__REPLY_TO`, `__TLS_ROOT_CERT_FILE` | off | Password-reset mail. `__TLS_ROOT_CERT_FILE` is an optional PEM of the CA that signed the SMTP server |
 | `LLDAP_HEALTHCHECK_OPTIONS__HTTP_HOST` / `__LDAP_HOST` | `localhost` | What `lldap healthcheck` probes |
@@ -152,7 +159,7 @@ database, keytabs) and `/var/kerberos/krb5kdc` (KDC database) — both must pers
 - [Kerberos](docs/kerberos.md), [SSSD + Kerberos + Keycloak guide](docs/SSSD_LDAP_Kerberos_Setup_Guide.md)
 - [Scripting (LDAP and GraphQL)](docs/scripting.md), [event logging](docs/logging.md),
   [two-factor authentication](docs/mfa.md), [OU policies](docs/policies.md),
-  [architecture](docs/architecture.md)
+  [allowed networks](docs/allowed-networks.md), [architecture](docs/architecture.md)
 - [FAQ](docs/faq.md), [building and testing](docs/testing.md), [changelog](CHANGELOG.md)
 
 ## Contributions

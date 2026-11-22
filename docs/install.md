@@ -1,8 +1,22 @@
 # Installing KLLDAP
 
-The Kerberos KDC runs inside the `lldap` process. The image is how you run the server.
+The Kerberos KDC runs inside the `lldap` process. You run the server from an image you build,
+or from the release tarball on a host.
 
-Images are amd64 and arm64, `aelieth/klldap:0.8.0`. The arm64 image is built under emulation and is not tested by us.
+0.8.1 is a pre-release, and its images are not published to a registry. To run it in a
+container, build the image yourself, at the root of a checkout of the `v0.8.1` tag:
+
+```sh
+docker build --build-arg VERSION=0.8.1 --tag aelieth/klldap:0.8.1 .
+```
+
+`VERSION=0.8.1` sets the image's `version` label (`dev` without it), and `aelieth/klldap:0.8.1`
+is the name the examples on this page use. The build fetches its dependencies, kerber-rust
+v1.2.3 among them from GitHub, so it needs the network. The
+`Dockerfile`'s `rootless` target gives the rootless image; name it
+`aelieth/klldap:0.8.1-rootless`. The image builds for amd64 and arm64; the arm64 image is built
+under emulation and is not tested by us. To install without building, use the
+[release tarball](#install-from-the-release-tarball).
 
 KLLDAP 0.8.0 is 64-bit only (x86_64 and arm64); there is no 32-bit or ARMv7 build.
 
@@ -113,7 +127,8 @@ comes up degraded, as it does under rootless Podman and unlike Docker.
 
 ### Kubernetes, TrueNAS SCALE and package repositories
 
-Nothing here installs KLLDAP. The image is how you run it. Upstream's install page
+Nothing here installs KLLDAP. The image you build, or the release tarball, is how you run it.
+Upstream's install page
 covers LLDAP's chart, TrueNAS app, packages and FreeBSD port.
 
 ### Install from the release tarball
@@ -222,11 +237,9 @@ start refuse.
 
 ### Upgrading from KLLDAP 0.8.0
 
+An upgrade from the 0.8.0 pre-release was not tested.
 Stop every KLLDAP server that uses the database before the first 0.8.1 start, and
-do not run 0.8.0 and 0.8.1 side by side. A server that finds the Kerberos realm left
-open watches it before it takes it over: 0.8.0 for thirty seconds, 0.8.1 for
-thirty-five. A 0.8.1 holder stops serving within thirty seconds of the start of
-its last write that reached the database. A 0.8.0 holder can serve that long, and
-longer under sustained load. So a 0.8.0 server could take the realm over from a
-0.8.1 holder that still serves, or a 0.8.1 server from a busy 0.8.0 holder, and
-two servers could serve the realm at once.
+do not run 0.8.0 and 0.8.1 side by side. A 0.8.1 server that finds the Kerberos realm
+left open watches it for thirty-five seconds before it takes it over. A 0.8.1
+holder stops serving within thirty seconds of the start of its last write that
+reached the database.

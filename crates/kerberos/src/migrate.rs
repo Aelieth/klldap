@@ -69,8 +69,9 @@ pub(crate) fn migrate(
         ),
         Found::Empty => Ok(()),
         Found::MitOnly => bail!(
-            "{} holds the MIT database of KLLDAP 0.7.2, which 0.8.0 cannot open; write its dump to \
-             {} with the 0.7.2 image (docs/kerberos.md, Upgrading from 0.7.2) and start again",
+            "{} holds the MIT database of KLLDAP 0.7.2, which this server cannot open; write its \
+             dump to {} with the 0.7.2 image (docs/kerberos.md, Upgrading from 0.7.2) and start \
+             again",
             dir.display(),
             dir.join(DUMP).display()
         ),
@@ -383,24 +384,33 @@ mod tests {
 
     #[test]
     fn test_a_realm_that_cannot_migrate_is_refused_untouched() {
-        let rows: [(&str, Spoil, &str); 3] = [
+        let rows: [(&str, Spoil, &str, Found); 4] = [
             (
                 "bad dump",
                 |t| fs::write(t.settings.data_dir.join(DUMP), "not a dump").unwrap(),
                 "does not parse",
+                Found::Dump,
             ),
             (
                 "no stash",
                 |t| fs::remove_file(t.settings.data_dir.join(".k5.EXAMPLE.COM")).unwrap(),
                 "has a dump but no stash at",
+                Found::Dump,
             ),
             (
                 "other realm",
                 |t| t.settings.realm = "OTHER.TEST".to_owned(),
                 "is for realm EXAMPLE.COM, but this server serves OTHER.TEST",
+                Found::Dump,
+            ),
+            (
+                "no dump",
+                |t| fs::remove_file(t.settings.data_dir.join(DUMP)).unwrap(),
+                "of KLLDAP 0.7.2, which this server cannot open; write its dump to",
+                Found::MitOnly,
             ),
         ];
-        for (case, spoil, cause) in rows {
+        for (case, spoil, cause, found) in rows {
             let mut temp = TempRealm::new();
             realm_as_mit(&temp);
             spoil(&mut temp);
@@ -411,7 +421,7 @@ mod tests {
                 migrate(&temp.settings, &paths, temp.host.as_ref()).unwrap_err()
             );
             assert!(error.contains(cause), "{case}: {error}");
-            assert_eq!(detect(&dir).unwrap(), Found::Dump, "{case}: nothing moved");
+            assert_eq!(detect(&dir).unwrap(), found, "{case}: nothing moved");
             assert!(held_names(&temp).is_empty(), "{case}: nothing written");
         }
         let temp = TempRealm::new();

@@ -1367,6 +1367,30 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn test_an_unlock_by_another_server_is_taken_at_the_doors_within_a_second() {
+        let pool = get_initialized_db().await;
+        let (here, there) = servers(&pool);
+        user_in(&here, "e1second", "e1secondou").await;
+        threshold(&there, "e1secondou", "1").await;
+        assert!(!bind(&there, "e1second", "nope").await);
+        there.lockout.write_all_now(&there).await;
+        assert!(
+            !bind(&there, "e1second", RIGHT).await,
+            "locked; the lock looked at"
+        );
+        here.unlock_user(&UserId::new("e1second")).await.unwrap();
+        let inside = bind(&there, "e1second", RIGHT).await;
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let past = bind(&there, "e1second", RIGHT).await;
+        assert_eq!(
+            (inside, past),
+            (false, true),
+            "inside the second the held lock answers; the first attempt past it takes the unlock"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_an_unlock_stamps_the_servers_clock_with_its_row_and_a_second_view_follows() {
         let pool = get_initialized_db().await;
         let (here, there) = servers(&pool);
@@ -1720,6 +1744,34 @@ pub(crate) mod tests {
             .find(|c| !valid.contains(c))
             .unwrap();
         ([valid[0].clone(), valid[2].clone()], wrong)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_sessionless_finish_whose_wrong_code_locks_writes_the_lock_row_saying_no_session()
+     {
+        let (_clock, at) = pinned();
+        let log = LogGuard::install_on_this_thread();
+        let h = handler().await.with_mfa_policy(MfaPolicy::Enrolled);
+        user_in(&h, "e1nosess", "e1nosessou").await;
+        threshold(&h, "e1nosessou", "1").await;
+        let seed = enroll(&h, "e1nosess", at).await;
+        let (_, wrong) = codes(&seed, at);
+        rows(&log, &[LogKind::AccountLock]);
+        let started = start(&h, "e1nosess", RIGHT).await;
+        let mut request = finish_request(started, RIGHT, Some(&wrong)).unwrap();
+        request.session = Some(false);
+        let answered = without_session(h.login_finish(request)).await;
+        let lock = (
+            LogKind::AccountLock,
+            Some("e1nosess".to_owned()),
+            Some("locked: web login; no session".to_owned()),
+        );
+        assert_eq!(
+            (answered.is_err(), rows(&log, &[LogKind::AccountLock])),
+            (true, vec![lock]),
+            "a sessionless finish whose wrong code reaches the threshold: its lock row says no session"
+        );
     }
 
     #[tokio::test]

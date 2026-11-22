@@ -1146,6 +1146,7 @@ pub(crate) mod tests {
     use pretty_assertions::assert_eq;
     use std::cell::Cell;
 
+    mod door_rows;
     mod networks_rows;
     mod start_rows;
 

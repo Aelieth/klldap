@@ -243,6 +243,45 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial]
+    async fn test_a_replaced_factor_ends_the_users_windows() {
+        let (_clock, at) = doors::pinned();
+        let handler = kerberos_handler().await;
+        doors::user_in(&handler, "e2kreplace", "e2kreplaceou").await;
+        let user = UserId::new("e2kreplace");
+        let seed = doors::enroll(&handler, "e2kreplace", at).await;
+        let db = handler.sql_pool.clone();
+        let earlier = NOW - 120;
+        note_window(&db, &user, "192.0.2.9", earlier, earlier + WINDOW)
+            .await
+            .unwrap();
+        let open = spans(&db, "e2kreplace").await;
+        let ([current, _], _) = doors::codes(&seed, at);
+        let restart = handler
+            .start_totp_enrollment(&user, Some(current), None)
+            .await
+            .unwrap();
+        let new_seed = lldap_mfa::seed_from_base32(&restart.secret_base32).unwrap();
+        handler
+            .finish_totp_enrollment(&user, &restart.state, &code(&new_seed, at as i64))
+            .await
+            .unwrap();
+        let finish = at as i64;
+        assert_eq!(
+            (open, spans(&db, "e2kreplace").await),
+            (
+                vec![
+                    (earlier, earlier + WINDOW, "192.0.2.9".to_owned()),
+                    (finish, finish + WINDOW, String::new())
+                ],
+                vec![(finish, finish + WINDOW, String::new())]
+            ),
+            "the enrollment's own window and an earlier one are open; a replacement of the factor ends \
+             both, and its finish opens its own"
+        );
+    }
+
+    #[tokio::test]
     async fn test_a_proof_opens_a_window_one_inside_extends_it_one_after_opens_another() {
         let db = get_initialized_db().await;
         let handler = SqlBackendHandler::new(generate_random_private_key(), db.clone());

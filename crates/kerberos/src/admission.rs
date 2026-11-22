@@ -2460,6 +2460,60 @@ pub(crate) mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial]
+    async fn test_judging_a_renewal_or_a_service_ticket_writes_no_activity() {
+        let b = "e6kdcrenew";
+        let (_temp, _embedded, store) = realm(&[b]).await;
+        let guard = EnforcementGuard::default_checks();
+        let cache: &'static PolicyCache = Box::leak(Box::new(PolicyCache::new()));
+        let counter: &'static Lockout = Box::leak(Box::default());
+        let pool = memory_pool().await;
+        let handler = SqlBackendHandler::new(generate_random_private_key(), pool.clone())
+            .with_policy_cache(cache)
+            .with_lockout(counter);
+        directory_user(&handler, b, "e6kdcrenewou").await;
+        let request = CreatePolicyRequest {
+            name: "e6 kdc renew".to_owned(),
+            description: String::new(),
+            items: [(INACTIVITY_DAYS.to_owned(), "30".to_owned())].into(),
+        };
+        let id = handler.create_policy(request).await.unwrap();
+        handler.set_ou_policy("e6kdcrenewou", id).await.unwrap();
+        let verdict = Arc::new(KdcVerdict::on(REALM, cache, counter));
+        store
+            .write()
+            .unwrap()
+            .policy
+            .plugins
+            .set_host_admission(verdict.clone());
+        cache.serve_successes(Arc::new(handler.clone()), tokio::runtime::Handle::current());
+        let user = UserId::new(b);
+        let stored = async || {
+            let rows = handler.read_activity(Some(&user)).await.unwrap();
+            rows.first().and_then(|(_, row)| row.last_success)
+        };
+        let start = lock_clock().and_utc();
+        guard.pin_clock(start);
+        let issued = kinit(&store, b, Some(PASSWORD)).0;
+        let written = stored().await;
+        guard.pin_clock(start + chrono::Duration::seconds(3_600));
+        let asked = [TgsKind::Renew, TgsKind::Normal]
+            .map(|kind| tgs_asks_of(&verdict, &store, Some(b), b, kind));
+        cache.drain_successes(&handler).await;
+        assert_eq!(
+            (
+                issued,
+                written,
+                asked,
+                cache.owed_successes(),
+                stored().await
+            ),
+            (0, Some(start), [Ok(()), Ok(())], 0, Some(start)),
+            "judging a renewal or a service ticket writes no activity"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial]
     async fn test_an_issued_ticket_is_carried_as_a_success_and_owed_while_the_database_is_held() {
         let b = "e6kdc";
         let (_temp, _embedded, store) = realm(&[b]).await;

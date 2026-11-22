@@ -83,3 +83,25 @@ async fn test_the_request_scope_takes_the_forwarded_address_only_from_a_listed_p
         );
     }
 }
+
+#[actix_web::test]
+async fn test_a_forwarded_header_is_not_read() {
+    let _backend = crate::auth_service::tests::ONE_BACKEND.lock().await;
+    let app = App::new()
+        .wrap(from_fn(log_request_scope))
+        .route("/", web::get().to(seen));
+    let app = init_service(app).await;
+    let peer: std::net::SocketAddr = "10.9.0.1:40000".parse().unwrap();
+    policy_cache().set_trusted_proxies(parse_list("10.9.0.1/32").unwrap());
+    let request = TestRequest::get()
+        .uri("/")
+        .peer_addr(peer)
+        .insert_header(("forwarded", "for=203.0.113.9"));
+    let response = call_service(&app, request.to_request()).await;
+    let got = String::from_utf8_lossy(&read_body(response).await).into_owned();
+    policy_cache().set_trusted_proxies(Vec::new());
+    assert_eq!(
+        got, "Some(10.9.0.1) None Some(10.9.0.1)",
+        "a listed proxy's Forwarded header is not read: the proxy is the client"
+    );
+}

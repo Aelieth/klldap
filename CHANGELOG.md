@@ -414,6 +414,18 @@
   instead of being prepared while the KDC waits.
 - The verbose HTTP log records the request path without its query string.
 
+### Dependencies
+
+- kerber-rust v1.2.3 replaces v1.2.2, at its tag: `krb5-kdc`, `krb5-admin`, `krb5-asn1`,
+  `krb5-config`, `krb5-crypto`, `krb5-gss`, `krb5-log`, `krb5-protocol`, `krb5-types` and its
+  `rasn` patch.
+- jiff 1.0.1 is new, built with its `std` feature only: `login-hours` is judged with it in the
+  `login_hours_timezone` zone. It adds five entries to `Cargo.lock`: jiff, jiff-core and
+  jiff-static 1.0.1, portable-atomic 1.15.0 and portable-atomic-util 0.2.8. The x86_64 and
+  aarch64 builds compile jiff and jiff-core only: jiff-static serves jiff features that are
+  not turned on, and portable-atomic and portable-atomic-util serve only targets without
+  pointer-sized atomics.
+
 ## [0.8.0] - 2026-11-15
 
 0.8.0 is a pre-release. The new policies and the front end have not yet had thorough testing. Further testing, verification and code review come before it is promoted.

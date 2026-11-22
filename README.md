@@ -23,7 +23,7 @@
 ## About
 
 KLLDAP is a hard fork of [LLDAP](https://github.com/lldap/lldap), the lightweight
-LDAP authentication server. In 0.8.0 the KDC and kadmin are kerber-rust (v1.2.2)
+LDAP authentication server. In 0.8.0 the KDC and kadmin are kerber-rust (v1.2.3)
 inside the `lldap` process, and MIT's KDC is no longer in the image's running system.
 Users, groups and passwords are managed once, through the web UI, LDAP or
 GraphQL; the KDC follows.

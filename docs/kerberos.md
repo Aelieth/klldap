@@ -692,7 +692,7 @@ thirty-five, so the two side by side have no slack.
 
 ## Upgrading from 0.7.2
 
-0.7.2 kept the realm in MIT's db2 format, which 0.8.0 cannot read. 0.8.0 keeps
+0.7.2 kept the realm in MIT's db2 format, which 0.8.1 cannot read. 0.8.1 keeps
 the realm in the directory database.
 
 Docker only, any tag: the script decides from the image itself.
@@ -700,13 +700,13 @@ Docker only, any tag: the script decides from the image itself.
 and changes nothing. `scripts/upgrade-0.7.2-to-0.8.0.sh --yes <container>`
 stops 0.7.2, backs up both volumes, writes the dump with the image that
 container runs, and prints the edits in the steps below. It does not pull,
-and it does not start 0.8.0. The script prints the edits for a compose file
-and for a `docker run` command. Start 0.8.0, then
+and it does not start 0.8.1. The script prints the edits for a compose file
+and for a `docker run` command. Start 0.8.1, then
 `scripts/upgrade-0.7.2-to-0.8.0.sh --verify <container> <backup-dir>`.
 Podman follows the steps below. Those steps are what the script does.
 
 1. Stop 0.7.2. Copy both volumes, the data directory and the KDC directory,
-   before the first 0.8.0 start. On MySQL or MariaDB, back up the database as
+   before the first 0.8.1 start. On MySQL or MariaDB, back up the database as
    well: schema changes are not transactional.
 
 2. Write a dump of the 0.7.2 realm into the KDC directory with the 0.7.2 image
@@ -729,8 +729,8 @@ Podman follows the steps below. Those steps are what the script does.
    `LLDAP_KERB_REALM_NAME` is ignored; set `LLDAP_KERBEROS_OPTIONS__REALM` to
    that realm, including when 0.7.2's `realm_name` in `kerberos_config.toml`
    was not the name the base DN gives. `LLDAP_KEYCLOAK_ADMIN_PASS` is ignored;
-   set `LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS`. Name the image `aelieth/klldap:0.8.0`
-   to get 0.8.0. `aelieth/klldap:latest` is still 0.7.2.
+   set `LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS`. Name the image `aelieth/klldap:0.8.1`
+   to get 0.8.1. `aelieth/klldap:latest` is still 0.7.2.
    A configuration that does not set `kerberos_options.enabled` now starts a
    realm; set `enabled = false` to stay without one. Pull that tag and start it.
 

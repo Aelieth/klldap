@@ -203,7 +203,7 @@ Moving between database backends is in [database_migration.md](database_migratio
 
 ### Upgrading from KLLDAP 0.7.2
 
-Write a dump of the Kerberos realm with the 0.7.2 image before the first 0.8.0 start; 0.8.0
+Write a dump of the Kerberos realm with the 0.7.2 image before the first 0.8.1 start; 0.8.1
 loads it and keeps the MIT files: [kerberos.md](kerberos.md#upgrading-from-072).
 
 At each start, a principal of a directory user without `kerberosSync`, a migrated one
@@ -212,7 +212,7 @@ turn `kerberosSync` on for the user, then change the user's password: the passwo
 what brings kinit back. Or remove the principal with kadmin.
 
 On MySQL and MariaDB schema changes are not transactional (the server commits at each DDL
-statement), so take a backup before the first 0.8.0 start; if a start is interrupted
+statement), so take a backup before the first 0.8.1 start; if a start is interrupted
 mid-migration the next start completes it.
 
 **A 0.7.2 compose file that publishes `88:88` must publish `88:1088`, or the KDC is

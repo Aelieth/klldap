@@ -44,10 +44,24 @@ jobs:
           build-args: VERSION=ci-gate
           cache-from: type=gha
           cache-to: type=gha,mode=max
+      - name: Build the test image with the gate's hooks
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          load: true
+          tags: klldap-test-kill
+          build-args: |
+            VERSION=ci-gate
+            LLDAP_FEATURES=lldap/kill-points lldap/test-admission
+          cache-from: |
+            type=gha
+            type=gha,scope=kill
+          cache-to: type=gha,mode=max,scope=kill
       - name: Install gate client tools
         run: sudo apt-get update && sudo apt-get install -y ldap-utils jq
       - name: Run the gate
-        run: GATE_DB=${{ matrix.db }} gate/run-gate.sh
+        run: GATE_DB=${{ matrix.db }} GATE_KILL_IMAGE=klldap-test-kill gate/run-gate.sh
       - name: Upload gate results
         if: failure()
         uses: actions/upload-artifact@v4

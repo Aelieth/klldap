@@ -15,8 +15,9 @@
 #   GATE_FIXTURE_DATA / GATE_FIXTURE_KDC / GATE_FIXTURE_BASE_DN / GATE_FIXTURE_ADMIN_PASS
 #                     enable the migration_boot phase (dirs mounted over /data and the KDC)
 #   GATE_LLDAP_CLI    path to a Zepmann/lldap-cli checkout to enable the lldap-cli phase
-#   GATE_KILL_IMAGE   image with the kill-points hook (`make test-kill-points`) for the
-#                     password-kill phase; unset, its kill rows are skipped
+#   GATE_KILL_IMAGE   image with the test hooks (`make test-kill-points`): the server of the
+#                     kdc-verdict phase, which fails without it, and of the password-kill
+#                     phase, whose kill rows are skipped without it
 
 set -uo pipefail
 

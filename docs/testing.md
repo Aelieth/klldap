@@ -89,5 +89,6 @@ host's `/etc/krb5.conf` or the login credential cache.
 `.github/workflows/rust.yml` runs the safety dance, a `licenses` job
 (`cargo deny check licenses sources`), a shellcheck
 pass, and a PostgreSQL migration lane. `.github/workflows/gate.yml`
-builds the image and runs the gate on SQLite and PostgreSQL. Both run
-on pushes and pull requests.
+builds the image and a second one with the gate's test hooks
+(`klldap-test-kill`, as `make test-kill-points` does), and runs the gate
+on SQLite and PostgreSQL. Both run on pushes and pull requests.

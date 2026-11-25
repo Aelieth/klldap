@@ -50,7 +50,7 @@ runs the SQLite gate on the rootless image.
 
 `make gate` builds that image and runs `gate/run-gate.sh` against it: the real
 container, entrypoint and all, exercised as CLI invocations (`ldapsearch`, `ldapmodify`,
-`kinit`, GraphQL over HTTP) through 35 phases — fresh boot, environment validation,
+`kinit`, GraphQL over HTTP) through 34 phases — fresh boot, environment validation,
 a custom `LLDAP_UID`/`LLDAP_GID` boot, GraphQL auth, OU lifecycle, the OU policies (their API,
 each item at the doors, login hours and inactivity, the lockout, allowed networks), the TOTP
 second factor, Kerberos lifecycle (principal, kinit, disable, re-enable), kadmin on directory
@@ -60,7 +60,7 @@ log queries (rows with peers, per-actor summary and activity, the tail cursor, a
 restart persistence (directory data and the logs table), a realm that cannot open, LDAPS,
 password-reset mail, compressed requests, static files, the web app and the policies page in a
 headless browser, password length at each door and the password pages, and, when their
-inputs are given, migration boot, the upgrade from a 0.8.0 image, a password change killed
+inputs are given, migration boot, a password change killed
 inside its transaction and a real lldap-cli run. It needs docker, the OpenLDAP client tools
 (`openldap-clients` / `ldap-utils`) and python3; `kinit` runs inside the container.
 

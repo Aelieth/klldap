@@ -4,7 +4,7 @@ use krb5_kdc::{
     Error, KDB_DISALLOW_ALL_TIX, KdcPolicy, PolicyAdjustment, Principal, PrincipalRead,
 };
 use krb5_types::{EncTicketPart, KdcReqBody, PrincipalName, err};
-use tracing::info;
+use lldap_domain_handlers::info_limited;
 
 const LOCKED_OUT: &str = "CLIENT LOCKED OUT";
 pub(crate) const NOT_FOUND: &str = "CLIENT_NOT_FOUND";
@@ -56,7 +56,7 @@ impl KdcPolicy for LiveClients {
             None => (NOT_FOUND, "no longer exists"),
         };
         let principal = ticket.cname.unparse_with_realm_lossy(store.realm());
-        info!("Refused a Kerberos ticket request from {principal}: the principal {reason}");
+        info_limited!("Refused a Kerberos ticket request from {principal}: the principal {reason}");
         *status = Some(word);
         Err(Error::Protocol {
             code: err::CLIENT_REVOKED,

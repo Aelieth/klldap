@@ -15,6 +15,7 @@ use krb5_kdc::{
     KdcLog, ListenLimits, PrincipalRead, PrincipalStore, SharedDump, SharedStore, Shutdown,
     kadm5_mask, lookup_principal_id,
 };
+use krb5_log::klog::{LogSink, Severity};
 use krb5_types::PrincipalName;
 use lldap_domain::types::UserId;
 use lldap_domain_handlers::enforcement::{CommitFollower, touched_users};
@@ -29,6 +30,7 @@ use lldap_domain_handlers::logging::{
 use lldap_domain_handlers::password::{
     PASSWORD_MIN_LENGTH, kill_point, password_rules, record_commit_failure, record_unreported,
 };
+use lldap_domain_handlers::warn_limited;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::panic::{self, AssertUnwindSafe};
@@ -38,7 +40,7 @@ use std::sync::{Arc, OnceLock, RwLock, Weak};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
-use tracing::{Span, error, info, warn};
+use tracing::{Span, debug, error, info, warn};
 use zeroize::Zeroizing;
 
 const KADMIND_START: Duration = Duration::from_secs(10);
@@ -737,7 +739,7 @@ impl Opened {
                 kdc_tcp,
                 flag,
                 ListenLimits::default(),
-                &KdcLog::process(),
+                &KdcLog::with_sink(Arc::new(KdcLines)),
             )
             .context("the KDC stopped serving")
         })?;
@@ -861,6 +863,20 @@ impl Watch {
         self.shutdown.trigger();
         if self.died.send(cause).is_err() {
             error!("💥 The server was already stopping");
+        }
+    }
+}
+
+/// The KDC's own lines: a warning or worse shares the failure lines' budget, the rest is debug.
+struct KdcLines;
+
+impl LogSink for KdcLines {
+    fn line(&self, severity: Severity, msg: &str) {
+        match severity {
+            Severity::Notice | Severity::Info | Severity::Debug => {
+                debug!(target: "krb5_klog", "{msg}")
+            }
+            _ => warn_limited!(target: "krb5_klog", "{msg}"),
         }
     }
 }
@@ -5449,5 +5465,30 @@ pub(crate) mod tests {
             .map(|(label, _, code)| (*label, *code))
             .collect();
         assert_eq!(got, wanted, "per row: kinit's answer");
+    }
+
+    #[test]
+    fn test_the_kdcs_own_lines_are_debug_below_a_warning_and_share_the_budget_from_it_up() {
+        use lldap_domain_handlers::logging::capture::{BUDGET, Lines};
+        use tracing::Level;
+        let (lines, _guard) = Lines::capture();
+        for severity in [Severity::Notice, Severity::Info, Severity::Debug] {
+            KdcLines.line(severity, "AS_REQ, ISSUE");
+        }
+        let below: Vec<_> = lines.take().into_iter().map(|line| line.level).collect();
+        for _ in 0..50 {
+            KdcLines.line(Severity::Warning, "preauth verify failure");
+            KdcLines.line(Severity::Err, "while dispatching");
+        }
+        let above = lines.take().into_iter();
+        let above: Vec<_> = above.map(|line| (line.level, line.target)).collect();
+        assert_eq!(
+            (below, above),
+            (
+                vec![Level::DEBUG; 3],
+                vec![(Level::WARN, "krb5_klog".to_owned()); BUDGET]
+            ),
+            "three lines below a warning, then a hundred from it up"
+        );
     }
 }

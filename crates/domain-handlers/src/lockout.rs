@@ -19,6 +19,7 @@ use lldap_domain_model::error::{DomainError, Result};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
@@ -699,6 +700,8 @@ pub struct Lockout {
     stale: AtomicBool,
     outage: Mutex<Option<(Instant, HashSet<UserId>)>>,
     kdc: RwLock<Option<KdcWriter>>,
+    /// A KDC wait for a write lapsed, and no write has landed within `WRITE_BOUND` since.
+    past_bound: AtomicBool,
 }
 
 impl Default for Lockout {
@@ -712,6 +715,7 @@ impl Default for Lockout {
             stale: AtomicBool::new(false),
             outage: Mutex::new(None),
             kdc: RwLock::new(None),
+            past_bound: AtomicBool::new(false),
         }
     }
 }
@@ -1108,10 +1112,19 @@ impl Lockout {
     }
 
     pub async fn carry<S: LockStore + ?Sized>(&self, store: &S, user: &UserId, step: Step) {
-        if step.write == Write::Now {
-            let users = std::slice::from_ref(user);
-            let _ = tokio::time::timeout(WRITE_BOUND, self.flush(store, users)).await;
+        self.carry_in_time(store, user, step).await;
+    }
+
+    async fn carry_in_time<S>(&self, store: &S, user: &UserId, step: Step) -> bool
+    where
+        S: LockStore + ?Sized,
+    {
+        if step.write != Write::Now {
+            return true;
         }
+        let users = std::slice::from_ref(user);
+        let flushed = tokio::time::timeout(WRITE_BOUND, self.flush(store, users));
+        flushed.await.is_ok()
     }
 
     async fn flush<S: LockStore + ?Sized>(&self, store: &S, users: &[UserId]) {
@@ -1166,7 +1179,11 @@ impl Lockout {
         if !writes.is_empty() {
             let period = self.period();
             let batch: Vec<LockWrite> = writes.iter().map(|(write, _)| write.clone()).collect();
+            let asked = tokio::time::Instant::now();
             let written = bounded(POLICY_READ_WAIT, store.write_locks(&period, &batch)).await;
+            if written.is_ok() && asked.elapsed() <= WRITE_BOUND {
+                self.past_bound.store(false, Ordering::Release);
+            }
             self.note(&written, &again.users);
             let Ok(written) = written else {
                 again.after = RETRY_AFTER;
@@ -1346,10 +1363,15 @@ impl Lockout {
             .is_some()
     }
 
+    pub fn kdc_waits(&self) -> bool {
+        !self.past_bound.load(Ordering::Acquire)
+    }
+
     /// On the KDC's thread: a queued count is marked here; a count due now is written on the
-    /// server's runtime, and the thread waits at most `WRITE_BOUND` for it.
+    /// server's runtime, and the thread waits at most `WRITE_BOUND` for it. While writes do not
+    /// keep that bound the count is left owed, for the run loop, with no wait.
     pub fn carry_from_kdc(&'static self, user: &UserId, step: Step) {
-        if step.write != Write::Now {
+        if step.write != Write::Now || !self.kdc_waits() {
             return;
         }
         let writer = self
@@ -1363,10 +1385,16 @@ impl Lockout {
         let (done, wait) = std::sync::mpsc::channel();
         let user = user.clone();
         runtime.spawn(async move {
-            self.carry(&*store, &user, step).await;
-            let _ = done.send(());
+            let in_time = self.carry_in_time(&*store, &user, step).await;
+            let _ = done.send(in_time);
         });
-        let _ = wait.recv_timeout(WRITE_BOUND);
+        let lapsed = matches!(
+            wait.recv_timeout(WRITE_BOUND),
+            Ok(false) | Err(RecvTimeoutError::Timeout)
+        );
+        if lapsed {
+            self.past_bound.store(true, Ordering::Release);
+        }
     }
 
     /// A row read here is taken only for an entry nothing touched since the read began.
@@ -3217,6 +3245,49 @@ mod tests {
             (users.to_vec(), true, true, [1, 1, 1]),
             "one bound for the three: the first read gave up, the others are not tried; every \
              start is still held, for the retry"
+        );
+    }
+
+    #[test]
+    fn test_the_kdc_thread_waits_for_no_count_after_a_wait_lapsed_until_a_write_lands_in_time() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let lockout: &'static Lockout = Box::leak(Box::default());
+        let store = Arc::new(Memory::default());
+        let user = bob();
+        lockout.seed(&user, LockRow::default());
+        lockout.serve_kdc(store.clone(), runtime.handle().clone());
+        let judged = state(policy(9, 0), LockRow::default());
+        let counted = |seconds: i64| {
+            let asked = Instant::now();
+            lockout.carry_from_kdc(&user, lockout.failure(&judged, at(seconds)));
+            asked.elapsed()
+        };
+        *store.delay.lock().unwrap() = Duration::from_millis(600);
+        let (first, second) = (counted(1), counted(2));
+        let lapsed = (
+            first >= WRITE_BOUND,
+            second < Duration::from_millis(50),
+            lockout.kdc_waits(),
+            store.count(&user),
+        );
+        *store.delay.lock().unwrap() = Duration::ZERO;
+        runtime.block_on(lockout.drain(&*store));
+        let restored = (lockout.kdc_waits(), store.count(&user));
+        counted(3);
+        assert_eq!(
+            lapsed,
+            (true, true, false, None),
+            "the first slow write is waited for to the bound; the second is owed with no wait"
+        );
+        assert_eq!(
+            (restored, store.count(&user), lockout.pending(&user)),
+            ((true, Some(2)), Some(3), false),
+            "a write that lands in time restores the wait: the next count is stored before the \
+             thread returns"
         );
     }
 }

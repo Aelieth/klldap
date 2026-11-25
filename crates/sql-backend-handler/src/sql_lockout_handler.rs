@@ -2211,58 +2211,6 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn test_a_finish_sent_again_takes_nothing_back_and_a_locked_user_is_refused() {
-        let (_clock, at) = pinned();
-        let h = handler().await.with_mfa_policy(MfaPolicy::Enrolled);
-        user_in(&h, "e1again", "e1againou").await;
-        user_in(&h, "e1kept", "e1keptou").await;
-        threshold(&h, "e1againou", "9").await;
-        threshold(&h, "e1keptou", "3").await;
-        let seed = enroll(&h, "e1again", at).await;
-        let started = start(&h, "e1again", RIGHT).await;
-        let kept = finish_request(started, RIGHT, None).unwrap();
-        let resend = || h.login_finish(kept.clone());
-        assert_eq!(resend().await.unwrap(), LoginOutcome::TotpRequired);
-        assert!(!bind(&h, "e1again", "nope").await);
-        assert_eq!(
-            (resend().await.unwrap(), stored(&h, "e1again").await),
-            (LoginOutcome::TotpRequired, Some(1)),
-            "a finish sent again changes no count"
-        );
-        let (_, wrong) = codes(&seed, at);
-        for n in 2..5 {
-            let mut guess = kept.clone();
-            guess.totp_code = Some(wrong.clone());
-            assert!(h.login_finish(guess).await.is_err());
-            assert_eq!(
-                stored(&h, "e1again").await,
-                Some(n),
-                "each wrong code on a re-posted finish counts, none is taken back"
-            );
-        }
-
-        let started = start(&h, "e1kept", RIGHT).await;
-        let signed_in = finish_request(started, RIGHT, None).unwrap();
-        assert!(h.login_finish(signed_in.clone()).await.is_ok());
-        for i in 0..3 {
-            assert!(!bind(&h, "e1kept", &format!("nope-{i}")).await);
-        }
-        let resent = h.login_finish(signed_in).await;
-        assert_eq!(
-            (
-                resent.map_err(|e| e.to_string()),
-                stored(&h, "e1kept").await
-            ),
-            (
-                Err(DomainError::from(opaque::AuthenticationError::failed_proof()).to_string()),
-                Some(3)
-            ),
-            "sent again for a locked user, it is refused as a failed proof is"
-        );
-    }
-
-    #[tokio::test]
-    #[serial]
     async fn test_a_locked_users_right_and_wrong_passwords_get_the_same_answer_byte_for_byte() {
         let h = handler().await;
         user_in(&h, "e1same", "e1sameou").await;

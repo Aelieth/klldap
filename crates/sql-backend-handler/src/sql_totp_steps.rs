@@ -551,17 +551,13 @@ pub(crate) mod tests {
         ];
         assert_eq!(
             (pruned, deletes()),
-            ([true, true], 3),
-            "one prune of the steps, the proofs and the starts at start, then none until a row \
-             is written"
+            ([true, true], 4),
+            "one prune of the steps, the proofs and both kinds of start at start, then none until \
+             a row is written"
         );
         handler.note_codes_written();
         handler.prune_totp_steps().await.unwrap();
-        assert_eq!(
-            deletes(),
-            3,
-            "a row written: the next tick prunes the three"
-        );
+        assert_eq!(deletes(), 4, "a row written: the next tick prunes the four");
     }
 
     #[tokio::test]

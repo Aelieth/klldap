@@ -68,6 +68,9 @@ pub mod login {
         /// The start's own +1 beside the user's row; only its verified finish removes it.
         #[serde(with = "fixed_width_overlay")]
         pub overlay: Option<u64>,
+        /// The start, in seconds since the Unix epoch, and its id: its finish is taken once.
+        pub issued_at: i64,
+        pub id: [u8; 16],
     }
 
     /// One flag and one id whether or not the start counted, so its length tells nothing.

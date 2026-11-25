@@ -222,6 +222,13 @@ pub(crate) enum UsedRegistrationStarts {
 }
 
 #[derive(DeriveIden, Clone, Copy)]
+pub(crate) enum UsedLoginStarts {
+    Table,
+    StartId,
+    ExpiresAt,
+}
+
+#[derive(DeriveIden, Clone, Copy)]
 pub(crate) enum MfaWindows {
     Table,
     UserId,
@@ -2071,6 +2078,7 @@ pub(crate) async fn ensure_v13_additions(pool: &DbConnection) -> Result<(), DbEr
     ensure_totp_steps(&transaction, backend).await?;
     ensure_mfa_used_proofs(&transaction, backend).await?;
     ensure_used_registration_starts(&transaction, backend).await?;
+    ensure_used_login_starts(&transaction, backend).await?;
     ensure_mfa_windows(&transaction, backend).await?;
     ensure_lockout_period(&transaction, backend).await?;
     ensure_inactivity_recording(&transaction, backend).await?;
@@ -2344,6 +2352,38 @@ async fn ensure_used_registration_starts(
                     )
                     .col(
                         ColumnDef::new(UsedRegistrationStarts::ExpiresAt)
+                            .big_integer()
+                            .not_null(),
+                    ),
+            ),
+        )
+        .await?;
+    Ok(())
+}
+
+/// The web login starts already finished: a random id and its expiry.
+async fn ensure_used_login_starts(
+    transaction: &DatabaseTransaction,
+    backend: sea_orm::DbBackend,
+) -> Result<(), DbErr> {
+    let table = UsedLoginStarts::Table;
+    if !relation_missing(transaction, backend, table.into_iden()).await? {
+        return Ok(());
+    }
+    transaction
+        .execute(
+            backend.build(
+                Table::create()
+                    .table(table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(UsedLoginStarts::StartId)
+                            .string_len(32)
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(UsedLoginStarts::ExpiresAt)
                             .big_integer()
                             .not_null(),
                     ),

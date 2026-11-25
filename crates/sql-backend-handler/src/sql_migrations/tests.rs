@@ -2444,6 +2444,7 @@ async fn drop_lockout_tables(pool: &DbConnection) {
         "totp_steps",
         "mfa_used_proofs",
         "used_registration_starts",
+        "used_login_starts",
         "mfa_windows",
     ] {
         pool.execute(sea_orm::Statement::from_string(
@@ -2504,6 +2505,12 @@ async fn expect_lockout_tables(pool: &DbConnection) {
     ))
     .await
     .expect("used_registration_starts restored");
+    pool.execute(sea_orm::Statement::from_string(
+        backend,
+        "SELECT start_id, expires_at FROM used_login_starts LIMIT 1".to_owned(),
+    ))
+    .await
+    .expect("used_login_starts restored");
     pool.execute(sea_orm::Statement::from_string(
         backend,
         "SELECT user_id, peer, opened_at, until_at FROM mfa_windows LIMIT 1".to_owned(),
@@ -3442,7 +3449,8 @@ async fn test_sqlite_dump_script_matches_migrated_tables() {
             "sqlite_sequence",
             "totp_steps",
             "mfa_used_proofs",
-            "used_registration_starts"
+            "used_registration_starts",
+            "used_login_starts"
         ]
         .map(str::to_owned)
     );
@@ -4082,6 +4090,28 @@ async fn test_mysql_ten_finishes_of_one_start_at_once_take_it_once() {
         return;
     };
     crate::sql_used_starts::tests::used_starts_lane(&pool).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_ten_finishes_of_one_login_start_at_once_take_it_once() {
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres_sized(10).await else {
+        return;
+    };
+    crate::sql_used_starts::tests::login_starts_lane(&pool).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial_test::serial]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_ten_finishes_of_one_login_start_at_once_take_it_once() {
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql_sized(10).await else {
+        return;
+    };
+    crate::sql_used_starts::tests::login_starts_lane(&pool).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

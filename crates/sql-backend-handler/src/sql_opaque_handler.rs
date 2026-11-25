@@ -2,7 +2,7 @@ use crate::SqlBackendHandler;
 use crate::sql_log_handler::{BUSY_DETAIL, UNKNOWN_USER_DETAIL};
 use crate::sql_mfa_handler::{TotpRejection, now_unix};
 use crate::sql_mfa_windows::with_proof;
-use crate::sql_used_starts::{CLOCK_TOLERANCE_SECS, take_start_id};
+use crate::sql_used_starts::{CLOCK_TOLERANCE_SECS, StartKind, take_start_id};
 use crate::sql_user_backend_handler::sync_still_off;
 use async_trait::async_trait;
 use base64::Engine;
@@ -96,6 +96,14 @@ const REGISTRATION_MAX_AGE: i64 = 120;
 const REGISTRATION_TOO_LONG: &str = "the registration took too long; start again";
 const REGISTRATION_UNMARKED: &str =
     "this registration could not be recorded as finished; try again";
+/// A login's finish too, and it is taken once.
+const LOGIN_MAX_AGE: i64 = 120;
+const LOGIN_TOO_LONG: &str = "the login's start is older than two minutes";
+const LOGIN_FINISHED: &str = "the login's start was already finished";
+const LOGIN_UNSTAMPED: &str = "the login's start carries no time or id";
+
+/// A login start as sealed before it carried a time and an id.
+type UnstampedLogin = (UserId, opaque::server::login::ServerLogin, (bool, u64));
 
 /// bincode as `bincode::serialize` writes it, refusing trailing bytes.
 fn decode_exact<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> bincode::Result<T> {
@@ -117,6 +125,40 @@ impl SqlBackendHandler {
             &mut key,
         )?;
         Ok(orion::aead::SecretKey::from_slice(&key)?)
+    }
+
+    /// A sealed login start; one sealed before it carried a time and an id is refused as a
+    /// proof that does not verify, with its row.
+    fn open_login(&self, server_data: &str) -> Result<login::ServerData> {
+        let secret_key = self.get_orion_secret_key(LOGIN_STATE_KEY_INFO)?;
+        let opened = orion::aead::open(
+            &secret_key,
+            &base64::engine::general_purpose::STANDARD.decode(server_data)?,
+        )?;
+        decode_exact(&opened).map_err(|e| match decode_exact::<UnstampedLogin>(&opened) {
+            Ok((username, ..)) => Self::refuse_start(&username, LOGIN_UNSTAMPED),
+            Err(_) => e.into(),
+        })
+    }
+
+    /// Before the proof and any read of the user; a refusal counts nothing.
+    async fn take_login_start(&self, user: &UserId, issued_at: i64, id: &[u8; 16]) -> Result<()> {
+        if now_unix() - issued_at > LOGIN_MAX_AGE {
+            return Err(Self::refuse_start(user, LOGIN_TOO_LONG));
+        }
+        let expires_at = issued_at + LOGIN_MAX_AGE + CLOCK_TOLERANCE_SECS;
+        let taken = take_start_id(&self.sql_pool, StartKind::Login, id, expires_at);
+        if !door_read(taken).await? {
+            return Err(Self::refuse_start(user, LOGIN_FINISHED));
+        }
+        self.note_codes_written();
+        Ok(())
+    }
+
+    /// The finish's row with its cause, and the answer of a proof that does not verify.
+    fn refuse_start(user: &UserId, detail: &str) -> DomainError {
+        logging::record_as(Some(user), LogKind::Login, None, false, Some(detail));
+        Self::refuse_finish()
     }
 
     fn open_registration(&self, server_data: &str) -> Result<registration::ServerData> {
@@ -680,10 +722,14 @@ impl OpaqueHandler for SqlOpaqueHandler {
             &user_id,
         )?;
         let secret_key = self.get_orion_secret_key(LOGIN_STATE_KEY_INFO)?;
+        let mut id = [0u8; 16];
+        rand::RngCore::fill_bytes(&mut rng, &mut id);
         let server_data = login::ServerData {
             username: user_id,
             server_login: start_response.state,
             overlay,
+            issued_at: now_unix(),
+            id,
         };
         let encrypted_state = orion::aead::seal(&secret_key, &bincode::serialize(&server_data)?)?;
 
@@ -702,15 +748,15 @@ impl OpaqueHandler for SqlOpaqueHandler {
             enrollment_proof: _,
             session: _,
         } = request;
-        let secret_key = self.get_orion_secret_key(LOGIN_STATE_KEY_INFO)?;
         let login::ServerData {
             username,
             server_login,
             overlay,
-        } = decode_exact(&orion::aead::open(
-            &secret_key,
-            &base64::engine::general_purpose::STANDARD.decode(&server_data)?,
-        )?)?;
+            issued_at,
+            id: start_id,
+        } = self.open_login(&server_data)?;
+        self.take_login_start(&username, issued_at, &start_id)
+            .await?;
 
         // Checked again in case login_start was bypassed.
         if door_read(self.is_user_disabled(&username)).await? {
@@ -837,7 +883,8 @@ impl OpaqueHandler for SqlOpaqueHandler {
             return Err(Self::took_too_long(&username));
         }
         let expires_at = issued_at + REGISTRATION_MAX_AGE + CLOCK_TOLERANCE_SECS;
-        match take_start_id(&self.sql_pool, &start.id, expires_at).await {
+        let kind = StartKind::Registration;
+        match take_start_id(&self.sql_pool, kind, &start.id, expires_at).await {
             Ok(true) => {
                 self.note_codes_written();
                 Ok(registration::Claim {
@@ -2878,21 +2925,25 @@ mod tests {
         guard.pin_clock(instant("2026-11-16T17:59:59Z"));
         let started = doors::start(&handler, USER, doors::RIGHT).await;
         let kept = doors::finish_request(started, doors::RIGHT, None).unwrap();
-        let with_code = |code: &str| login::ClientLoginFinishRequest {
-            totp_code: Some(code.to_owned()),
-            ..kept.clone()
-        };
         let first = (
             bind(doors::RIGHT.to_owned()).await,
-            web(kept.clone()).await,
+            web(kept).await,
             q31_rows(&log, USER),
         );
+        // The code step is a login of its own, as the web app makes it, started before 18:00.
+        let code_step = async |code: &str| {
+            guard.pin_clock(instant("2026-11-16T17:59:59Z"));
+            let started = doors::start(&handler, USER, doors::RIGHT).await;
+            let request = doors::finish_request(started, doors::RIGHT, Some(code)).unwrap();
+            guard.pin_clock(instant("2026-11-16T18:00:00Z"));
+            web(request).await
+        };
         guard.pin_clock(instant("2026-11-16T18:00:00Z"));
         let answers = (
             bind(format!("{}:{fresh}", doors::RIGHT)).await,
             bind(format!("{}:{wrong}", doors::RIGHT)).await,
-            web(with_code(fresh.as_str())).await,
-            web(with_code(wrong.as_str())).await,
+            code_step(fresh.as_str()).await,
+            code_step(wrong.as_str()).await,
         );
         let second = (answers, q31_rows(&log, USER), counted(&handler, USER));
         let (asked, _, _) = code_asked(USER);
@@ -3208,5 +3259,278 @@ mod tests {
                 "{label}: the one wrong password is the one count"
             );
         }
+    }
+
+    fn login_rows(log: &LogGuard, user: &str) -> Rows {
+        let events = log.recorder().take_events().into_iter();
+        let ours = events.filter(|e| e.kind == LogKind::Login && e.actor.as_deref() == Some(user));
+        ours.map(|e| (e.kind, e.success, e.detail)).collect()
+    }
+
+    fn login_row(success: bool, detail: Option<&str>) -> (LogKind, bool, Option<String>) {
+        (LogKind::Login, success, detail.map(str::to_owned))
+    }
+
+    /// The fail count the lockout holds for `user`, and the holds of its starts.
+    fn held_of(handler: &SqlBackendHandler, user: &str) -> (u32, usize) {
+        let user = UserId::new(user);
+        let row = handler.lockout.row(&user);
+        let count = row.map_or(0, |row| row.fail_count);
+        (count, handler.lockout.overlays(&user))
+    }
+
+    fn proof_failed() -> std::result::Result<LoginOutcome, Said> {
+        Err(said(opaque::AuthenticationError::failed_proof().into()))
+    }
+
+    fn signed_in(user: &str) -> std::result::Result<LoginOutcome, Said> {
+        Ok(LoginOutcome::Authenticated {
+            user_id: UserId::new(user),
+            mfa_enrollment_pending: false,
+        })
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_login_finish_is_taken_once_and_one_sent_again_counts_nothing() {
+        use crate::sql_lockout_handler::tests as doors;
+        use crate::sql_used_starts::tests::kept_of;
+        use lldap_domain_handlers::lockout::{DURATION, THRESHOLD};
+        let (_clock, at) = doors::pinned();
+        let log = LogGuard::install_on_this_thread();
+        let h = doors::handler().await.with_mfa_policy(MfaPolicy::Enrolled);
+        doors::user_in(&h, "d1code", "d1ou").await;
+        doors::user_in(&h, "d1plain", "d1ou").await;
+        doors::policy_on(&h, "d1ou", &[(THRESHOLD, "9"), (DURATION, "0")]).await;
+        let (_, wrong) = doors::codes(&doors::enroll(&h, "d1code", at).await, at);
+        let finish_of = async |user: &str| {
+            let started = doors::start(&h, user, doors::RIGHT).await;
+            doors::finish_request(started, doors::RIGHT, None).unwrap()
+        };
+        let coded = finish_of("d1code").await;
+        let plain = finish_of("d1plain").await;
+        let mut unverified = finish_of("d1plain").await;
+        unverified.credential_finalization = plain.credential_finalization.clone();
+        let with_wrong = login::ClientLoginFinishRequest {
+            totp_code: Some(wrong),
+            ..coded.clone()
+        };
+        let asked = login_row(false, Some("totp code required"));
+        let invalid = login_row(false, Some("invalid credentials"));
+        let rows = [
+            (
+                "the code step asked, sent again with a wrong code",
+                "d1code",
+                coded,
+                with_wrong,
+                Ok(LoginOutcome::TotpRequired),
+                asked,
+            ),
+            (
+                "a proof that does not verify",
+                "d1plain",
+                unverified.clone(),
+                unverified,
+                proof_failed(),
+                invalid,
+            ),
+            (
+                "signed in",
+                "d1plain",
+                plain.clone(),
+                plain,
+                signed_in("d1plain"),
+                login_row(true, None),
+            ),
+        ];
+        let _ = log.recorder().take_events();
+        for (n, (label, user, first, again, answer, row)) in (1..).zip(rows) {
+            let first = h.login_finish(first).await.map_err(said);
+            let held = held_of(&h, user);
+            let again = h.login_finish(again).await.map_err(said);
+            assert_eq!(
+                (
+                    (first, again),
+                    login_rows(&log, user),
+                    held_of(&h, user),
+                    kept_of(&h.sql_pool, StartKind::Login).await
+                ),
+                (
+                    (answer, proof_failed()),
+                    vec![row, login_row(false, Some(LOGIN_FINISHED))],
+                    held,
+                    n
+                ),
+                "{label}: the first finish as before; the second answered as a proof that does \
+                 not verify, with its own row, leaving the count and the holds as they were"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_login_finish_must_follow_its_start_within_two_minutes() {
+        use crate::sql_lockout_handler::tests as doors;
+        use crate::sql_mfa_handler::set_enrollment_clock;
+        use crate::sql_used_starts::tests::kept_of;
+        use lldap_domain_handlers::lockout::{DURATION, THRESHOLD};
+        let now = AT as i64;
+        let _clock = pin_clock(now);
+        let log = LogGuard::install_on_this_thread();
+        let h = doors::handler().await;
+        doors::user_in(&h, "d1late", "d1lateou").await;
+        doors::policy_on(&h, "d1lateou", &[(THRESHOLD, "9"), (DURATION, "0")]).await;
+        let rows = [
+            ("just started", 0, true),
+            ("two minutes", 120, true),
+            ("a second over two minutes", 121, false),
+            ("nine minutes", 540, false),
+            ("a day", 86_400, false),
+        ];
+        let _ = log.recorder().take_events();
+        let mut taken = 0;
+        for (label, age, signs_in) in rows {
+            set_enrollment_clock(Some(now));
+            let started = doors::start(&h, "d1late", doors::RIGHT).await;
+            let request = doors::finish_request(started, doors::RIGHT, None).unwrap();
+            set_enrollment_clock(Some(now + age));
+            let held = held_of(&h, "d1late");
+            let answer = h.login_finish(request).await.map_err(said);
+            taken += i64::from(signs_in);
+            let (expected, row, held) = match signs_in {
+                true => (signed_in("d1late"), login_row(true, None), (0, 0)),
+                false => (proof_failed(), login_row(false, Some(LOGIN_TOO_LONG)), held),
+            };
+            assert_eq!(
+                (
+                    answer,
+                    login_rows(&log, "d1late"),
+                    held_of(&h, "d1late"),
+                    kept_of(&h.sql_pool, StartKind::Login).await
+                ),
+                (expected, vec![row], held, taken),
+                "{label}: past the bound, refused before its id is taken, leaving the count and \
+                 the holds as they were"
+            );
+        }
+    }
+
+    /// `data` sealed under the handler's key for login starts.
+    fn sealed_login(handler: &SqlOpaqueHandler, data: &impl serde::Serialize) -> String {
+        let key = handler.get_orion_secret_key(LOGIN_STATE_KEY_INFO).unwrap();
+        let sealed = orion::aead::seal(&key, &bincode::serialize(data).unwrap()).unwrap();
+        base64::engine::general_purpose::STANDARD.encode(sealed)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_login_start_sealed_without_a_time_or_id_is_refused_with_one_row() {
+        use crate::sql_lockout_handler::tests as doors;
+        use crate::sql_used_starts::tests::kept_of;
+        let log = LogGuard::install_on_this_thread();
+        let h = doors::handler().await;
+        doors::user_in(&h, "d1old", "d1oldou").await;
+        let started = doors::start(&h, "d1old", doors::RIGHT).await;
+        let mut unstamped = doors::finish_request(started, doors::RIGHT, None).unwrap();
+        let login::ServerData {
+            username,
+            server_login,
+            ..
+        } = h.open_login(&unstamped.server_data).unwrap();
+        let before: UnstampedLogin = (username, server_login, (false, 0));
+        unstamped.server_data = sealed_login(&h, &before);
+        let mut unshaped = unstamped.clone();
+        unshaped.server_data = sealed_login(&h, &[7u8; 3]);
+        let _ = log.recorder().take_events();
+        let refused = h.login_finish(unstamped).await.map_err(said);
+        let rows = login_rows(&log, "d1old");
+        let unread = h.login_finish(unshaped).await;
+        assert_eq!(
+            (
+                refused,
+                rows,
+                matches!(unread, Err(DomainError::BinarySerializationError(_))),
+                log.recorder().take_events().len(),
+                kept_of(&h.sql_pool, StartKind::Login).await
+            ),
+            (
+                proof_failed(),
+                vec![login_row(false, Some(LOGIN_UNSTAMPED))],
+                true,
+                0,
+                0
+            ),
+            "a start sealed before its time and id were: refused as a proof that does not verify, \
+             with its row, nothing taken; sealed bytes of no start's shape answer as before, with \
+             no row"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_login_finish_taken_on_one_server_is_refused_on_another() {
+        use crate::sql_lockout_handler::tests as doors;
+        use crate::sql_used_starts::tests::kept_of;
+        let log = LogGuard::install_on_this_thread();
+        let (pool, key) = (get_initialized_db().await, generate_random_private_key());
+        let one = doors::own(SqlBackendHandler::new(key.clone(), pool.clone()));
+        let two = doors::own(SqlBackendHandler::new(key, pool));
+        doors::user_in(&one, "d1two", "d1twoou").await;
+        let rows = [
+            ("started and taken on one, sent to two", &one, &one, &two),
+            (
+                "started on one, taken on two, sent to one",
+                &one,
+                &two,
+                &one,
+            ),
+        ];
+        let _ = log.recorder().take_events();
+        for (n, (label, starts, takes, again)) in (1..).zip(rows) {
+            let started = doors::start(starts, "d1two", doors::RIGHT).await;
+            let request = doors::finish_request(started, doors::RIGHT, None).unwrap();
+            let answers = (
+                takes.login_finish(request.clone()).await.map_err(said),
+                again.login_finish(request).await.map_err(said),
+            );
+            assert_eq!(
+                (
+                    answers,
+                    login_rows(&log, "d1two"),
+                    kept_of(&one.sql_pool, StartKind::Login).await
+                ),
+                (
+                    (signed_in("d1two"), proof_failed()),
+                    vec![
+                        login_row(true, None),
+                        login_row(false, Some(LOGIN_FINISHED))
+                    ],
+                    n
+                ),
+                "{label}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_taken_login_start_is_pruned_a_minute_after_it_expires() {
+        use crate::sql_lockout_handler::tests as doors;
+        use crate::sql_mfa_handler::set_enrollment_clock;
+        use crate::sql_used_starts::tests::kept_of;
+        let now = AT as i64;
+        let _clock = pin_clock(now);
+        let h = doors::handler().await;
+        doors::user_in(&h, "d1prune", "d1pruneou").await;
+        h.prune_totp_steps().await.unwrap();
+        doors::web(&h, "d1prune", doors::RIGHT, None).await.unwrap();
+        let taken = kept_of(&h.sql_pool, StartKind::Login).await;
+        set_enrollment_clock(Some(now + LOGIN_MAX_AGE + 2 * CLOCK_TOLERANCE_SECS + 1));
+        let pruned = h.prune_totp_steps().await.unwrap();
+        assert_eq!(
+            (taken, pruned, kept_of(&h.sql_pool, StartKind::Login).await),
+            (1, 1, 0),
+            "a taken start is marked for the server's prune, which removes it once expired"
+        );
     }
 }

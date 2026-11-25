@@ -6,27 +6,48 @@ use sea_orm::{ConnectionTrait, DbBackend, Statement, Value};
 
 pub(crate) const CLOCK_TOLERANCE_SECS: i64 = ENROLLMENT_PROOF_CLOCK_TOLERANCE_SECS;
 
-/// Records a registration start's id as finished: false when it was taken before, on any server.
+/// The starts whose finish is taken once, each kind in its own table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StartKind {
+    Registration,
+    Login,
+}
+
+impl StartKind {
+    pub(crate) const ALL: [Self; 2] = [Self::Registration, Self::Login];
+
+    fn table(self) -> &'static str {
+        match self {
+            Self::Registration => "used_registration_starts",
+            Self::Login => "used_login_starts",
+        }
+    }
+}
+
+/// Records a start's id as finished: false when it was taken before, on any server.
 pub(crate) async fn take_start_id(
     db: &impl ConnectionTrait,
+    kind: StartKind,
     id: &[u8; 16],
     expires_at: i64,
 ) -> Result<bool> {
-    let backend = db.get_database_backend();
+    let (backend, table) = (db.get_database_backend(), kind.table());
     let values = vec![Value::from(hex(id)), Value::from(expires_at)];
     match backend {
         DbBackend::MySql => {
-            let sql = "INSERT IGNORE INTO used_registration_starts (start_id, expires_at) \
-                       VALUES (?, ?)";
+            let sql = format!("INSERT IGNORE INTO {table} (start_id, expires_at) VALUES (?, ?)");
             let done = db
                 .execute(Statement::from_sql_and_values(backend, sql, values))
                 .await?;
             Ok(done.rows_affected() == 1)
         }
         DbBackend::Postgres | DbBackend::Sqlite => {
-            let sql = "INSERT INTO used_registration_starts (start_id, expires_at) VALUES (?, ?) \
-                       ON CONFLICT (start_id) DO NOTHING RETURNING start_id";
-            let statement = Statement::from_sql_and_values(backend, numbered(backend, sql), values);
+            let sql = format!(
+                "INSERT INTO {table} (start_id, expires_at) VALUES (?, ?) \
+                 ON CONFLICT (start_id) DO NOTHING RETURNING start_id"
+            );
+            let statement =
+                Statement::from_sql_and_values(backend, numbered(backend, &sql), values);
             Ok(db.query_one(statement).await?.is_some())
         }
     }
@@ -35,17 +56,22 @@ pub(crate) async fn take_start_id(
 /// Kept a minute past the expiry, as a used proof is.
 pub(crate) async fn prune_used_starts(db: &impl ConnectionTrait, now: i64) -> Result<u64> {
     let backend = db.get_database_backend();
-    let sql = "DELETE FROM used_registration_starts WHERE expires_at < ?";
-    let before = Value::from(now - CLOCK_TOLERANCE_SECS);
-    let statement = Statement::from_sql_and_values(backend, numbered(backend, sql), [before]);
-    Ok(db.execute(statement).await?.rows_affected())
+    let mut pruned = 0;
+    for kind in StartKind::ALL {
+        let sql = format!("DELETE FROM {} WHERE expires_at < ?", kind.table());
+        let before = Value::from(now - CLOCK_TOLERANCE_SECS);
+        let statement = Statement::from_sql_and_values(backend, numbered(backend, &sql), [before]);
+        pruned += db.execute(statement).await?.rows_affected();
+    }
+    Ok(pruned)
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use crate::SqlBackendHandler;
-    use crate::sql_backend_handler::tests::get_initialized_db;
+    use crate::sql_backend_handler::tests::{get_initialized_db, insert_user};
+    use crate::sql_lockout_handler::tests as doors;
     use crate::sql_tables::{DbConnection, init_table};
     use lldap_auth::opaque;
     use lldap_domain::types::UserId;
@@ -54,13 +80,17 @@ pub(crate) mod tests {
 
     const NOW: i64 = 1_700_000_000;
 
-    pub(crate) async fn kept(db: &DbConnection) -> i64 {
+    pub(crate) async fn kept_of(db: &DbConnection, kind: StartKind) -> i64 {
         let count = Statement::from_string(
             db.get_database_backend(),
-            "SELECT COUNT(*) FROM used_registration_starts".to_owned(),
+            format!("SELECT COUNT(*) FROM {}", kind.table()),
         );
         let row = db.query_one(count).await.unwrap().unwrap();
         row.try_get_by_index(0).unwrap()
+    }
+
+    pub(crate) async fn kept(db: &DbConnection) -> i64 {
+        kept_of(db, StartKind::Registration).await
     }
 
     pub(crate) fn session(user: &str, session: u8) -> registration::Presenter {
@@ -132,20 +162,69 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_a_start_id_is_taken_once_and_its_row_goes_a_minute_after_it_expires() {
-        let db = get_initialized_db().await;
-        let (short, long) = ([1u8; 16], [2u8; 16]);
+        for kind in StartKind::ALL {
+            let db = get_initialized_db().await;
+            let (short, long) = ([1u8; 16], [2u8; 16]);
+            assert_eq!(
+                [
+                    take_start_id(&db, kind, &short, NOW + 10).await.unwrap(),
+                    take_start_id(&db, kind, &short, NOW + 10).await.unwrap(),
+                    take_start_id(&db, kind, &long, NOW + 300).await.unwrap(),
+                ],
+                [true, false, true],
+                "{kind:?}"
+            );
+            let other = match kind {
+                StartKind::Registration => StartKind::Login,
+                StartKind::Login => StartKind::Registration,
+            };
+            assert!(
+                take_start_id(&db, other, &short, NOW + 10).await.unwrap(),
+                "{kind:?}: the other kind's table holds its own ids"
+            );
+            let kept_until = NOW + 10 + CLOCK_TOLERANCE_SECS;
+            assert_eq!(prune_used_starts(&db, kept_until).await.unwrap(), 0);
+            assert_eq!(
+                prune_used_starts(&db, kept_until + 1).await.unwrap(),
+                2,
+                "{kind:?}: each table's expired row"
+            );
+            assert_eq!(
+                kept_of(&db, kind).await,
+                1,
+                "{kind:?}: the unexpired row stays"
+            );
+            assert!(take_start_id(&db, kind, &short, NOW + 10).await.unwrap());
+        }
+    }
+
+    pub(crate) async fn login_starts_lane(pool: &DbConnection) {
+        init_table(pool).await.expect("init");
+        let key = opaque::server::generate_random_private_key();
+        let handler = SqlBackendHandler::new(key, pool.clone());
+        insert_user(&handler, "bob", "bob-pass-1").await;
+        let started = doors::start(&handler, "bob", "bob-pass-1").await;
+        let request = doors::finish_request(started, "bob-pass-1", None).unwrap();
+        let tasks: Vec<_> = (0..10)
+            .map(|_| {
+                let (handler, request) = (handler.clone(), request.clone());
+                tokio::spawn(async move { handler.login_finish(request).await })
+            })
+            .collect();
+        let mut signed_in = 0;
+        for task in tasks {
+            signed_in += usize::from(task.await.unwrap().is_ok());
+        }
         assert_eq!(
-            [
-                take_start_id(&db, &short, NOW + 10).await.unwrap(),
-                take_start_id(&db, &short, NOW + 10).await.unwrap(),
-                take_start_id(&db, &long, NOW + 300).await.unwrap(),
-            ],
-            [true, false, true]
+            (signed_in, kept_of(pool, StartKind::Login).await),
+            (1, 1),
+            "ten finishes of one login start at once: one signs in, one row"
         );
-        let kept_until = NOW + 10 + CLOCK_TOLERANCE_SECS;
-        assert_eq!(prune_used_starts(&db, kept_until).await.unwrap(), 0);
-        assert_eq!(prune_used_starts(&db, kept_until + 1).await.unwrap(), 1);
-        assert_eq!(kept(&db).await, 1, "the unexpired row stays");
-        assert!(take_start_id(&db, &short, NOW + 10).await.unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial]
+    async fn test_ten_finishes_of_one_login_start_at_once_take_it_once() {
+        login_starts_lane(&get_initialized_db().await).await;
     }
 }

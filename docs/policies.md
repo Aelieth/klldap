@@ -582,7 +582,8 @@ entry refuses the start, naming it.
   refresh, and the server's start. While `ou_policies` or `policies` is locked, they wait as long
   as the database lets them.
 - On MySQL and MariaDB the 2-second bound is set by a different setting on each, chosen by
-  which of `max_statement_time` (MariaDB) and `max_execution_time` (MySQL) the server has. The
+  which of `max_statement_time` (MariaDB) and `max_execution_time` (MySQL) the server has; a
+  server that has both is bounded by `max_statement_time`. The
   server asks once, at its first bounded read, and keeps the answer until it stops. On a server
   that has neither, every bounded read fails: a sign-in that reads a user the policy cache does
   not hold yet is refused (`policy: unreadable`), a password change is refused ("the password

@@ -290,8 +290,11 @@ if [ "$DB" = mysql ] || [ "$DB" = mariadb ]; then
     echo "$DB_SETTINGS" >"$RESULTS_DIR/db-settings.txt"
 fi
 note "Durability $ROW: image=$GATE_IMAGE db=$DB run=$RUNID results=$RESULTS_DIR"
-driver_rev="$(git rev-parse --short HEAD 2>/dev/null)"
-git diff --quiet HEAD -- gate 2>/dev/null || driver_rev="$driver_rev+dirty"
+driver_rev=""
+if [ "$(git rev-parse --show-toplevel 2>/dev/null)" = "$(pwd -P)" ]; then
+    driver_rev="$(git rev-parse --short HEAD 2>/dev/null)"
+    git diff --quiet HEAD -- gate 2>/dev/null || driver_rev="$driver_rev+dirty"
+fi
 DUR_ROW="$ROW" DUR_DB="$DB" DUR_IMAGE="$GATE_IMAGE" DUR_PREFIX="$PREFIX" DUR_NET="$NET" \
     DUR_PG="$PG_CONTAINER" DUR_KILLS="$KILLS" DUR_TIMES="$TIMES" DUR_CASES="$CASES" DUR_REV="$driver_rev" \
     DUR_IMAGE_ID="$IMAGE_ID" DUR_CUTS="$CUTS" DUR_GUEST="$GUEST" DUR_LAB_LOCK="$LAB_LOCK" \

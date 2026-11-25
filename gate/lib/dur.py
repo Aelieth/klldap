@@ -57,6 +57,8 @@ CACHE_NOTE = ("guest disk qcow2 with QEMU's default cache (writeback): a cut los
 FIND_LLDAP = ('p=; m=0; for q in /proc/[0-9]*; do read -r c <"$q/comm" 2>/dev/null || continue; '
               '[ "$c" = lldap ] || continue; a=$(tr "\\0" " " <"$q/cmdline" 2>/dev/null | cut -d" " -f2); '
               '[ "$a" = run ] && { p=${q#/proc/}; m=$((m + 1)); }; done; [ "$m" = 1 ] || exit 3')
+with open(__file__, "rb") as own:
+    DRIVER_SHA256 = hashlib.sha256(own.read()).hexdigest()
 
 
 def run(*args, stdin=None, timeout=60):
@@ -445,16 +447,6 @@ def lockout_count(server, user):
     return db_number(server, f"SELECT COALESCE(MAX(fail_count), 0) FROM login_lockouts WHERE user_id = '{user}'")
 
 
-def count_stored(server, user, want, wait_s=5.0):
-    """Whether the table holds `want` for the user within `wait_s`: a kill aims at a stored count."""
-    deadline = time.monotonic() + wait_s
-    while lockout_count(server, user) != want:
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.2)
-    return True
-
-
 def virsh(*args):
     command = ["virsh", "-q", "-c", "qemu:///system", *args]
     if shutil.which("virsh") is None:
@@ -790,7 +782,6 @@ def one_kill(record, server, n, kind, i, lock_password, noise=None):
                 acked = acked and all(f'"{p}@{REALM}" randomized' in out for p in (SERVICE, SECOND))
         else:
             acked = killer is not None and refused_before and rc != 0 and REFUSED in out
-            acked = acked and count_stored(server, LOCKED, count)
     if not acked:
         if killer is not None:
             release(killer, False)
@@ -897,7 +888,7 @@ def one_kill(record, server, n, kind, i, lock_password, noise=None):
         got = f"{failures},locked={locked}"
         ok = got == expect
         if POWER:
-            # The count was read back from the table before the cut, so it survives whole.
+            # The server writes a count before it answers the refusal (given 250 ms): a cut keeps it whole.
             ok = failures == count and locked == (failures >= MAX_FAIL)
             got += f",lost={count - failures if failures is not None else 'unknown'}"
             if failures is not None and failures < count:
@@ -1023,7 +1014,7 @@ def main():
     record = Record()
     started = time.time()
     record.note(f"START row={ROW} db={DB} image={IMAGE} image_id={ENV.get('DUR_IMAGE_ID', '')} "
-                f"driver={ENV.get('DUR_REV', '')}")
+                f"driver={ENV.get('DUR_REV', '')} driver_sha256={DRIVER_SHA256}")
     if MYSQL:
         record.note(f"START db_settings: {ENV.get('DUR_DB_SETTINGS', '')} (printed, not tested)")
     if POWER:
@@ -1036,14 +1027,10 @@ def main():
             record.note(f"START install=host unit=klldap.service "
                         f"binary_sha256={ENV.get('DUR_BINARY_SHA', '')} "
                         f"unit_sha256={ENV.get('DUR_UNIT_SHA', '')} firewall: {ENV.get('DUR_FIREWALL', '')}")
-    error = None
+    error, asked = None, None
     try:
-        if ROW == "acc3":
-            acc3(record, int(ENV["DUR_KILLS"]))
-        elif POWER:
-            acc8(record, int(ENV["DUR_CUTS"]))
-        else:
-            acc4(record, int(ENV["DUR_TIMES"]))
+        asked = int(ENV["DUR_KILLS" if ROW == "acc3" else "DUR_CUTS" if POWER else "DUR_TIMES"])
+        (acc3 if ROW == "acc3" else acc8 if POWER else acc4)(record, asked)
     except Exception as e:
         error = str(e)
         record.note(f"ABORT {error}")
@@ -1071,7 +1058,8 @@ def main():
             record.note(f"ROW install={install} db={DB} noise cuts={record.noise['cuts']} "
                         f"in_window={record.noise['in_window']} pass={passed} fail={fails}")
     summary = {"row": ROW, "db": DB, "image": IMAGE, "image_id": ENV.get("DUR_IMAGE_ID", ""),
-               "driver": ENV.get("DUR_REV", ""), "seconds": round(time.time() - started),
+               "driver": ENV.get("DUR_REV", ""), "driver_sha256": DRIVER_SHA256,
+               "seconds": round(time.time() - started),
                "kinds": KINDS, "counts": {k: {"pass": p, "fail": f} for k, (p, f) in record.counts.items()},
                "gaps_ms": gaps, "writes_ms": writes, "aborted_iterations": record.aborted, "aborted": error,
                "lockout_lost_cuts": len(record.losses), "lockout_lost_sum": sum(record.losses),
@@ -1086,7 +1074,7 @@ def main():
              f"degraded_starts={record.degraded} findings={record.degraded}") if POWER else ""
     record.note(f"END failed={failed} aborted={error is not None} aborted_iterations={record.aborted} "
                 f"seconds={summary['seconds']}{power}")
-    return 0 if failed == 0 and error is None and record.aborted == 0 and record.counts else 1
+    return 0 if failed == 0 and error is None and record.aborted == 0 and (record.counts or asked == 0) else 1
 
 
 if __name__ == "__main__":

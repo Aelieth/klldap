@@ -70,6 +70,19 @@ jobs:
     steps:
       - name: Checkout sources
         uses: actions/checkout@v6.0.1
+      - name: No code asks jiff for the system time zone or for a zone by name
+        run: |
+          grep -rnE --include='*.rs' \
+            -e '::(try_)?system\b' \
+            -e '\bZoned(DateTime)?::(now|try_from|strptime|from_str)\b' \
+            -e 'parse::<(jiff::)?Zoned(DateTime)?>' \
+            -e '\bTimeZoneDatabase\b|\btz::db\b|jiff::tz::\{[^}]*\bdb\b' \
+            -e '\bTimeZone::get\b|\bin_tz\b' \
+            -e '\bparse_(zoned_datetime|time_zone)(_with)?\b' \
+            -e '\bto_(zoned_datetime|time_zone)_with\b|\.to_zoned_datetime\(\)' \
+            -e '\bTimeZoneAnnotation\b|\bPieces::parse\b|\bfmt::serde::tz\b' \
+            crates/ server/ app/ set-password/ migration-tool/ && rc=0 || rc=$?
+          [ "$rc" = 1 ] || { echo "::error::jiff is asked for the system time zone or for a zone by name (the lines above), or the search failed"; exit 1; }
       - name: Install build dependencies
         run: sudo apt-get update && sudo apt-get install -y pkg-config
       - name: Install Rust

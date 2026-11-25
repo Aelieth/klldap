@@ -138,12 +138,21 @@ schema; a database already at v13 gets it at the next start.
 
 Every event is printed with `target: logs`, e.g. `✅ user_delete bob by admin (graphql
 10.0.0.5)` or `❌ bind by ghost (ldap 127.0.0.1): unknown user`. Failures are `warn`,
-other events `info`, successful `bind`/`login`/`token_refresh` `debug`; the per-attempt
-`Login attempt` and LDAP bind session lines are `debug` too, so a failed bind is one
-terminal line, not three. Failure lines are rate-limited to 64 per 10 s — the excess is
+other events `info`, successful `bind`/`login`/`token_refresh` and a
+`password_reset_request` `debug`; the per-attempt `Login attempt` and LDAP bind session
+lines, a refused sign-in's own warning (a disabled or locked-out user), an unknown LDAP
+control and a malformed DN are `debug` too, so a refused sign-in is one terminal line.
+Failure lines are rate-limited to 64 per 10 s — the excess is
 dropped from the terminal only (the table keeps every stored row); the `suppressed N failure
 lines` summary prints on the next failure, or promptly when the flood stops (the writer's
-tick flushes it, so `persist = true`). `RUST_LOG=info,logs=debug` shows the
+tick flushes it, so `persist = true`). The same limit and the same summary take the
+server's own warnings that a request can cause (a policy or lockout that could not be read,
+a mail that could not be sent, an LDAP connection's error) and the line of an LDAP write
+request. An internal error is said once where it is answered, at the LDAP bind and at an
+HTTP 500, within the limit. A log writer that cannot store says so once when that starts
+(`Log events are not being stored`) and once when it ends, with the number lost. The
+embedded KDC's own lines (`target: krb5_klog`) are `debug` below a warning and share the
+limit from a warning up. `RUST_LOG=info,logs=debug` shows the
 successes as well. What is printed still grows Docker's json-file log; cap it with
 `--log-opt max-size=10m --log-opt max-file=3`.
 

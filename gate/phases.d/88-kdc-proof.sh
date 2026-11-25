@@ -3,6 +3,8 @@
 # sign-in with password and code at a directory door, then a ticket for the window. Three side
 # servers with their own realms: two with nothing set server-wide (one with a one-minute window),
 # one with LLDAP_ENABLE_MFA=true and a one-minute window; and the main server's explicit true.
+# Then the code at kinit, for a user who turned it on: kinit -l 5m with the password gives a
+# five-minute armor ticket, kinit -T with it and the code alone the real ticket (rows K.C.*).
 
 D="$(phase_dir)"
 MK_RUN="mk$(date +%H%M%S)"
@@ -21,6 +23,21 @@ MK_SAYS="KDC policy rejects request"
 MK_DETAIL="policy: enable-mfa (no fresh proof)"
 MK_MAIN_PORTS="$HTTP_PORT $LDAP_PORT" MK_MAIN_TOKEN="$TOKEN"
 MK_OLD_AT=0 MK_WIN_AT=0 MK_EXPL_AT=0 MK_UP=0 MK_MAIN_MADE=0 MK_SVC_MADE=0
+# The code at kinit: a side server whose mfa_proof_window is "0" (no window at all) with
+# LLDAP_ENABLE_MFA=true, the one-minute server for the rows inside a window, and on postgres the
+# main server beside a second server on its database.
+MC_ZERO="$CONTAINER-mfakdc0" MC_ZVOL="klldap-gate-mfakdc0-$RUNID"
+MC_ZKVOL="klldap-gate-mfakdc0-kdc-$RUNID"
+MC_TWO="$CONTAINER-mfakdc2" MC_TWO_VOL="klldap-gate-mfakdc2-$RUNID"
+EXTRA_CONTAINERS+=("$MC_ZERO" "$MC_TWO")
+EXTRA_VOLUMES+=("$MC_ZVOL" "$MC_ZKVOL" "$MC_TWO_VOL")
+MC_LOCK="${MK_RUN}lock" MC_ZERO_PORTS="" MC_ZERO_TOKEN="" MC_MAIN_MADE=0 MC_CODE="" MC_SPENT=""
+declare -A MC_USED=() MC_SECRET=()
+MC_XT=0
+case $- in *x*) MC_XT=1 ;; esac
+{ set +x; } 2>/dev/null
+MC_LEAK_PASS="$(python3 -c 'import secrets; print("Mc" + secrets.token_hex(10) + "!")')"
+[ "$MC_XT" = 1 ] && set -x
 
 mk_on() { HTTP_PORT="$1" LDAP_PORT="$2" TOKEN="$3"; }
 mk_main() {
@@ -451,12 +468,511 @@ mk_docs_bind() {
         t setsid -w ldapwhoami -x -H "$(ldap_url)" -D "$1" -W >"$D/docs-bind.out" 2>&1
 }
 
+mc_totp_at() {
+    TOTP_SECRET="$1" TOTP_STEP="$2" python3 - <<'PY'
+import base64, hashlib, hmac, os, struct
+secret = os.environ["TOTP_SECRET"]
+key = base64.b32decode(secret + "=" * (-len(secret) % 8))
+digest = hmac.new(key, struct.pack(">Q", int(os.environ["TOTP_STEP"])), hashlib.sha1).digest()
+offset = digest[19] & 0x0F
+code = (struct.unpack(">I", digest[offset:offset + 4])[0] & 0x7FFFFFFF) % 1000000
+print(f"{code:06d}")
+PY
+}
+
+# mc_code <user>: MC_CODE, a code of a step the user has not spent (this one or the next); it
+# waits for the next step when both are spent. Every sign-in with a code spends its step.
+mc_code() {
+    local now step
+    while :; do
+        now=$(($(date +%s) / 30))
+        for step in "$now" "$((now + 1))"; do
+            case " ${MC_USED[$1]:-} " in
+            *" $step "*) ;;
+            *)
+                MC_USED[$1]="${MC_USED[$1]:-} $step"
+                MC_CODE="$(mc_totp_at "${MC_SECRET[$1]:-}" "$step")"
+                MC_SPENT="$MC_SPENT $MC_CODE"
+                return 0
+                ;;
+            esac
+        done
+        sleep $((30 - $(date +%s) % 30 + 1))
+    done
+}
+
+mc_as_leak() { MK_PASS="$MC_LEAK_PASS" "$@"; }
+
+mc_enrol() {
+    local secret now
+    if [ "${2:-}" = leak ]; then
+        secret="$(mk_hush mc_as_leak mk__enrol "$1")"
+    else
+        secret="$(mk_enrol "$1")"
+    fi
+    now=$(($(date +%s) / 30))
+    MC_USED[$1]="$((now - 1)) $now"
+    MC_SECRET[$1]="$secret"
+    [ -n "$secret" ]
+}
+
+# mc_choose <user>: the user turns on the code at kinit on their own session.
+mc__choose() {
+    local token
+    mc_code "$1"
+    token="$(gate_login "$1" "$MK_PASS:$MC_CODE")" || return 1
+    TOKEN="$token" mk_gql 'mutation { setCodeAtKinit(on: true) { ok } }' '{}' >/dev/null
+}
+mc_choose() { mk_hush mc__choose "$@"; }
+
+# mc_offered <container> <user...>: each principal carries the otp string (within the 60 s pass).
+mc_offered() {
+    local c="$1" user _
+    shift
+    for user in "$@"; do
+        for _ in $(seq 1 75); do
+            gexec_in "$c" kadmin -k -t /data/kadm5.keytab -p "admin/admin@$REALM" -q "getstrs $user" \
+                >"$D/getstrs-$user.txt" 2>&1 && grep -q '^otp: ' "$D/getstrs-$user.txt" && continue 2
+            sleep 1
+        done
+        return 1
+    done
+}
+
+# mc_kinit <tag> <container> <user> <cache> <typed> [kinit options...]: ok, policy, incorrect,
+# preauth, revoked or other. <typed> on stdin: pass, leak (the leak row's password), leak:<code>,
+# or the text itself.
+mc__kinit() {
+    local c="$1" user="$2" cache="$3" typed="$4"
+    shift 4
+    case "$typed" in
+    pass) typed="$MK_PASS" ;;
+    leak) typed="$MC_LEAK_PASS" ;;
+    leak:*) typed="$MC_LEAK_PASS:${typed#leak:}" ;;
+    esac
+    # shellcheck disable=SC2016
+    gexec_in "$c" sh -c 'typed="$1" cache="$2"; shift 2; printf "%s\n" "$typed" |
+        KRB5_TRACE="$cache.trace" KRB5CCNAME="$cache" kinit "$@"' mc-kinit "$typed" "$cache" "$@" "$user@$REALM"
+}
+mc_kinit() {
+    local tag="$1" said
+    shift
+    if mk_hush mc__kinit "$@" >"$D/kinit-$tag.log" 2>&1; then
+        said=ok
+    else
+        said="$(mc_said "$D/kinit-$tag.log")"
+    fi
+    gexec_in "$1" cat "$3.trace" >"$D/kinit-$tag.trace" 2>&1 || true
+    echo "$said"
+}
+mc_said() {
+    if grep -qF "$MK_SAYS" "$1"; then
+        echo policy
+    elif grep -qF "Password incorrect" "$1"; then
+        echo incorrect
+    elif grep -qF "Preauthentication failed" "$1"; then
+        echo preauth
+    elif grep -qF "credentials have been revoked" "$1"; then
+        echo revoked
+    else
+        echo other
+    fi
+}
+
+mc_renew() {
+    # shellcheck disable=SC2016
+    if gexec_in "$2" sh -c 'KRB5CCNAME="$0" kinit -R' "$3" >"$D/renew-$1.log" 2>&1; then
+        echo ok
+    else
+        mc_said "$D/renew-$1.log"
+    fi
+}
+
+# mc_life <container> <cache>: the krbtgt ticket's life and renewable life by klist, in seconds.
+mc_life() {
+    # shellcheck disable=SC2016
+    gexec_in "$1" sh -c 'KRB5CCNAME="$0" klist' "$2" 2>/dev/null | python3 -c '
+import re, sys
+from datetime import datetime
+def at(text):
+    for form in ("%m/%d/%Y %H:%M:%S", "%m/%d/%y %H:%M:%S"):
+        try:
+            return datetime.strptime(text, form)
+        except ValueError:
+            pass
+    return None
+stamp = r"(\d\d/\d\d/\d{2,4} \d\d:\d\d:\d\d)"
+lines = sys.stdin.read().splitlines()
+life = renew = "none"
+for i, line in enumerate(lines):
+    m = re.match(stamp + r"\s+" + stamp + r"\s+krbtgt/", line)
+    if not m:
+        continue
+    start, end = at(m.group(1)), at(m.group(2))
+    life = int((end - start).total_seconds())
+    r = re.search(r"renew until " + stamp, lines[i + 1] if i + 1 < len(lines) else "")
+    if r:
+        renew = int((at(r.group(1)) - start).total_seconds())
+    break
+print(life, renew)'
+}
+
+mc_short() {
+    if [ "$1" -le 300 ] 2>/dev/null && { [ "$2" = none ] || [ "$2" -le 300 ] 2>/dev/null; }; then
+        echo short
+    else
+        echo "life $1 s, renewable $2 s"
+    fi
+}
+
+mc__bind() {
+    local dn
+    dn="$(mk_dn "$1")"
+    [ -n "$dn" ] || return 2
+    t ldapwhoami -x -H "$(ldap_url)" -D "$dn" -w "$MK_PASS:$2" >"$D/bind-$1.out" 2>&1
+}
+mc_bind() { mk_hush mc__bind "$@"; }
+
+# mc_simple <http port> <user> <code>: "200 token", or the status and the body.
+mc__simple() {
+    LOGIN_URL="http://127.0.0.1:$1/auth/simple/login" LOGIN_USER="$2" LOGIN_PASS="$MK_PASS:$3" \
+        t python3 - <<'PY'
+import json, os, urllib.error, urllib.request
+req = urllib.request.Request(os.environ["LOGIN_URL"], headers={"Content-Type": "application/json"},
+    data=json.dumps({"username": os.environ["LOGIN_USER"], "password": os.environ["LOGIN_PASS"]}).encode())
+try:
+    print("200", "token" if json.load(urllib.request.urlopen(req)).get("token") else "none")
+except urllib.error.HTTPError as e:
+    print(e.code, e.read().decode(errors="replace")[:200])
+except Exception as e:
+    print("000", str(e)[:200])
+PY
+}
+mc_simple() { mk_hush mc__simple "$@"; }
+
+# mc_once <true|false> <kind> <user> <detail start> <mark>: log_once, the detail matched by its
+# start (the mechanism follows it).
+mc__once() {
+    graphql "query(\$id: ID!, \$t: String!) { logs(filter: {kinds: [$2], target: \$t}, afterId: \$id, limit: 20) { success protocol detail } }" \
+        "$(ID="$5" T="$3" python3 -c 'import json,os; print(json.dumps({"id": os.environ["ID"], "t": os.environ["T"]}))')" 2>/dev/null |
+        OK="$1" WANT="$4" python3 -c '
+import json, os, sys
+rows = json.load(sys.stdin)["logs"]
+row = rows[0] if len(rows) == 1 else {}
+ok = (row.get("success") is (os.environ["OK"] == "true") and row.get("protocol") == "KERBEROS"
+      and (row.get("detail") or "").startswith(os.environ["WANT"]))
+print("one" if ok else "%d %s" % (len(rows), json.dumps(rows)[:300]))' 2>/dev/null
+}
+mc_once() {
+    local got="" _
+    FAIL_WHY=""
+    if [ -z "$5" ]; then
+        FAIL_WHY="no log marker could be read"
+        return 1
+    fi
+    for _ in $(seq 1 20); do
+        got="$(mc__once "$@")"
+        case "$got" in "" | "0 "*) sleep 0.5 ;; *) break ;; esac
+    done
+    [ "$got" = one ] && sleep 1 && got="$(mc__once "$@")"
+    [ "$got" = one ] || FAIL_WHY="$2 rows for $3 after the marker: ${got:-unread}; want one, success $1, protocol KERBEROS, detail starting '$4'"
+    [ -z "$FAIL_WHY" ]
+}
+
+# mc_check <id> <got> <want> <label> [mc_once's arguments]
+mc_check() {
+    local id="$1" got="$2" want="$3" label="$4"
+    shift 4
+    if [ "$got" != "$want" ]; then
+        p_bad "[K.C.$id] $label: got '$got', want '$want' (see the phase's files named after $id)"
+    elif [ "$#" = 0 ]; then
+        p_ok "[K.C.$id] $label"
+    elif mc_once "$@"; then
+        p_ok "[K.C.$id] $label, with one $2 row '$4...'"
+    else
+        p_bad "[K.C.$id] $label: '$got', but $FAIL_WHY"
+    fi
+}
+
+# shellcheck disable=SC2016
+mc_lock_link() {
+    local id
+    mk_gql 'mutation($n: String!) { createOu(name: $n) { ok } }' '{"n": "'"$1"'"}' >/dev/null || return 1
+    id="$(mk_gql 'mutation($n: String!, $i: [PolicyItemInput!]) { createPolicy(name: $n, items: $i) { id } }' \
+        '{"n": "'"$1"'", "i": [{"key": "lockout-threshold", "value": "3"}]}' | json_get createPolicy.id)" &&
+        [ -n "$id" ] || return 1
+    mk_gql 'mutation($o: String!, $p: Int!) { setOuPolicy(ou: $o, policyId: $p) { ok } }' \
+        '{"o": "'"$1"'", "p": '"$id"'}' >/dev/null
+}
+
+# The window-0 server: c1, c2, c3 take the code, d in an OU that locks at three, p with a password
+# of its own; the service, and the admin keytab's ticket as a host's armor.
+mc_zero_setup() {
+    local user
+    mc_lock_link "$MC_LOCK" || return 1
+    for user in c1 c2 c3; do mk_user "${MK_RUN}$user" "" || return 1; done
+    mk_user "${MK_RUN}d" "$MC_LOCK" || return 1
+    mk_hush mc_as_leak mk_user "${MK_RUN}p" "" || return 1
+    for user in c1 c2 c3 d p; do mk_ready "$MC_ZERO" "${MK_RUN}$user" || return 1; done
+    mk_service "$MC_ZERO" &&
+        gexec_in "$MC_ZERO" kinit -k -t /data/kadm5.keytab -c /tmp/mc-hostarmor "admin/admin@$REALM" \
+            >"$D/mc-hostarmor.log" 2>&1
+}
+
+mc_zero() {
+    local http ldap
+    read -r http ldap _ <<<"$MC_ZERO_PORTS"
+    mk_on "$http" "$ldap" "$MC_ZERO_TOKEN"
+}
+
+# mc_leaked <server log> <event log json>: the leak row's password, or a code spent there, found.
+mc_leaked() {
+    LEAK_PASS="$MC_LEAK_PASS" LEAK_CODES="$MC_SPENT" python3 - "$1" "$2" <<'PY'
+import os, re, sys
+said = [open(path, encoding="utf-8", errors="replace").read() for path in sys.argv[1:3]]
+found = []
+if any(os.environ["LEAK_PASS"] in text for text in said):
+    found.append("the password")
+for code in sorted(set(os.environ["LEAK_CODES"].split())):
+    pattern = re.compile(r"(?<![0-9.])" + code + r"(?![0-9])")
+    for where, text in zip(("server log", "event log"), said):
+        hit = pattern.search(text)
+        if hit:
+            line = text[text.rfind("\n", 0, hit.start()) + 1:text.find("\n", hit.end())]
+            found.append("a code in the %s: %s" % (where, line.replace(code, "<code>")[:160]))
+print("; ".join(found))
+PY
+}
+
+mc_zero_rows() {
+    local c1="${MK_RUN}c1" c2="${MK_RUN}c2" c3="${MK_RUN}c3" d="${MK_RUN}d" p="${MK_RUN}p"
+    local user got mark code wrong life renew leaked
+    mc_zero
+    for user in "$c1" "$c2" "$c3" "$d"; do
+        if ! mc_enrol "$user" || ! mc_choose "$user"; then
+            p_bad "[K.C.setup] $user: no factor, or the code at kinit not turned on: $(head -c 200 "$D/last.err")"
+            return 1
+        fi
+    done
+    if ! mc_enrol "$p" leak || ! mk_hush mc_as_leak mc__choose "$p"; then
+        p_bad "[K.C.setup] $p: no factor, or the code at kinit not turned on: $(head -c 200 "$D/last.err")"
+        return 1
+    fi
+    if ! mc_offered "$MC_ZERO" "$c1" "$c2" "$c3" "$d" "$p"; then
+        p_bad "[K.C.offer] a principal of a user who turned on the code at kinit carries no otp string after 75 s (see getstrs-*.txt)"
+        return 1
+    fi
+    p_ok "[K.C.offer] each user who turned on the code at kinit: the principal carries the otp string (kadmin getstrs)"
+
+    mark="$(log_mark)"
+    got="$(mc_kinit armor "$MC_ZERO" "$c1" /tmp/mc-armor-c1 pass -l 5m)"
+    mc_check armor "$got" ok "kinit -l 5m with the password: a ticket in the cache" false LOGIN "$c1" "totp code required (armor ticket" "$mark"
+    read -r life renew <<<"$(mc_life "$MC_ZERO" /tmp/mc-armor-c1)"
+    mc_check armor-life "$(mc_short "$life" "$renew")" short "klist: the armor ticket lives five minutes at most and renews no further"
+    mark="$(log_mark)"
+    got="$(mk_kvno mc-armor "$MC_ZERO" /tmp/mc-armor-c1)"
+    mk_refused_tgs C.armor-kvno "$got" "$c1" "$mark" "kvno with the armor ticket: '$MK_SAYS'" mc-armor
+    got="$(mc_renew armor "$MC_ZERO" /tmp/mc-armor-c1)"
+    mc_check armor-renew "$got" policy "kinit -R of the armor ticket: '$MK_SAYS'"
+    mc_code "$c1"
+    mark="$(log_mark)"
+    got="$(mc_kinit code "$MC_ZERO" "$c1" /tmp/mc-full-c1 "$MC_CODE" -T /tmp/mc-armor-c1)"
+    mc_check code "$got" ok "kinit -T with the armor ticket, the code alone at its prompt: a ticket, on a server with no window at all" true LOGIN "$c1" "ticket issued (OTP)" "$mark"
+    got="$(grep -cF 'Enter OTP Token Value' "$D/kinit-code.log" 2>/dev/null) $(grep -cF 'Password for' "$D/kinit-code.log" 2>/dev/null)"
+    mc_check code-prompt "$got" "1 0" "the stock kinit asked 'Enter OTP Token Value' once, and no password"
+    got="$(mk_kvno mc-code "$MC_ZERO" /tmp/mc-full-c1)"
+    mc_check code-kvno "$got" ok "kvno with that ticket: a service ticket, no window involved"
+    got="$(mc_renew code "$MC_ZERO" /tmp/mc-full-c1)"
+    mc_check code-renew "$got" ok "kinit -R of that ticket: renewed"
+
+    flood_quiet LOGIN KERBEROS >/dev/null
+    got="$(mc_kinit armor-c2 "$MC_ZERO" "$c2" /tmp/mc-armor-c2 pass -l 5m)"
+    mc_code "$c2"
+    code="$MC_CODE"
+    got="$got $(mc_kinit code-c2 "$MC_ZERO" "$c2" /tmp/mc-full-c2 "$code" -T /tmp/mc-armor-c2)"
+    mark="$(log_mark)"
+    got="$got $(mc_kinit replay "$MC_ZERO" "$c2" /tmp/mc-again-c2 "$code" -T /tmp/mc-armor-c2)"
+    mc_check replay "$got" "ok ok preauth" "the same right code twice at kinit -T: the second is 'Preauthentication failed'" false LOGIN "$c2" "totp replayed (OTP)" "$mark"
+    mc_code "$c2"
+    code="$MC_CODE"
+    got="$(mc_bind "$c2" "$code" && echo bound)"
+    mark="$(log_mark)"
+    got="$got $(mc_kinit door-then-kdc "$MC_ZERO" "$c2" /tmp/mc-door-c2 "$code" -T /tmp/mc-armor-c2)"
+    mc_check door-then-kdc "$got" "bound preauth" "a code taken by an LDAP bind (password:code), then typed at kinit -T: refused" false LOGIN "$c2" "totp replayed (OTP)" "$mark"
+    mc_code "$c2"
+    code="$MC_CODE"
+    got="$(mc_kinit kdc-then-door "$MC_ZERO" "$c2" /tmp/mc-kdc-c2 "$code" -T /tmp/mc-armor-c2)"
+    got="$got $(mc_bind "$c2" "$code" && echo bound || echo refused)"
+    mc_check kdc-then-door "$got" "ok refused" "a code taken at kinit -T, then given to an LDAP bind with the password: the bind is refused (see bind-$c2.out)"
+
+    flood_quiet LOGIN KERBEROS >/dev/null
+    mc_code "$c3"
+    mark="$(log_mark)"
+    got="$(mc_kinit foreign "$MC_ZERO" "$c3" /tmp/mc-full-c3 "$MC_CODE" -T /tmp/mc-hostarmor)"
+    mc_check foreign "$got" preauth "kinit -T armored by the admin keytab's ticket, with the user's right code: refused" false LOGIN "$c3" "armor is not the user's own ticket: admin/admin@$REALM (OTP)" "$mark"
+    mark="$(log_mark)"
+    got="$(mc_kinit password-only "$MC_ZERO" "$c3" /tmp/mc-pw-c3 pass)"
+    mc_check password-only "$got" policy "a plain kinit with the right password and no code: '$MK_SAYS' after the password" false LOGIN "$c3" "$MK_DETAIL" "$mark"
+    mark="$(log_mark)"
+    got="$(mc_kinit password-wrong "$MC_ZERO" "$c3" /tmp/mc-pw-c3 "Wrong$MK_PASS")"
+    mc_check password-wrong "$got" incorrect "a plain kinit with a wrong password: 'Password incorrect'" false LOGIN "$c3" "pre-authentication failed (" "$mark"
+    mc_code "$c3"
+    got="$(mc_bind "$c3" "$MC_CODE" && echo bound)"
+    got="$got $(mc_kinit zero-bind "$MC_ZERO" "$c3" /tmp/mc-pw-c3 pass)"
+    mc_check zero-bind "$got" "bound policy" "mfa_proof_window \"0\": after an LDAP bind with password:code, a plain kinit is still refused"
+
+    flood_quiet LOGIN KERBEROS >/dev/null
+    got="$(mc_kinit armor-d "$MC_ZERO" "$d" /tmp/mc-armor-d pass -l 5m)"
+    got="$got $(mc_kinit lock-1 "$MC_ZERO" "$d" /tmp/mc-pw-d "Wrong$MK_PASS")"
+    mc_code "$d"
+    wrong="$(printf '%06d' $(((10#$MC_CODE + 1) % 1000000)))"
+    mark="$(log_mark)"
+    got="$got $(mc_kinit lock-2 "$MC_ZERO" "$d" /tmp/mc-full-d "$wrong" -T /tmp/mc-armor-d)"
+    if ! mc_once false LOGIN "$d" "invalid totp (OTP)" "$mark"; then
+        p_bad "[K.C.wrong-code] a wrong code at kinit -T: $FAIL_WHY"
+    else
+        p_ok "[K.C.wrong-code] a wrong code at kinit -T, with one LOGIN row 'invalid totp (OTP)'"
+    fi
+    got="$got $(mc_kinit lock-3 "$MC_ZERO" "$d" /tmp/mc-pw-d "Wrong$MK_PASS")"
+    mc_code "$d"
+    mark="$(log_mark)"
+    got="$got $(mc_kinit locked "$MC_ZERO" "$d" /tmp/mc-full-d "$MC_CODE" -T /tmp/mc-armor-d)"
+    mc_check locked "$got" "ok incorrect preauth incorrect revoked" "an OU that locks at three: a wrong password, a wrong code and a wrong password each count, and the third locks; kinit -T with the right code is then 'credentials have been revoked'" false LOGIN "$d" "locked out" "$mark"
+
+    flood_quiet LOGIN KERBEROS >/dev/null
+    got="$(mc_kinit armor-p "$MC_ZERO" "$p" /tmp/mc-armor-p leak -l 5m)"
+    mc_code "$p"
+    mark="$(log_mark)"
+    got="$got $(mc_kinit typed-password "$MC_ZERO" "$p" /tmp/mc-full-p "leak:$MC_CODE" -T /tmp/mc-armor-p)"
+    mc_check typed-password "$got" "ok preauth" "the password, a colon and the code typed at the code prompt: refused" false LOGIN "$p" "no six-digit code (OTP)" "$mark"
+    docker logs "$MC_ZERO" >"$D/zero-server.log" 2>&1
+    mk_gql '{ logs(limit: 1000) { id timestamp kind success protocol actor target peer forwardedFor detail } }' '{}' \
+        >"$D/zero-events.json"
+    leaked="$(mc_leaked "$D/zero-server.log" "$D/zero-events.json")"
+    if [ ! -s "$D/zero-server.log" ] || [ ! -s "$D/zero-events.json" ]; then
+        p_bad "[K.C.no-leak] the window-0 server's log or event log could not be read (see zero-server.log, zero-events.json)"
+    elif [ -n "$leaked" ]; then
+        p_bad "[K.C.no-leak] found: $leaked"
+    else
+        p_ok "[K.C.no-leak] neither the leak row's password nor any code spent on the window-0 server is in its log (KDC lines included) or its event log"
+    fi
+}
+
+mc_short_rows() {
+    local v="${MK_RUN}v" got mark opened life renew http ldap
+    read -r http ldap _ <<<"$MK_SHORT_PORTS"
+    mk_on "$http" "$ldap" "$MK_SHORT_TOKEN"
+    if ! mk_user "$v" "$MK_ENABLED" || ! mk_ready "$MK_SHORT" "$v" || ! mk_service "$MK_SHORT" ||
+        ! mc_enrol "$v" || ! mc_choose "$v" || ! mc_offered "$MK_SHORT" "$v"; then
+        p_bad "[K.C.window-setup] the one-minute server's user who takes the code could not be made (see getstrs-$v.txt, last.err)"
+        return 1
+    fi
+    got="$(mc_kinit before-bind "$MK_SHORT" "$v" /tmp/mc-armor-v1 pass -l 5m)"
+    sleep 3
+    mc_code "$v"
+    got="$got $(mc_bind "$v" "$MC_CODE" && echo bound)"
+    opened="$(date +%s)"
+    mark="$(log_mark)"
+    got="$got $(mk_kvno mc-before-bind "$MK_SHORT" /tmp/mc-armor-v1)"
+    mc_check bind-after-armor "$got" "ok bound policy" "an armor ticket, then a bind with password:code a few seconds later: the window covers its time, yet kvno is '$MK_SAYS'"
+    got="$(mc_kinit window-plain "$MK_SHORT" "$v" /tmp/mc-plain-v pass)"
+    mc_check window-plain "$got" ok "inside that window, a plain kinit of the same user: a ticket (the window is kept)"
+    got="$(mc_kinit window-armor "$MK_SHORT" "$v" /tmp/mc-armor-v2 pass -l 5m)"
+    read -r life renew <<<"$(mc_life "$MK_SHORT" /tmp/mc-armor-v2)"
+    got="$got $(mc_short "$life" "$renew") $(mk_kvno mc-window-armor "$MK_SHORT" /tmp/mc-armor-v2)"
+    mc_check window-armor "$got" "ok short policy" "inside the window, kinit -l 5m: an armor ticket still, five minutes, and kvno '$MK_SAYS'"
+    mc_code "$v"
+    got="$(mc_kinit window-code "$MK_SHORT" "$v" /tmp/mc-full-v "$MC_CODE" -T /tmp/mc-armor-v2)"
+    mk_wait "$opened" 62
+    got="$got $(mk_kvno mc-window-code "$MK_SHORT" /tmp/mc-full-v) $(mc_renew window-code "$MK_SHORT" /tmp/mc-full-v)"
+    mc_check code-outlives-window "$got" "ok ok ok" "kinit -T with the code, then 62 s after the window opened: kvno and kinit -R work (no window involved)"
+    mark="$(log_mark)"
+    got="$(mc_kinit window-gone "$MK_SHORT" "$v" /tmp/mc-plain-v2 pass)"
+    mc_check window-gone "$got" policy "and a plain kinit then: '$MK_SAYS' after the password" false LOGIN "$v" "$MK_DETAIL" "$mark"
+}
+
+# mc_two_up: a second server on the gate's database, Kerberos off (one realm holder per database).
+mc_two_up() {
+    local i
+    docker rm -fv "$MC_TWO" >/dev/null 2>&1
+    docker volume rm "$MC_TWO_VOL" >/dev/null 2>&1
+    LLDAP_JWT_SECRET="$JWT_SECRET" LLDAP_KEY_SEED="$KEY_SEED" LLDAP_LDAP_USER_PASS="$ADMIN_PASS" \
+        LLDAP_DATABASE_URL="$GATE_DATABASE_URL" t docker run -d --name "$MC_TWO" --network "$NET" \
+        -p "127.0.0.1::17170" -v "$MC_TWO_VOL:/data" -e LLDAP_JWT_SECRET -e LLDAP_KEY_SEED \
+        -e LLDAP_LDAP_USER_PASS -e LLDAP_DATABASE_URL -e LLDAP_LDAP_BASE_DN="$BASE_DN" \
+        -e LLDAP_ENABLE_MFA=true -e LLDAP_KERBEROS_OPTIONS__ENABLED=false -e LLDAP_VERBOSE=true \
+        "$GATE_IMAGE" >/dev/null 2>>"$D/two.err" || return 1
+    for i in $(seq 1 60); do
+        gexec_in "$MC_TWO" /app/lldap healthcheck --config-file /data/lldap_config.toml >/dev/null 2>&1 &&
+            docker port "$MC_TWO" 17170/tcp | head -1 | sed 's/.*://' && return 0
+        [ "$i" -lt 60 ] && sleep 2
+    done
+    return 1
+}
+
+mc_two_rows() {
+    local n="${MK_RUN}n" two="" got mark code out
+    if [ "$GATE_DB" != postgres ]; then
+        note "[NOTE] ${PHASE}: [K.C.two-servers] two servers on one database need the postgres lane; on $GATE_DB this row is not run"
+        return 0
+    fi
+    mk_main
+    if ! mk_user "$n" ""; then
+        p_bad "[K.C.two-setup] $n could not be made on the main server: $(head -c 200 "$D/last.err")"
+        return 1
+    fi
+    MC_MAIN_MADE=1
+    if ! mk_ready "$CONTAINER" "$n" || ! mc_enrol "$n" || ! mc_choose "$n" || ! mc_offered "$CONTAINER" "$n"; then
+        p_bad "[K.C.two-setup] $n: no principal, no factor or no otp string (see getstrs-$n.txt)"
+        return 1
+    fi
+    if ! two="$(mc_two_up)" || [ -z "$two" ]; then
+        p_bad "[K.C.two-setup] the second server on the postgres database did not become healthy (see two.err)"
+        docker rm -fv "$MC_TWO" >/dev/null 2>&1
+        return 1
+    fi
+    got="$(mc_kinit two-armor "$CONTAINER" "$n" /tmp/mc-armor-n pass -l 5m)"
+    mc_code "$n"
+    code="$MC_CODE"
+    got="$got $(mc_kinit two-code "$CONTAINER" "$n" /tmp/mc-full-n "$code" -T /tmp/mc-armor-n)"
+    out="$(mc_simple "$two" "$n" "$code")"
+    got="$got $(grep -q 'already used' <<<"$out" && echo used || echo "'$out'")"
+    mc_check two-kdc-then-door "$got" "ok ok used" "two servers on postgres: a code taken at the main server's KDC is refused at the second server's /auth/simple/login as already used"
+    flood_quiet LOGIN KERBEROS >/dev/null
+    mc_code "$n"
+    code="$MC_CODE"
+    out="$(mc_simple "$two" "$n" "$code")"
+    mark="$(log_mark)"
+    got="$(grep -q '^200 token' <<<"$out" && echo signed || echo "'$out'")"
+    got="$got $(mc_kinit two-door-then-kdc "$CONTAINER" "$n" /tmp/mc-again-n "$code" -T /tmp/mc-armor-n)"
+    mc_check two-door-then-kdc "$got" "signed preauth" "two servers on postgres: a code taken at the second server's door is refused at the main server's kinit -T" false LOGIN "$n" "totp replayed (OTP)" "$mark"
+    docker logs "$MC_TWO" >"$D/two.log" 2>&1 || true
+    docker rm -fv "$MC_TWO" >/dev/null 2>&1
+    docker volume rm "$MC_TWO_VOL" >/dev/null 2>&1
+}
+
+mc_rows() {
+    if mk_up_side "$MC_ZERO" MC_ZERO_PORTS MC_ZERO_TOKEN mc_zero_setup "window-0 side server" \
+        "$MC_ZVOL" "$MC_ZKVOL" -e LLDAP_ENABLE_MFA=true -e LLDAP_KERBEROS_OPTIONS__MFA_PROOF_WINDOW=0; then
+        mc_zero_rows
+    fi
+    mc_short_rows
+    mc_two_rows
+}
+
 mk_down() {
     side_down "$MK_SIDE" "$MK_VOL" "$D/side.log"
     side_down "$MK_SHORT" "$MK_SVOL" "$D/short.log"
     side_down "$MK_EXPL" "$MK_EVOL" "$D/explicit.log"
-    docker volume rm "$MK_KVOL" "$MK_SKVOL" "$MK_EKVOL" >/dev/null 2>&1 || true
+    side_down "$MC_ZERO" "$MC_ZVOL" "$D/zero.log"
+    docker rm -fv "$MC_TWO" >/dev/null 2>&1 || true
+    docker volume rm "$MK_KVOL" "$MK_SKVOL" "$MK_EKVOL" "$MC_ZKVOL" "$MC_TWO_VOL" >/dev/null 2>&1 || true
     mk_main
+    if [ "$MC_MAIN_MADE" = 1 ]; then
+        # shellcheck disable=SC2016
+        mk_gql 'mutation($u: String!) { deleteUser(userId: $u) { ok } }' '{"u": "'"${MK_RUN}n"'"}' >/dev/null ||
+            p_bad "[K.cleanup] ${MK_RUN}n was not deleted on the main server"
+    fi
     if [ "$MK_MAIN_MADE" = 1 ]; then
         # shellcheck disable=SC2016
         mk_gql 'mutation($u: String!) { deleteUser(userId: $u) { ok } }' '{"u": "'"${MK_RUN}m"'"}' >/dev/null ||
@@ -503,6 +1019,7 @@ if [ "$MK_UP" = 1 ]; then
     mk_main
     if mk_main_setup; then
         mk_rows
+        mc_rows
     else
         p_bad "[K.setup] the main server's user or service could not be made: $(head -c 200 "$D/last.err")"
     fi

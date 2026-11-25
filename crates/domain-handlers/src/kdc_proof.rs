@@ -177,7 +177,7 @@ impl PolicyCache {
 
     /// Under the writers' lock; while it is held the user is marked for its taker.
     pub fn put_window(&self, user: &UserId, window: ProofWindow) {
-        let Ok(_writers) = self.writers.try_lock() else {
+        let Some(_taking) = self.try_take() else {
             self.mark(user);
             return;
         };

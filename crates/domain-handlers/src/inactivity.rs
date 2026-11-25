@@ -257,7 +257,7 @@ impl PolicyCache {
     }
 
     fn hold_success(&self, user: &UserId, at: Timestamp) {
-        let Ok(_writers) = self.writers.try_lock() else {
+        let Some(_taking) = self.try_take() else {
             self.mark(user);
             return;
         };

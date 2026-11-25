@@ -39,6 +39,7 @@ use tracing::warn;
 pub const POLICY_REFILL: Duration = Duration::from_secs(30);
 pub const FILL_GAP: Duration = Duration::from_millis(250);
 pub const FILL_BACKOFF_LIMIT: Duration = Duration::from_secs(30);
+const MARK_PASSES: usize = 4;
 const FLAG_OFF: u8 = 0;
 const FLAG_ON: u8 = 1;
 const FLAG_UNKNOWN: u8 = 2;
@@ -444,7 +445,8 @@ pub struct PolicyCache {
     generation: AtomicU64,
     reads: AtomicU64,
     fill: Notify,
-    pub(crate) writers: tokio::sync::Mutex<()>,
+    refill: AtomicBool,
+    writers: tokio::sync::Mutex<()>,
     marked: Mutex<Marks>,
     read_failed: AtomicBool,
     lockout: AtomicU8,
@@ -466,7 +468,7 @@ struct Marks {
 }
 
 /// Holds the writers' lock; once it is let go, marks still in the set go to the filler.
-struct Taking<'a> {
+pub(crate) struct Taking<'a> {
     cache: &'a PolicyCache,
     writers: Option<tokio::sync::MutexGuard<'a, ()>>,
 }
@@ -475,7 +477,7 @@ impl Drop for Taking<'_> {
     fn drop(&mut self) {
         drop(self.writers.take());
         if !self.cache.marks().users.is_empty() {
-            self.cache.poke_fill();
+            self.cache.fill.notify_one();
         }
     }
 }
@@ -493,6 +495,7 @@ impl PolicyCache {
             generation: AtomicU64::new(0),
             reads: AtomicU64::new(0),
             fill: Notify::new(),
+            refill: AtomicBool::new(false),
             writers: tokio::sync::Mutex::new(()),
             marked: Mutex::default(),
             read_failed: AtomicBool::new(false),
@@ -694,13 +697,10 @@ impl PolicyCache {
         marks.users.insert(user.clone(), made);
     }
 
-    fn marked_now(&self) -> Vec<(UserId, u64)> {
+    fn marked_since(&self, seen: u64) -> Vec<(UserId, u64)> {
         let marks = self.marks();
-        marks
-            .users
-            .iter()
-            .map(|(user, made)| (user.clone(), *made))
-            .collect()
+        let later = marks.users.iter().filter(|(_, made)| **made > seen);
+        later.map(|(user, made)| (user.clone(), *made)).collect()
     }
 
     fn unmark(&self, user: &UserId, made: u64) {
@@ -710,7 +710,25 @@ impl PolicyCache {
         }
     }
 
+    pub(crate) fn try_take(&self) -> Option<Taking<'_>> {
+        let writers = self.writers.try_lock().ok();
+        writers.map(|writers| Taking {
+            cache: self,
+            writers: Some(writers),
+        })
+    }
+
+    async fn take(&self) -> Taking<'_> {
+        let writers = Some(self.writers.lock().await);
+        Taking {
+            cache: self,
+            writers,
+        }
+    }
+
+    /// Asks the filler for a whole fill; a mark left at a release wakes it for the marks alone.
     pub fn poke_fill(&self) {
+        self.refill.store(true, Ordering::Release);
         self.fill.notify_one();
     }
 
@@ -787,11 +805,7 @@ pub async fn fill_policy_cache<H>(handler: &H, cache: &PolicyCache) -> Result<()
 where
     H: UserListerBackendHandler + UserBackendHandler + PolicyBackendHandler + ?Sized,
 {
-    let writers = cache.writers.lock().await;
-    let _taking = Taking {
-        cache,
-        writers: Some(writers),
-    };
+    let _taking = cache.take().await;
     let mut entries = build_entries(handler).await?;
     fill_activity(handler, cache, &mut entries).await;
     fill_windows(handler, cache, &mut entries).await;
@@ -809,23 +823,47 @@ where
 {
     tokio::spawn(async move {
         let mut gap = FILL_GAP;
+        let mut refill_at = tokio::time::Instant::now() + POLICY_REFILL;
         loop {
-            tokio::select! {
-                () = cache.poked() => {}
-                () = tokio::time::sleep(POLICY_REFILL) => {}
+            let due = tokio::select! {
+                () = cache.poked() => false,
+                () = tokio::time::sleep_until(refill_at) => true,
+            };
+            let whole = due | cache.refill.swap(false, Ordering::AcqRel);
+            if live(cache) {
+                let failed = fill_round(&handler, cache, whole).await;
+                gap = next_gap(gap, failed);
+                tokio::time::sleep(gap).await;
             }
-            if !live(cache) {
-                continue;
+            if whole {
+                refill_at = tokio::time::Instant::now() + POLICY_REFILL;
             }
-            let filled = fill_policy_cache(&handler, cache).await;
-            if let Err(e) = &filled {
-                warn!("The policy cache was not refilled: {e}");
-            }
-            let failed = filled.is_err() | cache.read_failed.swap(false, Ordering::AcqRel);
-            gap = next_gap(gap, failed);
-            tokio::time::sleep(gap).await;
         }
     })
+}
+
+/// A whole fill when one is asked or due, else the marks alone; a read that failed asks a whole
+/// fill of the next round. True when a read failed.
+async fn fill_round<H>(handler: &H, cache: &PolicyCache, whole: bool) -> bool
+where
+    H: UserListerBackendHandler + UserBackendHandler + PolicyBackendHandler + ?Sized,
+{
+    let filled = match whole {
+        true => fill_policy_cache(handler, cache).await,
+        false => {
+            let _taking = cache.take().await;
+            take_marks(handler, cache).await;
+            Ok(())
+        }
+    };
+    if let Err(e) = &filled {
+        warn!("The policy cache was not refilled: {e}");
+    }
+    let failed = filled.is_err() | cache.read_failed.swap(false, Ordering::AcqRel);
+    if failed {
+        cache.refill.store(true, Ordering::Release);
+    }
+    failed
 }
 
 /// A fill whose reads keep failing waits twice as long each time, up to `FILL_BACKOFF_LIMIT`.
@@ -1105,13 +1143,30 @@ where
     }
 }
 
-/// One pass over the marks present now, ending at the first read that gave up; a mark leaves the
-/// set only once its entry is stored.
+/// Passes over the marks until one finds none made since the pass before, `MARK_PASSES` at most,
+/// ending at the first read that gave up; a mark leaves the set only once its entry is stored.
 async fn take_marks<H>(handler: &H, cache: &PolicyCache)
 where
     H: UserBackendHandler + PolicyBackendHandler + ?Sized,
 {
-    for (user, made) in cache.marked_now() {
+    let mut seen = 0;
+    for _ in 0..MARK_PASSES {
+        let marks = cache.marked_since(seen);
+        let Some(last) = marks.iter().map(|(_, made)| *made).max() else {
+            return;
+        };
+        if !take_pass(handler, cache, marks).await {
+            return;
+        }
+        seen = last;
+    }
+}
+
+async fn take_pass<H>(handler: &H, cache: &PolicyCache, marks: Vec<(UserId, u64)>) -> bool
+where
+    H: UserBackendHandler + PolicyBackendHandler + ?Sized,
+{
+    for (user, made) in marks {
         let entry = match user_entry(handler, &user).await {
             Ok((ou_key, items, details)) => user_facts(handler, &details)
                 .await
@@ -1134,7 +1189,7 @@ where
             Err(DomainError::EntityNotFound(_)) => cache.remove_user(&user),
             Err(e) if gave_up(&e) => {
                 warn!("The policy cache did not take {user}'s change within its bound: {e}");
-                break;
+                return false;
             }
             Err(e) => {
                 warn!("The policy cache did not take {user}'s change: {e}");
@@ -1144,6 +1199,7 @@ where
         }
         cache.unmark(&user, made);
     }
+    true
 }
 
 /// Marks the user before trying the lock: a taker of the lock always sees the mark after it.
@@ -1155,12 +1211,8 @@ where
         return;
     }
     cache.mark(user);
-    let Ok(writers) = cache.writers.try_lock() else {
+    let Some(_taking) = cache.try_take() else {
         return;
-    };
-    let _taking = Taking {
-        cache,
-        writers: Some(writers),
     };
     take_marks(handler, cache).await;
 }
@@ -2140,6 +2192,7 @@ mod tests {
         activity_entry_reads: AtomicU64,
         recording_down: AtomicBool,
         successes: Mutex<Vec<(UserId, Timestamp)>>,
+        restless: Mutex<Option<&'static PolicyCache>>,
     }
 
     impl Directory {
@@ -2238,6 +2291,9 @@ mod tests {
             let meanwhile = self.meanwhile.lock().unwrap().take();
             if let Some((cache, other)) = meanwhile {
                 cache.mark(&other);
+            }
+            if let Some(cache) = *self.restless.lock().unwrap() {
+                cache.mark(user_id);
             }
             found.ok_or_else(|| DomainError::EntityNotFound(user_id.to_string()))
         }
@@ -2837,30 +2893,24 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn test_a_hook_takes_one_pass_and_hands_later_marks_to_the_filler() {
+    async fn test_a_mark_made_during_a_holders_walk_is_taken_by_that_holder() {
         let _judging = Judging::only(&[LATE, OTHER]);
         let cache: &'static PolicyCache = Box::leak(Box::new(PolicyCache::new()));
         let directory = Directory::knowing(&[LATE, OTHER]);
         let (late, other) = (UserId::new(LATE), UserId::new(OTHER));
         *directory.meanwhile.lock().unwrap() = Some((cache, other.clone()));
         user_written(&directory, cache, &late).await;
+        let left = (cache.marked(&other), poked(cache).await);
         assert_eq!(
-            (ou_of(cache, &late), ou_of(cache, &other)),
-            (Some(LABS.to_owned()), None),
-            "one pass over the marks present at the take"
+            (ou_of(cache, &late), ou_of(cache, &other), left),
+            (Some(LABS.to_owned()), Some(LABS.to_owned()), (false, false)),
+            "the holder walks again for the mark made during its walk: none goes to the filler"
         );
-        assert!(
-            cache.marks().users.contains_key(&other),
-            "the later mark stays"
-        );
-        assert!(poked(cache).await, "the later mark goes to the filler");
-        fill_policy_cache(&directory, cache).await.unwrap();
-        assert_eq!(ou_of(cache, &other), Some(LABS.to_owned()));
     }
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn test_a_user_marked_again_during_its_own_read_keeps_the_newer_mark() {
+    async fn test_a_user_marked_again_during_its_own_read_is_read_again_by_the_same_holder() {
         let _judging = Judging::only(&[LATE]);
         let cache: &'static PolicyCache = Box::leak(Box::new(PolicyCache::new()));
         let directory = Directory::knowing(&[LATE]);
@@ -2868,21 +2918,81 @@ mod tests {
         *directory.moves.lock().unwrap() = Some((late.clone(), "people"));
         *directory.meanwhile.lock().unwrap() = Some((cache, late.clone()));
         user_written(&directory, cache, &late).await;
+        let left = (cache.marked(&late), poked(cache).await);
         assert_eq!(
-            (ou_of(cache, &late), cache.marks().users.contains_key(&late)),
-            (Some(LABS.to_owned()), true),
-            "the read stored the state it saw; the mark made during the read stays"
+            (ou_of(cache, &late), left),
+            (Some("people".to_owned()), (false, false)),
+            "the mark made during the read outlives that read: the next pass stores the newer state"
         );
-        assert!(
-            poked(cache).await,
-            "the mark left after the pass goes to the filler"
-        );
-        fill_policy_cache(&directory, cache).await.unwrap();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_a_user_marked_at_every_read_is_left_to_the_filler_after_four_passes() {
+        let _judging = Judging::only(&[LATE]);
+        let cache: &'static PolicyCache = Box::leak(Box::new(PolicyCache::new()));
+        let directory = Directory::knowing(&[LATE]);
+        let late = UserId::new(LATE);
+        *directory.restless.lock().unwrap() = Some(cache);
+        user_written(&directory, cache, &late).await;
+        let reads = directory.entry_reads.load(Ordering::Relaxed);
         assert_eq!(
-            (ou_of(cache, &late), cache.marks().users.len()),
-            (Some("people".to_owned()), 0),
-            "the next pass stores the newer state"
+            (reads, cache.marked(&late), poked(cache).await),
+            (4, true, true),
+            "a stream of writes holds the lock for four passes; the mark left goes to the filler"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn test_a_mark_left_as_a_holder_lets_go_is_taken_by_the_filler_without_a_fill() {
+        let _judging = Judging::only(&[LATE]);
+        let cache: &'static PolicyCache = Box::leak(Box::new(PolicyCache::new()));
+        let directory = Directory::knowing(&[LATE]).listing(&[OTHER]);
+        let (late, other) = (UserId::new(LATE), UserId::new(OTHER));
+        let filler = start_policy_filler(directory, cache);
+        let held = cache.writers.lock().await;
+        cache.mark(&late);
+        drop(Taking {
+            cache,
+            writers: Some(held),
+        });
+        for _ in 0..100 {
+            if !cache.marked(&late) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let alone = (ou_of(cache, &late), ou_of(cache, &other));
+        cache.poke_fill();
+        for _ in 0..100 {
+            if ou_of(cache, &other).is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        filler.abort();
+        assert_eq!(
+            (alone, ou_of(cache, &other)),
+            ((Some(LABS.to_owned()), None), Some(LABS.to_owned())),
+            "the filler reads the marked user alone, not the listing, which holds another; a \
+             poke still asks the whole fill"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_mark_present_as_a_short_hold_ends_is_handed_to_the_filler() {
+        let (late, other) = (UserId::new(LATE), UserId::new(OTHER));
+        for (label, proof) in [("a proof put", true), ("a success held", false)] {
+            let (cache, directory) = (PolicyCache::new(), Directory::default());
+            turn(&cache, true);
+            cache.mark(&late);
+            match proof {
+                true => cache.put_window(&other, opened()),
+                false => cache.note_success(&directory, &other, at(0)).await,
+            }
+            assert!(poked(&cache).await, "{label}: letting go hands the mark on");
+        }
     }
 
     struct Rows(Mutex<Vec<logging::LogEvent>>);

@@ -16,6 +16,9 @@ CTL=k1ctl/gate.test
 PASS=K1syncPass2026!
 NEW=K1syncNewPass2026!
 SELF=K1selfPass2026!
+AFTER=K1afterPass2026!
+E128=aes128-cts-hmac-sha1-96:normal
+E256=aes256-cts-hmac-sha1-96:normal
 ADMIN="admin/admin@$REALM"
 CUR="$PASS"
 
@@ -80,6 +83,26 @@ PY
         sleep 0.5
     done
     return 1
+}
+# No access_denied row after the marker names the principal; a later refusal's row shows the writer passed it.
+log_none() {
+    local name="$1" later="$2" tag="$3" mark="$4"
+    # shellcheck disable=SC2016
+    graphql 'query($id: ID!) { logs(filter: {kinds: [ACCESS_DENIED]}, afterId: $id, limit: 100) { target detail } }' \
+        '{"id": "'"$mark"'"}' >"$D/$tag-log.json" 2>"$D/$tag-log.err" || return 1
+    NAME="$name" LATER="$later" python3 - "$D/$tag-log.json" >"$D/$tag-log.out" 2>&1 <<'PY'
+import json, os, sys
+rows = json.load(open(sys.argv[1], encoding="utf-8")).get("logs") or []
+name, later = os.environ["NAME"], os.environ["LATER"]
+named = [r for r in rows if r.get("target") == name or name in (r.get("detail") or "")]
+bad = []
+if named:
+    bad.append(f"access_denied rows name {name}: {json.dumps(named)}")
+if not any(r.get("detail") == later for r in rows):
+    bad.append(f"the later row '{later}' is not in the log, so nothing shows the writer passed the cpw")
+print("; ".join(bad))
+sys.exit(1 if bad else 0)
+PY
 }
 princ_view() {
     awk '/^(Policy:|Attributes:|Expiration date:|Password expiration date:|Number of keys:|Key:)/ { print }'
@@ -325,6 +348,59 @@ refused cpw-keepold "cpw -keepold -pw K1keepoldPass2026! $SYNC" \
     "Cannot change protected principal" "change_password" PROTECT_PRINCIPAL "$ADMIN"
 refused cpw-randkey "cpw -randkey $SYNC" \
     "Cannot change protected principal" "randkey" PROTECT_PRINCIPAL "$ADMIN"
+refused cpw-randkey-e "cpw -randkey -e $E256 $SYNC" \
+    "Cannot change protected principal" "randkey" PROTECT_PRINCIPAL "$ADMIN"
+E_MARK="$(log_mark)" || E_MARK=""
+ctl_kv="$(kvno_of "$CTL")"
+if kadmin_q "cpw -e $E256 -pw K1ctlEPass2026! $CTL" >"$D/cpw-e-ctl.txt" 2>&1 \
+    && ! grep -q " while " "$D/cpw-e-ctl.txt" \
+    && kinit_pw "$CTL@$REALM" "K1ctlEPass2026!" >"$D/kinit-cpw-e-ctl.log" 2>&1 \
+    && [ -n "$ctl_kv" ] && [ "$(kvno_of "$CTL")" = "$((ctl_kv + 1))" ]; then
+    p_ok "cpw-e-ctl: cpw -e $E256 on $CTL, no directory user's principal, is carried out: kinit takes the new password and the key version increased by one"
+else
+    p_bad "cpw-e-ctl: cpw -e $E256 on $CTL failed (kvno '${ctl_kv:-empty}' before; see cpw-e-ctl.txt, kinit-cpw-e-ctl.log)"
+fi
+for e in "aes128 $E128 K1e128Pass2026!" "aes256 $E256 K1e256Pass2026!"; do
+    read -r e_tag e_ks e_pw <<<"$e"
+    refused "cpw-e-$e_tag" "cpw -e $e_ks -pw $e_pw $SYNC" \
+        "Invalid key/salt tuples" "change_password" BAD_KEYSALTS "$ADMIN"
+    if kinit_pw "$SYNC@$REALM" "$e_pw" >"$D/kinit-cpw-e-$e_tag-new.log" 2>&1; then
+        p_bad "cpw-e-$e_tag: kinit of $SYNC takes the password the refused cpw carried"
+    elif grep -q 'Password incorrect' "$D/kinit-cpw-e-$e_tag-new.log"; then
+        p_ok "cpw-e-$e_tag: kinit of $SYNC with the password the refused cpw carried says Password incorrect"
+    else
+        p_bad "cpw-e-$e_tag: kinit of $SYNC with the password the refused cpw carried failed without 'Password incorrect' (see kinit-cpw-e-$e_tag-new.log)"
+    fi
+done
+E_LATER="kadmin change_password on $SYNC@$REALM by $ADMIN: BAD_KEYSALTS"
+if [ -n "$E_MARK" ] && log_none "$CTL@$REALM" "$E_LATER" cpw-e-ctl "$E_MARK"; then
+    p_ok "cpw-e-ctl: no access_denied names $CTL, in a log read past the later refusals"
+else
+    p_bad "cpw-e-ctl: $(cat "$D/cpw-e-ctl-log.out" 2>/dev/null || echo 'no rows read (see mark.err, cpw-e-ctl-log.err)')"
+fi
+KV="$(kvno_of "$SYNC")"
+MARK="$(log_mark)" || MARK=""
+if kadmin_q "cpw -pw $AFTER $SYNC" >"$D/cpw-after.txt" 2>&1 && ! grep -q " while " "$D/cpw-after.txt"; then
+    p_ok "cpw-after: a plain cpw of $SYNC after the refused key/salt lists produced no error text"
+else
+    p_bad "cpw-after: a plain cpw of $SYNC after the refused key/salt lists failed (see cpw-after.txt)"
+fi
+now="$(kvno_of "$SYNC")"
+if [ -n "$KV" ] && [ "$now" = "$((KV + 1))" ] \
+    && bind_ok "$SYNC" "$AFTER" && ! bind_ok "$SYNC" "$CUR" \
+    && kinit_pw "$SYNC@$REALM" "$AFTER" >"$D/kinit-after-new.log" 2>&1 \
+    && ! kinit_pw "$SYNC@$REALM" "$CUR" >"$D/kinit-after-old.log" 2>&1; then
+    p_ok "cpw-after: bind and kinit take the new password and the key version increased by one"
+else
+    p_bad "cpw-after: the doors did not follow the new password (kvno '${KV:-empty}' -> '${now:-empty}'; see kinit-after-new.log, kinit-after-old.log)"
+fi
+if [ -n "$MARK" ] && log_one PASSWORD_CHANGE "$SYNC@$REALM" "$CPW_DETAIL" true cpw-after "$MARK" "$ADMIN"; then
+    p_ok "cpw-after: exactly one password_change names the kadmin caller, protocol KADMIN, actor $ADMIN"
+else
+    p_bad "cpw-after: password_change '$CPW_DETAIL' with protocol KADMIN and actor $ADMIN is not exactly one (see cpw-after-log.json)"
+fi
+bind_ok "$SYNC" "$AFTER" && CUR="$AFTER"
+KV="$now"
 refused ktadd "ktadd -k /tmp/k1.kt $SYNC" \
     "Cannot change protected principal" "randkey" PROTECT_PRINCIPAL "$ADMIN"
 if gexec sh -c 'test ! -e /tmp/k1.kt'; then

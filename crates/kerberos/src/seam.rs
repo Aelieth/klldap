@@ -7347,4 +7347,134 @@ mod tests {
             "{refused:?}"
         );
     }
+
+    type Race = Box<dyn FnOnce() + Send>;
+
+    /// A host after whose `prepare` another change lands, before the caller takes its lock.
+    struct Raced {
+        inner: Arc<SqlRealm>,
+        race: Mutex<Option<Race>>,
+    }
+
+    impl KerberosStore for Raced {
+        fn load(&self) -> Result<LoadedRealm, KerberosStoreError> {
+            self.inner.load()
+        }
+
+        fn commit_change(&self, change: HostChange) -> Result<(), KerberosStoreError> {
+            self.inner.commit_change(change)
+        }
+
+        fn prepare(
+            &self,
+            intent: &WriteIntent,
+            target: Option<&TargetPeek>,
+        ) -> Result<Option<HostPrepared>, KerberosStoreError> {
+            let prepared = self.inner.prepare(intent, target);
+            let race = self.race.lock().unwrap().take();
+            if let Some(race) = race {
+                race();
+            }
+            prepared
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_a_cpw_that_meets_another_change_is_written_from_its_one_prepared_change() {
+        use lldap_test_utils::recording_log::LogGuard;
+
+        let guard = LogGuard::install();
+        let runtime = runtime();
+        let temp = TempRealm::new();
+        let profile = boot::profile(&temp.settings);
+        let memory = |runtime: &Runtime| sqlite_one_connection("sqlite::memory:", runtime);
+        let (committer, pool) = committer_on(&memory, &runtime);
+        add_user(&pool, &runtime, "bob");
+        let derived = Arc::new(AtomicUsize::new(0));
+        let (policies, minimum_reads) = minimums(&[Some(PASSWORD_MIN_LENGTH)]);
+        let records = Records {
+            handler: counting_deriver(Arc::clone(&derived)),
+            policies,
+            runtime: runtime.handle().clone(),
+        };
+        let host = Arc::new(SqlRealm::new(committer.store()).serving("EXAMPLE.COM", Some(records)));
+        host.start_pass_committed();
+        let raced = Arc::new(Raced {
+            inner: host.clone(),
+            race: Mutex::new(None),
+        });
+        let store = krb5_kdc::shared_dump(
+            boot::open_store(&temp.settings, &profile, raced.clone()).unwrap(),
+        );
+        let ready = Arc::new(AtomicBool::new(true));
+        let embedded = EmbeddedKerberos::new(store.clone(), &temp.settings, ready, host.clone());
+        runtime
+            .block_on(synced(&embedded, &UserId::new("bob"), "Bob-Password-1"))
+            .unwrap();
+        let bob = name("bob");
+        let another = {
+            let (store, host, bob) = (store.clone(), host.clone(), bob.clone());
+            move || {
+                let note = |s: &mut krb5_kdc::PrincipalStore| {
+                    s.set_string_in(&bob, "EXAMPLE.COM", "note", Some("raced"), "test")
+                };
+                let mut write = store.write().unwrap();
+                let noted = write.change_committing(committing(&*host), note);
+                noted.unwrap().unwrap();
+            }
+        };
+        *raced.race.lock().unwrap() = Some(Box::new(another));
+        guard.recorder().take_events();
+
+        let text = "Bob-Password-2";
+        let fill = with_password(text, 0);
+        let intent = intent_of(Operation::ChangePassword, kadmin(false), &["bob"], &fill);
+        let changed = krb5_kdc::change_password_shared_as(
+            &store,
+            intent,
+            (&bob, "EXAMPLE.COM"),
+            text.as_bytes(),
+            0,
+            ADMIN,
+            &[],
+            |_| Ok(()),
+        );
+        let answer = match changed {
+            Ok(()) => "written".to_owned(),
+            Err(StoreError::Host(KerberosStoreError::Denied(denial))) => {
+                format!("{}: {}", code_name(denial.kadm5_code), denial.text)
+            }
+            Err(e) => e.to_string(),
+        };
+        let events = guard.recorder().take_events().into_iter();
+        let rows: Rows = events.map(|e| (e.kind, e.target, e.detail)).collect();
+        let (kvno, noted) = {
+            let read = store.read().unwrap();
+            let bob = read.get_name(&bob).unwrap();
+            let note = ("note".to_owned(), "raced".to_owned());
+            (bob.top_kvno(), bob.string_attrs.contains(&note))
+        };
+        let counted = (
+            derived.load(Ordering::SeqCst),
+            minimum_reads.load(Ordering::SeqCst),
+        );
+        let stored = record_of(&pool, &runtime, "bob").is_some();
+        assert_eq!(
+            (
+                (answer, noted, counted),
+                (kvno, stored, rows),
+                details(&pool, &runtime, "password_change"),
+            ),
+            (
+                ("written".to_owned(), true, (1, 1)),
+                (Some(2), true, Vec::new()),
+                vec![format!("kadmin change_password by {ADMIN}")],
+            ),
+            "the record changed between the cpw's prepare and its lock: the change runs again \
+             under the lock and is written with the record prepared once"
+        );
+        drop((embedded, store, raced, host, temp));
+        runtime.block_on(committer.shutdown());
+    }
 }

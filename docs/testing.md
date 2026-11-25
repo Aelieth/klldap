@@ -76,6 +76,10 @@ inside its transaction and a real lldap-cli run. It needs docker, the OpenLDAP c
   `GATE_FIXTURE_DATA`/`GATE_FIXTURE_KDC`/`GATE_FIXTURE_BASE_DN` enable the migration
   boot phase against an existing volume set. The header of `gate/run-gate.sh` is the
   full environment contract.
+- The lldap-cli phase takes the tool from outside this tree: clone
+  [Zepmann/lldap-cli](https://github.com/Zepmann/lldap-cli) somewhere else and set
+  `GATE_LLDAP_CLI` to its `lldap-cli` script or to the checkout; the host needs `curl`,
+  `jq` and `column`, and the phase gives the tool the image's own `lldap_set_password`.
 
 ## The Kerberos end-to-end test
 

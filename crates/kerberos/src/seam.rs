@@ -6444,6 +6444,10 @@ mod tests {
         let sources = [
             ("admission.rs", include_str!("admission.rs")),
             (
+                "admission/tests/code_wire_rows.rs",
+                include_str!("admission/tests/code_wire_rows.rs"),
+            ),
+            (
                 "admission/tests/networks_rows.rs",
                 include_str!("admission/tests/networks_rows.rs"),
             ),

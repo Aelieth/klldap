@@ -19,6 +19,7 @@ use lldap_auth::opaque::{
 use lldap_domain::types::{AttributeName, UserId};
 use lldap_domain_handlers::{
     enforcement::{LoadedZone, load_zone},
+    kdc_code::ARMOR_ASK,
     kdc_proof::ProofSettings,
     kerberos::{domain_from_base_dn, realm_from},
     mfa::MfaPolicy,
@@ -279,6 +280,10 @@ fn seconds(name: &str, value: &str) -> Result<u64> {
         Ok(Ok(0)) if name == "ticket_lifetime" => {
             bail!("kerberos_options.{name} = {value:?} is refused: zero means no limit to the KDC")
         }
+        Ok(Ok(short)) if name == "ticket_lifetime" && short <= ARMOR_ASK.unsigned_abs() => bail!(
+            "kerberos_options.{name} = {value:?} is refused: a ticket of ten minutes or less is \
+             the armor ticket of a code at kinit; set more than \"10m\""
+        ),
         Ok(Ok(seconds)) if seconds > 0 => Ok(seconds),
         _ => bail!(
             "kerberos_options.{name} = {value:?} is not a positive Kerberos duration \
@@ -2170,6 +2175,35 @@ mod tests {
                     Ok(())
                 });
             }
+        }
+    }
+
+    #[test]
+    fn test_a_ticket_lifetime_of_ten_minutes_or_less_refuses_the_start() {
+        let short = "is refused: a ticket of ten minutes or less is the armor ticket of a code at \
+                     kinit; set more than \"10m\"";
+        let rows: [(&str, &str, Result<u64, &str>); 7] = [
+            ("env", "10m", Err(short)),
+            ("toml", "600", Err(short)),
+            ("env", "5m", Err(short)),
+            ("toml", "1", Err(short)),
+            ("env", "601", Ok(601)),
+            ("toml", "\"11m\"", Ok(660)),
+            ("env", "0", Err("zero means no limit to the KDC")),
+        ];
+        for (source, raw, expected) in rows {
+            Jail::expect_with(|jail| {
+                put_lifetime(jail, "ticket_lifetime", source, raw)?;
+                let loaded = init(default_run_opts()).and_then(|c| c.kerberos_settings());
+                match (loaded.map(|settings| settings.ticket_lifetime), expected) {
+                    (Ok(got), Ok(want)) => assert_eq!(got, want, "{source} {raw}"),
+                    (Err(e), Err(want)) => {
+                        assert!(e.to_string().contains(want), "{source} {raw}: {e}")
+                    }
+                    (got, _) => panic!("{source} {raw}: unexpected {got:?}"),
+                }
+                Ok(())
+            });
         }
     }
 

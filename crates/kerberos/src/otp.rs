@@ -32,7 +32,7 @@ impl KlldapTotp {
         Self::on(realm, policy_cache(), kdc_codes(), notes(), CODE_WAIT)
     }
 
-    fn on(
+    pub(crate) fn on(
         realm: &str,
         cache: &'static PolicyCache,
         codes: &'static KdcCodes,

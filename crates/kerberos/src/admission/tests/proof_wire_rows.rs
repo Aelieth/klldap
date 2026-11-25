@@ -51,7 +51,7 @@ fn tgs_wire(
     answer(store, &encode(&request).unwrap()).map(drop)
 }
 
-fn renewed(store: &SharedDump, tgt: &IssuedAs, user: &str) -> Asked {
+pub(super) fn renewed(store: &SharedDump, tgt: &IssuedAs, user: &str) -> Asked {
     let options = KdcOptions::forwardable()
         .with_bit(flag_bit::RENEWABLE, true)
         .with_bit(flag_bit::RENEW, true);

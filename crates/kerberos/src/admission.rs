@@ -8,8 +8,11 @@ use krb5_kdc::{KdcPolicy, PolicyAdjustment, Principal, PrincipalRead};
 use krb5_types::{EncTicketPart, HostAddress, KdcReqBody, PrincipalName, err};
 use lldap_domain::types::UserId;
 use lldap_domain_handlers::enforcement::{
-    Attempt, Door, PolicyCache, Refusal, admit_at_kdc_with, item_checks, policy_cache,
+    Attempt, Door, PolicyCache, Refusal, admit_at_kdc_with, door_clock, item_checks, policy_cache,
     record_kdc_row,
+};
+use lldap_domain_handlers::kdc_code::{
+    ARMOR_ASK, ARMOR_LIFE, CODE_INDICATOR, code_asked, factor_changed_at, factor_held,
 };
 use lldap_domain_handlers::kdc_proof::{
     ProofVerdict, kdc_verdict, proof_at_as, proof_at_tgs, proofs_live,
@@ -41,7 +44,13 @@ const NOT_SAID: &str = "refused by the directory";
 const PROOF_CODE: i32 = err::POLICY;
 pub(crate) const PROOF_TEXT: &str = "second factor needed: sign in to the directory with your \
     code (enrol there first if you have none), then run kinit again";
+/// For a user who turned on the code at kinit: both ways.
+pub(crate) const CODE_TEXT: &str = "second factor needed: get a short ticket with kinit -l 5m, \
+    then give your code with kinit -T, or sign in to the directory with your code, then run \
+    kinit again";
 const NO_FRESH_PROOF: &str = "no fresh proof";
+const FACTOR_CHANGED: &str = "factor changed since the code";
+const CODE_REQUIRED: &str = "totp code required";
 
 fn proof_refusal() -> KdcRefusal {
     KdcRefusal {
@@ -51,12 +60,26 @@ fn proof_refusal() -> KdcRefusal {
 }
 
 fn proof_detail(door: Door) -> String {
+    mfa_detail(door, NO_FRESH_PROOF)
+}
+
+fn mfa_detail(door: Door, why: &str) -> String {
     let refusal = Refusal {
         item: ENABLE_MFA,
         door,
         reason: None,
     };
-    format!("{} ({NO_FRESH_PROOF})", refusal.detail())
+    format!("{} ({why})", refusal.detail())
+}
+
+/// The shape kerber-rust's own `refused()` gives a refusal, without a status word.
+fn policy_error(text: &str) -> krb5_kdc::Error {
+    krb5_kdc::Error::Protocol {
+        code: PROOF_CODE,
+        text: Some(text.to_owned()),
+        e_data: None,
+        detail: None,
+    }
 }
 
 /// A renewal, a validation, a service ticket or user-to-user: the user is the one asking.
@@ -79,6 +102,51 @@ fn tgs_door(kind: TgsKind) -> Door {
 
 thread_local! {
     static AS_REFUSAL: RefCell<Option<(String, String)>> = const { RefCell::new(None) };
+    static AS_FACTOR: RefCell<Option<(String, Judged)>> = const { RefCell::new(None) };
+}
+
+/// The second factor's answer after the password, kept for the same request's notice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Judged {
+    /// A short ask of a user who turned on the code at kinit: a ticket good as armor only.
+    Armor,
+    Refused,
+}
+
+/// What a notice moves besides its row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Moves {
+    Failure,
+    /// The password and the code: the count is cleared and the user signed in.
+    BothFactors,
+    /// A ticket on the password: a sign-in, and a clear only for a user with no second factor.
+    Ticket,
+    Nothing,
+}
+
+fn moves(n: &AsNotice, judged: Option<Judged>) -> Moves {
+    match (n.reason, n.mechanism, judged) {
+        (AsReason::PreauthFailed, ..) => Moves::Failure,
+        (AsReason::Issued, _, Some(Judged::Armor)) => Moves::Nothing,
+        (AsReason::Issued, Some(Mechanism::Otp), _) => Moves::BothFactors,
+        (AsReason::Issued, ..) => Moves::Ticket,
+        _ => Moves::Nothing,
+    }
+}
+
+/// The second factor's own row, only with the reason the KDC then gave.
+fn judged_detail(n: &AsNotice, judged: Option<Judged>) -> Option<String> {
+    match (n.reason, judged) {
+        (AsReason::Issued, Some(Judged::Armor)) => {
+            let how = n.mechanism.map(mechanism_name);
+            let how = how.map_or_else(String::new, |how| format!("; {how}"));
+            Some(format!("{CODE_REQUIRED} (armor ticket{how})"))
+        }
+        (AsReason::PolicyRefused, Some(Judged::Refused)) if n.code == PROOF_CODE => {
+            Some(proof_detail(Door::KerberosAs))
+        }
+        _ => None,
+    }
 }
 
 /// The directory's verdict at the KDC, from memory under the store's read guard.
@@ -139,18 +207,20 @@ impl KdcVerdict {
     }
 
     /// Kerberos counts in the directory's one table; an S4U2Self gets no notice, so never counts.
-    fn count(&self, user: &UserId, n: &AsNotice, peer: Option<IpAddr>) {
-        if !self.cache.lockout_live() || !self.lockout.kdc_counts() {
+    fn count(&self, user: &UserId, moved: Moves, peer: Option<IpAddr>) {
+        let live = self.cache.lockout_live() && self.lockout.kdc_counts();
+        if moved == Moves::Nothing || !live {
             return;
         }
         let Some(lock) = self.lockout.kdc_state(self.cache, user) else {
             return;
         };
         let at = lock_clock();
-        let step = match n.reason {
-            AsReason::PreauthFailed => self.lockout.failure(&lock, at),
-            AsReason::Issued => self.lockout.ticket_issued(self.cache, &lock, at),
-            _ => return,
+        let step = match moved {
+            Moves::Failure => self.lockout.failure(&lock, at),
+            Moves::BothFactors => self.lockout.success(&lock, at),
+            Moves::Ticket => self.lockout.ticket_issued(self.cache, &lock, at),
+            Moves::Nothing => return,
         };
         if step.lock_logged {
             let detail = lock_detail(Door::KerberosAs);
@@ -160,9 +230,9 @@ impl KdcVerdict {
         self.lockout.carry_from_kdc(user, step);
     }
 
-    /// A ticket issued at AS is a sign-in for inactivity-days, with its own carry.
-    fn note_issued(&self, user: &UserId, n: &AsNotice) {
-        if n.reason == AsReason::Issued {
+    /// A ticket issued at AS is a sign-in for inactivity-days, with its own carry; armor is not.
+    fn note_issued(&self, user: &UserId, moved: Moves) {
+        if matches!(moved, Moves::BothFactors | Moves::Ticket) {
             self.cache.carry_success_from_kdc(user, lock_clock());
         }
     }
@@ -253,6 +323,7 @@ fn notice_detail(n: &AsNotice, said: Option<&str>) -> String {
 impl HostAdmission for KdcVerdict {
     fn check_as(&self, q: &AsQuestion<'_>) -> Result<(), KdcRefusal> {
         AS_REFUSAL.with(|held| *held.borrow_mut() = None);
+        AS_FACTOR.with(|held| *held.borrow_mut() = None);
         let Some(user) = user_of(q.client, &self.realm) else {
             return Ok(());
         };
@@ -265,6 +336,7 @@ impl HostAdmission for KdcVerdict {
         let (detail, answer) = match self.judge_items(&user, door, peer, q.now) {
             Err(refusal) => (refusal.detail(), REFUSED),
             Ok(()) if q.s4u2self => return Ok(()),
+            Ok(()) if proofs_live(self.cache) && factor_held(self.cache, &user) => return Ok(()),
             Ok(()) => {
                 let verdict = proof_at_as(self.cache, &user, i64::from(q.now), peer);
                 match self.no_fresh_proof(&user, verdict, door) {
@@ -294,6 +366,7 @@ impl HostAdmission for KdcVerdict {
 
     fn as_notice(&self, n: AsNotice) {
         let held = AS_REFUSAL.with(|held| held.borrow_mut().take());
+        let judged = AS_FACTOR.with(|held| held.borrow_mut().take());
         if matches!(
             n.code,
             err::PREAUTH_REQUIRED | err::MORE_PREAUTH_DATA_REQUIRED
@@ -307,15 +380,28 @@ impl HostAdmission for KdcVerdict {
                 .map(|(_, detail)| detail),
             _ => otp_said(&n, peer),
         };
+        let judged = judged
+            .filter(|(client, _)| *client == n.client)
+            .map(|(_, judged)| judged);
         let user = user_of_id(&n.client, &self.realm);
         let target = user.as_ref().map_or(n.client.as_str(), UserId::as_str);
-        let issued = n.reason == AsReason::Issued;
-        let detail = notice_detail(&n, said.as_deref());
+        let moved = moves(&n, judged);
+        let signed_in = matches!(moved, Moves::BothFactors | Moves::Ticket);
+        let detail = judged_detail(&n, judged);
+        let detail = detail.unwrap_or_else(|| notice_detail(&n, said.as_deref()));
         let (kind, proved) = (LogKind::Login, proved(&n));
-        record_kdc_row(user.as_ref(), target, kind, issued, peer, &detail, proved);
+        record_kdc_row(
+            user.as_ref(),
+            target,
+            kind,
+            signed_in,
+            peer,
+            &detail,
+            proved,
+        );
         if let Some(user) = &user {
-            self.count(user, &n, peer);
-            self.note_issued(user, &n);
+            self.count(user, moved, peer);
+            self.note_issued(user, moved);
         }
     }
 
@@ -362,10 +448,26 @@ impl HostAdmission for KdcVerdict {
     }
 }
 
-/// The second factor at TGS: the presented ticket's authentication time lies in a window.
+/// The second factor after the password: the code's mark, an armor ticket, or a window.
 pub(crate) struct SecondFactor {
     realm: String,
     cache: &'static PolicyCache,
+}
+
+/// The code's mark, only when the indicators are the presented ticket's own, not a second one's.
+fn coded(request: &KdcReqBody, indicators: &[String]) -> bool {
+    let second = request.additional_tickets.as_ref();
+    let second = second.is_some_and(|tickets| !tickets.is_empty());
+    !second
+        && indicators
+            .iter()
+            .any(|indicator| indicator == CODE_INDICATOR)
+}
+
+/// An armor ticket's shape: it ends five minutes or less after its issue.
+fn armor_shaped(ticket: &EncTicketPart) -> bool {
+    let issued = i64::from(ticket.authtime.unix_seconds());
+    i64::from(ticket.endtime.unix_seconds()) - issued <= ARMOR_LIFE
 }
 
 impl SecondFactor {
@@ -378,16 +480,55 @@ impl SecondFactor {
         }
     }
 
+    /// A directory user whose principal the KDC owns, while proofs are asked.
+    fn owned(&self, client: &Principal) -> Option<UserId> {
+        if !proofs_live(self.cache) {
+            return None;
+        }
+        user_of(client, &self.realm).filter(|_| client.host_owned())
+    }
+
     /// The ticket's client as the KDC finds it, an alias resolved, owned by the directory.
-    fn owes_a_proof(&self, store: &dyn PrincipalRead, ticket: &EncTicketPart) -> Option<UserId> {
+    fn ticket_user(&self, store: &dyn PrincipalRead, ticket: &EncTicketPart) -> Option<UserId> {
         if !proofs_live(self.cache) || ticket.crealm.as_bytes() != self.realm.as_bytes() {
             return None;
         }
         let client = store.fetch_client(&ticket.cname).ok().flatten()?;
-        let user = user_of(&client, &self.realm).filter(|_| client.host_owned())?;
+        self.owned(&client)
+    }
+
+    /// A ticket-granting ticket of this realm asked for ten minutes or less: `kinit -l 5m`.
+    fn armor_ask(&self, request: &KdcReqBody, server: &Principal, now: i64) -> bool {
+        let till = i64::from(request.till.unix_seconds());
+        let ours = server.realm == self.realm && server.name.is_krbtgt_for(&self.realm);
+        ours && till != 0 && till - now <= ARMOR_ASK
+    }
+
+    /// Why a ticket of a user who owes a proof gets nothing at TGS; `None` when it passes.
+    fn tgs_refusal(
+        &self,
+        request: &KdcReqBody,
+        ticket: &EncTicketPart,
+        indicators: &[String],
+        user: &UserId,
+    ) -> Option<&'static str> {
         let authtime = i64::from(ticket.authtime.unix_seconds());
-        let verdict = kdc_verdict(self.cache, &user, proof_at_tgs(self.cache, &user, authtime));
-        (verdict == ProofVerdict::NoFreshProof).then_some(user)
+        let why = match proof_at_tgs(self.cache, user, authtime) {
+            ProofVerdict::NotAsked => None,
+            _ if coded(request, indicators) => {
+                let changed = factor_changed_at(self.cache, user);
+                changed
+                    .is_some_and(|at| authtime < at)
+                    .then_some(FACTOR_CHANGED)
+            }
+            _ if code_asked(self.cache, user) && armor_shaped(ticket) => Some(NO_FRESH_PROOF),
+            ProofVerdict::Admitted => None,
+            ProofVerdict::NoFreshProof => Some(NO_FRESH_PROOF),
+        };
+        if why.is_some() {
+            self.cache.reread_soon(user);
+        }
+        why
     }
 }
 
@@ -414,22 +555,67 @@ impl KdcPolicy for SecondFactor {
         Ok(PolicyAdjustment::default())
     }
 
-    // `_status` stays unset: a status word would replace the text the client is sent.
-    fn check_tgs_from(
+    // A user with a factor: the code's mark, then a short ask as armor, then a window, else 12.
+    // The row is the notice's, from what is left in `AS_FACTOR`.
+    fn check_as_from(
         &self,
-        _request: &KdcReqBody,
-        store: &dyn PrincipalRead,
-        _server: &Principal,
-        ticket: &EncTicketPart,
-        _indicators: &[String],
+        request: &KdcReqBody,
+        _store: &dyn PrincipalRead,
+        client: &Principal,
+        server: &Principal,
+        indicators: &[String],
         peer: Option<&HostAddress>,
         _status: &mut Option<&'static str>,
     ) -> Result<PolicyAdjustment, krb5_kdc::Error> {
-        let Some(user) = self.owes_a_proof(store, ticket) else {
+        let enrolled = |user: &UserId| factor_held(self.cache, user);
+        let Some(user) = self.owned(client).filter(enrolled) else {
+            return Ok(PolicyAdjustment::default());
+        };
+        let now = door_clock().as_second();
+        let takes_code = code_asked(self.cache, &user);
+        let marked = indicators
+            .iter()
+            .any(|indicator| indicator == CODE_INDICATOR);
+        let judged = match proof_at_as(self.cache, &user, now, peer.and_then(ip_of)) {
+            ProofVerdict::NotAsked => return Ok(PolicyAdjustment::default()),
+            _ if marked => return Ok(PolicyAdjustment::default()),
+            _ if takes_code && self.armor_ask(request, server, now) => Judged::Armor,
+            ProofVerdict::Admitted => return Ok(PolicyAdjustment::default()),
+            ProofVerdict::NoFreshProof => Judged::Refused,
+        };
+        AS_FACTOR.with(|held| *held.borrow_mut() = Some((client.id(), judged)));
+        if judged == Judged::Armor {
+            return Ok(PolicyAdjustment {
+                lifetime: ARMOR_LIFE,
+                renew_lifetime: ARMOR_LIFE,
+            });
+        }
+        self.cache.reread_soon(&user);
+        Err(policy_error(match takes_code {
+            true => CODE_TEXT,
+            false => PROOF_TEXT,
+        }))
+    }
+
+    // `_status` stays unset: a status word would replace the text the client is sent.
+    fn check_tgs_from(
+        &self,
+        request: &KdcReqBody,
+        store: &dyn PrincipalRead,
+        _server: &Principal,
+        ticket: &EncTicketPart,
+        indicators: &[String],
+        peer: Option<&HostAddress>,
+        _status: &mut Option<&'static str>,
+    ) -> Result<PolicyAdjustment, krb5_kdc::Error> {
+        let Some(user) = self.ticket_user(store, ticket) else {
+            return Ok(PolicyAdjustment::default());
+        };
+        let Some(why) = self.tgs_refusal(request, ticket, indicators, &user) else {
             return Ok(PolicyAdjustment::default());
         };
         let (door, peer) = (Door::KerberosTgs, peer.and_then(ip_of));
-        let detail = proof_detail(door);
+        let detail = mfa_detail(door, why);
         record_kdc_row(
             Some(&user),
             user.as_str(),
@@ -439,13 +625,7 @@ impl KdcPolicy for SecondFactor {
             &detail,
             false,
         );
-        let refusal = proof_refusal();
-        Err(krb5_kdc::Error::Protocol {
-            code: refusal.code,
-            text: refusal.e_text,
-            e_data: None,
-            detail: None,
-        })
+        Err(policy_error(PROOF_TEXT))
     }
 }
 
@@ -465,7 +645,7 @@ pub(crate) mod tests {
         TgsReqParams, armor_key, attach_fast, build_fast_armor, fx_fast_padata_over, tgs_req_ex,
         unwrap_fast_rep,
     };
-    use krb5_types::{KdcOptions, KrbError, MethodData, TgsRep, ascii, pa};
+    use krb5_types::{KdcOptions, KerberosTime, KrbError, MethodData, TgsRep, Ticket, ascii, pa};
     use lldap_auth::opaque::server::generate_random_private_key;
     use lldap_domain::requests::CreateUserRequest;
     use lldap_domain::types::Attribute;
@@ -499,6 +679,7 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
 
+    mod code_wire_rows;
     mod networks_rows;
     mod proof_wire_rows;
 
@@ -1860,10 +2041,19 @@ pub(crate) mod tests {
 
     impl Proving {
         async fn enrol(&self, user: &str) {
-            let sql = format!("UPDATE users SET mfa_type = 'totp' WHERE user_id = '{user}'");
-            let enrolled = Statement::from_string(DbBackend::Sqlite, sql);
-            self.pool.execute(enrolled).await.unwrap();
+            self.update(user, "mfa_type = 'totp'").await;
+        }
+
+        async fn update(&self, user: &str, set: &str) {
+            let sql = format!("UPDATE users SET {set} WHERE user_id = '{user}'");
+            let changed = Statement::from_string(DbBackend::Sqlite, sql);
+            self.pool.execute(changed).await.unwrap();
             fill_policy_cache(&self.handler, self.cache).await.unwrap();
+        }
+
+        async fn take_code(&self, user: &str) {
+            self.update(user, "mfa_type = 'totp', code_at_kinit = true")
+                .await;
         }
 
         /// A directory door's proof, made from `from`.
@@ -2162,6 +2352,751 @@ pub(crate) mod tests {
         })
     }
 
+    const ASKED_AT: u32 = 1_700_000_000;
+
+    type Judgement = (Result<PolicyAdjustment, Said>, Option<Judged>);
+
+    /// The second factor's answer after the password, and what it leaves for the notice.
+    fn as_factor(
+        at: &Proving,
+        store: &SharedDump,
+        client: &PrincipalName,
+        server: &PrincipalName,
+        till: u32,
+        marked: bool,
+        from: Option<&str>,
+    ) -> Judgement {
+        let guard = store.read().unwrap();
+        let client = guard.fetch_name(client).unwrap().unwrap();
+        let server = guard.fetch_name(server).unwrap().unwrap();
+        let mut request = tgs_body(&ticket(REALM, "e8aunused"));
+        request.till = KerberosTime::from_unix_seconds(till);
+        let indicators: Vec<String> = marked
+            .then(|| CODE_INDICATOR.to_owned())
+            .into_iter()
+            .collect();
+        let sender = from.map(|ip| HostAddress::from_socket(format!("{ip}:88").parse().unwrap()));
+        AS_FACTOR.with(|held| *held.borrow_mut() = None);
+        let mut status = None;
+        let answer = at.factor.check_as_from(
+            &request,
+            &*guard,
+            &client,
+            &server,
+            &indicators,
+            sender.as_ref(),
+            &mut status,
+        );
+        let answer = answer.map_err(|e| match e {
+            krb5_kdc::Error::Protocol { code, text, .. } if status.is_none() => (code, text),
+            e => panic!("unexpected {e:?}, status {status:?}"),
+        });
+        let judged = AS_FACTOR.with(|held| held.borrow_mut().take());
+        (answer, judged.map(|(_, judged)| judged))
+    }
+
+    /// The directory's verdict before the password, then the second factor after it.
+    fn as_judged(at: &Proving, store: &SharedDump, user: &str) -> Result<(), i32> {
+        as_asks_of(&at.verdict, store, user, false)?;
+        let krbtgt = PrincipalName::krbtgt(REALM);
+        let till = 2_000_000_000;
+        let (answer, _) = as_factor(at, store, &name(user), &krbtgt, till, false, Some(PEER));
+        answer.map(drop).map_err(|(code, _)| code)
+    }
+
+    /// The second factor at TGS on a ticket of `user` issued at `ASKED_AT`, `life` seconds long.
+    fn tgs_factor(
+        at: &Proving,
+        store: &SharedDump,
+        user: &str,
+        life: u32,
+        marked: bool,
+        second: Option<&Ticket>,
+    ) -> Result<(), i32> {
+        let mut issued = ticket(REALM, user);
+        issued.endtime = KerberosTime::from_unix_seconds(ASKED_AT + life);
+        let mut request = tgs_body(&issued);
+        request.additional_tickets = second.map(|second| vec![second.clone()]);
+        let indicators: Vec<String> = marked
+            .then(|| CODE_INDICATOR.to_owned())
+            .into_iter()
+            .collect();
+        let guard = store.read().unwrap();
+        let krbtgt = PrincipalName::krbtgt(REALM);
+        let server = guard.fetch_name(&krbtgt).unwrap().unwrap();
+        let mut status = None;
+        let asked = at.factor.check_tgs_from(
+            &request,
+            &*guard,
+            &server,
+            &issued,
+            &indicators,
+            None,
+            &mut status,
+        );
+        asked.map(drop).map_err(|e| match e {
+            krb5_kdc::Error::Protocol { code, text, .. }
+                if status.is_none() && text.as_deref() == Some(PROOF_TEXT) =>
+            {
+                code
+            }
+            e => panic!("unexpected {e:?}, status {status:?}"),
+        })
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_after_the_password_the_codes_mark_a_short_ask_as_armor_or_a_window_else_12() {
+        let (code, code_win, plain, plain_win, bare) = (
+            "e8acode",
+            "e8acodewin",
+            "e8aplain",
+            "e8aplainwin",
+            "e8abare",
+        );
+        let users = [code, code_win, plain, plain_win, bare];
+        let (temp, _embedded, store) = realm(&users).await;
+        let svc = service(&temp, &store);
+        let at = proving(&store, &users, "e8aou", Some(MfaPolicy::Enrolled), true).await;
+        for user in [code, code_win] {
+            at.take_code(user).await;
+        }
+        for user in [plain, plain_win] {
+            at.enrol(user).await;
+        }
+        let opened = i64::from(ASKED_AT);
+        for user in [code_win, plain_win] {
+            assert!(at.prove(user, opened, PEER).await, "{user}: stored");
+        }
+        let clock = EnforcementGuard::default_checks();
+        clock.pin_clock(Timestamp::from_second(opened).unwrap());
+        let [code, code_win, plain, plain_win, bare] = users.map(name);
+        let krbtgt = PrincipalName::krbtgt(REALM);
+        let full: Judgement = (Ok(PolicyAdjustment::default()), None);
+        let adjusted = PolicyAdjustment {
+            lifetime: ARMOR_LIFE,
+            renew_lifetime: ARMOR_LIFE,
+        };
+        let armored: Judgement = (Ok(adjusted), Some(Judged::Armor));
+        let refused = |text: &str| -> Judgement {
+            let said = (PROOF_CODE, Some(text.to_owned()));
+            (Err(said), Some(Judged::Refused))
+        };
+        let (both_ways, window_way) = (refused(CODE_TEXT), refused(PROOF_TEXT));
+        let elsewhere = "198.51.100.9";
+        type Row<'a> = (
+            &'a str,
+            &'a PrincipalName,
+            u32,
+            bool,
+            bool,
+            &'a str,
+            Judgement,
+        );
+        let rows: [Row; 21] = [
+            (
+                "code: 5 min",
+                &code,
+                300,
+                true,
+                false,
+                PEER,
+                armored.clone(),
+            ),
+            (
+                "code: 10 min",
+                &code,
+                600,
+                true,
+                false,
+                PEER,
+                armored.clone(),
+            ),
+            (
+                "code: 10 min and 1 s",
+                &code,
+                601,
+                true,
+                false,
+                PEER,
+                both_ways.clone(),
+            ),
+            (
+                "code: a day",
+                &code,
+                86_400,
+                true,
+                false,
+                PEER,
+                both_ways.clone(),
+            ),
+            (
+                "code: no end asked",
+                &code,
+                0,
+                true,
+                false,
+                PEER,
+                both_ways.clone(),
+            ),
+            (
+                "code: 5 min of a service",
+                &code,
+                300,
+                false,
+                false,
+                PEER,
+                both_ways.clone(),
+            ),
+            (
+                "code: a day, the code's mark",
+                &code,
+                86_400,
+                true,
+                true,
+                PEER,
+                full.clone(),
+            ),
+            (
+                "code: 5 min, the code's mark",
+                &code,
+                300,
+                true,
+                true,
+                PEER,
+                full.clone(),
+            ),
+            (
+                "code, a window: a day",
+                &code_win,
+                86_400,
+                true,
+                false,
+                PEER,
+                full.clone(),
+            ),
+            (
+                "code, a window: 5 min",
+                &code_win,
+                300,
+                true,
+                false,
+                PEER,
+                armored.clone(),
+            ),
+            (
+                "code, a window from another address: a day",
+                &code_win,
+                86_400,
+                true,
+                false,
+                elsewhere,
+                both_ways.clone(),
+            ),
+            (
+                "code, a window from another address: 5 min",
+                &code_win,
+                300,
+                true,
+                false,
+                elsewhere,
+                armored.clone(),
+            ),
+            (
+                "no code: a day",
+                &plain,
+                86_400,
+                true,
+                false,
+                PEER,
+                window_way.clone(),
+            ),
+            (
+                "no code: 5 min",
+                &plain,
+                300,
+                true,
+                false,
+                PEER,
+                window_way.clone(),
+            ),
+            (
+                "no code: the code's mark",
+                &plain,
+                86_400,
+                true,
+                true,
+                PEER,
+                full.clone(),
+            ),
+            (
+                "no code, a window: a day",
+                &plain_win,
+                86_400,
+                true,
+                false,
+                PEER,
+                full.clone(),
+            ),
+            (
+                "no code, a window: 5 min",
+                &plain_win,
+                300,
+                true,
+                false,
+                PEER,
+                full.clone(),
+            ),
+            (
+                "no code, a window from another address",
+                &plain_win,
+                86_400,
+                true,
+                false,
+                elsewhere,
+                window_way.clone(),
+            ),
+            (
+                "no factor: a day",
+                &bare,
+                86_400,
+                true,
+                false,
+                PEER,
+                full.clone(),
+            ),
+            (
+                "no factor: 5 min",
+                &bare,
+                300,
+                true,
+                false,
+                PEER,
+                full.clone(),
+            ),
+            (
+                "a service as the client",
+                &svc.name,
+                300,
+                true,
+                false,
+                PEER,
+                full.clone(),
+            ),
+        ];
+        for (label, client, life, to_krbtgt, marked, from, expected) in rows {
+            let till = match life {
+                0 => 0,
+                life => ASKED_AT + life,
+            };
+            let server = if to_krbtgt { &krbtgt } else { &svc.name };
+            let got = as_factor(&at, &store, client, server, till, marked, Some(from));
+            assert_eq!(got, expected, "{label}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_at_tgs_the_codes_mark_holds_until_the_factor_changes_and_armor_never_passes() {
+        let (code, code_win, code_late, plain, plain_win) = (
+            "e8tcode",
+            "e8tcodewin",
+            "e8tcodelate",
+            "e8tplain",
+            "e8tplainwin",
+        );
+        let users = [code, code_win, code_late, plain, plain_win];
+        let (temp, _embedded, store) = realm(&users).await;
+        let svc = service(&temp, &store);
+        let at = proving(&store, &users, "e8tou", Some(MfaPolicy::Enrolled), false).await;
+        for user in [code, code_win, code_late] {
+            at.take_code(user).await;
+        }
+        for user in [plain, plain_win] {
+            at.enrol(user).await;
+        }
+        let issued = i64::from(ASKED_AT);
+        for (user, opened) in [
+            (code_win, issued),
+            (code_late, issued + 30),
+            (plain_win, issued),
+        ] {
+            assert!(at.prove(user, opened, "").await, "{user}: stored");
+        }
+        let u2u = Some(&svc.tgt.rep.0.ticket);
+        let (day, short) = (86_400, 300);
+        let refused: Result<(), i32> = Err(PROOF_CODE);
+        type Row<'a> = (
+            &'a str,
+            &'a str,
+            u32,
+            bool,
+            Option<&'a Ticket>,
+            Result<(), i32>,
+        );
+        let rows: [Row; 12] = [
+            ("the code's mark", code, day, true, None, Ok(())),
+            (
+                "the code's mark, a short ticket",
+                code,
+                short,
+                true,
+                None,
+                Ok(()),
+            ),
+            ("no mark, no window", code, day, false, None, refused),
+            (
+                "an armor ticket, no window",
+                code,
+                short,
+                false,
+                None,
+                refused,
+            ),
+            ("a window", code_win, day, false, None, Ok(())),
+            (
+                "an armor ticket inside a window",
+                code_win,
+                short,
+                false,
+                None,
+                refused,
+            ),
+            (
+                "an armor ticket 30 s before a window",
+                code_late,
+                short,
+                false,
+                None,
+                refused,
+            ),
+            (
+                "a ticket 30 s before a window",
+                code_late,
+                day,
+                false,
+                None,
+                Ok(()),
+            ),
+            (
+                "no code at kinit, a window: a short ticket",
+                plain_win,
+                short,
+                false,
+                None,
+                Ok(()),
+            ),
+            (
+                "no code at kinit, no window: a short ticket",
+                plain,
+                short,
+                false,
+                None,
+                refused,
+            ),
+            (
+                "an armor ticket, a second ticket's mark",
+                code,
+                short,
+                true,
+                u2u,
+                refused,
+            ),
+            (
+                "a window, a second ticket's mark",
+                code_win,
+                day,
+                true,
+                u2u,
+                Ok(()),
+            ),
+        ];
+        let log = LogGuard::install_on_this_thread();
+        let no_proof = proof_detail(Door::KerberosTgs);
+        let mut denied = Vec::new();
+        for (label, user, life, marked, second, expected) in rows {
+            let got = tgs_factor(&at, &store, user, life, marked, second);
+            assert_eq!(got, expected, "{label}");
+            if expected.is_err() {
+                denied.push(row(LogKind::AccessDenied, false, user, &no_proof));
+            }
+        }
+        assert_eq!(
+            kdc_rows(&log),
+            denied,
+            "one access_denied row for each refusal"
+        );
+        let changes = [
+            ("never changed", "NULL", Ok(())),
+            ("changed before the ticket", "1699999990", Ok(())),
+            ("changed in the ticket's second", "1700000000", Ok(())),
+            ("changed after the ticket", "1700000010", refused),
+        ];
+        let mut seen = Vec::new();
+        for (label, changed_at, _) in changes {
+            at.update(code, &format!("mfa_changed_at = {changed_at}"))
+                .await;
+            seen.push((label, tgs_factor(&at, &store, code, day, true, None)));
+        }
+        let changed = mfa_detail(Door::KerberosTgs, FACTOR_CHANGED);
+        assert_eq!(
+            (seen, kdc_rows(&log)),
+            (
+                changes
+                    .map(|(label, _, expected)| (label, expected))
+                    .to_vec(),
+                vec![row(LogKind::AccessDenied, false, code, &changed)]
+            ),
+            "a ticket with the code's mark from before the factor's last change is refused; a \
+             change in the same second cannot be told apart"
+        );
+        at.update(code_win, "code_at_kinit = false").await;
+        at.update(code, "code_at_kinit = false, mfa_changed_at = NULL")
+            .await;
+        let turned_off =
+            [code_win, code].map(|user| tgs_factor(&at, &store, user, short, false, None));
+        assert_eq!(
+            turned_off,
+            [Ok(()), refused],
+            "turned off while holding an armor ticket: option D again, a window that covers its \
+             time admits it and none refuses it"
+        );
+    }
+
+    /// The row's success and detail, the row's mark of a passed pre-authentication, and the moves.
+    type Noticed<'a> = (bool, &'a str, bool, Moves);
+    type NoticeRow<'a> = (
+        &'a str,
+        AsNotice,
+        Option<(&'a str, Judged)>,
+        Option<(crate::otp::Outcome, &'a str)>,
+        Option<&'a str>,
+        Noticed<'a>,
+    );
+
+    #[test]
+    #[serial]
+    fn test_each_kerberos_outcome_is_one_row_and_moves_only_what_it_proves() {
+        use crate::otp::Outcome::{Errored, Rejected};
+        use crate::otp::tests::note;
+        let log = LogGuard::install_on_this_thread();
+        let verdict = KdcVerdict::new(REALM);
+        let user = "e8nrow";
+        let client = format!("{user}@{REALM}");
+        let other = format!("e8nother@{REALM}");
+        let from = ip_of(&peer());
+        let notice = |reason, code, mechanism| AsNotice {
+            client: client.clone(),
+            requested: client.clone(),
+            peer: Some(peer()),
+            time: ASKED_AT,
+            code,
+            reason,
+            mechanism,
+        };
+        let (enc, otp) = (Some(Mechanism::EncTimestamp), Some(Mechanism::Otp));
+        let failed = err::PREAUTH_FAILED;
+        let no_proof = proof_detail(Door::KerberosAs);
+        let foreign = format!("armor is not the user's own ticket: host/ws.example.com@{REALM}");
+        let foreign_row = format!("{foreign} (OTP)");
+        let mine = client.as_str();
+        let rows: [NoticeRow; 17] = [
+            (
+                "1: a short password ticket",
+                notice(AsReason::Issued, 0, enc),
+                Some((mine, Judged::Armor)),
+                None,
+                None,
+                (
+                    false,
+                    "totp code required (armor ticket; encrypted timestamp)",
+                    true,
+                    Moves::Nothing,
+                ),
+            ),
+            (
+                "2: the right password, no window",
+                notice(AsReason::PolicyRefused, PROOF_CODE, enc),
+                Some((mine, Judged::Refused)),
+                None,
+                None,
+                (false, no_proof.as_str(), true, Moves::Nothing),
+            ),
+            (
+                "3: a wrong password",
+                notice(AsReason::PreauthFailed, failed, enc),
+                None,
+                None,
+                None,
+                (
+                    false,
+                    "pre-authentication failed (encrypted timestamp)",
+                    false,
+                    Moves::Failure,
+                ),
+            ),
+            (
+                "4: a wrong code",
+                notice(AsReason::PreauthFailed, failed, otp),
+                None,
+                Some((Rejected, "invalid totp")),
+                None,
+                (false, "invalid totp (OTP)", false, Moves::Failure),
+            ),
+            (
+                "5: a used code",
+                notice(AsReason::PreauthNotCompleted, failed, otp),
+                None,
+                Some((Errored, "totp replayed")),
+                None,
+                (false, "totp replayed (OTP)", false, Moves::Nothing),
+            ),
+            (
+                "6: the step's attempts spent",
+                notice(AsReason::PreauthNotCompleted, failed, otp),
+                None,
+                Some((Errored, "totp attempts exceeded")),
+                None,
+                (false, "totp attempts exceeded (OTP)", false, Moves::Nothing),
+            ),
+            (
+                "7: another's armor",
+                notice(AsReason::PreauthNotCompleted, failed, otp),
+                None,
+                Some((Errored, foreign.as_str())),
+                None,
+                (false, foreign_row.as_str(), false, Moves::Nothing),
+            ),
+            (
+                "8: not six digits",
+                notice(AsReason::PreauthNotCompleted, failed, otp),
+                None,
+                Some((Errored, "no six-digit code")),
+                None,
+                (false, "no six-digit code (OTP)", false, Moves::Nothing),
+            ),
+            (
+                "9: no code asked",
+                notice(AsReason::PreauthNotCompleted, failed, otp),
+                None,
+                Some((Errored, "no second factor asked")),
+                None,
+                (false, "no second factor asked (OTP)", false, Moves::Nothing),
+            ),
+            (
+                "10: the database silent",
+                notice(AsReason::PreauthNotCompleted, failed, otp),
+                None,
+                Some((Errored, "totp: unreadable")),
+                None,
+                (false, "totp: unreadable (OTP)", false, Moves::Nothing),
+            ),
+            (
+                "10: past kerber-rust's deadline",
+                notice(AsReason::PreauthNotCompleted, failed, otp),
+                None,
+                None,
+                None,
+                (
+                    false,
+                    "pre-authentication not completed (OTP)",
+                    false,
+                    Moves::Nothing,
+                ),
+            ),
+            (
+                "11: a locked user",
+                notice(AsReason::HostRefused, err::CLIENT_REVOKED, None),
+                None,
+                None,
+                Some("locked out"),
+                (false, "locked out", false, Moves::Nothing),
+            ),
+            (
+                "12: the right code",
+                notice(AsReason::Issued, 0, otp),
+                None,
+                None,
+                None,
+                (true, "ticket issued (OTP)", true, Moves::BothFactors),
+            ),
+            (
+                "a ticket inside a window",
+                notice(AsReason::Issued, 0, enc),
+                None,
+                None,
+                None,
+                (
+                    true,
+                    "ticket issued (encrypted timestamp)",
+                    true,
+                    Moves::Ticket,
+                ),
+            ),
+            (
+                "14: always, no factor, before the password",
+                notice(AsReason::HostRefused, PROOF_CODE, None),
+                None,
+                None,
+                Some(no_proof.as_str()),
+                (false, no_proof.as_str(), false, Moves::Nothing),
+            ),
+            (
+                "armor, then refused by the live-client check",
+                notice(AsReason::PolicyRefused, err::CLIENT_REVOKED, enc),
+                Some((mine, Judged::Armor)),
+                None,
+                None,
+                (
+                    false,
+                    "refused after pre-authentication, code 18 (encrypted timestamp)",
+                    true,
+                    Moves::Nothing,
+                ),
+            ),
+            (
+                "the second factor's answer for another client",
+                notice(AsReason::Issued, 0, enc),
+                Some((other.as_str(), Judged::Armor)),
+                None,
+                None,
+                (
+                    true,
+                    "ticket issued (encrypted timestamp)",
+                    true,
+                    Moves::Ticket,
+                ),
+            ),
+        ];
+        for (label, n, left, noted, refusal, (success, detail, passed, moved)) in rows {
+            let left = left.map(|(who, judged)| (who.to_owned(), judged));
+            let judged = left
+                .clone()
+                .filter(|(who, _)| *who == client)
+                .map(|(_, j)| j);
+            AS_FACTOR.with(|held| *held.borrow_mut() = left);
+            let refused = refusal.map(|detail| (client.clone(), detail.to_owned()));
+            AS_REFUSAL.with(|held| *held.borrow_mut() = refused);
+            if let Some((outcome, reason)) = noted {
+                notes().put(client.clone(), note(outcome, from, reason));
+            }
+            let moved_here = moves(&n, judged);
+            verdict.as_notice(n);
+            let events = log.recorder().take_events();
+            let marks: Vec<_> = events.iter().map(|e| e.proved).collect();
+            let rows: Vec<KdcRow> = events
+                .into_iter()
+                .map(|e| (e.kind, e.success, e.target, e.peer, e.detail))
+                .collect();
+            let expected = vec![peered(row(LogKind::Login, success, user, detail))];
+            assert_eq!(
+                (rows, marks, moved_here),
+                (expected, vec![passed], moved),
+                "{label}: one row, whether the password was proved before it, and what it moves"
+            );
+        }
+    }
+
     #[tokio::test]
     #[serial]
     async fn test_at_tgs_a_users_own_ticket_is_judged_by_its_authtime_whatever_the_kind() {
@@ -2239,9 +3174,11 @@ pub(crate) mod tests {
         let id = at.handler.create_policy(request).await.unwrap();
         at.handler.set_ou_policy("e2kafterou", id).await.unwrap();
         at.enrol(user).await;
+        let clock = EnforcementGuard::default_checks();
+        clock.pin_clock(Timestamp::from_second(1_700_000_000).unwrap());
         let asked = || {
             let renewal = tgs_judged(&at, &store, user, &name(user), TgsKind::Renew);
-            (as_asks_of(&at.verdict, &store, user, false), renewal)
+            (as_judged(&at, &store, user), renewal)
         };
         let before = asked();
         let change = UpdatePolicyRequest {

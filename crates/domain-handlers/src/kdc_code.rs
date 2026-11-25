@@ -14,6 +14,12 @@ pub const NOT_ASKED: &str = "no second factor asked";
 /// The principal's string that makes the KDC offer the code; it holds no secret.
 pub const CODE_KEY: &str = "otp";
 pub const CODE_OFFER: &str = r#"[{"type":"klldap-totp","indicators":["mfa"]}]"#;
+/// The authentication indicator an accepted code puts in the ticket.
+pub const CODE_INDICATOR: &str = "mfa";
+/// A ticket asked for this many seconds or fewer is the armor ticket of a user who takes the code.
+pub const ARMOR_ASK: i64 = 600;
+/// The armor ticket's life: a ticket that ends this soon after its issue is armor.
+pub const ARMOR_LIFE: i64 = 300;
 
 /// Exactly six ASCII digits, borrowed from the KDC's request: nothing else is ever read.
 pub struct KdcCode<'a>(&'a str);
@@ -61,6 +67,14 @@ pub async fn check_code(store: &dyn KdcCodeStore, user: &UserId, value: &[u8]) -
 /// When the user's factor last changed, from memory: no ticket with `mfa` from before it holds.
 pub fn factor_changed_at(cache: &PolicyCache, user: &UserId) -> Option<i64> {
     cache.get().facts_of(user)?.mfa_changed_at
+}
+
+/// From memory: the user holds a confirmed factor, so the KDC judges it after the password.
+pub fn factor_held(cache: &PolicyCache, user: &UserId) -> bool {
+    cache
+        .get()
+        .facts_of(user)
+        .is_some_and(|facts| facts.enrolled)
 }
 
 /// From memory: a factor, a resolved value that asks it, not exempt, and the user's own choice.
@@ -264,6 +278,31 @@ mod tests {
             ),
             (None, Some(1_770_000_015), None),
             "none kept yet; the change; a user the memory lacks"
+        );
+    }
+
+    #[test]
+    fn test_the_kdc_reads_a_held_factor_from_memory_and_an_armor_ask_is_short() {
+        type Facts = Option<(bool, bool, bool)>;
+        let rows: [(&str, Facts, bool); 4] = [
+            ("a factor", Some((true, false, false)), true),
+            ("a factor, exempt", Some((true, true, false)), true),
+            (
+                "no factor, the choice left on",
+                Some((false, false, true)),
+                false,
+            ),
+            ("a user the memory lacks", None, false),
+        ];
+        for (label, facts, held) in rows {
+            let cache = holding(Some(MfaPolicy::Enrolled), facts);
+            assert_eq!(factor_held(&cache, &UserId::new("e8kask")), held, "{label}");
+        }
+        let marked = format!(r#""indicators":["{CODE_INDICATOR}"]"#);
+        assert_eq!(
+            (CODE_OFFER.contains(&marked), ARMOR_LIFE, ARMOR_ASK),
+            (true, 300, 600),
+            "the offer's indicator is the one the KDC trusts; five minutes, asked as ten or less"
         );
     }
 

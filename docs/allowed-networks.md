@@ -31,7 +31,8 @@ everyone or no one: check `clientAddress` (shown on the policies page) before yo
   and the answer is byte for byte a wrong password's (LDAP 49 and the HTTP 401 body of a wrong
   password). The web login judges it when the sign-in starts, and a refused user's sign-in fails
   as a wrong password's does. For a user with a second factor it also comes before the code is asked
-  for. So nobody learns a user's list there without that user's password. Kerberos refuses before
+  for. At the bind and `/auth/simple/login` nobody learns a user's list without that user's
+  password; a refusal at any door counts nothing toward the lockout. Kerberos refuses before
   the password is checked, with code 18 and no text, as for every policy refusal: kinit prints
   "Client's credentials have been revoked", and a request for a user's name shows whether some
   directory policy refuses that user. The reason is in the log row only: `policy: allowed-networks

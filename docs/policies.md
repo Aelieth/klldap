@@ -373,7 +373,8 @@ for (and again with the code), so nobody learns a user's hours there without the
 password, and a refusal answers byte for byte as a wrong password does: LDAP 49 and
 `/auth/simple/login` 401 with the same body. The web login judges it when the sign-in starts,
 before a code or an enrolment is asked for, and a refused user's sign-in fails as a wrong
-password's does; there too nobody learns a user's hours without the user's password. At the KDC it
+password's does. The lockout counts only wrong passwords and wrong codes, at every door, whatever
+a policy says: a refusal by this item or any other counts nothing ([Lockout](#lockout)). At the KDC it
 is judged before any password, as the lockout is: kinit, a renewal or a service ticket outside the
 hours gets error 18 (`CLIENT_REVOKED`), which `kinit` shows as *Client's credentials have been
 revoked* for any policy refusal. Anyone can ask the KDC for a user's ticket without a password, so
@@ -451,7 +452,7 @@ byte the answer to a wrong password (LDAP 49 and the HTTP 401 body of a wrong pa
 comes only after the password was right and before a code or an enrolment is asked for (and
 again with the code), so nobody learns a user's state there without their password. The web
 login judges it when the sign-in starts, and a refused user's sign-in fails as
-a wrong password's does; there too nobody learns a user's state without their password. Kerberos
+a wrong password's does, but counts nothing ([Lockout](#lockout)). Kerberos
 refuses before the password is checked, with code 18 and no text, as for every policy refusal: kinit
 prints "Client's credentials have been revoked", and a request for a user's name shows whether some
 directory policy refuses that user ([kerberos.md](kerberos.md#inactivity-and-kinit)). The reason is

@@ -4,8 +4,8 @@ on:
   schedule:
     - cron: "0 15 * * 1"
   push:
-    # 0.8.1 is the current development line; drop it when this tree lands on main.
-    branches: [ 0.8.1 ]
+    # 0.8.1 and 0.8.2 are the development lines; drop them when this tree lands on main.
+    branches: [ 0.8.1, 0.8.2 ]
     tags:
       - "v*"
     paths:

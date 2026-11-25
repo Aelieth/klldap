@@ -1,7 +1,7 @@
 use crate::enforcement::{
-    Attempt, Door, INACTIVITY_DAYS, ItemCheck, POLICY_REFILL, PolicyCache, UserState,
-    cached_mfa_policy, door_clock, ensure_exempt_group, fill_policy_cache, follow_items,
-    follow_mfa_item, item_checks, resolve_items,
+    Attempt, Door, INACTIVITY_DAYS, ItemCheck, POLICY_REFILL, PolicyCache, UserState, bounded,
+    cached_mfa_policy, door_clock, door_read, ensure_exempt_group, fill_policy_cache, follow_items,
+    follow_mfa_item, gave_up, item_checks, resolve_items,
 };
 use crate::handler::{
     GroupBackendHandler, GroupListerBackendHandler, PolicyBackendHandler, UserBackendHandler,
@@ -11,7 +11,7 @@ use crate::inactivity::follow_recording;
 use crate::instant::{self, SignedDuration, Timestamp};
 use crate::logging::{self, LogKind};
 use crate::networks::warn_unreadable;
-use crate::policies::{EffectiveItem, Policy, catalog_item};
+use crate::policies::{EffectiveItem, POLICY_READ_WAIT, Policy, catalog_item};
 use async_trait::async_trait;
 use lldap_domain::types::{UserId, Uuid};
 use lldap_domain_model::error::{DomainError, Result};
@@ -828,7 +828,7 @@ impl Lockout {
             book.changes
         };
         if policy.threshold > 0 && self.book().needs_read(user) {
-            let stored = handler.read_lock(user).await?;
+            let stored = door_read(handler.read_lock(user)).await?;
             let mut book = self.book();
             let fresh = book.needs_read(user) && book.unchanged_since(user, since);
             let tick = book.tick();
@@ -880,7 +880,7 @@ impl Lockout {
             lockout: self,
             user,
         };
-        let stored = store.read_lock(user).await?;
+        let stored = door_read(store.read_lock(user)).await?;
         let mut book = self.book();
         let tick = book.tick();
         let Some((entry, table)) = book.entries.get_mut(user).zip(stored) else {
@@ -1165,7 +1165,7 @@ impl Lockout {
         if !writes.is_empty() {
             let period = self.period();
             let batch: Vec<LockWrite> = writes.iter().map(|(write, _)| write.clone()).collect();
-            let written = store.write_locks(&period, &batch).await;
+            let written = bounded(POLICY_READ_WAIT, store.write_locks(&period, &batch)).await;
             self.note(&written, &again.users);
             let Ok(written) = written else {
                 again.after = RETRY_AFTER;
@@ -1244,12 +1244,16 @@ impl Lockout {
             users.iter().filter(expired).cloned().collect()
         };
         let mut unread = Vec::new();
-        for user in expiring {
-            let split = match store.read_split(&user).await {
+        let mut expiring = expiring.into_iter();
+        while let Some(user) = expiring.next() {
+            let split = match door_read(store.read_split(&user)).await {
                 Ok(split) => split,
                 Err(e) => {
                     warn!("The starts of {user} were not folded: {e}");
                     unread.push(user);
+                    if gave_up(&e) {
+                        unread.extend(expiring.by_ref());
+                    }
                     continue;
                 }
             };
@@ -1376,7 +1380,10 @@ impl Lockout {
             };
             (book.changes, since_at)
         };
-        let rows = store.read_locks(since_at).await?;
+        let rows = match since_at {
+            Some(_) => bounded(POLICY_READ_WAIT, store.read_locks(since_at)).await?,
+            None => store.read_locks(since_at).await?,
+        };
         let present: HashSet<UserId> = match all {
             true => rows.iter().map(|(user, _, _)| user.clone()).collect(),
             false => store.read_lock_users().await?.into_iter().collect(),
@@ -1432,14 +1439,14 @@ impl Lockout {
             + ?Sized,
     {
         let _following = self.following.lock().await;
-        let policies = handler.list_policies().await?;
+        let policies = bounded(POLICY_READ_WAIT, handler.list_policies()).await?;
         let mfa = follow_mfa_item(handler, cache, &policies).await;
         let lockout = self.follow_threshold(handler, cache, &policies).await;
         let recorded = follow_recording(handler, cache, &policies, lock_clock()).await;
         warn_unreadable(cache, &policies);
         let items = follow_items(handler, cache, &policies).await;
         if cache.mfa_item_live()
-            && let Err(e) = ensure_exempt_group(handler).await
+            && let Err(e) = bounded(POLICY_READ_WAIT, ensure_exempt_group(handler)).await
         {
             warn!("The exempt group was not made: {e}");
         }
@@ -1463,7 +1470,7 @@ impl Lockout {
             + ?Sized,
     {
         let live = threshold_set(policies);
-        let period = handler.read_period().await?;
+        let period = bounded(POLICY_READ_WAIT, handler.read_period()).await?;
         let stale = self.stale.swap(false, Ordering::AcqRel);
         let moved = stale || period != self.period();
         if live && (moved || !cache.lockout_live()) {
@@ -2350,6 +2357,10 @@ mod tests {
             if self.unreadable.lock().unwrap().contains(user) {
                 return Err(DomainError::InternalError("unreadable".to_owned()));
             }
+            let delay = *self.read_delay.lock().unwrap();
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             Ok(self.splits.lock().unwrap().get(user).copied())
         }
 
@@ -3117,6 +3128,94 @@ mod tests {
             store.count(&user),
             Some(2),
             "the count is right once the write lands"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_batch_whose_write_never_answers_is_given_up_at_the_bound_and_retried() {
+        let lockout = Lockout::default();
+        let store = Memory::default();
+        let user = bob();
+        lockout.seed(&user, LockRow::default());
+        let _ = lockout.failure(&state(policy(0, 0), LockRow::default()), at(1));
+        *store.delay.lock().unwrap() = POLICY_READ_WAIT * 2;
+        let started = tokio::time::Instant::now();
+        let taken = lockout.drain(&store).await;
+        let took = started.elapsed();
+        let left = (
+            store.count(&user),
+            lockout.pending(&user),
+            lockout.outage().is_some(),
+        );
+        *store.delay.lock().unwrap() = Duration::ZERO;
+        expire(&lockout, &user);
+        let again = lockout.drain(&store).await;
+        assert_eq!(
+            (
+                (taken, took >= POLICY_READ_WAIT, took < POLICY_READ_WAIT * 2),
+                left,
+                (again, store.count(&user), lockout.pending(&user)),
+                lockout.outage()
+            ),
+            (
+                (1, true, true),
+                (None, true, true),
+                (1, Some(1), false),
+                None
+            ),
+            "given up at the bound as a failed write: kept, owed and counted as an outage; the \
+             next batch stores it"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_confirm_whose_read_never_answers_is_given_up_at_the_bound() {
+        let lockout = Lockout::default();
+        let store = Memory::default();
+        let user = bob();
+        lockout.seed(&user, row(3, Some(0), None));
+        *store.read_delay.lock().unwrap() = POLICY_READ_WAIT * 2;
+        let started = tokio::time::Instant::now();
+        let confirmed = lockout.confirm_with(&store, &user).await;
+        let took = started.elapsed();
+        assert_eq!(
+            (
+                confirmed.as_ref().is_err_and(gave_up),
+                took >= POLICY_READ_WAIT,
+                took < POLICY_READ_WAIT * 2,
+                lockout.row(&user)
+            ),
+            (true, true, true, Some(row(3, Some(0), None))),
+            "a failed read of the lock: the lock stands as it was"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_fold_leaves_at_the_first_split_read_that_gave_up_with_the_rest_unread() {
+        let lockout = Lockout::default();
+        let store = Memory::default();
+        let users = ["ann", "bob", "cid"].map(UserId::new);
+        for (id, user) in (1..).zip(&users) {
+            lockout.seed(user, LockRow::default());
+            let unlocked = state_of(user, policy(3, 0), LockRow::default());
+            assert!(lockout.start(&unlocked, id, at(1)), "{user}");
+            expire(&lockout, user);
+        }
+        *store.read_delay.lock().unwrap() = POLICY_READ_WAIT * 2;
+        let started = tokio::time::Instant::now();
+        let unread = lockout.fold_expired(&store, &users).await;
+        let took = started.elapsed();
+        let held = users.each_ref().map(|user| lockout.overlays(user));
+        assert_eq!(
+            (
+                unread,
+                took >= POLICY_READ_WAIT,
+                took < POLICY_READ_WAIT * 2,
+                held
+            ),
+            (users.to_vec(), true, true, [1, 1, 1]),
+            "one bound for the three: the first read gave up, the others are not tried; every \
+             start is still held, for the retry"
         );
     }
 }

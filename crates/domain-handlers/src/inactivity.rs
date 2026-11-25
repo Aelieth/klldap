@@ -1,6 +1,6 @@
 use crate::enforcement::{
-    Attempt, Entries, INACTIVITY_DAYS, ItemCheck, POLICY_UNANSWERED, PolicyCache, Snapshot,
-    UserFacts, UserState, WHOLE_READ_BOUND, bounded, item_set,
+    Attempt, Entries, FILL_CHUNK, INACTIVITY_DAYS, ItemCheck, POLICY_UNANSWERED, PolicyCache,
+    Snapshot, UserFacts, UserState, bounded, item_set,
 };
 use crate::handler::PolicyBackendHandler;
 use crate::instant::{self, SignedDuration, Timestamp};
@@ -370,7 +370,7 @@ pub async fn follow_recording<S: LockStore + ?Sized>(
         }
         (true, _) => {
             let turning = !live(cache) || cache.item_unread(INACTIVITY_DAYS);
-            let stored = match store.read_recording().await {
+            let stored = match bounded(POLICY_READ_WAIT, store.read_recording()).await {
                 Ok(None) => store.write_recording(true, at).await,
                 read => read,
             };
@@ -391,7 +391,26 @@ pub(crate) enum ActivityRead {
     Failed,
 }
 
-/// One read for every user while an OU's items set the item, in the fill before the flag.
+/// Every user's row, a chunk at a time in user-id order, each chunk under its own bound.
+async fn activity_rows<H>(handler: &H) -> Result<Vec<(UserId, Recorded)>>
+where
+    H: PolicyBackendHandler + ?Sized,
+{
+    let mut rows: Vec<(UserId, Recorded)> = Vec::new();
+    loop {
+        let after = rows.last().map(|(user, _)| user);
+        let chunk = handler.read_activity_after(after, FILL_CHUNK);
+        let chunk = bounded(POLICY_READ_WAIT, chunk).await?;
+        let last = chunk.len() < FILL_CHUNK;
+        rows.extend(chunk);
+        if last {
+            return Ok(rows);
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Every user's row while an OU's items set the item, in the fill before the flag.
 pub(crate) async fn read_activity_rows<H>(handler: &H, entries: &mut Entries) -> ActivityRead
 where
     H: PolicyBackendHandler + ?Sized,
@@ -399,7 +418,7 @@ where
     if !entries.items_of_ous.values().any(|items| judged_by(items)) {
         return ActivityRead::NotAsked;
     }
-    let rows = match bounded(WHOLE_READ_BOUND, handler.read_activity(None)).await {
+    let rows = match activity_rows(handler).await {
         Ok(rows) => rows,
         Err(e) => {
             warn!("The users' activity was not read: {e}");

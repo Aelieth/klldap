@@ -1,11 +1,12 @@
 use crate::enforcement::{
-    Entries, PolicyCache, Snapshot, UserFacts, WHOLE_READ_BOUND, bounded, mfa_can_be_on,
-    mfa_policy_from, user_written,
+    Entries, FILL_CHUNK, PolicyCache, Snapshot, UserFacts, bounded, mfa_can_be_on, mfa_policy_from,
+    user_written,
 };
 use crate::handler::{PolicyBackendHandler, UserBackendHandler};
 use crate::mfa::{MfaEnrollmentStatus, MfaPolicy, MfaRequirement, mfa_requirement};
-use crate::policies::EffectiveItem;
+use crate::policies::{EffectiveItem, POLICY_READ_WAIT};
 use lldap_domain::types::UserId;
+use lldap_domain_model::error::Result;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::{Arc, PoisonError};
@@ -213,7 +214,7 @@ impl PolicyCache {
     }
 
     /// One read in flight per user, and at most one a second.
-    fn reread_due(&self, user: &UserId, now: Instant) -> bool {
+    pub(crate) fn reread_due(&self, user: &UserId, now: Instant) -> bool {
         let mut rereads = self.rereads();
         let reread = rereads.entry(user.clone()).or_default();
         let recent = reread
@@ -249,7 +250,33 @@ impl PolicyCache {
     }
 }
 
-/// One read for the required users; a failed one leaves them none, so they alone are refused.
+/// At the fill's swap: the rereads of users it no longer lists are forgotten, but one in flight.
+pub(crate) fn forget_rereads(cache: &PolicyCache, next: &Snapshot) {
+    let listed = |user: &UserId| next.facts_of(user).is_some();
+    cache
+        .rereads()
+        .retain(|user, reread| reread.running || listed(user));
+}
+
+/// Every window, a chunk at a time in the order of its key, each chunk under its own bound.
+async fn window_rows<H>(handler: &H) -> Result<Vec<(UserId, ProofWindow)>>
+where
+    H: PolicyBackendHandler + ?Sized,
+{
+    let mut rows: Vec<(UserId, ProofWindow)> = Vec::new();
+    loop {
+        let chunk = handler.read_proof_windows_after(rows.last(), FILL_CHUNK);
+        let chunk = bounded(POLICY_READ_WAIT, chunk).await?;
+        let last = chunk.len() < FILL_CHUNK;
+        rows.extend(chunk);
+        if last {
+            return Ok(rows);
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+/// The windows of the required users; a failed read leaves them none, so they alone are refused.
 pub(crate) async fn fill_windows<H>(handler: &H, cache: &PolicyCache, entries: &mut Entries)
 where
     H: PolicyBackendHandler + ?Sized,
@@ -268,7 +295,7 @@ where
     if windows.is_empty() {
         return;
     }
-    let rows = match bounded(WHOLE_READ_BOUND, handler.read_proof_windows(None)).await {
+    let rows = match window_rows(handler).await {
         Ok(rows) => rows,
         Err(e) => {
             warn!("The second factor's windows were not read: {e}");

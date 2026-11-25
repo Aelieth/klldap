@@ -8,7 +8,7 @@ use crate::inactivity::{
 };
 use crate::instant::{Timestamp, from_naive};
 use crate::kdc_proof::{ProofSettings, ProofWindow, Reread, WindowReader};
-use crate::kdc_proof::{fill_windows, proofs_live, take_user_windows};
+use crate::kdc_proof::{fill_windows, forget_rereads, proofs_live, take_user_windows};
 use crate::kerberos::{CommitError, HostRow};
 use crate::lockout::{self, LockRow, Lockout, LockoutCheck, lockout};
 use crate::logging::{self, LogKind, Protocol, RequestMeta};
@@ -39,7 +39,6 @@ use tracing::warn;
 pub const POLICY_REFILL: Duration = Duration::from_secs(30);
 pub const FILL_GAP: Duration = Duration::from_millis(250);
 pub const FILL_BACKOFF_LIMIT: Duration = Duration::from_secs(30);
-pub const WHOLE_READ_BOUND: Duration = Duration::from_secs(30);
 pub const FILL_CHUNK: usize = 500;
 pub const OVERLAY_FOLD: usize = 1024;
 const MARK_PASSES: usize = 4;
@@ -830,6 +829,7 @@ impl PolicyCache {
             over,
         };
         forget_writes(self, &next);
+        forget_rereads(self, &next);
         self.swap(next);
     }
 
@@ -930,6 +930,12 @@ pub(crate) async fn bounded<T>(wait: Duration, read: impl Future<Output = Result
         .map_err(|_| unanswered)?
 }
 
+/// A door's read, its connection's acquire included, under `POLICY_READ_WAIT`; one that gives up
+/// is a failed read.
+pub async fn door_read<T>(read: impl Future<Output = Result<T>>) -> Result<T> {
+    bounded(POLICY_READ_WAIT, read).await
+}
+
 type UserEntry = (String, Arc<[EffectiveItem]>, User);
 
 async fn user_entry<H>(handler: &H, user: &UserId) -> Result<UserEntry>
@@ -948,7 +954,7 @@ async fn user_facts<H>(handler: &H, user: &User) -> Result<UserFacts>
 where
     H: UserBackendHandler + ?Sized,
 {
-    let groups = handler.get_user_groups(&user.user_id).await?;
+    let groups = door_read(handler.get_user_groups(&user.user_id)).await?;
     Ok(UserFacts::of(user, groups.iter()))
 }
 
@@ -2505,6 +2511,8 @@ mod tests {
         listing_takes: Duration,
         activity_parked: AtomicBool,
         proofs_parked: AtomicBool,
+        parked: Mutex<HashSet<&'static str>>,
+        chunk_takes: Duration,
     }
 
     impl Directory {
@@ -2544,6 +2552,28 @@ mod tests {
         fn group_names(&self) -> Vec<String> {
             let made = self.groups.lock().unwrap();
             made.iter().map(|g| g.display_name.to_string()).collect()
+        }
+
+        fn park(&self, read: &'static str) {
+            self.parked.lock().unwrap().insert(read);
+        }
+
+        fn unpark(&self) {
+            self.parked.lock().unwrap().clear();
+        }
+
+        /// A read named by `park` never answers.
+        async fn parked(&self, read: &str) {
+            let parked = self.parked.lock().unwrap().contains(read);
+            if parked {
+                std::future::pending::<()>().await;
+            }
+        }
+
+        async fn chunk(&self, user: Option<&UserId>) {
+            if user.is_none() && !self.chunk_takes.is_zero() {
+                tokio::time::sleep(self.chunk_takes).await;
+            }
         }
     }
 
@@ -2651,6 +2681,7 @@ mod tests {
             unimplemented!()
         }
         async fn get_user_groups(&self, _: &UserId) -> Result<HashSet<GroupDetails>> {
+            self.parked("get_user_groups").await;
             Ok(HashSet::new())
         }
         async fn ensure_kerberos_principal_consistency(&self, _: &UserId, _: bool) -> Result<()> {
@@ -2662,6 +2693,7 @@ mod tests {
     impl PolicyBackendHandler for Directory {
         async fn list_policies(&self) -> Result<Vec<Policy>> {
             self.policy_reads.fetch_add(1, Ordering::Relaxed);
+            self.parked("list_policies").await;
             match self.policies_down.load(Ordering::Relaxed) {
                 true => Err(DomainError::InternalError("down".to_owned())),
                 false => Ok(self.policies.clone()),
@@ -2721,6 +2753,7 @@ mod tests {
             if user.is_none() && self.proofs_parked.load(Ordering::Relaxed) {
                 std::future::pending::<()>().await;
             }
+            self.chunk(user).await;
             if self.proofs_down.load(Ordering::Relaxed) {
                 return Err(DomainError::InternalError("down".to_owned()));
             }
@@ -2733,6 +2766,7 @@ mod tests {
             if user.is_none() && self.activity_parked.load(Ordering::Relaxed) {
                 std::future::pending::<()>().await;
             }
+            self.chunk(user).await;
             if self.activity_down.load(Ordering::Relaxed) {
                 return Err(DomainError::InternalError("down".to_owned()));
             }
@@ -2757,6 +2791,7 @@ mod tests {
     #[async_trait]
     impl GroupListerBackendHandler for Directory {
         async fn list_groups(&self, _: Option<GroupRequestFilter>) -> Result<Vec<Group>> {
+            self.parked("list_groups").await;
             let epoch = DateTime::from_timestamp(0, 0).unwrap().naive_utc();
             let made = self.groups.lock().unwrap().clone();
             let group = |(n, made): (usize, CreateGroupRequest)| Group {
@@ -2793,18 +2828,22 @@ mod tests {
     #[async_trait]
     impl LockStore for Directory {
         async fn read_lock(&self, _: &UserId) -> Result<Option<LockRow>> {
+            self.parked("read_lock").await;
             Ok(None)
         }
         async fn read_locks(&self, _: Option<Timestamp>) -> Result<Vec<StoredLock>> {
+            self.parked("read_locks").await;
             Ok(Vec::new())
         }
         async fn read_lock_users(&self) -> Result<Vec<UserId>> {
+            self.parked("read_lock_users").await;
             Ok(Vec::new())
         }
         async fn read_split(&self, _: &UserId) -> Result<Option<SplitMark>> {
             Ok(None)
         }
         async fn read_period(&self) -> Result<String> {
+            self.parked("read_period").await;
             Ok("0".to_owned())
         }
         async fn write_locks(&self, period: &str, _: &[LockWrite]) -> Result<Written> {
@@ -2815,6 +2854,7 @@ mod tests {
             })
         }
         async fn read_recording(&self) -> Result<Option<Timestamp>> {
+            self.parked("read_recording").await;
             match self.recording_down.load(Ordering::Relaxed) {
                 true => Err(DomainError::InternalError("down".to_owned())),
                 false => Ok(None),
@@ -3492,7 +3532,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn test_a_whole_read_past_its_bound_is_a_read_that_failed_and_the_fill_stands() {
+    async fn test_a_chunk_of_a_read_past_its_bound_is_a_read_that_failed_and_the_fill_stands() {
         let late = UserId::new(LATE);
         for (label, activity) in [("the users' activity", true), ("the windows", false)] {
             let cache = PolicyCache::new();
@@ -3511,8 +3551,8 @@ mod tests {
                     filled,
                     cache.failed_read(),
                     ou_of(&cache, &late),
-                    took >= WHOLE_READ_BOUND,
-                    took < WHOLE_READ_BOUND + WITHIN
+                    took >= POLICY_READ_WAIT,
+                    took < WITHIN
                 ),
                 (true, true, Some(LABS.to_owned()), true, true),
                 "{label}: given up at its bound as a read that failed; the fill's listing stands"
@@ -4922,6 +4962,227 @@ mod tests {
                 (other, success(60))
             ],
             "the fill lists Late alone: Other's last write is forgotten, so the next one writes"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_door_read_answers_in_time_or_is_given_up_at_its_bound_as_a_failed_read() {
+        let inside = POLICY_READ_WAIT - Duration::from_millis(1);
+        let down = || Err("Internal error: `down`".to_owned());
+        let unanswered = Err(format!("Internal error: `{POLICY_UNANSWERED}`"));
+        type Row = (
+            &'static str,
+            Option<Duration>,
+            bool,
+            std::result::Result<u8, String>,
+            bool,
+        );
+        let rows: [Row; 5] = [
+            ("at once", Some(Duration::ZERO), false, Ok(7), false),
+            ("just inside the bound", Some(inside), false, Ok(7), false),
+            ("its own error", Some(Duration::ZERO), true, down(), false),
+            ("its own error, late", Some(inside), true, down(), false),
+            ("never", None, false, unanswered, true),
+        ];
+        for (label, takes, fails, answer, waits) in rows {
+            let read = async {
+                match takes {
+                    Some(takes) if takes.is_zero() => {}
+                    Some(takes) => tokio::time::sleep(takes).await,
+                    None => std::future::pending::<()>().await,
+                }
+                match fails {
+                    true => Err(DomainError::InternalError("down".to_owned())),
+                    false => Ok(7_u8),
+                }
+            };
+            let started = tokio::time::Instant::now();
+            let answered = door_read(read).await.map_err(|e| e.to_string());
+            let took = started.elapsed();
+            assert_eq!(
+                (answered, took >= POLICY_READ_WAIT, took < WITHIN),
+                (answer, waits, true),
+                "a read that answers {label}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn test_a_lock_row_not_read_within_the_bound_is_a_failed_read_of_the_lock() {
+        let (cache, counter) = (PolicyCache::new(), Lockout::default());
+        cache.set_lockout_live(true);
+        let three = [item("lockout-threshold", "3")];
+        cache.replace(entries(&[(STALLED, "e1ou")], &[("e1ou", &three[..])]));
+        let directory = Directory::knowing(&[STALLED]);
+        let stalled = UserId::new(STALLED);
+        directory.park("read_lock");
+        let started = tokio::time::Instant::now();
+        let state = counter.state(&directory, &cache, &stalled);
+        let state = tokio::time::timeout(WITHIN, state).await;
+        let took = started.elapsed();
+        directory.unpark();
+        let next = counter.state(&directory, &cache, &stalled).await;
+        assert_eq!(
+            (
+                state.map(|state| state.map(drop).map_err(|e| e.to_string())),
+                took >= POLICY_READ_WAIT,
+                took < WITHIN,
+                next.is_ok_and(|state| state.is_some())
+            ),
+            (
+                Ok(Err(format!("Internal error: `{POLICY_UNANSWERED}`"))),
+                true,
+                true,
+                true
+            ),
+            "the door's lock read is given up at the bound; the next sign-in reads the row"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn test_a_mark_pass_whose_group_read_never_answers_leaves_at_the_bound_with_its_mark() {
+        let _judging = Judging::only(&[STALLED]);
+        let cache = PolicyCache::new();
+        let directory = Directory::knowing(&[STALLED]);
+        let stalled = UserId::new(STALLED);
+        directory.park("get_user_groups");
+        let started = tokio::time::Instant::now();
+        let walk = user_written(&directory, &cache, &stalled);
+        let returned = tokio::time::timeout(WITHIN, walk).await.is_ok();
+        let took = started.elapsed();
+        let left = (returned, cache.marked(&stalled), cache.failed_read());
+        directory.unpark();
+        user_written(&directory, &cache, &stalled).await;
+        assert_eq!(
+            (
+                left,
+                took >= POLICY_READ_WAIT,
+                took < WITHIN,
+                cache.marked(&stalled),
+                ou_of(&cache, &stalled)
+            ),
+            (
+                (true, true, false),
+                true,
+                true,
+                false,
+                Some(LABS.to_owned())
+            ),
+            "given up at the bound as a read that gave up: the mark stays, and the next pass \
+             stores the user"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn test_a_follows_read_that_never_answers_is_given_up_at_the_bound() {
+        type Row = (&'static str, Option<(&'static str, &'static str)>, bool);
+        let rows: [Row; 5] = [
+            ("list_policies", None, true),
+            ("read_period", None, true),
+            ("read_recording", Some((INACTIVITY_DAYS, "30")), true),
+            ("list_groups", Some((ENABLE_MFA, "always")), false),
+            ("read_locks", None, true),
+        ];
+        for (read, set, fails) in rows {
+            let (cache, counter) = (PolicyCache::new(), Lockout::default());
+            let set = set.map(|(key, value)| linked(key, value, &[LABS]));
+            let directory = Directory {
+                policies: set.into_iter().collect(),
+                ..Directory::default()
+            };
+            // Only a refresh's read of the rows since its last one is timed: a whole read is not.
+            let refresh = read == "read_locks";
+            let follow = async || match refresh {
+                true => counter.refresh(&directory).await.map(drop),
+                false => counter.follow_policies(&directory, &cache).await.map(drop),
+            };
+            if refresh {
+                follow().await.unwrap();
+            }
+            directory.park(read);
+            let started = tokio::time::Instant::now();
+            let ended = tokio::time::timeout(WITHIN, follow()).await;
+            let took = started.elapsed();
+            directory.unpark();
+            let next = follow().await;
+            assert_eq!(
+                (
+                    matches!(&ended, Ok(Err(e)) if gave_up(e)),
+                    matches!(ended, Ok(Ok(()))),
+                    took >= POLICY_READ_WAIT,
+                    took < WITHIN,
+                    next.is_ok()
+                ),
+                (fails, !fails, true, true, true),
+                "{read}: given up at the bound, an error of the follow where a failed read is \
+                 one; the next follow reads"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_reads_of_many_chunks_that_each_answer_in_time_are_not_failed_by_their_length() {
+        let cache = PolicyCache::new();
+        cache.set_proofs(Some(ProofSettings::new(600, false, 3600)));
+        cache.set_mfa_policy(Some(MfaPolicy::Always));
+        let names: Vec<String> = (0..8_200).map(|n| format!("r1rows{n:04}")).collect();
+        let users: Vec<UserId> = names.iter().map(|name| UserId::new(name)).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let seen = Recorded {
+            last_success: Some(at(0)),
+            reenabled_at: None,
+        };
+        let mut directory = Directory::default().listing(&names);
+        directory.levels = idle_level("30");
+        directory.activity_rows =
+            Mutex::new(users.iter().map(|user| (user.clone(), seen)).collect());
+        directory.proof_rows = users.iter().map(|user| (user.clone(), opened())).collect();
+        directory.chunk_takes = POLICY_READ_WAIT - Duration::from_millis(100);
+        let started = tokio::time::Instant::now();
+        let filled = fill_policy_cache(&directory, &cache).await.is_ok();
+        let took = started.elapsed();
+        let entries = cache.get();
+        let recorded =
+            |user: &&UserId| entries.facts_of(user).and_then(|f| f.recorded) == Some(seen);
+        let proved = |user: &&UserId| entries.windows_of(user) == [opened()];
+        assert_eq!(
+            (
+                (filled, cache.failed_read()),
+                directory.activity_reads.load(Ordering::Relaxed),
+                directory.proof_reads.load(Ordering::Relaxed),
+                users.iter().filter(recorded).count(),
+                users.iter().filter(proved).count(),
+                took > Duration::from_secs(60)
+            ),
+            ((true, false), 17, 17, 8_200, 8_200, true),
+            "17 chunks of 1.9 s for the activity and 17 for the windows, 64.6 s in all: every \
+             chunk answered within its own bound, and every user's row and window is held once"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_fill_forgets_the_reread_of_a_user_it_no_longer_lists_unless_it_is_running() {
+        let cache = PolicyCache::new();
+        let directory = Directory::knowing(&[LATE]).listing(&[LATE]);
+        let (late, gone, running) = (UserId::new(LATE), UserId::new(OTHER), UserId::new(SLOW));
+        for user in [&late, &gone] {
+            let mut rereads = cache.rereads.lock().unwrap();
+            rereads.insert(user.clone(), Reread::default());
+        }
+        let due = cache.reread_due(&running, std::time::Instant::now());
+        fill_policy_cache(&directory, &cache).await.unwrap();
+        let rereads = cache.rereads.lock().unwrap();
+        assert_eq!(
+            (
+                due,
+                [&late, &gone, &running].map(|user| rereads.contains_key(user))
+            ),
+            (true, [true, false, true]),
+            "the fill lists Late alone: Other's reread is forgotten; one still running is kept \
+             for its own end"
         );
     }
 }

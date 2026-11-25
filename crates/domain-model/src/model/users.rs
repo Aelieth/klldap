@@ -26,6 +26,7 @@ pub struct Model {
     // Only backend code sets it, and only while kerberossync = 1.
     pub krb_principal_name: Option<String>,
     pub code_at_kinit: bool,
+    pub mfa_changed_at: Option<i64>,
 }
 
 impl EntityName for Entity {
@@ -49,6 +50,7 @@ pub enum Column {
     PasswordModifiedDate,
     KrbPrincipalName,
     CodeAtKinit,
+    MfaChangedAt,
 }
 
 impl ColumnTrait for Column {
@@ -69,6 +71,7 @@ impl ColumnTrait for Column {
             Column::PasswordModifiedDate => ColumnType::DateTime,
             Column::KrbPrincipalName => ColumnType::String(StringLen::N(255)),
             Column::CodeAtKinit => ColumnType::Boolean,
+            Column::MfaChangedAt => ColumnType::BigInteger,
         }
         .def()
     }
@@ -139,6 +142,7 @@ impl From<Model> for lldap_domain::types::User {
             krb_principal_name: user.krb_principal_name,
             mfa_type: user.mfa_type,
             code_at_kinit: user.code_at_kinit,
+            mfa_changed_at: user.mfa_changed_at,
         }
     }
 }

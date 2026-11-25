@@ -191,6 +191,7 @@ async fn change_factor(
         mfa_type: ActiveValue::Set(mfa_type),
         modified_date: ActiveValue::Set(chrono::Utc::now().naive_utc()),
         code_at_kinit,
+        mfa_changed_at: ActiveValue::Set(Some(now_unix())),
         ..Default::default()
     };
     user_update.update(txn).await?;
@@ -365,6 +366,7 @@ impl SqlBackendHandler {
             .col_expr(UserColumn::TotpSecret, Expr::value(None::<String>))
             .col_expr(UserColumn::MfaType, Expr::value(None::<String>))
             .col_expr(UserColumn::CodeAtKinit, Expr::value(false))
+            .col_expr(UserColumn::MfaChangedAt, Expr::value(now_unix()))
             .col_expr(
                 UserColumn::ModifiedDate,
                 Expr::value(chrono::Utc::now().naive_utc()),
@@ -1192,6 +1194,98 @@ pub(crate) mod tests {
             held.push(facts.map(|facts| (facts.enrolled, facts.code_at_kinit)));
         }
         assert_eq!(held, vec![Some((true, true)), Some((true, false))]);
+    }
+
+    async fn changed_at(handler: &SqlBackendHandler, user: &UserId) -> Option<i64> {
+        let found = model::User::find_by_id(user.clone()).one(&handler.sql_pool);
+        found.await.unwrap().unwrap().mfa_changed_at
+    }
+
+    #[tokio::test]
+    async fn test_each_change_of_the_factor_keeps_its_time_in_its_own_write() {
+        let _clock = pin_clock(AT);
+        let (setup, handler) = setup_handler().await;
+        let (bob, _, _, next) = enroll_user(&handler, &setup, "bob").await;
+        insert_user_no_password(&handler, "ann").await;
+        let ann = UserId::new("ann");
+        let factor = |sealed: &str| (Some(sealed.to_owned()), Some(MFA_TYPE_TOTP.to_owned()));
+        let mut seen = vec![
+            ("enrolled", changed_at(&handler, &bob).await),
+            ("never a factor", changed_at(&handler, &ann).await),
+        ];
+        let start = handler
+            .start_totp_enrollment(&bob, Some(next), None)
+            .await
+            .unwrap();
+        set_enrollment_clock(Some(AT + 60));
+        let (sealed, totp) = factor("v1.second");
+        handler.write_mfa_columns(&bob, sealed, totp).await.unwrap();
+        seen.push(("replaced", changed_at(&handler, &bob).await));
+        set_enrollment_clock(Some(AT + 120));
+        let (_, code) = current_code(&open_state(&setup, &start.state).seed);
+        let stale = handler
+            .finish_totp_enrollment(&bob, &start.state, &code)
+            .await;
+        let stale = stale.is_err_and(|e| e.to_string().contains("changed during enrollment"));
+        seen.push((
+            "a finish refused as stale",
+            changed_at(&handler, &bob).await,
+        ));
+        handler.set_code_at_kinit(&bob, true).await.unwrap();
+        seen.push((
+            "the code at kinit turned on",
+            changed_at(&handler, &bob).await,
+        ));
+        set_enrollment_clock(Some(AT + 180));
+        let admin = MfaResetReason::Administrative;
+        handler.reset_user_mfa(&bob, admin).await.unwrap();
+        seen.push(("an administrator's reset", changed_at(&handler, &bob).await));
+        set_enrollment_clock(Some(AT + 240));
+        let (sealed, totp) = factor("v1.third");
+        handler.write_mfa_columns(&bob, sealed, totp).await.unwrap();
+        set_enrollment_clock(Some(AT + 300));
+        handler.clear_all_mfa().await.unwrap();
+        seen.push(("the server key changed", changed_at(&handler, &bob).await));
+        seen.push((
+            "no factor when the key changed",
+            changed_at(&handler, &ann).await,
+        ));
+        assert_eq!(
+            (stale, seen),
+            (
+                true,
+                vec![
+                    ("enrolled", Some(AT)),
+                    ("never a factor", None),
+                    ("replaced", Some(AT + 60)),
+                    ("a finish refused as stale", Some(AT + 60)),
+                    ("the code at kinit turned on", Some(AT + 60)),
+                    ("an administrator's reset", Some(AT + 180)),
+                    ("the server key changed", Some(AT + 300)),
+                    ("no factor when the key changed", None),
+                ]
+            ),
+            "the factor's every change, and nothing else, moves its time"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_the_fill_carries_the_factors_change_time_to_the_kdcs_memory() {
+        use lldap_domain_handlers::enforcement::{PolicyCache, fill_policy_cache};
+        use lldap_domain_handlers::kdc_code::factor_changed_at;
+        let _clock = pin_clock(AT);
+        let cache: &'static PolicyCache = Box::leak(Box::default());
+        let (setup, handler) = setup_handler().await;
+        let handler = handler.with_policy_cache(cache);
+        let (bob, ..) = enroll_user(&handler, &setup, "bob").await;
+        fill_policy_cache(&handler, cache).await.unwrap();
+        let enrolled = factor_changed_at(cache, &bob);
+        set_enrollment_clock(Some(AT + 60));
+        let admin = MfaResetReason::Administrative;
+        handler.reset_user_mfa(&bob, admin).await.unwrap();
+        fill_policy_cache(&handler, cache).await.unwrap();
+        let reset = factor_changed_at(cache, &bob);
+        assert_eq!((enrolled, reset), (Some(AT), Some(AT + 60)));
     }
 
     #[tokio::test]

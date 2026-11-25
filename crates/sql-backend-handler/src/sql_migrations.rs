@@ -35,6 +35,7 @@ pub enum Users {
     ModifiedDate,
     PasswordModifiedDate,
     CodeAtKinit,
+    MfaChangedAt,
 }
 
 #[derive(DeriveIden, PartialEq, Eq, Debug, Serialize, Deserialize, Clone, Copy)]
@@ -2084,6 +2085,7 @@ pub(crate) async fn ensure_v13_additions(pool: &DbConnection) -> Result<(), DbEr
     ensure_lockout_period(&transaction, backend).await?;
     ensure_inactivity_recording(&transaction, backend).await?;
     ensure_code_at_kinit(&transaction, backend).await?;
+    ensure_mfa_changed_at(&transaction, backend).await?;
     transaction.commit().await
 }
 
@@ -2098,6 +2100,19 @@ async fn ensure_code_at_kinit(
         .default(false)
         .to_owned();
     let (table, name) = (Users::Table.into_iden(), Users::CodeAtKinit.into_iden());
+    ensure_column(transaction, backend, table, name, column).await
+}
+
+/// When the user's factor last changed, in Unix seconds; none before its first change here.
+async fn ensure_mfa_changed_at(
+    transaction: &DatabaseTransaction,
+    backend: sea_orm::DbBackend,
+) -> Result<(), DbErr> {
+    let column = ColumnDef::new(Users::MfaChangedAt)
+        .big_integer()
+        .null()
+        .to_owned();
+    let (table, name) = (Users::Table.into_iden(), Users::MfaChangedAt.into_iden());
     ensure_column(transaction, backend, table, name, column).await
 }
 

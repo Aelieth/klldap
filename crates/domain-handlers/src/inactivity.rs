@@ -994,6 +994,7 @@ pub(crate) mod tests {
             enrolled: false,
             exempt: false,
             code_at_kinit: false,
+            mfa_changed_at: None,
             created: at(-DAY),
             recorded: Some(Recorded::default()),
         };
@@ -1026,6 +1027,7 @@ pub(crate) mod tests {
             enrolled: false,
             exempt: false,
             code_at_kinit: false,
+            mfa_changed_at: None,
             created: at(-DAY),
             recorded: Some(reenabled),
         };

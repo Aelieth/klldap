@@ -323,6 +323,7 @@ mod tests {
             krb_principal_name: None,
             mfa_type: None,
             code_at_kinit: false,
+            mfa_changed_at: None,
         };
         for name in [
             "userid",

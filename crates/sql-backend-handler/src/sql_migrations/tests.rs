@@ -4404,22 +4404,29 @@ async fn test_the_factor_columns_of_users_come_back_with_the_additions() {
     let pool = get_in_memory_db().await;
     init_table(&pool).await.unwrap();
     insert_directory_user(&pool, "kept", "22222222-2222-2222-2222-222222222222").await;
-    let dropped = raw_statement("ALTER TABLE users DROP COLUMN code_at_kinit");
-    pool.execute(dropped).await.unwrap();
+    for column in ["code_at_kinit", "mfa_changed_at"] {
+        let dropped = raw_statement(&format!("ALTER TABLE users DROP COLUMN {column}"));
+        pool.execute(dropped).await.unwrap();
+    }
     ensure_v13_additions(&pool).await.unwrap();
     ensure_v13_additions(&pool).await.unwrap();
     #[derive(FromQueryResult, Debug, PartialEq)]
     struct Factor {
         code_at_kinit: bool,
+        mfa_changed_at: Option<i64>,
     }
-    let read = raw_statement("SELECT code_at_kinit FROM users WHERE user_id = 'kept'");
-    let kept = Factor::find_by_statement(read).one(&pool).await.unwrap();
+    let read = "SELECT code_at_kinit, mfa_changed_at FROM users WHERE user_id = 'kept'";
+    let kept = Factor::find_by_statement(raw_statement(read))
+        .one(&pool)
+        .await
+        .unwrap();
     assert_eq!(
         kept,
         Some(Factor {
-            code_at_kinit: false
+            code_at_kinit: false,
+            mfa_changed_at: None
         }),
-        "added again once, off for a user already there"
+        "added again once: off, and no change kept, for a user already there"
     );
     expect_kept_user(&pool).await;
 }

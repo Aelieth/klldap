@@ -265,6 +265,7 @@ pub(crate) mod tests {
             enrolled,
             exempt: false,
             code_at_kinit,
+            mfa_changed_at: None,
             created: Timestamp::UNIX_EPOCH,
             recorded: None,
         }

@@ -222,7 +222,8 @@ pub fn get_user_attribute(
             | lldap_domain_model::model::UserColumn::PasswordHash
             | lldap_domain_model::model::UserColumn::TotpSecret
             | lldap_domain_model::model::UserColumn::MfaType
-            | lldap_domain_model::model::UserColumn::CodeAtKinit,
+            | lldap_domain_model::model::UserColumn::CodeAtKinit
+            | lldap_domain_model::model::UserColumn::MfaChangedAt,
         ) => panic!("Should not get here"),
         UserFieldType::PrimaryField(lldap_domain_model::model::UserColumn::Uuid) => {
             vec![user.uuid.to_string().into_bytes()]
@@ -507,6 +508,7 @@ mod tests {
             krb_principal_name: None,
             mfa_type: None,
             code_at_kinit: false,
+            mfa_changed_at: None,
         }
     }
 

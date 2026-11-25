@@ -356,6 +356,8 @@ pub struct UserFacts {
     pub exempt: bool,
     /// The user turned on the code at kinit for themselves.
     pub code_at_kinit: bool,
+    /// When the factor last changed, in Unix seconds.
+    pub mfa_changed_at: Option<i64>,
     pub created: Timestamp,
     /// inactivity-days' row; `None` until read.
     pub recorded: Option<Recorded>,
@@ -368,6 +370,7 @@ impl UserFacts {
             enrolled: user.mfa_type.as_deref() == Some(MFA_TYPE_TOTP),
             exempt: groups.any(|group| group.display_name.as_str() == MFA_DISABLED_GROUP),
             code_at_kinit: user.code_at_kinit,
+            mfa_changed_at: user.mfa_changed_at,
             created: from_naive(user.creation_date),
             recorded: None,
         }
@@ -2596,6 +2599,7 @@ mod tests {
             krb_principal_name: None,
             mfa_type: None,
             code_at_kinit: false,
+            mfa_changed_at: None,
         }
     }
 

@@ -359,6 +359,7 @@ mod tests {
             enrolled,
             exempt,
             code_at_kinit: false,
+            mfa_changed_at: None,
             created: crate::instant::Timestamp::UNIX_EPOCH,
             recorded: None,
         }

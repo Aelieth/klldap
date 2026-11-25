@@ -2702,6 +2702,7 @@ pub(crate) mod tests {
             enrolled: false,
             exempt: false,
             code_at_kinit: false,
+            mfa_changed_at: None,
             created,
             recorded: Some(Recorded::default()),
         }

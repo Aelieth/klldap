@@ -495,6 +495,7 @@ pub struct User {
     pub mfa_type: Option<String>,
     #[serde(default)]
     pub code_at_kinit: bool,
+    pub mfa_changed_at: Option<i64>,
 }
 
 impl User {
@@ -559,6 +560,7 @@ impl Default for User {
             krb_principal_name: None,
             mfa_type: None,
             code_at_kinit: false,
+            mfa_changed_at: None,
         }
     }
 }

@@ -207,6 +207,7 @@ pub fn user_named(uid: &UserId) -> User {
         krb_principal_name: None,
         mfa_type: None,
         code_at_kinit: false,
+        mfa_changed_at: None,
     }
 }
 

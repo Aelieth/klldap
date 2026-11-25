@@ -58,6 +58,11 @@ pub async fn check_code(store: &dyn KdcCodeStore, user: &UserId, value: &[u8]) -
     }
 }
 
+/// When the user's factor last changed, from memory: no ticket with `mfa` from before it holds.
+pub fn factor_changed_at(cache: &PolicyCache, user: &UserId) -> Option<i64> {
+    cache.get().facts_of(user)?.mfa_changed_at
+}
+
 /// From memory: a factor, a resolved value that asks it, not exempt, and the user's own choice.
 pub fn code_asked(cache: &PolicyCache, user: &UserId) -> bool {
     let entries = cache.get();
@@ -192,6 +197,7 @@ mod tests {
             enrolled,
             exempt,
             code_at_kinit,
+            mfa_changed_at: None,
             created: crate::instant::Timestamp::UNIX_EPOCH,
             recorded: None,
         });
@@ -238,6 +244,26 @@ mod tests {
             (CODE_KEY, CODE_OFFER.contains(&typed)),
             ("otp", true),
             "{CODE_OFFER}"
+        );
+    }
+
+    #[test]
+    fn test_the_kdc_reads_when_the_factor_last_changed_from_memory() {
+        let cache = holding(Some(MfaPolicy::Enrolled), Some((true, false, false)));
+        let user = UserId::new("e8kask");
+        let before = factor_changed_at(&cache, &user);
+        let mut facts = cache.get().facts_of(&user).cloned().unwrap();
+        facts.mfa_changed_at = Some(1_770_000_015);
+        cache.put_facts(&user, facts);
+        let other = UserId::new("e8kother");
+        assert_eq!(
+            (
+                before,
+                factor_changed_at(&cache, &user),
+                factor_changed_at(&cache, &other)
+            ),
+            (None, Some(1_770_000_015), None),
+            "none kept yet; the change; a user the memory lacks"
         );
     }
 

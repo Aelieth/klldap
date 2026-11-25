@@ -1,16 +1,18 @@
 use crate::policy::NOT_FOUND;
-use krb5_kdc::Principal;
 use krb5_kdc::admission::{
     AsNotice, AsQuestion, AsReason, HostAdmission, KdcRefusal, Mechanism, TgsClient, TgsKind,
     TgsQuestion,
 };
-use krb5_types::{EncTicketPart, HostAddress, PrincipalName, err};
+use krb5_kdc::{KdcPolicy, PolicyAdjustment, Principal, PrincipalRead};
+use krb5_types::{EncTicketPart, HostAddress, KdcReqBody, PrincipalName, err};
 use lldap_domain::types::UserId;
 use lldap_domain_handlers::enforcement::{
     Attempt, Door, PolicyCache, Refusal, admit_at_kdc_with, item_checks, policy_cache,
     record_kdc_row,
 };
-use lldap_domain_handlers::kdc_proof::{ProofVerdict, kdc_verdict, proof_at_as, proof_at_tgs};
+use lldap_domain_handlers::kdc_proof::{
+    ProofVerdict, kdc_verdict, proof_at_as, proof_at_tgs, proofs_live,
+};
 use lldap_domain_handlers::kerberos::user_id_for_principal_name;
 use lldap_domain_handlers::lockout::{Lockout, THRESHOLD, lock_clock, lock_detail, lockout};
 use lldap_domain_handlers::logging::LogKind;
@@ -133,12 +135,6 @@ impl KdcVerdict {
     fn no_fresh_proof(&self, user: &UserId, verdict: ProofVerdict, door: Door) -> Option<String> {
         let verdict = kdc_verdict(self.cache, user, verdict);
         (verdict == ProofVerdict::NoFreshProof).then(|| proof_detail(door))
-    }
-
-    fn proof_at_tgs(&self, user: &UserId, ticket: &EncTicketPart) -> Option<String> {
-        let authtime = i64::from(ticket.authtime.unix_seconds());
-        let verdict = proof_at_tgs(self.cache, user, authtime);
-        self.no_fresh_proof(user, verdict, Door::KerberosTgs)
     }
 
     /// Kerberos counts in the directory's one table; an S4U2Self gets no notice, so never counts.
@@ -325,14 +321,10 @@ impl HostAdmission for KdcVerdict {
             return Ok(());
         };
         let door = tgs_door(q.kind);
-        let (detail, answer) = match self.judge_items(&user, door, peer, q.now) {
-            Err(refusal) => (refusal.detail(), REFUSED),
-            Ok(()) if !present(q.kind) => return Ok(()),
-            Ok(()) => match self.proof_at_tgs(&user, q.ticket) {
-                Some(detail) => (detail, proof_refusal()),
-                None => return Ok(()),
-            },
+        let Err(refusal) = self.judge_items(&user, door, peer, q.now) else {
+            return Ok(());
         };
+        let detail = refusal.detail();
         let by = || {
             let realm = String::from_utf8_lossy(q.ticket.crealm.as_bytes());
             Some(q.ticket.cname.unparse_with_realm_lossy(&realm))
@@ -351,7 +343,94 @@ impl HostAdmission for KdcVerdict {
             &detail,
             false,
         );
-        Err(answer)
+        Err(REFUSED)
+    }
+}
+
+/// The second factor at TGS: the presented ticket's authentication time lies in a window.
+pub(crate) struct SecondFactor {
+    realm: String,
+    cache: &'static PolicyCache,
+}
+
+impl SecondFactor {
+    pub(crate) const NAME: &'static str = "lldap_second_factor";
+
+    pub(crate) fn new(realm: &str, cache: &'static PolicyCache) -> Self {
+        Self {
+            realm: realm.to_owned(),
+            cache,
+        }
+    }
+
+    /// The ticket's client as the KDC finds it, an alias resolved, owned by the directory.
+    fn owes_a_proof(&self, store: &dyn PrincipalRead, ticket: &EncTicketPart) -> Option<UserId> {
+        if !proofs_live(self.cache) || ticket.crealm.as_bytes() != self.realm.as_bytes() {
+            return None;
+        }
+        let client = store.fetch_client(&ticket.cname).ok().flatten()?;
+        let user = user_of(&client, &self.realm).filter(|_| client.host_owned())?;
+        let authtime = i64::from(ticket.authtime.unix_seconds());
+        let verdict = kdc_verdict(self.cache, &user, proof_at_tgs(self.cache, &user, authtime));
+        (verdict == ProofVerdict::NoFreshProof).then_some(user)
+    }
+}
+
+impl KdcPolicy for SecondFactor {
+    fn name(&self) -> &'static str {
+        Self::NAME
+    }
+
+    fn check_as(
+        &self,
+        _store: &dyn PrincipalRead,
+        _client: &Principal,
+        _indicators: &[String],
+    ) -> Result<PolicyAdjustment, krb5_kdc::Error> {
+        Ok(PolicyAdjustment::default())
+    }
+
+    fn check_tgs(
+        &self,
+        _store: &dyn PrincipalRead,
+        _sname: &PrincipalName,
+        _indicators: &[String],
+    ) -> Result<PolicyAdjustment, krb5_kdc::Error> {
+        Ok(PolicyAdjustment::default())
+    }
+
+    // `_status` stays unset: a status word would replace the text the client is sent.
+    fn check_tgs_from(
+        &self,
+        _request: &KdcReqBody,
+        store: &dyn PrincipalRead,
+        _server: &Principal,
+        ticket: &EncTicketPart,
+        _indicators: &[String],
+        peer: Option<&HostAddress>,
+        _status: &mut Option<&'static str>,
+    ) -> Result<PolicyAdjustment, krb5_kdc::Error> {
+        let Some(user) = self.owes_a_proof(store, ticket) else {
+            return Ok(PolicyAdjustment::default());
+        };
+        let (door, peer) = (Door::KerberosTgs, peer.and_then(ip_of));
+        let detail = proof_detail(door);
+        record_kdc_row(
+            Some(&user),
+            user.as_str(),
+            door.log_kind(),
+            false,
+            peer,
+            &detail,
+            false,
+        );
+        let refusal = proof_refusal();
+        Err(krb5_kdc::Error::Protocol {
+            code: refusal.code,
+            text: refusal.e_text,
+            e_data: None,
+            detail: None,
+        })
     }
 }
 
@@ -360,7 +439,6 @@ pub(crate) mod tests {
     use super::*;
     use crate::embedded::EmbeddedKerberos;
     use crate::embedded::tests::{TempRealm, ask, synced};
-    use crate::policy::LiveClients;
     use crate::policy::tests::{tgs_body, ticket};
     use crate::seam::committing;
     use chrono::Utc;
@@ -1615,6 +1693,7 @@ pub(crate) mod tests {
         cache: &'static PolicyCache,
         counter: &'static Lockout,
         verdict: Arc<KdcVerdict>,
+        factor: Arc<SecondFactor>,
         pool: DatabaseConnection,
     }
 
@@ -1638,16 +1717,14 @@ pub(crate) mod tests {
         }
         fill_policy_cache(&handler, cache).await.unwrap();
         let verdict = Arc::new(KdcVerdict::on(REALM, cache, counter));
-        let mut opened = store.write().unwrap();
-        let plugins = &mut opened.policy.plugins;
-        plugins.set_host_admission(verdict.clone());
-        plugins.register_kdcpolicy(Arc::new(LiveClients));
-        drop(opened);
+        let factor = Arc::new(SecondFactor::new(REALM, cache));
+        crate::boot::install_judges(&mut store.write().unwrap(), verdict.clone(), factor.clone());
         Proving {
             handler,
             cache,
             counter,
             verdict,
+            factor,
             pool,
         }
     }
@@ -1898,9 +1975,67 @@ pub(crate) mod tests {
         );
     }
 
+    fn tgs_judged(
+        at: &Proving,
+        store: &SharedDump,
+        user: &str,
+        header: &PrincipalName,
+        kind: TgsKind,
+    ) -> Result<(), i32> {
+        let guard = store.read().unwrap();
+        let client = TgsClient::Found(guard.get_name(&name(user)).unwrap());
+        let krbtgt = PrincipalName::new(PrincipalName::NT_SRV_INST, ["krbtgt", REALM]);
+        let server = guard.fetch_name(&krbtgt).unwrap().unwrap();
+        let mut ticket = ticket(REALM, user);
+        ticket.cname = header.clone();
+        let request = tgs_body(&ticket);
+        let (subject, peer) = (name(user), peer());
+        let q = TgsQuestion {
+            client,
+            subject: &subject,
+            server: &server,
+            ticket: &ticket,
+            request: &request,
+            peer: Some(&peer),
+            now: 1_700_000_000,
+            kind,
+        };
+        at.verdict.check_tgs(&q).map_err(|r| r.code)?;
+        factor_asks(at, &*guard, &ticket)
+    }
+
+    fn factor_asks(
+        at: &Proving,
+        store: &dyn PrincipalRead,
+        ticket: &EncTicketPart,
+    ) -> Result<(), i32> {
+        let krbtgt = PrincipalName::new(PrincipalName::NT_SRV_INST, ["krbtgt", REALM]);
+        let server = store.fetch_name(&krbtgt).unwrap().unwrap();
+        let (request, peer) = (tgs_body(ticket), peer());
+        let mut status = None;
+        let factor = &at.factor;
+        let asked = factor.check_tgs_from(
+            &request,
+            store,
+            &server,
+            ticket,
+            &[],
+            Some(&peer),
+            &mut status,
+        );
+        asked.map(drop).map_err(|e| match e {
+            krb5_kdc::Error::Protocol { code, text, .. }
+                if status.is_none() && text.as_deref() == Some(PROOF_TEXT) =>
+            {
+                code
+            }
+            e => panic!("unexpected {e:?}, status {status:?}"),
+        })
+    }
+
     #[tokio::test]
     #[serial]
-    async fn test_at_tgs_the_tickets_authentication_time_decides_and_s4u_is_not_judged() {
+    async fn test_at_tgs_a_users_own_ticket_is_judged_by_its_authtime_whatever_the_kind() {
         let user = "e2kkinds";
         let (_temp, _embedded, store) = realm(&[user]).await;
         let at = proving(&store, &[user], "people", Some(MfaPolicy::Always), false).await;
@@ -1912,18 +2047,51 @@ pub(crate) mod tests {
             TgsKind::S4u2Self,
             TgsKind::S4u2Proxy,
         ];
-        let asked = || kinds.map(|kind| tgs_asks_of(&at.verdict, &store, Some(user), user, kind));
-        let before = asked();
+        let service = PrincipalName::new(PrincipalName::NT_SRV_HST, SERVICE.split('/'));
+        let asked =
+            |header: &PrincipalName| kinds.map(|kind| tgs_judged(&at, &store, user, header, kind));
+        let items = kinds.map(|kind| tgs_asks_of(&at.verdict, &store, Some(user), user, kind));
+        let before = [asked(&name(user)), asked(&service)];
         at.prove(user, 1_700_000_000 - 30, "").await;
         let refused = Err(PROOF_CODE);
         assert_eq!(
-            (before, asked()),
-            (
-                [refused, refused, refused, refused, Ok(()), Ok(())],
-                [Ok(()); 6]
-            ),
-            "a renewal, a validation, a service ticket and U2U ask the ticket's authentication \
-             time inside a window, long passed now; S4U2Self and S4U2Proxy are not judged"
+            (items, before, [asked(&name(user)), asked(&service)]),
+            ([Ok(()); 6], [[refused; 6], [Ok(()); 6]], [[Ok(()); 6]; 2]),
+            "the directory's verdict judges the items only. A renewal, a validation, a service \
+             ticket and U2U ask the ticket's authentication time inside a window, long passed \
+             now; so does an S4U request made with the user's own ticket, which 0.8.1 skipped: \
+             the policy hook is not told the request's kind. A service's ticket is not judged"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_the_second_factor_judges_only_a_principal_the_directory_owns() {
+        let (owned, foreign, unsynced) = ("e2kowned", "e2kforeign", "e2kunsynced");
+        let (temp, _embedded, store) = realm(&[owned]).await;
+        let foreign_name = name(foreign);
+        store
+            .write()
+            .unwrap()
+            .change_committing(committing(&*temp.own()), |s| {
+                s.insert_new_randkey(&foreign_name, REALM, &[], "test")
+            })
+            .unwrap()
+            .unwrap();
+        let users = [owned, foreign, unsynced];
+        let at = proving(&store, &users, "people", Some(MfaPolicy::Always), false).await;
+        let log = LogGuard::install_on_this_thread();
+        let asked = users.map(|user| {
+            let guard = store.read().unwrap();
+            factor_asks(&at, &*guard, &ticket(REALM, user))
+        });
+        let detail = proof_detail(Door::KerberosTgs);
+        let denied = peered(row(LogKind::AccessDenied, false, owned, &detail));
+        assert_eq!(
+            (asked, kdc_rows(&log)),
+            ([Err(PROOF_CODE), Ok(()), Ok(())], vec![denied]),
+            "each owes a proof; only the principal the directory owns is refused, with one row. \
+             One of the same name it does not own, or none, is left to the live-client check"
         );
     }
 
@@ -1943,7 +2111,7 @@ pub(crate) mod tests {
         at.handler.set_ou_policy("e2kafterou", id).await.unwrap();
         at.enrol(user).await;
         let asked = || {
-            let renewal = tgs_asks_of(&at.verdict, &store, Some(user), user, TgsKind::Renew);
+            let renewal = tgs_judged(&at, &store, user, &name(user), TgsKind::Renew);
             (as_asks_of(&at.verdict, &store, user, false), renewal)
         };
         let before = asked();

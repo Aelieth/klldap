@@ -100,7 +100,7 @@ async fn test_at_the_wire_the_authentication_time_decides_and_s4u_by_a_service_i
         ]
     };
     let refused = || -> Asked { Err(no_fresh_proof()) };
-    let judged = vec![refused(), refused(), Ok(()), Ok(())];
+    let judged = vec![refused(), refused(), refused(), Ok(())];
     let denied = row(
         LogKind::AccessDenied,
         false,
@@ -115,14 +115,15 @@ async fn test_at_the_wire_the_authentication_time_decides_and_s4u_by_a_service_i
     assert_eq!(
         (before, opened_later, covered),
         (
-            (judged.clone(), vec![denied.clone(); 2]),
-            (judged, vec![denied; 2]),
+            (judged.clone(), vec![denied.clone(); 3]),
+            (judged, vec![denied; 3]),
             (vec![Ok(()); 4], vec![])
         ),
-        "a service ticket and a renewal on a ticket from before the enrolment: 12 and the text, \
-         one row each; a window opened two minutes after the ticket does not cover it; one \
-         opened 30 s before does. User-to-user towards the service is not judged: the KDC asks \
-         about the second ticket's client. A service asking S4U2Self for the user is not judged"
+        "a service ticket, a renewal and user-to-user on a ticket from before the enrolment: 12 \
+         and the text, one row each; a window opened two minutes after the ticket does not \
+         cover it; one opened 30 s before does. User-to-user is judged on the asker's ticket, \
+         where 0.8.1 asked about the second ticket's client. A service asking S4U2Self for the \
+         user is not judged"
     );
 }
 

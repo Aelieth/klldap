@@ -82,19 +82,34 @@ pub(crate) struct OpenRealm {
 
 /// A marked client with no admission module is refused, so it goes in before the KDC serves.
 pub(crate) fn install_plugins(store: &mut PrincipalStore) {
-    store
-        .policy
-        .plugins
-        .register_kdcpolicy(Arc::new(LiveClients));
     #[cfg(not(feature = "test-admission"))]
-    let verdict = crate::admission::KdcVerdict::new(store.realm());
-    #[cfg(not(feature = "test-admission"))]
-    store.policy.plugins.set_host_admission(Arc::new(verdict));
+    {
+        let cache = lldap_domain_handlers::enforcement::policy_cache();
+        let verdict = crate::admission::KdcVerdict::new(store.realm());
+        let factor = crate::admission::SecondFactor::new(store.realm(), cache);
+        install_judges(store, Arc::new(verdict), Arc::new(factor));
+    }
     #[cfg(feature = "test-admission")]
-    store
-        .policy
-        .plugins
-        .set_host_admission(crate::admission_test::from_env());
+    {
+        let plugins = &mut store.policy.plugins;
+        plugins.register_kdcpolicy(Arc::new(LiveClients));
+        plugins.set_host_admission(crate::admission_test::from_env());
+    }
+}
+
+/// The second factor before the live client: a disabled user owing a proof is answered 12.
+#[cfg(any(test, not(feature = "test-admission")))]
+pub(crate) fn install_judges(
+    store: &mut PrincipalStore,
+    verdict: Arc<crate::admission::KdcVerdict>,
+    factor: Arc<crate::admission::SecondFactor>,
+) {
+    let plugins = &mut store.policy.plugins;
+    plugins.unregister_kdcpolicy(crate::admission::SecondFactor::NAME);
+    plugins.unregister_kdcpolicy(krb5_kdc::KdcPolicy::name(&LiveClients));
+    plugins.register_kdcpolicy(factor);
+    plugins.register_kdcpolicy(Arc::new(LiveClients));
+    plugins.set_host_admission(verdict);
 }
 
 pub(crate) fn open(settings: &RealmSettings, host: Arc<dyn Host>) -> Result<OpenRealm> {

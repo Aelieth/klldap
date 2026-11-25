@@ -253,7 +253,9 @@ ACL text, read at boot.
 - A deleted user's ticket requests are refused for every kind of request,
   delegation and user-to-user included. Renewals and service tickets keep their
   answer (code 18, `CLIENT_NOT_FOUND`); the refusal rows are described in
-  [logging.md](logging.md).
+  [logging.md](logging.md). A request whose subject's entry could not be read
+  is refused too (code 18, no text; the row says `the principal could not be
+  read`): MIT goes on with such a request.
 - Users in `lldap_disabled` have their principal disabled (`DISALLOW_ALL_TIX`).
   Leaving the group re-enables it. With the realm ready, the membership of a
   user with `kerberosSync`, its log row and the principal's status are written
@@ -461,7 +463,9 @@ KLLDAP answers each write to it:
 | `cpw` with fewer characters than the user's `password-min-length` (8 by default) | Refused. Characters are counted, not bytes. The minimum is read when kadmind prepares the change, waiting at most 2 seconds, and the commit holds the password to that same number. The `access_denied` row names `PASS_Q_TOOSHORT`. | `Password is too short` |
 | `cpw` while the user's minimum cannot be read | Refused, with nothing written. The minimum is read only when kadmind prepares the change, never under its lock; it can be tried again. The `access_denied` row says `PASS_Q_GENERIC: the password policy could not be read`. | `Unspecified password quality failure` |
 | `cpw` with a password that is not valid UTF-8, or with a NUL character | Refused | `Unspecified password quality failure` |
-| `cpw` kadmind could not prepare | Refused, before anything is derived or written; it can be tried again. The same refusal answers a `cpw` that met another change to the same principal at the same instant; run it again. The `access_denied` row says `PASS_Q_GENERIC: the change could not be prepared`. | `Unspecified password quality failure` |
+| `cpw` kadmind could not prepare | Refused, before anything is derived or written; it can be tried again. A `cpw` that meets another change to the same principal at the same instant is not refused: it is written, from the change prepared once. The `access_denied` row says `PASS_Q_GENERIC: the change could not be prepared`. | `Unspecified password quality failure` |
+| `cpw -e <types>` | Refused, with nothing derived or written, whatever the password: a directory user's key types are the realm's `supported_enctypes` and nothing else. MIT would store the types the client names. The `access_denied` row names `BAD_KEYSALTS`. | `Invalid key/salt tuples` |
+| a change that would leave a key of a type outside `supported_enctypes`, or a Kerberos policy name, on the principal | Refused when it is written. The row adds the cause: `BAD_KEYSALTS: a key type outside supported_enctypes`, or `PROTECT_PRINCIPAL: a Kerberos policy is named on the principal` (a policy name on a directory user's principal is cleared at the server's start). | `Invalid key/salt tuples`, or `Cannot change protected principal` |
 | `cpw -keepold`, `cpw -randkey`, `ktadd` | Refused | `Cannot change protected principal` |
 | `ktadd -norandkey` | Refused by kerber-rust itself: the keys are never read out. No log row is written. | ```Operation requires ``extract-keys'' privilege``` |
 | `modprinc -unlock` alone | Carried out by KLLDAP as the directory's unlock, in the change's own transaction: the user's lock is cleared, stamped with the server's clock (the unlock time kadmin sends is not read). Only the failure count, the unlock time and the modification stamp change on the principal. The keys and the password stay. | success |
@@ -662,7 +666,8 @@ The image sets `data_dir`, `admin_keytab` and `client_config`, and
 `/data/keytab/keycloak-http.keytab` and `/data/keycloak_config.toml`. Inside
 the image that environment overrides the same keys in the config file.
 
-`supported_enctypes` takes one type name per item. It accepts
+`supported_enctypes` is the only control of a directory user's key types: kadmin's
+`-e` is refused for such a principal (a deviation from MIT, above). `supported_enctypes` takes one type name per item. It accepts
 `aes256-cts-hmac-sha1-96`, `aes128-cts-hmac-sha1-96`,
 `aes256-cts-hmac-sha384-192` and `aes128-cts-hmac-sha256-128`. A family name
 such as `aes` or `default`, a `+` or `-` prefix, or two names in one item is

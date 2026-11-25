@@ -72,8 +72,11 @@ impl std::fmt::Display for KerberosLost {
     }
 }
 
+type HoldReply = oneshot::Sender<Result<bool, KerberosStoreError>>;
+
 enum Job {
     Load(oneshot::Sender<Result<LoadedRealm, KerberosStoreError>>),
+    Hold(HoldReply),
     Commit(
         Vec<HostRow>,
         RealmBatch,
@@ -171,6 +174,14 @@ impl KerberosStore for CommitterStore {
         let (tx, rx) = oneshot::channel();
         self.tx
             .blocking_send(Job::FillAliases(rows.to_vec(), tx))
+            .map_err(|_| stopped())?;
+        rx.blocking_recv().map_err(|_| stopped())?
+    }
+
+    fn realm_row_held(&self) -> Result<bool, KerberosStoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .blocking_send(Job::Hold(tx))
             .map_err(|_| stopped())?;
         rx.blocking_recv().map_err(|_| stopped())?
     }
@@ -370,6 +381,7 @@ async fn run(
 ) {
     let mut phase = open_phase(&pool, &timings, &lost_tx).await;
     let mut waiting = Vec::new();
+    let mut asking = Vec::new();
     loop {
         publish_unsettled(&unsettled_tx, &phase);
         let due = wake_time(&phase).is_some_and(|at| at <= Instant::now());
@@ -391,11 +403,15 @@ async fn run(
                 phase =
                     answer_load(&pool, phase, reply, &mut waiting, &lost_tx, timings.step).await;
             }
+            Incoming::Job(Job::Hold(reply)) => {
+                answer_hold(&phase, reply, &mut asking, &lost_tx);
+            }
             Incoming::Job(Job::Commit(host, batch, taken, reply)) => {
                 taken.store(true, Ordering::Release);
                 let watches = (&lost_tx, &unsettled_tx);
                 phase = commit_job(&pool, phase, &host, batch, reply, watches, &timings).await;
                 release_loads(&pool, &phase, &mut waiting, &lost_tx, timings.step).await;
+                release_holds(&phase, &mut asking, &lost_tx);
             }
             Incoming::Job(Job::Users(users, reply)) => {
                 let _ = reply.send(read_users(&pool, &users, timings.step).await);
@@ -418,16 +434,19 @@ async fn run(
             Incoming::Job(Job::Shutdown(reply)) => {
                 clear_held(&pool, &phase, timings.step).await;
                 cancel_loads(&mut waiting);
+                cancel_holds(&mut asking);
                 let _ = reply.send(());
                 break;
             }
             Incoming::Timer => {
                 phase = on_wake(&pool, phase, &timings, &lost_tx).await;
                 release_loads(&pool, &phase, &mut waiting, &lost_tx, timings.step).await;
+                release_holds(&phase, &mut asking, &lost_tx);
             }
             Incoming::Closed => {
                 clear_held(&pool, &phase, timings.step).await;
                 cancel_loads(&mut waiting);
+                cancel_holds(&mut asking);
                 break;
             }
         }
@@ -1557,6 +1576,53 @@ fn cancel_loads(waiting: &mut Vec<oneshot::Sender<Result<LoadedRealm, KerberosSt
     }
 }
 
+/// Whether this server holds the realm's row; None while it still looks for another holder.
+fn hold_answer(
+    phase: &Phase,
+    lost_tx: &watch::Sender<Option<KerberosLost>>,
+) -> Option<Result<bool, KerberosStoreError>> {
+    match phase {
+        Phase::Held(held) => Some(Ok(held.row)),
+        Phase::Lost => Some(Err(lost_answer(lost_tx))),
+        Phase::Starting { .. } | Phase::Watching { .. } => None,
+    }
+}
+
+fn answer_hold(
+    phase: &Phase,
+    reply: HoldReply,
+    asking: &mut Vec<HoldReply>,
+    lost_tx: &watch::Sender<Option<KerberosLost>>,
+) {
+    match hold_answer(phase, lost_tx) {
+        Some(answer) => {
+            let _ = reply.send(answer);
+        }
+        None => asking.push(reply),
+    }
+}
+
+fn release_holds(
+    phase: &Phase,
+    asking: &mut Vec<HoldReply>,
+    lost_tx: &watch::Sender<Option<KerberosLost>>,
+) {
+    if asking.is_empty() {
+        return;
+    }
+    if let Some(answer) = hold_answer(phase, lost_tx) {
+        for reply in asking.drain(..) {
+            let _ = reply.send(answer.clone());
+        }
+    }
+}
+
+fn cancel_holds(asking: &mut Vec<HoldReply>) {
+    for reply in asking.drain(..) {
+        let _ = reply.send(Err(stopped()));
+    }
+}
+
 fn store_err(err: KerberosSqlError) -> KerberosStoreError {
     match err {
         KerberosSqlError::Refused(reason) => KerberosStoreError::Refused(reason),
@@ -2115,6 +2181,81 @@ pub(crate) mod tests {
         let mut lost = handle.lost();
         assert_eq!(wait_lost(&mut lost).await, KerberosLost::Replaced);
         assert_eq!(hold(&db.other).await, (1, true));
+        handle.shutdown().await;
+    }
+
+    async fn hold_in_thread(store: Arc<dyn KerberosStore>) -> Result<bool, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(store.realm_row_held().map_err(|err| err.to_string()));
+        });
+        wait_thread(rx).await?
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_the_hold_question_waits_out_the_watch_and_tells_a_held_row_from_no_row() {
+        let _restore = Restore;
+        let long = Duration::from_secs(5);
+        let watch = Duration::from_millis(80);
+        let rows = [
+            ("a row that was not open is taken", Some(false), false, true),
+            ("a row left open, after the watch", Some(true), false, true),
+            ("the database has no realm row", None, false, false),
+            ("the realm's first commit made the row", None, true, true),
+        ];
+        for (row, open, commits, held) in rows {
+            let db = db().await;
+            if let Some(open) = open {
+                insert_realm(&db.pool, 5, open).await;
+            }
+            let started = Instant::now();
+            let handle = start_kerberos_committer_for(db.pool.clone(), long, long, watch, long);
+            if commits {
+                insert_alice(&db.pool).await;
+                commit_in_thread(batch()).await.unwrap();
+            }
+            let answer = hold_in_thread(kerberos_store()).await;
+            let waited = open != Some(true) || started.elapsed() >= watch;
+            assert_eq!((answer, waited), (Ok(held), true), "{row}");
+            handle.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_the_hold_question_answers_the_loss_when_another_server_holds_the_row() {
+        let _restore = Restore;
+        let db = db().await;
+        insert_realm(&db.pool, 5, true).await;
+        let long = Duration::from_secs(5);
+        let watch = Duration::from_millis(1000);
+        let handle = start_kerberos_committer_for(db.pool.clone(), long, long, watch, long);
+        commit_in_thread(batch())
+            .await
+            .expect_err("the watch has begun");
+        let txn = db.other.begin().await.unwrap();
+        heartbeat(&txn, 5).await.unwrap();
+        txn.commit().await.unwrap();
+        let err = hold_in_thread(kerberos_store()).await.unwrap_err();
+        assert_eq!(
+            err,
+            format!("Kerberos store failed: {}", KerberosLost::Occupied)
+        );
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_the_hold_question_answers_the_database_when_it_cannot_be_reached() {
+        let handle = spawn_committer(unreachable_postgres().await, short_timings());
+        let err = hold_in_thread(handle.store()).await.unwrap_err();
+        assert_eq!(
+            err,
+            format!(
+                "Kerberos store failed: {}",
+                KerberosLost::DatabaseUnreachable
+            )
+        );
         handle.shutdown().await;
     }
 

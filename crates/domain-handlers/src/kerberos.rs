@@ -166,6 +166,7 @@ pub trait KerberosSync: Send + Sync {
 const NOT_REGISTERED: &str = "Kerberos backend not registered";
 const NO_COMMIT: &str = "this Kerberos backend cannot commit a password";
 const NO_HOST_ROWS: &str = "this Kerberos store writes no directory rows";
+const NO_HOLD_ANSWER: &str = "this Kerberos store cannot say whether the realm's row is held";
 
 pub const USER_GONE: &str = "the user is gone";
 pub const KERBEROS_DISABLED: &str =
@@ -587,6 +588,11 @@ pub trait KerberosStore: Send + Sync {
     /// Why this server's last write is unknown while it still holds the realm.
     fn realm_unsettled(&self) -> Option<String> {
         None
+    }
+    /// Whether this server holds the realm's row, answered once its look for another holder has
+    /// ended; false: the database has no realm row to hold.
+    fn realm_row_held(&self) -> Result<bool, KerberosStoreError> {
+        Err(KerberosStoreError::NotReady(NO_HOLD_ANSWER.to_owned()))
     }
 }
 

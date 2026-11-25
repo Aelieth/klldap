@@ -112,3 +112,150 @@ if gexec sh -c "KRB5CCNAME=/tmp/gate_restore_cc kinit -kt /data/kadm5.keytab adm
 else
     p_bad "kinit -kt failed after the restore"
 fi
+
+# A second server on the gate's database while the gate's server holds the realm (W1): it watches
+# the realm for thirty-five seconds with no listener up, then exits naming the holder. With
+# force_ldap_user_pass_reset it first resets the admin's directory password without the realm.
+RW_PLAIN="${CONTAINER}-rwplain" RW_RESET="${CONTAINER}-rwreset"
+RW_SAID="another server holds the Kerberos realm in this database; this one wrote nothing and stops"
+RW_RAN="password ran without the Kerberos realm, because the Kerberos realm $REALM did not open: the directory password is the configured one"
+RW_ROW="admin password reset from the configuration"
+RW_SILENT="nothing listens on 17170 or 3890"
+RW_QUIET="" RW_CODE="" RW_SECS=0
+EXTRA_CONTAINERS+=("$RW_PLAIN" "$RW_RESET")
+EXTRA_VOLUMES+=("$RW_PLAIN-data" "$RW_PLAIN-kdc" "$RW_RESET-data" "$RW_RESET-kdc")
+
+# rw_up <name> [-e NAME=value ...]: a server with Kerberos on, on the gate's database, its volumes its own.
+rw_up() {
+    local name="$1"
+    shift
+    rw_down "$name"
+    LLDAP_JWT_SECRET="$JWT_SECRET" LLDAP_KEY_SEED="$KEY_SEED" LLDAP_LDAP_USER_PASS="$ADMIN_PASS" \
+        LLDAP_DATABASE_URL="$GATE_DATABASE_URL" t docker run -d --name "$name" --network "$NET" \
+        -v "$name-data:/data" -v "$name-kdc:/var/kerberos/krb5kdc" \
+        -e LLDAP_JWT_SECRET -e LLDAP_KEY_SEED -e LLDAP_LDAP_USER_PASS -e LLDAP_DATABASE_URL \
+        -e LLDAP_LDAP_BASE_DN="$BASE_DN" -e LLDAP_ENABLE_MFA=true -e LLDAP_VERBOSE=true "$@" \
+        "$GATE_IMAGE" >/dev/null 2>>"$D/second.err"
+}
+rw_down() {
+    docker rm -fv "$1" >/dev/null 2>&1
+    docker volume rm "$1-data" "$1-kdc" >/dev/null 2>&1
+}
+
+# rw_quiet <name>: while it runs, which of its HTTP and LDAP ports take a connection inside it.
+rw_quiet() {
+    local port open=""
+    if ! gexec_in "$1" bash -c : 2>/dev/null; then
+        echo "not running"
+        return
+    fi
+    for port in 17170 3890; do
+        gexec_in "$1" bash -c "</dev/tcp/127.0.0.1/$port" 2>/dev/null && open="$open $port"
+    done
+    if [ -n "$open" ]; then
+        echo "listening on$open"
+    else
+        echo "$RW_SILENT"
+    fi
+}
+
+# rw_second <name> [-e NAME=value ...]: started beside the holder and waited for. RW_QUIET is what
+# it answered fifteen seconds in; RW_CODE and RW_SECS are its exit; its log is <name>.log.
+rw_second() {
+    local name="$1" from
+    RW_QUIET="not started" RW_CODE="" RW_SECS=0
+    from="$(date +%s)"
+    rw_up "$@" || return 1
+    sleep 15
+    RW_QUIET="$(rw_quiet "$name")"
+    RW_CODE="$(timeout 120 docker wait "$name" 2>/dev/null)"
+    RW_SECS=$(($(date +%s) - from))
+    docker logs "$name" >"$D/$name.log" 2>&1
+}
+
+# rw_first: the gate's server still serves with its realm: healthy, the admin logs in, the keytab
+# kinits. Its two ports take rw_quiet's connection, which is that probe's control.
+rw_first() {
+    gexec /app/lldap healthcheck --config-file /data/lldap_config.toml >"$D/first-health.log" 2>&1 &&
+        gexec bash -c "</dev/tcp/127.0.0.1/17170 && </dev/tcp/127.0.0.1/3890" 2>>"$D/first-health.log" &&
+        TOKEN="$(gate_login 2>>"$D/first-health.log")" &&
+        gexec sh -c "KRB5CCNAME=/tmp/gate_rw_cc kinit -kt /data/kadm5.keytab admin/admin@$REALM" \
+            >"$D/first-kinit.log" 2>&1
+}
+
+# rw_watched <name>: nothing listened, it exited non-zero no sooner than the watch, and named the holder.
+rw_watched() {
+    [ "$RW_QUIET" = "$RW_SILENT" ] && [ -n "$RW_CODE" ] && [ "$RW_CODE" != 0 ] && [ "$RW_SECS" -ge 35 ] &&
+        grep -qF "$RW_SAID" "$D/$1.log"
+}
+
+rw_admin_sync() {
+    graphql '{ user(userId: "admin") { attributes { name value } } }' '{}' 2>/dev/null | python3 -c '
+import json, sys
+attrs = json.load(sys.stdin)["user"]["attributes"]
+vals = [",".join(a["value"]) for a in attrs if a["name"] == "kerberossync"]
+print(vals[0] if vals else "absent")' 2>/dev/null
+}
+
+# rw_reset_rows <mark>: the admin_bootstrap rows of a reset from the configuration after the marker.
+rw_reset_rows() {
+    graphql 'query($id: ID!) { logs(filter: {kinds: [ADMIN_BOOTSTRAP]}, afterId: $id, limit: 20) { detail } }' \
+        '{"id": "'"$1"'"}' 2>/dev/null | WANT="$RW_ROW" python3 -c '
+import json, os, sys
+print(sum(1 for row in json.load(sys.stdin)["logs"] if row.get("detail") == os.environ["WANT"]))' 2>/dev/null
+}
+
+rw_watch_row() {
+    local row="W1.second-watch" got
+    if ! rw_second "$RW_PLAIN"; then
+        p_bad "[$row] the second server did not start (see second.err)"
+        return
+    fi
+    got="at 15 s: $RW_QUIET; exit ${RW_CODE:-none} after ${RW_SECS}s"
+    if rw_watched "$RW_PLAIN" && rw_first; then
+        p_ok "[$row] a second server on the gate's database beside the holder: $got, its log says '$RW_SAID'; the gate's server stays healthy, logs the admin in and kinits"
+    else
+        p_bad "[$row] $got; want '$RW_SILENT', a non-zero exit after 35 s or more, '$RW_SAID' in $RW_PLAIN.log, and the gate's server healthy with its realm (see first-health.log, first-kinit.log)"
+    fi
+}
+
+rw_reset_row() {
+    local row="W1.second-reset" got mark sync rows
+    sync="$(rw_admin_sync)"
+    case "$sync" in
+    absent | 0) ;;
+    1)
+        p_skip "[$row] the gate's admin has Kerberos sync on, and the reset would turn it off for the phases after; not run"
+        return
+        ;;
+    *)
+        p_bad "[$row] the admin's kerberossync could not be read; not run"
+        return
+        ;;
+    esac
+    mark="$(log_mark)"
+    if ! rw_second "$RW_RESET" -e LLDAP_FORCE_LDAP_USER_PASS_RESET=always; then
+        p_bad "[$row] the second server did not start (see second.err)"
+        return
+    fi
+    got="at 15 s: $RW_QUIET; exit ${RW_CODE:-none} after ${RW_SECS}s"
+    if rw_watched "$RW_RESET" && grep -qF "$RW_RAN" "$D/$RW_RESET.log" && rw_first &&
+        rows="$(rw_reset_rows "$mark")" && [ "$rows" = 1 ]; then
+        p_ok "[$row] the same start with force_ldap_user_pass_reset=always: $got; its log says the reset ran without the realm, and '$RW_SAID'; one admin_bootstrap row '$RW_ROW'; the gate's server stays healthy, logs the admin in with the configured password and kinits"
+    else
+        p_bad "[$row] $got; admin_bootstrap rows '$RW_ROW' after the marker: ${rows:-unread}; want '$RW_SILENT', a non-zero exit after 35 s or more, '$RW_RAN' and '$RW_SAID' in $RW_RESET.log, one row, and the gate's server healthy with its realm"
+    fi
+}
+
+if [ "$GATE_DB" != postgres ]; then
+    p_skip "[W1.second-watch] two servers need one shared database; on $GATE_DB this row is not run"
+    p_skip "[W1.second-reset] two servers need one shared database; on $GATE_DB this row is not run"
+elif ! rw_first; then
+    p_bad "[W1.second-setup] the gate's server is not healthy with its realm before the rows (see first-health.log, first-kinit.log); not run"
+else
+    : >"$D/second.err"
+    rw_watch_row
+    rw_down "$RW_PLAIN"
+    rw_reset_row
+    rw_down "$RW_RESET"
+fi

@@ -723,12 +723,39 @@ pub fn require_settled(kind: LogKind, user: &UserId) -> Result<(), DomainError> 
         return Ok(());
     };
     let refused = unsettled_answer(&cause);
-    crate::logging::record_failure(kind, Some(user.as_str()), &refused.to_string());
+    let row = refusal_row(refused.to_string());
+    crate::logging::record_failure(kind, Some(user.as_str()), &row);
     Err(refused)
 }
 
 pub fn unsettled_answer(cause: &str) -> DomainError {
-    DomainError::KdcUnavailable(format!("{cause}; try again"))
+    DomainError::KdcUnavailable(refusal_text(cause, "try again"))
+}
+
+pub const OPENS_WITH_THE_REALM: &str = "the change will be possible when this server's realm opens";
+
+/// What every door tells a write refused for the realm's sake in directory-only; never `full`.
+pub fn closed_to_writes(full: &str) -> String {
+    let closed = RealmHealth::DirectoryOnly(full.to_owned());
+    let public = public_cause(&closed).unwrap_or_default();
+    format!("{public}; {OPENS_WITH_THE_REALM}")
+}
+
+/// A refusal for the realm's sake: `cause` and `then`; in directory-only, `closed_to_writes`.
+pub fn refusal_text(cause: &str, then: &str) -> String {
+    match kerberos_backend().directory_only() {
+        Some(full) => closed_to_writes(&full),
+        None => format!("{cause}; {then}"),
+    }
+}
+
+/// The row of a refusal that answered `said`: `said`; in directory-only, with the full cause.
+pub fn refusal_row(said: String) -> String {
+    let answer = |text: String| DomainError::KdcUnavailable(text).to_string();
+    match kerberos_backend().directory_only() {
+        Some(full) if said == answer(closed_to_writes(&full)) => answer(full),
+        _ => said,
+    }
 }
 
 pub const REALM_NOT_OPEN: &str = "the Kerberos realm did not open; the server log has the cause";
@@ -1213,28 +1240,36 @@ mod tests {
             Option<String>,
             Option<String>,
             Result<(), String>,
+            Option<&'static str>,
         );
+        const AGAIN: &str = "Kerberos KDC unavailable: down; try again";
+        const CLOSED: &str = "Kerberos KDC unavailable: the Kerberos realm did not open; the \
+            server log has the cause; the change will be possible when this server's realm opens";
         let down = || Some("down".to_owned());
-        let refused = || Err("Kerberos KDC unavailable: down; try again".to_owned());
+        let refused = |said: &str| Err(said.to_owned());
         let rows: [Row; 3] = [
-            ("ready", Arc::new(Up(true)), None, None, Ok(())),
+            ("ready", Arc::new(Up(true)), None, None, Ok(()), None),
             (
                 "admin-only",
                 degraded(DegradedMode::AdminOnly),
                 down(),
                 None,
-                refused(),
+                refused(AGAIN),
+                Some(AGAIN),
             ),
             (
                 "directory-only",
                 degraded(DegradedMode::DirectoryOnly),
                 None,
                 down(),
-                refused(),
+                refused(CLOSED),
+                Some("Kerberos KDC unavailable: down"),
             ),
         ];
         let bob = UserId::new("bob");
-        for (state, backend, unavailable, directory_only, settled) in rows {
+        for (state, backend, unavailable, directory_only, settled, row) in rows {
+            let logged = Arc::new(Rows::default());
+            crate::logging::set_log_sink(logged.clone());
             set_kerberos_backend(backend.clone());
             let got = (
                 backend.unavailable(),
@@ -1243,8 +1278,22 @@ mod tests {
                 require_settled(LogKind::UserCreate, &bob).map_err(|e| e.to_string()),
             );
             set_kerberos_backend(Arc::new(NoopKerberos::default()));
+            crate::logging::set_log_sink(Arc::new(crate::logging::NoopLogSink));
+            let details: Vec<_> = logged
+                .0
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.kind == LogKind::UserCreate)
+                .map(|e| e.detail.clone())
+                .collect();
             let want = (unavailable.clone(), directory_only, unavailable, settled);
-            assert_eq!(got, want, "{state}");
+            let kept = Vec::from_iter(row.map(|kept| Some(kept.to_owned())));
+            assert_eq!(
+                (got, details),
+                (want, kept),
+                "{state}: the answer, and the row with the full cause"
+            );
         }
     }
 

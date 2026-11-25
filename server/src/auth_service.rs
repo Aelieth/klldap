@@ -1461,7 +1461,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn test_a_synced_users_finish_is_one_transaction_and_takes_only_its_own_envelope() {
         let _backend = ONE_BACKEND.lock().await;
-        use lldap_domain_handlers::kerberos::{ANSWER_UNSETTLED, SYNC_CHANGED};
+        use lldap_domain_handlers::kerberos::{ANSWER_UNSETTLED, SYNC_CHANGED, closed_to_writes};
         use lldap_domain_handlers::password::PASSWORD_HAS_NUL;
         use lldap_test_utils::recording_log::LogGuard;
         const OPENED: &str = "Opened-pass-1";
@@ -1482,7 +1482,11 @@ pub(crate) mod tests {
         let starting = starting.to_string();
         let starting = starting.as_str();
         let unsettled = realm_not_ready(ANSWER_UNSETTLED).to_string();
-        let closed = realm_not_ready(DEGRADED_CAUSE).to_string();
+        let closed = format!("Kerberos KDC unavailable: {DEGRADED_CAUSE}");
+        let told = format!(
+            "`Kerberos KDC unavailable: {}`",
+            closed_to_writes(DEGRADED_CAUSE)
+        );
         let refused = Kdc::Answering(Err(CommitError::Refused(REFUSAL.to_owned())));
         let changed = Kdc::Answering(Err(CommitError::Refused(SYNC_CHANGED.to_owned())));
         let failed = Kdc::Answering(Err(CommitError::Failed("the batch".to_owned())));
@@ -1754,14 +1758,20 @@ pub(crate) mod tests {
             };
             let by = presenter("row-reader", false);
             let finish = finish_registration(&mock, &by, finish_body(envelope), the_key, open);
-            let got = with_actor(reader(), finish)
-                .await
-                .map_err(|e| error_to_http_response(e).status().as_u16());
+            let got = with_actor(reader(), finish).await;
+            let said = got.as_ref().err().map(ToString::to_string);
+            let got = got.map_err(|e| error_to_http_response(e).status().as_u16());
             let expected = match status {
                 200 => Ok(UserId::new("alice")),
                 status => Err(status),
             };
             assert_eq!(got, expected, "{row}");
+            let public = directory_only && sync;
+            assert_eq!(
+                (said.filter(|_| public), told.contains(DEGRADED_CAUSE)),
+                (public.then(|| told.clone()), false),
+                "{row}: in directory-only the answer has the public cause, the row the full one"
+            );
             assert_eq!(
                 opened.get(),
                 sync && envelope.is_some() && opens,

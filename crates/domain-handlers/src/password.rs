@@ -3,8 +3,8 @@ use crate::handler::PolicyBackendHandler;
 use crate::instant::Timestamp;
 use crate::kerberos::{
     CREATE_WITHOUT_SYNC, CommitError, Held, HostRow, KerberosState, KerberosSync, PasswordCommit,
-    SYNC_CHANGED, SYNC_OFF_FIRST, kerberos_backend, plain_password_refused, settled_state_of,
-    while_disabled,
+    SYNC_CHANGED, SYNC_OFF_FIRST, kerberos_backend, plain_password_refused, refusal_row,
+    refusal_text, settled_state_of, while_disabled,
 };
 use crate::logging::{self, LogKind};
 use crate::policies::{
@@ -263,7 +263,7 @@ pub fn record_unreported(kind: LogKind, user: &UserId, cause: &str) {
 pub fn record_failed(kind: LogKind, user: &UserId, error: &PasswordChangeError) {
     let detail = match error {
         PasswordChangeError::Unknown => UNKNOWN_ROW.to_owned(),
-        e => e.to_string(),
+        e => refusal_row(e.to_string()),
     };
     logging::record_failure(kind, Some(user.as_str()), &detail);
 }
@@ -276,7 +276,7 @@ pub fn refuse_unfinishable(user: &UserId) -> DomainError {
 }
 
 pub fn realm_not_ready(cause: &str) -> PasswordChangeError {
-    PasswordChangeError::Unavailable(format!("{cause}; {PASSWORD_NEEDS_THE_REALM}"))
+    PasswordChangeError::Unavailable(refusal_text(cause, PASSWORD_NEEDS_THE_REALM))
 }
 
 fn realm_ready(kind: LogKind, user: &UserId) -> Result<(), PasswordChangeError> {
@@ -823,7 +823,9 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_in_directory_only_a_plain_change_goes_on_and_a_synced_one_is_refused_first() {
-        use crate::kerberos::{DegradedKerberos, DegradedMode, NoopKerberos, set_kerberos_backend};
+        use crate::kerberos::{
+            DegradedKerberos, DegradedMode, NoopKerberos, closed_to_writes, set_kerberos_backend,
+        };
         use std::sync::Arc;
         let bob = UserId::new("bob");
         let turned_on = Deriving(
@@ -834,21 +836,44 @@ mod tests {
         let closed = DegradedKerberos::with_mode(realm, cause, DegradedMode::DirectoryOnly);
         set_kerberos_backend(Arc::new(closed));
         let (off, on, min) = (PasswordSync::Off, PasswordSync::On, PASSWORD_MIN_LENGTH);
-        let got = (
+        let plain = (
             change_password_everywhere(&Untouched, &bob, "Short-7", off, min).await,
             change_password_everywhere(&turned_on, &bob, "Eight-88", off, min).await,
-            change_password_everywhere(&Untouched, &bob, "Eight-88", on, min).await,
         );
+        let rows = Arc::new(Rows::default());
+        logging::set_log_sink(rows.clone());
+        let synced = change_password_everywhere(&Untouched, &bob, "Eight-88", on, min).await;
         set_kerberos_backend(Arc::new(NoopKerberos::default()));
+        logging::set_log_sink(Arc::new(logging::NoopLogSink));
         assert_eq!(
-            got,
+            plain,
             (
                 Err(PasswordChangeError::TooShort(8)),
                 Err(PasswordChangeError::SyncChanged),
-                Err(realm_not_ready("down")),
             ),
-            "a plain change passes to the rules, and the store's SYNC_CHANGED keeps its answer; \
-             a synced one is refused before anything is derived"
+            "a plain change passes to the rules, and the store's SYNC_CHANGED keeps its answer"
+        );
+        let logged: Vec<_> = rows
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|e| (e.kind, e.success, e.detail.clone().unwrap_or_default()))
+            .collect();
+        let told = closed_to_writes("down");
+        assert_eq!(
+            (synced, logged, told.contains("down")),
+            (
+                Err(PasswordChangeError::Unavailable(told)),
+                vec![(
+                    LogKind::PasswordChange,
+                    false,
+                    "Kerberos KDC unavailable: down".to_owned()
+                )],
+                false,
+            ),
+            "a synced one is refused before anything is derived: the public cause to the user, \
+             the full one in its row"
         );
     }
 

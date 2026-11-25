@@ -2502,7 +2502,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_each_life_step_with_kerberos_disabled_not_ready_or_unsettled() {
-        use lldap_domain_handlers::kerberos::{ANSWER_UNSETTLED, SYNC_OFF_FIRST};
+        use lldap_domain_handlers::kerberos::{ANSWER_UNSETTLED, SYNC_OFF_FIRST, closed_to_writes};
         use lldap_domain_handlers::password::realm_not_ready;
         use lldap_test_utils::recording_kerberos::{DEGRADED_CAUSE, DegradedGuard, NotReadyGuard};
         use lldap_test_utils::recording_log::LogGuard;
@@ -2636,18 +2636,19 @@ mod tests {
             ]
         };
         let directory_only = {
-            let password = realm_not_ready(DEGRADED_CAUSE).to_string();
-            let again = format!("Kerberos KDC unavailable: {DEGRADED_CAUSE}; try again");
+            let unavailable = |cause: &str| format!("Kerberos KDC unavailable: {cause}");
+            let told = unavailable(&closed_to_writes(DEGRADED_CAUSE));
+            let full = unavailable(DEGRADED_CAUSE);
             let refused = |step, kind, after| {
-                let logged = vec![failed(kind, &again)];
-                (step, Some(again.clone()), after, logged)
+                let logged = vec![failed(kind, &full)];
+                (step, Some(told.clone()), after, logged)
             };
             let membership = |step, kind| {
                 let logged = vec![done(kind), left_as(STATUS_LEFT_DIRECTORY_ONLY)];
                 (step, None, Some(true), logged)
             };
             let plain = |step, kind, after| (step, None, after, vec![done(kind)]);
-            let synced_password = vec![failed(LogKind::PasswordChange, &password)];
+            let synced_password = vec![failed(LogKind::PasswordChange, &full)];
             vec![
                 refused(Life::CreateSynced, LogKind::UserCreate, None),
                 plain(Life::CreateUnsynced, LogKind::UserCreate, Some(false)),
@@ -2656,7 +2657,7 @@ mod tests {
                 plain(Life::SyncKept, LogKind::UserUpdate, Some(true)),
                 (
                     Life::SyncedPassword,
-                    Some(password.clone()),
+                    Some(told.clone()),
                     Some(true),
                     synced_password,
                 ),
@@ -2705,8 +2706,10 @@ mod tests {
                         (e.kind, e.success, e.detail.filter(|_| shown))
                     })
                     .collect();
+                let public = state == "directory-only";
                 let answered = match (&got, &answer) {
                     (Ok(()), None) => true,
+                    (Err(e), Some(text)) if public => e == text && !e.contains(DEGRADED_CAUSE),
                     (Err(e), Some(text)) => e.contains(text.as_str()),
                     _ => false,
                 };

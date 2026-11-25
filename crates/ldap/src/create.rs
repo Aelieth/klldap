@@ -1183,25 +1183,27 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_a_synced_add_refused_for_the_realm_is_52_only_in_directory_only() {
+        use lldap_domain_handlers::kerberos::closed_to_writes;
         use lldap_test_utils::recording_kerberos::{DEGRADED_CAUSE, DegradedGuard};
-        let refused = || DomainError::KdcUnavailable(format!("{DEGRADED_CAUSE}; try again"));
+        let refused = |directory_only| {
+            DomainError::KdcUnavailable(match directory_only {
+                true => closed_to_writes(DEGRADED_CAUSE),
+                false => format!("{DEGRADED_CAUSE}; try again"),
+            })
+        };
         let rows = [
             (
                 false,
                 LdapResultCode::OperationsError,
-                format!("Could not create user: {:#?}", refused()),
+                format!("Could not create user: {:#?}", refused(false)),
             ),
-            (
-                true,
-                LdapResultCode::Unavailable,
-                format!("Kerberos KDC unavailable: {DEGRADED_CAUSE}; try again"),
-            ),
+            (true, LdapResultCode::Unavailable, refused(true).to_string()),
         ];
         for (directory_only, code, message) in rows {
             let mut mock = MockTestBackendHandler::new();
             mock.expect_create_user()
                 .times(1)
-                .return_once(move |_| Err(refused()));
+                .return_once(move |_| Err(refused(directory_only)));
             let ldap_handler = setup_bound_admin_handler(mock).await;
             let _kdc = match directory_only {
                 true => DegradedGuard::install_directory_only(),

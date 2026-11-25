@@ -247,7 +247,7 @@ pub mod tests {
         LdapBindCred, LdapBindResponse, LdapExtendedRequest, LdapOp, LdapResult as LdapResultOp,
     };
     use lldap_domain::types::{GroupDetails, GroupId, UserId, Uuid};
-    use lldap_domain_handlers::kerberos::{CommitError, SYNC_CHANGED};
+    use lldap_domain_handlers::kerberos::{CommitError, SYNC_CHANGED, closed_to_writes};
     use lldap_domain_handlers::password::{
         PASSWORD_CHANGE_IN_PROGRESS, RESULT_UNKNOWN, realm_not_ready,
     };
@@ -713,7 +713,10 @@ pub mod tests {
             (
                 Kdc::DirectoryOnly,
                 LdapResultCode::Unavailable,
-                realm_not_ready(DEGRADED_CAUSE).to_string(),
+                format!(
+                    "Kerberos KDC unavailable: {}",
+                    closed_to_writes(DEGRADED_CAUSE)
+                ),
             ),
             (
                 failed(CommitError::Busy),
@@ -761,8 +764,11 @@ pub mod tests {
     #[tokio::test]
     #[serial]
     async fn test_password_modify_answers_each_outcome_of_a_synced_change() {
+        use lldap_test_utils::recording_log::LogGuard;
         for (kdc, code, message) in kdc_rows() {
             let (guard, _offline, reached) = install(kdc.clone());
+            let log = LogGuard::install_on_this_thread();
+            let public = matches!(kdc, Kdc::DirectoryOnly);
             let mut mock = MockTestBackendHandler::new();
             mock.expect_get_user_details()
                 .returning(|uid| Ok(synced_user(uid)));
@@ -779,7 +785,7 @@ pub mod tests {
                 ldap_handler
                     .handle_ldap_message(password_modify_request("bob"))
                     .await,
-                Some(vec![make_extended_response(code, message)]),
+                Some(vec![make_extended_response(code, message.clone())]),
                 "{kdc:?}"
             );
             let ops = guard.map(|g| g.recorder().take_ops()).unwrap_or_default();
@@ -788,6 +794,14 @@ pub mod tests {
                 false => vec![],
             };
             assert_eq!(ops, expected, "{kdc:?}");
+            let full = format!("Kerberos KDC unavailable: {DEGRADED_CAUSE}");
+            let kept = log.recorder().take_events().into_iter();
+            let kept = kept.filter(|e| public && e.detail.as_deref() == Some(full.as_str()));
+            assert_eq!(
+                (kept.count(), public && message.contains(DEGRADED_CAUSE)),
+                (usize::from(public), false),
+                "{kdc:?}: in directory-only the full cause is in the row, not in the answer"
+            );
         }
     }
 

@@ -1794,15 +1794,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_a_user_change_refused_for_the_realm_is_a_field_error_with_its_text() {
+        use lldap_domain_handlers::kerberos::closed_to_writes;
         use lldap_domain_model::error::DomainError;
-        const REFUSED: &str = "the Kerberos realm did not open: test; try again";
+        use lldap_test_utils::recording_kerberos::DEGRADED_CAUSE;
         let queries = [
             r#"mutation { createUser(user: {id: "bob", email: "bob@example.com"}) { id } }"#,
             r#"mutation { updateUser(user: {id: "bob", displayName: "Bob"}) { ok } }"#,
             r#"mutation { deleteUser(userId: "bob") { ok } }"#,
         ];
         for query in queries {
-            let refused = || Err(DomainError::KdcUnavailable(REFUSED.to_owned()));
+            let told = closed_to_writes(DEGRADED_CAUSE);
+            let refused = || {
+                Err(DomainError::KdcUnavailable(closed_to_writes(
+                    DEGRADED_CAUSE,
+                )))
+            };
             let mut mock = MockTestBackendHandler::new();
             mock.expect_get_schema()
                 .returning(|| Ok(make_test_schema()));
@@ -1814,7 +1820,7 @@ mod tests {
                 .await
                 .unwrap();
             let messages: Vec<_> = errors.iter().map(|e| e.error().message()).collect();
-            let text = format!("Kerberos KDC unavailable: {REFUSED}");
+            let text = format!("Kerberos KDC unavailable: {told}");
             assert_eq!(messages, [text.as_str()], "{query}");
         }
     }
@@ -1964,11 +1970,12 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_set_user_password_answers_each_outcome_of_a_synced_change() {
-        use lldap_domain_handlers::kerberos::{CommitError, SYNC_CHANGED};
+        use lldap_domain_handlers::kerberos::{CommitError, SYNC_CHANGED, closed_to_writes};
         use lldap_domain_handlers::password::{
             PASSWORD_CHANGE_IN_PROGRESS, RESULT_UNKNOWN, realm_not_ready,
         };
         use lldap_test_utils::recording_kerberos::{DEGRADED_CAUSE, DegradedGuard};
+        use lldap_test_utils::recording_log::LogGuard;
         const REFUSAL: &str = "password policy: min_length 40";
         #[derive(Debug)]
         enum Kdc {
@@ -1989,7 +1996,10 @@ mod tests {
             ),
             (
                 Kdc::DirectoryOnly,
-                Some(realm_not_ready(DEGRADED_CAUSE).to_string()),
+                Some(format!(
+                    "Kerberos KDC unavailable: {}",
+                    closed_to_writes(DEGRADED_CAUSE)
+                )),
             ),
             (
                 failed(CommitError::Busy),
@@ -2011,6 +2021,8 @@ mod tests {
         ];
         for (kdc, error) in rows {
             let reached = matches!(kdc, Kdc::Answering(_));
+            let public = matches!(kdc, Kdc::DirectoryOnly);
+            let log = LogGuard::install_on_this_thread();
             let (guard, _offline) = match &kdc {
                 Kdc::Refusing => (Some(RecordingGuard::install_refusing(REFUSAL)), None),
                 Kdc::Offline => (None, Some(DegradedGuard::install())),
@@ -2047,6 +2059,16 @@ mod tests {
                 false => vec![],
             };
             assert_eq!(ops, expected, "{kdc:?}");
+            let full = format!("Kerberos KDC unavailable: {DEGRADED_CAUSE}");
+            let kept = log.recorder().take_events().into_iter();
+            let kept = kept.filter(|e| public && e.detail.as_deref() == Some(full.as_str()));
+            let leaked = errors.iter().map(|e| e.error().message());
+            let leaked = leaked.filter(|said| public && said.contains(DEGRADED_CAUSE));
+            assert_eq!(
+                (kept.count(), leaked.count()),
+                (usize::from(public), 0),
+                "{kdc:?}: in directory-only the full cause is in the row, not in the answer"
+            );
         }
     }
 

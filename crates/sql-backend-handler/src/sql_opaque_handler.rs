@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use lldap_auth::opaque;
 use lldap_domain::types::{GroupId, LoginOutcome, UserId};
-use lldap_domain_handlers::enforcement::{Attempt, Door, admit};
+use lldap_domain_handlers::enforcement::{Attempt, Door, admit, door_read};
 use lldap_domain_handlers::handler::{BindRequest, LoginHandler};
 use lldap_domain_handlers::instant::Timestamp;
 use lldap_domain_handlers::kerberos::{
@@ -497,7 +497,7 @@ impl LoginHandler for SqlBackendHandler {
             logging::record_as(Some(&name), LogKind::Bind, None, false, Some(NO_PASSWORD));
             return Err(invalid_credentials(&name));
         }
-        if self.is_user_disabled(&name).await? {
+        if door_read(self.is_user_disabled(&name)).await? {
             warn!(r#"Login attempt denied for disabled user "{}""#, &name);
             logging::record_as(
                 Some(&name),
@@ -517,7 +517,8 @@ impl LoginHandler for SqlBackendHandler {
             },
             _ => (password.as_str(), None),
         };
-        let Some(password_hash) = self.get_password_file_for_user(name.clone()).await? else {
+        let password_file = door_read(self.get_password_file_for_user(name.clone()));
+        let Some(password_hash) = password_file.await? else {
             debug!(r#"User "{}" doesn't exist or has no password"#, &name);
             logging::record_as(
                 Some(&name),
@@ -566,7 +567,7 @@ impl OpaqueHandler for SqlOpaqueHandler {
     ) -> Result<login::ServerLoginStartResponse> {
         let user_id = request.username;
 
-        if self.is_user_disabled(&user_id).await? {
+        if door_read(self.is_user_disabled(&user_id)).await? {
             warn!(
                 r#"OPAQUE login attempt denied for disabled user "{}""#,
                 &user_id
@@ -585,8 +586,7 @@ impl OpaqueHandler for SqlOpaqueHandler {
         }
 
         info!(r#"OPAQUE login attempt for "{}""#, &user_id);
-        let maybe_password_file = self
-            .get_password_file_for_user(user_id.clone())
+        let maybe_password_file = door_read(self.get_password_file_for_user(user_id.clone()))
             .await?
             .map(|bytes| {
                 opaque::server::ServerRegistration::deserialize(&bytes).map_err(|_| {
@@ -670,7 +670,7 @@ impl OpaqueHandler for SqlOpaqueHandler {
         )?)?;
 
         // Checked again in case login_start was bypassed.
-        if self.is_user_disabled(&username).await? {
+        if door_read(self.is_user_disabled(&username)).await? {
             warn!(
                 r#"OPAQUE login_finish denied for disabled user "{}""#,
                 &username
@@ -3030,6 +3030,54 @@ mod tests {
             ),
             "the value unreadable only after the starts: at the web finish the right proof gets \
              the failed proof, as one that does not verify does; only the row tells them apart"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_sign_in_whose_read_never_answers_is_given_up_at_the_bound_at_each_door() {
+        use crate::sql_lockout_handler::tests as doors;
+        use lldap_domain_handlers::enforcement::gave_up;
+        use lldap_domain_handlers::policies::POLICY_READ_WAIT;
+        const USER: &str = "r1held";
+        let log = LogGuard::install_on_this_thread();
+        let handler = doors::handler().await;
+        doors::user_in(&handler, USER, "r1ou").await;
+        let started = doors::start(&handler, USER, doors::RIGHT).await;
+        let finish = doors::finish_request(started, doors::RIGHT, None).unwrap();
+        let mut rng = rand::rngs::OsRng;
+        let begun = opaque::client::login::start_login(doors::RIGHT, &mut rng).unwrap();
+        let start = login::ClientLoginStartRequest {
+            username: UserId::new(USER),
+            login_start_request: begun.message,
+        };
+        q31_rows(&log, USER);
+        let bind = |meta| with_request(meta, doors::bind_as(&handler, USER, doors::RIGHT));
+        let held = handler.sql_pool.begin().await.unwrap();
+        let clock = std::time::Instant::now();
+        let signing_in = async {
+            tokio::join!(
+                bind(RequestMeta::ldap(None, None)),
+                bind(RequestMeta::http(None, None)),
+                async { handler.login_start(start).await.map(drop) },
+                async { handler.login_finish(finish).await.map(drop) },
+            )
+        };
+        let answers = tokio::time::timeout(POLICY_READ_WAIT * 2, signing_in).await;
+        let took = clock.elapsed();
+        held.rollback().await.unwrap();
+        let given_up = answers.map(|(ldap, simple, web_start, web_finish)| {
+            [ldap, simple, web_start, web_finish].map(|answer| answer.is_err_and(|e| gave_up(&e)))
+        });
+        assert_eq!(
+            (
+                given_up.ok(),
+                took >= POLICY_READ_WAIT,
+                q31_rows(&log, USER)
+            ),
+            (Some([true; 4]), true, Vec::new()),
+            "the LDAP bind, the simple login, the web start and the web finish, the one \
+             connection held: each is given up at the bound as a read that failed, with no row"
         );
     }
 }

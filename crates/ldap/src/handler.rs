@@ -22,6 +22,7 @@ use ldap3_proto::proto::{
 use lldap_access_control::AccessControlledBackendHandler;
 use lldap_auth::access_control::ValidationResults;
 use lldap_domain::types::UserId;
+use lldap_domain_handlers::enforcement::door_read;
 use lldap_domain_handlers::handler::{BackendHandler, LoginHandler};
 use lldap_domain_handlers::logging::{self, LogKind, NO_PASSWORD, RequestMeta, with_request};
 use lldap_mfa::without_password;
@@ -237,7 +238,7 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
             });
         }
         let inner = self.backend_handler.unsafe_get_handler();
-        if let Ok(user) = inner.get_user_details(&user_id).await {
+        if let Ok(user) = door_read(inner.get_user_details(&user_id)).await {
             let stored_ou = crate::attributes::get_user_ou(&user);
             let provided_ou =
                 match crate::dn::parse_distinguished_name(&request.dn.to_ascii_lowercase()) {

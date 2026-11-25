@@ -6,7 +6,7 @@ use crate::sql_totp_steps::{Mark, clear_used, mark_in, mark_used, refund, reserv
 use crate::sql_used_proofs::take_proof_id;
 use async_trait::async_trait;
 use lldap_domain::types::{MFA_TYPE_TOTP, TotpEnrollmentStart, UserId};
-use lldap_domain_handlers::enforcement::{UNREADABLE, mfa_item_matters, resolve_items};
+use lldap_domain_handlers::enforcement::{UNREADABLE, door_read, mfa_item_matters, resolve_items};
 use lldap_domain_handlers::handler::MfaBackendHandler;
 use lldap_domain_handlers::logging::{self, LogKind};
 use lldap_domain_handlers::mfa::{
@@ -274,7 +274,7 @@ impl SqlBackendHandler {
         kind: LogKind,
     ) -> Result<MfaRequirement> {
         let policy = self.door_policy(user_id, kind).await?;
-        self.requirement_under(policy, user_id).await
+        door_read(self.requirement_under(policy, user_id)).await
     }
 
     // Reserve before verifying, so a spent allowance cannot keep testing codes; a right code is

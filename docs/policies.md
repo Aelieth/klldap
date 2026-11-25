@@ -28,7 +28,8 @@ password. After a right password the OU's items are judged in this order: the lo
 `inactivity-days`, `allowed-networks`, `login-hours` (an item not read yet refuses first, as
 `policy: unreadable`). The first that refuses is the one the log row names, and the answer is a
 wrong password's. Only then is a code or an enrolment asked for, and with the code the items are
-judged again. Last, while the realm is degraded, only members of `lldap_admin` are let in
+judged again. Last, on a server whose realm did not open and which is admin-only, only members
+of `lldap_admin` are let in; a directory-only server lets everyone in
 ([kerberos.md](kerberos.md#when-the-realm-cannot-open)). At the web login the items are judged in
 the same order when the sign-in starts, and a refused user's sign-in fails as a wrong password's
 does. At Kerberos every item is judged before the password (error 18), then the second factor's
@@ -408,7 +409,8 @@ S4U2Proxy). Nobody is exempt, admins included.
 finish, a token refresh, or a ticket issued by kinit. Any proof of the password that the rules
 admit counts, a page's password check (a web login finish with `"session": false`) included.
 It is written beside the door's success row, after the last check that could still refuse, so a
-refused attempt, a wrong password and a refusal while Kerberos is unavailable write nothing. A
+refused attempt, a wrong password and a refusal on an admin-only server, whose realm did not
+open, write nothing. A
 token's use writes nothing (its refresh does), and neither does a renewal or a service ticket:
 give a client that only renews its tickets a limit longer than `renew_lifetime`. A service's
 request for a user (S4U2Self, S4U2Proxy) is judged but never counts, so a user who comes in only

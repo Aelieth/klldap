@@ -43,7 +43,9 @@ Environment=LLDAP_JWT_SECRET_FILE=/run/secrets/lldap-jwt-secret
 Environment=LLDAP_LDAP_USER_PASS_FILE=/run/secrets/lldap-ldap-user-pass
 
 
-# health check (the KDC bootstraps after the server is up, hence the start period)
+# health check (the start period covers the realm's first start). It passes a server whose
+# Kerberos realm did not open and which serves the directory alone; add --kerberos after
+# "healthcheck" to have it fail unless the realm serves.
 HealthCmd=/app/lldap healthcheck --config-file /data/lldap_config.toml
 HealthInterval=30s
 HealthRetries=3

@@ -37,6 +37,7 @@ a thirty-five-second watch.**
 - [Migrating from LLDAP](#migrating-from-lldap)
 - [Upgrading from KLLDAP 0.7.2](#upgrading-from-klldap-072)
 - [Upgrading from KLLDAP 0.8.0](#upgrading-from-klldap-080)
+- [Upgrading from KLLDAP 0.8.1](#upgrading-from-klldap-081)
 
 ### With Docker
 
@@ -56,7 +57,8 @@ The KDC listens on 1088 and kadmin on `127.0.0.1:1749`. Publish the KDC as `88:1
 1024, set on purpose, binds only where the engine lets any process bind a low port.
 Docker does. Podman does not, unless the container is given
 `--sysctl net.ipv4.ip_unprivileged_port_start=0` (untested). Elsewhere
-the server comes up degraded and says so. There is no reason to change the port
+the realm does not open, and the server comes up without it and says so
+([kerberos.md](kerberos.md#when-the-realm-cannot-open)). There is no reason to change the port
 inside the container; adjust the published port instead.
 
 With every capability dropped, add back `CHOWN`, `DAC_OVERRIDE`, `SETGID` and
@@ -65,7 +67,10 @@ With every capability dropped, add back `CHOWN`, `DAC_OVERRIDE`, `SETGID` and
 
 On the first start, in the image, the server creates the realm, writes
 `/data/kadm5.keytab` and `/data/krb5.conf`, and the healthcheck fails until the
-KDC is up. Tools inside the container use that `krb5.conf`, which carries the
+server answers, which it does once the KDC is up. The image's healthcheck
+passes a server whose realm did not open and which serves the directory alone;
+`lldap healthcheck --kerberos` is the check that fails unless the realm serves
+([kerberos.md](kerberos.md#health)). Tools inside the container use that `krb5.conf`, which carries the
 inner port. Clients outside use port 88. See [kerberos.md](kerberos.md).
 
 ```yaml
@@ -114,7 +119,7 @@ Rootless Podman on the standard image matches Docker on the default ports. The
 server runs as uid 1000, holds no capability, and owns UDP 1088. `UID` and
 `LLDAP_UID` behave as they do under Docker, and `--user` fails at `gosu`. A root
 start with every capability dropped needs the same four. A port below 1024, set
-on purpose, comes up degraded.
+on purpose, comes up without its realm.
 
 On the rootless image the same start is uid 1000 with no capability, with or
 without every capability dropped, and `UID` is ignored. A different user fails
@@ -123,7 +128,7 @@ is healthy as uid 1500 and holds no capability.
 
 Rootful Podman matches rootless Podman on both images. The default start is
 healthy as uid 1000, holds no capability, and owns UDP 1088. A port below 1024
-comes up degraded, as it does under rootless Podman and unlike Docker.
+comes up without its realm, as it does under rootless Podman and unlike Docker.
 
 ### Kubernetes, TrueNAS SCALE and package repositories
 
@@ -243,3 +248,31 @@ do not run 0.8.0 and 0.8.1 side by side. A 0.8.1 server that finds the Kerberos 
 left open watches it for thirty-five seconds before it takes it over. A 0.8.1
 holder stops serving within thirty seconds of the start of its last write that
 reached the database.
+
+### Upgrading from KLLDAP 0.8.1
+
+**The default for a server whose Kerberos realm does not open has changed.
+Until 0.8.1 such a server listened on loopback only and let in only members of
+`lldap_admin`. From 0.8.2 it serves LDAP and the web interface as configured,
+to every user, with Kerberos closed (`directory-only`).** Decide before the
+upgrade which you want:
+
+- To keep the old behaviour, set `kerberos_options.on_realm_failure =
+  "admin-only"` (`LLDAP_KERBEROS_OPTIONS__ON_REALM_FAILURE=admin-only`) before
+  the first 0.8.2 start.
+- With the default, users bind and sign in while the realm is closed. The KDC
+  and kadmin do not answer, a user with Kerberos sync cannot change a
+  password, and creating or deleting such a user and turning sync on or off
+  are refused (LDAP 52, HTTP 503) until the realm opens. Nothing is queued.
+- `/health` now answers a JSON object and 200 for such a server, and the
+  image's healthcheck calls it healthy. A monitor that relied on `/health`
+  answering 503, or on the container turning unhealthy, for a closed realm
+  must use `lldap healthcheck --kerberos`, which fails unless the realm
+  serves. A monitor that read the body of `/health` as text must read the
+  object.
+- A server stays `admin-only` whatever the key says when the realm's lockout
+  file is missing or unreadable, when the database has never held a realm, and
+  when it cannot learn that it holds the realm.
+
+A running server that loses its realm exits, as before. See
+[When the realm cannot open](kerberos.md#when-the-realm-cannot-open).

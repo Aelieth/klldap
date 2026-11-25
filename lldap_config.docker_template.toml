@@ -228,9 +228,9 @@ key_seed = "RanD0m STR1ng"
 ## To set these options from environment variables, use the following format
 ## (example with realm): LLDAP_KERBEROS_OPTIONS__REALM
 [kerberos_options]
-## Run Kerberos with the directory: directory writes wait for the KDC after boot, users with
-## kerberossync get principals, and the healthcheck also requires the KDC and the admin
-## keytab. Set false to run without a realm.
+## Run Kerberos with the directory: users with kerberossync get principals, and the
+## healthcheck of a ready realm also requires the KDC and the admin keytab. Set false to run
+## without a realm.
 #enabled = true
 ## The realm. Defaults to the domain of ldap_base_dn, uppercased (dc=example,dc=com gives
 ## EXAMPLE.COM).
@@ -278,7 +278,11 @@ key_seed = "RanD0m STR1ng"
 ## "directory-only": the directory serves everyone as configured, while the KDC and kadmin
 ## do not serve and every change that needs a Kerberos principal is refused.
 ## "admin-only": only admins may sign in, and LDAP, LDAPS and the web interface listen on
-## loopback only.
+## loopback only. Until 0.8.1 that was the only behaviour.
+## A server stays admin-only whatever is set here when the realm's lockout file is missing,
+## unreadable or not a lockout file, when the database has never held a realm, and when it
+## cannot learn that it holds the realm. /health answers 200 for directory-only;
+## "lldap healthcheck --kerberos" fails unless the realm serves.
 #on_realm_failure = "directory-only"
 ## The image sets these paths by ENV too; the code's defaults are relative to the working
 ## directory.

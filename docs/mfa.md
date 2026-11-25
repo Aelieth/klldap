@@ -118,8 +118,8 @@ not looked at.
 
 **A password check without a session.** `/auth/opaque/login/finish` takes an optional
 `"session": false`. That finish does what any finish does: it confirms the password, checks
-a code sent in `totp_code`, admits or refuses the user (while Kerberos is unavailable only
-admins are admitted, answered `503`), and mints a proof when asked. It makes no session: no
+a code sent in `totp_code`, admits or refuses the user (on an admin-only server, whose realm
+did not open, only admins are admitted, answered `503`), and mints a proof when asked. It makes no session: no
 token, no refresh token, no cookie. It writes one row at the door, the `login` success row
 or the refusal's, and an `account_lock` row when a wrong code it carries locks the user;
 every row it writes says `no session`, whatever the outcome. A verified finish answers

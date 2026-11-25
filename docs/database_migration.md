@@ -60,8 +60,9 @@ The three `kerberos_*`
 tables are the Kerberos realm. **The master-key file `.k5.<REALM>` in `kerberos_options.data_dir` must
 travel with the database.** Every realm record is sealed under it. If the
 database holds the realm and that file is missing, the realm does not open.
-The server comes up in the degraded state, and the cause says to restore the
-stash from the backup taken with the database. See
+The server comes up directory-only (or admin-only, as configured), and the
+cause in its log says to restore the stash from the backup taken with the
+database. See
 [When the realm cannot open](kerberos.md#when-the-realm-cannot-open).
 
 The directory's failed-login counts are the table `login_lockouts` (a lock is computed from a
@@ -69,8 +70,8 @@ count and the OU's policy), which the
 script dumps; it follows `users`. The other principals' failed-login counts live in the file
 `lockout` in that same directory.
 Copy it with the database. If the moved database holds the realm and the file
-is absent, the realm does not open. The server comes up in the degraded
-state, and the cause says the lockout file is missing; restore it, or create
+is absent, the realm does not open. The server comes up admin-only, whatever
+`on_realm_failure` says, and the cause says the lockout file is missing; restore it, or create
 an empty one to count failed logins from zero. A file that cannot be read or
 written, or that is not a kerber-rust lockout file, is the same case. An
 empty file counts from zero. See

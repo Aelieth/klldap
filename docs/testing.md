@@ -57,7 +57,8 @@ second factor, Kerberos lifecycle (principal, kinit, disable, re-enable), kadmin
 users, the KDC's verdict and its fresh-proof window,
 bootstrap idempotence, LDAP read and write matrices, Keycloak keytab export, the event
 log queries (rows with peers, per-actor summary and activity, the tail cursor, admin-only),
-restart persistence (directory data and the logs table), a realm that cannot open, LDAPS,
+restart persistence (directory data and the logs table), a realm that cannot open (admin-only and
+directory-only, with the web app's notice), LDAPS,
 password-reset mail, compressed requests, static files, the web app and the policies page in a
 headless browser, password length at each door and the password pages, and, when their
 inputs are given, migration boot, a password change killed

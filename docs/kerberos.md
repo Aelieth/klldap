@@ -41,12 +41,75 @@ policy, the container stays down.**
 
 If Kerberos is enabled and the realm does not
 open at startup (for example, the KDC port is taken, or the realm's database or
-directory cannot be read), the server starts in a degraded state instead of
+directory cannot be read), the server starts without the realm instead of
 exiting. So it does when the realm opens but reconciling its principals or its
 start pass fails: the server then still holds the realm (no other server takes
-it over until this one stops), and its KDC and kadmin do not serve. The same
-happens to a realm found lost before its KDC starts; the server then exits, as
-a server that loses the realm does. In the degraded state:
+it over until this one stops), and its KDC and kadmin do not serve.
+`kerberos_options.on_realm_failure`
+(`LLDAP_KERBEROS_OPTIONS__ON_REALM_FAILURE`) says what such a server goes on
+serving: `directory-only`, the default, or `admin-only`. Any other value
+refuses the start.
+
+**The default changed in 0.8.2. Until 0.8.1 a server whose realm did not open
+listened on loopback only and let in only members of `lldap_admin`. From 0.8.2
+it serves the directory to every user, as configured, with Kerberos closed.**
+To keep the old behaviour, set `on_realm_failure = "admin-only"` before the
+first 0.8.2 start. See
+[Upgrading from KLLDAP 0.8.1](install.md#upgrading-from-klldap-081).
+
+Neither state is entered by a running server. A server that loses its realm
+while it runs exits, as before, and so does one that finds the realm lost
+before its KDC starts; the restart then comes up as described here.
+
+#### directory-only
+
+The server holds the realm's row in the database, so no other server opens
+the realm beside it, and it serves the directory with Kerberos closed:
+
+- LDAP, LDAPS and the web interface listen as configured. The KDC and kadmin
+  do not answer.
+- Every user binds and signs in. Every policy is judged as always.
+- A change that touches no principal is made as usual: creating, changing and
+  deleting a user without `kerberosSync`, that user's password, groups,
+  memberships, OUs, policies, the schema, unlock and re-enable, two-factor
+  enrolment.
+- A change that needs a principal is refused, and nothing is written or
+  queued: a password change of a user with `kerberosSync` at every door,
+  creating a user with `kerberosSync`, turning `kerberosSync` on or off, and
+  deleting a user with `kerberosSync`. The answer is LDAP result 52
+  (unavailable), HTTP 503, or a GraphQL error, with one text: "Kerberos KDC
+  unavailable: the Kerberos realm did not open; the server log has the cause;
+  the change will be possible when this server's realm opens". It names no
+  file and no count. The refusal's log row keeps the full cause. The Keycloak
+  keytab export is refused too, and answers the admin with the cause.
+- A change of a synced user's `lldap_disabled` membership commits, and the
+  principal's status is left for the realm's next opening (see
+  [Principals](#principals)).
+- `/health` answers 200 and names the state. `lldap healthcheck` passes, and
+  `lldap healthcheck --kerberos` fails (see [Health](#health)).
+- The log says so once at start: "The Kerberos realm `<REALM>` is closed and
+  this server is directory-only (`<cause>`): the directory is served to
+  everyone, …". One `kerberos_sync` failure row says `directory-only:
+  <cause>`.
+- The web interface shows admins a notice with the state and the cause, and
+  the Kerberos sync switch is locked: a user is created without sync, and a
+  synced user's other attributes are still saved.
+
+A server configured `directory-only` stays `admin-only` in three cases, and
+logs "kerberos_options.on_realm_failure is directory-only, but this server
+stays admin-only: …" with the reason:
+
+- The realm's lockout file is missing, unreadable or not a lockout file (see
+  [The realm in the database](#the-realm-in-the-database)).
+- The database holds no Kerberos realm yet: the realm has never opened on it.
+  That is a first start that fails before the realm is written, an upgrade
+  from 0.7.2 without its dump, or an empty or wrong database beside an old
+  stash.
+- The server cannot learn that it holds the realm's row: another server holds
+  it, or the database did not answer. A server beside another holder then
+  exits, as below.
+
+#### admin-only
 
 - LDAP, LDAPS and the web interface listen on loopback only (`127.0.0.1`, or
   `::1` when the configured host is IPv6). The KDC and kadmin do not listen.
@@ -60,17 +123,52 @@ a server that loses the realm does. In the degraded state:
   changes are refused with "try again" (LDAP 52, HTTP 503), with or without
   `kerberosSync`, until the realm is repaired or Kerberos is disabled in the
   configuration.
-- `/health` answers 503 with the cause, and `lldap healthcheck` prints it and
-  fails.
-- The log names the cause: `the Kerberos realm <REALM> did not open: …`, or
-  `reconciling the principals of the Kerberos realm <REALM> failed: …`, or
-  `the start pass of the Kerberos realm <REALM> failed: …`. `/health` and the
-  forced reset's warning and `kerberos_sync` row name the same step.
+- `/health` answers 503 and names the state, and `lldap healthcheck` prints
+  that and fails.
+- In a container, loopback is the container's own, so reach the server with
+  `docker exec klldap /app/lldap healthcheck --config-file
+  /data/lldap_config.toml`.
+
+In both states the log names the cause: `the Kerberos realm <REALM> did not
+open: …`, or `reconciling the principals of the Kerberos realm <REALM>
+failed: …`, or `the start pass of the Kerberos realm <REALM> failed: …`. The
+forced reset's warning and `kerberos_sync` row name the same step.
 
 Fix the cause and restart. At startup the server tries the realm again and, if
-it opens, serves normally. Nothing in the product repairs the realm. In a
-container, loopback is the container's own, so reach the server with `docker
-exec klldap /app/lldap healthcheck --config-file /data/lldap_config.toml`.
+it opens, serves normally. Nothing in the product repairs the realm.
+
+#### Health
+
+`/health` answers one JSON object in every state: `{"kerberos": "<state>",
+"cause": "<text>"}`, without `cause` where there is none. The cause there is
+fit for an open endpoint: it names no file and no count. The full cause is in
+the server log, and admins read it in the web interface's notice and in
+`kerberosInfo.cause`.
+
+| State | Status | `cause` |
+|---|---|---|
+| `disabled` (Kerberos disabled in the configuration) | 200 | none |
+| `ready` | 200 | none |
+| `directory-only` | 200 | "the Kerberos realm did not open; the server log has the cause" |
+| `admin-only` | 503 | the same |
+| `unsettled` (the answer to the last Kerberos write is lost, see [Principals](#principals)) | 503 | "the answer to this server's last Kerberos write was lost and is not yet settled" |
+| `lost` (the realm was lost; the server is about to exit) | 503 | "the Kerberos realm was lost; the server log has the cause" |
+
+`lldap healthcheck` asks LDAP, LDAPS when enabled, and `/health`:
+
+- Without a flag it passes when the directory answers and `/health` answers
+  200: for `disabled`, `ready` and `directory-only`. For a `ready` realm it
+  also wants the KDC port to accept a connection and the admin keytab to
+  exist, as before. For a 503 it prints "503 Service Unavailable: Kerberos is
+  `<state>`: `<cause>`" and fails. **So the plain command, and the image's
+  HEALTHCHECK, no longer say that the realm serves: a directory-only server is
+  healthy.**
+- `lldap healthcheck --kerberos` also fails unless the state is `ready`:
+  "Healthcheck failed: --kerberos passes only a ready Kerberos realm, and this
+  server's is `<state>`". It takes the server's word over HTTP. Use it where a
+  monitor must know that Kerberos serves. It fails a server with Kerberos
+  disabled too. A flag of this name was removed in 0.8.0; it is back with this
+  meaning.
 
 ### The forced admin password reset
 
@@ -90,7 +188,8 @@ keys of `<admin>` from the configuration". When Kerberos cannot take part
 the realm fails), the reset runs without the realm: the directory password is
 the configured one, an admin with `kerberosSync` has the sync turned off in the
 same transaction, with one `kerberos_sync` row, and a warning at start says so.
-The server then starts, with the realm if it is usable and degraded if not.
+The server then starts, with the realm if it is usable and without it if not
+(see [When the realm cannot open](#when-the-realm-cannot-open)).
 When the reset with the realm failed and the realm is usable, the start pass
 runs again before the KDC serves, so the admin's old Kerberos password gets no
 ticket from this server at any moment. Otherwise the holder's status pass
@@ -104,14 +203,13 @@ the database stopped. The reset, like the first start's admin password, is
 written while the server starts, before it takes requests, and nothing orders
 it against another server's changes.
 
-`enabled` defaults to true, and the image no longer sets it. The container's
-healthcheck (`lldap healthcheck`) then also requires the KDC port to accept
-connections and the admin keytab to exist, otherwise the container reports
-unhealthy, and **directory writes (users, groups, passwords, attributes,
-settings) are refused with "Kerberos KDC unavailable" until the KDC has
-answered once after boot**, except `lldap_disabled` membership. Logins and
-reads are never gated. Set `enabled` to false to run without a realm: writes
-never wait and no principals are synced.
+`enabled` defaults to true, and the image no longer sets it. The server
+answers LDAP and HTTP only once the realm serves or the start has gone on
+without it, so no request meets a realm that is still starting. For a ready
+realm the container's healthcheck (`lldap healthcheck`) also requires the KDC
+port to accept connections and the admin keytab to exist; see
+[Health](#health) for what it says of a realm that did not open. Set `enabled`
+to false to run without a realm: no principals are synced.
 
 `admin/admin@REALM *` is always granted. `kadmin_acl` is optional extra
 ACL text, read at boot.
@@ -130,8 +228,8 @@ ACL text, read at boot.
   ADD, a synced user's directory record, Kerberos keys and `password_change`
   log row are written in one database transaction, so a stop at any point
   leaves both old or both new. Kerberos checks the password before anything is
-  written: a refusal is LDAP 53 (unwillingToPerform) or a GraphQL error, and an
-  offline KDC is 52 (unavailable), LDAP ADD included. A change that waits more
+  written: a refusal is LDAP 53 (unwillingToPerform) or a GraphQL error, and a
+  realm that did not open is 52 (unavailable), LDAP ADD included. A change that waits more
   than 10 s for another one is refused with 51 (busy) and writes nothing. If
   the database's answer to the commit is lost, KLLDAP reads the realm's
   generation back, and the read waits for the commit to finish. The change is
@@ -144,7 +242,7 @@ ACL text, read at boot.
   password change, turning `kerberosSync` on or off, creating or deleting a
   user with `kerberosSync`, and a change of such a user's `lldap_disabled`
   membership answer "try again" with one failure row, and `/health` answers
-  503 with the cause. Every user still binds and signs in, searches go on,
+  503 with the state `unsettled`. Every user still binds and signs in, searches go on,
   and other directory changes are made as usual. If the commit landed after
   all, this server stops serving the realm and exits; the next start loads it.
   It is unknown too if another server moved the generation meanwhile; this
@@ -164,9 +262,10 @@ ACL text, read at boot.
   other writes and reads the user's `kerberosSync` again first, so a switch
   turned on meanwhile is followed in the same transaction. A change of that
   membership is never refused because
-  Kerberos is disabled or not ready: with Kerberos disabled in the
-  configuration, or the realm not ready, the membership changes alone and a
-  `kerberos_sync` row says the principal's status is left for the start pass.
+  Kerberos is disabled or the realm did not open: with Kerberos disabled in
+  the configuration, or the server directory-only or admin-only, the
+  membership changes alone and a `kerberos_sync` row says the principal's
+  status is left for the start pass or for the realm's next opening.
   Whenever the realm opens, every principal the directory made (marked) for a
   user with `kerberosSync` takes its status from `lldap_disabled`, one
   `kerberos_sync` row for each principal changed ("disabled as the realm
@@ -192,9 +291,9 @@ ACL text, read at boot.
   principal.
 - Deleting a user with `kerberosSync`, and turning the switch off, change the
   directory and the principal in one database transaction: both change, or
-  neither, and one `user_delete` or `user_update` log row covers both. With the
-  KDC offline or starting they are refused, as every directory write is ("retry
-  shortly"). A change that finds the switch other than it read it writes
+  neither, and one `user_delete` or `user_update` log row covers both. On a
+  server whose realm did not open they are refused (see
+  [When the realm cannot open](#when-the-realm-cannot-open)). A change that finds the switch other than it read it writes
   nothing and answers "the user's Kerberos sync changed; try again"; so does a
   password change that finds the switch turned off when it commits, and a
   password change of a user without sync that finds it turned on: such a
@@ -295,8 +394,8 @@ ACL text, read at boot.
     shorter than the user's minimum, or with a NUL character, is refused (400),
     and nothing is written. With Kerberos disabled, the start refuses a user with
     `kerberosSync` (400, naming both ways on) and gives no key; with the realm
-    not ready it answers 503. The finish refuses the same before it opens the
-    envelope. Each refusal writes one `password_change` failure row.
+    closed or its last write unsettled it answers 503. The finish refuses the
+    same before it opens the envelope. Each refusal writes one `password_change` failure row.
   - A finish of a synced user without an envelope is refused (400, "reload the
     page and retry"): a page cached from an older version sends none.
   - Every start answer carries `password_min_length`, the user's minimum, and
@@ -309,8 +408,11 @@ ACL text, read at boot.
   - The key is 3072 bits, made anew at every start in the background; the log
     line "Made the 3072-bit RSA key in `<ms>` ms" gives the time, and a start
     that comes before it is ready waits for it. The `kerberosInfo` query
-    returns the same key, and `enabled`, false when the configuration disables
-    Kerberos. The create-user page reads it: with Kerberos disabled it shows no
+    returns the same key, `enabled`, false when the configuration disables
+    Kerberos, `state`, the realm's state as `/health` names it, for every
+    signed-in user, and `cause`, the full cause, for admins only. The pages
+    lock the Kerberos switch unless the state is `ready` or `disabled`. The
+    create-user page reads it: with Kerberos disabled it shows no
     Kerberos switch and sends no `kerberosSync` (if the page cannot read it, it
     shows the switch, and the server refuses a create with sync); otherwise the
     switch starts on. RSA-OAEP with SHA-256 seals at most 318 bytes, so the
@@ -566,7 +668,8 @@ When the first listed type changes, the next start gives `krbtgt/REALM`,
 the old ones, so tickets issued before the change still work. The old key
 versions are removed once `ticket_lifetime` plus `renew_lifetime` has passed,
 at a start or by the hourly cleanup. A roll that fails leaves the realm closed
-with the cause, as any realm that does not open. A user's own keys take the
+with the cause, as any realm that does not open: the server is then
+directory-only or admin-only. A user's own keys take the
 new types at that user's next password change.
 
 The old `LLDAP_KERB_*` variables are unknown. They warn at startup and are
@@ -581,8 +684,9 @@ The realm is rows in the directory database: `kerberos_realm`,
 `.k5.<REALM>` in `kerberos_options.data_dir` (default `krb5kdc`, and in the
 image `/var/kerberos/krb5kdc`). **Back up the database and that file
 together.** If the database holds the realm and the file is missing, the
-realm does not open. The server comes up in the degraded state, and the
-cause says to restore the stash from the backup taken with the database.
+realm does not open. The server comes up directory-only (or admin-only, as
+configured), and the cause in its log says to restore the stash from the
+backup taken with the database.
 See [When the realm cannot open](#when-the-realm-cannot-open).
 
 A first start also writes `.k5.<REALM>.bootstrap` beside the stash, and
@@ -624,9 +728,9 @@ within a moment of the next attempt: the one refused asks for the user's stored 
 next is answered by it.
 
 The failed sign-in counts of the other principals are the file `lockout` in the same directory. A missing
-file means the realm does not open. The server comes up in the degraded
-state, and the cause says the lockout file is missing; restore it, or create
-an empty one and sync it (`sync <file>`) to count failed logins from zero. A
+file means the realm does not open. The server comes up admin-only, whatever
+`on_realm_failure` says, and the cause says the lockout file is missing;
+restore it, or create an empty one and sync it (`sync <file>`) to count failed logins from zero. A
 file that cannot be read or written, or that is not a kerber-rust lockout
 file, is the same case: restore it, or put an empty file in its place and
 sync it. An empty file counts from zero. See
@@ -649,7 +753,15 @@ start that finds the realm left open waits out a thirty-five-second watch,
 five seconds past that. A second server pointed at the same database beside a
 live holder serves nothing: it answers no LDAP, HTTP or Kerberos request (it
 does not answer "try again"), waits out the watch, then exits and names the
-cause. A forced reset configured on it runs, without the realm, after the
+cause. That holds whether the holder serves its realm or is directory-only.
+With `on_realm_failure` at its default it also holds whatever stops the
+second server's own realm from opening: before it goes on directory-only a
+server asks whether it holds the realm's row, and that question is answered
+only when the watch has ended. A second server set to `admin-only` does not
+ask: if its own realm fails before it reads the realm from the database (0.7.2
+files without a dump, a data directory it cannot use, an unsafe SQLite
+durability setting), it comes up admin-only on loopback at once, and exits
+when the watch ends. A forced reset configured on it runs, without the realm, after the
 watch and before the exit.
 
 Every server on one database needs the same `kerberos_options.enabled`. A
@@ -662,15 +774,17 @@ realm; start once with Kerberos enabled, wait out the watch and stop cleanly
 to close it.
 
 Passwords are changed only by the server that holds the realm. With Kerberos
-enabled, a server whose realm is degraded, or that has just lost the realm,
+enabled, an admin-only server, or one that has just lost the realm,
 refuses every password change, with or without `kerberosSync`, before it
 derives, opens or writes anything. It answers "try again" (LDAP 52, HTTP 503,
 a GraphQL error) and writes one `password_change` failure row; a load
-balancer retries elsewhere. A server still watching beside a holder answers
+balancer retries elsewhere. A directory-only server holds the realm's row: it
+changes the password of a user without `kerberosSync`, and refuses that of a
+user with it, without "try again". A server still watching beside a holder answers
 nothing at all. The holder
 answers the same while the answer to its last write is lost and not yet
-settled. A server
-whose realm is degraded changes no password until the realm is repaired or
+settled. An admin-only server changes no password, and a directory-only one
+none of a user with `kerberosSync`, until the realm is repaired or
 Kerberos is disabled in the configuration. The forced reset of the admin is
 the one exception: it runs at start whatever the realm does.
 
@@ -769,8 +883,9 @@ Podman follows the steps below. Those steps are what the script does.
    brings kinit back. Or remove the principal with kadmin. A principal that
    names no directory user is left as it is.
 
-5. Without a dump the realm does not open. The server comes up in the degraded
-   state, the cause names the file to write, and nothing is moved. Write the
+5. Without a dump the realm does not open. The database holds no realm yet,
+   so the server comes up admin-only, whatever `on_realm_failure` says; the
+   cause in its log names the file to write, and nothing is moved. Write the
    dump (step 2) and start again. A dump for a realm other than
    `kerberos_options.realm`, or a dump without its stash, is refused the same
    way. A dump that names a principal which is only a user id, when that user
@@ -789,23 +904,24 @@ Podman follows the steps below. Those steps are what the script does.
 - `data_dir` lost, directory database intact (the default path is `krb5kdc`,
   and in the image `/var/kerberos/krb5kdc`): the stash `.k5.<REALM>` and the
   `lockout` file are gone, and the realm rows are still in the database. The
-  realm does not open. The server comes up in the degraded state, and the
-  cause says the stash is missing. Restore that file from the backup taken
-  with the database. With the stash back, a missing `lockout` file is its own
-  cause: restore it, or create an empty one and sync it (`sync <file>`) to
+  realm does not open. The server comes up directory-only (or admin-only, as
+  configured), and the cause says the stash is missing. Restore that file
+  from the backup taken with the database. With the stash back, a missing
+  `lockout` file is its own cause, and the server is then admin-only: restore
+  it, or create an empty one and sync it (`sync <file>`) to
   count failed logins from zero.
   A file that cannot be read or written, or that is not a kerber-rust lockout
   file, is the same case. See
   [When the realm cannot open](#when-the-realm-cannot-open).
 - The database has no realm, and `mit-db2.bak/` is still in `data_dir` without
-  the stash: the realm does not open. The server comes up in the degraded
-  state, and the cause names the backup, so a lost database is not silently
+  the stash: the realm does not open. The server comes up admin-only (the
+  database holds no realm), and the cause names the backup, so a lost database is not silently
   replaced by a new realm. Restore the database and the stash, or move
   `mit-db2.bak/` away to start a fresh realm.
 - `/data` lost: the directory database and `server_key` are gone, and with them
   the realm rows. If the stash is still in `data_dir`, the realm does not
-  open. The server comes up in the degraded state, and the cause says that
-  stash belongs to a realm the database does not hold. Restore the database,
+  open. The server comes up admin-only (the database holds no realm), and the
+  cause says that stash belongs to a realm the database does not hold. Restore the database,
   or put the 0.7.2 dump back beside the stash to run the import again. With
   nothing to restore and no 0.7.2 dump, moving the stash and the `lockout`
   file away is the last resort: the next start creates a new realm. Existing

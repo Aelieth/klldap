@@ -134,8 +134,10 @@ ENV KRB5_CONFIG=/data/krb5.conf \
 
 # Entry & health — pass --config-file explicitly (like upstream LLDAP) so the prepared
 # /data/lldap_config.toml (with key_seed, database_url pointing at the volume, etc.) is
-# always used for both the long-lived server and healthchecks. With Kerberos enabled, a
-# realm that is not serving turns the container unhealthy.
+# always used for both the long-lived server and healthchecks. The plain healthcheck passes a
+# server whose Kerberos realm did not open and which serves the directory alone
+# (directory-only); an admin-only server is unhealthy. "healthcheck --kerberos" is the command
+# that fails unless the realm serves.
 ENTRYPOINT ["tini", "--", "/docker-entrypoint.sh"]
 CMD ["run", "--config-file", "/data/lldap_config.toml"]
 HEALTHCHECK --start-period=90s --interval=30s --retries=3 \

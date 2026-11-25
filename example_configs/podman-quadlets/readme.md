@@ -1,7 +1,9 @@
 ## Installing the quadlet lldap user service
 
 These quadlets are upstream LLDAP's, adapted to the KLLDAP image (two volumes, the
-Kerberos ports and the healthcheck's Kerberos leg). The file publishes the KDC
+Kerberos ports and the healthcheck, which passes a server whose realm did not open and which
+serves the directory alone; add `--kerberos` to the `HealthCmd` to have it fail unless the realm
+serves). The file publishes the KDC
 as `88:1088` (tcp and udp). The server listens on 1088, and kadmin on
 `127.0.0.1:1749` is not published. This file has not been run.
 

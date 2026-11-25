@@ -30,8 +30,9 @@ that build on them; the terminal lines are LLDAP's usual output plus these event
 | `access_denied` | a GraphQL field or an LDAP operation refused for lack of rights, a rejected JWT (junk/`Invalid JWT`, `Expired JWT`, logged out, disabled account, wrong algorithm), a kadmin write refused on a directory user's principal ([kerberos.md](kerberos.md#kadmin-and-directory-users)), a Kerberos renewal, service ticket or S4U2Self refused on a directory policy, a ticket asked for a subject whose principal is gone (`the principal is gone`; protocol `kerberos`), or a non-admin's sign-in with the right password while Kerberos is unavailable (`only admins may sign in while Kerberos is unavailable`; at the LDAP bind `only admins may bind while Kerberos is unavailable`, target the user), which is then the attempt's only row: no `bind` or `login` success row | actor if known, detail = the refusal message. Like failed binds, the first 8 per client address and protocol are stored one-to-one; a flood past that coalesces into `access_denied_flood`. A kadmin refusal is never coalesced when the actor (the kadmin client) is not the target; one on the client's own principal coalesces per client |
 | `server_start`, `admin_bootstrap` | boot, admin created / password forced from the configuration | `system` |
 | `log_gap` | events dropped because the writer's queue overflowed | detail = how many |
-| `bind_flood` | brackets a flood of failed binds with detail `unknown user` or `no password given` (the two count together) from one client address and protocol: a `started` row the moment the source passes the first 8 failures, then a `resolved` row when it goes quiet (~20 s) or on shutdown | no actor; peer and protocol of the source; detail `unknown-user bind flood started`, then `unknown-user bind flood resolved: N binds, M names, Ds` (`M+` past 64), whichever of the two details the binds carry. An unpaired `started` = still ongoing |
-| `access_denied_flood` | brackets a flood of refusals from one client address and protocol (authenticated abuse or a junk-JWT spammer), or of one kadmin client's refusals on its own principal, the same way `bind_flood` does for binds | no actor (a kadmin flood: the client); peer and protocol of the source; detail `access-denied flood started`, then `access-denied flood resolved: N denials, M actors, Ds` (anonymous/junk-JWT counts as one actor) |
+| `bind_flood` | brackets a flood of failed binds with detail `unknown user` or `no password given` (the two count together) from one client address and protocol: a `started` row the moment the source passes the first 8 failures, then a `resolved` row when it goes quiet (~20 s) or on shutdown | no actor; protocol of the source; `peer` is the socket peer of the flood's first bind, `forwarded_for` the judged client address when it differs from that peer; detail `unknown-user bind flood started`, then `unknown-user bind flood resolved: N binds, M names, Ds` (`M+` past 64), whichever of the two details the binds carry. An unpaired `started` = still ongoing. With 4096 windows open, a further source is counted in one pair with no peer: `unknown-user bind flood from many sources started`, then `... from many sources resolved: N binds, S sources, Ds` |
+| `access_denied_flood` | brackets a flood of refusals from one client address and protocol (authenticated abuse or a junk-JWT spammer), or of one kadmin client's refusals on its own principal, the same way `bind_flood` does for binds | no actor (a kadmin flood: the client); protocol of the source, `peer` and `forwarded_for` as for `bind_flood`; detail `access-denied flood started`, then `access-denied flood resolved: N denials, M actors, Ds` (anonymous/junk-JWT counts as one actor); with 4096 windows open, `access-denied flood from many sources started` and `... from many sources resolved: N denials, S sources, Ds` |
+| `sign_in_flood` | brackets a flood of sign-ins refused before any credential was proved, each kind of row on its own: failed `bind` rows other than the two `bind_flood` counts, failed `login`, `token_refresh` (`invalid refresh token`), `password_reset_request` and `password_reset_complete` rows, from one client address and protocol, and for a known user from that address for that user ([Rows](#rows)): a `started` row at the ninth refusal, a `resolved` row when the window goes quiet (~20 s) or on shutdown. A row written after the password, the web login's proof, a held refresh token or Kerberos pre-authentication verified is never counted here | no actor; target = the user in a user's own window; protocol of the source, `peer` and `forwarded_for` as for `bind_flood`; detail `<kind> flood started`, then `<kind> flood resolved: N refusals, M names, Ds`, where `<kind>` is the kind of the rows (`bind`, `login`, `token_refresh`, `password_reset_request`, `password_reset_complete`); with 512 windows of one kind open, `<kind> flood from many sources started` and `... from many sources resolved: N refusals, S sources, Ds`, with no peer |
 
 Reserved for the coming Kerberos keytab / computer feature: `computer_create`,
 `computer_update`, `computer_delete`, `keytab_rotate` (`keytab_export` keeps
@@ -60,14 +61,44 @@ plus `admin_bootstrap`), `kerberos_sync delete` on every user delete.
 Deliberate missing rows: a successful `bind` repeated by the same actor over the same
 protocol from the same address within `bind_coalesce_seconds` (default 300) is printed but
 not stored — service accounts that bind every few seconds would otherwise fill the row
-budget. Failed binds against real accounts (other than `no password given`), other kinds and
-other addresses are always stored; the stored row is the first of each window, so "last seen"
-is at most one window early. Unknown-name bind failures and `no password given` binds are
-stored one-to-one only for the first 8 per address and protocol; past that, the burst is
-bracketed by a `bind_flood` `started` row and a `resolved` row (with the totals and
-duration) instead of one row per attempt, so a unique-name spray
-cannot push real history out of `max_entries`. Each source is one incident until it is quiet
-for ~20 s; a later burst from the same source is a separate incident.
+budget. The stored row is the first of each window, so "last seen" is at most one window
+early.
+
+A sign-in refused before any credential was proved is stored one-to-one only for the first 8
+of its flood window; past that, the burst is bracketed by a `started` row and a `resolved`
+row (with the totals and duration) instead of one row per attempt, so nobody without a
+password can push real history out of `max_entries`. A window holds one kind of row from
+one client address over one protocol: unknown-name and `no password given` binds together
+(`bind_flood`), every other failed `bind`, and failed `login`, `token_refresh`,
+`password_reset_request` and `password_reset_complete` rows, each on its own
+(`sign_in_flood`), and `access_denied` rows (`access_denied_flood`). The client address is
+the one `allowed-networks` judges ([Proxies and privacy](#proxies-and-privacy)): the socket
+peer, or behind a listed proxy the address taken from `X-Forwarded-For`. LDAP and Kerberos
+carry no forwarded address, so clients behind one application server or one NAT share an
+address. A window is one incident until it is quiet for ~20 s; a later burst is a separate
+incident.
+
+A refusal about a known user has a window for that user: `invalid credentials`, `locked
+out`, `account disabled` and `ou mismatch` at a bind; `locked out`, `account disabled` and a
+`policy: <item>` refusal when a web login starts; every refusal of a Kerberos sign-in (the
+KDC reports only existing principals); `account disabled` and `could not send email` at a
+reset request. So each known user's first 8 refusals from an address, of one kind over one
+protocol, are kept, for up to 16 users per address at a time; a further user's refusals from
+that address count in the address's own window, as do `policy: unreadable` refusals and the
+refusals that name no known user: an unknown name, a bad DN, a web login finish whose proof
+does not verify (whoever it names), a refresh token the server does not hold, a reset request
+for an unknown name, a wrong reset token.
+
+Always stored one-to-one: every success other than the repeated bind above; every `bind`,
+`login` and `token_refresh` row written after the password, the web login's proof, a held refresh token or Kerberos
+pre-authentication verified (a policy refusal after the right password, `totp code
+required`, every TOTP rejection, `mfa enrollment required`, `refused after
+pre-authentication`, a refresh refused for a held token); `account_lock`, `account_unlock`,
+`account_reenable` and every write by an admin; a kadmin refusal on another principal. At
+most 512 windows of one `sign_in_flood` kind are open at once (4096 for `bind_flood` and for
+`access_denied_flood`); a refusal that would open one more is counted in a single row pair
+for its kind and protocol, `... flood from many sources`, which keeps no row one-to-one and
+resolves like any window. No open window is closed to make room.
 
 ## Configuration
 
@@ -86,9 +117,9 @@ A longer history is `retention_days = 90`, `max_entries = 100000` (~150 bytes a 
 100000 rows are ~15 MB on SQLite). The effective horizon is the smaller of `retention_days`
 and `max_entries / rows per day`: with the defaults, 1666 rows a day already shorten it below
 30 days, and `logSummary(filter: {kinds: [BIND], success: true, since: "<yesterday>"},
-groupBy: [ACTOR])` shows who produces them. A unique-name bind flood no longer eats the
-horizon: past the first 8 per source it compresses to two `bind_flood` rows per incident
-(started + resolved), instead of thousands a second.
+groupBy: [ACTOR])` shows who produces them. A flood of sign-ins refused before a credential
+does not eat the horizon: past the first 8 of a window it compresses to two flood rows per
+incident (started + resolved), instead of thousands a second.
 
 Events never touch the database on the request path: they go through a bounded queue and
 are written in batches by one background task (one INSERT per batch; a trickle waits a
@@ -148,8 +179,8 @@ the given `id` (`"0"` for the beginning) — which is how another service tails 
 the last `id` seen, ask again with `afterId`, ids are assigned in order by a single writer
 so nothing is skipped — though after a burst, rows can still sit in the writer's queue for
 a few seconds (the tail fills in late), a `log_gap` row marks anything that was dropped, and
-a `bind_flood` incident shows a `started` row at once and its `resolved` row within ~20 s of
-the source going quiet. The GraphQL `LogKind` enum is the kinds this binary writes; reserved
+a flood incident (`bind_flood`, `sign_in_flood`, `access_denied_flood`) shows a `started` row
+at once and its `resolved` row within ~20 s of the source going quiet. The GraphQL `LogKind` enum is the kinds this binary writes; reserved
 `computer_*` / `keytab_rotate` rows (a newer binary, or the coming feature) are skipped when
 read, so a page can be shorter than `limit` — pass explicit `kinds` when tailing across
 such a downgrade.
@@ -189,8 +220,10 @@ in it, ready to be pasted into `since`/`until` to drill in):
 
 `kinds` defaults to `[BIND, LOGIN]` (the password-checking kinds a lockout counts); pass
 `[BIND, LOGIN, TOKEN_REFRESH, PASSWORD_RESET_COMPLETE]` for "is this account still used".
-`since` bounds all three fields. `failuresSinceLastSuccess` counts the failures recorded
-after `lastSuccess` (all failures in scope when there is none).
+`since` bounds all three fields. `failuresSinceLastSuccess` counts the failure rows stored
+after `lastSuccess` (all failure rows in scope when there is none). Past the first 8 of a
+flood window the failures are in the flood row's total, not in rows, so during a flood this
+number is lower than the failures sent; the counts a lockout judges are in `login_lockouts`.
 
 Every lookup is an index seek: `logs` has indexes on `timestamp` and on `actor`, `kind`,
 `target` and `peer` each paired with `timestamp`; a database already at v13 gets them at the
@@ -227,8 +260,14 @@ Limits to keep in mind:
 - Actors of failures are the *claimed* identity: an unknown name counts against nothing real,
   and a bind with an unparseable DN has no actor at all (the DN is the `target`) — and the
   table now says so: unknown names are `bind` rows with detail `unknown user`, then a
-  `bind_flood` `started`/`resolved` pair per source, so a name spray cannot bury the failures
-  of real accounts.
+  `bind_flood` `started`/`resolved` pair per source, in a window apart from the failed binds
+  of real accounts, so a name spray does not use up their rows.
+- A real account's failures are not all rows. Kept one-to-one: each known user's first 8
+  refusals per client address, protocol and kind of row in a flood window (for up to 16 users
+  per address at a time; past that, the address's first 8), and every failure after the
+  password or the proof verified (a wrong TOTP code, a policy refusal). Past the first 8 the
+  refusals are a count in a `sign_in_flood` row pair. What always remains per user is the one
+  `account_lock` row of each lock and the stored counts (`login_lockouts`).
 - `memberOf` is today's membership, not the membership at the time of the event.
 - Hours and days are UTC; `peer` behind a reverse proxy is the proxy (`forwarded_for` is the
   unverified header).
@@ -248,8 +287,9 @@ Limits to keep in mind:
 A locked user's refusal is a `bind`/`login` row with `success = false` and detail
 `locked out` (a token refresh or use: `token_refresh`/`access_denied`; a renewal or a
 service ticket: `access_denied`; an S4U2Self or an S4U2Proxy: `access_denied`, `locked out
-(S4U2Self by <service>)` or `locked out (S4U2Proxy by <service>)`), and the lock itself is one `account_lock` row. Refusals of one kind from one
-peer coalesce in a flood, as other failures do. A refusal by `login-hours`, `allowed-networks` or
+(S4U2Self by <service>)` or `locked out (S4U2Proxy by <service>)`), and the lock itself is one `account_lock` row. Past the first 8 of a
+flood window ([Rows](#rows)) the refusals written before a credential was proved are a count in
+a flood row pair, as other failures are. A refusal by `login-hours`, `allowed-networks` or
 `inactivity-days` is a row of the door's kind with the item and its reason, at every door:
 `policy: login-hours (outside login hours)`, `policy: allowed-networks (address not allowed)`,
 `policy: inactivity-days (inactive)`; for a service asking for the user the service follows, as
@@ -259,7 +299,8 @@ does not parse refuses as `policy: unreadable` ([policies.md](policies.md#login-
 for another policy: the detail `account expired`; rejected passwords are `password_change` rows
 with `success = false`.
 
-Each refused request writes its own row, so a client that asks again writes another. After a
+Each refused request writes its own row until its flood window has kept 8, so a client that
+asks again writes another. After a
 refused service ticket, `kvno` asks once more without referrals, so one refused `kvno` leaves
 two `access_denied` rows.
 
@@ -270,7 +311,9 @@ the client chain the proxy sent, unverified — decide what to trust when you re
 `trusted_proxies` set, `allowed-networks` judges the address its right-most rule takes from
 `X-Forwarded-For` ([allowed-networks.md](allowed-networks.md#whose-address)); the row still
 carries `peer` and `forwarded_for` as they came, so a refusal behind a proxy is read in
-`forwarded_for`. The log
+`forwarded_for`. The flood windows are keyed by that judged address. A flood row is the
+exception to "as they came": its `peer` is the socket peer of the window's first event and its
+`forwarded_for` is the judged address itself, set only when it differs from that peer. The log
 names accounts that were merely *tried* (unknown users, reset requests for unknown
 addresses), which is the point of it and also a reason to treat the table as sensitive.
 

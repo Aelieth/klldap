@@ -183,8 +183,9 @@ verify. A token refresh or use is refused. kinit, a renewal, a service ticket an
 S4U2Self for the user get error 18 (`CLIENT_REVOKED`, "Client's credentials have been
 revoked") before the KDC looks at any password; that is not the wrong-password answer (24),
 and anyone can see it without a password. An S4U2Self never counts. Nothing a locked user
-sends is counted. The reason is in the log: a `locked out` row for each refusal (refusals of
-the same kind from one peer coalesce in a flood, [logging.md](logging.md)), and one
+sends is counted. The reason is in the log: a `locked out` row for a refusal, kept for each
+user's first 8 from one client address at one kind of door and counted in a `sign_in_flood`
+row pair past that ([logging.md](logging.md#rows)), and always one
 `account_lock` row when a counted failure brings the stored count to the threshold. At LDAP
 bind and `/auth/simple/login` an empty password, or `:` and a code alone, is refused before
 the lock is read, locked or not: LDAP answers 53 (*unwillingToPerform*), `/auth/simple/login`
@@ -369,8 +370,10 @@ that answer shows that some rule refuses the user at that moment; it does not sa
 answers the same). Tickets already issued run out by themselves. S4U2Self and S4U2Proxy are not
 judged by the hours: a service asking for a user is not the user at a keyboard.
 
-Each refusal at a sign-in door is one row of the door's kind with the detail `policy:
-login-hours (outside login hours)` ([logging.md](logging.md)). A stored value that does not
+A refusal at a sign-in door is a row of the door's kind with the detail `policy:
+login-hours (outside login hours)` ([logging.md](logging.md)); the web login's start and
+kinit refuse before any password, so their rows are counted in a flood row pair past a
+user's first 8 ([logging.md](logging.md#rows)). A stored value that does not
 parse (one written to the database by hand, say) refuses the users it applies to as `policy:
 unreadable` at the doors that judge the hours, and the server logs one warning naming the
 policy and the item, again only when the value changes.

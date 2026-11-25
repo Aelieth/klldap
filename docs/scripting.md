@@ -127,6 +127,11 @@ You can use the token directly, either as a cookie, or as a bearer auth token
 (add an "Authorization" header with contents `"Bearer <token>"`).
 
 The JWT is valid for 1 day (unless you log out explicitly).
+A token from a password-reset link lives five minutes, as the link's cookie does, is taken only
+by the register start and finish of its user's password, and ends when that finish sets the
+password (at once on that server; on other servers sharing the database when they next start,
+as a logout does). Anywhere else, GraphQL included, it is answered as an invalid token (401
+`Invalid JWT`).
 You can use the refresh token to query `/auth/refresh` and get another JWT. The
 refresh token is valid for 30 days.
 

@@ -198,8 +198,9 @@ stored count, never in it, and counts at every door at once, so starts that are 
 lock the user as they come; such a lock gets its `account_lock` row when the starts join the
 stored count, about 10
 seconds after they began. A finish whose proof
-verifies removes its own start's +1, once, and changes nothing else; the same finish sent
-again finds nothing to remove. A sign-in that completes (the password and every factor
+verifies removes its own start's +1, once, and changes nothing else. A finish is taken once and
+within two minutes of its start: the same finish sent again, or a later one, is refused as a
+wrong password is, with its own `login` row, and counts nothing. A sign-in that completes (the password and every factor
 verified), at any door, also drops the user's starts made before it on that server, so a
 wrong web attempt before a right one never comes back, as a wrong bind before it does not; a
 finish that stops at "code required" drops nothing. A finish on a server that does not hold its

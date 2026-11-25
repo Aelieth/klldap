@@ -8,7 +8,7 @@ use lldap_domain_handlers::instant::{
 };
 use lldap_domain_handlers::lockout::LOCKED_OUT;
 use lldap_domain_handlers::logging::{
-    LogActivity, LogBucket, LogCursor, LogDimension, LogEvent, LogFilter, LogKind, LogRecord,
+    self, LogActivity, LogBucket, LogCursor, LogDimension, LogEvent, LogFilter, LogKind, LogRecord,
     LogSink, NO_PASSWORD, NoopLogSink, Protocol, flush_suppressed_warnings, set_log_sink,
 };
 use lldap_domain_model::{
@@ -27,10 +27,10 @@ use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::warn;
+use tracing::{info, warn};
 
 const MAX_PAGE: u32 = 1000;
 const QUEUE_CAPACITY: usize = 4096;
@@ -246,7 +246,7 @@ impl FloodWindow {
             detail: Some(detail),
             ..self.row.clone()
         };
-        warn!(target: "logs", "{event}");
+        logging::print(&event);
         event
     }
 
@@ -531,6 +531,29 @@ impl WriterCoalescers {
     }
 }
 
+/// A stretch of failed writes, said once when it starts and once when it ends.
+#[derive(Default)]
+struct Outage(Option<(Instant, u64)>);
+
+impl Outage {
+    fn failed(&mut self, rows: u64, e: &DbErr) {
+        match self.0.as_mut() {
+            Some((_, lost)) => *lost += rows,
+            None => {
+                warn!("Log events are not being stored ({e}); they are counted as dropped");
+                self.0 = Some((Instant::now(), rows));
+            }
+        }
+    }
+
+    fn ended(&mut self) {
+        if let Some((since, lost)) = self.0.take() {
+            let took = since.elapsed();
+            info!("Log events are stored again after {took:?}: {lost} lost");
+        }
+    }
+}
+
 // One INSERT per batch: a trickle lingers a moment to fill a batch, a full queue drains
 // back-to-back at insert speed. Dropped events surface as a log_gap row.
 async fn run_writer(
@@ -543,6 +566,7 @@ async fn run_writer(
 ) {
     let mut buffer = Vec::with_capacity(BATCH_SIZE);
     let mut inserted_since_trim = 0u64;
+    let mut outage = Outage::default();
     loop {
         // The tick lets an idle flood window resolve itself and the warn limiter flush even
         // when no new event is driving the loop.
@@ -575,11 +599,14 @@ async fn run_writer(
         rows.extend(floods.into_iter().map(to_active_model));
         let batch = rows.len() as u64;
         match insert_rows(&pool, rows).await {
-            Ok(()) => inserted_since_trim += batch,
+            Ok(()) => {
+                inserted_since_trim += batch;
+                outage.ended();
+            }
             Err(e) => {
                 // A failed batch counts as dropped, so the next gap row still accounts for it.
                 dropped.fetch_add(batch, Ordering::Relaxed);
-                warn!("Could not persist {batch} log events: {e}");
+                outage.failed(batch - u64::from(lost > 0), &e);
             }
         }
         if retention.max_entries > 0 && inserted_since_trim >= trim_interval(retention.max_entries)
@@ -603,8 +630,7 @@ fn trim_interval(max_entries: u64) -> u64 {
 }
 
 fn gap_event(lost: u64) -> LogEvent {
-    warn!(target: "logs", "❌ log_gap (system): dropped events: {lost}");
-    LogEvent {
+    let event = LogEvent {
         timestamp: Timestamp::now(),
         kind: LogKind::LogGap,
         success: false,
@@ -616,7 +642,9 @@ fn gap_event(lost: u64) -> LogEvent {
         detail: Some(format!("dropped events: {lost}")),
         source: None,
         proved: false,
-    }
+    };
+    logging::print(&event);
+    event
 }
 
 #[async_trait]
@@ -3079,5 +3107,83 @@ mod tests {
         drop(sink);
         task.await.unwrap();
         assert_eq!(rows(&pool).await.len(), 2, "0 stores every bind");
+    }
+
+    use lldap_domain_handlers::logging::capture::{BUDGET, Line, Lines};
+
+    #[test]
+    fn test_the_flood_rows_and_the_gap_row_print_within_the_failure_lines_budget() {
+        let (lines, _guard) = Lines::capture();
+        let mut flood = FloodCoalescer::new(FloodClass::UnknownBind, FLOOD_IDLE_SECONDS);
+        let base = at(1, 9, 0);
+        for source in 0..200 {
+            let peer = format!("10.0.0.{source}");
+            for i in 0..=FLOOD_PASS {
+                flood.keep(&unknown_bind(&format!("spray-{i}"), &peer, base));
+            }
+        }
+        let started = flood.flush(base, false).len();
+        gap_event(7);
+        let printed = lines.take_loud();
+        assert_eq!(
+            (started, printed.len()),
+            (200, BUDGET),
+            "200 windows start in one pass and a gap row follows: {printed:?}"
+        );
+    }
+
+    /// The loud lines so far, once `enough` says so of them or twenty seconds have passed.
+    async fn lines_until(lines: &Lines, seen: &mut Vec<Line>, enough: impl Fn(&[Line]) -> bool) {
+        for _ in 0..20_000 {
+            seen.extend(lines.take_loud());
+            if enough(seen) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn test_the_writer_says_an_outage_once_when_it_starts_and_once_when_it_ends() {
+        use sea_orm::Statement;
+        use tracing::Level;
+        let pool = get_initialized_db().await;
+        let (lines, _guard) = Lines::capture();
+        let rename = |from: &str, to: &str| {
+            let sql = format!("ALTER TABLE {from} RENAME TO {to}");
+            Statement::from_string(DbBackend::Sqlite, sql)
+        };
+        pool.execute(rename("logs", "logs_away")).await.unwrap();
+        let (sink, rx) = channel_sink(16);
+        let task = tokio::spawn(run_writer(
+            rx,
+            pool.clone(),
+            sink.dropped.clone(),
+            LogRetention::default(),
+            WriterCoalescers::new(0, FLOOD_IDLE_SECONDS),
+            Duration::from_millis(1),
+        ));
+        sink.record(event(LogKind::UserCreate, "bob", 0));
+        let gaps = |seen: &[Line]| seen.iter().filter(|l| l.text.contains("log_gap")).count();
+        let mut seen = Vec::new();
+        lines_until(&lines, &mut seen, |seen| gaps(seen) >= 10).await;
+        pool.execute(rename("logs_away", "logs")).await.unwrap();
+        let stored_again = |seen: &[Line]| seen.iter().any(|l| l.level == Level::INFO);
+        lines_until(&lines, &mut seen, stored_again).await;
+        drop(sink);
+        task.await.unwrap();
+        let own = seen.iter().filter(|l| l.target != "logs");
+        let own: Vec<_> = own.map(|l| (l.level, l.text.as_str())).collect();
+        let levels: Vec<_> = own.iter().map(|(level, _)| *level).collect();
+        assert_eq!(
+            levels,
+            vec![Level::WARN, Level::INFO],
+            "ten and more failed passes, then a good one: {own:?}"
+        );
+        let (started, ended) = (own[0].1, own[1].1);
+        assert!(
+            started.starts_with("Log events are not being stored (") && ended.ends_with(": 1 lost"),
+            "{own:?}"
+        );
     }
 }

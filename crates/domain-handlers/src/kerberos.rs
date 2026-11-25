@@ -573,6 +573,13 @@ impl std::fmt::Display for KerberosStoreError {
 
 impl std::error::Error for KerberosStoreError {}
 
+/// What a synced user's principal follows: `lldap_disabled`, and the code offered at kinit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SyncedStatus {
+    pub disabled: bool,
+    pub code_offered: bool,
+}
+
 pub trait KerberosStore: Send + Sync {
     fn load(&self) -> Result<LoadedRealm, KerberosStoreError>;
     fn commit(&self, batch: RealmBatch) -> Result<(), KerberosStoreError>;
@@ -596,8 +603,8 @@ pub trait KerberosStore: Send + Sync {
     fn user_synced(&self, _user: &UserId) -> Result<bool, KerberosStoreError> {
         Err(KerberosStoreError::NotReady(NO_HOST_ROWS.to_owned()))
     }
-    /// Each user with Kerberos sync and whether it is in `lldap_disabled`, in one read.
-    fn synced_statuses(&self) -> Result<Vec<(UserId, bool)>, KerberosStoreError> {
+    /// Each user with Kerberos sync and what its principal follows, in one read.
+    fn synced_statuses(&self) -> Result<Vec<(UserId, SyncedStatus)>, KerberosStoreError> {
         Err(KerberosStoreError::NotReady(NO_HOST_ROWS.to_owned()))
     }
     /// `start`, then each row name its alias rows lead to, at most `hops` further.

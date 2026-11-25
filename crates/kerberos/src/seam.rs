@@ -13,7 +13,7 @@ use lldap_domain::types::UserId;
 use lldap_domain_handlers::handler::PolicyBackendHandler;
 use lldap_domain_handlers::instant::Timestamp;
 use lldap_domain_handlers::kerberos::{
-    self as directory, AliasOnto, DIRECTORY_TARGET, DIRECTORY_USER, HostRow,
+    self as directory, AliasOnto, DIRECTORY_TARGET, DIRECTORY_USER, HostRow, SyncedStatus,
 };
 use lldap_domain_handlers::lockout::{UNLOCKED_BY_KADMIN, lock_clock, lockout};
 use lldap_domain_handlers::logging::{self, LogKind};
@@ -153,7 +153,7 @@ pub(crate) trait Host: KerberosStore {
     fn write_own(&self, change: HostChange, rows: Vec<HostRow>) -> Result<(), KerberosStoreError>;
     fn user_disabled(&self, user: &UserId) -> Result<bool, KerberosStoreError>;
     fn user_synced(&self, user: &UserId) -> Result<bool, KerberosStoreError>;
-    fn synced_statuses(&self) -> Result<Vec<(UserId, bool)>, KerberosStoreError>;
+    fn synced_statuses(&self) -> Result<Vec<(UserId, SyncedStatus)>, KerberosStoreError>;
     fn directory_users(&self, users: &[UserId]) -> Result<Vec<UserId>, KerberosStoreError>;
     /// Until the start pass has committed, only the bootstrap may come from outside.
     fn start_pass_committed(&self);
@@ -734,7 +734,7 @@ impl Host for SqlRealm {
         self.store.user_synced(user).map_err(store_error)
     }
 
-    fn synced_statuses(&self) -> Result<Vec<(UserId, bool)>, KerberosStoreError> {
+    fn synced_statuses(&self) -> Result<Vec<(UserId, SyncedStatus)>, KerberosStoreError> {
         self.store.synced_statuses().map_err(store_error)
     }
 
@@ -4325,6 +4325,7 @@ mod tests {
         use krb5_kdc::{AdminFields, KeyEntry, PrincipalStore};
         use lldap_auth::opaque::server::generate_random_private_key;
         use lldap_domain_handlers::handler::{BindRequest, LoginHandler};
+        use lldap_domain_handlers::kdc_code::{CODE_KEY, CODE_OFFER};
         use lldap_sql_backend_handler::SqlBackendHandler;
         use lldap_test_utils::recording_log::LogGuard;
 
@@ -4416,7 +4417,7 @@ mod tests {
         rows();
 
         let held = (host.load().unwrap(), record());
-        let on_bob: [Case; 16] = [
+        let on_bob: [Case; 17] = [
             (
                 "randkey",
                 Operation::Randkey,
@@ -4501,6 +4502,16 @@ mod tests {
                 nothing(),
                 Box::new(|s: &mut PrincipalStore| {
                     s.set_string_in(&bob, "EXAMPLE.COM", "note", Some("kadmin"), ADMIN)
+                }),
+                "set_string: PROTECT_PRINCIPAL",
+            ),
+            (
+                "setstring otp, the code's offer",
+                Operation::SetString,
+                &["bob"],
+                nothing(),
+                Box::new(|s: &mut PrincipalStore| {
+                    s.set_string_in(&bob, "EXAMPLE.COM", CODE_KEY, Some(CODE_OFFER), ADMIN)
                 }),
                 "set_string: PROTECT_PRINCIPAL",
             ),

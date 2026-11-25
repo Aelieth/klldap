@@ -11,6 +11,9 @@ pub const CODE_TYPE: &str = "klldap-totp";
 pub const WRONG_CODE: &str = "invalid totp";
 pub const CODE_UNREAD: &str = "totp: unreadable";
 pub const NOT_ASKED: &str = "no second factor asked";
+/// The principal's string that makes the KDC offer the code; it holds no secret.
+pub const CODE_KEY: &str = "otp";
+pub const CODE_OFFER: &str = r#"[{"type":"klldap-totp","indicators":["mfa"]}]"#;
 
 /// Exactly six ASCII digits, borrowed from the KDC's request: nothing else is ever read.
 pub struct KdcCode<'a>(&'a str);
@@ -226,6 +229,16 @@ mod tests {
             let cache = holding(server, facts);
             assert_eq!(code_asked(&cache, &UserId::new("E8KAsk")), asked, "{label}");
         }
+    }
+
+    #[test]
+    fn test_the_offer_names_the_verifier_and_the_mfa_indicator() {
+        let typed = format!(r#""type":"{CODE_TYPE}""#);
+        assert_eq!(
+            (CODE_KEY, CODE_OFFER.contains(&typed)),
+            ("otp", true),
+            "{CODE_OFFER}"
+        );
     }
 
     #[tokio::test]

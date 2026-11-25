@@ -1070,6 +1070,69 @@ pub(crate) mod tests {
         );
     }
 
+    fn hints(store: &SharedDump, svc: &Service, user: &str, armored: bool) -> Vec<i32> {
+        let mut request = krb5_protocol::as_req(name(user), REALM, nonce(), None).unwrap();
+        if !armored {
+            let e = decode::<KrbError>(&reply(store, &encode(&request).unwrap())).unwrap();
+            let data = e
+                .e_data
+                .map(|data| decode::<MethodData>(data.as_ref()).unwrap());
+            return data
+                .unwrap_or_default()
+                .iter()
+                .map(|p| p.padata_type)
+                .collect();
+        }
+        let sub = ProtocolKey::from_bytes(EncryptionType::Aes256CtsHmacSha196, &[0x53; 32]);
+        let sub = sub.unwrap();
+        let (ticket, session) = (svc.tgt.rep.0.ticket.clone(), &svc.tgt.session_key);
+        let realm = ascii(REALM);
+        let armor = build_fast_armor(ticket, session, &realm, &svc.name, Some(&sub)).unwrap();
+        let akey = armor_key(session, Some(&sub)).unwrap();
+        attach_fast(&mut request, &armor, &akey, Vec::new()).unwrap();
+        let outer = decode::<KrbError>(&reply(store, &encode(&request).unwrap())).unwrap();
+        let padata: MethodData = decode(outer.e_data.unwrap().as_ref()).unwrap();
+        let fast = unwrap_fast_rep(&akey, &Some(padata)).unwrap();
+        fast.padata.iter().map(|p| p.padata_type).collect()
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_the_kdc_offers_a_code_only_to_an_armored_ask_of_a_principal_with_the_offer() {
+        use lldap_domain_handlers::kdc_code::{CODE_KEY, CODE_OFFER};
+        let user = "e8koffer";
+        let (temp, _embedded, store) = realm(&[user]).await;
+        let svc = service(&temp, &store);
+        let _guard = EnforcementGuard::none();
+        let offer = |value: Option<&str>| {
+            store
+                .write()
+                .unwrap()
+                .change_committing(committing(&*temp.own()), |s| {
+                    s.set_string_in(&name(user), REALM, CODE_KEY, value, "test")
+                })
+                .unwrap()
+                .unwrap();
+        };
+        let offered = |armored| hints(&store, &svc, user, armored).contains(&pa::OTP_CHALLENGE);
+        let mut seen = vec![("no offer, armored", offered(true))];
+        offer(Some(CODE_OFFER));
+        seen.push(("the offer, armored", offered(true)));
+        seen.push(("the offer, a plain kinit", offered(false)));
+        offer(None);
+        seen.push(("the offer taken off, armored", offered(true)));
+        assert_eq!(
+            seen,
+            vec![
+                ("no offer, armored", false),
+                ("the offer, armored", true),
+                ("the offer, a plain kinit", false),
+                ("the offer taken off, armored", false),
+            ],
+            "the string only switches the offer; nothing is trusted from it"
+        );
+    }
+
     #[test]
     #[serial]
     fn test_an_otp_refusal_row_gives_the_verifiers_reason_once() {

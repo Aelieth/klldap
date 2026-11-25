@@ -19,10 +19,11 @@ use krb5_log::klog::{LogSink, Severity};
 use krb5_types::PrincipalName;
 use lldap_domain::types::UserId;
 use lldap_domain_handlers::enforcement::{CommitFollower, touched_users};
+use lldap_domain_handlers::kdc_code::{CODE_KEY, CODE_OFFER};
 use lldap_domain_handlers::kerberos::{
-    CommitError, Held, HostRow, KerberosSync, PasswordCommit, SYNC_CHANGED, UNREAD_AFTER_COMMIT,
-    USER_GONE as NO_USER_ROW, UserChange, UserStep, validate_kerberos_username,
-    validate_keytab_hostname,
+    CommitError, Held, HostRow, KerberosSync, PasswordCommit, SYNC_CHANGED, SyncedStatus,
+    UNREAD_AFTER_COMMIT, USER_GONE as NO_USER_ROW, UserChange, UserStep,
+    validate_kerberos_username, validate_keytab_hostname,
 };
 use lldap_domain_handlers::logging::{
     self, LogKind, current_request, record, record_outcome, with_request_sync,
@@ -72,6 +73,14 @@ pub(crate) const DISABLED_AT_TURN: &str =
 pub(crate) const ENABLED_AT_TURN: &str =
     "enabled by the holder's status pass: the user is not in lldap_disabled";
 pub(crate) const REMOVED_AT_TURN: &str = "removed by the holder's status pass";
+pub(crate) const OFFERED_AT_OPEN: &str =
+    "code at kinit offered as the realm opened: the user has a factor and turned it on";
+pub(crate) const WITHDRAWN_AT_OPEN: &str =
+    "code at kinit withdrawn as the realm opened: the user has no factor or turned it off";
+pub(crate) const OFFERED_AT_TURN: &str =
+    "code at kinit offered by the holder's status pass: the user has a factor and turned it on";
+pub(crate) const WITHDRAWN_AT_TURN: &str =
+    "code at kinit withdrawn by the holder's status pass: the user has no factor or turned it off";
 const USERS_UNREAD: &str = "the directory users of the marked principals were not read";
 
 /// What a pass writes; a pass that removes also takes out the principals of users gone or
@@ -80,17 +89,23 @@ const USERS_UNREAD: &str = "the directory users of the marked principals were no
 struct StatusRows {
     disabled: &'static str,
     enabled: &'static str,
+    offered: &'static str,
+    withdrawn: &'static str,
     removed: Option<&'static str>,
 }
 
 const AT_OPEN: StatusRows = StatusRows {
     disabled: DISABLED_AT_OPEN,
     enabled: ENABLED_AT_OPEN,
+    offered: OFFERED_AT_OPEN,
+    withdrawn: WITHDRAWN_AT_OPEN,
     removed: None,
 };
 const AT_TURN: StatusRows = StatusRows {
     disabled: DISABLED_AT_TURN,
     enabled: ENABLED_AT_TURN,
+    offered: OFFERED_AT_TURN,
+    withdrawn: WITHDRAWN_AT_TURN,
     removed: Some(REMOVED_AT_TURN),
 };
 pub(crate) const STATUSES_UNSET: &str = "the status of the marked principals was not set from \
@@ -1024,11 +1039,29 @@ impl Follow {
 #[derive(Clone, Copy)]
 enum Turn {
     Status(bool),
+    Offer(bool),
     Remove(&'static str),
 }
 
-/// Each marked principal of a synced user takes the user's `lldap_disabled`; `only` narrows it.
-/// Each chunk's rows commit with its statuses, so a later chunk's failure keeps them.
+struct Marked {
+    name: PrincipalName,
+    user: UserId,
+    locked: bool,
+    offer: Option<String>,
+}
+
+/// The `otp` string a principal carries; only the offer of the code is ever written there.
+fn offer_of(strings: &[(String, String)]) -> Option<&str> {
+    let offer = strings.iter().find(|(key, _)| key == CODE_KEY);
+    offer.map(|(_, value)| value.as_str())
+}
+
+fn offer_turn(offer: Option<&str>, offered: bool) -> Option<Turn> {
+    (offer != offered.then_some(CODE_OFFER)).then_some(Turn::Offer(offered))
+}
+
+/// Each marked principal of a synced user takes the user's `lldap_disabled` and code offer;
+/// `only` narrows it. Each chunk's rows commit with its changes: a later failure keeps them.
 fn follow_statuses(
     own: &Own,
     only: Option<&[PrincipalName]>,
@@ -1042,15 +1075,15 @@ fn follow_statuses(
     };
     let marked: Vec<_> = marked
         .into_iter()
-        .filter(|(name, _, _)| only.is_none_or(|only| only.contains(name)))
+        .filter(|one| only.is_none_or(|only| only.contains(&one.name)))
         .collect();
     let statuses = own.host.synced_statuses();
     let statuses = statuses.map_err(|e| anyhow!("{STATUSES_UNREAD}: {e}"))?;
-    let statuses: HashMap<UserId, bool> = statuses.into_iter().collect();
+    let statuses: HashMap<UserId, SyncedStatus> = statuses.into_iter().collect();
     let unsynced: Vec<_> = marked
         .iter()
-        .filter(|(_, user, _)| rows.removed.is_some() && !statuses.contains_key(user))
-        .map(|(_, user, _)| user.clone())
+        .filter(|one| rows.removed.is_some() && !statuses.contains_key(&one.user))
+        .map(|one| one.user.clone())
         .collect();
     let present: HashSet<UserId> = match unsynced.is_empty() {
         true => HashSet::new(),
@@ -1063,15 +1096,20 @@ fn follow_statuses(
     };
     let plan: Vec<_> = marked
         .into_iter()
-        .filter_map(|(name, user, locked)| {
-            let turn = match statuses.get(&user) {
-                Some(&disabled) if disabled != locked => Turn::Status(disabled),
-                Some(_) => return None,
-                None if rows.removed.is_none() => return None,
-                None if present.contains(&user) => Turn::Remove(NO_SYNC),
-                None => Turn::Remove(USER_GONE),
+        .flat_map(|one| {
+            let turns = match statuses.get(&one.user) {
+                Some(status) => {
+                    let (disabled, offered) = (status.disabled, status.code_offered);
+                    let status = (disabled != one.locked).then_some(Turn::Status(disabled));
+                    vec![status, offer_turn(one.offer.as_deref(), offered)]
+                }
+                None if rows.removed.is_none() => Vec::new(),
+                None if present.contains(&one.user) => vec![Some(Turn::Remove(NO_SYNC))],
+                None => vec![Some(Turn::Remove(USER_GONE))],
             };
-            Some((name, user, turn))
+            let Marked { name, user, .. } = one;
+            let turns = turns.into_iter().flatten();
+            turns.map(move |turn| (name.clone(), user.clone(), turn))
         })
         .collect();
     let mut followed = 0;
@@ -1098,6 +1136,19 @@ fn follow_statuses(
                         row.to_owned()
                     }
                     Turn::Status(_) => continue,
+                    Turn::Offer(offered)
+                        if offer_turn(offer_of(&p.string_attrs), offered).is_some() =>
+                    {
+                        let offer = offered.then_some(CODE_OFFER);
+                        s.set_string_in(name, &own.realm, CODE_KEY, offer, &own.actor)?;
+                        let row = if offered {
+                            rows.offered
+                        } else {
+                            rows.withdrawn
+                        };
+                        row.to_owned()
+                    }
+                    Turn::Offer(_) => continue,
                     Turn::Remove(_) if alias_of(s, &own.realm, user).is_some() => continue,
                     Turn::Remove(reason) => {
                         s.remove_in(name, &own.realm)?;
@@ -1132,7 +1183,7 @@ fn follow_statuses(
     Ok(followed)
 }
 
-fn marked_users(store: &PrincipalStore, realm: &str) -> Vec<(PrincipalName, UserId, bool)> {
+fn marked_users(store: &PrincipalStore, realm: &str) -> Vec<Marked> {
     store
         .ids()
         .iter()
@@ -1142,7 +1193,12 @@ fn marked_users(store: &PrincipalStore, realm: &str) -> Vec<(PrincipalName, User
             let one = (p.name.name_string.len() == 1)
                 .then(|| p.name.try_components_joined())
                 .flatten()?;
-            Some((p.name.clone(), UserId::new(&one), p.locked()))
+            Some(Marked {
+                name: p.name.clone(),
+                user: UserId::new(&one),
+                locked: p.locked(),
+                offer: offer_of(&p.string_attrs).map(str::to_owned),
+            })
         })
         .collect()
 }
@@ -1789,6 +1845,7 @@ pub(crate) mod tests {
         records: std::sync::Mutex<HashMap<String, Vec<u8>>>,
         fault: std::sync::Mutex<Option<Fault>>,
         disabled: std::sync::Mutex<Vec<String>>,
+        offered: std::sync::Mutex<Vec<String>>,
         sync: std::sync::Mutex<HashMap<String, bool>>,
         unread: AtomicBool,
         delay: std::sync::Mutex<Duration>,
@@ -1851,6 +1908,10 @@ pub(crate) mod tests {
         /// The sync the directory holds now, which a `SyncIs` row is checked against.
         pub(crate) fn set_sync(&self, user: &str, on: bool) {
             self.sync.lock().unwrap().insert(user.to_owned(), on);
+        }
+
+        pub(crate) fn set_offered(&self, users: &[&str]) {
+            *self.offered.lock().unwrap() = users.iter().map(|u| (*u).to_owned()).collect();
         }
 
         pub(crate) fn set_directory(&self, disabled: Option<&[&str]>) {
@@ -1972,15 +2033,20 @@ pub(crate) mod tests {
             Ok(self.sync.lock().unwrap().get(user.as_str()) == Some(&true))
         }
 
-        fn synced_statuses(&self) -> Result<Vec<(UserId, bool)>, KerberosStoreError> {
+        fn synced_statuses(&self) -> Result<Vec<(UserId, SyncedStatus)>, KerberosStoreError> {
             if self.unread.load(Ordering::Relaxed) {
                 return Err(unanswered_db());
             }
             let disabled = self.disabled.lock().unwrap().clone();
+            let offered = self.offered.lock().unwrap().clone();
             let sync = self.sync.lock().unwrap();
             let synced = sync.iter().filter(|(_, on)| **on);
+            let status = |user: &String| SyncedStatus {
+                disabled: disabled.contains(user),
+                code_offered: offered.contains(user),
+            };
             Ok(synced
-                .map(|(user, _)| (UserId::new(user), disabled.contains(user)))
+                .map(|(user, _)| (UserId::new(user), status(user)))
                 .collect())
         }
 
@@ -2621,6 +2687,114 @@ pub(crate) mod tests {
             ),
             (0, Err(true), 1, Some((true, true))),
             "a second opening writes nothing; an unread directory changes nothing"
+        );
+    }
+
+    fn offer(store: &SharedDump, user: &str) -> Option<String> {
+        let guard = store.read().unwrap();
+        let principal = guard.get_name(&user_principal(&UserId::new(user)))?;
+        offer_of(&principal.string_attrs).map(str::to_owned)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_each_marked_principal_carries_the_code_offer_its_user_asks_and_nothing_else() {
+        let guard = LogGuard::install_on_this_thread();
+        let temp = TempRealm::new();
+        let (embedded, store) = temp.embedded();
+        let users = ["ann", "ben", "cy", "dee"];
+        for user in users {
+            synced(&embedded, &UserId::new(user), "A-Password-1")
+                .await
+                .unwrap();
+        }
+        unmarked(&embedded, "eve", false);
+        let foreign = r#"[{"type":"radius"}]"#;
+        let ben = user_principal(&UserId::new("ben"));
+        in_change(&embedded.own(), |s| {
+            s.set_string_in(&ben, "EXAMPLE.COM", CODE_KEY, Some(foreign), "test")
+        })
+        .unwrap();
+        for user in ["ann", "ben", "cy", "dee", "eve"] {
+            temp.host.set_sync(user, true);
+        }
+        temp.host.set_directory(Some(&["dee"]));
+        temp.host.set_offered(&["ann", "dee", "eve"]);
+        guard.recorder().take_events();
+        let (writes, logged) = (temp.own_writes(), temp.host.logged().len());
+        let offers = || ["ann", "ben", "cy", "dee", "eve"].map(|user| offer(&store, user));
+        let row = |user: &str, detail: &str| {
+            let user = Some(user.to_owned());
+            (LogKind::KerberosSync, user, Some(detail.to_owned()))
+        };
+        let offered = Some(CODE_OFFER.to_owned());
+
+        let opened = follow_statuses(&embedded.own(), None, 2, AT_OPEN).unwrap();
+        let rows = temp.host.logged().split_off(logged);
+        let plain = kinit_code(&store, "ann", "A-Password-1");
+        assert_eq!(
+            (opened, temp.own_writes() - writes, offers(), rows, plain),
+            (
+                4,
+                2,
+                [offered.clone(), None, None, offered.clone(), None],
+                vec![
+                    row("ann", OFFERED_AT_OPEN),
+                    row("ben", WITHDRAWN_AT_OPEN),
+                    row("dee", DISABLED_AT_OPEN),
+                    row("dee", OFFERED_AT_OPEN),
+                ],
+                0
+            ),
+            "the offer exactly where the user asks it, another value taken off, an unmarked \
+             principal untouched, a principal changed twice in one pass; a plain kinit as before"
+        );
+
+        let again = follow_statuses(&embedded.own(), None, 2, AT_OPEN).unwrap();
+        temp.host.set_offered(&["dee"]);
+        let logged = temp.host.logged().len();
+        let queued = Arc::new(AtomicBool::new(true));
+        embedded.follow().statuses_in(queued, AT_TURN, 2).await;
+        let rows = temp.host.logged().split_off(logged);
+        assert_eq!(
+            (again, offers(), rows, guard.recorder().take_events().len()),
+            (
+                0,
+                [None, None, None, offered, None],
+                vec![row("ann", WITHDRAWN_AT_TURN)],
+                0
+            ),
+            "a second opening writes nothing; the turn withdraws a choice turned off"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_the_start_pass_offers_the_code_to_each_principal_it_marks() {
+        let temp = TempRealm::new();
+        let (embedded, store) = temp.embedded();
+        for user in ["fay", "gus"] {
+            unmarked(&embedded, user, false);
+            temp.host.set_sync(user, true);
+        }
+        temp.host.set_directory(Some(&[]));
+        temp.host.set_offered(&["fay"]);
+        let users = vec![(UserId::new("fay"), true), (UserId::new("gus"), true)];
+        let pass = embedded.start_pass(users.clone()).await.unwrap();
+        let again = embedded.start_pass(users).await.unwrap();
+        let offered = (offer(&store, "fay"), offer(&store, "gus"));
+        let rows = temp.host.logged().into_iter();
+        let rows: Vec<_> = rows
+            .filter_map(|(_, user, detail)| user.zip(detail))
+            .collect();
+        assert_eq!(
+            (pass.followed, again, offered, rows),
+            (
+                1,
+                StartPass::default(),
+                (Some(CODE_OFFER.to_owned()), None),
+                vec![("fay".to_owned(), OFFERED_AT_OPEN.to_owned())]
+            )
         );
     }
 

@@ -8,12 +8,12 @@ use crate::sql_lockout_handler::unlock_statement;
 use crate::sql_log_handler::to_active_model;
 use crate::sql_opaque_handler::user_disabled_in;
 use crate::sql_tables::DbConnection;
-use lldap_domain::types::{AttributeName, UserId, kerberos_sync_enabled};
+use lldap_domain::types::{AttributeName, MFA_TYPE_TOTP, UserId, kerberos_sync_enabled};
 use lldap_domain_handlers::instant::{Timestamp, to_naive};
 use lldap_domain_handlers::kerberos::{
     ANSWER_UNSETTLED, AliasOnto, CREATED_FIRST, DIRECTORY_TARGET, DIRECTORY_USER, HostRow,
     KerberosStore, KerberosStoreError, LoadedRealm, NoopKerberosStore, RealmBatch, RealmState,
-    SYNC_CHANGED, UNREAD_AFTER_COMMIT, USER_GONE, set_kerberos_store,
+    SYNC_CHANGED, SyncedStatus, UNREAD_AFTER_COMMIT, USER_GONE, set_kerberos_store,
 };
 use lldap_domain_handlers::password::{ANSWER_LOST, kill_point};
 use lldap_domain_model::error::DomainError;
@@ -89,7 +89,7 @@ enum Job {
     ),
     Disabled(UserId, oneshot::Sender<Result<bool, KerberosStoreError>>),
     Synced(UserId, oneshot::Sender<Result<bool, KerberosStoreError>>),
-    Statuses(oneshot::Sender<Result<Vec<(UserId, bool)>, KerberosStoreError>>),
+    Statuses(oneshot::Sender<Result<Vec<(UserId, SyncedStatus)>, KerberosStoreError>>),
     Chain(
         String,
         usize,
@@ -154,7 +154,7 @@ impl KerberosStore for CommitterStore {
         rx.blocking_recv().map_err(|_| stopped())?
     }
 
-    fn synced_statuses(&self) -> Result<Vec<(UserId, bool)>, KerberosStoreError> {
+    fn synced_statuses(&self) -> Result<Vec<(UserId, SyncedStatus)>, KerberosStoreError> {
         let (tx, rx) = oneshot::channel();
         self.tx
             .blocking_send(Job::Statuses(tx))
@@ -910,7 +910,7 @@ async fn read_synced(
 async fn read_statuses(
     pool: &DbConnection,
     step: Duration,
-) -> Result<Vec<(UserId, bool)>, KerberosStoreError> {
+) -> Result<Vec<(UserId, SyncedStatus)>, KerberosStoreError> {
     within(step, || KerberosStoreError::Failed(late(step)), async {
         statuses_in(pool)
             .await
@@ -919,7 +919,7 @@ async fn read_statuses(
     .await
 }
 
-async fn statuses_in(db: &impl ConnectionTrait) -> Result<Vec<(UserId, bool)>, DbErr> {
+async fn statuses_in(db: &impl ConnectionTrait) -> Result<Vec<(UserId, SyncedStatus)>, DbErr> {
     let schema = PublicSchema::shared().user_attributes();
     let synced = model::UserAttributes::find()
         .filter(model::UserAttributesColumn::AttributeName.eq(AttributeName::new(KERBEROS_SYNC)))
@@ -939,14 +939,25 @@ async fn statuses_in(db: &impl ConnectionTrait) -> Result<Vec<(UserId, bool)>, D
             .collect(),
         None => Vec::new(),
     };
+    let offered: Vec<UserId> = model::User::find()
+        .select_only()
+        .column(UserColumn::UserId)
+        .filter(ColumnTrait::eq(&UserColumn::MfaType, MFA_TYPE_TOTP))
+        .filter(ColumnTrait::eq(&UserColumn::CodeAtKinit, true))
+        .into_tuple()
+        .all(db)
+        .await?;
     Ok(synced
         .into_iter()
         .filter_map(|row| {
             let user = row.user_id.clone();
             let sync = codec::decode_attribute(row.attribute_name, &row.value, schema).ok()?;
             kerberos_sync_enabled(&[sync]).then(|| {
-                let member = disabled.contains(&user);
-                (user, member)
+                let status = SyncedStatus {
+                    disabled: disabled.contains(&user),
+                    code_offered: offered.contains(&user),
+                };
+                (user, status)
             })
         })
         .collect())
@@ -2292,7 +2303,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn test_each_synced_user_and_its_lldap_disabled_are_read_in_one_step() {
+    async fn test_each_synced_user_its_lldap_disabled_and_its_code_offer_are_read_in_one_step() {
         for name in ["lldap_disabled", "LLDAP_Disabled"] {
             let db = db().await;
             insert_alice(&db.pool).await;
@@ -2311,19 +2322,39 @@ pub(crate) mod tests {
                 db.pool.execute_unprepared(&statement).await.unwrap();
             }
             got.push(read_statuses(&db.pool, step).await.unwrap());
-            let alice = UserId::new("alice");
-            let disabled = read_disabled(&db.pool, &alice, step).await.unwrap();
+            for statement in [
+                "UPDATE users SET code_at_kinit = TRUE WHERE user_id = 'alice'",
+                "UPDATE users SET mfa_type = 'totp' WHERE user_id = 'alice'",
+                "UPDATE users SET code_at_kinit = FALSE WHERE user_id = 'alice'",
+            ] {
+                db.pool.execute_unprepared(statement).await.unwrap();
+                got.push(read_statuses(&db.pool, step).await.unwrap());
+            }
+            let disabled = read_disabled(&db.pool, &UserId::new("alice"), step)
+                .await
+                .unwrap();
+            let alice = |disabled, code_offered| {
+                let status = SyncedStatus {
+                    disabled,
+                    code_offered,
+                };
+                vec![(UserId::new("alice"), status)]
+            };
             assert_eq!(
                 (got, disabled),
                 (
                     vec![
                         Vec::new(),
-                        vec![(alice.clone(), false)],
-                        vec![(alice, true)]
+                        alice(false, false),
+                        alice(true, false),
+                        alice(true, false),
+                        alice(true, true),
+                        alice(true, false),
                     ],
                     true
                 ),
-                "{name}: the status pass and the one user's read find the group in any case"
+                "{name}: the group in any case; the code offered only with a factor and the \
+                 user's own choice"
             );
         }
     }

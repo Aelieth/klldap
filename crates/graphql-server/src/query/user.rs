@@ -10,6 +10,7 @@ use lldap_domain::types::{
 use lldap_domain_handlers::handler::{
     BackendHandler, LockoutBackendHandler, MfaBackendHandler, SignInState as DomainSignInState,
 };
+use lldap_domain_handlers::instant::to_utc;
 use lldap_domain_handlers::mfa::MfaPolicy;
 use lldap_opaque_handler::OpaqueHandler;
 use lldap_schema::PublicSchema;
@@ -84,9 +85,9 @@ impl From<DomainSignInState> for SignInState {
     fn from(state: DomainSignInState) -> Self {
         Self {
             locked: state.locked,
-            locked_until: state.locked_until,
+            locked_until: state.locked_until.map(to_utc),
             inactive: state.inactive_since.is_some(),
-            inactive_since: state.inactive_since,
+            inactive_since: state.inactive_since.map(to_utc),
         }
     }
 }

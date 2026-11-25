@@ -262,11 +262,11 @@ mod tests {
     use crate::enforcement::{
         INACTIVITY_DAYS, ItemFlags, Refusal, UNREADABLE, decide, default_item_checks,
     };
+    use crate::instant::{Timestamp, days};
     use crate::logging::{RequestMeta, with_request_sync};
     use crate::policies::{
         AttachedPolicy, EffectiveItem, PolicyId, PolicyScope, catalog_item, validate_items,
     };
-    use chrono::{DateTime, Duration};
     use pretty_assertions::assert_eq;
     use std::collections::BTreeMap;
 
@@ -293,7 +293,7 @@ mod tests {
             user,
             door,
             peer: peer.map(ip),
-            now: DateTime::from_timestamp(1_700_000_000, 0).unwrap(),
+            now: Timestamp::from_second(1_700_000_000).unwrap(),
             second_factor: false,
         }
     }
@@ -747,7 +747,7 @@ mod tests {
             decide(&outside, &items, &state, &checks).map_err(|refusal| refusal.item)
         };
         assert_eq!(
-            (named(outside.now - Duration::days(2)), named(outside.now)),
+            (named(outside.now - days(2)), named(outside.now)),
             (Err(INACTIVITY_DAYS), Err(ALLOWED_NETWORKS)),
             "an inactive user outside the list is named inactive"
         );

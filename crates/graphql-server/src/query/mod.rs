@@ -392,6 +392,7 @@ mod tests {
     use lldap_domain::types::{Attribute as DomainAttribute, GroupDetails, User as DomainUser};
     use lldap_domain::types::{AttributeName, AttributeType};
     use lldap_domain_handlers::handler::SignInState as DomainSignInState;
+    use lldap_domain_handlers::instant::Timestamp;
     use lldap_domain_handlers::logging::{
         LOGIN_KINDS, LogActivity as DomainLogActivity, LogBucket as DomainLogBucket, LogCursor,
         LogDimension, LogEvent, LogFilter, LogKind, LogRecord, Protocol,
@@ -586,7 +587,7 @@ mod tests {
     #[tokio::test]
     async fn test_only_an_admin_reads_a_users_sign_in_state() {
         const QUERY: &str = r#"{ user(userId: "bob") { id signInState { locked lockedUntil inactive inactiveSince } } }"#;
-        let at = |seconds: i64, nanos: u32| chrono::Utc.timestamp_opt(seconds, nanos).unwrap();
+        let at = |seconds: i64, nanos: i32| Timestamp::new(seconds, nanos).unwrap();
         let (until, since) = (at(1_800_000_600, 0), at(1_799_913_600, 0));
         let (milli, micro) = (
             at(1_800_000_600, 120_000_000),
@@ -982,10 +983,7 @@ mod tests {
         LogRecord {
             id,
             event: LogEvent {
-                timestamp: chrono::Utc
-                    .timestamp_opt(1714564800 + id, 0)
-                    .unwrap()
-                    .naive_utc(),
+                timestamp: Timestamp::from_second(1714564800 + id).unwrap(),
                 kind,
                 success: kind != LogKind::AccessDenied,
                 protocol: Protocol::Ldap,
@@ -1130,12 +1128,7 @@ mod tests {
                         kinds: vec![LogKind::Bind],
                         success: Some(false),
                         protocol: Some(Protocol::Ldap),
-                        since: Some(
-                            chrono::Utc
-                                .timestamp_opt(1714521600, 0)
-                                .unwrap()
-                                .naive_utc(),
-                        ),
+                        since: Some(Timestamp::from_second(1714521600).unwrap()),
                         ..Default::default()
                     }
                     && *limit == 50
@@ -1199,10 +1192,7 @@ mod tests {
             .times(1)
             .return_once(|_, _, _| {
                 let mut record = log_record(7, LogKind::Bind, "bob");
-                record.event.timestamp = chrono::Utc
-                    .timestamp_opt(1714564800, 123_450_000)
-                    .unwrap()
-                    .naive_utc();
+                record.event.timestamp = Timestamp::new(1714564800, 123_450_000).unwrap();
                 Ok(vec![record])
             });
         let schema = schema(Query::<MockTestBackendHandler>::new());
@@ -1229,6 +1219,38 @@ mod tests {
                 vec![]
             ))
         );
+    }
+
+    fn as_admin(mock: MockTestBackendHandler) -> Context<MockTestBackendHandler> {
+        Context::<MockTestBackendHandler>::new_for_tests(
+            mock,
+            ValidationResults {
+                user: UserId::new("admin"),
+                permission: Permission::Admin,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn test_a_time_past_the_last_instant_is_refused_before_the_logs_are_read() {
+        let queries = [
+            r#"{ logs(filter: {since: "9999-12-31T23:59:59Z"}) { id } }"#,
+            r#"{ logSummary(filter: {until: "9999-12-31T23:59:59Z"}) { count } }"#,
+            r#"{ logActivity(actor: "bob", since: "9999-12-31T23:59:59Z") { actor } }"#,
+        ];
+        let schema = schema(Query::<MockTestBackendHandler>::new());
+        for query in queries {
+            let context = as_admin(MockTestBackendHandler::new());
+            let (_, errors) = execute(query, None, &schema, &Variables::new(), &context)
+                .await
+                .unwrap();
+            let said: Vec<_> = errors.iter().map(|e| e.error().message()).collect();
+            assert_eq!(
+                said,
+                vec!["Time out of range: 9999-12-31 23:59:59 UTC"],
+                "{query}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1328,12 +1350,7 @@ mod tests {
                         kinds: vec![LogKind::Bind, LogKind::Login],
                         success: Some(false),
                         member_of_id: Some(GroupId(7)),
-                        since: Some(
-                            chrono::Utc
-                                .timestamp_opt(1714521600, 0)
-                                .unwrap()
-                                .naive_utc(),
-                        ),
+                        since: Some(Timestamp::from_second(1714521600).unwrap()),
                         ..Default::default()
                     }
                     && *group_by == vec![LogDimension::Actor, LogDimension::Day]
@@ -1341,12 +1358,7 @@ mod tests {
             })
             .times(1)
             .return_once(|_, _, _| {
-                let at = |secs: i64| {
-                    chrono::Utc
-                        .timestamp_opt(1714564800 + secs, 0)
-                        .unwrap()
-                        .naive_utc()
-                };
+                let at = |secs: i64| Timestamp::from_second(1714564800 + secs).unwrap();
                 Ok(vec![
                     DomainLogBucket {
                         actor: Some("bob".to_owned()),
@@ -1468,13 +1480,7 @@ mod tests {
             .withf(|actor, kinds, since| {
                 actor == &UserId::new("carol")
                     && *kinds == vec![LogKind::Login, LogKind::TokenRefresh]
-                    && *since
-                        == Some(
-                            chrono::Utc
-                                .timestamp_opt(1714521600, 0)
-                                .unwrap()
-                                .naive_utc(),
-                        )
+                    && *since == Some(Timestamp::from_second(1714521600).unwrap())
             })
             .times(1)
             .return_once(|actor, _, _| {

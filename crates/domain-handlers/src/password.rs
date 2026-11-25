@@ -1,5 +1,6 @@
 use crate::enforcement::POLICY_UNANSWERED;
 use crate::handler::PolicyBackendHandler;
+use crate::instant::Timestamp;
 use crate::kerberos::{
     CREATE_WITHOUT_SYNC, CommitError, Held, HostRow, KerberosState, KerberosSync, PasswordCommit,
     SYNC_CHANGED, SYNC_OFF_FIRST, kerberos_backend, settled_state, settled_state_of,
@@ -429,7 +430,7 @@ fn host_rows(user: &UserId, record: &[u8], create: Option<CreateUserRequest>) ->
     rows.push(HostRow::SetPassword {
         user: user.clone(),
         record: record.to_vec(),
-        now: chrono::Utc::now().naive_utc(),
+        now: Timestamp::now(),
     });
     rows.push(HostRow::SyncIs(user.clone(), true));
     logged.push(logging::event(LogKind::PasswordChange, target, true, None));

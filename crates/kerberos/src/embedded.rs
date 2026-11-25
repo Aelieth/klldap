@@ -3050,7 +3050,7 @@ pub(crate) mod tests {
                 HostRow::SetPassword {
                     user: UserId::new(user),
                     record: record.to_vec(),
-                    now: chrono::Utc::now().naive_utc(),
+                    now: lldap_domain_handlers::instant::Timestamp::now(),
                 },
                 HostRow::Log(event(LogKind::PasswordChange, Some(user), true, None)),
             ],

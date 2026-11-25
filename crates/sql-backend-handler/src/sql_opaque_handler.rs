@@ -4,11 +4,11 @@ use crate::sql_mfa_handler::{TotpRejection, now_unix};
 use crate::sql_mfa_windows::with_proof;
 use async_trait::async_trait;
 use base64::Engine;
-use chrono::NaiveDateTime;
 use lldap_auth::opaque;
 use lldap_domain::types::{GroupId, LoginOutcome, UserId};
 use lldap_domain_handlers::enforcement::{Attempt, Door, admit};
 use lldap_domain_handlers::handler::{BindRequest, LoginHandler};
+use lldap_domain_handlers::instant::Timestamp;
 use lldap_domain_handlers::kerberos::{
     LDAP_ADMINS_ONLY, kerberos_backend, refusal_while_degraded, require_kdc_ready,
 };
@@ -216,11 +216,11 @@ impl SqlBackendHandler {
         user: &UserId,
         door: Door,
         second_factor: bool,
-        now: NaiveDateTime,
+        now: Timestamp,
     ) -> Result<()> {
         let attempt = Attempt {
             second_factor,
-            now: now.and_utc(),
+            now,
             ..Attempt::new(user, door)
         };
         admit(self, &attempt)
@@ -229,7 +229,7 @@ impl SqlBackendHandler {
     }
 
     /// The items, judged when a web sign-in starts, before any password.
-    async fn admitted_at_start(&self, user: &UserId, now: NaiveDateTime) -> bool {
+    async fn admitted_at_start(&self, user: &UserId, now: Timestamp) -> bool {
         self.admit_at(user, Door::WebLogin, false, now)
             .await
             .is_ok()
@@ -2063,9 +2063,8 @@ mod tests {
         assert_eq!(got, wanted, "per row: the answer and its one row");
     }
 
-    fn instant(text: &str) -> chrono::DateTime<chrono::Utc> {
-        let at = chrono::DateTime::parse_from_rfc3339(text).unwrap();
-        at.with_timezone(&chrono::Utc)
+    fn instant(text: &str) -> Timestamp {
+        text.parse().unwrap()
     }
 
     /// One user under `mon 08:00-18:00` on its own OU, the real check judging only that user.
@@ -2422,6 +2421,7 @@ mod tests {
     async fn test_an_inactive_totp_users_right_password_gets_a_wrong_ones_answer_first() {
         use lldap_domain_handlers::enforcement::{INACTIVITY_DAYS, ItemFlags, policy_cache};
         use lldap_domain_handlers::inactivity::Recording;
+        use lldap_domain_handlers::instant::SignedDuration;
         const USER: &str = "q31idle";
         let _clock = pin_clock(AT as i64);
         let log = LogGuard::install_on_this_thread();
@@ -2432,15 +2432,15 @@ mod tests {
         let idle = [(INACTIVITY_DAYS, "1")];
         let (handler, guard) = q31_user(USER, MfaPolicy::Enrolled, &idle, flags).await;
         enroll(&handler, USER, AT).await;
-        let since = chrono::Utc::now();
+        let since = Timestamp::now();
         policy_cache().set_recording(Recording::Since(since));
         q31_rows(&log, USER);
-        guard.pin_clock(since + chrono::Duration::hours(1));
+        guard.pin_clock(since + SignedDuration::from_hours(1));
         let active = (
             at_three_doors(&handler, USER, None).await,
             q31_rows(&log, USER),
         );
-        guard.pin_clock(since + chrono::Duration::days(3));
+        guard.pin_clock(since + SignedDuration::from_hours(72));
         let doors = at_three_doors(&handler, USER, None).await;
         let inactive = (doors, q31_rows(&log, USER), counted(&handler, USER));
         assert_eq!(
@@ -2664,7 +2664,7 @@ mod tests {
             counted(&handler, USER),
             stored().await,
         );
-        let cleared = Some((0, Some(noon.naive_utc())));
+        let cleared = Some((0, Some(noon)));
         assert_eq!(failed, (true, 1), "a wrong password first: one count");
         assert_eq!(
             (bind, web),

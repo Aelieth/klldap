@@ -85,7 +85,7 @@ async fn test_the_kdc_judges_its_socket_peer_with_v4_v6_and_none_and_never_at_s4
         items_of_ous: HashMap::from([("e5ou".to_owned(), vec![list].into())]),
         facts: HashMap::new(),
         windows: HashMap::new(),
-        built_at: Utc::now(),
+        built_at: Timestamp::now(),
     });
     let flags = ItemFlags {
         networks: true,

@@ -1,3 +1,4 @@
+use crate::instant::Timestamp;
 use lldap_domain::types::{GroupId, UserId};
 use std::fmt;
 use std::net::IpAddr;
@@ -174,7 +175,7 @@ pub fn current_request() -> RequestMeta {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LogEvent {
-    pub timestamp: chrono::NaiveDateTime,
+    pub timestamp: Timestamp,
     pub kind: LogKind,
     pub success: bool,
     pub protocol: Protocol,
@@ -224,8 +225,8 @@ pub struct LogFilter {
     pub success: Option<bool>,
     pub protocol: Option<Protocol>,
     pub peer: Option<String>,
-    pub since: Option<chrono::NaiveDateTime>,
-    pub until: Option<chrono::NaiveDateTime>,
+    pub since: Option<Timestamp>,
+    pub until: Option<Timestamp>,
     pub member_of: Option<String>,
     pub member_of_id: Option<GroupId>,
 }
@@ -281,8 +282,8 @@ pub struct LogBucket {
     pub day: Option<String>,
     pub hour: Option<u32>,
     pub count: u64,
-    pub first: chrono::NaiveDateTime,
-    pub last: chrono::NaiveDateTime,
+    pub first: Timestamp,
+    pub last: Timestamp,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -411,7 +412,7 @@ fn build(
     detail: Option<&str>,
 ) -> LogEvent {
     LogEvent {
-        timestamp: chrono::Utc::now().naive_utc(),
+        timestamp: Timestamp::now(),
         kind,
         success,
         protocol: meta.protocol,
@@ -516,7 +517,7 @@ pub fn flush_suppressed_warnings(now: u64) {
 fn emit(event: &LogEvent) {
     match (event.success, event.kind) {
         (false, _) => {
-            let now = chrono::Utc::now().timestamp().max(0) as u64;
+            let now = Timestamp::now().as_second().max(0) as u64;
             match WARN_LIMITER.should_print(now) {
                 Print::Yes => warn!(target: "logs", "{event}"),
                 Print::YesWithSummary(missed) => {

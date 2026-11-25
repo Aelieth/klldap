@@ -7,11 +7,11 @@ use crate::sql_opaque_handler::invalid_credentials;
 use crate::sql_policy_handler::decode_items;
 use crate::sql_tables::DbConnection;
 use async_trait::async_trait;
-use chrono::NaiveDateTime;
 use lldap_domain::types::{UserId, Uuid};
 use lldap_domain_handlers::enforcement::{Door, UNREADABLE, inactive_since};
 use lldap_domain_handlers::handler::{LockoutBackendHandler, SignInState};
 use lldap_domain_handlers::inactivity::REENABLED_BY_ADMIN;
+use lldap_domain_handlers::instant::{Timestamp, from_naive, to_naive};
 use lldap_domain_handlers::lockout::{
     BATCH_LIMIT, LOCKED_OUT, LockRow, LockState, LockStore, LockWrite, SplitMark, Step, StoredLock,
     UNLOCKED_BY_ADMIN, Written, lock_clock, record_account_lock, sets_threshold,
@@ -58,10 +58,10 @@ fn name(user: &UserId) -> Value {
 fn values(row: &LockRow) -> [Value; 5] {
     [
         Value::from(i32::try_from(row.fail_count).unwrap_or(i32::MAX)),
-        row.last_failed.into(),
-        row.last_success.into(),
-        row.lock_logged.into(),
-        row.last_admin_unlock.into(),
+        row.last_failed.map(to_naive).into(),
+        row.last_success.map(to_naive).into(),
+        row.lock_logged.map(to_naive).into(),
+        row.last_admin_unlock.map(to_naive).into(),
     ]
 }
 
@@ -180,7 +180,8 @@ pub(crate) fn split_statement(
     Statement::from_sql_and_values(backend, numbered(backend, &sql), binds)
 }
 
-pub(crate) fn unlock_statement(backend: DbBackend, user: &UserId, at: NaiveDateTime) -> Statement {
+pub(crate) fn unlock_statement(backend: DbBackend, user: &UserId, at: Timestamp) -> Statement {
+    let at = to_naive(at);
     let upsert = match backend {
         DbBackend::MySql => "ON DUPLICATE KEY UPDATE",
         DbBackend::Postgres | DbBackend::Sqlite => "ON CONFLICT (user_id) DO UPDATE SET",
@@ -299,10 +300,10 @@ impl CountingStart {
 fn row_of(found: model::login_lockouts::Model) -> LockRow {
     LockRow {
         fail_count: u32::try_from(found.fail_count).unwrap_or(0),
-        last_failed: found.last_failed,
-        last_success: found.last_success,
-        last_admin_unlock: found.last_admin_unlock,
-        lock_logged: found.lock_logged,
+        last_failed: found.last_failed.map(from_naive),
+        last_success: found.last_success.map(from_naive),
+        last_admin_unlock: found.last_admin_unlock.map(from_naive),
+        lock_logged: found.lock_logged.map(from_naive),
     }
 }
 
@@ -315,9 +316,9 @@ impl LockStore for SqlBackendHandler {
         Ok(found.map(row_of))
     }
 
-    async fn read_locks(&self, since: Option<NaiveDateTime>) -> Result<Vec<StoredLock>> {
+    async fn read_locks(&self, since: Option<Timestamp>) -> Result<Vec<StoredLock>> {
         let mut query = model::LoginLockouts::find();
-        if let Some(since) = since {
+        if let Some(since) = since.map(to_naive) {
             query = query.filter(
                 Condition::any()
                     .add(LoginLockoutsColumn::LastFailed.gte(since))
@@ -374,19 +375,15 @@ impl LockStore for SqlBackendHandler {
         self.prune_totp_steps().await
     }
 
-    async fn read_recording(&self) -> Result<Option<NaiveDateTime>> {
+    async fn read_recording(&self) -> Result<Option<Timestamp>> {
         recording_in(&self.sql_pool).await
     }
 
-    async fn write_recording(
-        &self,
-        live: bool,
-        at: NaiveDateTime,
-    ) -> Result<Option<NaiveDateTime>> {
+    async fn write_recording(&self, live: bool, at: Timestamp) -> Result<Option<Timestamp>> {
         move_recording(&self.sql_pool, live, at).await
     }
 
-    async fn write_success(&self, user: &UserId, at: NaiveDateTime) -> Result<()> {
+    async fn write_success(&self, user: &UserId, at: Timestamp) -> Result<()> {
         let backend = self.sql_pool.get_database_backend();
         self.sql_pool
             .execute(success_statement(backend, user, at))
@@ -464,7 +461,7 @@ impl LockStore for SqlBackendHandler {
 pub async fn unlock_login_on(
     pool: &DbConnection,
     user: &UserId,
-    at: NaiveDateTime,
+    at: Timestamp,
     row: LogEvent,
 ) -> Result<()> {
     let txn = pool.begin().await?;
@@ -518,12 +515,10 @@ impl LockoutBackendHandler for SqlBackendHandler {
         let now = lock_clock();
         let lock = self.lock_state(user_id).await?;
         let lock = lock.filter(|lock| lock.locked(now));
-        let idle = inactive_since(self, self.policy_cache, user_id, now.and_utc()).await?;
+        let idle = inactive_since(self, self.policy_cache, user_id, now).await?;
         Ok(SignInState {
             locked: lock.is_some(),
-            locked_until: lock
-                .and_then(|lock| lock.row.lock_end(lock.policy))
-                .map(|end| end.and_utc()),
+            locked_until: lock.and_then(|lock| lock.row.lock_end(lock.policy)),
             inactive_since: idle,
         })
     }
@@ -554,24 +549,14 @@ impl SqlBackendHandler {
         self.lockout.carry(self, &lock.user, step).await;
     }
 
-    pub(crate) async fn count_failure(
-        &self,
-        lock: Option<&LockState>,
-        door: Door,
-        at: NaiveDateTime,
-    ) {
+    pub(crate) async fn count_failure(&self, lock: Option<&LockState>, door: Door, at: Timestamp) {
         if let Some(lock) = lock {
             self.carry_lock(lock, self.lockout.failure(lock, at), door)
                 .await;
         }
     }
 
-    pub(crate) async fn count_success(
-        &self,
-        lock: Option<&LockState>,
-        door: Door,
-        at: NaiveDateTime,
-    ) {
+    pub(crate) async fn count_success(&self, lock: Option<&LockState>, door: Door, at: Timestamp) {
         if let Some(lock) = lock {
             self.carry_lock(lock, self.lockout.success(lock, at), door)
                 .await;
@@ -598,7 +583,10 @@ pub(crate) mod tests {
     use lldap_domain_handlers::handler::{
         BindRequest, LoginHandler, MfaBackendHandler, PolicyBackendHandler, UserBackendHandler,
     };
-    use lldap_domain_handlers::lockout::{DURATION, Lockout, THRESHOLD, lock_detail};
+    use lldap_domain_handlers::instant::{SignedDuration, days};
+    use lldap_domain_handlers::lockout::{
+        DURATION, Lockout, LockoutPolicy, THRESHOLD, lock_detail,
+    };
     use lldap_domain_handlers::logging::{Protocol, RequestMeta, with_request, without_session};
     use lldap_domain_handlers::mfa::{
         MFA_DISABLED_GROUP, MfaPolicy, MfaRequirement, MfaResetReason,
@@ -795,7 +783,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn time(seconds: i64, micros: i64) -> NaiveDateTime {
+    fn time(seconds: i64, micros: i64) -> Timestamp {
         let at = 1_700_000_000_000_000 + seconds * 1_000_000 + micros;
         lldap_domain_handlers::lockout::time_of_micros(at).unwrap()
     }
@@ -860,7 +848,7 @@ pub(crate) mod tests {
             (vec![(nobody, None)], Some(next)),
             "a name that is no user stores nothing and holds up nothing"
         );
-        let other = Uuid::from_name_and_date("e1lane", &time(0, 0));
+        let other = Uuid::from_name_and_date("e1lane", &to_naive(time(0, 0)));
         let renamed = LockWrite {
             uuid: Some(other),
             ..write(&user, first)
@@ -1276,7 +1264,7 @@ pub(crate) mod tests {
         assert_eq!((binds(&sqlite), binds(&mysql)), (8, 18));
         let period = sqlite.values.as_ref().map(|v| v.0[7].clone());
         assert_eq!(period, Some(Value::from("7".to_owned())));
-        let uuid = Uuid::from_name_and_date("bob", &time(0, 0));
+        let uuid = Uuid::from_name_and_date("bob", &to_naive(time(0, 0)));
         let same = put_statement(DbBackend::Sqlite, "7", Some(&uuid), &user, &row);
         assert!(
             same.sql.contains("users.user_id = ? AND users.uuid = ?)") && binds(&same) == 9,
@@ -1322,7 +1310,7 @@ pub(crate) mod tests {
         for user in users {
             user_in(&h, user, &format!("{user}ou")).await;
         }
-        let t = chrono::DateTime::from_timestamp(chrono::Utc::now().timestamp() + 60, 0).unwrap();
+        let t = Timestamp::from_second(Timestamp::now().as_second() + 60).unwrap();
         guard.pin_clock(t);
         policy_on(&h, "e7lockou", &[(THRESHOLD, "2"), (DURATION, "600")]).await;
         policy_on(&h, "e7holdou", &[(THRESHOLD, "1"), (DURATION, "0")]).await;
@@ -1333,7 +1321,7 @@ pub(crate) mod tests {
             }
         }
         let at_t = sign_in_states(&h, &users).await;
-        guard.pin_clock(t + chrono::Duration::days(2));
+        guard.pin_clock(t + days(2));
         let two_days_on = sign_in_states(&h, &users).await;
         h.unlock_user(&UserId::new("e7hold")).await.unwrap();
         h.reenable_user(&UserId::new("e7idle")).await.unwrap();
@@ -1341,11 +1329,11 @@ pub(crate) mod tests {
         let neither = SignInState::default();
         let locked = |seconds: Option<i64>| SignInState {
             locked: true,
-            locked_until: seconds.map(|seconds| t + chrono::Duration::seconds(seconds)),
+            locked_until: seconds.map(|seconds| t + SignedDuration::from_secs(seconds)),
             ..neither
         };
         let inactive = SignInState {
-            inactive_since: Some(t + chrono::Duration::days(1)),
+            inactive_since: Some(t + days(1)),
             ..neither
         };
         assert_eq!(
@@ -1446,16 +1434,16 @@ pub(crate) mod tests {
     #[serial]
     fn test_the_guards_clock_reaches_every_attempt_and_the_lockout_until_it_drops() {
         let bob = UserId::new("q7clock");
-        let pinned = chrono::DateTime::from_timestamp(4_102_444_800, 0).unwrap();
+        let pinned = Timestamp::from_second(4_102_444_800).unwrap();
         let guard = EnforcementGuard::none();
         guard.pin_clock(pinned);
         let held = (Attempt::new(&bob, Door::LdapBind).now, lock_clock());
         drop(guard);
-        let now = chrono::Utc::now();
-        let after = (Attempt::new(&bob, Door::LdapBind).now - now).num_milliseconds();
+        let now = Timestamp::now();
+        let after = (Attempt::new(&bob, Door::LdapBind).now - now).as_millis();
         assert_eq!(
             held,
-            (pinned, pinned.naive_utc()),
+            (pinned, pinned),
             "pinned: the attempt and the lockout read it"
         );
         assert!(
@@ -1464,8 +1452,8 @@ pub(crate) mod tests {
         );
     }
 
-    fn instant(seconds: i64, nanos: u32) -> chrono::DateTime<chrono::Utc> {
-        chrono::DateTime::from_timestamp(seconds, nanos).unwrap()
+    fn instant(seconds: i64, nanos: u32) -> Timestamp {
+        Timestamp::new(seconds, nanos as i32).unwrap()
     }
 
     #[test]
@@ -1487,6 +1475,31 @@ pub(crate) mod tests {
                 "{nanos} ns"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_a_lock_row_stored_past_the_last_instant_stays_locked_until_the_last_instant() {
+        let h = handler().await;
+        insert_user_no_password(&h, "g2far").await;
+        let far = "INSERT INTO login_lockouts (user_id, fail_count, last_failed) \
+                   VALUES ('g2far', 3, '9999-12-31 23:59:59.999999')";
+        let far = Statement::from_string(DbBackend::Sqlite, far.to_owned());
+        h.sql_pool.execute(far).await.unwrap();
+        let row = h.read_lock(&UserId::new("g2far")).await.unwrap().unwrap();
+        let policy = LockoutPolicy {
+            threshold: 3,
+            duration_seconds: 600,
+        };
+        let now = lock_clock();
+        assert_eq!(
+            (
+                row.last_failed,
+                row.locked(policy, now),
+                row.lock_end(policy)
+            ),
+            (Some(Timestamp::MAX), true, Some(Timestamp::MAX)),
+            "MySQL's largest DATETIME"
+        );
     }
 
     #[test]
@@ -1518,7 +1531,7 @@ pub(crate) mod tests {
         lldap_domain_handlers::enforcement::policy_cache().set_lockout_live(false);
         let guard = EnforcementGuard::allowing(&["q7bind"], THRESHOLD);
         let user = UserId::new("q7bind");
-        let pinned = chrono::DateTime::from_timestamp(4_102_444_800, 0).unwrap();
+        let pinned = Timestamp::from_second(4_102_444_800).unwrap();
         for pin in [None, Some(pinned)] {
             if let Some(at) = pin {
                 guard.pin_clock(at);
@@ -1526,7 +1539,7 @@ pub(crate) mod tests {
             assert!(!bind(&h, "q7bind", "Wrong-Pass-1").await, "{pin:?}");
             assert!(bind(&h, "q7bind", RIGHT).await, "{pin:?}");
             let seen = guard.take_seen().into_iter();
-            let judged: Vec<_> = seen.map(|seen| seen.now.naive_utc()).collect();
+            let judged: Vec<_> = seen.map(|seen| seen.now).collect();
             let row = h.read_lock(&user).await.unwrap().unwrap();
             assert_eq!(
                 judged,
@@ -1534,7 +1547,7 @@ pub(crate) mod tests {
                 "{pin:?}: the items are judged at the instant the lockout's success is written"
             );
             if let Some(at) = pin {
-                assert_eq!(judged, vec![at.naive_utc()], "the pinned instant");
+                assert_eq!(judged, vec![at], "the pinned instant");
             }
         }
     }
@@ -1719,7 +1732,7 @@ pub(crate) mod tests {
             &burst,
             Door::KerberosAs,
             None,
-            lock_clock().and_utc().timestamp() as u32,
+            lock_clock().as_second() as u32,
         );
         let kdc = admit_at_kdc_with(h.policy_cache, h.lockout, &at_kdc, &default_item_checks());
         let refused = Err(Refusal {
@@ -2407,7 +2420,7 @@ pub(crate) mod tests {
             "forgotten in the delete's own path"
         );
         user_in(&h, "e1reborn", "e1rebornou").await;
-        let now = lock_clock().and_utc().timestamp() as u32;
+        let now = lock_clock().as_second() as u32;
         let at_kdc = Attempt::at_kdc(&user, Door::KerberosAs, None, now);
         let checks = default_item_checks();
         assert_eq!(

@@ -2,9 +2,10 @@ use crate::sql_backend_handler::SqlBackendHandler;
 use crate::sql_lockout_handler::{numbered, quoted};
 use crate::sql_log_handler::to_active_model;
 use crate::sql_tables::DbConnection;
-use chrono::{DateTime, NaiveDateTime, SecondsFormat, Utc};
+use chrono::NaiveDateTime;
 use lldap_domain::types::UserId;
 use lldap_domain_handlers::inactivity::{RECORDING_KEY, RECORDING_OFF, Recorded};
+use lldap_domain_handlers::instant::{Timestamp, from_naive, from_stored_text, to_naive};
 use lldap_domain_handlers::logging::LogEvent;
 use lldap_domain_model::{
     error::{DomainError, Result},
@@ -25,7 +26,8 @@ fn text(value: &str) -> Value {
 }
 
 /// The later of the stored success and `at`; a name that is no user stores nothing.
-pub(crate) fn success_statement(backend: DbBackend, user: &UserId, at: NaiveDateTime) -> Statement {
+pub(crate) fn success_statement(backend: DbBackend, user: &UserId, at: Timestamp) -> Statement {
+    let at = to_naive(at);
     let dual = if backend == DbBackend::MySql {
         " FROM DUAL"
     } else {
@@ -53,11 +55,8 @@ pub(crate) fn success_statement(backend: DbBackend, user: &UserId, at: NaiveDate
     statement(backend, &sql, values)
 }
 
-pub(crate) fn reenable_statement(
-    backend: DbBackend,
-    user: &UserId,
-    at: NaiveDateTime,
-) -> Statement {
+pub(crate) fn reenable_statement(backend: DbBackend, user: &UserId, at: Timestamp) -> Statement {
+    let at = to_naive(at);
     let upsert = match backend {
         DbBackend::MySql => "ON DUPLICATE KEY UPDATE",
         DbBackend::Postgres | DbBackend::Sqlite => "ON CONFLICT (user_id) DO UPDATE SET",
@@ -84,9 +83,9 @@ pub(crate) async fn read_activity_on(
     };
     let rows = db.query_all(query).await?;
     let of_row = |row: &sea_orm::QueryResult| -> Result<(UserId, Recorded)> {
-        let at = |index: usize| -> std::result::Result<Option<DateTime<Utc>>, DbErr> {
+        let at = |index: usize| -> std::result::Result<Option<Timestamp>, DbErr> {
             let stored = row.try_get_by_index::<Option<NaiveDateTime>>(index)?;
-            Ok(stored.map(|at| at.and_utc()))
+            Ok(stored.map(from_naive))
         };
         let user: String = row.try_get_by_index(0)?;
         let recorded = Recorded {
@@ -98,20 +97,20 @@ pub(crate) async fn read_activity_on(
     rows.iter().map(of_row).collect()
 }
 
-fn recording_text(at: NaiveDateTime) -> String {
-    at.and_utc().to_rfc3339_opts(SecondsFormat::Micros, true)
+fn recording_text(at: Timestamp) -> String {
+    format!("{at:.6}")
 }
 
-fn recording_of(stored: &str) -> Result<Option<NaiveDateTime>> {
+fn recording_of(stored: &str) -> Result<Option<Timestamp>> {
     if stored == RECORDING_OFF {
         return Ok(None);
     }
     let unread = |e| DomainError::InternalError(format!("{RECORDING_KEY} holds {stored:?}: {e}"));
-    let at = DateTime::parse_from_rfc3339(stored).map_err(unread)?;
-    Ok(Some(at.naive_utc()))
+    let at = from_stored_text(stored).map_err(unread)?;
+    Ok(Some(at))
 }
 
-pub(crate) async fn recording_in(db: &impl ConnectionTrait) -> Result<Option<NaiveDateTime>> {
+pub(crate) async fn recording_in(db: &impl ConnectionTrait) -> Result<Option<Timestamp>> {
     let backend = db.get_database_backend();
     let (key, value, _) = quoted(backend);
     let sql = format!("SELECT {value} FROM system_config WHERE {key} = ?");
@@ -128,8 +127,8 @@ pub(crate) async fn recording_in(db: &impl ConnectionTrait) -> Result<Option<Nai
 pub(crate) async fn move_recording(
     db: &impl ConnectionTrait,
     live: bool,
-    at: NaiveDateTime,
-) -> Result<Option<NaiveDateTime>> {
+    at: Timestamp,
+) -> Result<Option<Timestamp>> {
     let backend = db.get_database_backend();
     let (key, value, _) = quoted(backend);
     let (since, off) = (text(&recording_text(at)), text(RECORDING_OFF));
@@ -165,7 +164,7 @@ pub(crate) async fn move_recording(
 pub async fn reenable_user_on(
     pool: &DbConnection,
     user: &UserId,
-    at: NaiveDateTime,
+    at: Timestamp,
     row: LogEvent,
 ) -> Result<()> {
     let txn = pool.begin().await?;
@@ -187,7 +186,7 @@ pub async fn reenable_user_on(
 
 impl SqlBackendHandler {
     /// A door's success: written while inactivity-days is live, at most once an hour.
-    pub(crate) async fn note_activity(&self, user: &UserId, at: NaiveDateTime) {
+    pub(crate) async fn note_activity(&self, user: &UserId, at: Timestamp) {
         self.policy_cache.note_success(self, user, at).await;
     }
 }
@@ -206,6 +205,7 @@ pub(crate) mod tests {
     use lldap_domain_handlers::inactivity::{
         REENABLED_BY_ADMIN, REENABLED_BY_TOOL, Recording, follow_recording,
     };
+    use lldap_domain_handlers::instant::SignedDuration;
     use lldap_domain_handlers::lockout::{LockStore, lock_clock};
     use lldap_domain_handlers::logging::{self, LogKind, RequestMeta, with_request};
     use lldap_test_utils::enforcement::EnforcementGuard;
@@ -218,24 +218,23 @@ pub(crate) mod tests {
     const DAY: i64 = 86_400;
     const WRONG: &str = "Wrong-Pass-1";
 
-    fn exact(seconds: i64, nanos: u32) -> NaiveDateTime {
-        let at = DateTime::from_timestamp(seconds, nanos).unwrap();
-        at.naive_utc()
+    fn exact(seconds: i64, nanos: u32) -> Timestamp {
+        Timestamp::new(seconds, nanos as i32).unwrap()
     }
 
-    fn at(seconds: i64) -> NaiveDateTime {
+    fn at(seconds: i64) -> Timestamp {
         exact(1_700_000_000 + seconds, 0)
     }
 
-    fn success_at(at: NaiveDateTime) -> Recorded {
+    fn success_at(at: Timestamp) -> Recorded {
         Recorded {
-            last_success: Some(at.and_utc()),
+            last_success: Some(at),
             reenabled_at: None,
         }
     }
 
-    fn after(start: DateTime<Utc>, seconds: i64) -> DateTime<Utc> {
-        start + chrono::Duration::seconds(seconds)
+    fn after(start: Timestamp, seconds: i64) -> Timestamp {
+        start + SignedDuration::from_secs(seconds)
     }
 
     async fn stored(db: &DbConnection, user: &str) -> Vec<Recorded> {
@@ -273,8 +272,8 @@ pub(crate) mod tests {
             .execute(Statement::from_string(backend, columns.to_owned()))
             .await;
         let row = |success: Option<i64>, reenabled: Option<i64>| Recorded {
-            last_success: success.map(|s| at(s).and_utc()),
-            reenabled_at: reenabled.map(|s| at(s).and_utc()),
+            last_success: success.map(at),
+            reenabled_at: reenabled.map(at),
         };
         let mut got = Vec::new();
         for (step, seconds) in [("a success", 10), ("an older one", 5)] {
@@ -502,6 +501,28 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn test_a_success_stored_past_the_last_instant_reads_as_the_last_instant() {
+        let pool = get_initialized_db().await;
+        let handler = SqlBackendHandler::new(generate_random_private_key(), pool.clone());
+        let request = CreateUserRequest {
+            user_id: UserId::new("g2far"),
+            email: "g2far@example.com".into(),
+            ..Default::default()
+        };
+        handler.create_user(request).await.unwrap();
+        let far = "INSERT INTO user_activity (user_id, last_success) \
+                   VALUES ('g2far', '9999-12-31 23:59:59.999999')";
+        let far = Statement::from_string(DbBackend::Sqlite, far.to_owned());
+        pool.execute(far).await.unwrap();
+        let key = recording_of("9999-12-31T23:59:59.000000Z").unwrap();
+        assert_eq!(
+            (stored(&pool, "g2far").await, key),
+            (vec![success_at(Timestamp::MAX)], Some(Timestamp::MAX)),
+            "MySQL's largest DATETIME, as a row and as the recording key's text"
+        );
+    }
+
+    #[tokio::test]
     async fn test_the_activity_statements_on_sqlite() {
         activity_lane(&get_initialized_db().await).await;
     }
@@ -537,7 +558,7 @@ pub(crate) mod tests {
         let h = SqlBackendHandler::new(generate_random_private_key(), pool.clone());
         doors::user_in(&h, "e6door", "e6doorou").await;
         doors::policy_on(&h, "e6doorou", &[(INACTIVITY_DAYS, "30")]).await;
-        let start = lock_clock().and_utc();
+        let start = lock_clock();
         type Row = (&'static str, i64, &'static str, &'static str, bool, i64);
         let rows: [Row; 7] = [
             (
@@ -613,7 +634,7 @@ pub(crate) mod tests {
         for (user, ou) in users {
             doors::user_in(&h, user, ou).await;
         }
-        let start = lock_clock().and_utc();
+        let start = lock_clock();
         guard.pin_clock(start);
         doors::policy_on(&h, "e6aou", &[(INACTIVITY_DAYS, "365")]).await;
         guard.pin_clock(after(start, 35 * DAY));
@@ -669,7 +690,7 @@ pub(crate) mod tests {
         doors::user_in(&h, "e6same", "e6sameou").await;
         doors::policy_on(&h, "e6sameou", &[(INACTIVITY_DAYS, "1")]).await;
         let web = async |password: &str| doors::web(&h, "e6same", password, None).await.map(drop);
-        let now = Utc::now();
+        let now = Timestamp::now();
         let _ = doors::rows(&log, &[]);
         guard.pin_clock(now);
         let wrong_while_active = web(WRONG).await;
@@ -721,7 +742,7 @@ pub(crate) mod tests {
         doors::user_in(&h, "e6back", "e6backou").await;
         doors::user_in(&h, "e6tool", "e6backou").await;
         doors::policy_on(&h, "e6backou", &[(INACTIVITY_DAYS, "1")]).await;
-        guard.pin_clock(after(Utc::now(), 3 * DAY));
+        guard.pin_clock(after(Timestamp::now(), 3 * DAY));
         let signed_in = async || {
             let back = doors::bind(&h, "e6back", doors::RIGHT).await;
             (back, doors::bind(&h, "e6tool", doors::RIGHT).await)
@@ -741,7 +762,7 @@ pub(crate) mod tests {
             .map(|r| r.reenabled_at);
         assert_eq!(
             (before, after_both, reenabled),
-            ((false, false), (true, true), Some(Some(at.and_utc()))),
+            ((false, false), (true, true), Some(Some(at))),
             "refused as inactive; each re-enable restarts the count now, the tool's at the next \
              fill"
         );

@@ -1135,6 +1135,7 @@ pub(crate) mod tests {
     use super::*;
     use lldap_auth::opaque;
     use lldap_domain::types::{Attribute, User};
+    use lldap_domain_handlers::instant::{Timestamp, days};
     use lldap_domain_handlers::kerberos::CommitError;
     use lldap_domain_handlers::logging::{Protocol, RequestMeta, with_request};
     use lldap_domain_handlers::password::PASSWORD_MIN_LENGTH;
@@ -2856,9 +2857,8 @@ pub(crate) mod tests {
         guard
     }
 
-    fn instant(text: &str) -> chrono::DateTime<Utc> {
-        let at = chrono::DateTime::parse_from_rfc3339(text).unwrap();
-        at.with_timezone(&Utc)
+    fn instant(text: &str) -> Timestamp {
+        text.parse().unwrap()
     }
 
     #[tokio::test]
@@ -3035,7 +3035,7 @@ pub(crate) mod tests {
         let guard = EnforcementGuard::default_checks();
         let handler = sql_handler_with(&[("e6reset", "e6reset-pass-1")]).await;
         idle_after(&handler, "1").await;
-        guard.pin_clock(Utc::now() + chrono::Duration::days(3));
+        guard.pin_clock(Timestamp::now() + days(3));
         let state = app_state(handler.clone());
         let _ = log.recorder().take_events();
         let token = reset_token(&state.jwt_key, "e6reset");
@@ -3084,7 +3084,7 @@ pub(crate) mod tests {
         };
         let active = simple(PASSWORD).await.0;
         let wrong_while_active = login_start_answer(&state, "e6http", "e6http-wrong-1").await;
-        guard.pin_clock(Utc::now() + chrono::Duration::days(3));
+        guard.pin_clock(Timestamp::now() + days(3));
         let simple = (simple(PASSWORD).await, simple("e6http-wrong-1").await);
         let right = login_start_answer(&state, "e6http", PASSWORD).await;
         handler.clear_ou_policy("").await.unwrap();

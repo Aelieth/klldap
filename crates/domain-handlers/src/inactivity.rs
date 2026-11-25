@@ -3,9 +3,9 @@ use crate::enforcement::{
     UserState, item_set,
 };
 use crate::handler::PolicyBackendHandler;
+use crate::instant::{self, SignedDuration, Timestamp};
 use crate::lockout::{LockStore, QUEUE_LIMIT, STOP_BOUND, WRITE_BOUND};
 use crate::policies::{EffectiveItem, POLICY_READ_WAIT, Policy};
-use chrono::{DateTime, NaiveDateTime, Utc};
 use lldap_domain::types::UserId;
 use lldap_domain_model::error::Result;
 use std::collections::{BTreeSet, HashMap};
@@ -25,8 +25,8 @@ pub const WRITE_EVERY_SECS: i64 = 3600;
 /// A user's row: no success and no re-enable for a user it does not hold.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Recorded {
-    pub last_success: Option<DateTime<Utc>>,
-    pub reenabled_at: Option<DateTime<Utc>>,
+    pub last_success: Option<Timestamp>,
+    pub reenabled_at: Option<Timestamp>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -34,15 +34,15 @@ pub enum Recording {
     #[default]
     Unknown,
     Off,
-    Since(DateTime<Utc>),
+    Since(Timestamp),
 }
 
 /// The latest of the four starting points; `None` while one of them is not read.
 pub fn active_since(
-    created: DateTime<Utc>,
+    created: Timestamp,
     recorded: Option<Recorded>,
     recording: Recording,
-) -> Option<DateTime<Utc>> {
+) -> Option<Timestamp> {
     let (Recording::Since(since), Some(recorded)) = (recording, recorded) else {
         return None;
     };
@@ -55,10 +55,7 @@ pub fn active_since(
     )
 }
 
-pub fn cached_active_since(
-    cache: &PolicyCache,
-    facts: Option<&UserFacts>,
-) -> Option<DateTime<Utc>> {
+pub fn cached_active_since(cache: &PolicyCache, facts: Option<&UserFacts>) -> Option<Timestamp> {
     let facts = facts?;
     active_since(facts.created, facts.recorded, cache.recording())
 }
@@ -70,13 +67,13 @@ pub fn days(value: &str) -> Option<i64> {
 /// `Some(None)` while the check admits; `None` when the value or the start cannot be read.
 pub fn idle_past_limit(
     value: &str,
-    active_since: Option<DateTime<Utc>>,
-    now: DateTime<Utc>,
-) -> Option<Option<DateTime<Utc>>> {
+    active_since: Option<Timestamp>,
+    now: Timestamp,
+) -> Option<Option<Timestamp>> {
     match (days(value)?, active_since) {
         (0, _) => Some(None),
         (days, Some(since)) => {
-            let end = since + chrono::Duration::days(days);
+            let end = instant::later(since, instant::days(days));
             Some((now > end).then_some(end))
         }
         (_, None) => None,
@@ -123,7 +120,7 @@ impl ItemCheck for InactivityCheck {
     fn allows(&self, attempt: &Attempt<'_>, value: &str, state: &UserState) -> bool {
         match (days(value), state.active_since) {
             (Some(0), _) => true,
-            (Some(days), Some(since)) => attempt.now - since <= chrono::Duration::days(days),
+            (Some(days), Some(since)) => attempt.now - since <= instant::days(days),
             _ => false,
         }
     }
@@ -137,8 +134,8 @@ struct Writer {
 
 #[derive(Default)]
 pub(crate) struct ActivityBook {
-    written: Mutex<HashMap<UserId, NaiveDateTime>>,
-    owed: Mutex<HashMap<UserId, NaiveDateTime>>,
+    written: Mutex<HashMap<UserId, Timestamp>>,
+    owed: Mutex<HashMap<UserId, Timestamp>>,
     writer: RwLock<Option<Writer>>,
     recording: RwLock<Recording>,
     rows_failed: AtomicBool,
@@ -205,12 +202,12 @@ impl PolicyCache {
     }
 
     /// While the item is live: the first success after a start, then one an hour, per user.
-    fn success_due(&self, user: &UserId, at: NaiveDateTime) -> bool {
+    fn success_due(&self, user: &UserId, at: Timestamp) -> bool {
         if !live(self) {
             return false;
         }
         let mut written = held(&self.activity.written);
-        let every = chrono::Duration::seconds(WRITE_EVERY_SECS);
+        let every = SignedDuration::from_secs(WRITE_EVERY_SECS);
         if written.get(user).is_some_and(|last| at - *last < every) {
             return false;
         }
@@ -219,7 +216,7 @@ impl PolicyCache {
     }
 
     /// A door's success, after the last check that can still refuse.
-    pub async fn note_success<S>(&self, store: &S, user: &UserId, at: NaiveDateTime)
+    pub async fn note_success<S>(&self, store: &S, user: &UserId, at: Timestamp)
     where
         S: LockStore + ?Sized,
     {
@@ -228,7 +225,7 @@ impl PolicyCache {
         }
     }
 
-    async fn write_success<S>(&self, store: &S, user: &UserId, at: NaiveDateTime)
+    async fn write_success<S>(&self, store: &S, user: &UserId, at: Timestamp)
     where
         S: LockStore + ?Sized,
     {
@@ -236,18 +233,18 @@ impl PolicyCache {
         if !matches!(written, Ok(Ok(()))) {
             self.owe_success(user, at);
         }
-        self.hold_success(user, at.and_utc());
+        self.hold_success(user, at);
     }
 
     /// On the KDC's thread: written on the server's runtime; the thread waits at most
     /// `WRITE_BOUND`, and a write that does not land is owed.
-    pub fn carry_success_from_kdc(&'static self, user: &UserId, at: NaiveDateTime) {
+    pub fn carry_success_from_kdc(&'static self, user: &UserId, at: Timestamp) {
         if !self.success_due(user, at) {
             return;
         }
         let Some(Writer { store, runtime }) = self.writer() else {
             self.owe_success(user, at);
-            self.hold_success(user, at.and_utc());
+            self.hold_success(user, at);
             return;
         };
         let (done, wait) = std::sync::mpsc::channel();
@@ -259,7 +256,7 @@ impl PolicyCache {
         let _ = wait.recv_timeout(WRITE_BOUND);
     }
 
-    fn hold_success(&self, user: &UserId, at: DateTime<Utc>) {
+    fn hold_success(&self, user: &UserId, at: Timestamp) {
         let Ok(_writers) = self.writers.try_lock() else {
             self.mark(user);
             return;
@@ -275,7 +272,7 @@ impl PolicyCache {
         });
     }
 
-    fn owe_success(&self, user: &UserId, at: NaiveDateTime) {
+    fn owe_success(&self, user: &UserId, at: Timestamp) {
         let mut owed = held(&self.activity.owed);
         if owed.len() >= QUEUE_LIMIT && !owed.contains_key(user) {
             warn!("The sign-in of {user} was not kept for inactivity-days: {QUEUE_LIMIT} are owed");
@@ -296,7 +293,7 @@ impl PolicyCache {
     where
         S: LockStore + ?Sized,
     {
-        let taken: Vec<(UserId, NaiveDateTime)> = {
+        let taken: Vec<(UserId, Timestamp)> = {
             let mut owed = held(&self.activity.owed);
             let users: Vec<UserId> = owed.keys().take(limit).cloned().collect();
             let taken = users.iter().filter_map(|user| owed.remove_entry(user));
@@ -360,7 +357,7 @@ pub async fn follow_recording<S: LockStore + ?Sized>(
     store: &S,
     cache: &PolicyCache,
     policies: &[Policy],
-    at: NaiveDateTime,
+    at: Timestamp,
 ) -> Result<()> {
     for warning in cache.unreadable_warnings(policies) {
         warn!("{warning}");
@@ -380,9 +377,7 @@ pub async fn follow_recording<S: LockStore + ?Sized>(
             if turning && stored.is_err() {
                 cache.set_recording(Recording::Unknown);
             }
-            stored?.map_or(Recording::Unknown, |since| {
-                Recording::Since(since.and_utc())
-            })
+            stored?.map_or(Recording::Unknown, Recording::Since)
         }
     };
     cache.set_recording(next);
@@ -478,16 +473,16 @@ pub(crate) mod tests {
         cache.set_item_flags(flags);
     }
 
-    fn exact(seconds: i64, nanos: u32) -> DateTime<Utc> {
-        DateTime::from_timestamp(seconds, nanos).unwrap()
+    fn exact(seconds: i64, nanos: u32) -> Timestamp {
+        Timestamp::new(seconds, nanos as i32).unwrap()
     }
 
-    fn at(seconds: i64) -> DateTime<Utc> {
+    fn at(seconds: i64) -> Timestamp {
         exact(1_700_000_000 + seconds, 0)
     }
 
-    fn naive(seconds: i64) -> NaiveDateTime {
-        at(seconds).naive_utc()
+    fn naive(seconds: i64) -> Timestamp {
+        at(seconds)
     }
 
     fn item(value: &str) -> EffectiveItem {
@@ -510,7 +505,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn state(active_since: Option<DateTime<Utc>>) -> UserState {
+    fn state(active_since: Option<Timestamp>) -> UserState {
         UserState {
             active_since,
             ..UserState::default()
@@ -530,16 +525,16 @@ pub(crate) mod tests {
     /// The row's `recording_since` as a conditional store keeps it: `None` is off.
     #[derive(Default)]
     struct Memory {
-        successes: Mutex<Vec<(UserId, NaiveDateTime)>>,
+        successes: Mutex<Vec<(UserId, Timestamp)>>,
         down: AtomicBool,
         slow: AtomicBool,
-        since: Mutex<Option<NaiveDateTime>>,
+        since: Mutex<Option<Timestamp>>,
         recording_writes: Mutex<Vec<bool>>,
         recording_reads: AtomicU64,
     }
 
     impl Memory {
-        fn written(&self) -> Vec<(UserId, NaiveDateTime)> {
+        fn written(&self) -> Vec<(UserId, Timestamp)> {
             self.successes.lock().unwrap().clone()
         }
     }
@@ -549,7 +544,7 @@ pub(crate) mod tests {
         async fn read_lock(&self, _: &UserId) -> Result<Option<LockRow>> {
             Ok(None)
         }
-        async fn read_locks(&self, _: Option<NaiveDateTime>) -> Result<Vec<StoredLock>> {
+        async fn read_locks(&self, _: Option<Timestamp>) -> Result<Vec<StoredLock>> {
             Ok(Vec::new())
         }
         async fn read_lock_users(&self) -> Result<Vec<UserId>> {
@@ -568,15 +563,11 @@ pub(crate) mod tests {
                 ..Written::default()
             })
         }
-        async fn read_recording(&self) -> Result<Option<NaiveDateTime>> {
+        async fn read_recording(&self) -> Result<Option<Timestamp>> {
             self.recording_reads.fetch_add(1, Ordering::Relaxed);
             Ok(*self.since.lock().unwrap())
         }
-        async fn write_recording(
-            &self,
-            live: bool,
-            at: NaiveDateTime,
-        ) -> Result<Option<NaiveDateTime>> {
+        async fn write_recording(&self, live: bool, at: Timestamp) -> Result<Option<Timestamp>> {
             self.recording_writes.lock().unwrap().push(live);
             let mut since = self.since.lock().unwrap();
             match live {
@@ -585,7 +576,7 @@ pub(crate) mod tests {
             }
             Ok(*since)
         }
-        async fn write_success(&self, user: &UserId, at: NaiveDateTime) -> Result<()> {
+        async fn write_success(&self, user: &UserId, at: Timestamp) -> Result<()> {
             if self.slow.load(Ordering::Relaxed) {
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
@@ -933,7 +924,7 @@ pub(crate) mod tests {
         turn(cache, true);
         let bob = UserId::new("e6bob");
         let facts = UserFacts {
-            uuid: Uuid::from_name_and_date("e6bob", &NaiveDateTime::default()),
+            uuid: Uuid::from_name_and_date("e6bob", &chrono::NaiveDateTime::default()),
             enrolled: false,
             exempt: false,
             created: at(-DAY),
@@ -964,7 +955,7 @@ pub(crate) mod tests {
             ..Recorded::default()
         };
         let facts = UserFacts {
-            uuid: Uuid::from_name_and_date("e6bob", &NaiveDateTime::default()),
+            uuid: Uuid::from_name_and_date("e6bob", &chrono::NaiveDateTime::default()),
             enrolled: false,
             exempt: false,
             created: at(-DAY),

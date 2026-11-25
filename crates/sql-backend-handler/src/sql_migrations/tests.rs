@@ -2688,7 +2688,10 @@ async fn fresh_install_lane(pool: &DbConnection) {
         ],
         "equal counts: newest first"
     );
-    assert_eq!(by_hour[0].first, at(2, 13));
+    assert_eq!(
+        by_hour[0].first,
+        lldap_domain_handlers::instant::from_naive(at(2, 13))
+    );
     let sharp = NaiveDate::from_ymd_opt(2024, 5, 2)
         .unwrap()
         .and_hms_micro_opt(14, 0, 40, 600_000)

@@ -9,6 +9,7 @@ use crate::sql_log_handler::to_active_model;
 use crate::sql_opaque_handler::user_disabled_in;
 use crate::sql_tables::DbConnection;
 use lldap_domain::types::{AttributeName, UserId, kerberos_sync_enabled};
+use lldap_domain_handlers::instant::{Timestamp, to_naive};
 use lldap_domain_handlers::kerberos::{
     ANSWER_UNSETTLED, AliasOnto, CREATED_FIRST, DIRECTORY_TARGET, DIRECTORY_USER, HostRow,
     KerberosStore, KerberosStoreError, LoadedRealm, NoopKerberosStore, RealmBatch, RealmState,
@@ -823,8 +824,9 @@ async fn set_password_in(
     txn: &DatabaseTransaction,
     user: &UserId,
     record: &[u8],
-    now: chrono::NaiveDateTime,
+    now: Timestamp,
 ) -> Result<(), KerberosStoreError> {
+    let now = to_naive(now);
     let updated = model::User::update_many()
         .col_expr(UserColumn::PasswordHash, Expr::value(record.to_vec()))
         .col_expr(UserColumn::PasswordModifiedDate, Expr::value(now))
@@ -1723,7 +1725,7 @@ pub(crate) mod tests {
                 expiration: None,
                 password_expiration: None,
                 policy: None,
-                modified_date: when,
+                modified_date: lldap_domain_handlers::instant::from_naive(when),
                 alias_target: None,
             }],
             delete_principals: Vec::new(),
@@ -2363,7 +2365,7 @@ pub(crate) mod tests {
             HostRow::SetPassword {
                 user: UserId::new(user),
                 record: record.to_vec(),
-                now: chrono::Utc::now().naive_utc(),
+                now: Timestamp::now(),
             },
             HostRow::Log(event(LogKind::PasswordChange, Some(user), true, None)),
         ]

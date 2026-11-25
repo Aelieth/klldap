@@ -1,4 +1,5 @@
 use crate::inactivity::Recorded;
+use crate::instant::Timestamp;
 use crate::kdc_proof::ProofWindow;
 use crate::logging::{
     LogActivity, LogBucket, LogCursor, LogDimension, LogFilter, LogKind, LogRecord,
@@ -8,7 +9,6 @@ use crate::policies::{
     CreatePolicyRequest, OuPolicyState, Policy, PolicyId, PolicyLevel, UpdatePolicyRequest,
 };
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use ldap3_proto::proto::LdapSubstringFilter;
 use lldap_domain::{
     requests::{
@@ -215,7 +215,7 @@ pub trait LogBackendHandler: Send + Sync {
         &self,
         actor: &UserId,
         kinds: Vec<LogKind>,
-        since: Option<chrono::NaiveDateTime>,
+        since: Option<Timestamp>,
     ) -> Result<LogActivity>;
 }
 
@@ -283,8 +283,8 @@ pub trait PolicyBackendHandler: Send + Sync {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SignInState {
     pub locked: bool,
-    pub locked_until: Option<DateTime<Utc>>,
-    pub inactive_since: Option<DateTime<Utc>>,
+    pub locked_until: Option<Timestamp>,
+    pub inactive_since: Option<Timestamp>,
 }
 
 #[async_trait]

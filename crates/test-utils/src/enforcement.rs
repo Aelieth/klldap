@@ -1,9 +1,9 @@
-use chrono::{DateTime, Utc};
 use lldap_domain::types::UserId;
 use lldap_domain_handlers::enforcement::{
     Attempt, Door, Entries, ItemCheck, ItemFlags, PolicyCache, UserState, ZONE_FILES,
     default_item_checks, load_zone_from, policy_cache, set_item_checks, set_test_clock,
 };
+use lldap_domain_handlers::instant::Timestamp;
 use lldap_domain_handlers::policies::EffectiveItem;
 use std::net::IpAddr;
 use std::path::Path;
@@ -14,7 +14,7 @@ pub struct SeenAttempt {
     pub user: UserId,
     pub door: Door,
     pub peer: Option<IpAddr>,
-    pub now: DateTime<Utc>,
+    pub now: Timestamp,
     pub second_factor: bool,
     pub value: String,
 }
@@ -151,7 +151,7 @@ impl EnforcementGuard {
     }
 
     /// Every `Attempt::new` and `lock_clock()` read `now` until the guard drops.
-    pub fn pin_clock(&self, now: DateTime<Utc>) {
+    pub fn pin_clock(&self, now: Timestamp) {
         set_test_clock(Some(now));
     }
 

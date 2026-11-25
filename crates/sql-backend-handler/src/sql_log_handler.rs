@@ -3,6 +3,9 @@ use crate::sql_tables::DbConnection;
 use async_trait::async_trait;
 use lldap_domain::types::UserId;
 use lldap_domain_handlers::handler::LogBackendHandler;
+use lldap_domain_handlers::instant::{
+    SignedDuration, Timestamp, days, earlier, from_naive, to_naive,
+};
 use lldap_domain_handlers::logging::{
     LogActivity, LogBucket, LogCursor, LogDimension, LogEvent, LogFilter, LogKind, LogRecord,
     LogSink, NO_PASSWORD, NoopLogSink, Protocol, flush_suppressed_warnings, set_log_sink,
@@ -117,14 +120,14 @@ fn channel_sink(capacity: usize) -> (Arc<ChannelLogSink>, mpsc::Receiver<LogEven
 // Owned by the writer task, so the request path never takes a lock. The first success of a
 // window is stored, the repeats were already printed to the terminal.
 struct BindCoalescer {
-    window: chrono::Duration,
-    last: HashMap<(String, Protocol, Option<String>), chrono::NaiveDateTime>,
+    window: SignedDuration,
+    last: HashMap<(String, Protocol, Option<String>), Timestamp>,
 }
 
 impl BindCoalescer {
     fn new(seconds: u32) -> Self {
         Self {
-            window: chrono::Duration::seconds(i64::from(seconds)),
+            window: SignedDuration::from_secs(i64::from(seconds)),
             last: HashMap::new(),
         }
     }
@@ -150,7 +153,7 @@ impl BindCoalescer {
         }
     }
 
-    fn prune(&mut self, now: chrono::NaiveDateTime) {
+    fn prune(&mut self, now: Timestamp) {
         self.last.retain(|_, stored| now - *stored < self.window);
         if self.last.len() >= COALESCE_CAP {
             self.last.clear();
@@ -164,8 +167,8 @@ impl BindCoalescer {
 }
 
 struct FloodWindow {
-    started: chrono::NaiveDateTime,
-    last: chrono::NaiveDateTime,
+    started: Timestamp,
+    last: Timestamp,
     passed: u64,
     counted: u64,
     actors: HashSet<u64>,
@@ -173,7 +176,7 @@ struct FloodWindow {
 }
 
 impl FloodWindow {
-    fn open(timestamp: chrono::NaiveDateTime) -> Self {
+    fn open(timestamp: Timestamp) -> Self {
         Self {
             started: timestamp,
             last: timestamp,
@@ -227,7 +230,7 @@ impl FloodClass {
 
     fn resolved_detail(self, window: &FloodWindow) -> String {
         let more = if window.more_actors { "+" } else { "" };
-        let seconds = (window.last - window.started).num_seconds();
+        let seconds = (window.last - window.started).as_secs();
         let (noun, who) = match self {
             Self::UnknownBind => ("binds", "names"),
             Self::AccessDenied => ("denials", "actors"),
@@ -250,7 +253,7 @@ impl FloodClass {
 // events that do not belong to this class pass through untouched.
 struct FloodCoalescer {
     class: FloodClass,
-    idle: chrono::Duration,
+    idle: SignedDuration,
     windows: HashMap<FloodKey, FloodWindow>,
     ready: Vec<LogEvent>,
 }
@@ -281,7 +284,7 @@ impl FloodCoalescer {
     fn new(class: FloodClass, idle_seconds: i64) -> Self {
         Self {
             class,
-            idle: chrono::Duration::seconds(idle_seconds),
+            idle: SignedDuration::from_secs(idle_seconds),
             windows: HashMap::new(),
             ready: Vec::new(),
         }
@@ -323,12 +326,12 @@ impl FloodCoalescer {
         false
     }
 
-    fn flush(&mut self, now: chrono::NaiveDateTime, all: bool) -> Vec<LogEvent> {
+    fn flush(&mut self, now: Timestamp, all: bool) -> Vec<LogEvent> {
         self.flush_into_ready(now, all);
         std::mem::take(&mut self.ready)
     }
 
-    fn flush_into_ready(&mut self, now: chrono::NaiveDateTime, all: bool) {
+    fn flush_into_ready(&mut self, now: Timestamp, all: bool) {
         let ready = &mut self.ready;
         let idle = self.idle;
         let class = self.class;
@@ -343,7 +346,7 @@ impl FloodCoalescer {
         });
     }
 
-    fn started_event(&self, key: &FloodKey, timestamp: chrono::NaiveDateTime) -> LogEvent {
+    fn started_event(&self, key: &FloodKey, timestamp: Timestamp) -> LogEvent {
         let event = LogEvent {
             timestamp,
             kind: self.class.kind(),
@@ -424,9 +427,9 @@ async fn run_writer(
             }
             Err(_) => {}
         }
-        let now = chrono::Utc::now().naive_utc();
+        let now = Timestamp::now();
         bind.prune(now);
-        flush_suppressed_warnings(now.and_utc().timestamp().max(0) as u64);
+        flush_suppressed_warnings(now.as_second().max(0) as u64);
         let lost = dropped.swap(0, Ordering::Relaxed);
         let mut rows = Vec::with_capacity(buffer.len() + 1);
         if lost > 0 {
@@ -463,7 +466,7 @@ async fn run_writer(
         }
     }
     // The channel is closed: pending flood windows become rows, never lost.
-    let now = chrono::Utc::now().naive_utc();
+    let now = Timestamp::now();
     let mut rows = bind_flood.flush(now, true);
     rows.extend(denied_flood.flush(now, true));
     let rows = rows.into_iter().map(to_active_model).collect::<Vec<_>>();
@@ -479,7 +482,7 @@ fn trim_interval(max_entries: u64) -> u64 {
 fn gap_event(lost: u64) -> LogEvent {
     warn!(target: "logs", "❌ log_gap (system): dropped events: {lost}");
     LogEvent {
-        timestamp: chrono::Utc::now().naive_utc(),
+        timestamp: Timestamp::now(),
         kind: LogKind::LogGap,
         success: false,
         protocol: Protocol::System,
@@ -558,7 +561,7 @@ impl LogBackendHandler for SqlBackendHandler {
         &self,
         actor: &UserId,
         kinds: Vec<LogKind>,
-        since: Option<chrono::NaiveDateTime>,
+        since: Option<Timestamp>,
     ) -> DomainResult<LogActivity> {
         let scope = LogFilter {
             actor: Some(actor.as_str().to_owned()),
@@ -614,8 +617,8 @@ fn filter_condition(filter: &LogFilter) -> Condition {
                 .map(|p| LogsColumn::Protocol.eq(p.to_string())),
         )
         .add_option(filter.peer.as_deref().map(|p| LogsColumn::Peer.eq(p)))
-        .add_option(filter.since.map(|t| LogsColumn::Timestamp.gte(t)))
-        .add_option(filter.until.map(|t| LogsColumn::Timestamp.lte(t)))
+        .add_option(filter.since.map(|t| LogsColumn::Timestamp.gte(to_naive(t))))
+        .add_option(filter.until.map(|t| LogsColumn::Timestamp.lte(to_naive(t))))
         .add_option(member_of.map(members))
         .add_option(member_of_id.map(members))
 }
@@ -717,8 +720,8 @@ fn bucket_from_row(row: BucketRow) -> Option<LogBucket> {
         day: row.day,
         hour: row.hour.and_then(|h| h.parse().ok()),
         count: u64::try_from(row.count).unwrap_or(0),
-        first,
-        last,
+        first: from_naive(first),
+        last: from_naive(last),
     })
 }
 
@@ -731,14 +734,14 @@ fn last_event(scope: &LogFilter, success: bool) -> Select<model::Logs> {
         .order_by_desc(LogsColumn::Id)
 }
 
-fn failures_after(scope: &LogFilter, after: Option<chrono::NaiveDateTime>) -> Select<model::Logs> {
+fn failures_after(scope: &LogFilter, after: Option<Timestamp>) -> Select<model::Logs> {
     let query = model::Logs::find()
         .select_only()
         .column_as(LogsColumn::Id.count(), "count")
         .filter(filter_condition(scope))
         .filter(LogsColumn::Success.eq(false));
     match after {
-        Some(after) => query.filter(LogsColumn::Timestamp.gt(after)),
+        Some(after) => query.filter(LogsColumn::Timestamp.gt(to_naive(after))),
         None => query,
     }
 }
@@ -758,7 +761,7 @@ fn from_model(row: model::logs::Model) -> Option<LogRecord> {
     Some(LogRecord {
         id: row.id,
         event: LogEvent {
-            timestamp: row.timestamp,
+            timestamp: from_naive(row.timestamp),
             kind,
             success: row.success,
             protocol,
@@ -774,7 +777,7 @@ fn from_model(row: model::logs::Model) -> Option<LogRecord> {
 pub(crate) fn to_active_model(event: LogEvent) -> model::logs::ActiveModel {
     model::logs::ActiveModel {
         id: ActiveValue::NotSet,
-        timestamp: ActiveValue::Set(event.timestamp),
+        timestamp: ActiveValue::Set(to_naive(event.timestamp)),
         kind: ActiveValue::Set(event.kind.to_string()),
         success: ActiveValue::Set(event.success),
         protocol: ActiveValue::Set(event.protocol.to_string()),
@@ -805,9 +808,8 @@ pub async fn enforce_log_retention(
     retention: LogRetention,
 ) -> Result<(), DbErr> {
     if retention.retention_days > 0 {
-        let cutoff = chrono::Utc::now().naive_utc()
-            - chrono::Duration::days(i64::from(retention.retention_days));
-        delete_oldest_chunks(pool, OldestMatch::TimestampBefore(cutoff)).await?;
+        let cutoff = earlier(Timestamp::now(), days(i64::from(retention.retention_days)));
+        delete_oldest_chunks(pool, OldestMatch::TimestampBefore(to_naive(cutoff))).await?;
     }
     if retention.max_entries > 0 {
         trim_to_max_entries(pool, retention.max_entries).await?;
@@ -876,7 +878,7 @@ mod tests {
 
     fn event(kind: LogKind, actor: &str, days_ago: i64) -> LogEvent {
         LogEvent {
-            timestamp: chrono::Utc::now().naive_utc() - chrono::Duration::days(days_ago),
+            timestamp: Timestamp::now() - days(days_ago),
             kind,
             success: true,
             protocol: Protocol::Ldap,
@@ -888,14 +890,15 @@ mod tests {
         }
     }
 
-    fn at(day: u32, hour: u32, minute: u32) -> chrono::NaiveDateTime {
-        chrono::NaiveDate::from_ymd_opt(2024, 5, day)
+    fn at(day: u32, hour: u32, minute: u32) -> Timestamp {
+        let at = chrono::NaiveDate::from_ymd_opt(2024, 5, day)
             .unwrap()
             .and_hms_nano_opt(hour, minute, 40, 123_456_789)
-            .unwrap()
+            .unwrap();
+        from_naive(at)
     }
 
-    fn event_at(kind: LogKind, actor: &str, timestamp: chrono::NaiveDateTime) -> LogEvent {
+    fn event_at(kind: LogKind, actor: &str, timestamp: Timestamp) -> LogEvent {
         LogEvent {
             timestamp,
             ..event(kind, actor, 0)
@@ -1214,11 +1217,11 @@ mod tests {
             .await),
             vec![3]
         );
-        let now = chrono::Utc::now().naive_utc();
+        let now = Timestamp::now();
         assert_eq!(
             ids(&list(
                 LogFilter {
-                    since: Some(now - chrono::Duration::hours(36)),
+                    since: Some(now - SignedDuration::from_hours(36)),
                     until: Some(now),
                     ..Default::default()
                 },
@@ -1292,7 +1295,7 @@ mod tests {
         );
     }
 
-    fn unknown_bind(actor: &str, peer: &str, timestamp: chrono::NaiveDateTime) -> LogEvent {
+    fn unknown_bind(actor: &str, peer: &str, timestamp: Timestamp) -> LogEvent {
         LogEvent {
             success: false,
             detail: Some(UNKNOWN_USER_DETAIL.to_owned()),
@@ -1301,8 +1304,8 @@ mod tests {
         }
     }
 
-    fn nanos_after(base: chrono::NaiveDateTime, nanos: i64) -> chrono::NaiveDateTime {
-        base + chrono::Duration::nanoseconds(nanos)
+    fn nanos_after(base: Timestamp, nanos: i64) -> Timestamp {
+        base + SignedDuration::from_nanos(nanos)
     }
 
     #[test]
@@ -1344,6 +1347,28 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_a_log_row_stored_past_the_last_instant_lists_at_the_last_instant() {
+        use lldap_auth::opaque::server::generate_random_private_key;
+        let pool = get_initialized_db().await;
+        let handler = SqlBackendHandler::new(generate_random_private_key(), pool.clone());
+        let far = chrono::NaiveDate::from_ymd_opt(9999, 12, 31)
+            .unwrap()
+            .and_hms_micro_opt(23, 59, 59, 999_999)
+            .unwrap();
+        let row = model::logs::ActiveModel {
+            timestamp: ActiveValue::Set(far),
+            ..to_active_model(event(LogKind::Bind, "bob", 0))
+        };
+        insert_rows(&pool, vec![row]).await.unwrap();
+        let listed = handler
+            .list_log_events(LogFilter::default(), 10, LogCursor::Newest)
+            .await
+            .unwrap();
+        let stamps: Vec<_> = listed.iter().map(|r| r.event.timestamp).collect();
+        assert_eq!(stamps, vec![Timestamp::MAX], "MySQL's largest DATETIME");
+    }
+
     fn started_rows(rows: &[LogEvent]) -> usize {
         rows.iter()
             .filter(|r| r.detail.as_deref() == Some("unknown-user bind flood started"))
@@ -1368,12 +1393,12 @@ mod tests {
             let kept = flood.keep(&unknown_bind(
                 &format!("spray-{i}"),
                 "10.0.0.1",
-                base + chrono::Duration::seconds(i),
+                base + SignedDuration::from_secs(i),
             ));
             assert_eq!(kept, i < 8, "event {i}");
         }
         // The started row is queued the moment the source crosses the threshold.
-        let opened = flood.flush(base + chrono::Duration::seconds(15), false);
+        let opened = flood.flush(base + SignedDuration::from_secs(15), false);
         assert_eq!(opened.len(), 1);
         assert_eq!(opened[0].kind, LogKind::BindFlood);
         assert!(!opened[0].success);
@@ -1388,32 +1413,32 @@ mod tests {
         // The window is still active (last event at +11s), so nothing resolves yet.
         assert!(
             flood
-                .flush(base + chrono::Duration::seconds(20), false)
+                .flush(base + SignedDuration::from_secs(20), false)
                 .is_empty()
         );
 
         // Quiet past the idle threshold resolves it with no closing event: one row with
         // the totals and the span, stamped with the last event.
-        let closed = flood.flush(base + chrono::Duration::seconds(40), false);
+        let closed = flood.flush(base + SignedDuration::from_secs(40), false);
         assert_eq!(closed.len(), 1);
         assert_eq!(closed[0].peer.as_deref(), Some("10.0.0.1"));
         assert_eq!(
             closed[0].detail.as_deref(),
             Some("unknown-user bind flood resolved: 4 binds, 4 names, 11s")
         );
-        assert_eq!(closed[0].timestamp, base + chrono::Duration::seconds(11));
+        assert_eq!(closed[0].timestamp, base + SignedDuration::from_secs(11));
         assert!(
             flood
-                .flush(base + chrono::Duration::seconds(50), false)
+                .flush(base + SignedDuration::from_secs(50), false)
                 .is_empty()
         );
 
         // A later burst from the same source is a new incident, not a continuation.
-        let second = base + chrono::Duration::seconds(60);
+        let second = base + SignedDuration::from_secs(60);
         for i in 0..10 {
             flood.keep(&unknown_bind(&format!("b{i}"), "10.0.0.1", second));
         }
-        let closed = flood.flush(second + chrono::Duration::seconds(30), false);
+        let closed = flood.flush(second + SignedDuration::from_secs(30), false);
         assert_eq!(started_rows(&closed), 1);
         assert_eq!(
             resolved_rows(&closed)
@@ -1424,13 +1449,13 @@ mod tests {
         );
 
         // Exactly FLOOD_PASS failures from a source pass 1:1 and open nothing.
-        let third = second + chrono::Duration::seconds(60);
+        let third = second + SignedDuration::from_secs(60);
         for i in 0..FLOOD_PASS {
             assert!(flood.keep(&unknown_bind(&format!("c{i}"), "10.0.0.3", third)));
         }
         assert!(
             flood
-                .flush(third + chrono::Duration::seconds(999), true)
+                .flush(third + SignedDuration::from_secs(999), true)
                 .is_empty()
         );
     }
@@ -1507,7 +1532,7 @@ mod tests {
                 flood.keep(&no_password)
             })
             .collect();
-        let closed = flood.flush(base + chrono::Duration::seconds(30), false);
+        let closed = flood.flush(base + SignedDuration::from_secs(30), false);
         let details: Vec<_> = closed.iter().filter_map(|r| r.detail.as_deref()).collect();
         assert_eq!(
             (kept, details),
@@ -1607,7 +1632,7 @@ mod tests {
         );
 
         let mut coalescer = BindCoalescer::new(300);
-        let now = chrono::Utc::now().naive_utc();
+        let now = Timestamp::now();
         for i in 0..(COALESCE_CAP + 80) {
             let bind = LogEvent {
                 timestamp: now,
@@ -1626,7 +1651,7 @@ mod tests {
         assert!(coalescer.cached() > 0);
     }
 
-    fn denial(actor: Option<&str>, peer: &str, timestamp: chrono::NaiveDateTime) -> LogEvent {
+    fn denial(actor: Option<&str>, peer: &str, timestamp: Timestamp) -> LogEvent {
         LogEvent {
             success: false,
             detail: Some("Unauthorized".to_owned()),
@@ -1644,12 +1669,12 @@ mod tests {
             let kept = flood.keep(&denial(
                 Some(&format!("user-{i}")),
                 "10.0.0.7",
-                base + chrono::Duration::seconds(i),
+                base + SignedDuration::from_secs(i),
             ));
             assert_eq!(kept, i < 8, "denial {i}");
         }
         // The started row opens the incident on the first dropped denial.
-        let opened = flood.flush(base + chrono::Duration::seconds(12), false);
+        let opened = flood.flush(base + SignedDuration::from_secs(12), false);
         assert_eq!(opened.len(), 1);
         assert_eq!(opened[0].kind, LogKind::AccessDeniedFlood);
         assert!(!opened[0].success);
@@ -1660,7 +1685,7 @@ mod tests {
             Some("access-denied flood started")
         );
         // Quiet past the idle threshold resolves with the denial and actor counts.
-        let closed = flood.flush(base + chrono::Duration::seconds(40), false);
+        let closed = flood.flush(base + SignedDuration::from_secs(40), false);
         assert_eq!(closed.len(), 1);
         assert_eq!(closed[0].kind, LogKind::AccessDeniedFlood);
         assert_eq!(
@@ -1673,10 +1698,10 @@ mod tests {
             flood.keep(&denial(
                 None,
                 "10.0.0.8",
-                base + chrono::Duration::seconds(50 + i),
+                base + SignedDuration::from_secs(50 + i),
             ));
         }
-        let rows = flood.flush(base + chrono::Duration::seconds(120), true);
+        let rows = flood.flush(base + SignedDuration::from_secs(120), true);
         let resolved: Vec<_> = rows
             .iter()
             .filter(|r| {
@@ -1738,7 +1763,7 @@ mod tests {
                     ..denial(
                         Some("sable"),
                         "192.0.2.7",
-                        base + chrono::Duration::seconds(i as i64),
+                        base + SignedDuration::from_secs(i as i64),
                     )
                 };
                 flood.keep(&refusal)
@@ -1746,7 +1771,7 @@ mod tests {
             .collect();
         assert_eq!(kept, (0..12).map(|i| i < 8).collect::<Vec<_>>());
         let rows: Vec<_> = flood
-            .flush(base + chrono::Duration::seconds(60), true)
+            .flush(base + SignedDuration::from_secs(60), true)
             .into_iter()
             .map(|r| (r.kind, r.protocol, r.peer, r.detail))
             .collect();
@@ -1770,7 +1795,7 @@ mod tests {
     const ADMIN: &str = "admin/admin@EXAMPLE.COM";
     const K1SYNC: &str = "k1sync@EXAMPLE.COM";
 
-    fn kadmin_denial(caller: &str, target: &str, timestamp: chrono::NaiveDateTime) -> LogEvent {
+    fn kadmin_denial(caller: &str, target: &str, timestamp: Timestamp) -> LogEvent {
         LogEvent {
             timestamp,
             kind: LogKind::AccessDenied,
@@ -1807,7 +1832,7 @@ mod tests {
     fn test_kadmin_refusals_coalesce_only_on_the_callers_own_principal() {
         let mut flood = FloodCoalescer::new(FloodClass::AccessDenied, FLOOD_IDLE_SECONDS);
         let base = at(1, 9, 0);
-        let within = |i: i64| base + chrono::Duration::milliseconds(i * 40);
+        let within = |i: i64| base + SignedDuration::from_millis(i * 40);
         let admin: Vec<bool> = (0..20)
             .map(|i| flood.keep(&kadmin_denial(ADMIN, "bob@EXAMPLE.COM", within(i))))
             .collect();
@@ -1816,7 +1841,7 @@ mod tests {
             ..kadmin_denial(ADMIN, "bob@EXAMPLE.COM", base)
         };
         let no_caller_kept = (0..20).all(|_| flood.keep(&no_caller));
-        let flushed = flood.flush(base + chrono::Duration::hours(1), true);
+        let flushed = flood.flush(base + SignedDuration::from_hours(1), true);
         assert_eq!(
             (admin, no_caller_kept, flushed),
             (vec![true; 20], true, Vec::new()),
@@ -1827,7 +1852,7 @@ mod tests {
             .map(|i| flood.keep(&kadmin_denial(K1SYNC, K1SYNC, within(i))))
             .collect();
         let pass = usize::try_from(FLOOD_PASS).unwrap();
-        let rows = flood.flush(base + chrono::Duration::seconds(60), false);
+        let rows = flood.flush(base + SignedDuration::from_secs(60), false);
         assert_eq!(
             (own, flood_rows(&rows)),
             (
@@ -1862,7 +1887,7 @@ mod tests {
                 flood.keep(&own_name)
             })
             .collect();
-        let rows = flood.flush(base + chrono::Duration::seconds(60), false);
+        let rows = flood.flush(base + SignedDuration::from_secs(60), false);
         assert_eq!(
             (spray, flood_rows(&rows)),
             (
@@ -1904,9 +1929,9 @@ mod tests {
             },
             WRITER_TICK,
         ));
-        let now = chrono::Utc::now().naive_utc();
+        let now = Timestamp::now();
         for i in 0..20 {
-            let at = now + chrono::Duration::milliseconds(i * 40);
+            let at = now + SignedDuration::from_millis(i * 40);
             sink.record(kadmin_denial(ADMIN, "bob@EXAMPLE.COM", at));
             sink.record(kadmin_denial(K1SYNC, K1SYNC, at));
             sink.record(denial(Some("mallory"), "10.0.0.7", at));
@@ -1956,7 +1981,7 @@ mod tests {
             },
             WRITER_TICK,
         ));
-        let base = chrono::Utc::now().naive_utc();
+        let base = Timestamp::now();
         for i in 0..12 {
             sink.record(unknown_bind(&format!("flood-{i}"), "10.0.0.9", base));
         }
@@ -2003,7 +2028,7 @@ mod tests {
             },
             std::time::Duration::from_millis(100),
         ));
-        let now = chrono::Utc::now().naive_utc();
+        let now = Timestamp::now();
         for i in 0..12 {
             sink.record(unknown_bind(&format!("flood-{i}"), "10.0.0.9", now));
         }
@@ -2162,7 +2187,7 @@ mod tests {
             .await
             .unwrap();
         model::Logs::insert(model::logs::ActiveModel {
-            timestamp: ActiveValue::Set(at(3, 12, 0)),
+            timestamp: ActiveValue::Set(to_naive(at(3, 12, 0))),
             kind: ActiveValue::Set("computer_create".to_owned()),
             success: ActiveValue::Set(true),
             protocol: ActiveValue::Set("graphql".to_owned()),
@@ -2490,7 +2515,7 @@ mod tests {
             ..event_at(
                 LogKind::Bind,
                 "svc",
-                base + chrono::Duration::seconds(seconds),
+                base + SignedDuration::from_secs(seconds),
             )
         };
         sink.record(bind(0, "10.0.0.1", true));
@@ -2515,7 +2540,7 @@ mod tests {
                     r.kind.as_str(),
                     r.peer.as_deref().unwrap(),
                     r.success,
-                    r.timestamp
+                    from_naive(r.timestamp)
                 ))
                 .collect::<Vec<_>>(),
             vec![
@@ -2524,25 +2549,25 @@ mod tests {
                     "bind",
                     "10.0.0.2",
                     true,
-                    base + chrono::Duration::seconds(20)
+                    base + SignedDuration::from_secs(20)
                 ),
                 (
                     "bind",
                     "10.0.0.1",
                     false,
-                    base + chrono::Duration::seconds(30)
+                    base + SignedDuration::from_secs(30)
                 ),
                 (
                     "login",
                     "10.0.0.1",
                     true,
-                    base + chrono::Duration::seconds(40)
+                    base + SignedDuration::from_secs(40)
                 ),
                 (
                     "bind",
                     "10.0.0.1",
                     true,
-                    base + chrono::Duration::seconds(300)
+                    base + SignedDuration::from_secs(300)
                 ),
             ]
         );

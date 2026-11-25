@@ -66,7 +66,7 @@ pub(crate) fn now_unix() -> i64 {
     if let Some(now) = TEST_NOW.with(|clock| clock.get()) {
         return now;
     }
-    chrono::Utc::now().timestamp()
+    lldap_domain_handlers::instant::Timestamp::now().as_second()
 }
 
 fn refuse_proof(user_id: &UserId) -> DomainError {

@@ -2,6 +2,7 @@
 pub mod enforcement;
 pub mod handler;
 pub mod inactivity;
+pub mod instant;
 pub mod kdc_proof;
 pub mod kerberos;
 pub mod lockout;

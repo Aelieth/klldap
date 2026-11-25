@@ -1,3 +1,4 @@
+use crate::instant::Timestamp;
 use crate::logging::{LogEvent, LogKind};
 use async_trait::async_trait;
 use lldap_domain::requests::{CreateUserRequest, UpdateUserRequest};
@@ -197,7 +198,7 @@ pub enum HostRow {
     SetPassword {
         user: UserId,
         record: Vec<u8>,
-        now: chrono::NaiveDateTime,
+        now: Timestamp,
     },
     CreateUser(CreateUserRequest),
     Log(LogEvent),
@@ -218,7 +219,7 @@ pub enum HostRow {
     },
     Unlock {
         user: UserId,
-        at: chrono::NaiveDateTime,
+        at: Timestamp,
     },
 }
 
@@ -484,10 +485,10 @@ pub struct PrincipalRow {
     pub has_keys: bool,
     pub disabled: bool,
     pub kvno: i32,
-    pub expiration: Option<chrono::NaiveDateTime>,
-    pub password_expiration: Option<chrono::NaiveDateTime>,
+    pub expiration: Option<Timestamp>,
+    pub password_expiration: Option<Timestamp>,
     pub policy: Option<String>,
-    pub modified_date: chrono::NaiveDateTime,
+    pub modified_date: Timestamp,
     pub alias_target: Option<String>,
 }
 
@@ -722,11 +723,7 @@ mod tests {
                 expiration: None,
                 password_expiration: None,
                 policy: None,
-                modified_date: chrono::NaiveDateTime::parse_from_str(
-                    "1970-01-01 00:00:00",
-                    "%Y-%m-%d %H:%M:%S",
-                )
-                .unwrap(),
+                modified_date: Timestamp::UNIX_EPOCH,
                 alias_target: None,
             }],
             delete_principals: vec!["bob".to_owned()],
@@ -773,7 +770,7 @@ mod tests {
     #[test]
     fn test_host_rows_print_their_label_and_no_record() {
         use crate::logging::{LogKind, event};
-        let now = chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc();
+        let now = Timestamp::UNIX_EPOCH;
         let bob = UserId::new("bob");
         let rows: [(HostRow, &str, bool, bool); 12] = [
             (

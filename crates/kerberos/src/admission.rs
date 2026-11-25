@@ -359,6 +359,7 @@ pub(crate) mod tests {
     };
     use lldap_domain_handlers::handler::{PolicyBackendHandler, UserBackendHandler};
     use lldap_domain_handlers::inactivity::{Recorded, Recording};
+    use lldap_domain_handlers::instant::{SignedDuration, Timestamp, to_naive};
     use lldap_domain_handlers::kdc_proof::ProofSettings;
     use lldap_domain_handlers::kerberos::KerberosSync;
     use lldap_domain_handlers::logging::{Protocol, RequestMeta, with_request};
@@ -697,7 +698,7 @@ pub(crate) mod tests {
             items_of_ous,
             facts: HashMap::new(),
             windows: HashMap::new(),
-            built_at: Utc::now(),
+            built_at: Timestamp::now(),
         });
     }
 
@@ -1444,7 +1445,7 @@ pub(crate) mod tests {
         let log = LogGuard::install_on_this_thread();
         let guard = real_hours();
         cached_values(&[a], &[b], [DAYTIME, EVENING]);
-        let asked_at = chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap();
+        let asked_at = Timestamp::from_second(1_700_000_000).unwrap();
         let reasoned = "policy: login-hours (outside login hours)";
         let denied = vec![peered(row(LogKind::AccessDenied, false, a, reasoned))];
         let revoked = Err(err::CLIENT_REVOKED);
@@ -2348,9 +2349,9 @@ pub(crate) mod tests {
         assert!(took < Duration::from_secs(1), "{took:?}");
     }
 
-    fn idle_facts(name: &str, created: chrono::DateTime<Utc>) -> UserFacts {
+    fn idle_facts(name: &str, created: Timestamp) -> UserFacts {
         UserFacts {
-            uuid: lldap_domain::types::Uuid::from_name_and_date(name, &created.naive_utc()),
+            uuid: lldap_domain::types::Uuid::from_name_and_date(name, &to_naive(created)),
             enrolled: false,
             exempt: false,
             created,
@@ -2367,7 +2368,7 @@ pub(crate) mod tests {
         let _guard = EnforcementGuard::default_checks();
         let cache: &'static PolicyCache = Box::leak(Box::new(PolicyCache::new()));
         let counter: &'static Lockout = Box::leak(Box::default());
-        let long_ago = chrono::DateTime::from_timestamp(1_600_000_000, 0).unwrap();
+        let long_ago = Timestamp::from_second(1_600_000_000).unwrap();
         let thirty = EffectiveItem {
             key: INACTIVITY_DAYS.to_owned(),
             scope: PolicyScope::User,
@@ -2384,10 +2385,10 @@ pub(crate) mod tests {
             items_of_ous: HashMap::from([("e6ou".to_owned(), vec![thirty].into())]),
             facts: HashMap::from([
                 (idle_id, idle_facts(idle, long_ago)),
-                (fresh_id, idle_facts(fresh, Utc::now())),
+                (fresh_id, idle_facts(fresh, Timestamp::now())),
             ]),
             windows: HashMap::new(),
-            built_at: Utc::now(),
+            built_at: Timestamp::now(),
         });
         let flags = ItemFlags {
             inactivity: true,
@@ -2491,11 +2492,11 @@ pub(crate) mod tests {
             let rows = handler.read_activity(Some(&user)).await.unwrap();
             rows.first().and_then(|(_, row)| row.last_success)
         };
-        let start = lock_clock().and_utc();
+        let start = lock_clock();
         guard.pin_clock(start);
         let issued = kinit(&store, b, Some(PASSWORD)).0;
         let written = stored().await;
-        guard.pin_clock(start + chrono::Duration::seconds(3_600));
+        guard.pin_clock(start + SignedDuration::from_secs(3_600));
         let asked = [TgsKind::Renew, TgsKind::Normal]
             .map(|kind| tgs_asks_of(&verdict, &store, Some(b), b, kind));
         cache.drain_successes(&handler).await;
@@ -2545,8 +2546,8 @@ pub(crate) mod tests {
             let rows = handler.read_activity(Some(&user)).await.unwrap();
             rows.first().and_then(|(_, row)| row.last_success)
         };
-        let start = lock_clock().and_utc();
-        let later = start + chrono::Duration::seconds(3_600);
+        let start = lock_clock();
+        let later = start + SignedDuration::from_secs(3_600);
         guard.pin_clock(start);
         let first = kinit(&store, b, Some(PASSWORD)).0;
         let written = stored().await;

@@ -797,7 +797,7 @@ pub(crate) mod tests {
         doors::user_in(&h, "e3fill", "e3fillou").await;
         let user = UserId::new("e3fill");
         let verdict = || {
-            let now = lock_clock().and_utc().timestamp() as u32;
+            let now = lock_clock().as_second() as u32;
             let attempt = Attempt::at_kdc(&user, Door::KerberosAs, None, now);
             let judged =
                 admit_at_kdc_with(h.policy_cache, h.lockout, &attempt, &default_item_checks());

@@ -1,9 +1,10 @@
 use crate::api::{Context, FullHandler, field_error_callback};
 use anyhow::anyhow;
-use chrono::{DateTime, TimeZone, Utc};
-use juniper::{FieldResult, GraphQLInputObject, GraphQLObject, ID};
+use chrono::{DateTime, Utc};
+use juniper::{FieldError, FieldResult, GraphQLInputObject, GraphQLObject, ID};
 use lldap_domain::types::{GroupId, UserId};
 use lldap_domain_handlers::handler::LogBackendHandler;
+use lldap_domain_handlers::instant::{Timestamp, to_utc, try_from_utc};
 use lldap_domain_handlers::logging::{self, LOGIN_KINDS, LogCursor, LogRecord};
 use lldap_opaque_handler::OpaqueHandler;
 use std::str::FromStr;
@@ -164,7 +165,7 @@ impl From<LogRecord> for LogEntry {
         let event = record.event;
         Self {
             id: ID::new(record.id.to_string()),
-            timestamp: Utc.from_utc_datetime(&event.timestamp),
+            timestamp: to_utc(event.timestamp),
             kind: event.kind.into(),
             success: event.success,
             protocol: event.protocol.into(),
@@ -206,8 +207,8 @@ impl From<logging::LogBucket> for LogBucket {
             day: bucket.day,
             hour: bucket.hour.and_then(|h| i32::try_from(h).ok()),
             count: i32::try_from(bucket.count).unwrap_or(i32::MAX),
-            first: Utc.from_utc_datetime(&bucket.first),
-            last: Utc.from_utc_datetime(&bucket.last),
+            first: to_utc(bucket.first),
+            last: to_utc(bucket.last),
         }
     }
 }
@@ -251,9 +252,16 @@ pub struct LogFilterInput {
     member_of_id: Option<i32>,
 }
 
-impl From<LogFilterInput> for logging::LogFilter {
-    fn from(filter: LogFilterInput) -> Self {
-        Self {
+fn in_range(at: Option<DateTime<Utc>>) -> FieldResult<Option<Timestamp>> {
+    at.map(|at| try_from_utc(at).ok_or_else(|| format!("Time out of range: {at}").into()))
+        .transpose()
+}
+
+impl TryFrom<LogFilterInput> for logging::LogFilter {
+    type Error = FieldError;
+
+    fn try_from(filter: LogFilterInput) -> FieldResult<Self> {
+        Ok(Self {
             actor: filter.actor,
             target: filter.target,
             kinds: filter
@@ -265,11 +273,11 @@ impl From<LogFilterInput> for logging::LogFilter {
             success: filter.success,
             protocol: filter.protocol.map(Into::into),
             peer: filter.peer,
-            since: filter.since.map(|t| t.naive_utc()),
-            until: filter.until.map(|t| t.naive_utc()),
+            since: in_range(filter.since)?,
+            until: in_range(filter.until)?,
             member_of: filter.member_of,
             member_of_id: filter.member_of_id.map(GroupId),
-        }
+        })
     }
 }
 
@@ -304,7 +312,10 @@ pub(super) async fn list_logs<Handler: FullHandler + OpaqueHandler>(
     };
     let records = handler
         .list_log_events(
-            filter.map(Into::into).unwrap_or_default(),
+            filter
+                .map(logging::LogFilter::try_from)
+                .transpose()?
+                .unwrap_or_default(),
             page_size(limit),
             cursor,
         )
@@ -326,7 +337,10 @@ pub(super) async fn log_summary<Handler: FullHandler + OpaqueHandler>(
         .ok_or_else(field_error_callback(&span, "Unauthorized to read the logs"))?;
     let buckets = handler
         .summarize_log_events(
-            filter.map(Into::into).unwrap_or_default(),
+            filter
+                .map(logging::LogFilter::try_from)
+                .transpose()?
+                .unwrap_or_default(),
             group_by
                 .unwrap_or_default()
                 .into_iter()
@@ -354,8 +368,9 @@ pub(super) async fn log_activity<Handler: FullHandler + OpaqueHandler>(
         || LOGIN_KINDS.to_vec(),
         |kinds| kinds.into_iter().map(Into::into).collect(),
     );
+    let since = in_range(since)?;
     let activity = handler
-        .log_activity(&UserId::new(&actor), kinds, since.map(|t| t.naive_utc()))
+        .log_activity(&UserId::new(&actor), kinds, since)
         .instrument(span)
         .await
         .map_err(|e| anyhow!("Failed to load the log activity: {e}"))?;
@@ -412,7 +427,7 @@ mod tests {
                 actor: Some(actor.to_owned()),
                 ..Default::default()
             };
-            logging::LogFilter::from(filter).actor.unwrap()
+            logging::LogFilter::try_from(filter).unwrap().actor.unwrap()
         });
         assert_eq!(actors, typed, "the store matches it as given or lowercased");
     }

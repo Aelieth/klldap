@@ -1,8 +1,8 @@
 use crate::sql_backend_handler::tests::insert_user_no_password;
 use crate::sql_lockout_handler::tests as doors;
-use chrono::{DateTime, Utc};
 use lldap_domain::types::{LoginOutcome, UserId};
 use lldap_domain_handlers::enforcement::{Door, ItemFlags, policy_cache};
+use lldap_domain_handlers::instant::Timestamp;
 use lldap_domain_handlers::lockout::{DURATION, LOCKED_OUT, THRESHOLD};
 use lldap_domain_handlers::logging::LogKind;
 use lldap_domain_handlers::mfa::MfaPolicy;
@@ -36,7 +36,7 @@ fn signed_in(user: &str) -> Result<LoginOutcome, &'static str> {
     })
 }
 
-fn instant(text: &str) -> DateTime<Utc> {
+fn instant(text: &str) -> Timestamp {
     text.parse().unwrap()
 }
 

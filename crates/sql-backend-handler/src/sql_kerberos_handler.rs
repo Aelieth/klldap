@@ -1,4 +1,5 @@
 use crate::sql_migrations::{KerberosPolicies, KerberosPrincipals, KerberosRealm, Users};
+use lldap_domain_handlers::instant::{Timestamp, to_naive};
 use lldap_domain_handlers::kerberos::{
     LoadedPrincipal, LoadedRealm, PolicyRow, PrincipalRow, RealmBatch, RealmState,
     user_id_for_principal_name,
@@ -323,7 +324,7 @@ async fn upsert_principal(
                         Expr::value(time_value(principal.expiration)),
                         Expr::value(time_value(principal.password_expiration)),
                         Expr::value(string_value(principal.policy.clone())),
-                        Expr::value(principal.modified_date),
+                        Expr::value(to_naive(principal.modified_date)),
                         Expr::value(string_value(alias_target)),
                     ])
                     .on_conflict(
@@ -695,8 +696,8 @@ fn string_value(value: Option<String>) -> Value {
     Value::String(value.map(Box::new))
 }
 
-fn time_value(value: Option<chrono::NaiveDateTime>) -> Value {
-    Value::ChronoDateTime(value.map(Box::new))
+fn time_value(value: Option<Timestamp>) -> Value {
+    Value::ChronoDateTime(value.map(to_naive).map(Box::new))
 }
 
 #[cfg(test)]
@@ -721,7 +722,7 @@ pub(crate) mod tests {
             expiration: None,
             password_expiration: None,
             policy: None,
-            modified_date: stamp(),
+            modified_date: lldap_domain_handlers::instant::from_naive(stamp()),
             alias_target: None,
         }
     }

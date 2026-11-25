@@ -141,12 +141,11 @@ impl ItemCheck for LoginHoursCheck {
     }
 
     fn allows(&self, attempt: &Attempt<'_>, value: &str, _: &UserState) -> bool {
-        let at = Timestamp::from_second(attempt.now.timestamp());
         let zone = self.cache.login_hours_zone();
-        let (Some(zone), Ok(hours), Ok(at)) = (zone, parse(value), at) else {
+        let (Some(zone), Ok(hours)) = (zone, parse(value)) else {
             return false;
         };
-        judge(&hours, &zone, at)
+        judge(&hours, &zone, attempt.now)
     }
 }
 
@@ -201,7 +200,6 @@ mod tests {
         AttachedPolicy, EffectiveItem, POLICY_ITEM_CATALOG, PolicyLevel, PolicyScope,
         resolve_effective_items, validate_login_hours,
     };
-    use chrono::{DateTime, Utc};
     use lldap_domain::types::UserId;
     use pretty_assertions::assert_eq;
     use std::collections::{BTreeMap, HashMap};
@@ -256,12 +254,11 @@ mod tests {
     }
 
     fn attempt<'a>(user: &'a UserId, door: Door, at: &str) -> Attempt<'a> {
-        let now = DateTime::parse_from_rfc3339(at).unwrap();
         Attempt {
             user,
             door,
             peer: None,
-            now: now.with_timezone(&Utc),
+            now: instant(at),
             second_factor: false,
         }
     }
@@ -937,11 +934,11 @@ mod tests {
         );
         let bob = UserId::new("h2bob");
         let at = attempt(&bob, Door::LdapBind, "2026-11-16T18:00:00Z");
-        let failed = DateTime::parse_from_rfc3339("2026-11-16T17:59:00Z").unwrap();
+        let failed = instant("2026-11-16T17:59:00Z");
         let counter = Lockout::default();
         let row = LockRow {
             fail_count: 3,
-            last_failed: Some(failed.naive_utc()),
+            last_failed: Some(failed),
             ..LockRow::default()
         };
         counter.seed(&bob, row);

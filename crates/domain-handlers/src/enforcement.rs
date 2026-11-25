@@ -6,6 +6,7 @@ use crate::inactivity::{
     ActivityBook, InactivityCheck, Recorded, active_since, cached_active_since, fill_activity,
     idle_past_limit, read_user_activity,
 };
+use crate::instant::{Timestamp, from_naive};
 use crate::kdc_proof::{ProofSettings, ProofWindow, Reread, WindowReader};
 use crate::kdc_proof::{fill_windows, proofs_live, take_user_windows};
 use crate::kerberos::{CommitError, HostRow};
@@ -22,7 +23,6 @@ use crate::policies::{
     canonical_ou_key, catalog_item, resolve, resolve_effective_items,
 };
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};
 use jiff::tz::TimeZone;
 use lldap_domain::requests::{CreateGroupRequest, UpdateUserRequest};
 use lldap_domain::types::{Attribute, GroupDetails, MFA_TYPE_TOTP, User, UserId, Uuid, user_ou};
@@ -114,31 +114,31 @@ pub struct Attempt<'a> {
     pub user: &'a UserId,
     pub door: Door,
     pub peer: Option<IpAddr>,
-    pub now: DateTime<Utc>,
+    pub now: Timestamp,
     pub second_factor: bool,
 }
 
 #[cfg(any(test, feature = "test-backend-scope"))]
-static TEST_CLOCK: RwLock<Option<DateTime<Utc>>> = RwLock::new(None);
+static TEST_CLOCK: RwLock<Option<Timestamp>> = RwLock::new(None);
 
 /// For tests only, through test-utils' `EnforcementGuard`: the doors' clock until it is reset.
 #[cfg(any(test, feature = "test-backend-scope"))]
-pub fn set_test_clock(now: Option<DateTime<Utc>>) {
+pub fn set_test_clock(now: Option<Timestamp>) {
     *TEST_CLOCK.write().unwrap_or_else(PoisonError::into_inner) = now;
 }
 
 #[cfg(any(test, feature = "test-backend-scope"))]
-fn pinned_clock() -> Option<DateTime<Utc>> {
+fn pinned_clock() -> Option<Timestamp> {
     *TEST_CLOCK.read().unwrap_or_else(PoisonError::into_inner)
 }
 
 #[cfg(not(any(test, feature = "test-backend-scope")))]
-fn pinned_clock() -> Option<DateTime<Utc>> {
+fn pinned_clock() -> Option<Timestamp> {
     None
 }
 
-pub fn door_clock() -> DateTime<Utc> {
-    pinned_clock().unwrap_or_else(Utc::now)
+pub fn door_clock() -> Timestamp {
+    pinned_clock().unwrap_or_else(Timestamp::now)
 }
 
 impl<'a> Attempt<'a> {
@@ -158,7 +158,7 @@ impl<'a> Attempt<'a> {
             user,
             door,
             peer,
-            now: DateTime::from_timestamp(i64::from(now), 0).unwrap_or_else(Utc::now),
+            now: Timestamp::from_second(i64::from(now)).unwrap_or_else(|_| Timestamp::now()),
             second_factor: false,
         }
     }
@@ -187,7 +187,7 @@ impl Refusal {
 pub struct UserState {
     pub lock: Option<LockRow>,
     /// The latest of inactivity's starting points; `None` while one is not read.
-    pub active_since: Option<DateTime<Utc>>,
+    pub active_since: Option<Timestamp>,
 }
 
 pub trait ItemCheck: Send + Sync {
@@ -333,7 +333,7 @@ pub struct UserFacts {
     pub uuid: Uuid,
     pub enrolled: bool,
     pub exempt: bool,
-    pub created: DateTime<Utc>,
+    pub created: Timestamp,
     /// inactivity-days' row; `None` until read.
     pub recorded: Option<Recorded>,
 }
@@ -344,7 +344,7 @@ impl UserFacts {
             uuid: user.uuid.clone(),
             enrolled: user.mfa_type.as_deref() == Some(MFA_TYPE_TOTP),
             exempt: groups.any(|group| group.display_name.as_str() == MFA_DISABLED_GROUP),
-            created: user.creation_date.and_utc(),
+            created: from_naive(user.creation_date),
             recorded: None,
         }
     }
@@ -417,7 +417,7 @@ pub struct Entries {
     pub items_of_ous: HashMap<String, Arc<[EffectiveItem]>>,
     pub facts: HashMap<UserId, UserFacts>,
     pub windows: HashMap<UserId, Arc<[ProofWindow]>>,
-    pub built_at: DateTime<Utc>,
+    pub built_at: Timestamp,
 }
 
 impl Entries {
@@ -765,7 +765,7 @@ where
     H: UserListerBackendHandler + PolicyBackendHandler + ?Sized,
 {
     let mut entries = Entries {
-        built_at: Utc::now(),
+        built_at: Timestamp::now(),
         ..Entries::default()
     };
     let mut ou_keys = BTreeSet::new();
@@ -1255,7 +1255,7 @@ async fn resolve_entry<H>(
     cache: &PolicyCache,
     user: &UserId,
     activity: bool,
-) -> Result<(Arc<[EffectiveItem]>, Option<DateTime<Utc>>)>
+) -> Result<(Arc<[EffectiveItem]>, Option<Timestamp>)>
 where
     H: UserBackendHandler + PolicyBackendHandler + ?Sized,
 {
@@ -1274,7 +1274,7 @@ where
     let unanswered = DomainError::InternalError(POLICY_UNANSWERED.to_owned());
     let (details, levels, recorded) = read.await.map_err(|_| unanswered)??;
     let items = resolve_effective_items(POLICY_ITEM_CATALOG, &levels).into();
-    let created = details.creation_date.and_utc();
+    let created = from_naive(details.creation_date);
     Ok((
         items,
         active_since(created, Some(recorded), cache.recording()),
@@ -1286,8 +1286,8 @@ pub async fn inactive_since<H>(
     handler: &H,
     cache: &PolicyCache,
     user: &UserId,
-    now: DateTime<Utc>,
-) -> Result<Option<DateTime<Utc>>>
+    now: Timestamp,
+) -> Result<Option<Timestamp>>
 where
     H: UserBackendHandler + PolicyBackendHandler + ?Sized,
 {
@@ -1471,12 +1471,13 @@ mod tests {
     use crate::handler::{ReadSchemaBackendHandler, UserRequestFilter};
     use crate::inactivity::Recording;
     use crate::inactivity::tests::turn;
+    use crate::instant::SignedDuration;
     use crate::lockout::{LockStore, LockWrite, SplitMark, StoredLock, Written, first_follow};
     use crate::policies::{
         AttachedPolicy, CreatePolicyRequest, ItemSource, OuPolicyState, Policy, PolicyId,
         PolicyLevel, PolicyScope, UpdatePolicyRequest, catalog_item,
     };
-    use chrono::NaiveDateTime;
+    use chrono::DateTime;
     use lldap_domain::requests::{CreateUserRequest, UpdateGroupRequest};
     use lldap_domain::types::{Attribute, Group, GroupDetails, GroupId, User, UserAndGroups, Uuid};
     use lldap_schema::PublicSchema;
@@ -1527,8 +1528,8 @@ mod tests {
         }
     }
 
-    fn at(seconds: i64) -> DateTime<Utc> {
-        DateTime::from_timestamp(1_700_000_000 + seconds, 0).unwrap()
+    fn at(seconds: i64) -> Timestamp {
+        Timestamp::from_second(1_700_000_000 + seconds).unwrap()
     }
 
     fn entries(users: &[(&str, &str)], ous: &[(&str, &[EffectiveItem])]) -> Entries {
@@ -1856,7 +1857,7 @@ mod tests {
             &[("e1clean", "e1ou"), ("e1counted", "e1ou")],
             &[("e1ou", &three[..])],
         ));
-        let failed = Some(at(-5).naive_utc());
+        let failed = Some(at(-5));
         let locked = LockRow {
             fail_count: 3,
             last_failed: failed,
@@ -2138,7 +2139,7 @@ mod tests {
         activity_reads: AtomicU64,
         activity_entry_reads: AtomicU64,
         recording_down: AtomicBool,
-        successes: Mutex<Vec<(UserId, NaiveDateTime)>>,
+        successes: Mutex<Vec<(UserId, Timestamp)>>,
     }
 
     impl Directory {
@@ -2394,7 +2395,7 @@ mod tests {
         async fn read_lock(&self, _: &UserId) -> Result<Option<LockRow>> {
             Ok(None)
         }
-        async fn read_locks(&self, _: Option<NaiveDateTime>) -> Result<Vec<StoredLock>> {
+        async fn read_locks(&self, _: Option<Timestamp>) -> Result<Vec<StoredLock>> {
             Ok(Vec::new())
         }
         async fn read_lock_users(&self) -> Result<Vec<UserId>> {
@@ -2413,13 +2414,13 @@ mod tests {
                 ..Written::default()
             })
         }
-        async fn read_recording(&self) -> Result<Option<NaiveDateTime>> {
+        async fn read_recording(&self) -> Result<Option<Timestamp>> {
             match self.recording_down.load(Ordering::Relaxed) {
                 true => Err(DomainError::InternalError("down".to_owned())),
                 false => Ok(None),
             }
         }
-        async fn write_success(&self, user: &UserId, at: NaiveDateTime) -> Result<()> {
+        async fn write_success(&self, user: &UserId, at: Timestamp) -> Result<()> {
             self.successes.lock().unwrap().push((user.clone(), at));
             Ok(())
         }
@@ -3325,12 +3326,12 @@ mod tests {
     #[test]
     fn test_without_a_pinned_clock_an_attempt_takes_the_time_of_the_moment() {
         let bob = UserId::new("bob");
-        let before = Utc::now();
+        let before = Timestamp::now();
         let now = Attempt::new(&bob, Door::LdapBind).now;
-        let took = (now - before).num_milliseconds();
+        let took = (now - before).as_millis();
         assert!((0..1_000).contains(&took), "{took} ms");
-        let lock = lockout::lock_clock().and_utc();
-        let apart = (lock - now).num_milliseconds();
+        let lock = lockout::lock_clock();
+        let apart = (lock - now).as_millis();
         assert!(apart.abs() < 1_000, "the lockout's clock: {apart} ms");
     }
 
@@ -3517,7 +3518,7 @@ mod tests {
         ];
         let locked = LockRow {
             fail_count: 1,
-            last_failed: Some(at(0).naive_utc()),
+            last_failed: Some(at(0)),
             ..LockRow::default()
         };
         let both = UserState {
@@ -3588,7 +3589,7 @@ mod tests {
             last_success: Some(at(0)),
             reenabled_at: None,
         };
-        let epoch = DateTime::from_timestamp(0, 0).unwrap();
+        let epoch = Timestamp::UNIX_EPOCH;
         for (label, value, reads, read) in [("not set", "0", 0, false), ("set", "30", 1, true)] {
             let cache = PolicyCache::new();
             let mut directory = Directory::knowing(&[LATE]).listing(&[LATE, OTHER]);
@@ -3690,7 +3691,7 @@ mod tests {
     struct Idle;
 
     impl Idle {
-        fn since(recording: DateTime<Utc>) -> Self {
+        fn since(recording: Timestamp) -> Self {
             let checks: Vec<Arc<dyn ItemCheck>> = vec![Arc::new(InactivityCheck)];
             set_item_checks(checks.into());
             turn(policy_cache(), true);
@@ -3720,8 +3721,8 @@ mod tests {
             let (joined, alone) = (&d.activity_entry_reads, &d.entry_reads);
             [count(joined), count(alone), count(&d.activity_reads)]
         };
-        let now = Utc::now();
-        let ago = |seconds: i64| now - chrono::Duration::seconds(seconds);
+        let now = Timestamp::now();
+        let ago = |seconds: i64| now - SignedDuration::from_secs(seconds);
         let inactive = Err("policy: inactivity-days (inactive)".to_owned());
         let rows = [
             ("active since the recording began", 3_600, None, Ok(())),
@@ -3845,7 +3846,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_inactivity_turning_on_with_a_read_unanswered_refuses_its_users_until_both_read() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let _idle = Idle::since(now);
         let (cache, counter) = (policy_cache(), Lockout::default());
         let mut directory = Directory::knowing(&[LATE]).listing(&[LATE]);
@@ -3853,7 +3854,7 @@ mod tests {
         directory.levels = idle_level("30");
         let late = UserId::new(LATE);
         let checks: Vec<Arc<dyn ItemCheck>> = vec![Arc::new(InactivityCheck)];
-        let seconds = u32::try_from(now.timestamp()).unwrap();
+        let seconds = u32::try_from(now.as_second()).unwrap();
         let detail = |verdict: std::result::Result<(), Refusal>| verdict.map_err(|r| r.detail());
         let verdicts = async || {
             let door = admit(&directory, &Attempt::new(&late, Door::LdapBind)).await;
@@ -3911,12 +3912,12 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_while_inactivitys_own_data_is_unread_a_user_under_0_or_no_limit_is_admitted() {
-        let now = Utc::now();
+        let now = Timestamp::now();
         let _idle = Idle::since(now);
         let (cache, counter) = (policy_cache(), Lockout::default());
         let late = UserId::new(LATE);
         let checks: Vec<Arc<dyn ItemCheck>> = vec![Arc::new(InactivityCheck)];
-        let seconds = u32::try_from(now.timestamp()).unwrap();
+        let seconds = u32::try_from(now.as_second()).unwrap();
         let detail = |verdict: std::result::Result<(), Refusal>| verdict.map_err(|r| r.detail());
         let unreadable = Err("policy: unreadable".to_owned());
         let rows = [
@@ -3987,20 +3988,20 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_a_refill_that_misses_the_activity_keeps_what_was_read_and_refuses_no_one() {
-        let now = Utc::now();
-        let _idle = Idle::since(now - chrono::Duration::days(40));
+        let now = Timestamp::now();
+        let _idle = Idle::since(now - SignedDuration::from_hours(40 * 24));
         let (cache, counter) = (policy_cache(), Lockout::default());
         let mut directory = Directory::knowing(&[LATE, OTHER]).listing(&[LATE, OTHER]);
         directory.policies = vec![linked(INACTIVITY_DAYS, "30", &[LABS])];
         directory.levels = idle_level("30");
         let (late, other) = (UserId::new(LATE), UserId::new(OTHER));
         let seen = Recorded {
-            last_success: Some(now - chrono::Duration::hours(1)),
+            last_success: Some(now - SignedDuration::from_hours(1)),
             reenabled_at: None,
         };
         *directory.activity_rows.lock().unwrap() = vec![(late.clone(), seen)];
         let checks: Vec<Arc<dyn ItemCheck>> = vec![Arc::new(InactivityCheck)];
-        let seconds = u32::try_from(now.timestamp()).unwrap();
+        let seconds = u32::try_from(now.as_second()).unwrap();
         let verdicts = async || {
             let mut got = Vec::new();
             for user in [&late, &other] {
@@ -4175,7 +4176,7 @@ mod tests {
         turn(cache, true);
         for n in 0..300 {
             let user = UserId::new(&format!("e6owed{n}"));
-            cache.carry_success_from_kdc(&user, at(0).naive_utc());
+            cache.carry_success_from_kdc(&user, at(0));
         }
         let owed = cache.owed_successes();
         let running = counter.run(directory.clone(), cache);
@@ -4235,7 +4236,7 @@ mod tests {
         turn(&cache, true);
         let directory = Directory::knowing(&[LATE]).listing(&[LATE]);
         let (late, other) = (UserId::new(LATE), UserId::new(OTHER));
-        let success = |seconds: i64| at(seconds).naive_utc();
+        let success = at;
         for user in [&late, &other] {
             cache.note_success(&directory, user, success(0)).await;
         }

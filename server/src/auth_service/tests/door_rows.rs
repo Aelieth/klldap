@@ -141,7 +141,7 @@ async fn test_an_inactive_users_refresh_and_token_use_are_refused_with_401_and_o
     idle_after(&handler, "1").await;
     let _ = log.recorder().take_events();
     let active = (doors(&handler, "e6door").await, rows(&log, "e6door"));
-    guard.pin_clock(chrono::Utc::now() + chrono::Duration::days(3));
+    guard.pin_clock(Timestamp::now() + days(3));
     let idle = (doors(&handler, "e6door").await, rows(&log, "e6door"));
     handler.clear_ou_policy("").await.unwrap();
     let refreshed: Vec<Row> = vec![(LogKind::TokenRefresh, true, None)];

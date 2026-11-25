@@ -10,6 +10,7 @@ use krb5_kdc::{
 };
 use lldap_domain::types::UserId;
 use lldap_domain_handlers::handler::PolicyBackendHandler;
+use lldap_domain_handlers::instant::Timestamp;
 use lldap_domain_handlers::kerberos::{
     self as directory, AliasOnto, DIRECTORY_TARGET, DIRECTORY_USER, HostRow,
 };
@@ -889,7 +890,7 @@ impl SqlRealm {
             HostRow::SetPassword {
                 user: user.clone(),
                 record,
-                now: chrono::Utc::now().naive_utc(),
+                now: Timestamp::now(),
             },
             HostRow::Log(row.clone()),
         ];
@@ -1051,10 +1052,8 @@ fn principal_row(row: PrincipalRow) -> Result<directory::PrincipalRow, KerberosS
     })
 }
 
-fn time(seconds: u32) -> chrono::NaiveDateTime {
-    chrono::DateTime::from_timestamp(i64::from(seconds), 0)
-        .unwrap_or_default()
-        .naive_utc()
+fn time(seconds: u32) -> Timestamp {
+    Timestamp::from_second(i64::from(seconds)).unwrap_or_default()
 }
 
 fn store_error(e: directory::KerberosStoreError) -> KerberosStoreError {
@@ -1489,7 +1488,7 @@ mod tests {
                 HostRow::SetPassword {
                     user: UserId::new(user),
                     record: record.to_vec(),
-                    now: chrono::Utc::now().naive_utc(),
+                    now: Timestamp::now(),
                 },
                 HostRow::Log(logging::event(
                     LogKind::PasswordChange,
@@ -7323,7 +7322,7 @@ mod tests {
 
     #[test]
     fn test_principal_rows_convert() {
-        let when = |s| chrono::DateTime::from_timestamp(s, 0).unwrap().naive_utc();
+        let when = |s| Timestamp::from_second(s).unwrap();
         let converted = principal_row(row(3, Some(1_798_761_600))).unwrap();
         assert_eq!(
             (

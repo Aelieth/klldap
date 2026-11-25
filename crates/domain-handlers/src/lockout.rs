@@ -8,11 +8,11 @@ use crate::handler::{
     UserListerBackendHandler,
 };
 use crate::inactivity::follow_recording;
+use crate::instant::{self, SignedDuration, Timestamp};
 use crate::logging::{self, LogKind};
 use crate::networks::warn_unreadable;
 use crate::policies::{EffectiveItem, Policy, catalog_item};
 use async_trait::async_trait;
-use chrono::NaiveDateTime;
 use lldap_domain::types::{UserId, Uuid};
 use lldap_domain_model::error::{DomainError, Result};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -48,22 +48,21 @@ pub const SUCCESS_BUDGET: Duration = Duration::from_secs(2);
 pub const NOT_READ_YET: &str = "the lockout's state is not read yet";
 const REREAD_MARGIN_SECS: i64 = 60;
 
-pub fn lock_clock() -> NaiveDateTime {
+pub fn lock_clock() -> Timestamp {
     let now = door_clock();
-    chrono::DateTime::from_timestamp_micros(now.timestamp_micros())
-        .unwrap_or(now)
-        .naive_utc()
+    time_of_micros(micros_of(now)).unwrap_or(now)
 }
 
-pub fn micros_of(at: NaiveDateTime) -> i64 {
-    at.and_utc().timestamp_micros()
+pub fn micros_of(at: Timestamp) -> i64 {
+    instant::floor_micros(at)
 }
 
-pub fn time_of_micros(micros: i64) -> Option<NaiveDateTime> {
-    chrono::DateTime::from_timestamp_micros(micros).map(|at| at.naive_utc())
+pub fn time_of_micros(micros: i64) -> Option<Timestamp> {
+    let (seconds, micro) = (micros.div_euclid(1_000_000), micros.rem_euclid(1_000_000));
+    Timestamp::new(seconds, (micro * 1_000) as i32).ok()
 }
 
-fn after(a: Option<NaiveDateTime>, b: Option<NaiveDateTime>) -> bool {
+fn after(a: Option<Timestamp>, b: Option<Timestamp>) -> bool {
     match (a, b) {
         (Some(a), Some(b)) => a > b,
         (Some(_), None) => true,
@@ -99,14 +98,14 @@ impl LockoutPolicy {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LockRow {
     pub fail_count: u32,
-    pub last_failed: Option<NaiveDateTime>,
-    pub last_success: Option<NaiveDateTime>,
-    pub last_admin_unlock: Option<NaiveDateTime>,
-    pub lock_logged: Option<NaiveDateTime>,
+    pub last_failed: Option<Timestamp>,
+    pub last_success: Option<Timestamp>,
+    pub last_admin_unlock: Option<Timestamp>,
+    pub lock_logged: Option<Timestamp>,
 }
 
 impl LockRow {
-    pub fn locked(&self, policy: LockoutPolicy, now: NaiveDateTime) -> bool {
+    pub fn locked(&self, policy: LockoutPolicy, now: Timestamp) -> bool {
         if !after(self.last_failed, self.last_admin_unlock) {
             return false;
         }
@@ -116,20 +115,20 @@ impl LockRow {
         if policy.duration_seconds == 0 {
             return true;
         }
-        let duration = chrono::Duration::seconds(i64::from(policy.duration_seconds));
+        let duration = SignedDuration::from_secs(i64::from(policy.duration_seconds));
         self.last_failed
-            .is_some_and(|failed| failed + duration > now)
+            .is_some_and(|failed| instant::later(failed, duration) > now)
     }
 
     /// The end of the lock `locked` reports; `None` while it holds until an admin unlocks.
-    pub fn lock_end(&self, policy: LockoutPolicy) -> Option<NaiveDateTime> {
-        let duration = chrono::Duration::seconds(i64::from(policy.duration_seconds));
+    pub fn lock_end(&self, policy: LockoutPolicy) -> Option<Timestamp> {
+        let duration = SignedDuration::from_secs(i64::from(policy.duration_seconds));
         self.last_failed
             .filter(|_| policy.duration_seconds > 0)
-            .map(|failed| failed + duration)
+            .map(|failed| instant::later(failed, duration))
     }
 
-    pub fn failed(self, at: NaiveDateTime) -> Self {
+    pub fn failed(self, at: Timestamp) -> Self {
         let base = if after(self.last_failed, self.last_admin_unlock) {
             self.fail_count
         } else {
@@ -142,7 +141,7 @@ impl LockRow {
         }
     }
 
-    pub fn cleared(self, at: NaiveDateTime) -> Self {
+    pub fn cleared(self, at: Timestamp) -> Self {
         Self {
             fail_count: 0,
             last_success: self.last_success.max(Some(at)),
@@ -150,7 +149,7 @@ impl LockRow {
         }
     }
 
-    pub fn unlocked(self, at: NaiveDateTime) -> Self {
+    pub fn unlocked(self, at: Timestamp) -> Self {
         Self {
             fail_count: 0,
             last_admin_unlock: Some(at),
@@ -211,7 +210,7 @@ impl SplitMark {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Overlay {
     pub id: u64,
-    pub at: NaiveDateTime,
+    pub at: Timestamp,
     pub policy: LockoutPolicy,
     pub expires: Instant,
     pub peer: Option<IpAddr>,
@@ -240,7 +239,7 @@ pub type StoredLock = (UserId, Option<Uuid>, LockRow);
 pub trait LockStore: Send + Sync {
     async fn read_lock(&self, user: &UserId) -> Result<Option<LockRow>>;
     /// The rows with a stamp at or after `since`; every row for `None`.
-    async fn read_locks(&self, since: Option<NaiveDateTime>) -> Result<Vec<StoredLock>>;
+    async fn read_locks(&self, since: Option<Timestamp>) -> Result<Vec<StoredLock>>;
     async fn read_lock_users(&self) -> Result<Vec<UserId>>;
     async fn read_split(&self, user: &UserId) -> Result<Option<SplitMark>>;
     async fn read_period(&self) -> Result<String>;
@@ -251,19 +250,15 @@ pub trait LockStore: Send + Sync {
         Ok(0)
     }
     /// When inactivity-days last went live, as stored; `None` while it is off.
-    async fn read_recording(&self) -> Result<Option<NaiveDateTime>> {
+    async fn read_recording(&self) -> Result<Option<Timestamp>> {
         Ok(None)
     }
     /// One conditional write, from off to `at` while live or to off when not; the value after.
-    async fn write_recording(
-        &self,
-        live: bool,
-        at: NaiveDateTime,
-    ) -> Result<Option<NaiveDateTime>> {
+    async fn write_recording(&self, live: bool, at: Timestamp) -> Result<Option<Timestamp>> {
         Ok(live.then_some(at))
     }
     /// The later of the stored success and `at`, for a user who exists.
-    async fn write_success(&self, _user: &UserId, _at: NaiveDateTime) -> Result<()> {
+    async fn write_success(&self, _user: &UserId, _at: Timestamp) -> Result<()> {
         Ok(())
     }
 }
@@ -338,7 +333,7 @@ impl ItemCheck for LockoutCheck {
             threshold: value.parse().unwrap_or(0),
             duration_seconds: number(items, DURATION),
         };
-        !row.locked(policy, attempt.now.naive_utc())
+        !row.locked(policy, attempt.now)
     }
 }
 
@@ -352,7 +347,7 @@ pub struct LockState {
 }
 
 impl LockState {
-    pub fn locked(&self, now: NaiveDateTime) -> bool {
+    pub fn locked(&self, now: Timestamp) -> bool {
         self.row.locked(self.policy, now)
     }
 }
@@ -404,7 +399,7 @@ impl Entry {
         self.unwritten.clear();
     }
 
-    fn count(&mut self, row: LockRow, times: &[NaiveDateTime]) {
+    fn count(&mut self, row: LockRow, times: &[Timestamp]) {
         self.change(row);
         for at in times {
             if self.unwritten.len() == UNWRITTEN_CAP {
@@ -453,7 +448,7 @@ impl Entry {
         self.overlays.iter().map(|overlay| overlay.expires).min()
     }
 
-    fn fold_all(&mut self, at: NaiveDateTime) -> Option<Option<IpAddr>> {
+    fn fold_all(&mut self, at: Timestamp) -> Option<Option<IpAddr>> {
         let (mut row, mut logged, mut times) = (self.row, None, Vec::new());
         for overlay in self.overlays.drain(..) {
             let mut step = Step::default();
@@ -488,7 +483,7 @@ struct Book {
     order: VecDeque<(UserId, u64)>,
     seq: u64,
     dropped: u64,
-    read_at: Option<NaiveDateTime>,
+    read_at: Option<Timestamp>,
     changes: u64,
     forgotten: HashMap<UserId, u64>,
     cleared_at: u64,
@@ -940,12 +935,7 @@ impl Lockout {
         }
     }
 
-    fn log_once(
-        policy: LockoutPolicy,
-        row: LockRow,
-        at: NaiveDateTime,
-        step: &mut Step,
-    ) -> LockRow {
+    fn log_once(policy: LockoutPolicy, row: LockRow, at: Timestamp, step: &mut Step) -> LockRow {
         if !row.locked(policy, at) || row.lock_logged_this_cycle() {
             return row;
         }
@@ -964,7 +954,7 @@ impl Lockout {
     }
 
     /// Counted on the user's current row, never on the row the door read before its work.
-    pub fn failure(&self, state: &LockState, at: NaiveDateTime) -> Step {
+    pub fn failure(&self, state: &LockState, at: Timestamp) -> Step {
         let mut book = self.book();
         let tick = book.tick();
         let Some(entry) = book
@@ -990,7 +980,7 @@ impl Lockout {
 
     /// False when the user is locked by now, the start's own +1 not counted, or when the entry
     /// the door read is gone, so no start is accepted unrecorded.
-    pub fn start(&self, state: &LockState, id: u64, at: NaiveDateTime) -> bool {
+    pub fn start(&self, state: &LockState, id: u64, at: Timestamp) -> bool {
         let expires = Instant::now() + START_HOLD;
         let mut book = self.book();
         let tick = book.tick();
@@ -1059,7 +1049,7 @@ impl Lockout {
     }
 
     /// A completed sign-in drops the user's starts made before it, here and with no write.
-    pub fn success(&self, state: &LockState, at: NaiveDateTime) -> Step {
+    pub fn success(&self, state: &LockState, at: Timestamp) -> Step {
         let mut book = self.book();
         let tick = book.tick();
         let Some(entry) = book
@@ -1084,7 +1074,7 @@ impl Lockout {
     }
 
     /// A ticket on the password alone is a sign-in only for a user known to have no second factor.
-    pub fn ticket_issued(&self, cache: &PolicyCache, state: &LockState, at: NaiveDateTime) -> Step {
+    pub fn ticket_issued(&self, cache: &PolicyCache, state: &LockState, at: Timestamp) -> Step {
         let entries = cache.get();
         let policy = cached_mfa_policy(cache, &entries, &state.user);
         let one_factor = entries
@@ -1097,7 +1087,7 @@ impl Lockout {
         self.success(state, at)
     }
 
-    pub fn unlocked(&self, user: &UserId, at: NaiveDateTime) {
+    pub fn unlocked(&self, user: &UserId, at: Timestamp) {
         let mut book = self.book();
         let owed = book.owed.contains_key(user);
         let tick = book.tick();
@@ -1377,12 +1367,12 @@ impl Lockout {
     /// A row read here is taken only for an entry nothing touched since the read began.
     async fn reread<S: LockStore + ?Sized>(&self, store: &S, all: bool) -> Result<usize> {
         let read_at = lock_clock();
-        let margin = chrono::Duration::seconds(REREAD_MARGIN_SECS);
+        let margin = SignedDuration::from_secs(REREAD_MARGIN_SECS);
         let (since, since_at) = {
             let book = self.book();
             let since_at = match all {
                 true => None,
-                false => book.read_at.map(|at| at - margin),
+                false => book.read_at.map(|at| instant::earlier(at, margin)),
             };
             (book.changes, since_at)
         };
@@ -1650,13 +1640,11 @@ mod tests {
         assert_eq!(WRITE_BOUND, Duration::from_millis(250));
     }
 
-    fn exact(seconds: i64, nanos: u32) -> NaiveDateTime {
-        chrono::DateTime::from_timestamp(seconds, nanos)
-            .unwrap()
-            .naive_utc()
+    fn exact(seconds: i64, nanos: u32) -> Timestamp {
+        Timestamp::new(seconds, nanos as i32).unwrap()
     }
 
-    fn at(seconds: i64) -> NaiveDateTime {
+    fn at(seconds: i64) -> Timestamp {
         exact(1_700_000_000 + seconds, 0)
     }
 
@@ -1690,7 +1678,7 @@ mod tests {
     }
 
     fn account(n: u8) -> Uuid {
-        Uuid::from_name_and_date(&format!("bob{n}"), &at(0))
+        Uuid::from_name_and_date(&format!("bob{n}"), &instant::to_naive(at(0)))
     }
 
     fn state(policy: LockoutPolicy, row: LockRow) -> LockState {
@@ -2045,7 +2033,7 @@ mod tests {
             user: &user,
             door: Door::TokenUse,
             peer: None,
-            now: at(seconds).and_utc(),
+            now: at(seconds),
             second_factor: false,
         };
         let locked = UserState {
@@ -2336,7 +2324,7 @@ mod tests {
             Ok(self.stored(user))
         }
 
-        async fn read_locks(&self, since: Option<NaiveDateTime>) -> Result<Vec<StoredLock>> {
+        async fn read_locks(&self, since: Option<Timestamp>) -> Result<Vec<StoredLock>> {
             self.calls
                 .lock()
                 .unwrap()

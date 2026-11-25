@@ -60,11 +60,12 @@ target = os.environ["TARGET"] or None
 print(sum(1 for r in rows if r.get("target") == target and r.get("detail") == os.environ["DETAIL"]))
 PY
 }
-# mig_healthy <container> <tag>: waits for the import; 0 when healthy and serving.
+# mig_healthy <container> <tag>: waits for the import; 0 when healthy with its realm ready
+# (healthcheck --kerberos) and serving.
 mig_healthy() {
     local name="$1" tag="$2" healthy=""
     for _ in $(seq 1 120); do
-        if docker exec "$name" /app/lldap healthcheck --config-file /data/lldap_config.toml >/dev/null 2>&1; then
+        if docker exec "$name" /app/lldap healthcheck --kerberos --config-file /data/lldap_config.toml >/dev/null 2>&1; then
             healthy=1
             break
         fi
@@ -256,17 +257,25 @@ for _ in $(seq 1 90); do
     [ -z "$(docker ps -q -f "name=^$MIG_B$")" ] && break
     sleep 1
 done
+# The key is at its default, directory-only, and this database has never held a realm: the server
+# stays admin-only and says why. /health names the state and the public cause, never the path.
+MIG_B_503="503 Service Unavailable: Kerberos is admin-only: the Kerberos realm did not open; the server log has the cause"
+MIG_B_STAYS="kerberos_options.on_realm_failure is directory-only, but this server stays admin-only: this database holds no Kerberos realm yet"
 docker exec "$MIG_B" /app/lldap healthcheck --config-file /data/lldap_config.toml >"$D/branch-b-health.log" 2>&1
-if [ -n "$degraded" ] && grep -q "503 Service Unavailable" "$D/branch-b-health.log"; then
-    p_ok "without the dump the realm does not open: degraded, /health answers 503"
+mig_b_plain=$?
+docker exec "$MIG_B" /app/lldap healthcheck --kerberos --config-file /data/lldap_config.toml >"$D/branch-b-health-kerberos.log" 2>&1
+mig_b_flag=$?
+if [ -n "$degraded" ] && [ "$mig_b_plain" != 0 ] && [ "$mig_b_flag" != 0 ] &&
+    grep -qF "$MIG_B_503" "$D/branch-b-health.log" && grep -qF "$MIG_B_STAYS" "$D/branch-b-docker.log"; then
+    p_ok "without the dump the realm does not open and the database holds no realm: admin-only though the key is at its default, the log says why, and both healthchecks fail with '$MIG_B_503'"
 else
-    p_bad "branch B did not come up degraded (see branch-b-docker.log, branch-b-health.log)"
+    p_bad "branch B did not come up admin-only (healthcheck exit $mig_b_plain, with --kerberos $mig_b_flag; want both non-zero, '$MIG_B_503' in branch-b-health.log and '$MIG_B_STAYS' in branch-b-docker.log)"
 fi
-if cat "$D/branch-b-health.log" "$D/branch-b-docker.log" | grep -q "$KDC/principal.dump" \
-    && cat "$D/branch-b-health.log" "$D/branch-b-docker.log" | grep -q "Upgrading from 0.7.2"; then
-    p_ok "the cause names the dump file and the upgrade section"
+if grep -q "$KDC/principal.dump" "$D/branch-b-docker.log" && grep -q "Upgrading from 0.7.2" "$D/branch-b-docker.log" &&
+    ! grep -qF "$KDC/principal.dump" "$D/branch-b-health.log"; then
+    p_ok "the server's log names the dump file and the upgrade section, and the healthcheck's answer does not name the file"
 else
-    p_bad "the cause does not name the dump file and the upgrade section"
+    p_bad "the log does not name the dump file and the upgrade section, or the healthcheck's answer names $KDC/principal.dump"
 fi
 if docker exec "$MIG_B" sh -c "[ ! -e $KDC/mit-db2.bak ] && [ -f $KDC/principal ] && [ -f $KDC/principal.kadm5 ]"; then
     p_ok "nothing moved: no mit-db2.bak/, the db2 files where they were"

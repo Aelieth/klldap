@@ -123,7 +123,10 @@ ls_client_up() {
         docker cp "$GATE_ROOT/lib/lowspec-client.sh" "$LS_CLIENT:/tmp/lowspec-client.sh" >/dev/null 2>>"$LS_D/client.err"
 }
 
-ls_healthy() { docker exec "$LS_SRV" /app/lldap healthcheck --config-file /data/lldap_config.toml >/dev/null 2>&1; }
+ls_healthy() {
+    docker exec "$LS_SRV" /app/lldap healthcheck ${GATE_REALM_FLAG:+"$GATE_REALM_FLAG"} \
+        --config-file /data/lldap_config.toml >/dev/null 2>&1
+}
 
 # ls_server_up: the limited server, its limits read back, its users and policy. 0; 1 with LS_WHY;
 # 2 with LS_WHY when the server runs but its cgroup does not show the limits.

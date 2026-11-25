@@ -128,7 +128,9 @@ class Record:
 
 
 class Server:
-    HEALTH = ("/app/lldap", "healthcheck", "--config-file", "/data/lldap_config.toml")
+    # --kerberos: the plain command also passes a server whose realm did not open and which is
+    # directory-only; every wait here is followed by a kinit, a kvno or a synced write.
+    HEALTH = ("/app/lldap", "healthcheck", "--kerberos", "--config-file", "/data/lldap_config.toml")
 
     def __init__(self, name, data, kdc, db_url, shared=None):
         self.name = f"{PREFIX}-{name}"
@@ -333,7 +335,7 @@ class Server:
 class HostServer(Server):
     """The server under klldap.service in the guest (ACC-8's host leg, D182), reached over ssh."""
 
-    HEALTH = ("sh", "-c", f"set -a; . {OPT}/secret/env; cd {OPT} && exec ./lldap healthcheck")
+    HEALTH = ("sh", "-c", f"set -a; . {OPT}/secret/env; cd {OPT} && exec ./lldap healthcheck --kerberos")
 
     def __init__(self, db_url):
         self.name = "klldap.service"
@@ -497,7 +499,11 @@ def lockout_text(state):
 
 
 def wait_up(server, since):
-    """Healthy, or the log since the boot names a lockout cause: (seconds, cause) or (None, None)."""
+    """Healthy, or the log since the boot names a lockout cause: (seconds, cause) or (None, None).
+
+    Healthy is healthcheck --kerberos, so a start that did not open is never taken for a good one:
+    with a lockout cause the server stays admin-only and is found here by its log, as before; with
+    any other cause it is directory-only, fails the flag and runs into BOOT_LIMIT, as before."""
     started = time.monotonic()
     while time.monotonic() - started < BOOT_LIMIT:
         if server.running():

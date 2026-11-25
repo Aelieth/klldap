@@ -23,7 +23,7 @@ docker run -d --name "$UID_CONTAINER" --network "$NET" \
 
 uid_healthy=""
 for _ in $(seq 1 120); do
-    if docker exec "$UID_CONTAINER" /app/lldap healthcheck \
+    if docker exec "$UID_CONTAINER" /app/lldap healthcheck --kerberos \
         --config-file /data/lldap_config.toml >/dev/null 2>&1; then
         uid_healthy=1
         break
@@ -85,7 +85,7 @@ docker run -d --name "$UID_CONTAINER" --network "$NET" \
     "$GATE_IMAGE" >"$D/run-upstream-names.log" 2>&1 || p_bad "could not start the UID/GID container"
 upstream_uid=""
 for _ in $(seq 1 120); do
-    if docker exec "$UID_CONTAINER" /app/lldap healthcheck \
+    if docker exec "$UID_CONTAINER" /app/lldap healthcheck --kerberos \
         --config-file /data/lldap_config.toml >/dev/null 2>&1; then
         upstream_uid="$(docker exec "$UID_CONTAINER" sh -c 'stat -c %u /proc/$(pgrep -x lldap | head -1)' 2>/dev/null)"
         break

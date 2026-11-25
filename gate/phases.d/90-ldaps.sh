@@ -55,7 +55,7 @@ docker run -d --name "$LDAPS_C" --hostname ldaps-gate --network "$NET" \
 
 healthy=""
 for _ in $(seq 1 90); do
-    if docker exec "$LDAPS_C" /app/lldap healthcheck \
+    if docker exec "$LDAPS_C" /app/lldap healthcheck --kerberos \
         --config-file /data/lldap_config.toml >/dev/null 2>&1; then
         healthy=1
         break

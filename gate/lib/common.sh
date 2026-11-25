@@ -193,11 +193,24 @@ discover_ports() {
     [ -n "$LDAP_PORT" ] && [ -n "$HTTP_PORT" ]
 }
 
-# wait_healthy [seconds]: poll the in-container healthcheck until it passes.
-wait_healthy() {
-    local limit="${1:-90}" i=0
+# An image older than 0.8.2 has no --kerberos flag and its plain healthcheck already means the
+# realm serves: the gate runs on one with GATE_REALM_FLAG= (empty).
+GATE_REALM_FLAG="${GATE_REALM_FLAG---kerberos}"
+
+# wait_healthy [seconds]: poll the in-container healthcheck until the realm serves. It asks with
+# --kerberos: the plain command also passes a server whose realm did not open and which is
+# directory-only, and every caller goes on to kinit, kadmin or a synced user.
+wait_healthy() { wait_health "${1:-90}" ${GATE_REALM_FLAG:+"$GATE_REALM_FLAG"}; }
+
+# wait_answering [seconds]: the plain healthcheck: the directory answers, whatever the realm's state.
+wait_answering() { wait_health "${1:-90}"; }
+
+# wait_health <seconds> [healthcheck flag ...]
+wait_health() {
+    local limit="$1" i=0
+    shift
     while [ "$i" -lt "$limit" ]; do
-        if docker exec "$CONTAINER" /app/lldap healthcheck \
+        if docker exec "$CONTAINER" /app/lldap healthcheck "$@" \
             --config-file /data/lldap_config.toml >/dev/null 2>&1; then
             return 0
         fi
@@ -212,7 +225,8 @@ wait_healthy() {
 }
 
 # side_up <name> <volume> [-e NAME=value ...]: another server on its own SQLite volume with
-# Kerberos off, removed and made again by its exact name; prints its HTTP and LDAP ports.
+# Kerberos off, removed and made again by its exact name; prints its HTTP and LDAP ports. Its
+# healthcheck is the plain one: --kerberos fails a server whose Kerberos is disabled.
 side_up() {
     local name="$1" vol="$2" i=0
     shift 2
@@ -237,7 +251,8 @@ side_up() {
 
 # side_up_kdc <name> <volume> <kdc volume> [-e NAME=value ...]: another server on its own SQLite
 # volume with its own realm on a second volume (Kerberos on, nothing set server-wide), removed and
-# made again by its exact name; prints its HTTP, LDAP and KDC (tcp) ports. kinit runs inside it.
+# made again by its exact name; prints its HTTP, LDAP and KDC (tcp) ports. kinit runs inside it,
+# so it is waited for with healthcheck --kerberos: its realm serves.
 side_up_kdc() {
     local name="$1" vol="$2" kvol="$3" i=0
     shift 3
@@ -251,8 +266,8 @@ side_up_kdc() {
         -e LLDAP_JWT_SECRET -e LLDAP_KEY_SEED -e LLDAP_LDAP_USER_PASS \
         -e LLDAP_LDAP_BASE_DN="$BASE_DN" -e LLDAP_DATABASE_URL="sqlite:////data/users.db?mode=rwc" \
         -e LLDAP_VERBOSE=true "$@" "$GATE_IMAGE" >/dev/null || return 1
-    while ! docker exec "$name" /app/lldap healthcheck --config-file /data/lldap_config.toml \
-        >/dev/null 2>&1; do
+    while ! docker exec "$name" /app/lldap healthcheck ${GATE_REALM_FLAG:+"$GATE_REALM_FLAG"} \
+        --config-file /data/lldap_config.toml >/dev/null 2>&1; do
         i=$((i + 1))
         [ "$i" -lt 90 ] && [ -n "$(docker ps -q -f "name=^${name}$")" ] || return 1
         sleep 1

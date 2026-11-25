@@ -181,7 +181,7 @@ fi
 
 healthy=""
 for _ in $(seq 1 90); do
-    if docker exec "$KDC_C" /app/lldap healthcheck --config-file /data/lldap_config.toml \
+    if docker exec "$KDC_C" /app/lldap healthcheck --kerberos --config-file /data/lldap_config.toml \
         >/dev/null 2>&1; then
         healthy=1
         break
@@ -601,7 +601,7 @@ if ! docker run -d --name "$REL_C" --network "$NET" \
 fi
 rel_healthy=""
 for _ in $(seq 1 90); do
-    if docker exec "$REL_C" /app/lldap healthcheck --config-file /data/lldap_config.toml \
+    if docker exec "$REL_C" /app/lldap healthcheck --kerberos --config-file /data/lldap_config.toml \
         >/dev/null 2>&1; then
         rel_healthy=1
         break

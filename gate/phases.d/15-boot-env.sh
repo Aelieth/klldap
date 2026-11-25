@@ -21,7 +21,7 @@ docker run -d --name "$ENV_CONTAINER" --network none -e LLDAP_VERBOSE=true \
     "$GATE_IMAGE" >"$D/missing-base-dn.run" 2>&1
 healthy=""
 for _ in $(seq 1 60); do
-    if docker exec "$ENV_CONTAINER" /app/lldap healthcheck \
+    if docker exec "$ENV_CONTAINER" /app/lldap healthcheck --kerberos \
         --config-file /data/lldap_config.toml >/dev/null 2>&1; then
         healthy=1
         break
@@ -49,7 +49,7 @@ docker run -d --name "$ENV_CONTAINER" --network none \
     -v "$OLD_DATA:/data" -v "$OLD_KDC:/var/kerberos/krb5kdc" "$GATE_IMAGE" >"$D/oldcfg.run" 2>&1
 healthy=""
 for _ in $(seq 1 90); do
-    if docker exec "$ENV_CONTAINER" /app/lldap healthcheck \
+    if docker exec "$ENV_CONTAINER" /app/lldap healthcheck --kerberos \
         --config-file /data/lldap_config.toml >/dev/null 2>&1; then
         healthy=1
         break

@@ -198,7 +198,7 @@ mail_healthy() {
     local name="$1"
     local _
     for _ in $(seq 1 90); do
-        if docker exec "$name" /app/lldap healthcheck \
+        if docker exec "$name" /app/lldap healthcheck --kerberos \
             --config-file /data/lldap_config.toml >/dev/null 2>&1; then
             return 0
         fi

@@ -360,6 +360,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::embedded::EmbeddedKerberos;
     use crate::embedded::tests::{TempRealm, ask, synced};
+    use crate::policy::LiveClients;
     use crate::policy::tests::{tgs_body, ticket};
     use crate::seam::committing;
     use chrono::Utc;
@@ -406,6 +407,7 @@ pub(crate) mod tests {
     use std::time::{Duration, Instant};
 
     mod networks_rows;
+    mod proof_wire_rows;
 
     const REALM: &str = "EXAMPLE.COM";
     const PASSWORD: &str = "Kdc-Pass-1";
@@ -1636,12 +1638,11 @@ pub(crate) mod tests {
         }
         fill_policy_cache(&handler, cache).await.unwrap();
         let verdict = Arc::new(KdcVerdict::on(REALM, cache, counter));
-        store
-            .write()
-            .unwrap()
-            .policy
-            .plugins
-            .set_host_admission(verdict.clone());
+        let mut opened = store.write().unwrap();
+        let plugins = &mut opened.policy.plugins;
+        plugins.set_host_admission(verdict.clone());
+        plugins.register_kdcpolicy(Arc::new(LiveClients));
+        drop(opened);
         Proving {
             handler,
             cache,

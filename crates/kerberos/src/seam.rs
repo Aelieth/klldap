@@ -6436,6 +6436,10 @@ mod tests {
                 "admission/tests/networks_rows.rs",
                 include_str!("admission/tests/networks_rows.rs"),
             ),
+            (
+                "admission/tests/proof_wire_rows.rs",
+                include_str!("admission/tests/proof_wire_rows.rs"),
+            ),
             ("admission_test.rs", include_str!("admission_test.rs")),
             ("boot.rs", include_str!("boot.rs")),
             ("embedded.rs", include_str!("embedded.rs")),

@@ -134,5 +134,7 @@ In order to handle logout correctly, we rely on a blacklist of JWTs. When a
 user logs out, their refresh token is removed from the backend, and all of
 their currently valid JWTs are added to a blacklist. Incoming requests are
 checked against this blacklist (in-memory, faster than calling the database).
+A logout acts only on a refresh token the server holds for that user; any
+other token changes nothing, and the answer still clears the cookies.
 Applications that want to use these JWTs should subscribe to be notified of
 blacklisted JWTs (TODO: implement the PubSub service and API).

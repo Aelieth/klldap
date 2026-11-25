@@ -408,15 +408,19 @@ where
     Backend: TcpBackendHandler + BackendHandler + 'static,
 {
     let (refresh_token_hash, user) = get_refresh_token(request)?;
-    data.get_tcp_handler()
-        .delete_refresh_token(refresh_token_hash)
-        .await?;
-    let new_blacklisted_jwt_hashes = data.get_tcp_handler().blacklist_jwts(&user).await?;
-    let mut jwt_blacklist = data.jwt_blacklist.write().unwrap();
-    for jwt_hash in new_blacklisted_jwt_hashes {
-        jwt_blacklist.insert(jwt_hash);
+    let handler = data.get_tcp_handler();
+    // Only a token the server holds for this user ends anything; the cookies are cleared anyway.
+    if handler.check_token(refresh_token_hash, &user).await? {
+        handler.delete_refresh_token(refresh_token_hash).await?;
+        let new_blacklisted_jwt_hashes = handler.blacklist_jwts(&user).await?;
+        let mut jwt_blacklist = data.jwt_blacklist.write().unwrap();
+        for jwt_hash in new_blacklisted_jwt_hashes {
+            jwt_blacklist.insert(jwt_hash);
+        }
+        logging::record_as(Some(&user), LogKind::Logout, None, true, None);
+    } else {
+        debug!(?user, "The refresh token is not one held for this user");
     }
-    logging::record_as(Some(&user), LogKind::Logout, None, true, None);
     let mut path = data.server_url.path().to_string();
     if !path.ends_with('/') {
         path.push('/');
@@ -3025,6 +3029,89 @@ pub(crate) mod tests {
             (true, 0, 200, 1),
             "a token's use writes nothing; the refresh writes the success"
         );
+    }
+
+    #[tokio::test]
+    async fn test_a_logout_acts_only_on_a_refresh_token_the_server_holds_for_that_user() {
+        use lldap_test_utils::recording_log::LogGuard;
+        let _backend = ONE_BACKEND.lock().await;
+        let users = [("o1ann", "o1ann-pass-1"), ("o1ben", "o1ben-pass-1")];
+        let handler = sql_handler_with(&users).await;
+        let state = app_state(handler.clone());
+        let log = LogGuard::install_on_this_thread();
+        let (ann, ben) = (UserId::new("o1ann"), UserId::new("o1ben"));
+        let rows = [
+            ("a held token of the user", Some("HELD+o1ann"), 200, true),
+            (
+                "a token not held, a known user",
+                Some("o1-other+o1ann"),
+                200,
+                false,
+            ),
+            (
+                "a held token under another user's name",
+                Some("HELD+o1ben"),
+                200,
+                false,
+            ),
+            ("no token", None, 401, false),
+        ];
+        for (label, presented, status, acts) in rows {
+            let (held, _) = handler.create_refresh_token(&ann).await.unwrap();
+            let ann_jwt = create_jwt(&handler, &state.jwt_key, &ann, HashSet::new(), false).await;
+            let ben_jwt = create_jwt(&handler, &state.jwt_key, &ben, HashSet::new(), false).await;
+            let jwts = [ann_jwt, ben_jwt].map(|token| default_hash(token.as_str()));
+            let _ = log.recorder().take_events();
+            let mut request = actix_web::test::TestRequest::get();
+            if let Some(presented) = presented {
+                let token = presented.replace("HELD", &held);
+                request = request.insert_header(("refresh-token", token));
+            }
+            let response = get_logout_handler(state.clone(), request.to_http_request()).await;
+            let mut cleared: Vec<_> = response
+                .cookies()
+                .filter(|c| c.value().is_empty() && c.max_age() == Some(0.days()))
+                .map(|c| c.name().to_owned())
+                .collect();
+            cleared.sort();
+            let kept = handler.check_token(default_hash(held.as_str()), &ann).await;
+            let stored = handler.get_jwt_blacklist().await.unwrap();
+            let in_memory = state.jwt_blacklist.read().unwrap().clone();
+            let ended = |set: &HashSet<u64>| jwts.map(|hash| set.contains(&hash));
+            let rows: Vec<_> = log
+                .recorder()
+                .take_events()
+                .into_iter()
+                .filter(|e| e.kind == LogKind::Logout)
+                .map(|e| (e.actor, e.success))
+                .collect();
+            let cookies = match status {
+                200 => vec!["refresh_token".to_owned(), "token".to_owned()],
+                _ => vec![],
+            };
+            let row = acts.then(|| (Some("o1ann".to_owned()), true));
+            assert_eq!(
+                (
+                    response.status().as_u16(),
+                    cleared,
+                    kept.unwrap(),
+                    ended(&stored),
+                    ended(&in_memory),
+                    rows
+                ),
+                (
+                    status,
+                    cookies,
+                    !acts,
+                    [acts, false],
+                    [acts, false],
+                    Vec::from_iter(row)
+                ),
+                "{label}: the status, the cookies cleared, whether o1ann keeps the refresh token, \
+                 the access tokens of o1ann and o1ben ended in the table and in memory, the \
+                 logout rows"
+            );
+        }
     }
 
     #[tokio::test]

@@ -120,6 +120,16 @@ impl TcpBackendHandler for SqlBackendHandler {
     }
 
     #[instrument(skip_all, level = "debug")]
+    async fn blacklist_jwt(&self, jwt_hash: u64) -> Result<()> {
+        model::JwtStorage::update_many()
+            .col_expr(JwtStorageColumn::Blacklisted, Expr::value(true))
+            .filter(JwtStorageColumn::JwtHash.eq(jwt_hash as i64))
+            .exec(self.pool())
+            .await?;
+        Ok(())
+    }
+
+    #[instrument(skip_all, level = "debug")]
     async fn delete_refresh_token(&self, refresh_token_hash: u64) -> Result<()> {
         model::JwtRefreshStorage::delete_by_id(refresh_token_hash as i64)
             .exec(self.pool())

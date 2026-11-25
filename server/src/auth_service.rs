@@ -58,6 +58,12 @@ use zeroize::Zeroizing;
 type Token<S> = jwt::Token<jwt::Header, JWTClaims, S>;
 type SignedToken = Token<jwt::token::Signed>;
 
+/// A session's access token lives a day; a reset token, and its cookie, as long as its page.
+const SESSION_TOKEN_SECS: i64 = 86_400;
+const RESET_TOKEN_SECS: i64 = 300;
+const INVALID_JWT: &str = "Invalid JWT";
+const RESET_TOKEN_ELSEWHERE: &str = "a reset token is taken only to set its user's password";
+
 fn default_hash<T: Hash + ?Sized>(token: &T) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::Hasher;
@@ -73,9 +79,14 @@ async fn create_jwt<Handler: TcpBackendHandler>(
     groups: HashSet<GroupDetails>,
     password_reset: bool,
 ) -> TcpResult<SignedToken> {
+    let life = match password_reset {
+        true => RESET_TOKEN_SECS,
+        false => SESSION_TOKEN_SECS,
+    };
+    let now = Utc::now();
     let claims = JWTClaims {
-        exp: Utc::now() + chrono::Duration::days(1),
-        iat: Utc::now(),
+        exp: now + chrono::Duration::seconds(life),
+        iat: now,
         jti: Uuid::new_v4(),
         user: user.to_string(),
         groups: groups
@@ -381,7 +392,7 @@ where
     Ok(HttpResponse::Ok()
         .cookie(
             Cookie::build("token", token.as_str())
-                .max_age(5.minutes())
+                .max_age(RESET_TOKEN_SECS.seconds())
                 // Cookie is only valid to reset the password.
                 .path(format!("{path}auth"))
                 .http_only(true)
@@ -631,32 +642,30 @@ where
 
 const NOT_AUTHORIZED: &str = "Not authorized to change the user's password";
 
+/// The bearer's validation, who it presents, and its token's hash, by which a reset token ends.
 async fn password_bearer<Backend>(
     request: &HttpRequest,
     payload: &mut actix_web::dev::Payload,
     data: &AppState<Backend>,
-) -> TcpResult<(ValidationResults, registration::Presenter)>
+) -> TcpResult<(ValidationResults, registration::Presenter, u64)>
 where
     Backend: BackendHandler + OpaqueHandler + 'static,
 {
     use actix_web::FromRequest;
-    let bearer = BearerAuth::from_request(request, payload).await.ok();
-    // A rejected token is recorded by checked_token; only a missing one is not.
-    let checked = match bearer {
-        Some(bearer) => checked_token(data, bearer.token()).await.ok(),
-        None => {
-            logging::record_failure(LogKind::AccessDenied, None, NOT_AUTHORIZED);
-            None
-        }
+    let unauthorized = || TcpError::UnauthorizedError(NOT_AUTHORIZED.to_string());
+    let Ok(bearer) = BearerAuth::from_request(request, payload).await else {
+        logging::record_failure(LogKind::AccessDenied, None, NOT_AUTHORIZED);
+        return Err(unauthorized());
     };
-    let (validation, claims) =
-        checked.ok_or_else(|| TcpError::UnauthorizedError(NOT_AUTHORIZED.to_string()))?;
+    // A rejected token is recorded by checked_token.
+    let checked = checked_token(data, bearer.token()).await;
+    let (validation, claims) = checked.map_err(|_| unauthorized())?;
     let presenter = registration::Presenter {
         actor: validation.user.clone(),
         session: claims.jti.into_bytes(),
         reset: claims.password_reset,
     };
-    Ok((validation, presenter))
+    Ok((validation, presenter, default_hash(bearer.token())))
 }
 
 #[instrument(skip_all, level = "debug")]
@@ -669,7 +678,7 @@ where
     Backend: BackendHandler + OpaqueHandler + 'static,
 {
     use actix_web::FromRequest;
-    let (validation_result, by) = password_bearer(request, payload, data).await?;
+    let (validation_result, by, _) = password_bearer(request, payload, data).await?;
     let registration_start_request =
         web::Json::<registration::ClientRegistrationStartRequest>::from_request(request, payload)
             .await
@@ -882,7 +891,7 @@ where
 {
     use actix_web::FromRequest;
     // The finish is taken only from the session that made the start.
-    let (_, presenter) = password_bearer(http_request, payload, data).await?;
+    let (_, presenter, token_hash) = password_bearer(http_request, payload, data).await?;
     let body =
         web::Json::<registration::ClientRegistrationFinish>::from_request(http_request, payload)
             .await
@@ -902,6 +911,7 @@ where
     .await?;
     // A recovery clears the second factor only once the new password is committed.
     if presenter.reset {
+        end_reset_token(data, token_hash).await;
         with_actor(
             actor,
             data.get_mfa_handler()
@@ -910,6 +920,15 @@ where
         .await?;
     }
     Ok(HttpResponse::Ok().finish())
+}
+
+/// A reset token ends once its password is set: here at once, and in the table, as a logout
+/// ends a session's.
+async fn end_reset_token<Backend: TcpBackendHandler>(data: &AppState<Backend>, jwt_hash: u64) {
+    data.jwt_blacklist.write().unwrap().insert(jwt_hash);
+    if let Err(e) = data.get_tcp_handler().blacklist_jwt(jwt_hash).await {
+        warn!("A reset token was ended here but could not be ended in the table: {e}");
+    }
 }
 
 async fn opaque_register_finish_handler<Backend>(
@@ -993,13 +1012,20 @@ async fn account_is_disabled<Backend: BackendHandler>(
     }
 }
 
+/// A token's use at GraphQL, where a reset token is answered as an invalid one.
 #[instrument(skip_all, level = "debug", err(level = "debug"), ret)]
 pub(crate) async fn check_if_token_is_valid<Backend: BackendHandler + OpaqueHandler>(
     state: &AppState<Backend>,
     token_str: &str,
 ) -> Result<ValidationResults, actix_web::Error> {
-    let checked = checked_token(state, token_str).await;
-    checked.map(|(validation, _)| validation)
+    let (validation, claims) = checked_token(state, token_str).await?;
+    if claims.password_reset {
+        let user = Some(&validation.user);
+        let detail = Some(RESET_TOKEN_ELSEWHERE);
+        logging::record_as(user, LogKind::AccessDenied, None, false, detail);
+        return Err(ErrorUnauthorized(INVALID_JWT));
+    }
+    Ok(validation)
 }
 
 async fn checked_token<Backend: BackendHandler + OpaqueHandler>(
@@ -1009,8 +1035,8 @@ async fn checked_token<Backend: BackendHandler + OpaqueHandler>(
     let token: Token<_> =
         VerifyWithKey::verify_with_key(token_str, &state.jwt_key).map_err(|_| {
             // Recorded (not terminal-only) so a junk-JWT flood is visible and coalesces.
-            logging::record_failure(LogKind::AccessDenied, None, "Invalid JWT");
-            ErrorUnauthorized("Invalid JWT")
+            logging::record_failure(LogKind::AccessDenied, None, INVALID_JWT);
+            ErrorUnauthorized(INVALID_JWT)
         })?;
     if token.claims().exp.lt(&Utc::now()) {
         logging::record_failure(LogKind::AccessDenied, None, "Expired JWT");
@@ -2068,6 +2094,9 @@ pub(crate) mod tests {
         }
         async fn blacklist_jwts(&self, _: &UserId) -> DomainResult<HashSet<u64>> {
             unimplemented!()
+        }
+        async fn blacklist_jwt(&self, _: u64) -> DomainResult<()> {
+            Ok(())
         }
         async fn delete_refresh_token(&self, _: u64) -> DomainResult<()> {
             unimplemented!()
@@ -3530,7 +3559,7 @@ pub(crate) mod tests {
         let state = app_state(handler.clone());
         let _ = log.recorder().take_events();
         let token = reset_token(&state.jwt_key, "e6reset");
-        let checked = check_if_token_is_valid(&state, &token).await;
+        let checked = checked_token(&state, &token).await;
         let status = checked
             .map(drop)
             .map_err(|e| e.as_response_error().status_code());
@@ -4020,5 +4049,169 @@ pub(crate) mod tests {
             refused && levels.contains(&Level::WARN) && !levels.contains(&Level::ERROR),
             "{levels:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_a_reset_token_lives_as_long_as_its_cookie() {
+        let _backend = ONE_BACKEND.lock().await;
+        let _guard = EnforcementGuard::none();
+        let handler = sql_handler_with(&[("p1life", "p1life-pass-1")]).await;
+        let state = app_state(handler.clone());
+        let mailed = handler.start_password_reset(&UserId::new("p1life")).await;
+        let request = actix_web::test::TestRequest::get().param("token", mailed.unwrap().unwrap());
+        let response = get_password_reset_step2_handler(state.clone(), request.to_http_request());
+        let response = response.await;
+        let cookie = response.cookies().find(|c| c.name() == "token");
+        let cookie = cookie.and_then(|c| c.max_age());
+        let (status, body) = answered(response).await;
+        let sent: password_reset::ServerPasswordResetResponse =
+            serde_json::from_slice(&body).unwrap();
+        let token: Token<_> = VerifyWithKey::verify_with_key(sent.token.as_str(), &state.jwt_key)
+            .expect("the reset token verifies");
+        let claims = token.claims();
+        assert_eq!(
+            (
+                status,
+                cookie,
+                (claims.exp - claims.iat).num_seconds(),
+                claims.password_reset
+            ),
+            (
+                200,
+                Some(RESET_TOKEN_SECS.seconds()),
+                RESET_TOKEN_SECS,
+                true
+            ),
+            "the token the reset page sets a password with lives as long as its cookie"
+        );
+    }
+
+    /// The start route's status and body as `bearer`, for `user`.
+    async fn start_answered<B>(
+        state: &web::Data<AppState<B>>,
+        bearer: &str,
+        user: &str,
+    ) -> (u16, String)
+    where
+        B: BackendHandler + OpaqueHandler + 'static,
+    {
+        let mut rng = rand::rngs::OsRng;
+        let start = opaque::client::registration::start_registration(b"p1-any-pass", &mut rng);
+        let body = registration::ClientRegistrationStartRequest {
+            username: UserId::new(user),
+            registration_start_request: start.unwrap().message,
+        };
+        let (request, mut payload) = actix_web::test::TestRequest::post()
+            .insert_header(("Authorization", format!("Bearer {bearer}")))
+            .set_json(body)
+            .to_http_parts();
+        let answer = opaque_register_start(&request, &mut payload, state).await;
+        let answer = answer.map(|_| HttpResponse::Ok().finish());
+        let (status, body) = answered(answer.unwrap_or_else(error_to_http_response)).await;
+        (status, String::from_utf8(body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn test_a_reset_token_ends_when_its_password_is_set_and_not_before() {
+        const ANN: &str = "p1ann";
+        let _backend = ONE_BACKEND.lock().await;
+        let _guard = EnforcementGuard::none();
+        let handler = sql_handler_with(&[(ANN, "p1ann-pass-0")]).await;
+        let state = app_state(handler.clone());
+        let ann = UserId::new(ANN);
+        let mint = async |reset: bool| {
+            let token = create_jwt(&handler, &state.jwt_key, &ann, HashSet::new(), reset);
+            token.await.unwrap().as_str().to_owned()
+        };
+        let (reset, session) = (mint(true).await, mint(false).await);
+        let ended = async || {
+            let stored = handler.get_jwt_blacklist().await.unwrap();
+            let in_memory = state.jwt_blacklist.read().unwrap().clone();
+            [&reset, &session].map(|token| {
+                let hash = default_hash(token.as_str());
+                (stored.contains(&hash), in_memory.contains(&hash))
+            })
+        };
+        let by_session = started(&state, &session, ANN, "p1ann-pass-1").await;
+        let refused = finished(&state, Some(&reset), &by_session).await;
+        let after_refused = ended().await;
+        let body = started(&state, &reset, ANN, "p1ann-pass-2").await;
+        let taken = finished(&state, Some(&reset), &body).await.0;
+        let after_taken = ended().await;
+        let starts = (
+            start_answered(&state, &reset, ANN).await,
+            start_answered(&state, &session, ANN).await.0,
+        );
+        let unauthorized = (401, format!("Unauthorized: `{NOT_AUTHORIZED}`"));
+        assert_eq!(
+            (
+                (refused, after_refused),
+                (
+                    taken,
+                    after_taken,
+                    binds(&handler, ANN, "p1ann-pass-2").await
+                ),
+                starts
+            ),
+            (
+                (unfinishable(), [(false, false); 2]),
+                (200, [(true, true), (false, false)], true),
+                (unauthorized, 200)
+            ),
+            "a refused finish ends nothing; the finish that sets the password ends its reset \
+             token, in the table and here, and no other token of the user; the reset token \
+             then starts nothing, the session still does"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_reset_token_is_refused_as_an_invalid_one_where_no_password_is_set() {
+        use lldap_test_utils::recording_log::LogGuard;
+        let _backend = ONE_BACKEND.lock().await;
+        let _guard = EnforcementGuard::none();
+        let state = app_state(sql_handler_with(&[("p1use", "p1use-pass-1")]).await);
+        let key = &state.jwt_key;
+        let denied = |actor: Option<&str>, detail: &str| {
+            let actor = actor.map(str::to_owned);
+            (LogKind::AccessDenied, false, actor, Some(detail.to_owned()))
+        };
+        let invalid = Err((401, INVALID_JWT.to_owned()));
+        let rows = [
+            (
+                "a session token",
+                session_token(key, "p1use"),
+                Ok(()),
+                vec![],
+            ),
+            (
+                "a reset token",
+                reset_token(key, "p1use"),
+                invalid.clone(),
+                vec![denied(Some("p1use"), RESET_TOKEN_ELSEWHERE)],
+            ),
+            (
+                "a token that does not verify",
+                "junk".to_owned(),
+                invalid,
+                vec![denied(None, INVALID_JWT)],
+            ),
+        ];
+        let log = LogGuard::install_on_this_thread();
+        for (label, token, answer, expected) in rows {
+            let used = check_if_token_is_valid(&state, &token).await.map(drop);
+            let used = used.map_err(|e| {
+                let status = e.as_response_error().status_code().as_u16();
+                (status, e.to_string())
+            });
+            let events = log.recorder().take_events().into_iter();
+            let rows: Vec<_> = events
+                .map(|e| (e.kind, e.success, e.actor, e.detail))
+                .collect();
+            assert_eq!(
+                (used, rows),
+                (answer, expected),
+                "{label}: at a token's use, as GraphQL checks it"
+            );
+        }
     }
 }

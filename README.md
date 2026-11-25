@@ -4,11 +4,11 @@
 
 
 <p align="center">
-  <a href="https://github.com/Aelieth/klldap/actions/workflows/rust.yml?query=branch%3A0.8.1">
-    <img src="https://github.com/Aelieth/klldap/actions/workflows/rust.yml/badge.svg?branch=0.8.1" alt="Build"/>
+  <a href="https://github.com/Aelieth/klldap/actions/workflows/rust.yml?query=branch%3A0.8.2">
+    <img src="https://github.com/Aelieth/klldap/actions/workflows/rust.yml/badge.svg?branch=0.8.2" alt="Build"/>
   </a>
-  <a href="https://github.com/Aelieth/klldap/actions/workflows/gate.yml?query=branch%3A0.8.1">
-    <img src="https://github.com/Aelieth/klldap/actions/workflows/gate.yml/badge.svg?branch=0.8.1" alt="Gate"/>
+  <a href="https://github.com/Aelieth/klldap/actions/workflows/gate.yml?query=branch%3A0.8.2">
+    <img src="https://github.com/Aelieth/klldap/actions/workflows/gate.yml/badge.svg?branch=0.8.2" alt="Gate"/>
   </a>
 </p>
 

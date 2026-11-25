@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.8.2] (unreleased)
+
+0.8.2 is not a release. This heading only opens the branch.
+
 ## [0.8.1] - 2026-11-23
 
 0.8.1 is a pre-release. The new policies and the front end have not yet had thorough testing. Further testing, verification and code review come before it is promoted.

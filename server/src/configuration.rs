@@ -109,6 +109,46 @@ impl std::default::Default for HealthcheckOptions {
     }
 }
 
+/// `kerberos_options.on_realm_failure`: what the server goes on serving when its realm does
+/// not open. `directory-only`: the directory to everyone, with each change that needs a
+/// principal refused. `admin-only`: admins alone, on loopback.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum OnRealmFailure {
+    #[default]
+    DirectoryOnly,
+    AdminOnly,
+}
+
+impl<'de> Deserialize<'de> for OnRealmFailure {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Visitor;
+
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = OnRealmFailure;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("directory-only or admin-only")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                match value {
+                    "directory-only" => Ok(OnRealmFailure::DirectoryOnly),
+                    "admin-only" => Ok(OnRealmFailure::AdminOnly),
+                    _ => Err(E::custom(format!(
+                        "'{value}': expected directory-only or admin-only"
+                    ))),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, derive_builder::Builder)]
 #[builder(pattern = "owned")]
 pub struct KerberosOptions {
@@ -149,6 +189,8 @@ pub struct KerberosOptions {
     pub mfa_proof_window: String,
     #[builder(default = "false")]
     pub mfa_proof_same_address: bool,
+    #[builder(default)]
+    pub on_realm_failure: OnRealmFailure,
 }
 
 impl std::default::Default for KerberosOptions {
@@ -1930,6 +1972,53 @@ mod tests {
                     (Ok(got), Ok(want)) => assert_eq!(got.map(seen), want, "{env:?}"),
                     (Err(e), Err(text)) => assert!(e.to_string().contains(text), "{env:?}: {e}"),
                     (loaded, _) => panic!("{env:?}: unexpected {loaded:?}"),
+                }
+                Ok(())
+            });
+        }
+    }
+
+    #[test]
+    fn test_on_realm_failure_is_directory_only_unless_set_and_takes_two_values() {
+        use OnRealmFailure::{AdminOnly, DirectoryOnly};
+        type Row = (&'static str, Option<&'static str>, Option<OnRealmFailure>);
+        let rows: [Row; 8] = [
+            ("", None, Some(DirectoryOnly)),
+            ("\"directory-only\"", None, Some(DirectoryOnly)),
+            ("\"admin-only\"", None, Some(AdminOnly)),
+            ("", Some("admin-only"), Some(AdminOnly)),
+            (
+                "\"admin-only\"",
+                Some("directory-only"),
+                Some(DirectoryOnly),
+            ),
+            ("\"loopback\"", None, None),
+            ("", Some("Admin-Only"), None),
+            ("1", None, None),
+        ];
+        for (file, env, expected) in rows {
+            Jail::expect_with(|jail| {
+                jail.clear_env();
+                jail.set_env("LLDAP_JWT_SECRET", "secret");
+                if !file.is_empty() {
+                    jail.create_file(
+                        "lldap_config.toml",
+                        &format!("[kerberos_options]\non_realm_failure = {file}\n"),
+                    )?;
+                }
+                if let Some(value) = env {
+                    jail.set_env("LLDAP_KERBEROS_OPTIONS__ON_REALM_FAILURE", value);
+                }
+                let loaded = init(default_run_opts())
+                    .map(|config| config.kerberos_options.on_realm_failure)
+                    .map_err(|e| e.to_string());
+                match (loaded, expected) {
+                    (Ok(got), Some(want)) => assert_eq!(got, want, "{file:?} {env:?}"),
+                    (Err(e), None) => assert!(
+                        e.contains("directory-only or admin-only"),
+                        "{file:?} {env:?}: {e}"
+                    ),
+                    (loaded, _) => panic!("{file:?} {env:?}: unexpected {loaded:?}"),
                 }
                 Ok(())
             });

@@ -273,6 +273,13 @@ key_seed = "RanD0m STR1ng"
 #kadmin_port = 1749
 ## Extra kadmin ACL lines. admin/admin@REALM * is always granted.
 #kadmin_acl = "/data/kadm5.acl"
+## What the server goes on serving when the realm does not open at start
+## (LLDAP_KERBEROS_OPTIONS__ON_REALM_FAILURE).
+## "directory-only": the directory serves everyone as configured, while the KDC and kadmin
+## do not serve and every change that needs a Kerberos principal is refused.
+## "admin-only": only admins may sign in, and LDAP, LDAPS and the web interface listen on
+## loopback only.
+#on_realm_failure = "directory-only"
 ## The image sets these paths by ENV too; the code's defaults are relative to the working
 ## directory.
 ## Database and stash. The directory itself is mode 0700.

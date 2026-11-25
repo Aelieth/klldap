@@ -1,9 +1,16 @@
+use crate::enforcement::{PolicyCache, UserFacts, cached_mfa_policy};
+use crate::mfa::MfaPolicy;
 use async_trait::async_trait;
 use lldap_domain::types::UserId;
 use std::sync::{Arc, LazyLock, PoisonError, RwLock};
 
 pub const CODE_DIGITS: usize = 6;
 pub const NO_SIX_DIGITS: &str = "no six-digit code";
+/// The KDC's token type for the code: the verifier's name.
+pub const CODE_TYPE: &str = "klldap-totp";
+pub const WRONG_CODE: &str = "invalid totp";
+pub const CODE_UNREAD: &str = "totp: unreadable";
+pub const NOT_ASKED: &str = "no second factor asked";
 
 /// Exactly six ASCII digits, borrowed from the KDC's request: nothing else is ever read.
 pub struct KdcCode<'a>(&'a str);
@@ -46,6 +53,16 @@ pub async fn check_code(store: &dyn KdcCodeStore, user: &UserId, value: &[u8]) -
         Some(code) => store.check_kdc_code(user, code).await,
         None => CodeVerdict::Refused(NO_SIX_DIGITS),
     }
+}
+
+/// From memory: a factor, a resolved value that asks it, not exempt, and the user's own choice.
+pub fn code_asked(cache: &PolicyCache, user: &UserId) -> bool {
+    let entries = cache.get();
+    let policy = cached_mfa_policy(cache, &entries, user);
+    let asked = |(policy, facts): (MfaPolicy, &UserFacts)| {
+        facts.code_at_kinit && facts.second_factor_required(policy)
+    };
+    policy.zip(entries.facts_of(user)).is_some_and(asked)
 }
 
 #[derive(Clone)]
@@ -159,6 +176,56 @@ mod tests {
             (format!("{code:?}"), code.as_str()),
             ("KdcCode(..)".to_owned(), "123456")
         );
+    }
+
+    fn holding(server: Option<MfaPolicy>, facts: Option<(bool, bool, bool)>) -> PolicyCache {
+        let cache = PolicyCache::new();
+        cache.set_mfa_policy(server);
+        if server.is_none() {
+            cache.set_mfa_item_unknown();
+        }
+        let facts = facts.map(|(enrolled, exempt, code_at_kinit)| UserFacts {
+            uuid: lldap_domain::types::Uuid::from_name_and_date("e8kask", &Default::default()),
+            enrolled,
+            exempt,
+            code_at_kinit,
+            created: crate::instant::Timestamp::UNIX_EPOCH,
+            recorded: None,
+        });
+        let user = UserId::new("e8kask");
+        cache.replace(crate::enforcement::Entries {
+            facts: facts.map(|facts| (user, facts)).into_iter().collect(),
+            ..Default::default()
+        });
+        cache
+    }
+
+    #[test]
+    fn test_the_kdc_asks_a_code_only_of_a_user_with_a_factor_asked_who_turned_it_on() {
+        use MfaPolicy::{Always, Disabled, Enrolled};
+        type Facts = Option<(bool, bool, bool)>;
+        let (on, off) = (Some((true, false, true)), Some((true, false, false)));
+        let (bare, exempt) = (Some((false, false, true)), Some((true, true, true)));
+        let rows: [(&str, Option<MfaPolicy>, Facts, bool); 9] = [
+            ("enabled, a factor, turned on", Some(Enrolled), on, true),
+            ("always, a factor, turned on", Some(Always), on, true),
+            (
+                "enabled, a factor, not turned on",
+                Some(Enrolled),
+                off,
+                false,
+            ),
+            ("enabled, no factor", Some(Enrolled), bare, false),
+            ("always, no factor", Some(Always), bare, false),
+            ("off, a factor, turned on", Some(Disabled), on, false),
+            ("exempt, a factor, turned on", Some(Always), exempt, false),
+            ("a user the memory lacks", Some(Always), None, false),
+            ("the OU's value not read yet", None, on, false),
+        ];
+        for (label, server, facts, asked) in rows {
+            let cache = holding(server, facts);
+            assert_eq!(code_asked(&cache, &UserId::new("E8KAsk")), asked, "{label}");
+        }
     }
 
     #[tokio::test]

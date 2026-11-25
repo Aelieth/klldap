@@ -1,3 +1,4 @@
+use crate::otp::{Outcome, notes};
 use crate::policy::NOT_FOUND;
 use krb5_kdc::admission::{
     AsNotice, AsQuestion, AsReason, HostAdmission, KdcRefusal, Mechanism, TgsClient, TgsKind,
@@ -185,7 +186,7 @@ pub(crate) fn ip_of(peer: &HostAddress) -> Option<IpAddr> {
     }
 }
 
-fn user_named(name: &PrincipalName, of: &str, realm: &str) -> Option<UserId> {
+pub(crate) fn user_named(name: &PrincipalName, of: &str, realm: &str) -> Option<UserId> {
     if of != realm {
         return None;
     }
@@ -220,10 +221,21 @@ fn proved(n: &AsNotice) -> bool {
     matches!(n.reason, AsReason::PolicyRefused | AsReason::Issued)
 }
 
+/// The verifier's reason for an OTP refusal, left for this notice; taken once.
+fn otp_said(n: &AsNotice, peer: Option<IpAddr>) -> Option<String> {
+    let outcome = match (n.mechanism, n.reason) {
+        (Some(Mechanism::Otp), AsReason::PreauthFailed) => Outcome::Rejected,
+        (Some(Mechanism::Otp), AsReason::PreauthNotCompleted) => Outcome::Errored,
+        _ => return None,
+    };
+    notes().take(&n.client, outcome, peer)
+}
+
 fn notice_detail(n: &AsNotice, said: Option<&str>) -> String {
     let outcome = match (n.reason, said) {
         (AsReason::HostRefused, Some(said)) => said.to_owned(),
         (AsReason::HostRefused, None) => NOT_SAID.to_owned(),
+        (AsReason::PreauthFailed | AsReason::PreauthNotCompleted, Some(said)) => said.to_owned(),
         (AsReason::Issued, _) => "ticket issued".to_owned(),
         (AsReason::PreauthFailed, _) => "pre-authentication failed".to_owned(),
         (AsReason::PreauthNotCompleted, _) => "pre-authentication not completed".to_owned(),
@@ -288,12 +300,15 @@ impl HostAdmission for KdcVerdict {
         ) {
             return;
         }
-        let said = held
-            .filter(|(client, _)| *client == n.client)
-            .map(|(_, detail)| detail);
+        let peer = n.peer.as_ref().and_then(ip_of);
+        let said = match n.reason {
+            AsReason::HostRefused => held
+                .filter(|(client, _)| *client == n.client)
+                .map(|(_, detail)| detail),
+            _ => otp_said(&n, peer),
+        };
         let user = user_of_id(&n.client, &self.realm);
         let target = user.as_ref().map_or(n.client.as_str(), UserId::as_str);
-        let peer = n.peer.as_ref().and_then(ip_of);
         let issued = n.reason == AsReason::Issued;
         let detail = notice_detail(&n, said.as_deref());
         let (kind, proved) = (LogKind::Login, proved(&n));
@@ -1053,6 +1068,57 @@ pub(crate) mod tests {
             vec![],
             "a request for pre-authentication is no sign-in"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn test_an_otp_refusal_row_gives_the_verifiers_reason_once() {
+        use crate::otp::tests::note;
+        let log = LogGuard::install_on_this_thread();
+        let verdict = KdcVerdict::new(REALM);
+        let user = "e8knote";
+        let client = format!("{user}@{REALM}");
+        let from = ip_of(&peer());
+        let wrong = note(crate::otp::Outcome::Rejected, from, "invalid totp");
+        notes().put(client.clone(), wrong);
+        notes().put(
+            client.clone(),
+            note(crate::otp::Outcome::Errored, from, "totp replayed"),
+        );
+        let notice = |reason, code| AsNotice {
+            client: client.clone(),
+            requested: client.clone(),
+            peer: Some(peer()),
+            time: 1_700_000_000,
+            code,
+            reason,
+            mechanism: Some(Mechanism::Otp),
+        };
+        let failed = err::PREAUTH_FAILED;
+        let rows = [
+            (
+                AsReason::PreauthNotCompleted,
+                failed,
+                false,
+                "totp replayed (OTP)",
+            ),
+            (AsReason::PreauthFailed, failed, false, "invalid totp (OTP)"),
+            (
+                AsReason::PreauthFailed,
+                failed,
+                false,
+                "pre-authentication failed (OTP)",
+            ),
+            (AsReason::Issued, 0, true, "ticket issued (OTP)"),
+        ];
+        for (reason, code, success, detail) in rows {
+            verdict.as_notice(notice(reason, code));
+            assert_eq!(
+                kdc_rows(&log),
+                vec![peered(row(LogKind::Login, success, user, detail))],
+                "{detail}: two attempts in flight, each row its own reason, taken once"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2572,6 +2638,7 @@ pub(crate) mod tests {
             uuid: lldap_domain::types::Uuid::from_name_and_date(name, &to_naive(created)),
             enrolled: false,
             exempt: false,
+            code_at_kinit: false,
             created,
             recorded: Some(Recorded::default()),
         }

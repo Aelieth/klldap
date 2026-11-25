@@ -354,6 +354,8 @@ pub struct UserFacts {
     pub uuid: Uuid,
     pub enrolled: bool,
     pub exempt: bool,
+    /// The user turned on the code at kinit for themselves.
+    pub code_at_kinit: bool,
     pub created: Timestamp,
     /// inactivity-days' row; `None` until read.
     pub recorded: Option<Recorded>,
@@ -365,6 +367,7 @@ impl UserFacts {
             uuid: user.uuid.clone(),
             enrolled: user.mfa_type.as_deref() == Some(MFA_TYPE_TOTP),
             exempt: groups.any(|group| group.display_name.as_str() == MFA_DISABLED_GROUP),
+            code_at_kinit: false,
             created: from_naive(user.creation_date),
             recorded: None,
         }

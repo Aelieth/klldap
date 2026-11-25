@@ -6445,6 +6445,7 @@ mod tests {
             ("embedded.rs", include_str!("embedded.rs")),
             ("lib.rs", include_str!("lib.rs")),
             ("migrate.rs", include_str!("migrate.rs")),
+            ("otp.rs", include_str!("otp.rs")),
             ("policy.rs", include_str!("policy.rs")),
             ("rotate.rs", include_str!("rotate.rs")),
             ("seam.rs", include_str!("seam.rs")),

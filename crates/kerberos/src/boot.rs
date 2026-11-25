@@ -87,7 +87,9 @@ pub(crate) fn install_plugins(store: &mut PrincipalStore) {
         let cache = lldap_domain_handlers::enforcement::policy_cache();
         let verdict = crate::admission::KdcVerdict::new(store.realm());
         let factor = crate::admission::SecondFactor::new(store.realm(), cache);
+        let codes = crate::otp::KlldapTotp::new(store.realm());
         install_judges(store, Arc::new(verdict), Arc::new(factor));
+        install_codes(store, Arc::new(codes));
     }
     #[cfg(feature = "test-admission")]
     {
@@ -110,6 +112,16 @@ pub(crate) fn install_judges(
     plugins.register_kdcpolicy(factor);
     plugins.register_kdcpolicy(Arc::new(LiveClients));
     plugins.set_host_admission(verdict);
+}
+
+/// Inert while no principal carries the `otp` string; kerber-rust offers the code only then.
+#[cfg(not(feature = "test-admission"))]
+fn install_codes(store: &mut PrincipalStore, codes: Arc<crate::otp::KlldapTotp>) {
+    let plugins = &mut store.policy.plugins;
+    plugins.unregister_otp_verifier(krb5_kdc::OtpVerifier::name(&*codes));
+    if let Err(e) = plugins.register_otp_verifier(codes) {
+        warn!("The KDC's check of a code was not registered: {e}");
+    }
 }
 
 pub(crate) fn open(settings: &RealmSettings, host: Arc<dyn Host>) -> Result<OpenRealm> {

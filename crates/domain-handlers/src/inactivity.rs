@@ -993,6 +993,7 @@ pub(crate) mod tests {
             uuid: Uuid::from_name_and_date("e6bob", &chrono::NaiveDateTime::default()),
             enrolled: false,
             exempt: false,
+            code_at_kinit: false,
             created: at(-DAY),
             recorded: Some(Recorded::default()),
         };
@@ -1024,6 +1025,7 @@ pub(crate) mod tests {
             uuid: Uuid::from_name_and_date("e6bob", &chrono::NaiveDateTime::default()),
             enrolled: false,
             exempt: false,
+            code_at_kinit: false,
             created: at(-DAY),
             recorded: Some(reenabled),
         };

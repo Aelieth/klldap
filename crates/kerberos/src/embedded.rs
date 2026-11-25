@@ -4364,6 +4364,53 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn test_an_adoption_resets_the_password_expiry_the_must_change_flag_and_the_fail_count() {
+        use krb5_kdc::{KDB_REQUIRES_PWCHANGE, LockoutUpdate};
+        let temp = TempRealm::new();
+        let (embedded, store) = temp.embedded();
+        let name = user_principal(&UserId::new("hugo"));
+        unmarked(&embedded, "hugo", false);
+        in_change(&embedded.own(), |s| {
+            let fields = AdminFields {
+                attributes: Some(KDB_REQUIRES_PWCHANGE),
+                pw_expire: Some(EXPIRES),
+                ..Default::default()
+            };
+            s.apply_admin_fields_in(&name, "EXAMPLE.COM", fields, "test")
+        })
+        .unwrap();
+        let reset = || {
+            let guard = store.read().unwrap();
+            let p = guard.get_name(&name)?;
+            let must_change = p.attributes & KDB_REQUIRES_PWCHANGE != 0;
+            let policy = p.pw_policy.clone();
+            Some((policy, p.pw_expire, must_change, guard.fail_auth_of(p)))
+        };
+        {
+            let guard = store.read().unwrap();
+            let failed = LockoutUpdate {
+                set_last_failure: true,
+                ..Default::default()
+            };
+            guard.update_lockout(guard.get_name(&name).unwrap(), EXPIRES - 1, failed);
+        }
+        let before = reset();
+        let adopted = embedded.commit_user(life("hugo", UserStep::SyncOn)).await;
+        assert_eq!(
+            (before, adopted, marked(&store, "hugo"), reset()),
+            (
+                Some((None, EXPIRES, true, 1)),
+                Some(Ok(())),
+                Some((true, true)),
+                Some((None, 0, false, 0))
+            ),
+            "sync turned on, no Kerberos policy bound: the password expiry and the must-change \
+             flag set by hand and the principal's Kerberos failure count are reset with the keys"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_an_add_with_a_password_onto_a_bound_principal_is_judged_once_by_its_old_policy() {
         use lldap_auth::opaque::server::generate_random_private_key;
         use lldap_domain::requests::CreateUserRequest;

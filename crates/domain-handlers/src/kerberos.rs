@@ -120,6 +120,11 @@ pub trait KerberosSync: Send + Sync {
     fn unavailable(&self) -> Option<String> {
         None
     }
+    /// Why the realm is closed while the directory still serves everyone: a change that needs a
+    /// principal is refused, and nothing else is.
+    fn directory_only(&self) -> Option<String> {
+        None
+    }
     /// Why a held realm still refuses a change to both stores: its last write is unsettled.
     fn unsettled(&self) -> Option<String> {
         None
@@ -390,14 +395,30 @@ impl KerberosSync for NoopKerberos {
     }
 }
 
+/// What a server whose realm did not open goes on serving.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DegradedMode {
+    AdminOnly,
+    DirectoryOnly,
+}
+
 pub struct DegradedKerberos {
     realm: String,
     cause: String,
+    mode: DegradedMode,
 }
 
 impl DegradedKerberos {
     pub fn new(realm: String, cause: String) -> Self {
-        Self { realm, cause }
+        Self::with_mode(realm, cause, DegradedMode::AdminOnly)
+    }
+
+    pub fn with_mode(realm: String, cause: String, mode: DegradedMode) -> Self {
+        Self { realm, cause, mode }
+    }
+
+    fn cause_in(&self, mode: DegradedMode) -> Option<String> {
+        (self.mode == mode).then(|| self.cause.clone())
     }
 }
 
@@ -407,7 +428,10 @@ impl KerberosSync for DegradedKerberos {
         false
     }
     fn unavailable(&self) -> Option<String> {
-        Some(self.cause.clone())
+        self.cause_in(DegradedMode::AdminOnly)
+    }
+    fn directory_only(&self) -> Option<String> {
+        self.cause_in(DegradedMode::DirectoryOnly)
     }
     fn realm(&self) -> &str {
         &self.realm
@@ -626,9 +650,14 @@ pub fn set_kerberos_store(store: Arc<dyn KerberosStore>) {
 }
 
 /// Directory writes are refused until the KDC has come up, so nothing changes that the
-/// KDC could not follow.
+/// KDC could not follow. In directory-only they go on; `require_settled` still refuses a change
+/// to both stores.
 pub fn require_kdc_ready() -> Result<(), DomainError> {
-    match kerberos_state() {
+    let backend = kerberos_backend();
+    if backend.directory_only().is_some() {
+        return Ok(());
+    }
+    match state_of(&*backend) {
         KerberosState::NotReady(cause) => Err(DomainError::KdcUnavailable(cause)),
         KerberosState::Disabled | KerberosState::Ready => Ok(()),
     }
@@ -652,6 +681,7 @@ pub fn state_of(backend: &dyn KerberosSync) -> KerberosState {
     KerberosState::NotReady(
         backend
             .unavailable()
+            .or_else(|| backend.directory_only())
             .unwrap_or_else(|| "the Kerberos KDC is still starting; retry shortly".to_owned()),
     )
 }
@@ -1071,6 +1101,69 @@ mod tests {
         );
     }
 
+    fn degraded(mode: DegradedMode) -> Arc<dyn KerberosSync> {
+        let (realm, cause) = ("EXAMPLE.COM".to_owned(), "down".to_owned());
+        Arc::new(DegradedKerberos::with_mode(realm, cause, mode))
+    }
+
+    #[test]
+    #[serial]
+    fn test_directory_only_admits_everyone_and_still_refuses_a_change_to_both_stores() {
+        type Row = (
+            &'static str,
+            Arc<dyn KerberosSync>,
+            Option<String>,
+            Option<String>,
+            Result<(), String>,
+        );
+        let down = || Some("down".to_owned());
+        let refused = || Err("Kerberos KDC unavailable: down; try again".to_owned());
+        let rows: [Row; 3] = [
+            ("ready", Arc::new(Up(true)), None, None, Ok(())),
+            (
+                "admin-only",
+                degraded(DegradedMode::AdminOnly),
+                down(),
+                None,
+                refused(),
+            ),
+            (
+                "directory-only",
+                degraded(DegradedMode::DirectoryOnly),
+                None,
+                down(),
+                refused(),
+            ),
+        ];
+        let bob = UserId::new("bob");
+        for (state, backend, unavailable, directory_only, settled) in rows {
+            set_kerberos_backend(backend.clone());
+            let got = (
+                backend.unavailable(),
+                backend.directory_only(),
+                refusal_while_degraded(&bob, false, backend.unavailable()),
+                require_settled(LogKind::UserCreate, &bob).map_err(|e| e.to_string()),
+            );
+            set_kerberos_backend(Arc::new(NoopKerberos::default()));
+            let want = (unavailable.clone(), directory_only, unavailable, settled);
+            assert_eq!(got, want, "{state}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_degraded_realm_changes_no_principal_in_either_mode() {
+        for mode in [DegradedMode::AdminOnly, DegradedMode::DirectoryOnly] {
+            let (backend, bob) = (degraded(mode), UserId::new("bob"));
+            let refused = [
+                backend.delete_principal(&bob).await.err(),
+                backend.set_principal_enabled(&bob, true).await.err(),
+                backend.export_keytab_for_keycloak("kc.test").await.err(),
+            ];
+            let down = || Some("down".to_owned());
+            assert_eq!(refused, [down(), down(), down()], "{mode:?}");
+        }
+    }
+
     struct Unsettled;
 
     #[async_trait]
@@ -1096,7 +1189,7 @@ mod tests {
     #[serial]
     fn test_an_unsettled_realm_is_held_and_refuses_only_a_change_to_both_stores() {
         let down = || KerberosState::NotReady("down".to_owned());
-        let rows: [(Arc<dyn KerberosSync>, KerberosState, KerberosState, bool); 4] = [
+        let rows: [(Arc<dyn KerberosSync>, KerberosState, KerberosState, bool); 5] = [
             (
                 Arc::new(NoopKerberos::new("EXAMPLE.COM".to_owned())),
                 KerberosState::Disabled,
@@ -1118,6 +1211,7 @@ mod tests {
                 KerberosState::Ready,
                 true,
             ),
+            (degraded(DegradedMode::DirectoryOnly), down(), down(), true),
             (
                 Arc::new(Unsettled),
                 KerberosState::Ready,

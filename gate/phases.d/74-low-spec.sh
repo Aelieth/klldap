@@ -12,9 +12,9 @@ LS_CPUSET="${GATE_LOWSPEC_CPUSET:-0}"          # the one core the server is pinn
 LS_BIND_WAIT="${GATE_LOWSPEC_BIND_WAIT:-30}"   # the seconds an ordinary bind is waited for
 LS_KINDS="${GATE_LOWSPEC_KINDS:-}"             # some of the kinds below, comma or space separated; empty: all
 # The thresholds, each for every kind; empty: measured, neither PASS nor FAIL.
-LS_MAX_ROWS="${GATE_LOWSPEC_MAX_ROWS:-}"       # the most one-to-one log rows a kind may write
-LS_MAX_MEM_MB="${GATE_LOWSPEC_MAX_MEM_MB:-}"   # the most megabytes the server may have grown by after the settle
-LS_MAX_BIND_MS="${GATE_LOWSPEC_MAX_BIND_MS:-}" # the longest an ordinary bind may take during a flood
+LS_MAX_ROWS="${GATE_LOWSPEC_MAX_ROWS-64}"      # the most one-to-one and log_gap rows a kind may write
+LS_MAX_MEM_MB="${GATE_LOWSPEC_MAX_MEM_MB-64}"  # the most megabytes the server may have grown by after the settle
+LS_MAX_BIND_MS="${GATE_LOWSPEC_MAX_BIND_MS-2000}" # the longest an ordinary bind may take during a flood
 
 LS_ALL="ldap-unknown ldap-wrong ldap-locked web-start web-finish simple-wrong refresh-junk reset-unknown kinit-wrong"
 LS_CPUS=1 LS_MEM_MB=256

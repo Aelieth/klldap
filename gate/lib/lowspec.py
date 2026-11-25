@@ -296,9 +296,9 @@ def report(args):
             rows["one"], rows["kinds"], rows["flood"], rows["gap"], rows["dropped"])
         text += "; %d ids given, %d rows are this phase's own binds, %d already pruned" % (
             rows["written"], rows["own"], rows["pruned"])
-        state = verdict(rows["one"], args.max_rows)
+        state = verdict(rows["one"] + rows["gap"], args.max_rows)
         if state in ("pass", "fail"):
-            text += "; at most %s one-to-one rows allowed" % args.max_rows
+            text += "; at most %s one-to-one and log_gap rows allowed" % args.max_rows
         print("ROWS %s %s" % (state, text))
 
     if growth is None:

@@ -24,8 +24,9 @@
 #                     quiet seconds after it (25), the core its server is pinned to (0), the seconds
 #                     an ordinary bind is waited for (30), some of its kinds
 #   GATE_LOWSPEC_MAX_ROWS / GATE_LOWSPEC_MAX_MEM_MB / GATE_LOWSPEC_MAX_BIND_MS
-#                     its thresholds, each for every kind: one-to-one log rows, megabytes of memory
-#                     growth, milliseconds of an ordinary bind. Unset: reported as measured
+#                     its thresholds, each for every kind: one-to-one and log_gap rows (64),
+#                     megabytes of memory growth (64), milliseconds of an ordinary bind (2000).
+#                     Set and empty: reported as measured (a baseline on another build)
 
 set -uo pipefail
 

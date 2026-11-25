@@ -284,6 +284,7 @@ fn seconds(name: &str, value: &str) -> Result<u64> {
             "kerberos_options.{name} = {value:?} is refused: a ticket of ten minutes or less is \
              the armor ticket of a code at kinit; set more than \"10m\""
         ),
+        Ok(Ok(0)) if name == "mfa_proof_window" => Ok(0),
         Ok(Ok(seconds)) if seconds > 0 => Ok(seconds),
         _ => bail!(
             "kerberos_options.{name} = {value:?} is not a positive Kerberos duration \
@@ -1953,7 +1954,7 @@ mod tests {
     fn test_the_proof_window_and_the_address_tie() {
         type Want = std::result::Result<Option<(i64, bool, i64)>, &'static str>;
         let week = 7 * 86_400 + 3600;
-        let rows: [(&[(&str, &str)], Want); 9] = [
+        let rows: [(&[(&str, &str)], Want); 10] = [
             (&[], Ok(Some((600, false, week)))),
             (&[("MFA_PROOF_WINDOW", "1h")], Ok(Some((3600, false, week)))),
             (&[("MFA_PROOF_WINDOW", "90")], Ok(Some((90, false, week)))),
@@ -1970,10 +1971,8 @@ mod tests {
                 &[("TICKET_LIFETIME", "10d"), ("RENEW_LIFETIME", "1d")],
                 Ok(Some((600, false, 10 * 86_400 + 3600))),
             ),
-            (
-                &[("MFA_PROOF_WINDOW", "0")],
-                Err("mfa_proof_window = \"0\" is not a positive Kerberos duration"),
-            ),
+            (&[("MFA_PROOF_WINDOW", "0")], Ok(Some((0, false, week)))),
+            (&[("MFA_PROOF_WINDOW", "0s")], Ok(Some((0, false, week)))),
             (&[("MFA_PROOF_WINDOW", "-1m")], Err("mfa_proof_window")),
         ];
         for (env, expected) in rows {

@@ -649,6 +649,12 @@ option off, names match exactly.
 itself. Their `_FILE` forms, in the environment or the file, stop the start
 and name the key.
 
+`mfa_proof_window` takes a Kerberos duration or a bare number of seconds, as the lifetimes
+below. `"0"` opens no window: a sign-in with the code at a directory door then opens nothing
+at the KDC, and a window already kept admits nothing. A user who must give a second factor
+then gets a ticket only with the code at kinit, which they turn on for themselves (see
+[A second factor and kinit](#a-second-factor-and-kinit)). A negative is refused.
+
 `ticket_lifetime` and `renew_lifetime` take a Kerberos duration (`24h`, `7d`,
 `36000s`) or a bare number of seconds (`36000`), quoted or not, in the file or
 the environment. Zero and a negative are refused: to the KDC a zero ticket life

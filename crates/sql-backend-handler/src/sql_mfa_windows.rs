@@ -3,7 +3,7 @@ use crate::sql_lockout_handler::numbered;
 use crate::sql_tables::DbConnection;
 use crate::sql_totp_steps::lock_conflict;
 use lldap_domain::types::UserId;
-use lldap_domain_handlers::kdc_proof::ProofWindow;
+use lldap_domain_handlers::kdc_proof::{ProofSettings, ProofWindow};
 use lldap_domain_handlers::logging;
 use lldap_domain_handlers::warn_limited;
 use lldap_domain_model::error::Result;
@@ -203,7 +203,7 @@ impl SqlBackendHandler {
     /// A password and a code proven at a directory door open Kerberos for the window. After
     /// the sign-in, outside any transaction; false when the write failed.
     pub async fn note_proof(&self, user: &UserId, now: i64) -> bool {
-        let Some(settings) = self.proofs else {
+        let Some(settings) = self.proofs.filter(ProofSettings::opens) else {
             return true;
         };
         let peer = settings.peer_of(logging::current_request().peer);
@@ -715,6 +715,29 @@ pub(crate) mod tests {
             ),
             (true, vec![]),
             "where Kerberos is off, nothing is written"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_window_of_zero_stores_no_proof_and_the_sign_in_stands() {
+        let _clock = pin_clock(NOW);
+        let zero = Some(ProofSettings::new(0, false, 3600));
+        let h = doors::handler().await.with_mfa_policy(MfaPolicy::Enrolled);
+        let h = h.with_proofs(zero);
+        doors::user_in(&h, "e9kzero", "e9kou").await;
+        let user = UserId::new("e9kzero");
+        let seed = doors::enroll(&h, "e9kzero", NOW as u64).await;
+        set_enrollment_clock(Some(NOW + 60));
+        let with_code = format!("{}:{}", doors::RIGHT, code(&seed, NOW + 60));
+        let bound = doors::bind(&h, "e9kzero", &with_code).await;
+        let noted = h.note_proof(&user, NOW + 90).await;
+        let held = h.policy_cache.get().windows_of(&user).len();
+        assert_eq!(
+            (bound, noted, spans(&h.sql_pool, "e9kzero").await, held),
+            (true, true, vec![], 0),
+            "mfa_proof_window = \"0\": the enrolment and a bind with the code stand, and \
+             neither writes a window, in the table or in memory"
         );
     }
 

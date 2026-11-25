@@ -253,8 +253,8 @@ key_seed = "RanD0m STR1ng"
 ## within this long after a sign-in with password and code at a directory door (an LDAP
 ## bind or /auth/simple/login with "password:code", the web login, or the finish of an
 ## enrolment or of a replacement of the factor). A Kerberos
-## duration ("10m", "1h") or a bare number of seconds ("600"). Zero and a negative are
-## refused.
+## duration ("10m", "1h") or a bare number of seconds ("600"). "0" opens no window: such
+## a user's kinit then needs the code (kinit -l 5m, then kinit -T). A negative is refused.
 #mfa_proof_window = "10m"
 ## Ask that kinit come from the address the code was given from.
 #mfa_proof_same_address = false

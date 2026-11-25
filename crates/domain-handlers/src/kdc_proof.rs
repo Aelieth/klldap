@@ -38,6 +38,11 @@ impl ProofSettings {
         }
     }
 
+    /// `mfa_proof_window = "0"`: a proof opens nothing, and no kept window admits.
+    pub fn opens(&self) -> bool {
+        self.window > 0
+    }
+
     /// The address a window is kept under: the door's, and only with the tie on.
     pub fn peer_of(&self, peer: Option<IpAddr>) -> String {
         match (self.same_address, peer) {
@@ -108,11 +113,8 @@ fn judge(
     if !known_required(cache, &entries, user) {
         return ProofVerdict::NotAsked;
     }
-    match entries
-        .windows_of(user)
-        .iter()
-        .any(|w| admits(&settings, w))
-    {
+    let windows = entries.windows_of(user);
+    match settings.opens() && windows.iter().any(|w| admits(&settings, w)) {
         true => ProofVerdict::Admitted,
         false => ProofVerdict::NoFreshProof,
     }
@@ -634,6 +636,43 @@ mod tests {
             proof_at_as(&cache, &user, NOW, other),
             NotAsked,
             "Kerberos off"
+        );
+    }
+
+    #[test]
+    fn test_with_a_window_of_zero_no_kept_window_admits_and_the_rest_is_judged_as_ever() {
+        use ProofVerdict::*;
+        let user = UserId::new("e2kuser");
+        let fresh = [window(NOW - 100, NOW + 500, "")];
+        let zero = ProofSettings::new(0, false, 7 * 86_400);
+        let (enrolled, bare) = (
+            facts("e2kuser", true, false),
+            facts("e2kuser", false, false),
+        );
+        let rows = [
+            (
+                "enabled, enrolled, a fresh window",
+                "enabled",
+                &enrolled,
+                NoFreshProof,
+            ),
+            ("enabled, not enrolled", "enabled", &bare, NotAsked),
+            ("always, not enrolled", "always", &bare, NoFreshProof),
+            ("off", "off", &enrolled, NotAsked),
+        ];
+        for (label, value, user_facts, verdict) in rows {
+            let cache = cache_with(None, value, user_facts, &fresh);
+            cache.set_proofs(Some(zero));
+            let asked = [
+                proof_at_as(&cache, &user, NOW, None),
+                proof_at_tgs(&cache, &user, NOW),
+            ];
+            assert_eq!(asked, [verdict; 2], "{label}");
+        }
+        assert_eq!(
+            (zero.opens(), settings(false).opens(), zero.kept),
+            (false, true, 7 * 86_400 + 3600),
+            "zero is a setting: present, opening nothing, keeping nothing longer"
         );
     }
 

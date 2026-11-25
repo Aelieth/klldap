@@ -6,6 +6,7 @@ use crate::handler::PolicyBackendHandler;
 use crate::instant::{self, SignedDuration, Timestamp};
 use crate::lockout::{LockStore, QUEUE_LIMIT, STOP_BOUND, WRITE_BOUND};
 use crate::policies::{EffectiveItem, POLICY_READ_WAIT, Policy};
+use crate::warn_limited;
 use lldap_domain::types::UserId;
 use lldap_domain_model::error::Result;
 use std::collections::{BTreeSet, HashMap};
@@ -275,7 +276,9 @@ impl PolicyCache {
     fn owe_success(&self, user: &UserId, at: Timestamp) {
         let mut owed = held(&self.activity.owed);
         if owed.len() >= QUEUE_LIMIT && !owed.contains_key(user) {
-            warn!("The sign-in of {user} was not kept for inactivity-days: {QUEUE_LIMIT} are owed");
+            warn_limited!(
+                "The sign-in of {user} was not kept for inactivity-days: {QUEUE_LIMIT} are owed"
+            );
             return;
         }
         let kept = owed.entry(user.clone()).or_insert(at);
@@ -475,11 +478,11 @@ where
             true
         }
         Ok(Err(e)) => {
-            warn!("The activity of {user} was not read: {e}");
+            warn_limited!("The activity of {user} was not read: {e}");
             false
         }
         Err(_) => {
-            warn!("The activity of {user} was not read: {POLICY_UNANSWERED}");
+            warn_limited!("The activity of {user} was not read: {POLICY_UNANSWERED}");
             false
         }
     }

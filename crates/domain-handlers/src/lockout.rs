@@ -12,6 +12,7 @@ use crate::instant::{self, SignedDuration, Timestamp};
 use crate::logging::{self, LogKind};
 use crate::networks::warn_unreadable;
 use crate::policies::{EffectiveItem, POLICY_READ_WAIT, Policy, catalog_item};
+use crate::warn_limited;
 use async_trait::async_trait;
 use lldap_domain::types::{UserId, Uuid};
 use lldap_domain_model::error::{DomainError, Result};
@@ -842,7 +843,7 @@ impl Lockout {
             return Ok(Some(state));
         }
         if let Err(e) = self.confirm_with(handler, user).await {
-            warn!("The lock of {user} was not confirmed against the table: {e}");
+            warn_limited!("The lock of {user} was not confirmed against the table: {e}");
         }
         Ok(Some(self.lock_state(user, policy)))
     }
@@ -1249,7 +1250,7 @@ impl Lockout {
             let split = match door_read(store.read_split(&user)).await {
                 Ok(split) => split,
                 Err(e) => {
-                    warn!("The starts of {user} were not folded: {e}");
+                    warn_limited!("The starts of {user} were not folded: {e}");
                     unread.push(user);
                     if gave_up(&e) {
                         unread.extend(expiring.by_ref());
@@ -1448,7 +1449,7 @@ impl Lockout {
         if cache.mfa_item_live()
             && let Err(e) = bounded(POLICY_READ_WAIT, ensure_exempt_group(handler)).await
         {
-            warn!("The exempt group was not made: {e}");
+            warn_limited!("The exempt group was not made: {e}");
         }
         recorded?;
         Ok(mfa? | lockout? | items?)
@@ -1549,7 +1550,7 @@ impl Lockout {
                     other => other.map(drop),
                 };
                 if let Err(e) = refreshed {
-                    warn!("The lockout view was not refreshed: {e}");
+                    warn_limited!("The lockout view was not refreshed: {e}");
                 }
                 let missed = pending && cache.activity_pending();
                 tries = if missed { tries.saturating_add(1) } else { 0 };
@@ -1632,7 +1633,7 @@ where
 
 async fn prune_spent_steps<S: LockStore + ?Sized>(store: &S) {
     if let Err(e) = store.prune_codes().await {
-        warn!("The second factor's past steps were not pruned: {e}");
+        warn_limited!("The second factor's past steps were not pruned: {e}");
     }
 }
 

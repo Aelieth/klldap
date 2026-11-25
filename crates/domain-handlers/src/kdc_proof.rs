@@ -5,6 +5,7 @@ use crate::enforcement::{
 use crate::handler::{PolicyBackendHandler, UserBackendHandler};
 use crate::mfa::{MfaEnrollmentStatus, MfaPolicy, MfaRequirement, mfa_requirement};
 use crate::policies::{EffectiveItem, POLICY_READ_WAIT};
+use crate::warn_limited;
 use lldap_domain::types::UserId;
 use lldap_domain_model::error::Result;
 use std::collections::HashMap;
@@ -335,7 +336,7 @@ where
             true
         }
         Err(e) => {
-            warn!("The second factor's windows of {user} were not read: {e}");
+            warn_limited!("The second factor's windows of {user} were not read: {e}");
             cache.put_windows(user, Vec::new());
             false
         }

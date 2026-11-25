@@ -22,6 +22,7 @@ use crate::policies::{
     EffectiveItem, POLICY_ITEM_CATALOG, POLICY_READ_WAIT, Policy, PolicyValueType,
     canonical_ou_key, catalog_item, resolve, resolve_effective_items,
 };
+use crate::warn_limited;
 use async_trait::async_trait;
 use jiff::tz::TimeZone;
 use lldap_domain::requests::{CreateGroupRequest, UpdateUserRequest};
@@ -1395,11 +1396,13 @@ where
             }
             Err(DomainError::EntityNotFound(_)) => cache.remove_user(&user),
             Err(e) if gave_up(&e) => {
-                warn!("The policy cache did not take {user}'s change within its bound: {e}");
+                warn_limited!(
+                    "The policy cache did not take {user}'s change within its bound: {e}"
+                );
                 return false;
             }
             Err(e) => {
-                warn!("The policy cache did not take {user}'s change: {e}");
+                warn_limited!("The policy cache did not take {user}'s change: {e}");
                 cache.read_failed.store(true, Ordering::Release);
                 continue;
             }
@@ -1639,9 +1642,10 @@ where
             }
         }
         Err(e) => {
-            warn!(
+            warn_limited!(
                 "The policy of {} could not be read at {:?}: {e}",
-                attempt.user, attempt.door
+                attempt.user,
+                attempt.door
             );
             Err(Refusal {
                 item: UNREADABLE,

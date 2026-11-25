@@ -9,6 +9,7 @@ use crate::handler::{
 };
 use crate::inactivity::follow_recording;
 use crate::instant::{self, SignedDuration, Timestamp};
+use crate::kdc_code::{KdcCodeStore, kdc_codes};
 use crate::logging::{self, LogKind};
 use crate::networks::warn_unreadable;
 use crate::policies::{EffectiveItem, POLICY_READ_WAIT, Policy, catalog_item};
@@ -1623,6 +1624,7 @@ pub type Running = tokio::task::JoinHandle<()>;
 pub async fn start_lockout<S>(store: &S, cache: &'static PolicyCache) -> Running
 where
     S: LockStore
+        + KdcCodeStore
         + UserListerBackendHandler
         + UserBackendHandler
         + PolicyBackendHandler
@@ -1640,6 +1642,7 @@ where
     lockout.serve_kdc(store.clone(), tokio::runtime::Handle::current());
     cache.serve_windows(store.clone(), tokio::runtime::Handle::current());
     cache.serve_successes(store.clone(), tokio::runtime::Handle::current());
+    kdc_codes().serve(store.clone(), tokio::runtime::Handle::current());
     lockout.run(store, cache)
 }
 

@@ -10,6 +10,7 @@ use lldap_domain_handlers::enforcement::{
     UNREADABLE, before_credential, door_read, mfa_item_matters, resolve_items,
 };
 use lldap_domain_handlers::handler::MfaBackendHandler;
+use lldap_domain_handlers::kdc_code::{CodeVerdict, KdcCode, KdcCodeStore};
 use lldap_domain_handlers::logging::{self, LogKind};
 use lldap_domain_handlers::mfa::{
     EnableMfa, MFA_DISABLED_GROUP, MfaEnrollmentStatus, MfaPolicy, MfaRequirement, MfaResetReason,
@@ -581,6 +582,18 @@ impl MfaBackendHandler for SqlBackendHandler {
     }
 }
 
+#[async_trait]
+impl KdcCodeStore for SqlBackendHandler {
+    async fn check_kdc_code(&self, user: &UserId, code: KdcCode<'_>) -> CodeVerdict {
+        match self.verify_user_totp(user, code.as_str()).await {
+            Ok(Ok(())) => CodeVerdict::Accepted,
+            Ok(Err(TotpRejection::Invalid)) => CodeVerdict::Wrong,
+            Ok(Err(rejection)) => CodeVerdict::Refused(rejection.detail()),
+            Err(e) => CodeVerdict::Refused(TotpRejection::unreadable(user, e).detail()),
+        }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -1103,6 +1116,106 @@ pub(crate) mod tests {
                 .await
                 .unwrap(),
             Err(TotpRejection::ReenrollmentRequired)
+        );
+    }
+
+    async fn at_kdc(handler: &SqlBackendHandler, user: &UserId, value: &str) -> CodeVerdict {
+        lldap_domain_handlers::kdc_code::check_code(handler, user, value.as_bytes()).await
+    }
+
+    #[tokio::test]
+    async fn test_the_kdcs_code_check_is_the_doors_and_a_value_not_six_digits_spends_nothing() {
+        use lldap_domain_handlers::kdc_code::NO_SIX_DIGITS;
+        let _clock = pin_clock(AT);
+        let (setup, handler) = setup_handler().await;
+        let (bob, seed, enrolled_with, next) = enroll_user(&handler, &setup, "bob").await;
+        insert_user_no_password(&handler, "john").await;
+        let john = UserId::new("john");
+        let marks = failures(&handler, &bob).await;
+        let shapes = [
+            format!("pw:{next}"),
+            format!("{next}\n"),
+            next[..5].to_owned(),
+            String::new(),
+        ];
+        let mut unread = Vec::new();
+        for value in &shapes {
+            unread.push(at_kdc(&handler, &bob, value).await);
+        }
+        let untouched = failures(&handler, &bob).await == marks;
+        let refused = |rejection: TotpRejection| CodeVerdict::Refused(rejection.detail());
+        type Step<'a> = (&'a str, &'a UserId, String, CodeVerdict);
+        let steps: [Step; 5] = [
+            (
+                "the code given at the enrolment",
+                &bob,
+                enrolled_with,
+                refused(TotpRejection::Replayed),
+            ),
+            (
+                "a code not used yet",
+                &bob,
+                next.clone(),
+                CodeVerdict::Accepted,
+            ),
+            (
+                "the same code again",
+                &bob,
+                next.clone(),
+                refused(TotpRejection::Replayed),
+            ),
+            ("a wrong code", &bob, wrong_code(&seed), CodeVerdict::Wrong),
+            (
+                "a user with no factor",
+                &john,
+                next.clone(),
+                refused(TotpRejection::NotEnrolled),
+            ),
+        ];
+        for (label, user, value, expected) in steps {
+            assert_eq!(at_kdc(&handler, user, &value).await, expected, "{label}");
+        }
+        let at_a_door = handler.verify_user_totp(&bob, &next).await.unwrap();
+        assert_eq!(
+            (unread, untouched, at_a_door),
+            (
+                vec![CodeVerdict::Refused(NO_SIX_DIGITS); 4],
+                true,
+                Err(TotpRejection::Replayed)
+            ),
+            "the password and the code, a newline, five digits and nothing: refused before any \
+             read, no attempt spent. A code taken at the KDC is used at the doors too"
+        );
+        for _ in 1..TOTP_MAX_ATTEMPTS_PER_STEP {
+            let _ = at_kdc(&handler, &bob, &wrong_code(&seed)).await;
+        }
+        let spent = at_kdc(&handler, &bob, &wrong_code(&seed)).await;
+        let rename = |from: &str, to: &str| {
+            let sql = format!("ALTER TABLE {from} RENAME TO {to}");
+            Statement::from_string(DbBackend::Sqlite, sql)
+        };
+        let pool = &handler.sql_pool;
+        pool.execute(rename("totp_steps", "totp_steps_away"))
+            .await
+            .unwrap();
+        let unreadable = at_kdc(&handler, &bob, &next).await;
+        pool.execute(rename("totp_steps_away", "totp_steps"))
+            .await
+            .unwrap();
+        let junk = "A".repeat(SEALED_BLOB_LEN - SEALED_PREFIX.len());
+        let sealed = Some(format!("{SEALED_PREFIX}{junk}"));
+        let totp = Some(MFA_TYPE_TOTP.to_owned());
+        handler.write_mfa_columns(&bob, sealed, totp).await.unwrap();
+        let key_changed = at_kdc(&handler, &bob, &next).await;
+        assert_eq!(
+            (spent, unreadable, key_changed),
+            (
+                refused(TotpRejection::TooManyAttempts),
+                refused(TotpRejection::Unreadable),
+                refused(TotpRejection::ReenrollmentRequired)
+            ),
+            "the doors' attempt limit, an unreadable table and a changed key, each with the \
+             doors' detail"
         );
     }
 

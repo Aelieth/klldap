@@ -77,6 +77,31 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --tests --all -- -D warnings
 
+  alone:
+    name: cargo check (each package alone)
+    needs: pre_job
+    if: ${{ needs.pre_job.outputs.should_skip != 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v6.0.1
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y pkg-config jq
+      - name: Install Rust
+        run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Check each package without the others' features
+        shell: bash
+        run: |
+          packages="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[].name')"
+          failed=""
+          for package in $packages; do
+            echo "::group::cargo check -p $package"
+            cargo check -p "$package" || failed="$failed $package"
+            echo "::endgroup::"
+          done
+          [ -z "$failed" ] || { echo "::error::these packages do not build alone:$failed"; exit 1; }
+
   licenses:
     name: cargo deny
     needs: pre_job

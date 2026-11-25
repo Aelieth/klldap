@@ -86,7 +86,8 @@ host's `/etc/krb5.conf` or the login credential cache.
 
 ## CI
 
-`.github/workflows/rust.yml` runs the safety dance, a `licenses` job
+`.github/workflows/rust.yml` runs the safety dance, a check that each
+package builds alone (`cargo check -p`, one package at a time), a `licenses` job
 (`cargo deny check licenses sources`), a shellcheck
 pass, and a PostgreSQL migration lane. `.github/workflows/gate.yml`
 builds the image and a second one with the gate's test hooks

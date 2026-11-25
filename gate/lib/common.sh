@@ -329,6 +329,37 @@ print("one" if ok else "%d %s" % (len(rows), json.dumps(rows)[:300]))' 2>/dev/nu
 
 log_mark() { graphql '{ logs(limit: 1) { id } }' '{}' 2>/dev/null | json_get logs.0.id 2>/dev/null; }
 
+# flood_quiet <KIND> <PROTOCOL>: wait until no flood window for refused rows of that kind over
+# that protocol can still be open on the server (20 s without a refusal, then the writer's 5 s
+# tick), so the next refusal is the first of its window. Prints the seconds waited; gives up at 60.
+flood_quiet() {
+    local waited=0
+    while [ "$waited" -lt 60 ] && [ "$(flood_state "$1" "$2")" != closed ]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+    printf '%s\n' "$waited"
+}
+# flood_state <KIND> <PROTOCOL>: "closed" when the newest refused row of the kind is over 27 s old
+# and no sign_in_flood row of the kind is a `started` without its `resolved`; else "open", also
+# when the log cannot be read.
+flood_state() {
+    graphql "{ logs(filter: {kinds: [$1, SIGN_IN_FLOOD], protocol: $2, success: false}, limit: 100) { kind timestamp peer target detail } }" '{}' 2>/dev/null |
+        KIND="$1" python3 -c '
+import calendar, json, os, sys, time
+kind = os.environ["KIND"]
+rows = json.load(sys.stdin)["logs"]
+newest = {}
+for r in rows:
+    detail = r.get("detail") or ""
+    if r["kind"] == "SIGN_IN_FLOOD" and detail.startswith(kind.lower() + " flood"):
+        newest.setdefault((r.get("peer"), r.get("target"), "many sources" in detail), detail)
+ages = [time.time() - calendar.timegm(time.strptime(r["timestamp"][:19], "%Y-%m-%dT%H:%M:%S"))
+        for r in rows if r["kind"] == kind]
+started = any(d.endswith("started") for d in newest.values())
+print("open" if started or (ages and min(ages) < 27) else "closed")' 2>/dev/null || echo open
+}
+
 # log_once <true|false> <kind> <target> <detail> <mark> <protocol>: one such row after the marker; else FAIL_WHY.
 log_once() {
     local got="" i

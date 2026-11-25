@@ -301,6 +301,9 @@ ne_today() {
         done
     day="$(LC_ALL=C date -d '+2 days' +%a | tr 'A-Z' 'a-z')"
     # From here the test policy is on the user's OU only; the root keeps what it had.
+    # kinit is refused before any password: P2.2's eleven refusals left its flood window open,
+    # and P2.3's row must be the first of a new one.
+    flood_quiet LOGIN KERBEROS >/dev/null
     ne_case login-hours "$day 03:00-03:01" &&
         for door in simple-login ldap-bind kinit; do
             ne_door "P2.3-$door" "login-hours='$day 03:00-03:01' on the user's OU (now is outside it)" "$door" out \

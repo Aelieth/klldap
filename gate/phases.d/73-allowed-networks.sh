@@ -204,7 +204,7 @@ an_setup() {
 }
 
 an_main() {
-    local out tok addr right wrong mark rows rc got
+    local out tok addr right wrong mark rows rc got quiet
     out="$(an_gql 'mutation($o: String!, $p: Int!) { setOuPolicy(ou: $o, policyId: $p) { ok warnings } }' '{"o": "'"$AN_OU"'", "p": '"$AN_POLICY"'}')"
     if [ "$(json_get setOuPolicy.ok <<<"$out" 2>/dev/null)" = True ] && [ "$(json_get setOuPolicy.warnings <<<"$out" 2>/dev/null)" = "[]" ]; then
         an_pass "[N1.save-no-warning] the admin links allowed-networks=$AN_IP/32 to $AN_OU: ok, warnings [] (the list does not reach the admin)"
@@ -265,13 +265,15 @@ an_main() {
     else
         an_finding "[N1.kinit-inside] kinit from the client gave '$got': $(head -c 200 "$AN_D/kinit-in.out")"
     fi
+    # kinit is refused before any password: the row must be the first of its flood window.
+    quiet="$(flood_quiet LOGIN KERBEROS)"
     mark="$(an_mark)"
     got="$(an_kinit_there)"
     rows="$(an_one "kind = 'login' AND protocol = 'kerberos' AND NOT success AND detail = '$AN_NOT' AND $(an_who "$AN_USER")" "$mark")"
     if [ "$got" = revoked ] && an_is "$rows" 1; then
-        an_pass_read "[N1.kinit-outside] kinit $AN_USER inside the server's container (loopback, outside the list): 'credentials have been revoked' (18), and one login row '$AN_NOT' (protocol kerberos)"
+        an_pass_read "[N1.kinit-outside] kinit $AN_USER inside the server's container (loopback, outside the list): 'credentials have been revoked' (18), and one login row '$AN_NOT' (protocol kerberos), the first of its flood window (waited $quiet s for the last one to close)"
     else
-        an_finding "[N1.kinit-outside] kinit inside the server's container gave '$got' (want revoked): $(head -c 200 "$AN_D/kinit-there.out"); rows: $rows (want 1)"
+        an_fail "[N1.kinit-outside] kinit inside the server's container gave '$got' (want revoked): $(head -c 200 "$AN_D/kinit-there.out"); rows: $rows (want 1, after $quiet s of waiting for a closed flood window)"
     fi
 
     out="$(an_login_in "$CONTAINER" "$AN_USER" 192.0.2.1)"

@@ -246,8 +246,28 @@ lk__enrol() {
         '{"s": "'"$state"'", "c": "'"$(lk__code)"'"}' >/dev/null 2>&1
 }
 
+# lk_flood <protocol> <mark>: "<started> <resolved>", the sign_in_flood rows of 50 wrong binds
+# once their window has closed (20 s after the last one, then the writer's tick).
+lk_flood() {
+    local row resolved
+    [ "$LK_READS" = 1 ] || {
+        echo unread
+        return
+    }
+    row="kind = 'sign_in_flood' AND NOT success AND protocol = '$1' AND (target = '$LK_USER' OR target IS NULL) AND id > ${2:-0}"
+    resolved="$row AND detail LIKE 'bind flood resolved: 42 refusals, 1 names, %'"
+    for _ in $(seq 1 45); do
+        [ "$(log_rows "$resolved")" = 0 ] || break
+        sleep 1
+    done
+    printf '%s %s\n' "$(log_rows "$row AND detail = 'bind flood started'")" "$(log_rows "$resolved")"
+}
+
 lk_fifty() {
-    local door="$1" i wrong=0 rows proto out before after
+    local door="$1" i wrong=0 rows proto out before after mark quiet flood
+    proto="$([ "$door" = ldap-bind ] && echo ldap || echo http)"
+    quiet="$(flood_quiet BIND "${proto^^}")"
+    mark="$(lk_mark)"
     for i in $(seq 1 50); do
         case "$door" in
         ldap-bind)
@@ -261,13 +281,6 @@ lk_fifty() {
         esac
     done
     [ "$wrong" = 0 ] || lk_finding "[L1.$door-wrong] $wrong of 50 wrong passwords at $door were not refused as wrong"
-    proto="$([ "$door" = ldap-bind ] && echo ldap || echo http)"
-    rows="$(lk_rows "kind = 'bind' AND protocol = '$proto' AND actor = '$LK_USER' AND NOT success" 50)"
-    if lk_is "$rows" 50; then
-        lk_pass_read "[L1.$door-rows] 50 wrong passwords at $door: 50 failure rows (kind bind, protocol $proto), one per attempt"
-    else
-        lk_finding "[L1.$door-rows] 50 wrong passwords at $door wrote $rows failure rows (kind bind, protocol $proto), not one per attempt"
-    fi
     before="$(lk_count_wait "$LK_USER" 50)"
     case "$door" in
     ldap-bind) lk_bind "$LK_USER" pass ;;
@@ -280,6 +293,13 @@ lk_fifty() {
     else
         lk_finding "[L1.$door-right] no threshold: fail_count after 50 wrong at $door was $before (want 50); the right password $([ "$out" = 0 ] && echo allowed || echo REFUSED) (want allowed); fail_count after it $after (want 0)"
     fi
+    flood="$(lk_flood "$proto" "$mark")"
+    rows="$(log_rows "kind = 'bind' AND protocol = '$proto' AND actor = '$LK_USER' AND NOT success AND id > ${mark:-0}")"
+    if lk_is "$rows" 8 && lk_is "$flood" "1 1"; then
+        lk_pass_read "[L1.$door-rows] 50 wrong passwords at $door after $quiet s of waiting for a closed flood window: the first 8 are failure rows (kind bind, protocol $proto), the other 42 are one sign_in_flood pair, 'bind flood started' and 'bind flood resolved: 42 refusals, 1 names', while fail_count read 50"
+    else
+        lk_fail "[L1.$door-rows] 50 wrong passwords at $door wrote $rows failure rows (kind bind, protocol $proto; want 8) and sign_in_flood rows 'bind flood started' and 'bind flood resolved: 42 refusals, 1 names': $flood (want 1 1); fail_count read $before"
+    fi
 }
 
 lk_threshold() {
@@ -288,6 +308,8 @@ lk_threshold() {
     ldap-bind) proto=ldap label="ldap bind" want=49 ;;
     simple-login) proto=http label="simple login" want=401 ;;
     esac
+    # The four refusals below must be kept one to one: no flood window of this door is open.
+    flood_quiet BIND "${proto^^}" >/dev/null
     mark="$(lk_mark)"
     for i in 1 2 3; do
         case "$door" in
@@ -317,7 +339,7 @@ lk_threshold() {
     if [ "$wrong" = 0 ] && lk_is "$count" 3 && [ "$right" = "$want" ] && lk_is "$rows" 1 && lk_is "$locks" 1; then
         lk_pass_read "[L1.$door-locked] OU threshold 3: 3 wrong at $door (fail_count 3), then the right password is refused as a wrong one ($want); one 'locked out' row (kind bind, protocol $proto) and one account_lock 'locked: $label'"
     else
-        lk_finding "[L1.$door-locked] OU threshold 3: $wrong of 3 wrong not refused, fail_count $count (want 3), the right password answered $right (want $want); 'locked out' rows: $rows, account_lock rows: $locks (want 1 and 1)"
+        lk_fail "[L1.$door-locked] OU threshold 3: $wrong of 3 wrong not refused, fail_count $count (want 3), the right password answered $right (want $want); 'locked out' rows: $rows, account_lock rows: $locks (want 1 and 1)"
     fi
     lk_unlock "$LK_LOCK" || lk_finding "[L1.$door-unlock] unlockUser $LK_LOCK failed: $(head -c 200 "$LK_D/last.err")"
 }
@@ -498,6 +520,9 @@ lk_kerberos() {
 
 lk_kinit_policy() {
     local mark w count got rows locks
+    # The 20 wrong kinits above may have left a flood window open: the 'locked out' row is kept
+    # one to one only in a new one.
+    flood_quiet LOGIN KERBEROS >/dev/null
     mark="$(lk_mark)"
     w="$(lk_wrong3 p)"
     count="$(lk_count_wait "$LK_LOCK" 3)"
@@ -507,7 +532,7 @@ lk_kinit_policy() {
     if [ "$w" = "$LK_W3" ] && lk_is "$count" 3 && [ "$got" = revoked ] && lk_is "$rows" 1 && lk_is "$locks" 1; then
         lk_pass_read "[L1.kinit-policy] OU threshold 3 on $LK_LOCK: 3 wrong, each 'Password incorrect' (fail_count 3), then the right password is refused before pre-auth ('credentials have been revoked'); one kerberos login row 'locked out' and one account_lock 'locked: kerberos'"
     else
-        lk_finding "[L1.kinit-policy] OU threshold 3: the 3 wrong gave '$w', fail_count $count (want 3), the right password '$got' (want revoked); 'locked out' login rows: $rows, account_lock rows: $locks (want 1 and 1)"
+        lk_fail "[L1.kinit-policy] OU threshold 3: the 3 wrong gave '$w', fail_count $count (want 3), the right password '$got' (want revoked); 'locked out' login rows: $rows, account_lock rows: $locks (want 1 and 1)"
     fi
 }
 

@@ -416,6 +416,8 @@ hi_session() {
 
 hi_hours_main() {
     local door
+    # kinit is refused before any password: its rows must start a flood window of their own.
+    flood_quiet LOGIN KERBEROS >/dev/null
     hi_zone_row H.main-zone "$CONTAINER" "UTC (built in)"
     for door in $HI_DOORS; do
         hi_out "H.out-$door" "$door" "$HI_USER" "$HI_DN" "$HI_HOURS_DETAIL" "$CONTAINER" \

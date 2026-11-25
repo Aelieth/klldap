@@ -11,6 +11,7 @@ use lldap_domain::types::UserId;
 use lldap_domain_model::error::Result;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock};
 use std::time::Duration;
 use tracing::warn;
@@ -141,6 +142,7 @@ pub(crate) struct ActivityBook {
     recording: RwLock<Recording>,
     rows_failed: AtomicBool,
     warned: Mutex<BTreeSet<(String, String)>>,
+    past_bound: AtomicBool,
 }
 
 fn held<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -226,24 +228,36 @@ impl PolicyCache {
         }
     }
 
-    async fn write_success<S>(&self, store: &S, user: &UserId, at: Timestamp)
+    async fn write_success<S>(&self, store: &S, user: &UserId, at: Timestamp) -> bool
     where
         S: LockStore + ?Sized,
     {
         let written = tokio::time::timeout(WRITE_BOUND, store.write_success(user, at)).await;
-        if !matches!(written, Ok(Ok(()))) {
-            self.owe_success(user, at);
+        match written {
+            Ok(Ok(())) => self.landed_in_time(),
+            _ => self.owe_success(user, at),
         }
         self.hold_success(user, at);
+        written.is_ok()
+    }
+
+    fn landed_in_time(&self) {
+        self.activity.past_bound.store(false, Ordering::Release);
+    }
+
+    pub fn kdc_waits_for_successes(&self) -> bool {
+        !self.activity.past_bound.load(Ordering::Acquire)
     }
 
     /// On the KDC's thread: written on the server's runtime; the thread waits at most
-    /// `WRITE_BOUND`, and a write that does not land is owed.
+    /// `WRITE_BOUND`, and a write that does not land is owed. While writes do not keep that
+    /// bound the success is owed at once, for the run loop, with no wait.
     pub fn carry_success_from_kdc(&'static self, user: &UserId, at: Timestamp) {
         if !self.success_due(user, at) {
             return;
         }
-        let Some(Writer { store, runtime }) = self.writer() else {
+        let writer = self.writer().filter(|_| self.kdc_waits_for_successes());
+        let Some(Writer { store, runtime }) = writer else {
             self.owe_success(user, at);
             self.hold_success(user, at);
             return;
@@ -251,10 +265,16 @@ impl PolicyCache {
         let (done, wait) = std::sync::mpsc::channel();
         let user = user.clone();
         runtime.spawn(async move {
-            self.write_success(&*store, &user, at).await;
-            let _ = done.send(());
+            let in_time = self.write_success(&*store, &user, at).await;
+            let _ = done.send(in_time);
         });
-        let _ = wait.recv_timeout(WRITE_BOUND);
+        let lapsed = matches!(
+            wait.recv_timeout(WRITE_BOUND),
+            Ok(false) | Err(RecvTimeoutError::Timeout)
+        );
+        if lapsed {
+            self.activity.past_bound.store(true, Ordering::Release);
+        }
     }
 
     fn hold_success(&self, user: &UserId, at: Timestamp) {
@@ -312,6 +332,7 @@ impl PolicyCache {
                 None
             };
             if matches!(stored, Some(Ok(()))) {
+                self.landed_in_time();
                 written += 1;
                 continue;
             }
@@ -569,6 +590,7 @@ pub(crate) mod tests {
         successes: Mutex<Vec<(UserId, Timestamp)>>,
         down: AtomicBool,
         slow: AtomicBool,
+        stalled: AtomicBool,
         since: Mutex<Option<Timestamp>>,
         recording_writes: Mutex<Vec<bool>>,
         recording_reads: AtomicU64,
@@ -620,6 +642,9 @@ pub(crate) mod tests {
         async fn write_success(&self, user: &UserId, at: Timestamp) -> Result<()> {
             if self.slow.load(Ordering::Relaxed) {
                 tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            if self.stalled.load(Ordering::Relaxed) {
+                tokio::time::sleep(WRITE_BOUND * 2).await;
             }
             if self.down.load(Ordering::Relaxed) {
                 return Err(DomainError::InternalError("down".to_owned()));
@@ -1125,5 +1150,51 @@ pub(crate) mod tests {
                     users it applies to are refused as unreadable until it is set again"
             .to_owned();
         assert_eq!(said, [vec![text.clone()], vec![], vec![], vec![text]]);
+    }
+
+    #[test]
+    fn test_the_kdc_thread_waits_for_no_success_after_a_wait_lapsed_until_one_lands_in_time() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let cache: &'static PolicyCache = Box::leak(Box::new(PolicyCache::new()));
+        let store = Arc::new(Memory::default());
+        turn(cache, true);
+        cache.serve_successes(store.clone(), runtime.handle().clone());
+        let users = ["e6one", "e6two", "e6three"].map(UserId::new);
+        let issued = |user: &UserId| {
+            let asked = std::time::Instant::now();
+            cache.carry_success_from_kdc(user, naive(0));
+            asked.elapsed()
+        };
+        store.stalled.store(true, Ordering::Relaxed);
+        let (first, second) = (issued(&users[0]), issued(&users[1]));
+        let lapsed = (
+            first >= WRITE_BOUND,
+            second < Duration::from_millis(50),
+            cache.kdc_waits_for_successes(),
+            store.written().len(),
+        );
+        store.stalled.store(false, Ordering::Relaxed);
+        let until = std::time::Instant::now() + Duration::from_secs(2);
+        while cache.owed_successes() < 2 && std::time::Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let drained = runtime.block_on(cache.drain_successes(&*store));
+        let restored = cache.kdc_waits_for_successes();
+        issued(&users[2]);
+        assert_eq!(
+            lapsed,
+            (true, true, false, 0),
+            "the first slow write is waited for to the bound; the second is owed with no wait"
+        );
+        assert_eq!(
+            (drained, restored, store.written().len()),
+            (2, true, 3),
+            "a write that lands in time restores the wait: the next success is stored before \
+             the thread returns"
+        );
     }
 }

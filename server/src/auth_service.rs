@@ -3291,11 +3291,11 @@ pub(crate) mod tests {
         let handler = sql_handler_with(&[("q32http", PASSWORD)])
             .await
             .with_policy_cache(cache);
-        cache.set_mfa_item_unknown();
         let state = app_state(handler);
         let right = login_finish_request(&state, "q32http", PASSWORD).await;
         let mut forged = login_finish_request(&state, "q32http", PASSWORD).await;
         forged.credential_finalization = right.credential_finalization.clone();
+        cache.set_mfa_item_unknown();
         let finish = async |request: login::ClientLoginFinishRequest| {
             answered(opaque_login_finish_handler(state.clone(), web::Json(request)).await).await
         };
@@ -3304,8 +3304,8 @@ pub(crate) mod tests {
         assert_eq!(finished.0.0, 401, "{}", text(&finished.0.1));
         assert_eq!(
             finished.0, finished.1,
-            "the enable-mfa value unreadable: the right proof and a proof that does not verify \
-             get the same status and body"
+            "the enable-mfa value unreadable only after the starts: the right proof and a proof \
+             that does not verify get the same status and body"
         );
     }
 

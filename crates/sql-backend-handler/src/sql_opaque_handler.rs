@@ -228,11 +228,14 @@ impl SqlBackendHandler {
             .map_err(|_| invalid_credentials(user))
     }
 
-    /// The items, judged when a web sign-in starts, before any password.
+    /// The items, then the enable-mfa value's read, judged when a web sign-in starts, before any
+    /// password.
     async fn admitted_at_start(&self, user: &UserId, now: Timestamp) -> bool {
-        self.admit_at(user, Door::WebLogin, false, now)
+        let items = self
+            .admit_at(user, Door::WebLogin, false, now)
             .await
-            .is_ok()
+            .is_ok();
+        items && self.door_policy(user, LogKind::Login).await.is_ok()
     }
 
     /// After the proof verified: a proof that does not verify, answered at once. The finish's split
@@ -439,7 +442,8 @@ impl OpaqueHandler for SqlOpaqueHandler {
                 .map_err(|e| Self::lock_unreadable(&user_id, LogKind::Login, e))?,
             None => None,
         };
-        // A locked user, and one the items refuse, is answered as a name with no password file is.
+        // A locked user, and one the items or an unreadable enable-mfa value refuse, is answered as
+        // a name with no password file is.
         let maybe_password_file = match lock {
             Some(lock) => {
                 let id = rand::RngCore::next_u64(&mut rng);
@@ -2685,6 +2689,11 @@ mod tests {
         let log = LogGuard::install_on_this_thread();
         let handler = doors::handler().await;
         doors::user_in(&handler, USER, "q32ou").await;
+        let started = doors::start(&handler, USER, doors::RIGHT).await;
+        let right = doors::finish_request(started, doors::RIGHT, None).unwrap();
+        let started = doors::start(&handler, USER, doors::RIGHT).await;
+        let mut forged = doors::finish_request(started, doors::RIGHT, None).unwrap();
+        forged.credential_finalization = right.credential_finalization.clone();
         handler.policy_cache.set_mfa_item_unknown();
         q31_rows(&log, USER);
         let bind = async |meta: RequestMeta, password: &str| {
@@ -2698,11 +2707,6 @@ mod tests {
             bind(RequestMeta::http(None, None), "Wrong-Pass-1").await,
         ];
         let bind_rows = q31_rows(&log, USER);
-        let started = doors::start(&handler, USER, doors::RIGHT).await;
-        let right = doors::finish_request(started, doors::RIGHT, None).unwrap();
-        let started = doors::start(&handler, USER, doors::RIGHT).await;
-        let mut forged = doors::finish_request(started, doors::RIGHT, None).unwrap();
-        forged.credential_finalization = right.credential_finalization.clone();
         let web = [
             handler.login_finish(right).await.map(drop).map_err(said),
             handler.login_finish(forged).await.map(drop).map_err(said),
@@ -2729,8 +2733,8 @@ mod tests {
                     row(LogKind::Login, "invalid credentials")
                 ]
             ),
-            "the web finish reads it after the proof: the right proof gets the failed proof, as \
-             one that does not verify does; only the row tells them apart"
+            "the value unreadable only after the starts: at the web finish the right proof gets \
+             the failed proof, as one that does not verify does; only the row tells them apart"
         );
     }
 }

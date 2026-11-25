@@ -259,20 +259,21 @@ impl SqlBackendHandler {
     }
 
     /// At a door, an OU item that cannot be read refuses with the door's own row.
+    pub(crate) async fn door_policy(&self, user_id: &UserId, kind: LogKind) -> Result<MfaPolicy> {
+        self.user_mfa_policy(user_id).await.map_err(|e| {
+            warn!(r#"The OU policy of "{user_id}" could not be read for enable-mfa: {e}"#);
+            let detail = format!("policy: {UNREADABLE}");
+            logging::record_as(Some(user_id), kind, None, false, Some(&detail));
+            invalid_credentials(user_id)
+        })
+    }
+
     pub(crate) async fn door_requirement(
         &self,
         user_id: &UserId,
         kind: LogKind,
     ) -> Result<MfaRequirement> {
-        let policy = match self.user_mfa_policy(user_id).await {
-            Ok(policy) => policy,
-            Err(e) => {
-                warn!(r#"The OU policy of "{user_id}" could not be read for enable-mfa: {e}"#);
-                let detail = format!("policy: {UNREADABLE}");
-                logging::record_as(Some(user_id), kind, None, false, Some(&detail));
-                return Err(invalid_credentials(user_id));
-            }
-        };
+        let policy = self.door_policy(user_id, kind).await?;
         self.requirement_under(policy, user_id).await
     }
 
@@ -1846,10 +1847,11 @@ pub(crate) mod tests {
             "an OU that sets it turns the item on, and the write that links it makes the group"
         );
         for door in asked {
+            let reads = if door == "web" { 2 } else { 1 };
             assert_eq!(
                 run(&h, door).await,
-                (vec![], 1, 0),
-                "{door}: one read of the cache, none of the tables"
+                (vec![], reads, 0),
+                "{door}: the cache is read (at the web start and again at its finish), none of the tables"
             );
         }
         let explicit = h.clone().with_mfa_policy(MfaPolicy::Disabled);

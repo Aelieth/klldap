@@ -145,6 +145,36 @@ async fn test_refused_web_starts_count_nothing_and_the_lock_is_judged_first() {
 
 #[tokio::test]
 #[serial]
+async fn test_an_unreadable_enable_mfa_value_refuses_when_a_web_sign_in_starts() {
+    let log = LogGuard::install_on_this_thread();
+    let h = doors::handler().await;
+    doors::user_in(&h, "f5lost", "f5lostou").await;
+    doors::policy_on(&h, "f5lostou", &[(THRESHOLD, "3"), (DURATION, "0")]).await;
+    insert_user_no_password(&h, "f5bare").await;
+    h.policy_cache.set_mfa_item_unknown();
+    doors::rows(&log, &[LogKind::Login]);
+    let refused = doors::web(&h, "f5lost", doors::RIGHT, None).await;
+    let no_password = doors::web(&h, "f5bare", doors::RIGHT, None).await;
+    let user = UserId::new("f5lost");
+    let counted = (
+        h.lockout.effective(&user).map_or(0, |row| row.fail_count),
+        h.lockout.overlays(&user),
+        h.lockout.pending(&user),
+    );
+    assert_eq!(
+        (refused, doors::rows(&log, &[LogKind::Login]), counted),
+        (
+            no_password,
+            vec![row("f5lost", "policy: unreadable")],
+            (0, 0, false)
+        ),
+        "the right password is answered as a name with no password file is; the refusal is the \
+         one row, the name with no password file has none; nothing counted"
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn test_an_enrolled_user_refused_when_the_sign_in_starts_is_asked_for_no_code() {
     let (_clock, at) = doors::pinned();
     let log = LogGuard::install_on_this_thread();

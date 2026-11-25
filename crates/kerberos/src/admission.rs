@@ -299,7 +299,7 @@ impl HostAdmission for KdcVerdict {
 
     fn check_tgs(&self, q: &TgsQuestion<'_>) -> Result<(), KdcRefusal> {
         let peer = q.peer.and_then(ip_of);
-        let Some(client) = q.client else {
+        let Some(client) = q.client.principal() else {
             let user = user_named(q.subject, &self.realm, &self.realm);
             let name = q.subject.unparse_with_realm_lossy(&self.realm);
             let target = user.as_ref().map_or(name.as_str(), UserId::as_str);
@@ -351,7 +351,7 @@ pub(crate) mod tests {
     use chrono::Utc;
     use krb5_asn1::{decode, encode};
     use krb5_crypto::{EncryptionType, ProtocolKey, string_to_key};
-    use krb5_kdc::admission::TgsKind;
+    use krb5_kdc::admission::{TgsClient, TgsKind};
     use krb5_kdc::{IssuedAs, PrincipalRead, SharedDump};
     use krb5_protocol::{
         TgsReqParams, armor_key, attach_fast, build_fast_armor, fx_fast_padata_over, tgs_req_ex,
@@ -596,7 +596,8 @@ pub(crate) mod tests {
         kind: TgsKind,
     ) -> Result<(), i32> {
         let guard = store.read().unwrap();
-        let client = client.map(|user| guard.get_name(&name(user)).unwrap());
+        let found = |user: &str| TgsClient::Found(guard.get_name(&name(user)).unwrap());
+        let client = client.map_or(TgsClient::NoEntry, found);
         let krbtgt = PrincipalName::new(PrincipalName::NT_SRV_INST, ["krbtgt", REALM]);
         let server = guard.fetch_name(&krbtgt).unwrap().unwrap();
         let ticket = ticket(REALM, subject);
@@ -623,7 +624,8 @@ pub(crate) mod tests {
         kind: TgsKind,
     ) -> Result<(), (i32, Option<String>)> {
         let guard = store.read().unwrap();
-        let client = client.map(|user| guard.get_name(&name(user)).unwrap());
+        let found = |user: &str| TgsClient::Found(guard.get_name(&name(user)).unwrap());
+        let client = client.map_or(TgsClient::NoEntry, found);
         let krbtgt = PrincipalName::new(PrincipalName::NT_SRV_INST, ["krbtgt", REALM]);
         let server = guard.fetch_name(&krbtgt).unwrap().unwrap();
         let mut header = ticket(REALM, "unused");

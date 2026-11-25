@@ -53,7 +53,7 @@ fn asked_tgs(
     let request = tgs_body(&ticket);
     let subject = name(user);
     let q = TgsQuestion {
-        client: Some(client),
+        client: TgsClient::Found(client),
         subject: &subject,
         server: &server,
         ticket: &ticket,

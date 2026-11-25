@@ -91,7 +91,7 @@ impl HostAdmission for TestAdmission {
     }
 
     fn check_tgs(&self, q: &TgsQuestion<'_>) -> Result<(), KdcRefusal> {
-        match q.client {
+        match q.client.principal() {
             Some(client) if !self.listed(&client.id()) => Ok(()),
             _ => Err(revoked()),
         }
@@ -178,7 +178,7 @@ mod tests {
     use crate::seam::committing;
     use krb5_asn1::{decode, encode};
     use krb5_crypto::{EncryptionType, ProtocolKey, string_to_key};
-    use krb5_kdc::admission::{AsReason, Mechanism, TgsKind};
+    use krb5_kdc::admission::{AsReason, Mechanism, TgsClient, TgsKind};
     use krb5_kdc::{IssuedAs, KDB_DISALLOW_ALL_TIX, Principal, PrincipalRead, SharedDump};
     use krb5_types::{KerberosString, KrbError, PrincipalName, TgsRep};
     use lldap_domain::types::UserId;
@@ -309,7 +309,8 @@ mod tests {
         }
 
         fn check_tgs(&self, q: &TgsQuestion<'_>) -> Result<(), KdcRefusal> {
-            let client = q.client.map_or_else(|| "none".to_owned(), Principal::id);
+            let client = q.client.principal();
+            let client = client.map_or_else(|| "none".to_owned(), Principal::id);
             self.note(format!("tgs {client} {:?}", q.kind));
             let subject = q.subject.unparse_with_realm_lossy(REALM);
             self.subjects.lock().unwrap().push(subject);
@@ -538,8 +539,12 @@ mod tests {
                     from_vars(Some(refuse.clone().into()), None)
                 }
             };
+            let client = match present {
+                true => TgsClient::Found(bob),
+                false => TgsClient::NoEntry,
+            };
             let q = TgsQuestion {
-                client: present.then_some(bob),
+                client,
                 subject: &subject,
                 server: &server,
                 ticket: &ticket,

@@ -89,6 +89,7 @@ NET="$PREFIX-net"
 PG_CONTAINER="$PREFIX-pg"
 MY_CONTAINER="$PREFIX-db"
 MY_ENV="${DB^^}"
+KEPT_LIST=/home/lab/klldap-dur-kept
 vsh() {
     if command -v virsh >/dev/null 2>&1; then
         virsh -q -c qemu:///system "$@"
@@ -116,6 +117,10 @@ cleanup() {
         if [ -e "$RESULTS_DIR/keep" ]; then
             echo "KEPT the run's containers and volumes in the guest ($PREFIX-*):" \
                 "$(head -1 "$RESULTS_DIR/keep")" | tee -a "$RESULTS_DIR/dur.log"
+            docker ps -a --format '{{.Names}}' -f "name=^$PREFIX-" >"$RESULTS_DIR/kept-containers"
+            ssh "$ADDR" "cat >>$KEPT_LIST && sync $KEPT_LIST" <"$RESULTS_DIR/kept-containers" ||
+                echo "KEPT names not recorded in the guest ($KEPT_LIST): see kept-containers" |
+                tee -a "$RESULTS_DIR/dur.log"
             return
         fi
     fi
@@ -180,8 +185,8 @@ EOF
     printf '#!/bin/sh\nexec %s -F %s "$@"\n' "$real_ssh" "$SSH_CONFIG" >"$RESULTS_DIR/bin/ssh"
     chmod 755 "$RESULTS_DIR/bin/ssh"
     export PATH="$RESULTS_DIR/bin:$PATH" TMPDIR="$RESULTS_DIR/tmp"
-    groups="$(ssh "$ADDR" id -nG 2>&1)"
-    enabled="$(ssh "$ADDR" systemctl is-enabled docker 2>&1)"
+    groups="$(ssh -n "$ADDR" id -nG 2>&1)"
+    enabled="$(ssh -n "$ADDR" systemctl is-enabled docker 2>&1)"
     case " $groups " in
     *" docker "*) ;;
     *)
@@ -193,24 +198,38 @@ EOF
         note "the guest's docker is not enabled at boot ($enabled)"
         exit 1
     }
-    DOCKER_ROOT="$(ssh "$ADDR" findmnt -no SOURCE,FSTYPE,OPTIONS --target /var/lib/docker 2>&1)"
+    DOCKER_ROOT="$(ssh -n "$ADDR" findmnt -no SOURCE,FSTYPE,OPTIONS --target /var/lib/docker 2>&1)"
     export DOCKER_HOST="ssh://lab@$ADDR"
     if [ "$INSTALL" = host ]; then
+        # A leg that ended with `keep` left its containers on the ports this install needs.
+        for name in $(ssh -n "$ADDR" cat "$KEPT_LIST" 2>/dev/null); do
+            case "$name" in
+            klldap-dur-*) ;;
+            *) continue ;;
+            esac
+            if docker rm -f -v "$name" >/dev/null 2>&1; then
+                note "removed the kept container $name (its named volumes stay)"
+            elif docker container inspect "$name" >/dev/null 2>&1; then
+                note "could not remove the kept container $name"
+                exit 1
+            fi
+        done
+        ssh -n "$ADDR" rm -f "$KEPT_LIST"
         stage=/home/lab/klldap-stage
-        if ! { ssh "$ADDR" mkdir -p "$stage" &&
+        if ! { ssh -n "$ADDR" mkdir -p "$stage" &&
             scp -q -F "$SSH_CONFIG" "$BINARY" "$ADDR:$stage/lldap" &&
             scp -q -F "$SSH_CONFIG" example_configs/lldap.service gate/lib/dur-host.sh \
                 "$ADDR:$stage/"; }; then
             note "could not stage the host install in the guest"
             exit 1
         fi
-        { ssh "$ADDR" systemctl is-active firewalld; ssh "$ADDR" sudo -n firewall-cmd --list-all; } \
+        { ssh -n "$ADDR" systemctl is-active firewalld; ssh -n "$ADDR" sudo -n firewall-cmd --list-all; } \
             >"$RESULTS_DIR/firewall-before.txt" 2>&1
         FIREWALL="firewalld not active"
         if [ "$(head -1 "$RESULTS_DIR/firewall-before.txt")" = active ]; then
-            if ! { ssh "$ADDR" sudo -n firewall-cmd --permanent --add-port=3890/tcp \
+            if ! { ssh -n "$ADDR" sudo -n firewall-cmd --permanent --add-port=3890/tcp \
                 --add-port=17170/tcp >/dev/null &&
-                ssh "$ADDR" sudo -n firewall-cmd --reload >/dev/null; }; then
+                ssh -n "$ADDR" sudo -n firewall-cmd --reload >/dev/null; }; then
                 note "could not open 3890/tcp and 17170/tcp in the guest's firewalld"
                 exit 1
             fi
@@ -302,6 +321,6 @@ DUR_ROW="$ROW" DUR_DB="$DB" DUR_IMAGE="$GATE_IMAGE" DUR_PREFIX="$PREFIX" DUR_NET
     DUR_SETTLE="$SETTLE" DUR_DOCKER_ROOT="${DOCKER_ROOT:-}" DUR_KINDS="$KINDS" DUR_INSTALL="$INSTALL" \
     DUR_BINARY_SHA="${BINARY_SHA:-}" DUR_UNIT_SHA="${UNIT_SHA:-}" DUR_FIREWALL="${FIREWALL:-}" \
     DUR_MY="$MY_CONTAINER" DUR_DB_SETTINGS="${DB_SETTINGS:-}" \
-    python3 -I "$GATE_ROOT/lib/dur.py" "$RESULTS_DIR"
+    python3 -I "$GATE_ROOT/lib/dur.py" "$RESULTS_DIR" </dev/null
 DUR_RC=$?
 exit "$DUR_RC"

@@ -1,3 +1,4 @@
+use crate::enforcement::UserFacts;
 use crate::inactivity::Recorded;
 use crate::instant::Timestamp;
 use crate::kdc_proof::ProofWindow;
@@ -7,6 +8,7 @@ use crate::logging::{
 use crate::mfa::{MfaPolicy, MfaRequirement, MfaResetReason};
 use crate::policies::{
     CreatePolicyRequest, OuPolicyState, Policy, PolicyId, PolicyLevel, UpdatePolicyRequest,
+    canonical_ou_key,
 };
 use async_trait::async_trait;
 use ldap3_proto::proto::LdapSubstringFilter;
@@ -17,7 +19,7 @@ use lldap_domain::{
     },
     types::{
         AttributeName, AttributeValue, Group, GroupDetails, GroupId, GroupName, LdapObjectClass,
-        TotpEnrollmentStart, User, UserAndGroups, UserId, Uuid,
+        TotpEnrollmentStart, User, UserAndGroups, UserId, Uuid, user_ou,
     },
 };
 use lldap_domain_model::{error::Result, model::UserColumn};
@@ -146,6 +148,24 @@ pub trait GroupBackendHandler: ReadSchemaBackendHandler {
     async fn delete_group(&self, group_id: GroupId) -> Result<()>;
 }
 
+/// What a fill of the policy cache reads of one user.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListedUser {
+    pub user_id: UserId,
+    pub ou_key: String,
+    pub facts: UserFacts,
+}
+
+impl ListedUser {
+    pub fn of<'a>(user: &User, groups: impl Iterator<Item = &'a GroupDetails>) -> Self {
+        Self {
+            user_id: user.user_id.clone(),
+            ou_key: canonical_ou_key(&user_ou(&user.attributes)),
+            facts: UserFacts::of(user, groups),
+        }
+    }
+}
+
 #[async_trait]
 pub trait UserListerBackendHandler: ReadSchemaBackendHandler {
     async fn list_users(
@@ -153,6 +173,21 @@ pub trait UserListerBackendHandler: ReadSchemaBackendHandler {
         filters: Option<UserRequestFilter>,
         get_groups: bool,
     ) -> Result<Vec<UserAndGroups>>;
+
+    /// In user-id order; a page shorter than `limit` is the last. Without paging: all, per page.
+    async fn list_users_after(
+        &self,
+        after: Option<&UserId>,
+        limit: usize,
+    ) -> Result<Vec<ListedUser>> {
+        let mut users = self.list_users(None, true).await?;
+        users.sort_by_key(|entry| entry.user.user_id.clone());
+        let later = |entry: &UserAndGroups| after.is_none_or(|after| entry.user.user_id > *after);
+        let page = users.iter().filter(|entry| later(entry)).take(limit);
+        let listed =
+            |entry: &UserAndGroups| ListedUser::of(&entry.user, entry.groups.iter().flatten());
+        Ok(page.map(listed).collect())
+    }
 }
 
 #[async_trait]

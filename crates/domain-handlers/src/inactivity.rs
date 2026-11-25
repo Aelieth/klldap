@@ -1,6 +1,6 @@
 use crate::enforcement::{
-    Attempt, Entries, INACTIVITY_DAYS, ItemCheck, POLICY_UNANSWERED, PolicyCache, UserFacts,
-    UserState, item_set,
+    Attempt, Entries, INACTIVITY_DAYS, ItemCheck, POLICY_UNANSWERED, PolicyCache, Snapshot,
+    UserFacts, UserState, WHOLE_READ_BOUND, bounded, item_set,
 };
 use crate::handler::PolicyBackendHandler;
 use crate::instant::{self, SignedDuration, Timestamp};
@@ -384,36 +384,55 @@ pub async fn follow_recording<S: LockStore + ?Sized>(
     Ok(())
 }
 
-/// One read for every user while an OU's items set the item, in the fill before the flag. A read
-/// that fails keeps what this server holds, and the follow tries it again.
-pub(crate) async fn fill_activity<H>(handler: &H, cache: &PolicyCache, entries: &mut Entries)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ActivityRead {
+    NotAsked,
+    Read,
+    Failed,
+}
+
+/// One read for every user while an OU's items set the item, in the fill before the flag.
+pub(crate) async fn read_activity_rows<H>(handler: &H, entries: &mut Entries) -> ActivityRead
 where
     H: PolicyBackendHandler + ?Sized,
 {
-    held(&cache.activity.written).retain(|user, _| entries.facts.contains_key(user));
-    let failed = &cache.activity.rows_failed;
     if !entries.items_of_ous.values().any(|items| judged_by(items)) {
-        failed.store(false, Ordering::Release);
-        return;
+        return ActivityRead::NotAsked;
     }
-    let rows = match handler.read_activity(None).await {
+    let rows = match bounded(WHOLE_READ_BOUND, handler.read_activity(None)).await {
         Ok(rows) => rows,
         Err(e) => {
             warn!("The users' activity was not read: {e}");
-            cache.note_read_failed();
-            failed.store(true, Ordering::Release);
-            let kept = cache.current();
-            for (user, facts) in entries.facts.iter_mut() {
-                facts.recorded = kept.facts_of(user).and_then(|was| was.recorded);
-            }
-            return;
+            return ActivityRead::Failed;
         }
     };
-    failed.store(false, Ordering::Release);
     let rows: HashMap<UserId, Recorded> = rows.into_iter().collect();
     for (user, facts) in entries.facts.iter_mut() {
         facts.recorded = Some(rows.get(user).copied().unwrap_or_default());
     }
+    ActivityRead::Read
+}
+
+/// At the fill's swap: a read that failed keeps what this server holds then, for the follow.
+pub(crate) fn settle_activity(
+    cache: &PolicyCache,
+    in_use: &Snapshot,
+    entries: &mut Entries,
+    read: ActivityRead,
+) {
+    let failed = read == ActivityRead::Failed;
+    cache.activity.rows_failed.store(failed, Ordering::Release);
+    if !failed {
+        return;
+    }
+    cache.note_read_failed();
+    for (user, facts) in entries.facts.iter_mut() {
+        facts.recorded = in_use.facts_of(user).and_then(|was| was.recorded);
+    }
+}
+
+pub(crate) fn forget_writes(cache: &PolicyCache, next: &Snapshot) {
+    held(&cache.activity.written).retain(|user, _| next.facts_of(user).is_some());
 }
 
 /// One user's row again, as a write asks; false when the read failed.

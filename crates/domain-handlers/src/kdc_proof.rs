@@ -1,5 +1,6 @@
 use crate::enforcement::{
-    Entries, PolicyCache, Snapshot, UserFacts, mfa_can_be_on, mfa_policy_from, user_written,
+    Entries, PolicyCache, Snapshot, UserFacts, WHOLE_READ_BOUND, bounded, mfa_can_be_on,
+    mfa_policy_from, user_written,
 };
 use crate::handler::{PolicyBackendHandler, UserBackendHandler};
 use crate::mfa::{MfaEnrollmentStatus, MfaPolicy, MfaRequirement, mfa_requirement};
@@ -267,7 +268,7 @@ where
     if windows.is_empty() {
         return;
     }
-    let rows = match handler.read_proof_windows(None).await {
+    let rows = match bounded(WHOLE_READ_BOUND, handler.read_proof_windows(None)).await {
         Ok(rows) => rows,
         Err(e) => {
             warn!("The second factor's windows were not read: {e}");

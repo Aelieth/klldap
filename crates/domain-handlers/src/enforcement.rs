@@ -3,8 +3,8 @@ use crate::handler::{
     UserBackendHandler, UserListerBackendHandler,
 };
 use crate::inactivity::{
-    ActivityBook, InactivityCheck, Recorded, active_since, cached_active_since, fill_activity,
-    idle_past_limit, read_user_activity,
+    ActivityBook, ActivityRead, InactivityCheck, Recorded, active_since, cached_active_since,
+    forget_writes, idle_past_limit, read_activity_rows, read_user_activity, settle_activity,
 };
 use crate::instant::{Timestamp, from_naive};
 use crate::kdc_proof::{ProofSettings, ProofWindow, Reread, WindowReader};
@@ -27,7 +27,7 @@ use jiff::tz::TimeZone;
 use lldap_domain::requests::{CreateGroupRequest, UpdateUserRequest};
 use lldap_domain::types::{Attribute, GroupDetails, MFA_TYPE_TOTP, User, UserId, Uuid, user_ou};
 use lldap_domain_model::error::{DomainError, Result};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
@@ -39,6 +39,8 @@ use tracing::warn;
 pub const POLICY_REFILL: Duration = Duration::from_secs(30);
 pub const FILL_GAP: Duration = Duration::from_millis(250);
 pub const FILL_BACKOFF_LIMIT: Duration = Duration::from_secs(30);
+pub const WHOLE_READ_BOUND: Duration = Duration::from_secs(30);
+pub const FILL_CHUNK: usize = 500;
 pub const OVERLAY_FOLD: usize = 1024;
 const MARK_PASSES: usize = 4;
 const FLAG_OFF: u8 = 0;
@@ -548,7 +550,9 @@ pub struct PolicyCache {
     reads: AtomicU64,
     fill: Notify,
     refill: AtomicBool,
+    fills: tokio::sync::Mutex<()>,
     writers: tokio::sync::Mutex<()>,
+    touched: Mutex<Option<HashSet<UserId>>>,
     marked: Mutex<Marks>,
     read_failed: AtomicBool,
     lockout: AtomicU8,
@@ -584,6 +588,18 @@ impl Drop for Taking<'_> {
     }
 }
 
+/// One fill at a time; until its swap, or its end without one, edited users are recorded.
+struct Filling<'a> {
+    cache: &'a PolicyCache,
+    _fills: tokio::sync::MutexGuard<'a, ()>,
+}
+
+impl Drop for Filling<'_> {
+    fn drop(&mut self) {
+        *self.cache.touched() = None;
+    }
+}
+
 impl Default for PolicyCache {
     fn default() -> Self {
         Self::new()
@@ -598,7 +614,9 @@ impl PolicyCache {
             reads: AtomicU64::new(0),
             fill: Notify::new(),
             refill: AtomicBool::new(false),
+            fills: tokio::sync::Mutex::new(()),
             writers: tokio::sync::Mutex::new(()),
+            touched: Mutex::new(None),
             marked: Mutex::default(),
             read_failed: AtomicBool::new(false),
             lockout: AtomicU8::new(FLAG_OFF),
@@ -756,8 +774,9 @@ impl PolicyCache {
         self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// Under the writers' lock; a change that leaves the user as held swaps nothing.
+    /// Under the writers' lock; a fill that is building records the user, changed or not.
     pub(crate) fn edit(&self, user: &UserId, change: impl FnOnce(&mut Over)) {
+        self.touch(user);
         let held = self.current();
         let was = held.of(user);
         let mut now = was.clone();
@@ -771,6 +790,47 @@ impl PolicyCache {
         if large {
             self.poke_fill();
         }
+    }
+
+    fn touched(&self) -> std::sync::MutexGuard<'_, Option<HashSet<UserId>>> {
+        self.touched.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn touch(&self, user: &UserId) {
+        if let Some(touched) = self.touched().as_mut() {
+            touched.insert(user.clone());
+        }
+    }
+
+    /// The order of the locks: the lockout's `following`, then `fills`, then `writers`.
+    async fn begin_fill(&self) -> Filling<'_> {
+        let fills = self.fills.lock().await;
+        let _taking = self.take().await;
+        *self.touched() = Some(HashSet::new());
+        Filling {
+            cache: self,
+            _fills: fills,
+        }
+    }
+
+    /// Under the writers' lock, with no wait from the record's taking to the swap.
+    fn swap_in(&self, built: Built) {
+        let Built {
+            mut entries,
+            activity,
+        } = built;
+        let held = self.current();
+        let touched = self.touched().take().unwrap_or_default();
+        let edited = |user: &UserId| Some((user.clone(), held.over.get(user)?.clone()));
+        let over = touched.iter().filter_map(edited).collect();
+        touched.iter().for_each(|user| self.mark(user));
+        settle_activity(self, &held, &mut entries, activity);
+        let next = Snapshot {
+            base: Arc::new(entries),
+            over,
+        };
+        forget_writes(self, &next);
+        self.swap(next);
     }
 
     pub fn put_user(&self, user: &UserId, ou_key: &str, items: Arc<[EffectiveItem]>) {
@@ -862,12 +922,12 @@ pub fn policy_cache() -> &'static PolicyCache {
     &CACHE
 }
 
-async fn ou_items<H>(handler: &H, ou_key: &str) -> Result<Arc<[EffectiveItem]>>
-where
-    H: PolicyBackendHandler + ?Sized,
-{
-    let levels = handler.get_policy_levels(ou_key).await?;
-    Ok(resolve_effective_items(POLICY_ITEM_CATALOG, &levels).into())
+/// A fill has no bound on its length: each of its reads answers within its own, or it fails.
+pub(crate) async fn bounded<T>(wait: Duration, read: impl Future<Output = Result<T>>) -> Result<T> {
+    let unanswered = DomainError::InternalError(POLICY_UNANSWERED.to_owned());
+    tokio::time::timeout(wait, read)
+        .await
+        .map_err(|_| unanswered)?
 }
 
 type UserEntry = (String, Arc<[EffectiveItem]>, User);
@@ -901,29 +961,56 @@ where
         ..Entries::default()
     };
     let mut ou_keys = BTreeSet::new();
-    for entry in handler.list_users(None, true).await? {
-        let ou_key = canonical_ou_key(&user_ou(&entry.user.attributes));
-        ou_keys.insert(ou_key.clone());
-        let facts = UserFacts::of(&entry.user, entry.groups.iter().flatten());
-        entries.facts.insert(entry.user.user_id.clone(), facts);
-        entries.ous_of_users.insert(entry.user.user_id, ou_key);
+    let mut after: Option<UserId> = None;
+    loop {
+        let chunk = handler.list_users_after(after.as_ref(), FILL_CHUNK);
+        let chunk = bounded(POLICY_READ_WAIT, chunk).await?;
+        let last = chunk.len() < FILL_CHUNK;
+        for listed in chunk {
+            ou_keys.insert(listed.ou_key.clone());
+            entries.facts.insert(listed.user_id.clone(), listed.facts);
+            entries
+                .ous_of_users
+                .insert(listed.user_id.clone(), listed.ou_key);
+            after = Some(listed.user_id);
+        }
+        if last {
+            break;
+        }
+        tokio::task::yield_now().await;
     }
     for ou_key in ou_keys {
-        let items = ou_items(handler, &ou_key).await?;
+        let levels = bounded(POLICY_READ_WAIT, handler.bounded_policy_levels(&ou_key)).await?;
+        let items = resolve_effective_items(POLICY_ITEM_CATALOG, &levels).into();
         entries.items_of_ous.insert(ou_key, items);
     }
     Ok(entries)
 }
 
+struct Built {
+    entries: Entries,
+    activity: ActivityRead,
+}
+
+async fn build<H>(handler: &H, cache: &PolicyCache) -> Result<Built>
+where
+    H: UserListerBackendHandler + PolicyBackendHandler + ?Sized,
+{
+    let mut entries = build_entries(handler).await?;
+    let activity = read_activity_rows(handler, &mut entries).await;
+    fill_windows(handler, cache, &mut entries).await;
+    Ok(Built { entries, activity })
+}
+
+/// The build runs off the writers' lock; one that fails or is dropped swaps nothing.
 pub async fn fill_policy_cache<H>(handler: &H, cache: &PolicyCache) -> Result<()>
 where
     H: UserListerBackendHandler + UserBackendHandler + PolicyBackendHandler + ?Sized,
 {
+    let _filling = cache.begin_fill().await;
+    let built = build(handler, cache).await?;
     let _taking = cache.take().await;
-    let mut entries = build_entries(handler).await?;
-    fill_activity(handler, cache, &mut entries).await;
-    fill_windows(handler, cache, &mut entries).await;
-    cache.replace(entries);
+    cache.swap_in(built);
     take_marks(handler, cache).await;
     Ok(())
 }
@@ -1635,6 +1722,7 @@ mod tests {
     use crate::inactivity::Recording;
     use crate::inactivity::tests::turn;
     use crate::instant::SignedDuration;
+    use crate::kdc_proof::{ProofVerdict, proof_at_as};
     use crate::lockout::{LockStore, LockWrite, SplitMark, StoredLock, Written, first_follow};
     use crate::policies::{
         AttachedPolicy, CreatePolicyRequest, ItemSource, OuPolicyState, Policy, PolicyId,
@@ -2299,6 +2387,22 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_a_fill_lists_the_users_a_chunk_at_a_time() {
+        let names: Vec<String> = (0..1_200).map(|n| format!("r1chunk{n:04}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let directory = Directory::default().listing(&names);
+        let entries = build_entries(&directory).await.unwrap();
+        assert_eq!(
+            (
+                directory.user_lists.load(Ordering::Relaxed),
+                entries.ous_of_users.len()
+            ),
+            (3, 1_200),
+            "1,200 users in chunks of 500: three reads, every user once"
+        );
+    }
+
     struct Names(&'static [&'static str]);
 
     impl ItemCheck for Names {
@@ -2393,6 +2497,14 @@ mod tests {
         recording_down: AtomicBool,
         successes: Mutex<Vec<(UserId, Timestamp)>>,
         restless: Mutex<Option<&'static PolicyCache>>,
+        gate: Option<Arc<tokio::sync::Semaphore>>,
+        writes: Mutex<Option<&'static PolicyCache>>,
+        proves: Mutex<Option<&'static PolicyCache>>,
+        proofs_seen: Mutex<Vec<ProofVerdict>>,
+        listing_parked: AtomicBool,
+        listing_takes: Duration,
+        activity_parked: AtomicBool,
+        proofs_parked: AtomicBool,
     }
 
     impl Directory {
@@ -2450,6 +2562,9 @@ mod tests {
             _: bool,
         ) -> Result<Vec<UserAndGroups>> {
             self.user_lists.fetch_add(1, Ordering::Relaxed);
+            if let Some(gate) = &self.gate {
+                let _ = gate.acquire().await;
+            }
             if let Some((cache, counter)) = *self.watching.lock().unwrap() {
                 let late = UserId::new(LATE);
                 let attempt = Attempt::at_kdc(&late, Door::KerberosAs, None, 1_700_000_000);
@@ -2465,6 +2580,29 @@ mod tests {
                 let verdict = admit_at_kdc_with(cache, counter, &attempt, &checks);
                 let flag = !cache.item_off(INACTIVITY_DAYS);
                 self.verdicts.lock().unwrap().push((flag, verdict));
+            }
+            let writes = self.writes.lock().unwrap().take();
+            if let Some(cache) = writes {
+                let late = UserId::new(LATE);
+                user_written(self, cache, &late).await;
+                let attempt = Attempt::at_kdc(&late, Door::KerberosAs, None, 1_700_000_000);
+                let counter = Lockout::default();
+                let verdict = admit_at_kdc_with(cache, &counter, &attempt, &item_checks());
+                let held = ou_of(cache, &late).is_some();
+                self.verdicts.lock().unwrap().push((held, verdict));
+            }
+            let proves = self.proves.lock().unwrap().take();
+            if let Some(cache) = proves {
+                let late = UserId::new(LATE);
+                cache.put_window(&late, opened());
+                let verdict = proof_at_as(cache, &late, opened().opened_at, None);
+                self.proofs_seen.lock().unwrap().push(verdict);
+            }
+            if self.listing_parked.load(Ordering::Relaxed) {
+                std::future::pending::<()>().await;
+            }
+            if !self.listing_takes.is_zero() {
+                tokio::time::sleep(self.listing_takes).await;
             }
             if self.users_down.load(Ordering::Relaxed) {
                 return Err(DomainError::InternalError("down".to_owned()));
@@ -2573,13 +2711,16 @@ mod tests {
             }
         }
         async fn bounded_policy_levels(&self, _: &str) -> Result<Vec<PolicyLevel>> {
-            unimplemented!()
+            Ok(self.levels.clone())
         }
         async fn read_proof_windows(
             &self,
             user: Option<&UserId>,
         ) -> Result<Vec<(UserId, ProofWindow)>> {
             self.proof_reads.fetch_add(1, Ordering::Relaxed);
+            if user.is_none() && self.proofs_parked.load(Ordering::Relaxed) {
+                std::future::pending::<()>().await;
+            }
             if self.proofs_down.load(Ordering::Relaxed) {
                 return Err(DomainError::InternalError("down".to_owned()));
             }
@@ -2589,6 +2730,9 @@ mod tests {
         }
         async fn read_activity(&self, user: Option<&UserId>) -> Result<Vec<(UserId, Recorded)>> {
             self.activity_reads.fetch_add(1, Ordering::Relaxed);
+            if user.is_none() && self.activity_parked.load(Ordering::Relaxed) {
+                std::future::pending::<()>().await;
+            }
             if self.activity_down.load(Ordering::Relaxed) {
                 return Err(DomainError::InternalError("down".to_owned()));
             }
@@ -2936,7 +3080,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_a_proof_put_while_a_fill_holds_the_lock_is_read_by_the_taker() {
+    async fn test_a_proof_put_while_the_lock_is_held_is_read_by_the_taker() {
         let cache = PolicyCache::new();
         cache.set_proofs(Some(ProofSettings::new(600, false, 3600)));
         cache.set_mfa_policy(Some(MfaPolicy::Enrolled));
@@ -3193,6 +3337,221 @@ mod tests {
             }
             assert!(poked(&cache).await, "{label}: letting go hands the mark on");
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_a_user_written_during_a_fill_is_admitted_at_the_kdc_before_it_ends_and_after() {
+        let _judging = Judging::only(&[LATE]);
+        let late = UserId::new(LATE);
+        let rows = [
+            ("a user the fill's listing lacks", None),
+            (
+                "a user it lists as before a move since undone",
+                Some("people"),
+            ),
+        ];
+        for (label, listed_in) in rows {
+            let cache: &'static PolicyCache = Box::leak(Box::new(PolicyCache::new()));
+            let mut directory = Directory::knowing(&[LATE]);
+            if let Some(ou) = listed_in {
+                let before = Directory::knowing(&[LATE]).listing(&[LATE]);
+                fill_policy_cache(&before, cache).await.unwrap();
+                directory.listed = vec![user_in(LATE, ou)];
+            }
+            *directory.writes.lock().unwrap() = Some(cache);
+            fill_policy_cache(&directory, cache).await.unwrap();
+            let during = directory.verdicts.lock().unwrap().clone();
+            let after = (ou_of(cache, &late), cache.marks().users.len());
+            assert_eq!(
+                (during, after),
+                (vec![(true, Ok(()))], (Some(LABS.to_owned()), 0)),
+                "{label}: stored and admitted while the fill lists; the fill's older listing \
+                 does not undo the write, and no mark is left"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_proof_stored_during_a_fill_admits_at_the_kdc_before_it_ends_and_after() {
+        let cache: &'static PolicyCache = Box::leak(Box::new(PolicyCache::new()));
+        cache.set_proofs(Some(ProofSettings::new(600, false, 3600)));
+        cache.set_mfa_policy(Some(MfaPolicy::Enrolled));
+        let known = || Directory::knowing(&[LATE]).listing(&[LATE]);
+        let late = UserId::new(LATE);
+        let before = known().enrolling(&[LATE]);
+        fill_policy_cache(&before, cache).await.unwrap();
+        let mut directory = known().enrolling(&[LATE]);
+        directory.proof_rows = vec![(late.clone(), opened())];
+        *directory.proves.lock().unwrap() = Some(cache);
+        fill_policy_cache(&directory, cache).await.unwrap();
+        let during = directory.proofs_seen.lock().unwrap().clone();
+        let after = proof_at_as(cache, &late, opened().opened_at, None);
+        assert_eq!(
+            (during, after, cache.marks().users.len()),
+            (vec![ProofVerdict::Admitted], ProofVerdict::Admitted, 0),
+            "a proof put while the fill lists opens Kerberos at once, and the fill keeps it"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
+    async fn test_a_fill_that_fails_after_a_write_leaves_that_write_and_nothing_stuck() {
+        let _judging = Judging::only(&[LATE, OTHER]);
+        let (late, other) = (UserId::new(LATE), UserId::new(OTHER));
+        let short = Duration::from_millis(500);
+        type Row = (&'static str, bool, bool, Duration, (bool, bool));
+        let rows: [Row; 3] = [
+            ("its listing fails", true, false, WITHIN, (true, false)),
+            (
+                "a chunk of its listing does not answer within its bound",
+                false,
+                true,
+                WITHIN,
+                (true, true),
+            ),
+            (
+                "it is dropped in its build",
+                false,
+                true,
+                short,
+                (false, false),
+            ),
+        ];
+        for (label, down, parked, within, expected) in rows {
+            let cache: &'static PolicyCache = Box::leak(Box::new(PolicyCache::new()));
+            let directory = Directory::knowing(&[LATE, OTHER]);
+            *directory.writes.lock().unwrap() = Some(cache);
+            directory.users_down.store(down, Ordering::Relaxed);
+            directory.listing_parked.store(parked, Ordering::Relaxed);
+            let (base, started) = (cache.get(), tokio::time::Instant::now());
+            let ended = tokio::time::timeout(within, fill_policy_cache(&directory, cache)).await;
+            let took = started.elapsed();
+            let unanswered = matches!(&ended, Ok(Err(e)) if gave_up(e));
+            let failed = (matches!(ended, Ok(Err(_))), unanswered);
+            let bound = if unanswered {
+                POLICY_READ_WAIT
+            } else {
+                Duration::ZERO
+            };
+            let left = (
+                ou_of(cache, &late),
+                cache.marks().users.len(),
+                cache.touched().is_some(),
+                Arc::ptr_eq(&base.base, &cache.get().base),
+            );
+            directory.users_down.store(false, Ordering::Relaxed);
+            directory.listing_parked.store(false, Ordering::Relaxed);
+            user_written(&directory, cache, &other).await;
+            let next = (ou_of(cache, &other), cache.marks().users.len());
+            let again = fill_policy_cache(&directory, cache).await.is_ok();
+            assert_eq!(
+                (
+                    failed,
+                    took >= bound,
+                    took < bound + WITHIN,
+                    left,
+                    next,
+                    again
+                ),
+                (
+                    expected,
+                    true,
+                    true,
+                    (Some(LABS.to_owned()), 0, false, true),
+                    (Some(LABS.to_owned()), 0),
+                    true
+                ),
+                "{label}: the write made while it built stays stored, with no mark and no record \
+                 of the build; nothing was swapped; the next write and the next fill run"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_fill_of_many_chunks_that_each_answer_in_time_is_not_failed_by_its_length() {
+        let cache = PolicyCache::new();
+        let names: Vec<String> = (0..8_200).map(|n| format!("r1long{n:04}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let mut directory = Directory::default().listing(&names);
+        directory.listing_takes = POLICY_READ_WAIT - Duration::from_millis(100);
+        let started = tokio::time::Instant::now();
+        let filled = fill_policy_cache(&directory, &cache).await.is_ok();
+        let took = started.elapsed();
+        assert_eq!(
+            (
+                filled,
+                directory.user_lists.load(Ordering::Relaxed),
+                cache.get().ous_of_users().len(),
+                took > Duration::from_secs(30)
+            ),
+            (true, 17, 8_200, true),
+            "17 chunks of 1.9 s each, 32.3 s in all: every chunk answered within its own bound, \
+             and no bound is set on the fill's length"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_whole_read_past_its_bound_is_a_read_that_failed_and_the_fill_stands() {
+        let late = UserId::new(LATE);
+        for (label, activity) in [("the users' activity", true), ("the windows", false)] {
+            let cache = PolicyCache::new();
+            cache.set_proofs(Some(ProofSettings::new(600, false, 3600)));
+            cache.set_mfa_policy(Some(MfaPolicy::Enrolled));
+            let directory = Directory::knowing(&[LATE]).listing(&[LATE]);
+            let mut directory = directory.enrolling(&[LATE]);
+            directory.levels = idle_level("30");
+            directory.activity_parked.store(activity, Ordering::Relaxed);
+            directory.proofs_parked.store(!activity, Ordering::Relaxed);
+            let started = tokio::time::Instant::now();
+            let filled = fill_policy_cache(&directory, &cache).await.is_ok();
+            let took = started.elapsed();
+            assert_eq!(
+                (
+                    filled,
+                    cache.failed_read(),
+                    ou_of(&cache, &late),
+                    took >= WHOLE_READ_BOUND,
+                    took < WHOLE_READ_BOUND + WITHIN
+                ),
+                (true, true, Some(LABS.to_owned()), true, true),
+                "{label}: given up at its bound as a read that failed; the fill's listing stands"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_second_fill_waits_for_the_first_and_its_later_listing_stays() {
+        let cache: &'static PolicyCache = Box::leak(Box::new(PolicyCache::new()));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut first = Directory::knowing(&[LATE]).listing(&[LATE]);
+        first.gate = Some(gate.clone());
+        let first = Arc::new(first);
+        let second = Arc::new(Directory::knowing(&[OTHER]).listing(&[OTHER]));
+        let lists = |directory: &Directory| directory.user_lists.load(Ordering::Relaxed);
+        let fill = |directory: &Arc<Directory>| {
+            let directory = directory.clone();
+            tokio::spawn(async move { fill_policy_cache(&*directory, cache).await.is_ok() })
+        };
+        let early = fill(&first);
+        for _ in 0..100 {
+            if lists(&first) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let later = fill(&second);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let waiting = (lists(&first), lists(&second));
+        gate.add_permits(1);
+        let ended = (early.await.unwrap(), later.await.unwrap());
+        let (late, other) = (UserId::new(LATE), UserId::new(OTHER));
+        assert_eq!(
+            (waiting, ended, ou_of(cache, &late), ou_of(cache, &other)),
+            ((1, 0), (true, true), None, Some(LABS.to_owned())),
+            "while the first fill builds the second has listed nothing; the second's listing, \
+             the later one, is what the cache holds"
+        );
     }
 
     struct Rows(Mutex<Vec<logging::LogEvent>>);

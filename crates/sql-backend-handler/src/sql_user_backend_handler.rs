@@ -251,6 +251,76 @@ impl UserListerBackendHandler for SqlBackendHandler {
         }
         Ok(users)
     }
+
+    /// One page: the users' rows, their groups, and of their attributes the OU's alone.
+    #[instrument(skip(self), level = "debug", err)]
+    async fn list_users_after(
+        &self,
+        after: Option<&UserId>,
+        limit: usize,
+    ) -> Result<Vec<lldap_domain_handlers::handler::ListedUser>> {
+        let later = match after {
+            Some(after) => ColumnTrait::gt(&UserColumn::UserId, after).into_condition(),
+            None => bool_to_expr(true),
+        };
+        let users = model::User::find()
+            .filter(later)
+            .order_by_asc(UserColumn::UserId)
+            .limit(u64::try_from(limit).unwrap_or(u64::MAX))
+            .all(&self.sql_pool)
+            .await?;
+        let ids: Vec<UserId> = users.iter().map(|user| user.user_id.clone()).collect();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let name = || {
+            SimpleExpr::FunctionCall(Func::lower(Expr::col(
+                model::UserAttributesColumn::AttributeName,
+            )))
+        };
+        let ou = PublicSchema::shared()
+            .user_attributes()
+            .get_by_name_or_alias("ou");
+        let names = ou
+            .into_iter()
+            .flat_map(|ou| std::iter::once(&ou.name).chain(&ou.aliases));
+        let named_ou = names.fold(Cond::any().add(name().eq("ou".to_owned())), |any, alias| {
+            any.add(name().eq(alias.to_lowercase()))
+        });
+        let attributes = model::UserAttributes::find()
+            .filter(model::UserAttributesColumn::UserId.is_in(ids.clone()))
+            .filter(named_ou)
+            .order_by_asc(model::UserAttributesColumn::UserId)
+            .order_by_asc(model::UserAttributesColumn::AttributeName)
+            .all(&self.sql_pool)
+            .await?;
+        let mut ous = std::collections::HashMap::<UserId, Vec<_>>::new();
+        for attribute in attributes {
+            let of_user = ous.entry(attribute.user_id.clone()).or_default();
+            of_user.push(attribute);
+        }
+        let memberships = model::Membership::find()
+            .filter(model::MembershipColumn::UserId.is_in(ids))
+            .find_also_related(model::Group)
+            .all(&self.sql_pool)
+            .await?;
+        let mut groups = std::collections::HashMap::<UserId, Vec<GroupDetails>>::new();
+        for (membership, group) in memberships {
+            let of_user = groups.entry(membership.user_id).or_default();
+            of_user.extend(group.map(GroupDetails::from));
+        }
+        let schema = self.get_schema().await?;
+        let listed = users.into_iter().map(|user| -> Result<_> {
+            let id = user.user_id.clone();
+            let user = Self::user_of((user, ous.remove(&id).unwrap_or_default()), &schema)?;
+            let groups = groups.get(&id).map(Vec::as_slice).unwrap_or_default();
+            Ok(lldap_domain_handlers::handler::ListedUser::of(
+                &user,
+                groups.iter(),
+            ))
+        });
+        listed.collect()
+    }
 }
 
 impl SqlBackendHandler {
@@ -1223,6 +1293,55 @@ mod tests {
         let fixture = TestFixture::new().await;
         let users = get_user_names(&fixture.handler, None).await;
         assert_eq!(users, vec!["bob", "john", "nogroup", "patrick"]);
+    }
+
+    #[tokio::test]
+    async fn test_the_users_are_listed_a_page_at_a_time_in_user_id_order() {
+        let fixture = TestFixture::new().await;
+        let handler = &fixture.handler;
+        let exempt = insert_group(handler, MFA_DISABLED_GROUP).await;
+        insert_membership(handler, exempt, "john").await;
+        let labs = Attribute {
+            name: "ou".into(),
+            value: "people\\labs".to_owned().into(),
+        };
+        let moved = UpdateUserRequest {
+            user_id: UserId::new("patrick"),
+            insert_attributes: vec![labs],
+            ..Default::default()
+        };
+        handler.update_user(moved).await.unwrap();
+        let mut pages = Vec::new();
+        let mut after: Option<UserId> = None;
+        loop {
+            let page = handler.list_users_after(after.as_ref(), 3).await.unwrap();
+            let row = page.iter().map(|user| {
+                (
+                    user.user_id.to_string(),
+                    user.ou_key.clone(),
+                    user.facts.exempt,
+                )
+            });
+            pages.push(row.collect::<Vec<_>>());
+            after = page.last().map(|user| user.user_id.clone());
+            if page.len() < 3 {
+                break;
+            }
+        }
+        let row = |user: &str, ou: &str, exempt| (user.to_owned(), ou.to_owned(), exempt);
+        assert_eq!(
+            pages,
+            vec![
+                vec![
+                    row("bob", "people", false),
+                    row("john", "people", true),
+                    row("nogroup", "people", false)
+                ],
+                vec![row("patrick", "people\\labs", false)]
+            ],
+            "pages of three in user-id order, the last one short; each user's OU key from its \
+             own attribute, and its exempt group read"
+        );
     }
 
     #[tokio::test]

@@ -808,7 +808,7 @@ pub(crate) mod tests {
                  AND pid <> pg_backend_pid()"
             }
         };
-        for _ in 0..100 {
+        for _ in 0..500 {
             let row = pool.query_one(Statement::from_string(backend, sql)).await;
             let waiting: i64 = row
                 .ok()
@@ -817,13 +817,14 @@ pub(crate) mod tests {
             if waiting > 0 {
                 return true;
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
         false
     }
 
-    /// PostgreSQL and MySQL lanes: a user made while a cache fill waits on the held
-    /// `ou_policies`; the KDC's count and verdict are called as `KdcVerdict` calls them.
+    /// PostgreSQL and MySQL lanes: a cache fill and a user's write under a held `ou_policies`,
+    /// then a fill once it is free; the KDC's count and verdict are called as `KdcVerdict`
+    /// calls them.
     pub(crate) async fn held_fill_lane(pool: &DbConnection) {
         init_table(pool).await.unwrap();
         let key = generate_random_private_key();
@@ -835,12 +836,18 @@ pub(crate) mod tests {
             h.policy_cache.lockout_unknown(),
         );
         let holder = Holder::take(pool, "ou_policies").await;
-        let filler = h.clone();
+        let (filler, started) = (h.clone(), Instant::now());
         let filling =
             tokio::spawn(async move { fill_policy_cache(&filler, filler.policy_cache).await });
         let waited = fill_waits(pool).await;
+        let ended = tokio::time::timeout(ACQUIRE, filling).await;
+        let gave = matches!(&ended, Ok(Ok(Err(e))) if gave_up(e));
+        let fill = (waited, gave, started.elapsed() < WITHIN);
         doors::user_in(&h, "e3fill", "e3fillou").await;
         let user = UserId::new("e3fill");
+        let started = Instant::now();
+        user_written(&h, h.policy_cache, &user).await;
+        let hook = started.elapsed() < WITHIN;
         let verdict = || {
             let now = lock_clock().as_second() as u32;
             let attempt = Attempt::at_kdc(&user, Door::KerberosAs, None, now);
@@ -855,15 +862,16 @@ pub(crate) mod tests {
             .map(|lock| h.lockout.failure(lock, lock_clock()));
         let counted = h.lockout.row(&user).map_or(0, |row| row.fail_count);
         let during = (verdict(), h.policy_cache.marked(&user));
+        let cached = doors::bind(&h, "e3held", doors::RIGHT).await;
         holder.release().await;
-        let filled = tokio::time::timeout(ACQUIRE, filling).await;
-        let filled = matches!(filled, Ok(Ok(Ok(()))));
+        let filled = fill_policy_cache(&h, h.policy_cache).await.is_ok();
         let after = (verdict(), h.policy_cache.marked(&user));
         let signed_in = doors::bind(&h, "e3fill", doors::RIGHT).await;
         assert_eq!(
-            (flags, waited, before, step.is_some(), counted, during),
+            (flags, fill, hook, before, step.is_some(), counted, during),
             (
                 (true, false),
+                (true, true, true),
                 true,
                 Ok(()),
                 true,
@@ -873,12 +881,14 @@ pub(crate) mod tests {
                     true
                 )
             ),
-            "during the hold: the fill waits; one wrong password counts, then the user is not loaded"
+            "during the hold: the fill waits and gives up within its bound; the write's hook \
+             returns; one wrong password counts, then the user is not loaded"
         );
         assert_eq!(
-            (filled, after, signed_in),
-            (true, (Ok(()), false), true),
-            "after the hold: the fill ends with the user in it, the KDC admits it, it signs in"
+            (cached, filled, after, signed_in),
+            (true, true, (Ok(()), false), true),
+            "a user the cache holds signs in during the hold; after it, a fill ends with the \
+             written user in it, the KDC admits it, it signs in"
         );
     }
 

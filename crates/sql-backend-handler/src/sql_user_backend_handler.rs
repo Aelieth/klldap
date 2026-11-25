@@ -188,7 +188,7 @@ fn to_value(opt_name: &Option<String>) -> ActiveValue<Option<String>> {
 
 #[async_trait]
 impl UserListerBackendHandler for SqlBackendHandler {
-    #[instrument(skip(self), level = "debug", ret, err)]
+    #[instrument(skip(self), level = "debug", ret, err(level = "debug"))]
     async fn list_users(
         &self,
         filters: Option<UserRequestFilter>,
@@ -253,7 +253,7 @@ impl UserListerBackendHandler for SqlBackendHandler {
     }
 
     /// One page: the users' rows, their groups, and of their attributes the OU's alone.
-    #[instrument(skip(self), level = "debug", err)]
+    #[instrument(skip(self), level = "debug", err(level = "debug"))]
     async fn list_users_after(
         &self,
         after: Option<&UserId>,

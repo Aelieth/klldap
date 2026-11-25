@@ -17,6 +17,7 @@ use lldap_domain_handlers::lockout::{
     UNLOCKED_BY_ADMIN, Written, lock_clock, record_account_lock, sets_threshold,
 };
 use lldap_domain_handlers::logging::{self, LogEvent, LogKind};
+use lldap_domain_handlers::warn_limited;
 use lldap_domain_model::{
     error::{DomainError, Result},
     model::{
@@ -28,7 +29,7 @@ use sea_orm::{
     QuerySelect, Statement, TransactionTrait, Value, sea_query::OnConflict,
 };
 use std::collections::HashMap;
-use tracing::warn;
+use tracing::debug;
 
 const COLUMNS: [&str; 4] = ["fail_count", "last_failed", "last_success", "lock_logged"];
 /// The counting period, raised by the change that makes the first threshold effective.
@@ -530,7 +531,7 @@ impl SqlBackendHandler {
     }
 
     pub(crate) fn lock_unreadable(user: &UserId, kind: LogKind, e: DomainError) -> DomainError {
-        warn!(r#"The lockout of "{user}" could not be read: {e}"#);
+        warn_limited!(r#"The lockout of "{user}" could not be read: {e}"#);
         let detail = format!("policy: {UNREADABLE}");
         logging::record_as(Some(user), kind, None, false, Some(&detail));
         invalid_credentials(user)
@@ -538,7 +539,7 @@ impl SqlBackendHandler {
 
     /// The refusal's own row; a refusal counts nothing and logs no lock.
     pub(crate) fn refuse_locked(&self, user: &UserId, kind: LogKind) {
-        warn!(r#"Login attempt refused for "{user}": {LOCKED_OUT}"#);
+        debug!(r#"Login attempt refused for "{user}": {LOCKED_OUT}"#);
         logging::record_as(Some(user), kind, None, false, Some(LOCKED_OUT));
     }
 

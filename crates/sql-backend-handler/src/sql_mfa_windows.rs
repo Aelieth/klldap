@@ -5,9 +5,9 @@ use crate::sql_totp_steps::lock_conflict;
 use lldap_domain::types::UserId;
 use lldap_domain_handlers::kdc_proof::ProofWindow;
 use lldap_domain_handlers::logging;
+use lldap_domain_handlers::warn_limited;
 use lldap_domain_model::error::Result;
 use sea_orm::{ConnectionTrait, DbBackend, IsolationLevel, Statement, TransactionTrait, Value};
-use tracing::warn;
 
 pub(crate) const PROOF_NOT_STORED: &str = "proof not stored";
 
@@ -220,7 +220,7 @@ impl SqlBackendHandler {
                 true
             }
             Err(e) => {
-                warn!(r#"The second factor's proof for "{user}" was not stored: {e}"#);
+                warn_limited!(r#"The second factor's proof for "{user}" was not stored: {e}"#);
                 false
             }
         }

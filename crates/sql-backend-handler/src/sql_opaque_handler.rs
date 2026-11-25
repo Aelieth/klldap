@@ -18,6 +18,7 @@ use lldap_domain_handlers::lockout::{LockState, Step, lock_clock};
 use lldap_domain_handlers::logging::{self, LogKind, NO_PASSWORD};
 use lldap_domain_handlers::mfa::MfaRequirement;
 use lldap_domain_handlers::password::refuse_unfinishable;
+use lldap_domain_handlers::warn_limited;
 use lldap_domain_model::{
     error::{DomainError, Result},
     model::{self, UserColumn},
@@ -143,7 +144,7 @@ impl SqlBackendHandler {
         DomainError::AuthenticationError(REGISTRATION_UNMARKED.to_owned())
     }
 
-    #[instrument(skip(self), level = "debug", err)]
+    #[instrument(skip(self), level = "debug", err(level = "debug"))]
     async fn get_password_file_for_user(&self, user_id: UserId) -> Result<Option<Vec<u8>>> {
         Ok(model::User::find_by_id(user_id)
             .select_only()
@@ -435,7 +436,7 @@ impl SqlBackendHandler {
                 Some(code) => match self.verify_user_totp(&username, code).await? {
                     Ok(()) => (Some("totp"), false),
                     Err(rejection) => {
-                        warn!(
+                        warn_limited!(
                             r#"TOTP refused for "{}": {}"#,
                             &username,
                             rejection.detail()
@@ -467,7 +468,7 @@ impl SqlBackendHandler {
         self.admit_while_degraded(&username, Door::WebLogin).await?;
         let stored = !second_factor || self.note_proof(&username, now_unix()).await;
         let detail = detail.map(|detail| with_proof(detail, stored));
-        info!(r#"OPAQUE login successful for "{}""#, &username);
+        debug!(r#"OPAQUE login successful for "{}""#, &username);
         logging::record_as(
             Some(&username),
             LogKind::Login,
@@ -498,7 +499,7 @@ impl LoginHandler for SqlBackendHandler {
             return Err(invalid_credentials(&name));
         }
         if door_read(self.is_user_disabled(&name)).await? {
-            warn!(r#"Login attempt denied for disabled user "{}""#, &name);
+            debug!(r#"Login attempt denied for disabled user "{}""#, &name);
             logging::record_as(
                 Some(&name),
                 LogKind::Bind,
@@ -568,7 +569,7 @@ impl OpaqueHandler for SqlOpaqueHandler {
         let user_id = request.username;
 
         if door_read(self.is_user_disabled(&user_id)).await? {
-            warn!(
+            debug!(
                 r#"OPAQUE login attempt denied for disabled user "{}""#,
                 &user_id
             );
@@ -585,7 +586,7 @@ impl OpaqueHandler for SqlOpaqueHandler {
             )));
         }
 
-        info!(r#"OPAQUE login attempt for "{}""#, &user_id);
+        debug!(r#"OPAQUE login attempt for "{}""#, &user_id);
         let maybe_password_file = door_read(self.get_password_file_for_user(user_id.clone()))
             .await?
             .map(|bytes| {
@@ -671,7 +672,7 @@ impl OpaqueHandler for SqlOpaqueHandler {
 
         // Checked again in case login_start was bypassed.
         if door_read(self.is_user_disabled(&username)).await? {
-            warn!(
+            debug!(
                 r#"OPAQUE login_finish denied for disabled user "{}""#,
                 &username
             );
@@ -701,7 +702,7 @@ impl OpaqueHandler for SqlOpaqueHandler {
             return Err(opaque::AuthenticationError::failed_proof().into());
         }
         if let Err(e) = verified {
-            warn!(r#"OPAQUE login attempt failed for "{}""#, &username);
+            debug!(r#"OPAQUE login attempt failed for "{}""#, &username);
             logging::record_as(
                 Some(&username),
                 LogKind::Login,
@@ -771,7 +772,7 @@ impl OpaqueHandler for SqlOpaqueHandler {
         self.start_registration(request, Some(start))
     }
 
-    #[instrument(skip_all, level = "debug", err)]
+    #[instrument(skip_all, level = "debug", err(level = "debug"))]
     async fn registration_claim(
         &self,
         request: &registration::ClientRegistrationFinishRequest,
@@ -808,6 +809,9 @@ mod networks_rows;
 
 #[cfg(test)]
 mod start_rows;
+
+#[cfg(test)]
+mod line_rows;
 
 #[cfg(test)]
 mod tests {

@@ -14,6 +14,7 @@ use lldap_domain_handlers::mfa::{
     mfa_requirement,
 };
 use lldap_domain_handlers::policies::resolve;
+use lldap_domain_handlers::warn_limited;
 use lldap_domain_model::{
     error::{DomainError, Result},
     model::{self, UserColumn},
@@ -146,7 +147,7 @@ impl TotpRejection {
 
     /// The database could not answer: refused, never judged from memory.
     fn unreadable(user_id: &UserId, e: DomainError) -> Self {
-        warn!("The TOTP state of {user_id} could not be read or written: {e}");
+        warn_limited!("The TOTP state of {user_id} could not be read or written: {e}");
         Self::Unreadable
     }
 }
@@ -261,7 +262,7 @@ impl SqlBackendHandler {
     /// At a door, an OU item that cannot be read refuses with the door's own row.
     pub(crate) async fn door_policy(&self, user_id: &UserId, kind: LogKind) -> Result<MfaPolicy> {
         self.user_mfa_policy(user_id).await.map_err(|e| {
-            warn!(r#"The OU policy of "{user_id}" could not be read for enable-mfa: {e}"#);
+            warn_limited!(r#"The OU policy of "{user_id}" could not be read for enable-mfa: {e}"#);
             let detail = format!("policy: {UNREADABLE}");
             logging::record_as(Some(user_id), kind, None, false, Some(&detail));
             invalid_credentials(user_id)

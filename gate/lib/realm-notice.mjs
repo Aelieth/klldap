@@ -238,7 +238,7 @@ async function adminPages() {
   row("details-switch", "SEEN", await syncSwitch());
 
   currentStep = "details-save";
-  await fill("input[name=display_name]", `${synced} saved`);
+  await fill("input[name=displayname]", `${synced} saved`);
   await click("Save changes");
   await waitFor(
     `!!document.querySelector(".alert-danger") || [...document.querySelectorAll(".alert-success")].some((a) => !a.closest("[hidden]"))`,

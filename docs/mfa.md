@@ -6,8 +6,8 @@ the `/auth/simple/login` endpoint scripts use, and LDAP simple bind. The secret 
 with a key derived from the server's private key and kept in the `totp_secret` /
 `mfa_type` columns that were always there; nothing happens until `enable_mfa` says so,
 server-wide or for an OU.
-Kerberos does not ask the code itself: a user who must give one gets a ticket only shortly
-after a sign-in with the code (below).
+At Kerberos a user who must give the code gets a ticket after a sign-in with the code, or by
+giving the code to kinit itself once they turn that on (below).
 
 ## Modes
 
@@ -86,6 +86,19 @@ one with `"enrollmentProof": true`, at `/auth/simple/login` or at
 `/auth/opaque/login/finish`, returns it as `enrollmentProof` in its answer. A replacement
 needs `currentCode` instead.
 
+### The code at kinit
+
+A user with a factor can turn on, for themselves alone, that kinit asks their code: the switch
+on the second-factor line of their own page ("kinit then asks your code after a short password
+ticket (kinit -l 5m, then kinit -T), for a client that can do it"), or
+`setCodeAtKinit(on: true)` on their own session. It is off by default. An administrator sees it
+(`codeAtKinit`, *Code at kinit: On/Off*); nobody but the user sets it, and it needs no code.
+Turning it on needs a factor and a value that is not `off`; turning it off always works.
+Removing or resetting the factor turns it off, so a new enrolment starts with it off; a
+replacement keeps it. Each change writes one `mfa_enroll` row, `code at kinit on` or `code at
+kinit off`; asked without a factor, the refusal row is `code at kinit: not enrolled`. How kinit
+then works is in [kerberos.md](kerberos.md#the-code-at-kinit).
+
 ## Logging in
 
 The web login asks for the password, then, when the account has a factor, for the code in
@@ -142,7 +155,9 @@ attempts fail with *Too many TOTP attempts* until the next step, right code or n
 failed verifications count, a replay costs nothing, and the counter is reached only after
 the password verified, so it cannot lock out someone whose password the attacker lacks.
 Both are kept in the database (the table `totp_steps`: one row per account and 30-second
-step, and no code), so every server on one database shares them and a restart keeps them.
+step, and no code), so every server on one database shares them and a restart keeps them. A
+code given at kinit is checked the same way, against the same rows: it is used once across
+every door and the KDC.
 A database that cannot answer refuses the code (`totp: unreadable`). Servers on one database
 need synchronised clocks, as for the enrollment proof: a step's row is kept for ten steps
 after its step, so the *already used* mark holds as long as the servers' clocks differ by
@@ -166,16 +181,19 @@ the flag the server refuses to start, as it does for passwords.
 
 ## Kerberos
 
-A user who must give a second factor at the directory's doors gets a Kerberos ticket only
-within a window (default 10 minutes, `kerberos_options.mfa_proof_window`) after a sign-in
-at a directory door with the password and a code, or after finishing an enrolment or a
-replacement. Without one, kinit is refused with error 12 and a text that says what to do.
-SSSD's Kerberos logins and Keycloak's Kerberos federation are kinit here. Services acting
-for users (S4U2Self, S4U2Proxy) are not asked, and a Kerberos password change does not
-touch the factor. Keep the accounts that bind to LDAP on behalf of other systems exempt.
-The details are in [kerberos.md](kerberos.md#a-second-factor-and-kinit). OTP
-pre-authentication (RFC 6560) is out of scope; a path that asks the code inside Kerberos in
-one exchange is planned.
+A user who must give a second factor at the directory's doors gets a Kerberos ticket in one
+of two ways. With the code at kinit turned on (above), `kinit -l 5m` with the password gives a
+five-minute ticket good only as armor, and `kinit -T` with that ticket and the code alone gives
+the real ticket, marked `mfa` (OTP pre-authentication, RFC 6560, inside FAST). Or, for every
+client, within a window (default 10 minutes, `kerberos_options.mfa_proof_window`; `"0"` opens
+none) after a sign-in at a directory door with the password and a code, or after finishing an
+enrolment or a replacement, kinit with the password alone gets a ticket. Otherwise kinit is
+refused with error 12 after the password, and a text that says what to do. SSSD's Kerberos
+logins and Keycloak's Kerberos federation are kinit with the password here: they use the window.
+A service asking a ticket for a user (S4U2Self, S4U2Proxy) is not asked, and a Kerberos
+password change does not touch the factor. Keep the accounts that bind to LDAP on behalf of
+other systems exempt. The details are in
+[kerberos.md](kerberos.md#a-second-factor-and-kinit).
 
 ## What is recorded
 
@@ -188,7 +206,9 @@ that makes no session adds `no session` (`no session` alone, `totp; no session`,
 `totp code required; no session`). Failures are
 `invalid totp`, `totp replayed`, `totp attempts exceeded`, `totp: unreadable` (the database
 could not answer), `totp re-enrollment required`
-(the sealed secret no longer opens) and `mfa enrollment required`. The challenge itself —
+(the sealed secret no longer opens) and `mfa enrollment required`. A code given at kinit
+writes the Kerberos `login` rows with `(OTP)` after their detail
+([kerberos.md](kerberos.md#the-code-at-kinit)). The challenge itself —
 password right, code missing — is the failure row `totp code required`. Enrollment and
 resets are `mfa_enroll` (`started`, `totp`, `replaced`, and the refusals, among them
 `password proof required` and `proof: unreadable`) and `mfa_reset` (`self`,
@@ -252,9 +272,19 @@ enrollment, a 90-second replay window, five attempts per step, issuer `KLLDAP` �
 - No recovery codes: recovery is an administrator, the password-reset e-mail, or the exempt
   group.
 - Inside the Kerberos window that a sign-in with the code opens, the password alone gets a
-  ticket. The KDC refuses before it checks the password, so anyone who can send it a
-  request for a user's name can see, without the password, whether that user needs a
-  second factor and whether they proved it within the window.
+  ticket. For a user who must give a factor and has none the KDC refuses before it checks
+  the password, so a request for that user's name shows, without the password, that they
+  must enrol.
+- At kinit's code prompt type the code alone. A client that sends the password with the
+  code (`password:code`) has sent the password to the KDC inside FAST: it is refused unread
+  and never logged, but it was sent.
+- The password proof behind a code at kinit may be as old as the user's oldest unexpired
+  ticket (`ticket_lifetime`), since any ticket of the user works as armor.
+- SSSD with `krb5_use_fast` armors with the host's keytab: it may ask the code of a user who
+  turned on the code at kinit, and the code is then refused. Leave the choice off for such
+  users.
+- A user who turned on the code at kinit and whose value later becomes `off`, or who becomes
+  exempt, gets a code prompt that refuses at an armored kinit until they turn it off.
 - Sessions and refresh tokens minted before an enrollment stay valid until they expire.
 - Administrators can exempt themselves through `lldap_mfa_disabled` — the deliberate
   break-glass, for the second factor only; the OU's other items still judge them.

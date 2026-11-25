@@ -470,7 +470,7 @@ KLLDAP answers each write to it:
 | `ktadd -norandkey` | Refused by kerber-rust itself: the keys are never read out. No log row is written. | ```Operation requires ``extract-keys'' privilege``` |
 | `modprinc -unlock` alone | Carried out by KLLDAP as the directory's unlock, in the change's own transaction: the user's lock is cleared, stamped with the server's clock (the unlock time kadmin sends is not read). Only the failure count, the unlock time and the modification stamp change on the principal. The keys and the password stay. | success |
 | `modprinc` with any other option | Refused | `Cannot change protected principal` |
-| `setstr`, `delstr`, `purgekeys` | Refused | `Cannot change protected principal` |
+| `setstr`, `delstr`, `purgekeys` | Refused. The one string KLLDAP writes there itself is `otp`, for a user who turned on the code at kinit ([A second factor and kinit](#a-second-factor-and-kinit)); `getstrs` shows it | `Cannot change protected principal` |
 | `delprinc`, `renprinc` | Refused | `Cannot change protected principal` |
 | `alias` onto the principal, or onto one of its aliases | Refused | `Cannot change protected principal` |
 | `renprinc` of one of its aliases | Refused | `Cannot change protected principal` |
@@ -518,63 +518,163 @@ Make these changes in the directory instead:
 
 A directory user who must give a second factor at the directory's doors (their resolved
 `enable_mfa` is `always`, or `enabled` and they are enrolled, and they are not in
-`lldap_mfa_disabled`; see [mfa.md](mfa.md#modes)) gets a ticket only within
-`mfa_proof_window` (default 10 minutes) after signing in at a directory door with the
-password and a code: an LDAP bind or `/auth/simple/login` with `password:code`, the web
-login with its code step, or the finish of an enrolment or of a replacement of the factor.
-Nothing else opens the window: not the password alone, a token refresh or a ticket. Every
-other user's kinit is unchanged, and nothing is read for them.
+`lldap_mfa_disabled`; see [mfa.md](mfa.md#modes)) gets a ticket in one of two ways:
+
+- **The code at kinit**, for a user who turned it on for themselves: two `kinit` commands,
+  the password and then the code, both inside Kerberos. Nothing is installed on the client.
+- **A window**, for every such user and every client: within `mfa_proof_window` (default 10
+  minutes) after a sign-in at a directory door with the password and a code (an LDAP bind
+  or `/auth/simple/login` with `password:code`, the web login with its code step, or the
+  finish of an enrolment or of a replacement of the factor), kinit with the password alone
+  gets a ticket. Nothing else opens the window: not the password alone, a token refresh, a
+  ticket, or a code given at kinit. `mfa_proof_window = "0"` opens none
+  ([Configuration](#configuration)).
+
+Every other user's kinit is unchanged, and nothing is read for them.
+
+### The code at kinit
+
+A user with a factor turns it on for themselves: the switch on the second-factor line of
+their own page, or `setCodeAtKinit(on: true)` on their own session. It is off by default.
+An administrator reads it (`codeAtKinit`); nobody else sets it. Removing or resetting the
+factor turns it off, so a new enrolment starts with it off; a replacement keeps it. Within
+a minute (the realm's status pass) the user's principal carries the string `otp`, which
+makes the KDC offer the code to an armored kinit of that user. With the stock MIT client:
 
 ```sh
-ldapwhoami -x -H ldap://ldap.example.com:3890 -D uid=alice,ou=people,dc=example,dc=com -W
-kinit alice
+kinit -l 5m -c FILE:/run/user/$UID/krb5-armor alice   # the password
+kinit -T FILE:/run/user/$UID/krb5-armor alice         # Enter OTP Token Value: the code alone
+kdestroy -c FILE:/run/user/$UID/krb5-armor
 ```
 
-At the prompt, type the password, a colon and the current code.
+- **The first ticket is armor only.** For such a user a password kinit that asks a
+  ticket-granting ticket of ten minutes or less by the KDC's clock (`-l 5m`) always gets a
+  ticket of five minutes that renews no further, inside a window too. It gets no service ticket and no
+  renewal: `kvno` and `kinit -R` are answered error 12 (`KDC policy rejects request`), window
+  or not. Its `login` row is a failure, `totp code required (armor ticket; <mechanism>)`: it
+  counts nothing toward the lockout, clears nothing and is no sign-in for `inactivity-days`.
+  A kinit that asks for more than ten minutes, or for a service, is judged as in
+  [The password at kinit](#the-password-at-kinit). The server refuses to start with a
+  `ticket_lifetime` of ten minutes or less, so that no ticket of full life has that shape.
+- **The second ticket** carries the authentication indicator `mfa`. Its renewals and service
+  tickets need no window for its whole life. Its row is `ticket issued (OTP)`: the lockout
+  count is cleared and the sign-in counts for `inactivity-days`. A code at kinit opens no
+  window.
+- **Only six digits are read.** Type the code alone at the prompt, never `password:code`. A
+  value that is not exactly six ASCII digits is refused before anything else is read: it is
+  not tested, not counted and not logged, and its memory is wiped. Its row says `no
+  six-digit code (OTP)` and nothing of the value. A client that sends the password with the
+  code has still sent the password to the KDC, inside FAST; the KDC never asks for it.
+- **The code is the doors' code:** the same five attempts per 30-second step and the same
+  used-once mark (`totp_steps`), on every server of the database. A code taken at kinit is
+  refused at a door, and the reverse.
+- **The armor must be the user's own ticket.** A ticket of another user, a host keytab's
+  ticket (SSSD with `krb5_use_fast`), an anonymous ticket or one of another realm is
+  refused, the code not looked at, and the row names the armor's client.
+- **A change of the factor ends the code's tickets.** A ticket with `mfa` issued before the
+  user's factor last changed (enrolled, replaced, removed or reset, by anyone) is refused at
+  its next service ticket or renewal, error 12, with an `access_denied` row `policy:
+  enable-mfa (factor changed since the code)`. A change in the same second as the ticket
+  cannot be told apart. Another server learns of the change at its next read of the user (at
+  most about 30 seconds).
+- **Every refusal of the code looks the same to the client:** `kinit: Preauthentication
+  failed`. The `login` row says why:
 
-- **The refusal:** without a fresh proof the KDC answers error 12 (KDC policy rejects
-  request) with the text "second factor needed: sign in to the directory with your code
-  (enrol there first if you have none), then run kinit again", before it looks at the
-  password. It writes one `login` row, `policy: enable-mfa (no fresh proof)`, and counts
-  nothing toward the lockout. A locked user is refused as locked first. kinit prints only
-  the code's message, `KDC policy rejects request`, and its trace (`KRB5_TRACE`) only the
-  code: the text travels in the KDC's answer, for a client that shows it, and the server's
-  log row names the reason.
-- **Tickets:** a ticket issued under a proof is an ordinary ticket. Its renewals,
-  validations and service tickets are judged by the time it was issued, which must lie in
-  a window, so they go on after the window ends. A ticket issued before the requirement
-  applied to the user (an enrolment, a policy change, the upgrade) is refused at its next
-  renewal or service ticket, with the same code and text and an `access_denied` row. A
-  postdated ticket is judged by the time it was issued like any other, and is refused once
-  its window is no longer kept (the longer of the ticket and renewable lifetimes, plus an
-  hour).
-- **Services acting for users** (S4U2Self, S4U2Proxy) are not asked: the user is not there
-  to give a code.
+| Case | Row detail | Lockout |
+|---|---|---|
+| A wrong code | `invalid totp (OTP)` | one failure |
+| A code used before, at kinit or at a door | `totp replayed (OTP)` | nothing |
+| The step's five attempts spent | `totp attempts exceeded (OTP)` | nothing |
+| The armor is not the user's own ticket | `armor is not the user's own ticket: <armor client> (OTP)` | nothing; the code is not looked at |
+| Not six ASCII digits | `no six-digit code (OTP)` | nothing; the value is not read |
+| No code asked of the user (`off`, exempt, no factor, the choice turned off) | `no second factor asked (OTP)` | nothing |
+| The database did not answer within 2 seconds | `totp: unreadable (OTP)` | nothing |
+| Past the KDC's 5 seconds, or its queue full | `pre-authentication not completed (OTP)` | nothing |
+
+A locked user is refused as locked (error 18, a `locked out` row) before any code is looked
+at.
+
+### The password at kinit
+
+For a user with a factor the KDC judges the second factor after the password; until 0.8.1 it
+judged it before.
+
+- A wrong password is `Password incorrect` (error 24), row `pre-authentication failed
+  (<mechanism>)`, and it counts toward the lockout.
+- The right password with no window and no short ask is error 12 (`KDC policy rejects
+  request`), row `policy: enable-mfa (no fresh proof)`, counted nowhere. For a user who
+  turned on the code at kinit its text says both ways: "second factor needed: get a short
+  ticket with kinit -l 5m, then give your code with kinit -T, or sign in to the directory
+  with your code, then run kinit again". For the others it says "second factor needed: sign
+  in to the directory with your code (enrol there first if you have none), then run kinit
+  again". kinit prints only the code's message, `KDC policy rejects request`, and its trace
+  (`KRB5_TRACE`) only the code: the text travels in the KDC's answer, for a client that shows
+  it.
+- Inside a window the password alone gets a ticket, as before, for a user who takes the code
+  at kinit too (whose short ask is still armor).
+- A user who must give a factor and has none (`always`, not enrolled) is refused before the
+  password, as before, with the second text.
+
+So for a user with a factor an answer tells a right password from a wrong one, as it does
+for every user without one, and a request with no password does not show whether the user
+needs a factor. An armored request still shows the code offered to a user who turned on the
+code at kinit. For a user who must enrol first, the refusal comes before the password check
+and each one writes its `login` row.
+
+### Tickets and windows
+
+- **Tickets:** renewals, validations, service tickets and user-to-user of a ticket without
+  `mfa` are judged by the time the ticket was issued, which must lie in a window, so they go
+  on after the window ends; user-to-user is judged on the asking user's own ticket. A ticket
+  issued before the requirement applied to the user (an enrolment, a policy change, the
+  upgrade) is refused at its next renewal or service ticket, with the same code and text and
+  an `access_denied` row. A postdated ticket is judged by the time it was issued like any
+  other, and is refused once its window is no longer kept (the longer of the ticket and
+  renewable lifetimes, plus an hour).
+- **Services acting for users:** a service that asks a ticket for a user (S4U2Self,
+  S4U2Proxy) is not asked: the user is not there to give a code. A request made with a
+  directory user's own ticket is judged as the ticket's renewals are.
 - **The window is a stated limit:** inside it, the password alone gets a ticket.
-- **What a request shows:** the refusal comes before the password check, so anyone who
-  can send the KDC a request for a user's name can see, without the password, whether
-  that user needs a second factor and whether they proved it within the window: such a
-  user is answered error 12 outside a window. Each refusal writes its `login` row.
-- **The address:** with `mfa_proof_same_address = true` the kinit must come from the
-  address the code was given from, the one on that sign-in's log row. An IPv4 address
-  seen over IPv6 (`::ffff:192.0.2.7`) counts as the IPv4 address.
-- **Clocks:** a window is stamped by the directory server's clock and judged by the
-  KDC's. A proof stamped up to 60 seconds ahead of the KDC's clock still opens its window,
-  and nothing is allowed at its end. Keep the servers' clocks synchronised.
-- **Servers:** the windows are kept in the database (`mfa_windows`), shared by every
-  server. Another server learns of a proof at its next read of the policy cache (about every 30
+- **The address:** with `mfa_proof_same_address = true` the kinit must come from the address
+  the code was given from, the one on that sign-in's log row. An IPv4 address seen over IPv6
+  (`::ffff:192.0.2.7`) counts as the IPv4 address. A short ask from another address inside
+  the window is still armor, and armor never passes without the code.
+- **Clocks:** a window is stamped by the directory server's clock and judged by the KDC's. A
+  proof stamped up to 60 seconds ahead of the KDC's clock still opens its window, and nothing
+  is allowed at its end. Keep the servers' clocks synchronised.
+- **Servers:** the windows are kept in the database (`mfa_windows`), shared by every server.
+  Another server learns of a proof at its next read of the policy cache (about every 30
   seconds), and at once after a refusal there reads that user again, factor, group and
   windows (at most once a second): the next kinit passes.
-- **A proof belongs to its factor:** resetting or removing a user's factor ends their
-  windows at once, and a replacement ends the old ones and opens its own. A password change
-  leaves them.
-- **Retention:** a window is kept for the longer of `ticket_lifetime` and `renew_lifetime`
-  in force when it is pruned, and an hour more. Raising either later does not bring pruned
+- **A proof belongs to its factor:** resetting or removing a user's factor ends their windows
+  at once, and a replacement ends the old ones and opens its own. A password change leaves
+  them.
+- **Retention:** a window is kept for the longer of `ticket_lifetime` and `renew_lifetime` in
+  force when it is pruned, and an hour more. Raising either later does not bring pruned
   windows back.
 - **Failures:** a proof that cannot be stored leaves the sign-in standing, and its row says
-  `proof not stored`. While the second factor's settings cannot be read, a user known to
-  need a proof is refused, and every other user gets today's kinit.
-- **Later:** a path that asks the code inside Kerberos itself, in one exchange, is planned.
+  `proof not stored`. While the second factor's settings cannot be read, a user known to need
+  a proof is refused, and every other user gets today's kinit.
+
+### Stated limits of the code at kinit
+
+- **The armor's age:** any unexpired ticket of the user works as armor, so the password proof
+  behind a code may be as old as `ticket_lifetime` (24 hours by default), not five minutes.
+- **S4U2Self and user-to-user:** the KDC hands the policy no indicators for an S4U2Self
+  request, so a ticket with `mfa` gets an S4U2Self ticket only inside a window; and for
+  user-to-user it hands the second ticket's, so user-to-user is judged by the window and the
+  asking ticket's shape, not by its `mfa`.
+- **Clients not tested:** only MIT's `kinit` in the image runs the two commands in the gate.
+  Windows, Heimdal, macOS, Java (Keycloak's Kerberos password login among them), pam_krb5 and
+  SSSD's own login are not tested; for them the window is the way. SSSD with
+  `krb5_use_fast` armors with the host's keytab: for a user who turned on the code at kinit
+  it may ask the code, which is then refused (not the user's own armor). Leave the code at
+  kinit off for a user who signs in through such a client.
+- **The offer:** the `otp` string follows the user's choice within the status pass (60
+  seconds). It only switches the offer: the KDC trusts nothing from it and judges the factor,
+  the value and the choice from memory each time. A user whose value later becomes `off`, or
+  who becomes exempt, keeps the string until they turn the choice off, and an armored kinit
+  then gets a code prompt that refuses (`no second factor asked`).
 
 ## Inactivity and kinit
 
@@ -658,7 +758,8 @@ then gets a ticket only with the code at kinit, which they turn on for themselve
 `ticket_lifetime` and `renew_lifetime` take a Kerberos duration (`24h`, `7d`,
 `36000s`) or a bare number of seconds (`36000`), quoted or not, in the file or
 the environment. Zero and a negative are refused: to the KDC a zero ticket life
-means no limit. `renew_lifetime` is also the KDC's longest renewable life. A
+means no limit. A `ticket_lifetime` of ten minutes or less is refused too: that is the armor
+ticket of the code at kinit. `renew_lifetime` is also the KDC's longest renewable life. A
 principal keeps the ticket life it was created with. At every start the server
 brings krbtgt and the users to the configured lives. The Keycloak HTTP
 principal, `admin/admin` and the kadmin services keep theirs, so a raised

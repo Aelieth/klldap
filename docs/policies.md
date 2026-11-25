@@ -32,8 +32,12 @@ judged again. Last, on a server whose realm did not open and which is admin-only
 of `lldap_admin` are let in; a directory-only server lets everyone in
 ([kerberos.md](kerberos.md#when-the-realm-cannot-open)). At the web login the items are judged in
 the same order when the sign-in starts, and a refused user's sign-in fails as a wrong password's
-does. At Kerberos every item is judged before the password (error 18), then the second factor's
-window (error 12). A refusal by an item neither counts toward the lockout nor clears its count.
+does. At Kerberos every item is judged before the password (error 18). A user who must give a
+second factor and has none is refused next, still before the password (error 12). For a user with
+a factor the password comes next (a wrong one counts toward the lockout), then the second factor:
+the code given at kinit, a short ask that gets an armor ticket, or a window, else error 12
+([kerberos.md](kerberos.md#the-password-at-kinit)). A refusal by an item neither counts toward
+the lockout nor clears its count.
 
 ## Using it
 
@@ -110,7 +114,7 @@ directory's doors follow the user's value:
 | LDAP bind, `/auth/simple/login` | `password:code` | refused, *MFA enrollment required* |
 | Web login | the code step | admitted only to enroll (`mfaEnrollmentRequired`) |
 | Token refresh and use | as the session was made ([mfa.md](mfa.md#modes)) | confined to reading their own user and enrolling |
-| kinit, renewals, service tickets | a ticket within `mfa_proof_window` of a sign-in with the code ([kerberos.md](kerberos.md#a-second-factor-and-kinit)) | refused (error 12) until the user enrols, which opens the window |
+| kinit, renewals, service tickets | the code at kinit (`kinit -l 5m`, then `kinit -T`) for a user who turned it on, or a ticket within `mfa_proof_window` of a sign-in with the code ([kerberos.md](kerberos.md#a-second-factor-and-kinit)); judged after the password | refused (error 12) before the password until the user enrols, which opens the window |
 
 A user whose value is `off` gives no code and cannot enroll (*MFA is disabled for this
 user*); one whose value is `always` cannot reset their own factor. Where the server-wide

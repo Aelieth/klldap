@@ -237,7 +237,8 @@ key_seed = "RanD0m STR1ng"
 #realm = "EXAMPLE.COM"
 ## Ticket lifetimes take a Kerberos duration ("24h", "7d", "36000s") or a
 ## bare number of seconds ("36000"), quoted or not, in the file or the
-## environment. Zero and a negative are refused.
+## environment. Zero and a negative are refused, and a ticket_lifetime of ten minutes
+## or less (the armor ticket of the code at kinit).
 #ticket_lifetime = "24h"
 #renew_lifetime = "7d"
 ## Issue forwardable tickets.

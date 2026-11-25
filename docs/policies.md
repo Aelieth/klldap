@@ -231,7 +231,10 @@ ones this server had not written yet.
 
 Under a threshold, each count is written before the door answers, and the door waits at most
 250 ms for that write in all. When the database takes longer, the door answers anyway and the
-count is owed: it is tried again about a second later, and a crash before then loses it. Other
+count is owed: it is tried again about a second later, and a crash before then loses it. After
+one such wait the KDC stops waiting: until a count's write, a door's or the background
+writer's, lands within 250 ms again, it answers at once and each count it takes is owed in the
+same way. The directory doors wait every time. Other
 counts are owed and written within about a second: those of a user with no threshold, and a
 web start's +1 once its 10 seconds are over. Each write carries the user's state as it stands
 (the count, the last failure, the lock), so a late or repeated write never counts twice; a
@@ -244,8 +247,14 @@ what the doors judge with while the server runs; a door about to refuse a locked
 reads that user's stored row, at most once a second. A clean stop writes what is owed, every
 start still held included, within a second, so a sign-in in progress at that moment counts once
 (the user's next sign-in clears it). A crash or a power cut loses what is still owed: the
-last second or so of counts, a count whose write took longer than 250 ms, and up to the last
-10 seconds of web starts.
+last second or so of counts, a count whose write took longer than 250 ms or that the KDC took
+while the database was not keeping that bound, and up to the last 10 seconds of web starts.
+
+A bind that gets none of the server's four key-stretching slots within 2 seconds, or finds 32
+binds already waiting for one, is answered busy (LDAP result 51, HTTP 503) with one failed
+`bind` row, `server busy`; it counts as no failure. A name that is no user is remembered as
+such for 5 seconds on the server that read it: a user created on another server within those
+seconds of a sign-in attempt for its name is answered `unknown user` there until they pass.
 
 With several servers on one database (only with Kerberos disabled), each server counts the
 attempts it sees exactly, the servers agree within 30 seconds, and a guesser who spreads the

@@ -730,7 +730,10 @@ A directory user's failed Kerberos sign-ins are counted in the directory's one t
 one counter for LDAP bind, the web, `/auth/simple/login` and kinit. Under a threshold the KDC
 waits at most 250 ms for a failure's write before it answers: a write that lands in that time
 survives a kill, and one that takes longer is owed, tried again about a second later, and lost
-if the server is killed first. A locked user gets error 18 (`CLIENT_REVOKED`) before the KDC
+if the server is killed first. After a wait that ran out, the KDC does not wait for the
+following writes: those counts are owed too, until a count's write lands within 250 ms again.
+The sign-in time an issued ticket records for `inactivity-days` follows the same rule on its
+own. A locked user gets error 18 (`CLIENT_REVOKED`) before the KDC
 looks at any password, and so does a renewal or a service ticket asked with a ticket issued
 before the lock; kinit prints "Client's credentials have been revoked". That is not the
 wrong-password answer (24), and anyone can ask for it without a password, so a lock is

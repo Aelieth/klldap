@@ -8,7 +8,7 @@ use crate::{
             static_value::StaticValue,
             submit::Submit,
         },
-        kerberos_switch::{KerberosSwitch, prepare_kerberos_update},
+        kerberos_switch::{KerberosSwitch, prepare_kerberos_update, sync_locked},
         user_details::{Attribute, AttributeSchema, User},
     },
     infra::{
@@ -43,6 +43,7 @@ pub struct UserDetailsForm {
     original_kerberossync_enabled: bool,
     show_kerberos_banner: bool,
     kerberos_enabled: Option<bool>,
+    sync_locked: bool,
 }
 
 pub enum Msg {
@@ -87,7 +88,9 @@ impl CommonComponent<UserDetailsForm> for UserDetailsForm {
                 Ok(true)
             }
             Msg::KerberosInfoResponse(info) => {
-                let enabled = info.map(|data| data.kerberos_info.enabled);
+                let info = info.map(|data| data.kerberos_info);
+                self.sync_locked = info.as_ref().is_ok_and(|info| sync_locked(&info.state));
+                let enabled = info.map(|info| info.enabled);
                 self.kerberos_enabled = Some(enabled.unwrap_or(true));
                 Ok(true)
             }
@@ -116,6 +119,7 @@ impl Component for UserDetailsForm {
             original_kerberossync_enabled: kerberossync_enabled,
             show_kerberos_banner: false,
             kerberos_enabled: None,
+            sync_locked: false,
         }
     }
 
@@ -175,6 +179,7 @@ impl Component for UserDetailsForm {
                     show_banner={self.show_kerberos_banner}
                     username={Some(self.user.id.clone())}
                     kerberos_disabled={self.kerberos_enabled == Some(false)}
+                    locked={self.sync_locked}
                     />
                 }
             } else { html! {} }}

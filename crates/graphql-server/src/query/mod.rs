@@ -27,7 +27,7 @@ use lldap_domain::types::{GroupId, UserId};
 use lldap_domain_handlers::handler::{
     BackendHandler, PosixBackendHandler, ReadSchemaBackendHandler, SystemConfigBackendHandler,
 };
-use lldap_domain_handlers::kerberos::kerberos_backend;
+use lldap_domain_handlers::kerberos::{kerberos_backend, realm_health};
 use lldap_domain_handlers::logging::current_request;
 use lldap_keycloak::{KeycloakConfig, SUGGESTED_HOSTNAME};
 use lldap_opaque_handler::OpaqueHandler;
@@ -45,6 +45,10 @@ pub struct Query<Handler: FullHandler + OpaqueHandler> {
 pub struct KerberosInfo {
     pub public_key_der_base64: Option<String>,
     pub enabled: bool,
+    /// The realm's state, in the words of /health.
+    pub state: String,
+    /// Why the realm is in that state, in full; answered to admins only.
+    pub cause: Option<String>,
 }
 
 #[derive(GraphQLObject)]
@@ -217,10 +221,14 @@ impl<Handler: FullHandler + OpaqueHandler> Query<Handler> {
         self.get_schema(context, span).await.map(Into::into)
     }
 
-    fn kerberos_info(&self, _context: &Context<Handler>) -> FieldResult<KerberosInfo> {
+    fn kerberos_info(&self, context: &Context<Handler>) -> FieldResult<KerberosInfo> {
+        let health = realm_health();
+        let admin = context.get_admin_handler().is_some();
         Ok(KerberosInfo {
             public_key_der_base64: Some(public_key_der_base64()),
             enabled: kerberos_backend().enabled(),
+            state: health.word().to_owned(),
+            cause: health.cause().filter(|_| admin).map(str::to_owned),
         })
     }
 
@@ -1553,39 +1561,67 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn kerberos_info_says_whether_the_configuration_enables_kerberos() {
+    async fn kerberos_info_names_the_state_to_everyone_and_the_cause_to_admins_only() {
+        use Permission::{Admin, Regular};
         use lldap_domain_handlers::kerberos::{
-            DegradedKerberos, KerberosSync, NoopKerberos, set_kerberos_backend,
+            DegradedKerberos, DegradedMode, KerberosSync, NoopKerberos, set_kerberos_backend,
         };
-        const QUERY: &str = r#"{ kerberosInfo { enabled } }"#;
+        use lldap_test_utils::recording_kerberos::RecordingKerberos;
+        const QUERY: &str = r#"{ kerberosInfo { enabled state cause } }"#;
         let schema = schema(Query::<MockTestBackendHandler>::new());
-        let context = Context::<MockTestBackendHandler>::new_for_tests(
-            MockTestBackendHandler::new(),
-            ValidationResults {
-                user: UserId::new("admin"),
-                permission: Permission::Admin,
-            },
-        );
+        let context = |permission, enrollment_pending| {
+            let user = UserId::new("ann");
+            let actor = ValidationResults { user, permission };
+            let mut context = Context::new_for_tests(MockTestBackendHandler::new(), actor);
+            context.mfa_enrollment_pending = enrollment_pending;
+            context
+        };
         let realm = || "EXAMPLE.COM".to_owned();
-        let rows: [(Arc<dyn KerberosSync>, bool); 2] = [
-            (Arc::new(NoopKerberos::new(realm())), false),
+        let closed = |mode| -> Arc<dyn KerberosSync> {
+            Arc::new(DegradedKerberos::with_mode(realm(), "down".into(), mode))
+        };
+        let everyone = || closed(DegradedMode::DirectoryOnly);
+        type Row = (
+            Arc<dyn KerberosSync>,
+            (Permission, bool),
+            (bool, &'static str, Option<&'static str>),
+        );
+        let rows: [Row; 6] = [
             (
-                Arc::new(DegradedKerberos::new(realm(), "down".into())),
-                true,
+                Arc::new(NoopKerberos::new(realm())),
+                (Admin, false),
+                (false, "disabled", None),
             ),
+            (
+                RecordingKerberos::new(),
+                (Admin, false),
+                (true, "ready", None),
+            ),
+            (
+                closed(DegradedMode::AdminOnly),
+                (Admin, false),
+                (true, "admin-only", Some("down")),
+            ),
+            (
+                everyone(),
+                (Admin, false),
+                (true, "directory-only", Some("down")),
+            ),
+            (everyone(), (Regular, false), (true, "directory-only", None)),
+            (everyone(), (Admin, true), (true, "directory-only", None)),
         ];
-        let mut got = Vec::new();
-        for (backend, _) in &rows {
-            set_kerberos_backend(backend.clone());
+        for (backend, (permission, enrollment_pending), (enabled, state, cause)) in rows {
+            set_kerberos_backend(backend);
+            let context = context(permission, enrollment_pending);
             let answer = execute(QUERY, None, &schema, &Variables::new(), &context).await;
-            got.push(answer.ok().map(|(value, errors)| (value, errors.len())));
+            set_kerberos_backend(Arc::new(NoopKerberos::default()));
+            let got = answer.ok().map(|(value, errors)| (value, errors.len()));
+            let want = graphql_value!({
+                "kerberosInfo": {"enabled": enabled, "state": state, "cause": cause}
+            });
+            let row = format!("{state}, {permission:?}, enrollment pending {enrollment_pending}");
+            assert_eq!(got, Some((want, 0)), "{row}");
         }
-        set_kerberos_backend(Arc::new(NoopKerberos::default()));
-        let want: Vec<_> = rows
-            .iter()
-            .map(|&(_, enabled)| Some((graphql_value!({"kerberosInfo": {"enabled": enabled}}), 0)))
-            .collect();
-        assert_eq!(got, want);
     }
 
     #[tokio::test]

@@ -1,5 +1,7 @@
 query GetKerberosInfo {
   kerberosInfo {
     enabled
+    state
+    cause
   }
 }

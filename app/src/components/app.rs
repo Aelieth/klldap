@@ -10,6 +10,7 @@ use crate::{
         group_details::GroupDetails,
         group_schema_table::ListGroupSchema,
         group_table::GroupTable,
+        kerberos_notice::KerberosNotice,
         login::LoginForm,
         policy_workbench::PolicyWorkbench,
         register_mfa::RegisterMfa,
@@ -181,6 +182,7 @@ impl Component for App {
         html! {
           <div>
             <Banner is_admin={is_admin} username={username} on_logged_out={link.callback(|_| Msg::Logout)} />
+            { if is_admin { html! { <KerberosNotice /> } } else { html! {} } }
             <div class="container py-3">
               <div class="row justify-content-center app-content">
                 <main class="py-3">

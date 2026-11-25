@@ -13,7 +13,7 @@ use crate::{
             field::Field,
             submit::Submit,
         },
-        kerberos_switch::KerberosSwitch,
+        kerberos_switch::{KerberosSwitch, sync_locked},
         ou_selector::OuSelector,
         router::AppRoute,
     },
@@ -75,6 +75,7 @@ pub struct CreateUserForm {
     opaque_data: Option<opaque::client::registration::ClientRegistration>,
     kerberossync_enabled: bool,
     kerberos_enabled: Option<bool>,
+    sync_locked: bool,
     selected_ou: String,
     ous: Vec<String>,
     // POSIX auto-assign flags
@@ -148,7 +149,9 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
                 Ok(true)
             }
             Msg::KerberosInfoResponse(info) => {
-                let enabled = info.map(|data| data.kerberos_info.enabled);
+                let info = info.map(|data| data.kerberos_info);
+                self.sync_locked = info.as_ref().is_ok_and(|info| sync_locked(&info.state));
+                let enabled = info.map(|info| info.enabled);
                 self.kerberos_enabled = Some(enabled.unwrap_or(true));
                 Ok(true)
             }
@@ -166,7 +169,11 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
                 }
 
                 let model = self.form.model();
-                let sync = sent_sync(self.kerberos_enabled, self.kerberossync_enabled);
+                let sync = sent_sync(
+                    self.kerberos_enabled,
+                    self.sync_locked,
+                    self.kerberossync_enabled,
+                );
                 if sync == Some(true) {
                     check_kerberos_envelope(&model.password)?;
                 }
@@ -305,6 +312,7 @@ impl Component for CreateUserForm {
             opaque_data: None,
             kerberossync_enabled: true,
             kerberos_enabled: None,
+            sync_locked: false,
             selected_ou: "people".to_string(),
             ous: vec!["people".to_string()],
             posix_config_loaded: false,
@@ -357,9 +365,10 @@ impl Component for CreateUserForm {
                 { if self.kerberos_enabled == Some(true) {
                     html! {
                         <KerberosSwitch
-                        enabled={self.kerberossync_enabled}
+                        enabled={self.kerberossync_enabled && !self.sync_locked}
                         on_toggle={link.callback(Msg::ToggleKerberosSync)}
                         show_banner={false}
+                        locked={self.sync_locked}
                         />
                     }
                 } else { html! {} }}
@@ -443,8 +452,9 @@ fn password_may_be_unset(user_id: &str, cause: &str) -> anyhow::Error {
     )
 }
 
-fn sent_sync(kerberos_enabled: Option<bool>, switch: bool) -> Option<bool> {
-    (kerberos_enabled != Some(false)).then_some(switch)
+/// A locked switch shows Off, and a user is created without sync.
+fn sent_sync(kerberos_enabled: Option<bool>, locked: bool, switch: bool) -> Option<bool> {
+    (kerberos_enabled != Some(false)).then_some(switch && !locked)
 }
 
 fn create_attributes(
@@ -574,14 +584,15 @@ mod tests {
             ]
         };
         let rows = [
-            (Some(true), true, Some("1")),
-            (Some(true), false, Some("0")),
-            (Some(false), true, None),
-            (Some(false), false, None),
-            (None, true, Some("1")),
+            (Some(true), false, true, Some("1")),
+            (Some(true), false, false, Some("0")),
+            (Some(false), false, true, None),
+            (Some(false), false, false, None),
+            (None, false, true, Some("1")),
+            (Some(true), true, true, Some("0")),
         ];
-        for (kerberos, switch, sent) in rows {
-            let sync = sent_sync(kerberos, switch);
+        for (kerberos, locked, switch, sent) in rows {
+            let sync = sent_sync(kerberos, locked, switch);
             let attributes = create_attributes(form(), "people", sync);
             let got: Vec<_> = attributes
                 .iter()
@@ -592,7 +603,10 @@ mod tests {
                 ("ou", "people".to_owned()),
             ];
             want.extend(sent.map(|value| ("kerberossync", value.to_owned())));
-            assert_eq!(got, want, "Kerberos {kerberos:?}, switch {switch}");
+            assert_eq!(
+                got, want,
+                "Kerberos {kerberos:?}, locked {locked}, switch {switch}"
+            );
         }
     }
 }

@@ -11,6 +11,28 @@ pub struct KerberosSwitchProps {
     pub username: Option<String>,
     #[prop_or_default]
     pub kerberos_disabled: bool,
+    #[prop_or_default]
+    pub locked: bool,
+}
+
+pub const SYNC_LOCKED: &str =
+    "The Kerberos realm is not ready: Kerberos sync cannot be changed until it is.";
+
+/// Only a ready realm takes a sync change; with Kerberos disabled the switch still turns sync off.
+pub fn sync_locked(state: &str) -> bool {
+    !matches!(state, "ready" | "disabled")
+}
+
+fn sync_hint(locked: bool, kerberos_disabled: bool) -> &'static str {
+    match (locked, kerberos_disabled) {
+        (true, _) => SYNC_LOCKED,
+        (false, true) => {
+            "Kerberos is disabled: OFF turns sync off; the next start with Kerberos removes the principal."
+        }
+        (false, false) => {
+            "ON = sync principal on next password change. OFF = delete principal immediately."
+        }
+    }
 }
 
 #[function_component(KerberosSwitch)]
@@ -33,22 +55,20 @@ pub fn kerberos_switch(props: &KerberosSwitchProps) -> Html {
                     <button
                         type="button"
                         class={classes!("btn", "btn-outline-primary", if props.enabled { "active" } else { "" })}
+                        disabled={props.locked}
                         onclick={props.on_toggle.reform(|_| true)}>
                         {"On"}
                     </button>
                     <button
                         type="button"
                         class={classes!("btn", "btn-outline-secondary", if !props.enabled { "active" } else { "" })}
+                        disabled={props.locked}
                         onclick={props.on_toggle.reform(|_| false)}>
                         {"Off"}
                     </button>
                 </div>
                 <div class="form-text text-muted ms-3">
-                    { if props.kerberos_disabled {
-                        "Kerberos is disabled: OFF turns sync off; the next start with Kerberos removes the principal."
-                    } else {
-                        "ON = sync principal on next password change. OFF = delete principal immediately."
-                    } }
+                    { sync_hint(props.locked, props.kerberos_disabled) }
                 </div>
             </div>
 
@@ -86,4 +106,25 @@ pub fn prepare_kerberos_update(
     }
 
     (to_insert, to_remove)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_only_a_ready_realm_takes_a_sync_change_and_a_disabled_one_still_turns_sync_off() {
+        let rows = [
+            ("ready", false),
+            ("disabled", false),
+            ("directory-only", true),
+            ("admin-only", true),
+            ("unsettled", true),
+            ("lost", true),
+        ];
+        for (state, locked) in rows {
+            assert_eq!(sync_locked(state), locked, "{state}");
+            assert_eq!(sync_hint(locked, false) == SYNC_LOCKED, locked, "{state}");
+        }
+    }
 }

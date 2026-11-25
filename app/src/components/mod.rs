@@ -22,6 +22,7 @@ pub mod group_details;
 pub mod group_details_form;
 pub mod group_schema_table;
 pub mod group_table;
+pub mod kerberos_notice;
 pub mod kerberos_switch;
 pub mod keycloak_settings;
 pub mod login;

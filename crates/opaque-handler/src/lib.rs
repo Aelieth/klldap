@@ -1,26 +1,25 @@
 #![forbid(unsafe_code)]
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use lldap_domain::types::{LoginOutcome, UserId};
 use lldap_domain_model::error::{DomainError, Result};
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::task::JoinError;
 
 use lldap_auth::opaque;
 pub use lldap_auth::{login, registration};
 
 pub const STRETCH_FAILED: &str = "OPAQUE key stretching did not complete";
+pub const STRETCH_BUSY: &str = "too many sign-ins are waiting for key stretching; try again";
 
 static STRETCH: LazyLock<Arc<Semaphore>> = LazyLock::new(|| Arc::new(Semaphore::new(4)));
 
-async fn stretch_on<T: Send + 'static>(
-    permits: Arc<Semaphore>,
+async fn run_with<T: Send + 'static>(
+    permit: OwnedSemaphorePermit,
     work: impl FnOnce() -> T + Send + 'static,
-) -> std::result::Result<T, tokio::task::JoinError> {
-    let permit = permits
-        .acquire_owned()
-        .await
-        .expect("the stretch semaphore is not closed");
+) -> std::result::Result<T, JoinError> {
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
         work()
@@ -28,10 +27,65 @@ async fn stretch_on<T: Send + 'static>(
     .await
 }
 
+async fn stretch_on<T: Send + 'static>(
+    permits: Arc<Semaphore>,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> std::result::Result<T, JoinError> {
+    let permit = permits
+        .acquire_owned()
+        .await
+        .expect("the stretch semaphore is not closed");
+    run_with(permit, work).await
+}
+
 pub async fn stretch<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
-) -> std::result::Result<T, tokio::task::JoinError> {
+) -> std::result::Result<T, JoinError> {
     stretch_on(Arc::clone(&STRETCH), work).await
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StretchError {
+    /// No place to wait was free, or no permit came within the wait: the work never started.
+    Busy,
+    Failed,
+}
+
+pub struct StretchGate {
+    permits: Arc<Semaphore>,
+    waiting: Semaphore,
+    wait: Duration,
+}
+
+impl StretchGate {
+    pub fn new(waiters: usize, wait: Duration) -> Self {
+        Self::on(Arc::clone(&STRETCH), waiters, wait)
+    }
+
+    pub fn on(permits: Arc<Semaphore>, waiters: usize, wait: Duration) -> Self {
+        Self {
+            permits,
+            waiting: Semaphore::new(waiters),
+            wait,
+        }
+    }
+
+    pub async fn stretch<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> std::result::Result<T, StretchError> {
+        let Ok(place) = self.waiting.try_acquire() else {
+            return Err(StretchError::Busy);
+        };
+        let permit = Arc::clone(&self.permits).acquire_owned();
+        let permit = tokio::time::timeout(self.wait, permit).await;
+        drop(place);
+        let Ok(Ok(permit)) = permit else {
+            return Err(StretchError::Busy);
+        };
+        let done = run_with(permit, work).await;
+        done.map_err(|_| StretchError::Failed)
+    }
 }
 
 #[async_trait]
@@ -210,5 +264,63 @@ mod tests {
         })
         .await
         .expect("permit returned");
+    }
+
+    fn with_no_permit(waiters: usize, wait: Duration) -> StretchGate {
+        StretchGate::on(Arc::new(Semaphore::new(0)), waiters, wait)
+    }
+
+    #[tokio::test]
+    async fn the_waiter_past_the_last_place_is_turned_away_at_once() {
+        let gate = Arc::new(with_no_permit(32, Duration::from_secs(60)));
+        let mut waiting = Vec::new();
+        for _ in 0..32 {
+            let gate = Arc::clone(&gate);
+            waiting.push(tokio::spawn(async move { gate.stretch(|| ()).await }));
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while gate.waiting.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("thirty-two wait");
+        let asked = std::time::Instant::now();
+        let turned_away = gate.stretch(|| ()).await;
+        let at_once = asked.elapsed() < Duration::from_secs(1);
+        waiting.iter().for_each(|waiter| waiter.abort());
+        assert_eq!((turned_away, at_once), (Err(StretchError::Busy), true));
+    }
+
+    #[tokio::test]
+    async fn a_waiter_is_given_up_at_the_wait_and_its_work_never_starts() {
+        let wait = Duration::from_millis(50);
+        let gate = with_no_permit(1, wait);
+        let started = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&started);
+        let asked = std::time::Instant::now();
+        let work = move || counted.fetch_add(1, Ordering::SeqCst);
+        let given_up = gate.stretch(work).await;
+        let waited = asked.elapsed();
+        assert_eq!(
+            (
+                given_up,
+                started.load(Ordering::SeqCst),
+                gate.waiting.available_permits()
+            ),
+            (Err(StretchError::Busy), 0, 1)
+        );
+        let bound = (waited >= wait, waited < Duration::from_secs(2));
+        assert_eq!(bound, (true, true), "{waited:?}");
+    }
+
+    #[tokio::test]
+    async fn work_that_starts_and_does_not_complete_is_failed_and_returns_its_permit() {
+        let gate = StretchGate::on(Arc::new(Semaphore::new(1)), 1, Duration::from_secs(2));
+        let stopped = gate.stretch(|| -> u8 { panic!("stopped") }).await;
+        assert_eq!(
+            (stopped, gate.stretch(|| 7_u8).await),
+            (Err(StretchError::Failed), Ok(7))
+        );
     }
 }

@@ -260,16 +260,18 @@ impl LLDAPFixture {
         (status, std::fs::read_to_string(&path).unwrap_or_default())
     }
 
-    pub fn healthcheck_output(&self) -> std::process::Output {
-        server_command(
+    pub fn healthcheck_output(&self, kerberos: bool) -> std::process::Output {
+        let mut check = server_command(
             "healthcheck",
             &self.db_url,
             self.ldap_port,
             self.http_port,
             &self.extra_env,
-        )
-        .output()
-        .expect("healthcheck command failed to execute")
+        );
+        check.args(kerberos.then_some("--kerberos"));
+        check
+            .output()
+            .expect("healthcheck command failed to execute")
     }
 
     pub fn ldap_url(&self) -> String {
@@ -445,21 +447,26 @@ fn spawn_server(
     cmd.spawn().expect("Unable to start server")
 }
 
-// With Kerberos the listeners bind after the start sequence, whose first commit may wait 60 s.
-fn start_attempts(extra_env: &[(String, String)]) -> u8 {
-    let kerberos = extra_env
+fn runs_realm(extra_env: &[(String, String)]) -> bool {
+    extra_env
         .iter()
         .any(|(key, _)| key.starts_with("LLDAP_KERBEROS_OPTIONS__"))
         && !extra_env
             .iter()
-            .any(|(key, value)| key == KERBEROS_ENABLED && value == "false");
-    if kerberos {
+            .any(|(key, value)| key == KERBEROS_ENABLED && value == "false")
+}
+
+// With Kerberos the listeners bind after the start sequence, whose first commit may wait 60 s.
+fn start_attempts(extra_env: &[(String, String)]) -> u8 {
+    if runs_realm(extra_env) {
         90
     } else {
         MAX_HEALTHCHECK_ATTEMPS
     }
 }
 
+// Healthy, for a server that runs a realm, is a ready realm: the plain command also passes a
+// directory-only server.
 fn wait_until_healthy(
     db_url: &str,
     ldap_port: u16,
@@ -468,8 +475,10 @@ fn wait_until_healthy(
 ) {
     let mut started = false;
     let attempts = start_attempts(extra_env);
+    let ready = runs_realm(extra_env).then_some("--kerberos");
     for attempt in 0..attempts {
         let status = server_command("healthcheck", db_url, ldap_port, http_port, extra_env)
+            .args(ready)
             .status()
             .expect("healthcheck command failed to execute");
         if status.success() {

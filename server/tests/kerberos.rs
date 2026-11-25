@@ -1,5 +1,5 @@
 use crate::common::{
-    auth::{get_token, get_token_for, register_sealed},
+    auth::{get_token, get_token_for, register_sealed, register_start_status},
     env,
     fixture::{LLDAPFixture, exec_sql, free_port, query_i64},
 };
@@ -571,14 +571,49 @@ fn login(http: &Client, base: &str, username: &str, password: &str) -> (StatusCo
     (status, body)
 }
 
-fn health(http: &Client, base: &str) -> (StatusCode, String) {
+fn health(http: &Client, base: &str) -> (StatusCode, Value) {
     let response = http
         .get(format!("{base}/health"))
         .send()
         .expect("health send");
     let status = response.status();
-    let body = response.text().expect("health body");
-    (status, body)
+    (status, response.json().expect("health body"))
+}
+
+const ON_REALM_FAILURE: &str = "LLDAP_KERBEROS_OPTIONS__ON_REALM_FAILURE";
+const NOT_OPEN: &str = "the Kerberos realm did not open; the server log has the cause";
+
+/// The body of `/health` for a realm that did not open: the state, and no path or count.
+fn closed(state: &str) -> Value {
+    json!({"kerberos": state, "cause": NOT_OPEN})
+}
+
+fn ready() -> (StatusCode, Value) {
+    (StatusCode::OK, json!({"kerberos": "ready"}))
+}
+
+fn user_with_password(http: &Client, base: &str, user: &str, sync: &str, password: &str) {
+    let token = get_token(http, base);
+    let created = gql(
+        http,
+        base,
+        &token,
+        "mutation($u: CreateUserInput!) { createUser(user: $u) { id } }",
+        json!({"u": {
+            "id": user,
+            "email": format!("{user}@example.com"),
+            "attributes": [{"name": "kerberossync", "value": [sync]}]
+        }}),
+    );
+    assert_eq!(created["data"]["createUser"]["id"], user, "{created}");
+    let set = gql(
+        http,
+        base,
+        &token,
+        "mutation($id: String!, $password: String!) { setUserPassword(userId: $id, password: $password) { ok } }",
+        json!({"id": user, "password": password}),
+    );
+    assert_eq!(set["data"]["setUserPassword"]["ok"], true, "{set}");
 }
 
 fn bind_rc(url: &str, username: &str, password: &str) -> u32 {
@@ -595,47 +630,37 @@ fn hold_kdc(port: u16) -> UdpSocket {
 }
 
 #[test]
-fn kerberos_degraded() {
+fn kerberos_closed_realm_admin_only() {
     const BOB: &str = "bob";
     const PASS: &str = "BobSmoke-2026!";
-    let mut realm = start_realm(false);
+    let admin_only = [(ON_REALM_FAILURE, "admin-only")];
+    let mut realm = start_realm_seeded(true, false, free_port(), &admin_only, |_| {});
     let http = client();
     let base = realm.fixture.http_url();
     let token = get_token(&http, &base);
-    let created = gql(
-        &http,
-        &base,
-        &token,
-        "mutation($u: CreateUserInput!) { createUser(user: $u) { id } }",
-        json!({"u": {"id": BOB, "email": "bob@example.com"}}),
-    );
-    assert_eq!(created["data"]["createUser"]["id"], BOB, "{created}");
-    let set = gql(
-        &http,
-        &base,
-        &token,
-        "mutation($id: String!, $password: String!) { setUserPassword(userId: $id, password: $password) { ok } }",
-        json!({"id": BOB, "password": PASS}),
-    );
-    assert_eq!(set["data"]["setUserPassword"]["ok"], true, "{set}");
+    user_with_password(&http, &base, BOB, "0", PASS);
     let bob_token = get_token_for(&http, &base, BOB, PASS);
     let kdc_port = realm.kdc_port;
     let ldap_url = realm.fixture.ldap_url();
 
     let holder = realm.fixture.restart_after(|| hold_kdc(kdc_port));
-    let base = realm.fixture.http_url();
-    let (status, body) = health(&http, &base);
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert!(body.contains("did not open"), "{body}");
+    let down = (StatusCode::SERVICE_UNAVAILABLE, closed("admin-only"));
+    assert_eq!(health(&http, &base), down);
+    assert_log_line(
+        &realm.fixture,
+        "Only admins may sign in, over LDAP on 127.0.0.1 and HTTP on 127.0.0.1",
+    );
 
-    let check = realm.fixture.healthcheck_output();
+    let check = realm.fixture.healthcheck_output(false);
     let check_text = output_text(&check);
     assert!(
         !check.status.success(),
         "healthcheck succeeded: {check_text}"
     );
     assert!(
-        check_text.contains("503 Service Unavailable: the Kerberos realm"),
+        check_text.contains(&format!(
+            "503 Service Unavailable: Kerberos is admin-only: {NOT_OPEN}"
+        )),
         "{check_text}"
     );
 
@@ -679,25 +704,126 @@ fn kerberos_degraded() {
 
     drop(holder);
     realm.fixture.restart();
-    let base = realm.fixture.http_url();
-    let ldap_url = realm.fixture.ldap_url();
-    let (status, body) = health(&http, &base);
-    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(health(&http, &base), ready());
     let (status, body) = login(&http, &base, BOB, PASS);
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(bind_rc(&ldap_url, BOB, PASS), 0);
 
     let fresh_port = free_port();
     let fresh_holder = hold_kdc(fresh_port);
-    let fresh = start_realm_at(false, true, fresh_port);
+    let fresh = start_realm_seeded(false, true, fresh_port, &admin_only, |_| {});
     let fresh_http = client();
     let fresh_base = fresh.fixture.http_url();
-    let (status, body) = health(&fresh_http, &fresh_base);
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
-    assert!(body.contains("did not open"), "{body}");
+    assert_eq!(health(&fresh_http, &fresh_base), down);
     let (status, body) = login(&fresh_http, &fresh_base, &admin, &admin_pass);
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(bind_rc(&fresh.fixture.ldap_url(), &admin, &admin_pass), 0);
+    drop(fresh);
+    drop(fresh_holder);
+}
+
+#[test]
+fn kerberos_closed_realm_directory_only() {
+    use ldap3::exop::PasswordModify;
+    const BOB: &str = "bob";
+    const SUE: &str = "sue";
+    const PASS: &str = "BobSmoke-2026!";
+    const NEXT: &str = "BobNext-2026!";
+    let mut realm = start_realm(true);
+    let http = client();
+    let base = realm.fixture.http_url();
+    user_with_password(&http, &base, BOB, "0", PASS);
+    user_with_password(&http, &base, SUE, "1", PASS);
+    let kdc_port = realm.kdc_port;
+    let ldap_url = realm.fixture.ldap_url();
+
+    let holder = realm.fixture.restart_after(|| hold_kdc(kdc_port));
+    let serving = (StatusCode::OK, closed("directory-only"));
+    assert_eq!(health(&http, &base), serving);
+    assert_log_line(
+        &realm.fixture,
+        "the directory is served to everyone, over LDAP on 0.0.0.0 and HTTP on 0.0.0.0",
+    );
+    let plain = realm.fixture.healthcheck_output(false);
+    expect_ok(&plain, "the plain healthcheck of a directory-only server");
+    let flagged = realm.fixture.healthcheck_output(true);
+    expect_fail(&flagged, "healthcheck --kerberos with the realm closed");
+    let flagged = output_text(&flagged);
+    assert!(
+        flagged.contains(
+            "--kerberos passes only a ready Kerberos realm, and this server's is directory-only"
+        ),
+        "{flagged}"
+    );
+
+    let (status, body) = login(&http, &base, BOB, PASS);
+    assert_eq!(status, StatusCode::OK, "an ordinary user signs in: {body}");
+    assert_eq!(
+        (
+            bind_rc(&ldap_url, BOB, PASS),
+            bind_rc(&ldap_url, BOB, "wrong")
+        ),
+        (0, 49)
+    );
+
+    let token = get_token(&http, &base);
+    let (key, status, body) = register_sealed(&http, &base, &token, BOB, NEXT, |_, _| None);
+    assert_eq!(
+        (key, status),
+        (None, StatusCode::OK),
+        "a user without sync changes a password: {body}"
+    );
+    assert_eq!(
+        (bind_rc(&ldap_url, BOB, NEXT), bind_rc(&ldap_url, BOB, PASS)),
+        (0, 49)
+    );
+
+    let (status, body) = register_start_status(&http, &base, &token, SUE, NEXT);
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    let base_dn = env::base_dn();
+    let mut ldap = LdapConn::new(&ldap_url).expect("ldap connection");
+    ldap.simple_bind(
+        &format!("uid={},ou=people,{base_dn}", env::admin_dn()),
+        &env::admin_password(),
+    )
+    .expect("bind send")
+    .success()
+    .expect("admin bind");
+    let modified = ldap
+        .extended(PasswordModify {
+            user_id: Some(&format!("uid={SUE},ou=people,{base_dn}")),
+            old_pass: None,
+            new_pass: Some(NEXT),
+        })
+        .expect("password modify send");
+    let _ = ldap.unbind();
+    assert_eq!(
+        (
+            modified.1.rc,
+            bind_rc(&ldap_url, SUE, PASS),
+            bind_rc(&ldap_url, SUE, NEXT)
+        ),
+        (52, 0, 49),
+        "a synced user's password stays as it was: {}",
+        modified.1.text
+    );
+
+    drop(holder);
+    realm.fixture.restart();
+    assert_eq!(health(&http, &base), ready());
+    expect_ok(
+        &kinit_user(&realm.krb, SUE, PASS),
+        "kinit with the password from before, once the realm is open again",
+    );
+
+    let fresh_port = free_port();
+    let fresh_holder = hold_kdc(fresh_port);
+    let fresh = start_realm_at(false, true, fresh_port);
+    let fresh_health = health(&client(), &fresh.fixture.http_url());
+    assert_eq!(
+        fresh_health, serving,
+        "a first start made the realm before the KDC's port failed: it holds the realm's row"
+    );
     drop(fresh);
     drop(fresh_holder);
 }
@@ -1031,14 +1157,29 @@ fn kerberos_refuses_a_dump_whose_user_is_missing() {
         &[("LLDAP_KERBEROS_OPTIONS__REALM", "LIVEBOB.TEST")],
         seed_0_7_2_realm,
     );
-    let (status, body) = health(&client(), &realm.fixture.http_url());
-    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
+    let http = client();
+    let base = realm.fixture.http_url();
+    assert_eq!(
+        health(&http, &base),
+        (StatusCode::SERVICE_UNAVAILABLE, closed("admin-only")),
+        "a database with no realm yet stays admin-only under the default on_realm_failure"
+    );
+    let info = gql(
+        &http,
+        &base,
+        &get_token(&http, &base),
+        "{ kerberosInfo { state cause } }",
+        json!({}),
+    );
+    let info = &info["data"]["kerberosInfo"];
+    assert_eq!(info["state"], "admin-only", "{info}");
+    let said = info["cause"].as_str().unwrap_or_default();
     for cause in [
         "the Kerberos realm LIVEBOB.TEST did not open",
         "principal livebob names user livebob, and there is no such user",
         "create the user it names, or remove the principal on 0.7.2 and dump again",
     ] {
-        assert!(body.contains(cause), "{cause}: {body}");
+        assert!(said.contains(cause), "{cause}: {info}");
     }
     for table in ["kerberos_realm", "kerberos_principals"] {
         let rows = query_i64(
@@ -1462,19 +1603,19 @@ fn kerberos_forced_reset_of_a_synced_admin() {
         .fixture
         .set_env("LLDAP_FORCE_LDAP_USER_PASS_RESET", "always");
     let holder = realm.fixture.restart_after(|| hold_kdc(kdc_port));
-    let (status, body) = health(&http, &realm.fixture.http_url());
     let realm_closed = (
-        status,
+        health(&http, &realm.fixture.http_url()),
         bind_rc(&ldap_url, &admin, &configured),
         bind_rc(&ldap_url, &admin, NEXT),
         synced(),
         turned_off(),
         warned(realm.fixture.server_log()),
     );
+    let open_to_all = (StatusCode::OK, closed("directory-only"));
     assert_eq!(
         realm_closed,
-        (StatusCode::SERVICE_UNAVAILABLE, 0, 49, 0, 1, 1),
-        "the realm cannot open: the reset, sync off, one row, the warning, and it serves: {body}"
+        (open_to_all, 0, 49, 0, 1, 1),
+        "the realm cannot open: the reset, sync off, one row, the warning, and it serves everyone"
     );
     drop(holder);
     realm
@@ -1594,7 +1735,11 @@ fn lldap_disabled_changed_without_the_realm_is_followed_when_it_opens() {
     }
 
     let kdc_port = realm.kdc_port;
-    for (mutation, enabled) in [("addUserToGroup", false), ("removeUserFromGroup", true)] {
+    for (mutation, enabled, mode) in [
+        ("addUserToGroup", false, "admin-only"),
+        ("removeUserFromGroup", true, "directory-only"),
+    ] {
+        realm.fixture.set_env(ON_REALM_FAILURE, mode);
         let holder = realm.fixture.restart_after(|| hold_kdc(kdc_port));
         toggle_disabled(&http, &realm.fixture.http_url(), mutation);
         drop(holder);
@@ -1620,18 +1765,21 @@ fn lldap_disabled_changed_without_the_realm_is_followed_when_it_opens() {
         [
             rows("Kerberos is disabled: the status of a principal, if there is one,"),
             rows("the Kerberos realm is not ready: the status of a principal, if there is one,"),
+            rows("the Kerberos realm is closed on this server: the status of a principal, if"),
             rows("disabled as the realm opened: the user is in lldap_disabled"),
             rows("enabled as the realm opened: the user is not in lldap_disabled"),
         ],
-        [2, 2, 2, 2],
-        "one row for each change left, and one for each status the opening set"
+        [2, 1, 1, 2, 2],
+        "one row for each change left, admin-only then directory-only, and one for each status \
+         the opening set"
     );
 }
 
 #[test]
 fn kerberos_forced_reset_of_an_admin_without_sync_waits_for_the_realm() {
     const NEXT: &str = "AdminNext-2026!";
-    let mut realm = start_realm(true);
+    let admin_only = [(ON_REALM_FAILURE, "admin-only")];
+    let mut realm = start_realm_seeded(true, false, free_port(), &admin_only, |_| {});
     let http = client();
     let base = realm.fixture.http_url();
     let admin = env::admin_dn();
@@ -1700,17 +1848,22 @@ fn kerberos_forced_reset_of_an_admin_without_sync_waits_for_the_realm() {
     let before = resets();
     let kdc_port = realm.kdc_port;
     let holder = realm.fixture.restart_after(|| hold_kdc(kdc_port));
-    let (status, body) = health(&http, &realm.fixture.http_url());
+    let closed_health = health(&http, &realm.fixture.http_url());
     let ldap_url = realm.fixture.ldap_url();
     assert_eq!(
         (
-            status,
+            closed_health,
             bind_rc(&ldap_url, &admin, &configured),
             bind_rc(&ldap_url, &admin, NEXT),
             resets() - before
         ),
-        (StatusCode::SERVICE_UNAVAILABLE, 0, 49, 1),
-        "the realm cannot open: the reset runs as upstream's and the server serves: {body}"
+        (
+            (StatusCode::SERVICE_UNAVAILABLE, closed("admin-only")),
+            0,
+            49,
+            1
+        ),
+        "the realm cannot open: the reset runs as upstream's and the server serves its admins"
     );
     drop(holder);
 }

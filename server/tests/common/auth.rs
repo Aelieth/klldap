@@ -168,6 +168,30 @@ pub fn register_password_over_http(
         .expect("register finish status");
 }
 
+// The start of the pages' ceremony alone, for a start the server refuses.
+pub fn register_start_status(
+    client: &Client,
+    base_url: &str,
+    bearer: &str,
+    username: &str,
+    password: &str,
+) -> (StatusCode, String) {
+    let mut rng = rand::rngs::OsRng;
+    let start = opaque::client::registration::start_registration(password.as_bytes(), &mut rng)
+        .expect("registration start");
+    let response = client
+        .post(format!("{base_url}/auth/opaque/register/start"))
+        .bearer_auth(bearer)
+        .json(&registration::ClientRegistrationStartRequest {
+            username: UserId::new(username),
+            registration_start_request: start.message,
+        })
+        .send()
+        .expect("register start send");
+    let status = response.status();
+    (status, response.text().expect("register start body"))
+}
+
 // The pages' ceremony: `seal` makes the finish's envelope from the start answer's key and its
 // server data.
 pub fn register_sealed(

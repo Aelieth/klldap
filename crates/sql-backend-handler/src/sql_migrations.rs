@@ -34,6 +34,7 @@ pub enum Users {
     Uuid,
     ModifiedDate,
     PasswordModifiedDate,
+    CodeAtKinit,
 }
 
 #[derive(DeriveIden, PartialEq, Eq, Debug, Serialize, Deserialize, Clone, Copy)]
@@ -2082,7 +2083,22 @@ pub(crate) async fn ensure_v13_additions(pool: &DbConnection) -> Result<(), DbEr
     ensure_mfa_windows(&transaction, backend).await?;
     ensure_lockout_period(&transaction, backend).await?;
     ensure_inactivity_recording(&transaction, backend).await?;
+    ensure_code_at_kinit(&transaction, backend).await?;
     transaction.commit().await
+}
+
+/// The user's own choice of a code at kinit; off until the user turns it on.
+async fn ensure_code_at_kinit(
+    transaction: &DatabaseTransaction,
+    backend: sea_orm::DbBackend,
+) -> Result<(), DbErr> {
+    let column = ColumnDef::new(Users::CodeAtKinit)
+        .boolean()
+        .not_null()
+        .default(false)
+        .to_owned();
+    let (table, name) = (Users::Table.into_iden(), Users::CodeAtKinit.into_iden());
+    ensure_column(transaction, backend, table, name, column).await
 }
 
 /// A policy item stored under an older name is carried over; a second run finds none.

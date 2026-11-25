@@ -8,6 +8,7 @@ query GetUserDetails($id: String!) {
     uuid
     mfaEnrolled
     mfaMode
+    codeAtKinit
     groups {
       id
       displayName

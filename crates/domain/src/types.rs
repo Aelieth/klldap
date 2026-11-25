@@ -493,6 +493,8 @@ pub struct User {
     pub password_modified_date: NaiveDateTime,
     pub krb_principal_name: Option<String>,
     pub mfa_type: Option<String>,
+    #[serde(default)]
+    pub code_at_kinit: bool,
 }
 
 impl User {
@@ -556,6 +558,7 @@ impl Default for User {
             password_modified_date: epoch,
             krb_principal_name: None,
             mfa_type: None,
+            code_at_kinit: false,
         }
     }
 }

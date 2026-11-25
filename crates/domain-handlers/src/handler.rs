@@ -274,6 +274,8 @@ pub trait MfaBackendHandler: Send + Sync {
     -> Result<()>;
     async fn reset_user_mfa(&self, user_id: &UserId, reason: MfaResetReason) -> Result<()>;
     async fn reset_own_mfa(&self, user_id: &UserId, code: &str) -> Result<()>;
+    /// The user's own choice that kinit asks the code; only with a factor.
+    async fn set_code_at_kinit(&self, user_id: &UserId, on: bool) -> Result<()>;
 }
 
 #[async_trait]

@@ -432,6 +432,7 @@ type Mutation {
   resetOwnMfa(code: String!): Success!
   startMfaEnrollment(currentCode: String, enrollmentProof: String): MfaEnrollmentStart!
   finishMfaEnrollment(state: String!, code: String!): Success!
+  setCodeAtKinit(on: Boolean!): Success!
   unlockUser(userId: String!): Success!
   reenableUser(userId: String!): Success!
 }
@@ -584,6 +585,8 @@ type User {
   mfaEnrolled: Boolean
   "The user's resolved enable_mfa: off, enabled or always (self)."
   mfaMode: String
+  "Whether kinit asks the user's code after a short password ticket (admin or self)."
+  codeAtKinit: Boolean
   "Whether the doors refuse the user now: the lock and inactivity (admins only, and only under `user(userId)`)."
   signInState: SignInState
   "User-defined attributes, including ou and sshpublickey for legacy clients."

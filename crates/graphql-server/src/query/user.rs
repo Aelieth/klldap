@@ -201,6 +201,13 @@ impl<Handler: BackendHandler + OpaqueHandler> User<Handler> {
         Some(mode.unwrap_or(MfaPolicy::Always).item().to_owned())
     }
 
+    /// Whether kinit asks the user's code after a short password ticket (admin or self).
+    fn code_at_kinit(&self, context: &Context<Handler>) -> Option<bool> {
+        (context.validation_result.is_admin()
+            || context.validation_result.user == self.user.user_id)
+            .then_some(self.user.code_at_kinit)
+    }
+
     /// Whether the doors refuse the user now: the lock and inactivity (admins only, and only under `user(userId)`).
     async fn sign_in_state(&self, context: &Context<Handler>) -> FieldResult<Option<SignInState>> {
         let handler = context.get_admin_handler().filter(|_| self.alone);

@@ -31,6 +31,18 @@ use yew::prelude::*;
 )]
 pub struct GetUserDetails;
 
+#[derive(GraphQLQuery)]
+#[graphql(
+    schema_path = "../schema.graphql",
+    query_path = "queries/set_code_at_kinit.graphql",
+    response_derives = "Debug",
+    custom_scalars_module = "crate::infra::graphql"
+)]
+pub struct SetCodeAtKinit;
+
+const CODE_AT_KINIT: &str = "kinit then asks your code after a short password ticket \
+     (kinit -l 5m, then kinit -T), for a client that can do it.";
+
 pub type User = get_user_details::GetUserDetailsUser;
 pub type Group = get_user_details::GetUserDetailsUserGroups;
 pub type Attribute = get_user_details::GetUserDetailsUserAttributes;
@@ -66,6 +78,8 @@ pub enum Msg {
     OnUserAddedToGroup(Group),
     OnUserRemovedFromGroup((String, i64)),
     OnMfaReset,
+    ToggleCodeAtKinit(bool),
+    CodeAtKinitResponse(Result<set_code_at_kinit::ResponseData>),
     OnSignInAction(String),
     OnSignInActionStarted,
     Refresh,
@@ -91,6 +105,22 @@ pub fn blocks_own_reset(is_self: bool, mfa_mode: Option<&str>) -> bool {
 
 pub fn offers_enrolment(mfa_mode: Option<&str>) -> bool {
     matches!(mfa_mode, Some("enabled" | "always"))
+}
+
+/// Beside the factor: the user's own switch, a value an admin reads, or nothing.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CodeAtKinit {
+    Switch(bool),
+    Shown(bool),
+    Hidden,
+}
+
+pub fn code_at_kinit(is_self: bool, enrolled: bool, value: Option<bool>) -> CodeAtKinit {
+    match (value, enrolled, is_self) {
+        (Some(on), true, true) => CodeAtKinit::Switch(on),
+        (Some(on), true, false) => CodeAtKinit::Shown(on),
+        _ => CodeAtKinit::Hidden,
+    }
 }
 
 pub fn keeps_sign_in_result(msg: &Msg) -> bool {
@@ -140,7 +170,23 @@ impl CommonComponent<UserDetails> for UserDetails {
                 self.mut_groups().retain(|g| g.id != group_id);
             }
             Msg::OnMfaReset => {
-                self.user_and_schema.as_mut().unwrap().0.mfa_enrolled = Some(false);
+                let user = &mut self.user_and_schema.as_mut().unwrap().0;
+                user.mfa_enrolled = Some(false);
+                user.code_at_kinit = user.code_at_kinit.map(|_| false);
+            }
+            Msg::ToggleCodeAtKinit(on) => {
+                self.common.call_graphql::<SetCodeAtKinit, _>(
+                    ctx,
+                    set_code_at_kinit::Variables { on },
+                    Msg::CodeAtKinitResponse,
+                    "Error changing the code at kinit",
+                );
+                return Ok(false);
+            }
+            Msg::CodeAtKinitResponse(response) => {
+                response?;
+                ctx.link().send_message(Msg::Refresh);
+                return Ok(false);
             }
             Msg::Refresh => {
                 self.common.call_graphql::<GetUserDetails, _>(
@@ -390,6 +436,7 @@ impl Component for UserDetails {
                     }
                   } else { html! {} }}
                   </div>
+                  { self.view_code_at_kinit(ctx, u, ctx.props().mfa_enabled && mfa_enrolled) }
 
                   <UserDetailsForm
                   user={u.clone()}
@@ -423,6 +470,35 @@ impl UserDetails {
             Msg::UserDetailsResponse,
             "Error trying to fetch user details",
         );
+    }
+
+    fn view_code_at_kinit(&self, ctx: &Context<Self>, u: &User, enrolled: bool) -> Html {
+        match code_at_kinit(ctx.props().is_self, enrolled, u.code_at_kinit) {
+            CodeAtKinit::Hidden => html! {},
+            CodeAtKinit::Shown(on) => html! {
+              <div class="mx-3 mb-3">
+                {"Code at kinit: "}
+                <span class="border rounded px-1">{ if on { "On" } else { "Off" } }</span>
+              </div>
+            },
+            CodeAtKinit::Switch(on) => {
+                let toggle = ctx.link().callback(move |_| Msg::ToggleCodeAtKinit(!on));
+                html! {
+                  <div class="form-check form-switch mx-3 mb-3">
+                    <input
+                      class="form-check-input"
+                      type="checkbox"
+                      role="switch"
+                      id="codeAtKinit"
+                      checked={on}
+                      disabled={self.common.is_task_running()}
+                      onchange={toggle} />
+                    <label class="form-check-label" for="codeAtKinit">{"Code at kinit"}</label>
+                    <div class="form-text">{CODE_AT_KINIT}</div>
+                  </div>
+                }
+            }
+        }
     }
 
     fn view_messages(&self, error: &Option<Error>) -> Html {
@@ -522,6 +598,11 @@ mod tests {
             ("the disable toggle", Msg::AddToLldapDisabled, false),
             ("a refresh", Msg::Refresh, false),
             ("a two-factor reset", Msg::OnMfaReset, false),
+            (
+                "the code at kinit switched",
+                Msg::ToggleCodeAtKinit(true),
+                false,
+            ),
             ("an error", Msg::OnError(anyhow!("refused")), false),
         ];
         for (label, msg, kept) in rows {
@@ -540,6 +621,21 @@ mod tests {
         ];
         for (name, group, found) in rows {
             assert_eq!(is_group(name, group), found, "{name} {group}");
+        }
+    }
+
+    #[test]
+    fn test_the_code_at_kinit_is_the_users_switch_and_a_value_an_admin_reads() {
+        use CodeAtKinit::{Hidden, Shown, Switch};
+        let rows = [
+            ("the user, off", true, true, Some(false), Switch(false)),
+            ("the user, on", true, true, Some(true), Switch(true)),
+            ("an admin", false, true, Some(true), Shown(true)),
+            ("no factor", true, false, Some(false), Hidden),
+            ("not given to this reader", false, true, None, Hidden),
+        ];
+        for (label, is_self, enrolled, value, expected) in rows {
+            assert_eq!(code_at_kinit(is_self, enrolled, value), expected, "{label}");
         }
     }
 

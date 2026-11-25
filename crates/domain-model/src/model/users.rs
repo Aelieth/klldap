@@ -25,6 +25,7 @@ pub struct Model {
     pub password_modified_date: chrono::NaiveDateTime,
     // Only backend code sets it, and only while kerberossync = 1.
     pub krb_principal_name: Option<String>,
+    pub code_at_kinit: bool,
 }
 
 impl EntityName for Entity {
@@ -47,6 +48,7 @@ pub enum Column {
     ModifiedDate,
     PasswordModifiedDate,
     KrbPrincipalName,
+    CodeAtKinit,
 }
 
 impl ColumnTrait for Column {
@@ -66,6 +68,7 @@ impl ColumnTrait for Column {
             Column::ModifiedDate => ColumnType::DateTime,
             Column::PasswordModifiedDate => ColumnType::DateTime,
             Column::KrbPrincipalName => ColumnType::String(StringLen::N(255)),
+            Column::CodeAtKinit => ColumnType::Boolean,
         }
         .def()
     }
@@ -135,6 +138,7 @@ impl From<Model> for lldap_domain::types::User {
             password_modified_date: user.password_modified_date,
             krb_principal_name: user.krb_principal_name,
             mfa_type: user.mfa_type,
+            code_at_kinit: user.code_at_kinit,
         }
     }
 }

@@ -95,6 +95,7 @@ mockall::mock! {
         async fn finish_totp_enrollment(&self, user_id: &UserId, state: &str, code: &str) -> Result<()>;
         async fn reset_user_mfa(&self, user_id: &UserId, reason: MfaResetReason) -> Result<()>;
         async fn reset_own_mfa(&self, user_id: &UserId, code: &str) -> Result<()>;
+        async fn set_code_at_kinit(&self, user_id: &UserId, on: bool) -> Result<()>;
     }
     #[async_trait]
     impl PolicyBackendHandler for TestBackendHandler {
@@ -205,6 +206,7 @@ pub fn user_named(uid: &UserId) -> User {
         attributes: vec![],
         krb_principal_name: None,
         mfa_type: None,
+        code_at_kinit: false,
     }
 }
 

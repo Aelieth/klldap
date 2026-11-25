@@ -71,6 +71,23 @@ pub(super) async fn start_mfa_enrollment<Handler: FullHandler + OpaqueHandler>(
         .into())
 }
 
+pub(super) async fn set_code_at_kinit<Handler: FullHandler + OpaqueHandler>(
+    context: &Context<Handler>,
+    on: bool,
+) -> FieldResult<Success> {
+    let span = debug_span!("[GraphQL mutation] set_code_at_kinit");
+    let user_id = &context.validation_result.user;
+    span.in_scope(|| debug!(?user_id, on));
+    if on {
+        context.reject_if_mfa_disabled(&span)?;
+    }
+    context
+        .get_mfa_self_handler()
+        .set_code_at_kinit(user_id, on)
+        .await?;
+    Ok(Success::new())
+}
+
 pub(super) async fn finish_mfa_enrollment<Handler: FullHandler + OpaqueHandler>(
     context: &Context<Handler>,
     state: String,

@@ -527,6 +527,7 @@ mod tests {
                     ],
                     krb_principal_name: None,
                     mfa_type: None,
+                    code_at_kinit: false,
                 })
             });
         let mut groups = HashSet::new();
@@ -729,6 +730,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_the_code_at_kinit_is_read_by_the_user_and_an_admin_only() {
+        const QUERY: &str = r#"{ user(userId: "bob") { id codeAtKinit } }"#;
+        let read = graphql_value!({"user": {"id": "bob", "codeAtKinit": true}});
+        let hidden = graphql_value!({"user": {"id": "bob", "codeAtKinit": None}});
+        let rows = [
+            (
+                "the user themself",
+                Permission::Regular,
+                "bob",
+                read.clone(),
+            ),
+            ("an admin", Permission::Admin, "admin", read),
+            (
+                "a read-only admin",
+                Permission::Readonly,
+                "viewer",
+                hidden.clone(),
+            ),
+            (
+                "a password manager",
+                Permission::PasswordManager,
+                "keeper",
+                hidden,
+            ),
+        ];
+        let schema = schema(Query::<MockTestBackendHandler>::new());
+        for (label, permission, asker, expected) in rows {
+            let mut mock = MockTestBackendHandler::new();
+            setup_default_schema(&mut mock);
+            mock.expect_get_user_details()
+                .with(eq(UserId::new("bob")))
+                .returning(|_| {
+                    let mut bob = user_named(&UserId::new("bob"));
+                    bob.code_at_kinit = true;
+                    Ok(bob)
+                });
+            let user = UserId::new(asker);
+            let context = Context::<MockTestBackendHandler>::new_for_tests(
+                mock,
+                ValidationResults { user, permission },
+            );
+            let (value, errors) = execute(QUERY, None, &schema, &Variables::new(), &context)
+                .await
+                .unwrap();
+            assert_eq!((value, errors.len()), (expected, 0), "{label}");
+        }
+    }
+
+    #[tokio::test]
     async fn test_a_list_of_users_answers_no_sign_in_state_and_reads_none() {
         let mut mock = MockTestBackendHandler::new();
         setup_default_schema(&mut mock);
@@ -891,6 +941,7 @@ mod tests {
                             attributes: Vec::new(),
                             krb_principal_name: None,
                             mfa_type: None,
+                            code_at_kinit: false,
                         },
                         groups: None,
                     },
@@ -912,6 +963,7 @@ mod tests {
                             attributes: Vec::new(),
                             krb_principal_name: None,
                             mfa_type: None,
+                            code_at_kinit: false,
                         },
                         groups: None,
                     },

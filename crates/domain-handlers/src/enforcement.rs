@@ -367,7 +367,7 @@ impl UserFacts {
             uuid: user.uuid.clone(),
             enrolled: user.mfa_type.as_deref() == Some(MFA_TYPE_TOTP),
             exempt: groups.any(|group| group.display_name.as_str() == MFA_DISABLED_GROUP),
-            code_at_kinit: false,
+            code_at_kinit: user.code_at_kinit,
             created: from_naive(user.creation_date),
             recorded: None,
         }
@@ -2595,6 +2595,7 @@ mod tests {
             password_modified_date: epoch,
             krb_principal_name: None,
             mfa_type: None,
+            code_at_kinit: false,
         }
     }
 

@@ -771,6 +771,10 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         mfa::finish_mfa_enrollment(context, state, code).await
     }
 
+    async fn set_code_at_kinit(context: &Context<Handler>, on: bool) -> FieldResult<Success> {
+        mfa::set_code_at_kinit(context, on).await
+    }
+
     async fn unlock_user(context: &Context<Handler>, user_id: String) -> FieldResult<Success> {
         let span = debug_span!("[GraphQL mutation] unlock_user");
         span.in_scope(|| debug!(?user_id));
@@ -1206,6 +1210,7 @@ mod tests {
             password_modified_date: epoch(),
             krb_principal_name: None,
             mfa_type: None,
+            code_at_kinit: false,
         }
     }
 
@@ -2395,6 +2400,7 @@ mod tests {
     const FINISH_MFA: &str =
         r#"mutation { finishMfaEnrollment(state: "sealed", code: "123456") { ok } }"#;
     const RESET_OWN_MFA: &str = r#"mutation { resetOwnMfa(code: "123456") { ok } }"#;
+    const SET_CODE_AT_KINIT: &str = r#"mutation { setCodeAtKinit(on: true) { ok } }"#;
 
     fn expect_mfa_reset(mock: &mut MockTestBackendHandler, user: &str) {
         let expected = UserId::new(user);
@@ -2523,7 +2529,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_mfa_mutation_policy_gates() {
-        for query in [START_MFA, FINISH_MFA, RESET_OWN_MFA] {
+        for query in [START_MFA, FINISH_MFA, RESET_OWN_MFA, SET_CODE_AT_KINIT] {
             let (_, errors) = execute(
                 query,
                 None,
@@ -2540,6 +2546,25 @@ mod tests {
                 "{query}: {errors:?}"
             );
         }
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_set_code_at_kinit()
+            .withf(|user, on| user == &UserId::new("bob") && !*on)
+            .times(1)
+            .returning(|_, _| Ok(()));
+        let (value, errors) = execute(
+            r#"mutation { setCodeAtKinit(on: false) { ok } }"#,
+            None,
+            &root_schema(),
+            &Variables::new(),
+            &regular_context(mock),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            (value, errors.len()),
+            (graphql_value!({"setCodeAtKinit": {"ok": true}}), 0),
+            "turning the code at kinit off stays the user's own way out"
+        );
         // The administrative reset stays available as the cleanup path.
         let mut mock = MockTestBackendHandler::new();
         expect_mfa_reset(&mut mock, "bob");
@@ -2574,6 +2599,10 @@ mod tests {
             .withf(|user, code| user == &UserId::new("bob") && code == "123456")
             .times(1)
             .returning(|_, _| Ok(()));
+        mock.expect_set_code_at_kinit()
+            .withf(|user, on| user == &UserId::new("bob") && *on)
+            .times(1)
+            .returning(|_, _| Ok(()));
         let context = policy_context(mock, "bob", Permission::Regular, MfaPolicy::Enrolled, false);
         for (query, expected) in [
             (
@@ -2589,6 +2618,10 @@ mod tests {
                 graphql_value!({"finishMfaEnrollment": {"ok": true}}),
             ),
             (RESET_OWN_MFA, graphql_value!({"resetOwnMfa": {"ok": true}})),
+            (
+                SET_CODE_AT_KINIT,
+                graphql_value!({"setCodeAtKinit": {"ok": true}}),
+            ),
         ] {
             let (value, errors) = execute(query, None, &root_schema(), &Variables::new(), &context)
                 .await

@@ -36,6 +36,7 @@ use std::cell::Cell;
 use tracing::{info, instrument, warn};
 
 const TOTP_ISSUER: &str = "KLLDAP";
+const CODE_AT_KINIT_UNSET: &str = "code at kinit: not enrolled";
 const OU_ITEM_NOT_READ: &str = "the OU policies are not read yet";
 
 #[cfg(any(test, feature = "test-clock"))]
@@ -172,18 +173,24 @@ async fn stored_factor(txn: &impl ConnectionTrait, user_id: &UserId) -> Result<O
     })
 }
 
-/// The factor, its used marks and its proofs change together, in the caller's transaction.
+/// The factor, its used marks and its proofs change together, in the caller's transaction; a
+/// factor removed takes the user's choice of a code at kinit with it.
 async fn change_factor(
     txn: &impl ConnectionTrait,
     user_id: &UserId,
     totp_secret: Option<String>,
     mfa_type: Option<String>,
 ) -> Result<()> {
+    let code_at_kinit = match mfa_type {
+        Some(_) => ActiveValue::NotSet,
+        None => ActiveValue::Set(false),
+    };
     let user_update = model::users::ActiveModel {
         user_id: ActiveValue::Set(user_id.clone()),
         totp_secret: ActiveValue::Set(totp_secret),
         mfa_type: ActiveValue::Set(mfa_type),
         modified_date: ActiveValue::Set(chrono::Utc::now().naive_utc()),
+        code_at_kinit,
         ..Default::default()
     };
     user_update.update(txn).await?;
@@ -357,6 +364,7 @@ impl SqlBackendHandler {
         let cleared = model::User::update_many()
             .col_expr(UserColumn::TotpSecret, Expr::value(None::<String>))
             .col_expr(UserColumn::MfaType, Expr::value(None::<String>))
+            .col_expr(UserColumn::CodeAtKinit, Expr::value(false))
             .col_expr(
                 UserColumn::ModifiedDate,
                 Expr::value(chrono::Utc::now().naive_utc()),
@@ -430,6 +438,34 @@ impl MfaBackendHandler for SqlBackendHandler {
         self.user_written(user_id).await;
         info!(r#"Cleared own MFA state for "{}""#, user_id);
         logging::record(LogKind::MfaReset, target, Some("self"));
+        Ok(())
+    }
+
+    #[instrument(skip_all, level = "debug", err(level = "debug"))]
+    async fn set_code_at_kinit(&self, user_id: &UserId, on: bool) -> Result<()> {
+        let target = Some(user_id.as_str());
+        let user = self.get_user_model(user_id).await?;
+        if user.mfa_type.as_deref() != Some(MFA_TYPE_TOTP) {
+            let rejection = TotpRejection::NotEnrolled;
+            logging::record_failure(LogKind::MfaEnroll, target, CODE_AT_KINIT_UNSET);
+            return Err(rejection.into_error(user_id));
+        }
+        if user.code_at_kinit == on {
+            return Ok(());
+        }
+        // Only while the factor stays: a removal racing this write keeps the choice off.
+        model::User::update_many()
+            .col_expr(UserColumn::CodeAtKinit, Expr::value(on))
+            .filter(ColumnTrait::eq(&UserColumn::UserId, user_id))
+            .filter(ColumnTrait::eq(&UserColumn::MfaType, MFA_TYPE_TOTP))
+            .exec(&self.sql_pool)
+            .await?;
+        self.user_written(user_id).await;
+        let detail = match on {
+            true => "code at kinit on",
+            false => "code at kinit off",
+        };
+        logging::record(LogKind::MfaEnroll, target, Some(detail));
         Ok(())
     }
 
@@ -1035,6 +1071,127 @@ pub(crate) mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, DomainError::EntityNotFound(_)));
+    }
+
+    async fn code_at_kinit(handler: &SqlBackendHandler, user: &UserId) -> bool {
+        let found = model::User::find_by_id(user.clone()).one(&handler.sql_pool);
+        found.await.unwrap().unwrap().code_at_kinit
+    }
+
+    #[tokio::test]
+    async fn test_the_code_at_kinit_is_the_users_own_choice_and_goes_with_the_factor() {
+        let _clock = pin_clock(AT);
+        let guard = LogGuard::install_on_this_thread();
+        let (setup, handler) = setup_handler().await;
+        let (bob, _, _, next) = enroll_user(&handler, &setup, "bob").await;
+        insert_user_no_password(&handler, "ann").await;
+        let ann = UserId::new("ann");
+        let factor = |sealed: &str| (Some(sealed.to_owned()), Some(MFA_TYPE_TOTP.to_owned()));
+        let mut seen = vec![("enrolled", code_at_kinit(&handler, &bob).await)];
+        handler.set_code_at_kinit(&bob, true).await.unwrap();
+        seen.push(("turned on", code_at_kinit(&handler, &bob).await));
+        handler.set_code_at_kinit(&bob, true).await.unwrap();
+        seen.push(("on again", code_at_kinit(&handler, &bob).await));
+        handler.reset_own_mfa(&bob, &next).await.unwrap();
+        seen.push(("the user's own reset", code_at_kinit(&handler, &bob).await));
+        let (sealed, totp) = factor("v1.first");
+        handler.write_mfa_columns(&bob, sealed, totp).await.unwrap();
+        seen.push(("a new enrolment", code_at_kinit(&handler, &bob).await));
+        handler.set_code_at_kinit(&bob, true).await.unwrap();
+        let (sealed, totp) = factor("v1.second");
+        handler.write_mfa_columns(&bob, sealed, totp).await.unwrap();
+        seen.push(("the factor replaced", code_at_kinit(&handler, &bob).await));
+        handler.set_code_at_kinit(&bob, false).await.unwrap();
+        seen.push(("turned off", code_at_kinit(&handler, &bob).await));
+        handler.set_code_at_kinit(&bob, true).await.unwrap();
+        handler.write_mfa_columns(&bob, None, None).await.unwrap();
+        seen.push(("the factor removed", code_at_kinit(&handler, &bob).await));
+        let (sealed, totp) = factor("v1.third");
+        handler.write_mfa_columns(&bob, sealed, totp).await.unwrap();
+        handler.set_code_at_kinit(&bob, true).await.unwrap();
+        let admin = MfaResetReason::Administrative;
+        handler.reset_user_mfa(&bob, admin).await.unwrap();
+        seen.push((
+            "an administrator's reset",
+            code_at_kinit(&handler, &bob).await,
+        ));
+        let (sealed, totp) = factor("v1.fourth");
+        handler.write_mfa_columns(&bob, sealed, totp).await.unwrap();
+        handler.set_code_at_kinit(&bob, true).await.unwrap();
+        handler.clear_all_mfa().await.unwrap();
+        seen.push((
+            "the server key changed",
+            code_at_kinit(&handler, &bob).await,
+        ));
+        let refused = handler.set_code_at_kinit(&ann, true).await;
+        let refused = refused.is_err_and(|e| e.to_string().contains("not enrolled"));
+        seen.push((
+            "no factor: refused",
+            refused && !code_at_kinit(&handler, &ann).await,
+        ));
+        assert_eq!(
+            seen,
+            vec![
+                ("enrolled", false),
+                ("turned on", true),
+                ("on again", true),
+                ("the user's own reset", false),
+                ("a new enrolment", false),
+                ("the factor replaced", true),
+                ("turned off", false),
+                ("the factor removed", false),
+                ("an administrator's reset", false),
+                ("the server key changed", false),
+                ("no factor: refused", true),
+            ]
+        );
+        let rows: Vec<_> = guard
+            .recorder()
+            .take_events()
+            .into_iter()
+            .filter(|e| {
+                e.detail
+                    .as_deref()
+                    .is_some_and(|d| d.starts_with("code at kinit"))
+            })
+            .map(|e| (e.kind, e.success, e.target, e.detail))
+            .collect();
+        let row = |success, target: &str, detail: &str| {
+            let (target, detail) = (Some(target.to_owned()), Some(detail.to_owned()));
+            (LogKind::MfaEnroll, success, target, detail)
+        };
+        let on = row(true, "bob", "code at kinit on");
+        assert_eq!(
+            rows,
+            vec![
+                on.clone(),
+                on.clone(),
+                row(true, "bob", "code at kinit off"),
+                on.clone(),
+                on.clone(),
+                on,
+                row(false, "ann", CODE_AT_KINIT_UNSET),
+            ],
+            "one row each way, none for a choice already made"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_the_fill_carries_the_code_at_kinit_to_the_kdcs_memory() {
+        use lldap_domain_handlers::enforcement::{PolicyCache, fill_policy_cache};
+        let _clock = pin_clock(AT);
+        let cache: &'static PolicyCache = Box::leak(Box::default());
+        let (setup, handler) = setup_handler().await;
+        let handler = handler.with_policy_cache(cache);
+        let (bob, ..) = enroll_user(&handler, &setup, "bob").await;
+        let mut held = Vec::new();
+        for on in [true, false] {
+            handler.set_code_at_kinit(&bob, on).await.unwrap();
+            fill_policy_cache(&handler, cache).await.unwrap();
+            let facts = cache.get().facts_of(&bob).cloned();
+            held.push(facts.map(|facts| (facts.enrolled, facts.code_at_kinit)));
+        }
+        assert_eq!(held, vec![Some((true, true)), Some((true, false))]);
     }
 
     #[tokio::test]

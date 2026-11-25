@@ -838,7 +838,7 @@ w1_min_web() {
     sealed=""
     [ -z "$key" ] || sealed="$(printf '%s' "$short" | wire_seal_in "$key" "$MIN_USER")"
     if [ -z "$sealed" ]; then
-        w1_say min-web-finish FAIL "not run: no transport key, or OpenSSL did not seal (see min-key.err, seal.err)"
+        w1_say min-web-finish FAIL "not run: no transport key (see min-key.err)"
     else
         w1_min_page min-web-finish "$typed" \
             "WIRE start-key=yes finish-envelope=yes rewrite=swapped finish-status=400 graphql-seal=no create-sent=no page=stayed" \
@@ -1056,7 +1056,7 @@ else
     W1_MARK="$(log_mark)"
     refused=no
     if [ -z "$NUL_SEALED" ]; then
-        WIRE_LINE="not run: no transport key, or OpenSSL did not seal (see nul-key.err, seal.err)" WIRE_ALERT=""
+        WIRE_LINE="not run: no transport key (see nul-key.err)" WIRE_ALERT=""
     else
         wire_page nul-web change "$NUL" "$(w1_gen 24)" swap "$NUL_SEALED"
         if [ "$WIRE_LINE" = "WIRE start-key=yes finish-envelope=yes rewrite=swapped finish-status=400 graphql-seal=no create-sent=no page=stayed" ] \

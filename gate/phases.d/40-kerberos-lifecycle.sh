@@ -172,7 +172,7 @@ env_nosync() {
     new="$(env_gen)"
     sealed="$(wire_seal "$ENV_KEY" "$new" "$ENV_PLAIN")"
     [ -n "$sealed" ] || {
-        p_bad "[U1.env-nosync-refused] OpenSSL did not seal (see seal.err)"
+        p_bad "[U1.env-nosync-refused] no seal order could be made: the transport key is empty"
         return
     }
     mark="$(log_mark)"
@@ -196,7 +196,7 @@ env_other() {
     typed="$(env_gen)"
     sealed="$(wire_seal "$ENV_KEY" "$typed" "$ENV_PLAIN")"
     [ -n "$sealed" ] || {
-        p_bad "[U1.env-other-label] OpenSSL did not seal (see seal.err)"
+        p_bad "[U1.env-other-label] no seal order could be made: the transport key is empty"
         return
     }
     mark="$(log_mark)"
@@ -204,12 +204,12 @@ env_other() {
     env_sides "$ENV_USER" "$typed" "$ENV_OLD"
     if [ "$WIRE_LINE" = "$want" ] && [ "$ENV_GOT" = "$ENV_BOTH_OLD" ] &&
         grep -qF 'the Kerberos password envelope did not open' <<<"$WIRE_ALERT"; then
-        p_ok "[U1.env-other-label] $ENV_USER's finish with an envelope sealed under $ENV_PLAIN's label: 400 '$WIRE_ALERT', and bind and kinit keep the old password"
+        p_ok "[U1.env-other-label] $ENV_USER's finish with an envelope sealed under $ENV_PLAIN's label for the same start: 400 '$WIRE_ALERT', and bind and kinit keep the old password"
     else
         p_bad "[U1.env-other-label] $WIRE_LINE (alert: ${WIRE_ALERT:-none}); $ENV_GOT; want $want, 'did not open', $ENV_BOTH_OLD"
     fi
     fail_row U1.env-other-label-row PASSWORD_CHANGE "$ENV_USER" \
-        "the Kerberos password envelope did not open: Decryption failed" "$mark" HTTP
+        "the Kerberos password envelope did not open" "$mark" HTTP
 }
 
 if ! docker image inspect "$WIRE_IMAGE" >/dev/null 2>&1; then
@@ -220,11 +220,11 @@ else
         env_synced
         graphql '{ kerberosInfo { publicKeyDerBase64 } }' >"$D/envelope-key.json" 2>&1 &&
             ENV_KEY="$(json_get kerberosInfo.publicKeyDerBase64 <"$D/envelope-key.json" 2>/dev/null)"
-        if [ -n "$ENV_KEY" ] && gexec sh -c 'command -v openssl' >/dev/null 2>&1; then
+        if [ -n "$ENV_KEY" ]; then
             env_nosync
             env_other
         else
-            p_skip "[U1.env-openssl] no transport key or no openssl in the image (see envelope-key.json): the two refused-envelope rows did not run"
+            p_skip "[U1.env-key] no transport key (see envelope-key.json): the two refused-envelope rows did not run"
         fi
     fi
     for u in "$ENV_USER" "$ENV_PLAIN"; do

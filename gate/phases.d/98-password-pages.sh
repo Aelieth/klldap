@@ -1,7 +1,8 @@
 # shellcheck shell=bash
 # Phase: U1′'s password pages and the set-password tool. register/start gives a key only to a
-# synced user; that user's finish carries the password sealed for that user (OAEP label
-# klldap-kerberos-envelope-v1:<user>), and the server commits it to both stores in one transaction.
+# synced user; that user's finish carries the password sealed for that user and that start (OAEP
+# label klldap-kerberos-envelope-v2:<user>:<the start's server data>), and the server commits it to
+# both stores in one transaction. A finish is taken once, from the session that made its start.
 
 # Passwords and tokens travel in this phase's variables and helpers: nothing of it is traced. The
 # tracing state is put back at the end.
@@ -14,7 +15,8 @@ PP_PM="${PP_RUN}m" PP_SYNC="${PP_RUN}s" PP_PLAIN="${PP_RUN}p" PP_BIG="${PP_RUN}b
 PP_GONE_MUT='mutation($u: String!, $e: String!) { syncKerberosPassword(userId: $u, encryptedPassword: $e) }'
 PP_SET='mutation($id: String!, $pw: String!) { setUserPassword(userId: $id, password: $pw) { ok } }'
 PP_UPD='mutation($u: UpdateUserInput!) { updateUser(user: $u) { ok } }'
-PP_KEY="" PP_GOT="" PP_WIRE="" PP_ALERT=""
+PP_KEY="" PP_GOT="" PP_WIRE="" PP_ALERT="" PP_OTHER="" PP_AGAIN_SAID=""
+PP_UNFINISHABLE="this registration cannot be finished; start again"
 PP_BOTH_NEW="bind-new=yes bind-old=no kinit-new=yes kinit-old=no"
 PP_BOTH_OLD="bind-new=no bind-old=yes kinit-new=no kinit-old=yes"
 PP_BROWSER_IMAGE="mcr.microsoft.com/playwright@sha256:766137e2d9caad4744187e53cdc89320ba6f2eb57cff097374020944b44dd0a9"
@@ -64,17 +66,8 @@ pp_binds() {
     PP_GOT="bind-new=$bn bind-old=$bo"
 }
 
-# pp_seal <password> <label user>: the page's envelope, sealed by the image's OpenSSL.
-pp_seal() {
-    local hex
-    hex="$(printf '%s' "klldap-kerberos-envelope-v1:$2" | python3 -c 'import sys; print(sys.stdin.buffer.read().hex())')"
-    printf '%s' "$1" | t docker exec -i -e KEY="$PP_KEY" -e HEX="$hex" "$CONTAINER" sh -c '
-        printf %s "$KEY" | base64 -d >/tmp/gate_pp.der &&
-            openssl rsa -RSAPublicKey_in -inform DER -in /tmp/gate_pp.der -pubout -out /tmp/gate_pp.pem 2>/dev/null &&
-            openssl pkeyutl -encrypt -pubin -inkey /tmp/gate_pp.pem -pkeyopt rsa_padding_mode:oaep \
-                -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256 -pkeyopt "rsa_oaep_label:$HEX" | base64 -w0
-        rc=$?; rm -f /tmp/gate_pp.der /tmp/gate_pp.pem; exit $rc' 2>>"$PP_D/seal.err"
-}
+# pp_seal <password> <label user>: a seal order; the page's driver seals it for the page's own start.
+pp_seal() { wire_seal "$PP_KEY" "$1" "$2"; }
 
 pp_register() {
     local tok="$1" user="$2" pw="$3"
@@ -120,9 +113,8 @@ print("yes" if os.environ["U"] in [u["id"] for u in json.load(sys.stdin)["users"
 pp_setup() {
     local pm_gid
     graphql '{ kerberosInfo { publicKeyDerBase64 } }' >"$PP_D/key.json" 2>&1 &&
-        PP_KEY="$(json_get kerberosInfo.publicKeyDerBase64 <"$PP_D/key.json")" &&
-        gexec sh -c 'command -v openssl' >/dev/null 2>&1 || {
-        p_bad "[U1.pages-setup] no transport key or no openssl in the image (see key.json)"
+        PP_KEY="$(json_get kerberosInfo.publicKeyDerBase64 <"$PP_D/key.json")" && [ -n "$PP_KEY" ] || {
+        p_bad "[U1.pages-setup] no transport key (see key.json)"
         return 1
     }
     pm_gid="$(graphql '{ groups { id displayName } }' '{}' | GROUP=lldap_password_manager python3 -c '
@@ -206,22 +198,80 @@ pp_manager() {
     fi
 }
 
-# pp_wire <tag> <change|create> <user> <typed> [<add|swap> <envelope>] [<mail>]: PP_WIRE, PP_ALERT.
+# pp_wire <tag> <change|create> <user> <typed> [<add|swap> <seal order>] [<mail>]: PP_WIRE, PP_ALERT.
+# With PP_OTHER_TOKEN set, a copy of the page's finish goes first with that bearer (PP_OTHER: its
+# status and body); with PP_AGAIN=1 the page's finish goes once more with the page's own token
+# (PP_AGAIN_SAID).
 pp_wire() {
     local tag="$1" kind="$2" user="$3" typed="$4" mode="${5:-}" envelope="${6:-}" mail="${7:-}"
     docker rm -f "$PP_BROWSER_CTN" >/dev/null 2>&1 || true
     (
         export BROWSER_ADMIN_PASS="$ADMIN_PASS" BROWSER_PASS="$typed" BROWSER_FINISH_ENVELOPE="$envelope"
+        export BROWSER_FINISH_OTHER_TOKEN="${PP_OTHER_TOKEN:-}"
         timeout 180 docker run --rm --name "$PP_BROWSER_CTN" --network "$NET" --init --shm-size=1g \
             --user "$(id -u):$(id -g)" --entrypoint node \
             -v "$GATE_ROOT/lib/password-wire.mjs:/work/password-wire.mjs:ro" -v "$PP_D:/out" \
             -e HOME=/tmp/home -e BROWSER_OUT=/out -e BROWSER_URL="http://${CONTAINER}:17170" \
             -e BROWSER_PAGE="$kind" -e BROWSER_USER="$user" -e BROWSER_TAG="$tag" -e BROWSER_MAIL="$mail" \
             -e BROWSER_FINISH_MODE="$mode" -e BROWSER_ADMIN_PASS -e BROWSER_PASS -e BROWSER_FINISH_ENVELOPE \
+            -e BROWSER_FINISH_OTHER_TOKEN -e BROWSER_FINISH_AGAIN="${PP_AGAIN:-}" \
             "$PP_BROWSER_IMAGE" /work/password-wire.mjs >"$PP_D/wire-$tag.out" 2>"$PP_D/wire-$tag.err"
     )
     PP_WIRE="$(grep -m1 '^WIRE \|^ROW wire FAIL' "$PP_D/wire-$tag.out" 2>/dev/null || echo "no line (see wire-$tag.err)")"
     PP_ALERT="$(grep -m1 '^ALERT ' "$PP_D/wire-$tag.out" 2>/dev/null | sed 's/^ALERT //')"
+    PP_OTHER="$(grep -m1 '^OTHER ' "$PP_D/wire-$tag.out" 2>/dev/null | sed 's/^OTHER //')"
+    PP_AGAIN_SAID="$(grep -m1 '^AGAIN ' "$PP_D/wire-$tag.out" 2>/dev/null | sed 's/^AGAIN //')"
+}
+
+# pp_refusals <user> <mark>: the failed password_change rows for the user after the mark, as
+# "<count> <protocol> <detail> | ...".
+pp_refusals() {
+    graphql "query(\$id: ID!, \$t: String!) { logs(filter: {kinds: [PASSWORD_CHANGE], target: \$t, success: false}, afterId: \$id, limit: 20) { protocol detail } }" \
+        '{"id": "'"$2"'", "t": "'"$1"'"}' 2>/dev/null | python3 -c '
+import json, sys
+rows = json.load(sys.stdin)["logs"]
+print(len(rows), " | ".join("%s %s" % (r.get("protocol"), r.get("detail")) for r in rows))' 2>/dev/null
+}
+
+# pp_once <row> <tag> <what>: one change of the synced user through the page, with the extra finish
+# that PP_OTHER_TOKEN or PP_AGAIN names. The extra one must be a 401 with the one sentence and one
+# failed password_change row, while the page's own finish is taken and both stores hold its password.
+pp_once() {
+    local row="$1" tag="$2" what="$3" new mark said rows=""
+    local want="WIRE start-key=yes finish-envelope=yes rewrite=none finish-status=200 graphql-seal=no create-sent=no page=done"
+    new="$(pp_gen)"
+    mark="$(log_mark)"
+    pp_wire "$tag" change "$PP_SYNC" "$new"
+    said="${PP_OTHER:-$PP_AGAIN_SAID}"
+    pp_sides "$PP_SYNC" "$new" "$PP_SYNC_PASS"
+    if [ "$PP_WIRE" = "$want" ] && [ "$PP_GOT" = "$PP_BOTH_NEW" ] &&
+        grep -q '^status=401 ' <<<"$said" && grep -qF "$PP_UNFINISHABLE" <<<"$said"; then
+        PP_SYNC_PASS="$new"
+        p_ok "[$row] $what: 401 '$PP_UNFINISHABLE'; the page's own finish is taken, and bind and kinit hold its password"
+    else
+        pp_bind "$PP_SYNC" "$new" && PP_SYNC_PASS="$new"
+        p_bad "[$row] the extra finish answered '${said:-nothing}'; $PP_WIRE ${PP_ALERT:+(alert: $PP_ALERT) }; $PP_GOT; want 401 '$PP_UNFINISHABLE', $want, $PP_BOTH_NEW"
+    fi
+    if [ -n "$mark" ]; then
+        for _ in $(seq 1 20); do
+            rows="$(pp_refusals "$PP_SYNC" "$mark")"
+            case "$rows" in "" | "0 "*) sleep 0.5 ;; *) break ;; esac
+        done
+        [ "${rows%% *}" = 1 ] && sleep 1 && rows="$(pp_refusals "$PP_SYNC" "$mark")"
+    fi
+    if [ "$rows" = "1 HTTP $PP_UNFINISHABLE" ]; then
+        p_ok "[$row-row] one failed password_change row names $PP_SYNC after the refusal: protocol HTTP, '$PP_UNFINISHABLE'"
+    else
+        p_bad "[$row-row] failed password_change rows for $PP_SYNC after the marker: ${rows:-unread}; want one, protocol HTTP, '$PP_UNFINISHABLE'"
+    fi
+}
+
+# A finish is taken only from the session that made its start, and once.
+pp_finish_rows() {
+    PP_OTHER_TOKEN="$TOKEN" PP_AGAIN="" pp_once U1.finish-other-session finish-other \
+        "the page's finish presented first by the admin's other session"
+    PP_OTHER_TOKEN="" PP_AGAIN=1 pp_once U1.finish-once finish-again \
+        "the page's finish presented a second time by the page's own session"
 }
 
 pp_wire_rows() {
@@ -257,7 +307,7 @@ pp_inject_nosync() {
     new="$(pp_gen)"
     sealed="$(pp_seal "$new" "$PP_PLAIN")"
     [ -n "$sealed" ] || {
-        p_bad "[$row] OpenSSL did not seal (see seal.err)"
+        p_bad "[$row] no seal order could be made: the transport key is empty"
         return
     }
     mark="$(log_mark)"
@@ -273,14 +323,14 @@ pp_inject_nosync() {
         "a Kerberos password envelope is taken only for a user with Kerberos sync" "$mark" HTTP
 }
 
-# The server commits the envelope's password, sealed by OpenSSL with the user's label, not the typed one.
+# The server commits the envelope's password, sealed with the user's label for the page's own start, not the typed one.
 pp_swap_label() {
     local row="U1.envelope-label" typed sealed p2 t_bind=no t_kinit=no
     local want="WIRE start-key=yes finish-envelope=yes rewrite=swapped finish-status=200 graphql-seal=no create-sent=no page=done"
     typed="$(pp_gen)" p2="$(pp_gen)"
     sealed="$(pp_seal "$p2" "$PP_SYNC")"
     [ -n "$sealed" ] || {
-        p_bad "[$row] OpenSSL did not seal (see seal.err)"
+        p_bad "[$row] no seal order could be made: the transport key is empty"
         return
     }
     pp_wire sync-label change "$PP_SYNC" "$typed" swap "$sealed"
@@ -289,7 +339,7 @@ pp_swap_label() {
     pp_kinit "$PP_SYNC" "$typed" && t_kinit=yes
     if [ "$PP_WIRE" = "$want" ] && [ "$PP_GOT" = "$PP_BOTH_NEW" ] && [ "$t_bind $t_kinit" = "no no" ]; then
         PP_SYNC_PASS="$p2"
-        p_ok "[$row] an envelope sealed with 'klldap-kerberos-envelope-v1:$PP_SYNC' opens: bind and kinit take its password, not the typed one"
+        p_ok "[$row] an envelope sealed with 'klldap-kerberos-envelope-v2:$PP_SYNC:<the start's server data>' opens: bind and kinit take its password, not the typed one"
     else
         pp_bind "$PP_SYNC" "$p2" && PP_SYNC_PASS="$p2"
         p_bad "[$row] $PP_WIRE ${PP_ALERT:+(alert: $PP_ALERT) }; envelope's password $PP_GOT; typed bind=$t_bind kinit=$t_kinit; want $want, $PP_BOTH_NEW, typed no no"
@@ -302,7 +352,7 @@ pp_swap_other() {
     typed="$(pp_gen)"
     sealed="$(pp_seal "$typed" "$PP_PLAIN")"
     [ -n "$sealed" ] || {
-        p_bad "[$row] OpenSSL did not seal (see seal.err)"
+        p_bad "[$row] no seal order could be made: the transport key is empty"
         return
     }
     mark="$(log_mark)"
@@ -310,12 +360,12 @@ pp_swap_other() {
     pp_sides "$PP_SYNC" "$typed" "$PP_SYNC_PASS"
     if [ "$PP_WIRE" = "$want" ] && [ "$PP_GOT" = "$PP_BOTH_OLD" ] &&
         grep -q 'the Kerberos password envelope did not open' <<<"$PP_ALERT"; then
-        p_ok "[$row] $PP_SYNC's finish with an envelope sealed for $PP_PLAIN: 400 '$PP_ALERT', and bind and kinit keep the old password"
+        p_ok "[$row] $PP_SYNC's finish with an envelope sealed for $PP_PLAIN and the same start: 400 '$PP_ALERT', and bind and kinit keep the old password"
     else
         p_bad "[$row] $PP_WIRE (alert: ${PP_ALERT:-none}); $PP_GOT; want $want, 'did not open', $PP_BOTH_OLD"
     fi
     fail_row "$row-row" PASSWORD_CHANGE "$PP_SYNC" \
-        "the Kerberos password envelope did not open: Decryption failed" "$mark" HTTP
+        "the Kerberos password envelope did not open" "$mark" HTTP
 }
 
 pp_create_big() {
@@ -880,6 +930,7 @@ if pp_setup; then
         pp_inject_nosync
         pp_swap_label
         pp_swap_other
+        pp_finish_rows
         pp_create_big
         pp_create_synced
         pp_min_page

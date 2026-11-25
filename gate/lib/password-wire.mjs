@@ -1,9 +1,14 @@
 // What a password page sends, run as the admin: the start key, the finish envelope and status, and
 // GraphQL's syncKerberosPassword or createUser; for the create page also whether it shows the
-// Kerberos switch. BROWSER_FINISH_MODE add|swap puts BROWSER_FINISH_ENVELOPE into the finish body.
+// Kerberos switch. BROWSER_FINISH_MODE add|swap puts BROWSER_FINISH_ENVELOPE into the finish body;
+// an envelope "seal:<key>:<user>:<plaintext, base64>" is sealed here, when the page's finish is
+// held, under the label of that finish's own server data. BROWSER_FINISH_OTHER_TOKEN sends a copy
+// of the held finish with that bearer before the page's own goes on (line OTHER);
+// BROWSER_FINISH_AGAIN=1 sends the page's finish once more with the page's own token (line AGAIN).
 // Values are never printed.
 
 import { spawn } from "node:child_process";
+import { constants, createPublicKey, publicEncrypt } from "node:crypto";
 import { readdirSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 
@@ -17,7 +22,13 @@ const adminPass = process.env.BROWSER_ADMIN_PASS || "";
 const typed = process.env.BROWSER_PASS || "";
 const finishMode = process.env.BROWSER_FINISH_MODE || "";
 const finishEnvelope = process.env.BROWSER_FINISH_ENVELOPE || "";
-const secrets = [adminPass, typed, finishEnvelope].filter((s) => s.length > 0);
+const otherToken = process.env.BROWSER_FINISH_OTHER_TOKEN || "";
+const finishAgain = process.env.BROWSER_FINISH_AGAIN === "1";
+const holdsFinish = Boolean(finishMode || otherToken || finishAgain);
+const LABEL = "klldap-kerberos-envelope-v2";
+const sealOrder = finishEnvelope.startsWith("seal:") ? finishEnvelope.split(":") : null;
+const sealedPlain = sealOrder ? Buffer.from(sealOrder[3] || "", "base64").toString("utf8") : "";
+const secrets = [adminPass, typed, finishEnvelope, otherToken, sealedPlain].filter((s) => s.length > 0);
 const WAIT_MS = 30000;
 const START = "/auth/opaque/register/start";
 const FINISH = "/auth/opaque/register/finish";
@@ -37,6 +48,7 @@ const wire = {
   createSwitch: "none",
 };
 const startIds = new Set();
+let sentFinish = "";
 
 function say(line) {
   process.stdout.write(`${line}\n`);
@@ -95,22 +107,65 @@ function hasEnvelope(body) {
   return body.includes('"kerberos_password_envelope"') ? "yes" : "no";
 }
 
-function rewriteFinish(params) {
-  const body = postBody(params.request);
-  wire.finishEnvelope = hasEnvelope(body);
-  let out = body;
+// The envelope the finish carries: the given one, or the order's plaintext sealed to the order's
+// key for the order's user and this finish's server data.
+function envelopeFor(serverData) {
+  if (!sealOrder) return finishEnvelope;
+  const [, key, user, plain] = sealOrder;
+  const publicKey = createPublicKey({ key: Buffer.from(key, "base64"), format: "der", type: "pkcs1" });
+  const sealed = publicEncrypt(
+    {
+      key: publicKey,
+      padding: constants.RSA_PKCS1_OAEP_PADDING,
+      oaepHash: "sha256",
+      oaepLabel: Buffer.from(`${LABEL}:${user}:${serverData}`, "utf8"),
+    },
+    Buffer.from(plain || "", "base64"),
+  );
+  return sealed.toString("base64");
+}
+
+function rewritten(body) {
+  let json;
   try {
-    const json = JSON.parse(body);
-    wire.rewrite = "kerberos_password_envelope" in json ? "swapped" : "added";
-    json.kerberos_password_envelope = finishEnvelope;
-    out = JSON.stringify(json);
+    json = JSON.parse(body);
   } catch {
     wire.rewrite = "unparsed";
+    return body;
   }
-  send("Fetch.continueRequest", {
-    requestId: params.requestId,
-    postData: Buffer.from(out, "utf8").toString("base64"),
-  }).catch(() => {
+  let envelope;
+  try {
+    envelope = envelopeFor(json.server_data || "");
+  } catch {
+    wire.rewrite = "unsealed";
+    return body;
+  }
+  wire.rewrite = "kerberos_password_envelope" in json ? "swapped" : "added";
+  json.kerberos_password_envelope = envelope;
+  return JSON.stringify(json);
+}
+
+async function postFinish(body, token) {
+  try {
+    const res = await fetch(`${base}${FINISH}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      body,
+    });
+    return `status=${res.status} body=${redact(await res.text()).replace(/\s+/g, " ").slice(0, 300)}`;
+  } catch {
+    return "status=unsent body=";
+  }
+}
+
+async function holdFinish(params) {
+  const body = postBody(params.request);
+  wire.finishEnvelope = hasEnvelope(body);
+  sentFinish = finishMode ? rewritten(body) : body;
+  if (otherToken) wire.other = await postFinish(sentFinish, otherToken);
+  const sent = { requestId: params.requestId };
+  if (finishMode) sent.postData = Buffer.from(sentFinish, "utf8").toString("base64");
+  send("Fetch.continueRequest", sent).catch(() => {
     wire.rewrite = "not-sent";
   });
 }
@@ -118,14 +173,16 @@ function rewriteFinish(params) {
 function onEvent(msg) {
   const params = msg.params || {};
   if (msg.method === "Fetch.requestPaused") {
-    rewriteFinish(params);
+    holdFinish(params).catch(() => {
+      wire.rewrite = "not-sent";
+    });
     return;
   }
   if (msg.method === "Network.requestWillBeSent") {
     const url = params.request?.url || "";
     const body = postBody(params.request);
     if (url.includes(START)) startIds.add(params.requestId);
-    if (url.includes(FINISH) && !finishMode) wire.finishEnvelope = hasEnvelope(body);
+    if (url.includes(FINISH) && !holdsFinish) wire.finishEnvelope = hasEnvelope(body);
     if (url.includes("/api/graphql") && body.includes("syncKerberosPassword")) wire.graphqlSeal = "yes";
     if (url.includes("/api/graphql") && body.includes("createUser")) {
       wire.createSent = "yes";
@@ -245,7 +302,7 @@ async function connect() {
   await send("Page.enable");
   await send("Runtime.enable");
   await send("Network.enable", { maxPostDataSize: 65536 });
-  if (finishMode) {
+  if (holdsFinish) {
     await send("Fetch.enable", { patterns: [{ urlPattern: `*${FINISH}*`, requestStage: "Request" }] });
   }
 }
@@ -314,6 +371,13 @@ async function openCreate() {
   }
 }
 
+// The page's own session token: the cookie the register routes read as the bearer.
+async function pageToken() {
+  const found = await send("Network.getCookies", { urls: [`${base}${FINISH}`] });
+  const cookie = (found.cookies || []).find((c) => c.name === "token");
+  return cookie ? cookie.value : "";
+}
+
 async function alertText() {
   return evalValue(`[...document.querySelectorAll(".alert-danger")].map((a) => a.textContent).join(" ").replace(/\\s+/g, " ").trim()`);
 }
@@ -344,6 +408,12 @@ try {
   );
   if (pageKind === "create") say(`CREATE kerberossync=${wire.createSync}`);
   if (pageKind === "create") say(`SWITCH kerberos=${wire.createSwitch}`);
+  if (otherToken) say(`OTHER ${wire.other || "status=none body="}`);
+  if (finishAgain) {
+    const token = sentFinish ? await pageToken() : "";
+    if (token) secrets.push(token);
+    say(`AGAIN ${token ? await postFinish(sentFinish, token) : "status=none body="}`);
+  }
   if (alert) say(`ALERT ${redact(alert).slice(0, 400)}`);
 } catch (err) {
   failed = true;

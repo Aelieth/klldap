@@ -407,20 +407,21 @@ kinit_pw() {
 
 WIRE_IMAGE="mcr.microsoft.com/playwright@sha256:766137e2d9caad4744187e53cdc89320ba6f2eb57cff097374020944b44dd0a9"
 
+# wire_seal <key> <plaintext> <label user>, wire_seal_in <key> <label user> (plaintext on stdin): a
+# seal order for wire_page. The page's driver seals it when it holds the page's finish, under the
+# label klldap-kerberos-envelope-v2:<label user>:<that finish's server data>, so the envelope belongs
+# to the start the page's own session made and goes out once, with that session.
 wire_seal() { printf '%s' "$2" | wire_seal_in "$1" "$3"; }
 
 wire_seal_in() {
-    local hex
-    hex="$(printf '%s' "klldap-kerberos-envelope-v1:$2" | python3 -c 'import sys; print(sys.stdin.buffer.read().hex())')"
-    t docker exec -i -e KEY="$1" -e HEX="$hex" "$CONTAINER" sh -c '
-        printf %s "$KEY" | base64 -d >/tmp/gate_wire.der &&
-            openssl rsa -RSAPublicKey_in -inform DER -in /tmp/gate_wire.der -pubout -out /tmp/gate_wire.pem 2>/dev/null &&
-            openssl pkeyutl -encrypt -pubin -inkey /tmp/gate_wire.pem -pkeyopt rsa_padding_mode:oaep \
-                -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256 -pkeyopt "rsa_oaep_label:$HEX" | base64 -w0
-        rc=$?; rm -f /tmp/gate_wire.der /tmp/gate_wire.pem; exit $rc' 2>>"$(phase_dir)/seal.err"
+    [ -n "$1" ] || return 1
+    printf 'seal:%s:%s:%s\n' "$1" "$2" "$(base64 -w0)"
 }
 
-# wire_page <tag> <change|create> <user> <typed> [<add|swap> <envelope>] [<mail>]: WIRE_LINE, WIRE_ALERT.
+# wire_page <tag> <change|create> <user> <typed> [<add|swap> <envelope or seal order>] [<mail>]:
+# WIRE_LINE, WIRE_ALERT. With WIRE_OTHER_TOKEN set, a copy of the page's finish goes first with that
+# bearer (WIRE_OTHER: its status and body); with WIRE_AGAIN=1 the page's finish goes once more with
+# the page's own token (WIRE_AGAIN).
 # shellcheck disable=SC2034
 wire_page() {
     local tag="$1" kind="$2" user="$3" typed="$4" mode="${5:-}" envelope="${6:-}" mail="${7:-}"
@@ -430,17 +431,21 @@ wire_page() {
     docker rm -f "$ctn" >/dev/null 2>&1 || true
     (
         export BROWSER_ADMIN_PASS="$ADMIN_PASS" BROWSER_PASS="$typed" BROWSER_FINISH_ENVELOPE="$envelope"
+        export BROWSER_FINISH_OTHER_TOKEN="${WIRE_OTHER_TOKEN:-}"
         timeout 180 docker run --rm --name "$ctn" --network "$NET" --init --shm-size=1g \
             --user "$(id -u):$(id -g)" --entrypoint node \
             -v "$GATE_ROOT/lib/password-wire.mjs:/work/password-wire.mjs:ro" -v "$dir:/out" \
             -e HOME=/tmp/home -e BROWSER_OUT=/out -e BROWSER_URL="http://${CONTAINER}:17170" \
             -e BROWSER_PAGE="$kind" -e BROWSER_USER="$user" -e BROWSER_TAG="$tag" -e BROWSER_MAIL="$mail" \
             -e BROWSER_FINISH_MODE="$mode" -e BROWSER_ADMIN_PASS -e BROWSER_PASS -e BROWSER_FINISH_ENVELOPE \
+            -e BROWSER_FINISH_OTHER_TOKEN -e BROWSER_FINISH_AGAIN="${WIRE_AGAIN:-}" \
             "$WIRE_IMAGE" /work/password-wire.mjs >"$dir/wire-$tag.out" 2>"$dir/wire-$tag.err"
     )
     docker rm -f "$ctn" >/dev/null 2>&1 || true
     WIRE_LINE="$(grep -m1 '^WIRE \|^ROW wire FAIL' "$dir/wire-$tag.out" 2>/dev/null || echo "no line (see wire-$tag.err)")"
     WIRE_ALERT="$(grep -m1 '^ALERT ' "$dir/wire-$tag.out" 2>/dev/null | sed 's/^ALERT //')"
+    WIRE_OTHER="$(grep -m1 '^OTHER ' "$dir/wire-$tag.out" 2>/dev/null | sed 's/^OTHER //')"
+    WIRE_AGAIN_SAID="$(grep -m1 '^AGAIN ' "$dir/wire-$tag.out" 2>/dev/null | sed 's/^AGAIN //')"
 }
 
 gate_summary() {

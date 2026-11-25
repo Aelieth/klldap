@@ -16,6 +16,7 @@ use lldap_domain_handlers::handler::{BackendHandler, BindRequest, LoginHandler};
 use lldap_domain_handlers::password::{
     PasswordChangeError, PasswordSync, change_password_everywhere, min_length_of,
 };
+use lldap_domain_handlers::warn_limited;
 use lldap_domain_model::error::DomainError;
 use lldap_mfa::{MFA_ENROLLMENT_REQUIRED, TOTP_SEPARATOR, TotpFailure, totp_failure};
 use lldap_opaque_handler::OpaqueHandler;
@@ -71,10 +72,24 @@ pub(crate) async fn bind(
             code: LdapResultCode::Unavailable,
             message: cause,
         }),
-        Err(e) => Err(LdapError {
-            code: LdapResultCode::InvalidCredentials,
-            message: totp_diagnostic(&e.to_string()),
-        }),
+        Err(e) => {
+            say_fault(&e);
+            Err(LdapError {
+                code: LdapResultCode::InvalidCredentials,
+                message: totp_diagnostic(&e.to_string()),
+            })
+        }
+    }
+}
+
+/// A refusal has its row; an error of the server's own is said here, for the answer hides it.
+fn say_fault(e: &DomainError) {
+    let refused = matches!(
+        e,
+        DomainError::AuthenticationError(_) | DomainError::AuthenticationProtocolError(_)
+    );
+    if !refused {
+        warn_limited!("A bind was refused on an error of the server's own: {e}");
     }
 }
 
@@ -950,5 +965,24 @@ pub mod tests {
                 "Missing either user_id or password".to_string(),
             )])
         );
+    }
+
+    #[tokio::test]
+    async fn test_a_bind_says_an_error_of_the_servers_own_within_the_budget_and_no_refusal() {
+        use lldap_domain_handlers::logging::capture::{BUDGET, Lines};
+        type Failure = fn() -> DomainError;
+        let refusal: Failure = || DomainError::AuthenticationError("for bob".to_owned());
+        let fault: Failure = || DomainError::InternalError("the database is away".to_owned());
+        for (label, failure, said) in [("a refusal", refusal, 0), ("a fault", fault, BUDGET)] {
+            let mut mock = MockTestBackendHandler::new();
+            mock.expect_bind().returning(move |_| Err(failure()));
+            let (lines, _guard) = Lines::capture();
+            for _ in 0..100 {
+                let answered = bind(&mock, UserId::new("bob"), "pass").await;
+                let code = answered.map_err(|e| e.code);
+                assert_eq!(code, Err(LdapResultCode::InvalidCredentials), "{label}");
+            }
+            assert_eq!(lines.take_loud().len(), said, "{label}");
+        }
     }
 }

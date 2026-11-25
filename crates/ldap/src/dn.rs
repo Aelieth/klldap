@@ -1,7 +1,7 @@
 use crate::core::error::{LdapError, LdapResult};
 use ldap3_proto::LdapResultCode;
 use lldap_domain::types::{GroupName, UserId};
-use tracing::{debug, warn};
+use tracing::debug;
 
 pub use lldap_domain::types::DEFAULT_PRIMARY_USER_OU;
 pub const DEFAULT_PRIMARY_GROUP_OU: &str = "groups";
@@ -134,7 +134,7 @@ pub fn parse_distinguished_name(dn: &str) -> LdapResult<Vec<(String, String)>> {
         .collect();
 
     if let Err(e) = &result {
-        warn!(?dn, error = ?e, "Invalid DN syntax received from client");
+        debug!(?dn, error = ?e, "Invalid DN syntax received from client");
     }
     result
 }
@@ -283,5 +283,20 @@ pub fn build_group_dn(group_name: &GroupName, internal_ou: &str, base_dn_str: &s
         format!("cn={},{}", group_name, base_dn_str)
     } else {
         format!("cn={},{}", group_name, ou_part + "," + base_dn_str)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lldap_domain_handlers::logging::capture::Lines;
+    use tracing::Level;
+
+    #[test]
+    fn test_a_malformed_dn_is_refused_and_both_its_lines_are_at_debug() {
+        let (lines, _guard) = Lines::capture();
+        let parsed = parse_distinguished_name("uid=bob,people");
+        let levels: Vec<_> = lines.take().into_iter().map(|line| line.level).collect();
+        assert_eq!((parsed.is_err(), levels), (true, vec![Level::DEBUG; 2]));
     }
 }

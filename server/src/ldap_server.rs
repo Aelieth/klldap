@@ -7,13 +7,14 @@ use anyhow::{Context, Result};
 use ldap3_proto::{LdapCodec, control::LdapControl, proto::LdapMsg, proto::LdapOp};
 use lldap_access_control::AccessControlledBackendHandler;
 use lldap_domain_handlers::handler::{BackendHandler, LoginHandler};
+use lldap_domain_handlers::{info_limited, warn_limited};
 use lldap_kerberos::boot::with_port_hint;
 use lldap_ldap::{LdapHandler, LdapInfo};
 use lldap_opaque_handler::OpaqueHandler;
 use std::net::IpAddr;
 use tokio_rustls::TlsAcceptor as RustlsTlsAcceptor;
 use tokio_util::codec::{FramedRead, FramedWrite};
-use tracing::{debug, error, info, instrument};
+use tracing::{debug, info, instrument};
 use uuid::Uuid;
 
 #[instrument(skip_all, level = "debug", name = "LDAP request", fields(session_id = %session.session_uuid()))]
@@ -31,7 +32,7 @@ where
     let msg = msg.context("while receiving LDAP op")?;
     for control in msg.ctrl.iter() {
         if let LdapControl::Unknown { oid, .. } = control {
-            info!("Received unknown control: {}, ignoring", oid);
+            debug!("Received unknown control: {}, ignoring", oid);
         }
     }
     debug!(?msg);
@@ -54,7 +55,7 @@ where
             }
 
             if is_real_operation {
-                info!("LDAP request session_id: {}", session.session_uuid());
+                info_limited!("LDAP request session_id: {}", session.session_uuid());
             } else {
                 debug!("LDAP request session_id: {}", session.session_uuid());
             }
@@ -178,7 +179,7 @@ where
                 handle_ldap_stream(stream, handler, ldap_info, peer).await
             }
         })
-        .map_err(|err: anyhow::Error| error!("[LDAP] Service Error: {:#}", err))
+        .map_err(|err: anyhow::Error| warn_limited!("[LDAP] Service Error: {:#}", err))
     };
 
     info!("Starting the LDAP server on port {}", config.ldap_port);
@@ -203,7 +204,7 @@ where
                     handle_ldap_stream(tls_stream, handler, ldap_info, peer).await
                 }
             })
-            .map_err(|err: anyhow::Error| error!("[LDAPS] Service Error: {:#}", err))
+            .map_err(|err: anyhow::Error| warn_limited!("[LDAPS] Service Error: {:#}", err))
         };
 
         info!(
@@ -497,6 +498,47 @@ mod tests {
         assert_eq!(
             got, wanted,
             "per row: the bind's answer, who the connection is after it, its one row"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_an_unknown_control_prints_nothing_and_a_requests_line_shares_the_budget() {
+        use lldap_domain_handlers::logging::capture::{BUDGET, Lines};
+        use lldap_test_utils::MockTestBackendHandler;
+        let info = LdapInfo::new("dc=example,dc=com", Vec::new(), Vec::new()).unwrap();
+        let info: &'static LdapInfo = Box::leak(Box::new(info));
+        let backend = AccessControlledBackendHandler::new(MockTestBackendHandler::new());
+        let mut session = LdapHandler::new(backend, info, Uuid::new_v4(), None);
+        let unknown = || LdapControl::Unknown {
+            oid: "1.2.3.4".to_owned(),
+            criticality: false,
+            value: None,
+        };
+        let whoami = LdapOp::ExtendedRequest(LdapExtendedRequest {
+            name: OID_WHOAMI.to_owned(),
+            value: None,
+        });
+        let (lines, _guard) = Lines::capture();
+        let mut answers: Vec<LdapMsg> = Vec::new();
+        for msgid in 0..100 {
+            let msg = LdapMsg {
+                msgid,
+                op: whoami.clone(),
+                ctrl: vec![unknown(), unknown()],
+            };
+            let served = handle_ldap_message(Ok(msg), &mut answers, &mut session).await;
+            assert!(served.unwrap(), "{msgid}");
+        }
+        let loud = lines.take_loud();
+        let of_requests = |text: &str| loud.iter().filter(|l| l.text.starts_with(text)).count();
+        assert_eq!(
+            (
+                of_requests("Received unknown control"),
+                of_requests("LDAP request session_id") > 0,
+                loud.len()
+            ),
+            (0, true, BUDGET),
+            "200 unknown controls on 100 unbound requests: {loud:?}"
         );
     }
 }

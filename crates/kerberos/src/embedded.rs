@@ -4322,6 +4322,48 @@ pub(crate) mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn test_an_adopted_principal_keeps_the_flags_the_renewable_life_and_the_strings_it_had() {
+        use krb5_kdc::{KDB_DISALLOW_FORWARDABLE, KDB_REQUIRES_PRE_AUTH};
+        const FLAGS: u32 = KDB_REQUIRES_PRE_AUTH | KDB_DISALLOW_FORWARDABLE;
+        let temp = TempRealm::new();
+        let (embedded, store) = temp.embedded();
+        let name = user_principal(&UserId::new("gina"));
+        unmarked(&embedded, "gina", false);
+        put_policy(&store, "min12", 12, 86_400);
+        bind_policy(&embedded, &name, "min12");
+        in_change(&embedded.own(), |s| {
+            let fields = AdminFields {
+                attributes: Some(FLAGS),
+                max_renewable_life: Some(7200),
+                ..Default::default()
+            };
+            s.apply_admin_fields_in(&name, "EXAMPLE.COM", fields, "test")?;
+            s.set_string_in(&name, "EXAMPLE.COM", "note", Some("kadmin"), "test")
+        })
+        .unwrap();
+        let kept = || {
+            let guard = store.read().unwrap();
+            let p = guard.get_name(&name)?;
+            let flags = p.attributes & !KDB_DISALLOW_ALL_TIX;
+            Some((flags, p.max_renewable_life, p.string_attrs.clone()))
+        };
+        let before = kept();
+        let adopted = embedded.commit_user(life("gina", UserStep::SyncOn)).await;
+        assert_eq!(
+            (before.clone(), adopted, binding(&store, "gina"), kept()),
+            (
+                Some((FLAGS, 7200, vec![("note".to_owned(), "kadmin".to_owned())])),
+                Some(Ok(())),
+                Some((true, None, false)),
+                before
+            ),
+            "adopted with its policy cleared: the flags besides the lock, the renewable life and \
+             the string attribute are the ones it had"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_an_add_with_a_password_onto_a_bound_principal_is_judged_once_by_its_old_policy() {
         use lldap_auth::opaque::server::generate_random_private_key;
         use lldap_domain::requests::CreateUserRequest;

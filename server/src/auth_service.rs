@@ -24,7 +24,7 @@ use lldap_auth::{
     login, password_reset, registration,
 };
 use lldap_domain::types::{GroupDetails, GroupName, LoginOutcome, UserId, kerberos_sync_enabled};
-use lldap_domain_handlers::enforcement::{Attempt, Door, admit, refuse_unreadable};
+use lldap_domain_handlers::enforcement::{Attempt, Door, admit, door_read, refuse_unreadable};
 use lldap_domain_handlers::handler::{
     BackendHandler, BindRequest, LoginHandler, MfaBackendHandler, PolicyBackendHandler,
     UserRequestFilter,
@@ -71,7 +71,7 @@ async fn create_jwt<Handler: TcpBackendHandler>(
     user: &UserId,
     groups: HashSet<GroupDetails>,
     password_reset: bool,
-) -> SignedToken {
+) -> TcpResult<SignedToken> {
     let claims = JWTClaims {
         exp: Utc::now() + chrono::Duration::days(1),
         iat: Utc::now(),
@@ -91,9 +91,8 @@ async fn create_jwt<Handler: TcpBackendHandler>(
     let token = jwt::Token::new(header, claims).sign_with_key(key).unwrap();
     handler
         .register_jwt(user, default_hash(token.as_str()), expiry)
-        .await
-        .unwrap();
-    token
+        .await?;
+    Ok(token)
 }
 
 fn parse_refresh_token(token: &str) -> TcpResult<(u64, UserId)> {
@@ -130,10 +129,8 @@ where
     Backend: TcpBackendHandler + BackendHandler + 'static,
 {
     let (refresh_token_hash, user) = get_refresh_token(request)?;
-    let found = data
-        .get_tcp_handler()
-        .check_token(refresh_token_hash, &user)
-        .await?;
+    let handler = data.get_tcp_handler();
+    let found = door_read(handler.check_token(refresh_token_hash, &user)).await?;
     if !found {
         logging::record_as(
             Some(&user),
@@ -174,7 +171,7 @@ where
             "Account disabled".to_string(),
         )));
     }
-    let groups = data.get_readonly_handler().get_user_groups(&user).await?;
+    let groups = door_read(data.get_readonly_handler().get_user_groups(&user)).await?;
     if let Some(cause) =
         refusal_while_degraded(&user, is_admin(&groups), kerberos_backend().unavailable())
     {
@@ -190,7 +187,7 @@ where
             return Err(refresh_refused(&user));
         }
     };
-    let token = create_jwt(data.get_tcp_handler(), jwt_key, &user, groups, false).await;
+    let token = create_jwt(data.get_tcp_handler(), jwt_key, &user, groups, false).await?;
     logging::record_as(Some(&user), LogKind::TokenRefresh, None, true, None);
     handler.note_sign_in(&user).await;
     Ok(HttpResponse::Ok()
@@ -234,16 +231,14 @@ where
         .match_info()
         .get("user_id")
         .ok_or_else(|| TcpError::BadRequest("Missing user ID".to_string()))?;
-    let user_results = data
-        .get_readonly_handler()
-        .list_users(
-            Some(UserRequestFilter::Or(vec![
-                UserRequestFilter::UserId(UserId::new(user_string)),
-                UserRequestFilter::Equality(UserColumn::Email, user_string.to_owned()),
-            ])),
-            false,
-        )
-        .await?;
+    let user_results = door_read(data.get_readonly_handler().list_users(
+        Some(UserRequestFilter::Or(vec![
+            UserRequestFilter::UserId(UserId::new(user_string)),
+            UserRequestFilter::Equality(UserColumn::Email, user_string.to_owned()),
+        ])),
+        false,
+    ))
+    .await?;
     // The response stays silent about unknown or disabled accounts; the log does not.
     if user_results.is_empty() {
         logging::record_as(
@@ -344,9 +339,8 @@ where
         .match_info()
         .get("token")
         .ok_or_else(|| TcpError::BadRequest("Missing reset token".to_owned()))?;
-    let user_id = data
-        .get_tcp_handler()
-        .get_user_id_for_password_reset_token(token)
+    let handler = data.get_tcp_handler();
+    let user_id = door_read(handler.get_user_id_for_password_reset_token(token))
         .await
         .map_err(|e| {
             debug!("Reset token error: {e:#}");
@@ -378,7 +372,7 @@ where
         groups,
         true,
     )
-    .await;
+    .await?;
     let mut path = data.server_url.path().to_string();
     if !path.ends_with('/') {
         path.push('/');
@@ -422,7 +416,7 @@ where
     let (refresh_token_hash, user) = get_refresh_token(request)?;
     let handler = data.get_tcp_handler();
     // Only a token the server holds for this user ends anything; the cookies are cleared anyway.
-    if handler.check_token(refresh_token_hash, &user).await? {
+    if door_read(handler.check_token(refresh_token_hash, &user)).await? {
         handler.delete_refresh_token(refresh_token_hash).await?;
         let new_blacklisted_jwt_hashes = handler.blacklist_jwts(&user).await?;
         let mut jwt_blacklist = data.jwt_blacklist.write().unwrap();
@@ -502,9 +496,9 @@ where
 {
     // The authentication was successful, we need to fetch the groups to create the JWT
     // token.
-    let groups = data.get_readonly_handler().get_user_groups(name).await?;
+    let groups = door_read(data.get_readonly_handler().get_user_groups(name)).await?;
     let (refresh_token, max_age) = data.get_tcp_handler().create_refresh_token(name).await?;
-    let token = create_jwt(data.get_tcp_handler(), &data.jwt_key, name, groups, false).await;
+    let token = create_jwt(data.get_tcp_handler(), &data.jwt_key, name, groups, false).await?;
     let refresh_token_plus_name = refresh_token + "+" + name.as_str();
     let mut path = data.server_url.path().to_string();
     if !path.ends_with('/') {
@@ -990,7 +984,7 @@ async fn account_is_disabled<Backend: BackendHandler>(
     state: &AppState<Backend>,
     user: &UserId,
 ) -> bool {
-    match state.get_readonly_handler().get_user_groups(user).await {
+    match door_read(state.get_readonly_handler().get_user_groups(user)).await {
         Ok(groups) => groups
             .iter()
             .any(|g| g.display_name == "lldap_disabled".into()),
@@ -3469,7 +3463,7 @@ pub(crate) mod tests {
             let (held, _) = handler.create_refresh_token(&ann).await.unwrap();
             let ann_jwt = create_jwt(&handler, &state.jwt_key, &ann, HashSet::new(), false).await;
             let ben_jwt = create_jwt(&handler, &state.jwt_key, &ben, HashSet::new(), false).await;
-            let jwts = [ann_jwt, ben_jwt].map(|token| default_hash(token.as_str()));
+            let jwts = [ann_jwt, ben_jwt].map(|token| default_hash(token.unwrap().as_str()));
             let _ = log.recorder().take_events();
             let mut request = actix_web::test::TestRequest::get();
             if let Some(presented) = presented {
@@ -3916,6 +3910,100 @@ pub(crate) mod tests {
             ),
             "a degraded realm keeps out all but admins; a held one whose last write is \
              unsettled keeps no one out"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_read_that_never_answers_is_given_up_at_the_bound_at_each_token_door() {
+        use actix_web::test::TestRequest;
+        use lldap_domain_handlers::policies::POLICY_READ_WAIT;
+        use lldap_test_utils::recording_log::LogGuard;
+        use sea_orm::TransactionTrait;
+        let _backend = ONE_BACKEND.lock().await;
+        let handler = sql_handler_with(&[("r1door", "r1door-pass-1")]).await;
+        let pool = handler.pool().clone();
+        let state = app_state(handler);
+        let token = session_token(&state.jwt_key, "r1door");
+        let held = || TestRequest::get().insert_header(("refresh-token", "r1-refresh+r1door"));
+        let asked = TestRequest::post().param("user_id", "r1door");
+        let reset = TestRequest::get().param("token", "r1-reset-token");
+        let log = LogGuard::install_on_this_thread();
+        let connection = pool.begin().await.unwrap();
+        let clock = std::time::Instant::now();
+        let doors = async {
+            tokio::join!(
+                get_refresh_handler(state.clone(), held().to_http_request()),
+                get_logout_handler(state.clone(), held().to_http_request()),
+                check_if_token_is_valid(&state, &token),
+                get_password_reset_step1_handler(state.clone(), asked.to_http_request()),
+                get_password_reset_step2_handler(state.clone(), reset.to_http_request()),
+            )
+        };
+        let answers = tokio::time::timeout(POLICY_READ_WAIT * 2, doors).await;
+        let took = clock.elapsed();
+        connection.rollback().await.unwrap();
+        let statuses = answers.map(|(refresh, logout, used, asked, reset)| {
+            let used = match used {
+                Ok(_) => 200,
+                Err(e) => e.as_response_error().status_code().as_u16(),
+            };
+            let answered = [refresh, logout, asked, reset].map(|answer| answer.status().as_u16());
+            (answered, used)
+        });
+        let events = log.recorder().take_events().into_iter();
+        let mut rows: Vec<_> = events
+            .map(|e| (e.detail, e.kind, e.success, e.actor))
+            .collect();
+        rows.sort_by_key(|row| row.0.clone());
+        let row = |detail: &str, kind, actor: Option<&str>| {
+            let actor = actor.map(str::to_owned);
+            (Some(detail.to_owned()), kind, false, actor)
+        };
+        assert_eq!(
+            (statuses.ok(), took >= POLICY_READ_WAIT, rows),
+            (
+                Some(([500, 500, 500, 404], 401)),
+                true,
+                vec![
+                    row("Account disabled", LogKind::AccessDenied, Some("r1door")),
+                    row(
+                        "wrong or expired reset token",
+                        LogKind::PasswordResetComplete,
+                        None
+                    )
+                ]
+            ),
+            "the one connection held: the refresh, the logout and the reset request answer 500 \
+             with no row; the reset finish its 404 and a token's use its 401, each with the row \
+             of its failed read"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_refresh_whose_token_is_not_stored_answers_500_with_no_success_row() {
+        use lldap_test_utils::recording_log::LogGuard;
+        use sea_orm::{ConnectionTrait, Statement};
+        let _backend = ONE_BACKEND.lock().await;
+        let _guard = EnforcementGuard::none();
+        let handler = sql_handler_with(&[("r1mint", "r1mint-pass-1")]).await;
+        let user = UserId::new("r1mint");
+        let (refresh, _) = handler.create_refresh_token(&user).await.unwrap();
+        let backend = handler.pool().get_database_backend();
+        let gone = Statement::from_string(backend, "DROP TABLE jwt_storage".to_owned());
+        handler.pool().execute(gone).await.unwrap();
+        let state = app_state(handler);
+        let log = LogGuard::install_on_this_thread();
+        let request = actix_web::test::TestRequest::get()
+            .insert_header(("refresh-token", format!("{refresh}+r1mint")))
+            .to_http_request();
+        let status = get_refresh_handler(state, request).await.status().as_u16();
+        let events = log.recorder().take_events().into_iter();
+        let rows: Vec<_> = events.map(|e| (e.kind, e.success)).collect();
+        assert_eq!(
+            (status, rows),
+            (500, vec![]),
+            "the access token's row cannot be written: an error to the caller, and no row says \
+             the refresh succeeded"
         );
     }
 }

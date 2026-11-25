@@ -1,11 +1,12 @@
 use crate::embedded::Follow;
+use krb5_crypto::{EncryptionType, KeySalt};
 use krb5_kdc::host::{
     Caller, Denial, HostChange, HostPrepared, KerberosStore, KerberosStoreError, LoadedPrincipal,
     LoadedRealm, Operation, PolicyRow, PrincipalRow, RealmBatch, RealmState, RowChange, TargetPeek,
     WriteIntent,
 };
 use krb5_kdc::{
-    MAX_ALIAS_DEPTH, Principal, TL_LAST_ADMIN_UNLOCK, TL_MOD_PRINC, TlData, kadm5_mask,
+    KeyEntry, MAX_ALIAS_DEPTH, Principal, TL_LAST_ADMIN_UNLOCK, TL_MOD_PRINC, TlData, kadm5_mask,
     lookup_principal_id,
 };
 use lldap_domain::types::UserId;
@@ -34,9 +35,12 @@ pub(crate) const KADM5_PROTECT_PRINCIPAL: u32 = 43_787_550;
 pub(crate) const KADM5_PASS_Q_TOOSHORT: u32 = 43_787_542;
 pub(crate) const KADM5_AUTH_ADD: u32 = 43_787_522;
 pub(crate) const KADM5_PASS_Q_GENERIC: u32 = 43_787_577;
+pub(crate) const KADM5_BAD_KEYSALTS: u32 = 43_787_578;
 const DERIVE_WAIT: Duration = Duration::from_secs(30);
 const UNPREPARED: &str = "the change could not be prepared";
 const POLICY_UNREAD: &str = "the password policy could not be read";
+const POLICY_NAMED: &str = "a Kerberos policy is named on the principal";
+const KEYS_OUTSIDE: &str = "a key type outside supported_enctypes";
 const NO_FOLLOW: &str = "after kadmin change_password the status was not set from \
      lldap_disabled and stays as it was: no realm engine is wired to this host";
 const UNLOCK_ROW_BITS: u32 = kadm5_mask::TL_DATA | kadm5_mask::MOD_TIME | kadm5_mask::MOD_NAME;
@@ -109,6 +113,7 @@ pub(crate) struct SqlRealm {
     store: Arc<dyn directory::KerberosStore>,
     started: AtomicBool,
     realm: String,
+    keysalts: Vec<KeySalt>,
     records: Option<Records>,
     follow: Mutex<Option<Follow>>,
     following: Arc<AtomicBool>,
@@ -120,15 +125,23 @@ impl SqlRealm {
             store,
             started: AtomicBool::new(false),
             realm: String::new(),
+            keysalts: Vec::new(),
             records: None,
             follow: Mutex::new(None),
             following: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// The realm whose one-part names are the directory's, and what derives a `cpw`'s record.
-    pub(crate) fn serving(mut self, realm: &str, records: Option<Records>) -> Self {
+    /// The realm whose one-part names are the directory's, the key types a `cpw` may store for
+    /// them, and what derives a `cpw`'s record.
+    pub(crate) fn serving(
+        mut self,
+        realm: &str,
+        enctypes: &[EncryptionType],
+        records: Option<Records>,
+    ) -> Self {
         self.realm = realm.to_owned();
+        self.keysalts = enctypes.iter().map(|&etype| etype.into()).collect();
         self.records = records;
         self
     }
@@ -410,10 +423,12 @@ fn unlock_entries(before: &Principal, after: &Principal) -> bool {
     stamped && (entry || tl_of(after, unlock) == tl_of(before, unlock))
 }
 
+/// A key/salt list the client sent (`-e`) is refused before the password is looked at.
 fn password_verdict(intent: &WriteIntent, named: Named) -> Verdict {
     let keepold = intent.keepold.is_some_and(|keepold| keepold != 0);
     let code = match &intent.password {
         _ if keepold || named.user.is_none() => KADM5_PROTECT_PRINCIPAL,
+        Some(_) if !intent.keysalts.is_empty() => KADM5_BAD_KEYSALTS,
         Some(password) => match std::str::from_utf8(password.as_slice())
             .map(|password| password_rules(password, PASSWORD_MIN_LENGTH))
         {
@@ -474,6 +489,7 @@ pub(crate) fn code_name(code: u32) -> &'static str {
         KADM5_AUTH_ADD => "AUTH_ADD",
         KADM5_PASS_Q_TOOSHORT => "PASS_Q_TOOSHORT",
         KADM5_PASS_Q_GENERIC => "PASS_Q_GENERIC",
+        KADM5_BAD_KEYSALTS => "BAD_KEYSALTS",
         _ => "another code",
     }
 }
@@ -483,6 +499,8 @@ enum Refusal {
     Code(u32),
     TooShort(usize),
     PolicyUnread,
+    PolicyNamed,
+    KeysOutside,
 }
 
 const PROTECTED: Refusal = Refusal::Code(KADM5_PROTECT_PRINCIPAL);
@@ -500,16 +518,25 @@ impl Refusal {
             Self::Code(code) => code,
             Self::TooShort(_) => KADM5_PASS_Q_TOOSHORT,
             Self::PolicyUnread => KADM5_PASS_Q_GENERIC,
+            Self::PolicyNamed => KADM5_PROTECT_PRINCIPAL,
+            Self::KeysOutside => KADM5_BAD_KEYSALTS,
+        }
+    }
+
+    fn cause(self) -> Option<&'static str> {
+        match self {
+            Self::PolicyUnread => Some(POLICY_UNREAD),
+            Self::PolicyNamed => Some(POLICY_NAMED),
+            Self::KeysOutside => Some(KEYS_OUTSIDE),
+            Self::Code(_) | Self::TooShort(_) => None,
         }
     }
 }
 
 fn denied(intent: &WriteIntent, refusal: Refusal, named: &Named) -> KerberosStoreError {
     let code = refusal.code();
-    let cause = match refusal {
-        Refusal::PolicyUnread => format!(": {POLICY_UNREAD}"),
-        _ => String::new(),
-    };
+    let cause = refusal.cause().map(|why| format!(": {why}"));
+    let cause = cause.unwrap_or_default();
     let text = match refusal {
         Refusal::TooShort(min) => {
             format!("the password is shorter than {min} {PASSWORD_LENGTH_UNIT}")
@@ -522,7 +549,11 @@ fn denied(intent: &WriteIntent, refusal: Refusal, named: &Named) -> KerberosStor
             "{} is a directory user's name; turn on Kerberos for the user in KLLDAP",
             named.principal
         ),
-        Refusal::Code(_) => format!(
+        Refusal::Code(KADM5_BAD_KEYSALTS) | Refusal::KeysOutside => format!(
+            "{} belongs to a directory user; its key types are the realm's supported_enctypes",
+            named.principal
+        ),
+        Refusal::Code(_) | Refusal::PolicyNamed => format!(
             "{} belongs to a directory user; change it in KLLDAP",
             named.principal
         ),
@@ -620,7 +651,11 @@ impl KerberosStore for SqlRealm {
         {
             return Err(KerberosStoreError::Refused("starting".to_owned()));
         }
-        match verdict(&change, &self.realm)? {
+        let judged = verdict(&change, &self.realm)?;
+        if let Verdict::Unlock(named) | Verdict::Password(named) = &judged {
+            self.leaves_nothing_else(&change, named)?;
+        }
+        match judged {
             Verdict::Write { new, onto } => {
                 let onto: Vec<Named> = onto.iter().map(|t| Named::of(t, &self.realm)).collect();
                 let onto = self.onto(&change.intent, onto);
@@ -819,6 +854,37 @@ impl SqlRealm {
             record,
             min,
         }))
+    }
+
+    /// A change from outside leaves on a directory user's principal neither a Kerberos policy's
+    /// name nor a stored key of a type outside the realm's list.
+    fn leaves_nothing_else(
+        &self,
+        change: &HostChange,
+        named: &Named,
+    ) -> Result<(), KerberosStoreError> {
+        let mut owned = change.rows.iter().filter(|row| row.host_owned);
+        match owned.find_map(|row| self.left_on(row)) {
+            Some(refusal) => Err(denied(&change.intent, refusal, named)),
+            None => Ok(()),
+        }
+    }
+
+    fn left_on(&self, row: &RowChange) -> Option<Refusal> {
+        let after = row.after.as_ref()?;
+        if after.pw_policy.is_some() {
+            return Some(Refusal::PolicyNamed);
+        }
+        let listed = |key: &KeyEntry| {
+            let salt = key.salt_type.unwrap_or(0);
+            let keysalt = KeySalt {
+                etype: key.etype,
+                salt,
+            };
+            self.keysalts.contains(&keysalt)
+        };
+        let stored = row.mask & kadm5_mask::KEY_DATA != 0;
+        (stored && !after.keys.iter().all(listed)).then_some(Refusal::KeysOutside)
     }
 
     fn write_new(
@@ -1201,6 +1267,17 @@ mod tests {
             init_table(&pool).await.unwrap();
             (start_unregistered_committer(pool.clone()), pool)
         })
+    }
+
+    /// The host as the server builds it for `temp`'s realm.
+    fn served(
+        committer: &KerberosCommitterHandle,
+        temp: &TempRealm,
+        records: Option<Records>,
+    ) -> Arc<SqlRealm> {
+        let settings = &temp.settings;
+        let host = SqlRealm::new(committer.store());
+        Arc::new(host.serving(&settings.realm, &settings.supported_enctypes, records))
     }
 
     fn sql(pool: &DatabaseConnection, runtime: &Runtime, statement: &str) {
@@ -2932,7 +3009,7 @@ mod tests {
             policies,
             runtime: runtime.handle().clone(),
         };
-        let host = Arc::new(SqlRealm::new(committer.store()).serving("EXAMPLE.COM", Some(records)));
+        let host = served(&committer, &temp, Some(records));
         host.start_pass_committed();
         let store = krb5_kdc::shared_dump(
             boot::open_store(&temp.settings, &profile, host.clone()).unwrap(),
@@ -3602,7 +3679,7 @@ mod tests {
     fn test_the_commit_judges_the_minimum_its_prepare_read() {
         use lldap_test_utils::recording_log::LogGuard;
         let guard = LogGuard::install();
-        let realm = SqlRealm::new(Arc::new(Nothing)).serving("EXAMPLE.COM", None);
+        let realm = SqlRealm::new(Arc::new(Nothing)).serving("EXAMPLE.COM", &[], None);
         realm.start_pass_committed();
         let dora = krb5_kdc::PrincipalBuilder::new(name("dora"), "EXAMPLE.COM").build();
         let change = |password: &'static str, min: usize| {
@@ -4122,6 +4199,15 @@ mod tests {
         })
     }
 
+    /// As `with_password`, with a key/salt list the client sent (`-e`).
+    fn with_list(text: &'static str) -> Fill {
+        Box::new(move |intent: &mut WriteIntent| {
+            intent.password = Some(Zeroizing::new(text.as_bytes().to_vec()));
+            intent.keepold = Some(0);
+            intent.keysalts = vec![EncryptionType::Aes128CtsHmacSha196.into()];
+        })
+    }
+
     const NOT_UTF8: &[u8] = b"Bob-\xff\xfe-Password";
 
     fn intent_of(
@@ -4256,7 +4342,7 @@ mod tests {
             policies: Arc::new(handler.clone()),
             runtime: runtime.handle().clone(),
         };
-        let host = Arc::new(SqlRealm::new(committer.store()).serving("EXAMPLE.COM", Some(records)));
+        let host = served(&committer, &temp, Some(records));
         host.start_pass_committed();
         let store = krb5_kdc::shared_dump(
             boot::open_store(&temp.settings, &profile, host.clone()).unwrap(),
@@ -4287,6 +4373,7 @@ mod tests {
             .iter()
             .map(|&e| e.into())
             .collect();
+        let other = [KeySalt::from(EncryptionType::Aes128CtsHmacSha196)];
         let keys = || {
             let etype = krb5_crypto::EncryptionType::Aes256CtsHmacSha196;
             let key = krb5_kdc::random_key(etype).unwrap();
@@ -4329,7 +4416,7 @@ mod tests {
         rows();
 
         let held = (host.load().unwrap(), record());
-        let on_bob: [Case; 15] = [
+        let on_bob: [Case; 16] = [
             (
                 "randkey",
                 Operation::Randkey,
@@ -4504,6 +4591,24 @@ mod tests {
                     )
                 }),
                 "change_password: PASS_Q_GENERIC",
+            ),
+            (
+                "cpw -e",
+                Operation::ChangePassword,
+                &["bob"],
+                with_list("Bob-Password-9"),
+                Box::new(|s: &mut PrincipalStore| {
+                    let password = b"Bob-Password-9";
+                    s.set_password_etypes_keepold_n_in(
+                        &bob,
+                        "EXAMPLE.COM",
+                        password,
+                        0,
+                        ADMIN,
+                        &other,
+                    )
+                }),
+                "change_password: BAD_KEYSALTS",
             ),
             (
                 "alias onto bob",
@@ -5386,7 +5491,7 @@ mod tests {
             policies,
             runtime: runtime.handle().clone(),
         };
-        let host = Arc::new(SqlRealm::new(committer.store()).serving("EXAMPLE.COM", Some(records)));
+        let host = served(&committer, &temp, Some(records));
         host.start_pass_committed();
         let store = krb5_kdc::shared_dump(
             boot::open_store(&temp.settings, &profile, host.clone()).unwrap(),
@@ -5770,7 +5875,7 @@ mod tests {
             policies: Arc::new(handler.clone()),
             runtime: runtime.handle().clone(),
         };
-        let host = Arc::new(SqlRealm::new(committer.store()).serving("EXAMPLE.COM", Some(records)));
+        let host = served(&committer, &temp, Some(records));
         let (embedded, opened) = EmbeddedKerberos::open_on(&temp.settings, host.clone()).unwrap();
         host.start_pass_committed();
         runtime
@@ -5990,7 +6095,7 @@ mod tests {
             policies: Arc::new(handler.clone()),
             runtime: runtime.handle().clone(),
         };
-        let host = Arc::new(SqlRealm::new(committer.store()).serving("EXAMPLE.COM", Some(records)));
+        let host = served(&committer, &temp, Some(records));
         host.start_pass_committed();
         let store = krb5_kdc::shared_dump(
             boot::open_store(&temp.settings, &profile, host.clone()).unwrap(),
@@ -6076,7 +6181,7 @@ mod tests {
         let profile = boot::profile(&temp.settings);
         let (committer, pool) = committer_on(connect, &runtime);
         add_user(&pool, &runtime, "bob");
-        let host = Arc::new(SqlRealm::new(committer.store()).serving("EXAMPLE.COM", None));
+        let host = served(&committer, &temp, None);
         host.start_pass_committed();
         let store = krb5_kdc::shared_dump(
             boot::open_store(&temp.settings, &profile, host.clone()).unwrap(),
@@ -6383,7 +6488,7 @@ mod tests {
             intent.password = Some(Zeroizing::new(text.as_bytes().to_vec()));
             intent.keepold = Some(keepold);
         }
-        let rows: [Row; 16] = [
+        let rows: [Row; 17] = [
             (Operation::Unspecified, false, |_| {}, "written"),
             (Operation::Modify, false, |_| {}, "written"),
             (Operation::Embedded, false, |_| {}, "refused"),
@@ -6442,6 +6547,15 @@ mod tests {
                     i.keepold = Some(0);
                 },
                 "PASS_Q_GENERIC",
+            ),
+            (
+                Operation::ChangePassword,
+                false,
+                |i| {
+                    password(i, "Bob-Pass-9", 0);
+                    i.keysalts = vec![EncryptionType::Aes128CtsHmacSha196.into()];
+                },
+                "written",
             ),
         ];
         let bob = krb5_kdc::PrincipalBuilder::new(name("bob"), "EXAMPLE.COM").build();
@@ -6931,11 +7045,14 @@ mod tests {
             intent.password = Some(Zeroizing::new(text.as_bytes().to_vec()));
             intent.keepold = Some(keepold);
         }
+        fn listed(intent: &mut WriteIntent) {
+            intent.keysalts = vec![EncryptionType::Aes128CtsHmacSha196.into()];
+        }
         let (bob, svc) = (
             Some(("bob@EXAMPLE.COM", true)),
             Some(("svc@EXAMPLE.COM", false)),
         );
-        let rows: [Row; 32] = [
+        let rows: [Row; 38] = [
             (
                 "create, no record",
                 Operation::Create,
@@ -7114,6 +7231,66 @@ mod tests {
                 ["svc@EXAMPLE.COM", ""],
                 |i| password(i, "short", 1),
                 "pass",
+            ),
+            (
+                "cpw -e",
+                Operation::ChangePassword,
+                bob,
+                ["bob@EXAMPLE.COM", ""],
+                |i| {
+                    password(i, "Bob-Password-2", 0);
+                    listed(i);
+                },
+                "BAD_KEYSALTS bob@EXAMPLE.COM",
+            ),
+            (
+                "cpw -e of 7 characters: the list is judged first",
+                Operation::ChangePassword,
+                bob,
+                ["bob@EXAMPLE.COM", ""],
+                |i| {
+                    password(i, "pässwör", 0);
+                    listed(i);
+                },
+                "BAD_KEYSALTS bob@EXAMPLE.COM",
+            ),
+            (
+                "cpw -e -keepold",
+                Operation::ChangePassword,
+                bob,
+                ["bob@EXAMPLE.COM", ""],
+                |i| {
+                    password(i, "Bob-Password-2", 1);
+                    listed(i);
+                },
+                "PROTECT_PRINCIPAL bob@EXAMPLE.COM",
+            ),
+            (
+                "cpw -e of an unowned record",
+                Operation::ChangePassword,
+                svc,
+                ["svc@EXAMPLE.COM", ""],
+                |i| {
+                    password(i, "Bob-Password-2", 0);
+                    listed(i);
+                },
+                "pass",
+            ),
+            (
+                "cpw -randkey -e",
+                Operation::Randkey,
+                bob,
+                ["bob@EXAMPLE.COM", ""],
+                listed,
+                "PROTECT_PRINCIPAL bob@EXAMPLE.COM",
+            ),
+            (
+                "ank -e, a user's name",
+                Operation::Create,
+                None,
+                ["alice@EXAMPLE.COM", ""],
+                listed,
+                "ask alice@EXAMPLE.COM as alice",
             ),
             (
                 "unlock",
@@ -7398,7 +7575,7 @@ mod tests {
             policies,
             runtime: runtime.handle().clone(),
         };
-        let host = Arc::new(SqlRealm::new(committer.store()).serving("EXAMPLE.COM", Some(records)));
+        let host = served(&committer, &temp, Some(records));
         host.start_pass_committed();
         let raced = Arc::new(Raced {
             inner: host.clone(),
@@ -7476,5 +7653,126 @@ mod tests {
         );
         drop((embedded, store, raced, host, temp));
         runtime.block_on(committer.shutdown());
+    }
+
+    #[test]
+    #[serial]
+    fn test_a_kadmin_change_leaves_no_policy_name_and_no_key_outside_the_realms_list() {
+        use lldap_test_utils::recording_log::LogGuard;
+        const OURS: EncryptionType = EncryptionType::Aes256CtsHmacSha196;
+        const OTHER: EncryptionType = EncryptionType::Aes128CtsHmacSha196;
+        const BOB: &str = "bob@EXAMPLE.COM";
+        const WRITTEN: &str = "this Kerberos store writes no directory rows";
+        const OUTSIDE: &str = "BAD_KEYSALTS: a key type outside supported_enctypes";
+        const NAMED: &str = "PROTECT_PRINCIPAL: a Kerberos policy is named on the principal";
+
+        let guard = LogGuard::install();
+        let realm = SqlRealm::new(Arc::new(Nothing)).serving("EXAMPLE.COM", &[OURS], None);
+        realm.start_pass_committed();
+        let keyed = |etype: EncryptionType, kvno: u32| {
+            let key = KeyEntry::new(etype, krb5_kdc::random_key(etype).unwrap(), kvno);
+            let bob = krb5_kdc::PrincipalBuilder::new(name("bob"), "EXAMPLE.COM");
+            bob.keys(vec![key]).build()
+        };
+        let bobs_row = |before: Principal, after: Principal, bits: u32| RowChange {
+            id: BOB.to_owned(),
+            before: Some(before),
+            after: Some(after),
+            mask: bits,
+            host_owned: true,
+        };
+        let cpw = |after: Principal, bits: u32| {
+            let prepared: HostPrepared = Box::new(PreparedRecord {
+                user: UserId::new("bob"),
+                record: Vec::new(),
+                min: PASSWORD_MIN_LENGTH,
+            });
+            let fill = with_password("Bob-Password-9", 0);
+            HostChange {
+                intent: intent_of(Operation::ChangePassword, kadmin(false), &["bob"], &fill),
+                rows: vec![bobs_row(keyed(OURS, 1), after, bits)],
+                prepared: Some(prepared),
+                batch: RealmBatch::default(),
+            }
+        };
+        let unlock = |policy: Option<&str>| {
+            let mut before = keyed(OURS, 1);
+            before.fail_auth_count = 5;
+            before.pw_policy = policy.map(str::to_owned);
+            let mut after = before.clone();
+            after.fail_auth_count = 0;
+            after.tl_data.push(TlData {
+                ty: TL_LAST_ADMIN_UNLOCK,
+                contents: vec![2, 0, 0, 0],
+            });
+            let fill = mask(kadm5_mask::FAIL_AUTH_COUNT);
+            HostChange {
+                intent: intent_of(Operation::Modify, kadmin(false), &["bob"], &fill),
+                rows: vec![bobs_row(before, after, kadm5_mask::TL_DATA)],
+                prepared: None,
+                batch: RealmBatch {
+                    upsert_principals: vec![row(1, None)],
+                    ..RealmBatch::default()
+                },
+            }
+        };
+        let stored = kadm5_mask::KEY_DATA | kadm5_mask::KVNO;
+        let mut salted = keyed(OURS, 2);
+        salted.keys[0].salt_type = Some(4);
+        let mut bound = keyed(OURS, 2);
+        bound.pw_policy = Some("strict".to_owned());
+        let cpw_row = |code| denial(BOB, "change_password", code);
+        let rows = [
+            (
+                "a cpw storing the realm's key type",
+                cpw(keyed(OURS, 2), stored),
+                WRITTEN,
+                Rows::new(),
+            ),
+            (
+                "another key type",
+                cpw(keyed(OTHER, 2), stored),
+                "BAD_KEYSALTS",
+                cpw_row(OUTSIDE),
+            ),
+            (
+                "the realm's key type with another salt",
+                cpw(salted, stored),
+                "BAD_KEYSALTS",
+                cpw_row(OUTSIDE),
+            ),
+            (
+                "another key type the change did not store",
+                cpw(keyed(OTHER, 1), 0),
+                WRITTEN,
+                Rows::new(),
+            ),
+            (
+                "a cpw, a policy name",
+                cpw(bound, stored),
+                "PROTECT_PRINCIPAL",
+                cpw_row(NAMED),
+            ),
+            ("an unlock", unlock(None), WRITTEN, Rows::new()),
+            (
+                "an unlock, a policy name",
+                unlock(Some("strict")),
+                "PROTECT_PRINCIPAL",
+                denial(BOB, "modify", NAMED),
+            ),
+        ];
+        for (label, change, expected, logged) in rows {
+            let answer = match realm.commit_change(change) {
+                Err(KerberosStoreError::Denied(denial)) => code_name(denial.kadm5_code).to_owned(),
+                Err(KerberosStoreError::Refused(why)) => why,
+                other => format!("{other:?}"),
+            };
+            let events = guard.recorder().take_events().into_iter();
+            let denials: Rows = events
+                .filter(|e| e.kind == LogKind::AccessDenied)
+                .map(|e| (e.kind, e.target, e.detail))
+                .collect();
+            assert_eq!((answer, denials), (expected.to_owned(), logged), "{label}");
+        }
     }
 }

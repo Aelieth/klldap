@@ -142,7 +142,8 @@ impl EmbeddedKerberos {
         store: Arc<dyn lldap_domain_handlers::kerberos::KerberosStore>,
         records: Records,
     ) -> Result<(Arc<Self>, RealmThreads)> {
-        let host = SqlRealm::new(store).serving(&settings.realm, Some(records));
+        let enctypes = &settings.supported_enctypes;
+        let host = SqlRealm::new(store).serving(&settings.realm, enctypes, Some(records));
         Self::start_on(settings, Arc::new(host))
     }
 
@@ -153,7 +154,8 @@ impl EmbeddedKerberos {
         store: Arc<dyn lldap_domain_handlers::kerberos::KerberosStore>,
         records: Records,
     ) -> Result<(Arc<Self>, Opened)> {
-        let host = SqlRealm::new(store).serving(&settings.realm, Some(records));
+        let enctypes = &settings.supported_enctypes;
+        let host = SqlRealm::new(store).serving(&settings.realm, enctypes, Some(records));
         Self::open_on(settings, Arc::new(host))
     }
 

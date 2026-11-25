@@ -19,7 +19,7 @@ mod tls;
 
 use crate::{
     cli::{Command, PolicyUnlinkOpts, ReenableOpts, RunOpts, TestEmailOpts, UnlockOpts},
-    configuration::{Configuration, compare_private_key_hashes},
+    configuration::{Configuration, OnRealmFailure, compare_private_key_hashes},
     database_string::DatabaseUrl,
     db_cleaner::Scheduler,
 };
@@ -46,7 +46,7 @@ use lldap_domain_handlers::enforcement::{
 };
 use lldap_domain_handlers::inactivity::REENABLED_BY_TOOL;
 use lldap_domain_handlers::kerberos::{
-    DegradedKerberos, KerberosSync, NoopKerberos, kerberos_backend, kerberos_store,
+    DegradedKerberos, DegradedMode, KerberosSync, NoopKerberos, kerberos_backend, kerberos_store,
     set_kerberos_backend,
 };
 use lldap_domain_handlers::lockout::{UNLOCKED_BY_TOOL, lock_clock, lockout, start_lockout};
@@ -55,7 +55,7 @@ use lldap_domain_handlers::password::{
     PASSWORD_MIN_LENGTH, PasswordChangeError, PasswordSync, change_password_everywhere,
     min_length_for_user, password_rules,
 };
-use lldap_kerberos::boot::{RealmSettings, client_address};
+use lldap_kerberos::boot::{RealmSettings, client_address, lockout_file_fault};
 use lldap_kerberos::embedded::{EmbeddedKerberos, FOLLOW_EVERY, Opened, RealmThreads, Records};
 
 use lldap_domain_handlers::handler::{
@@ -87,6 +87,36 @@ const OPEN_REALM_WITH_KERBEROS_OFF: &str = "Kerberos is disabled on this server,
 
 fn open_realm_warning(kerberos_enabled: bool, marked_open: bool) -> Option<&'static str> {
     (!kerberos_enabled && marked_open).then_some(OPEN_REALM_WITH_KERBEROS_OFF)
+}
+
+const STAYS_ADMIN_ONLY: &str = "kerberos_options.on_realm_failure is directory-only, but this \
+    server stays admin-only";
+const LOCKOUT_FILE_FAULT: &str =
+    "the Kerberos lockout file is missing, unreadable or another realm's";
+const NO_REALM_ROW: &str = "this database holds no Kerberos realm yet";
+const HOLD_UNANSWERED: &str = "whether this server holds the realm's row is not known";
+
+/// What a server whose realm did not open goes on serving and, where the configuration asked for
+/// directory-only and it stays admin-only, why. `held`: `realm_row_held`, None where not asked.
+fn realm_fallback(
+    configured: OnRealmFailure,
+    lockout_fault: bool,
+    held: Option<Result<bool, String>>,
+) -> (DegradedMode, Option<String>) {
+    let stays = |why: &str| {
+        let line = format!("{STAYS_ADMIN_ONLY}: {why}");
+        (DegradedMode::AdminOnly, Some(line))
+    };
+    match (configured, lockout_fault, held) {
+        (OnRealmFailure::AdminOnly, _, _) => (DegradedMode::AdminOnly, None),
+        (OnRealmFailure::DirectoryOnly, true, _) => stays(LOCKOUT_FILE_FAULT),
+        (OnRealmFailure::DirectoryOnly, false, held) => match held {
+            Some(Ok(true)) => (DegradedMode::DirectoryOnly, None),
+            Some(Ok(false)) => stays(NO_REALM_ROW),
+            Some(Err(e)) => stays(&format!("{HOLD_UNANSWERED}: {e}")),
+            None => stays(HOLD_UNANSWERED),
+        },
+    }
 }
 
 fn sync_turned_off(cause: &str) -> String {
@@ -655,13 +685,13 @@ async fn set_up_server(
                             bail!(RESTART_WITHOUT_FORCE);
                         }
                     }
-                    set_kerberos_backend(Arc::new(DegradedKerberos::new(realm.clone(), cause)));
-                    config.ldap_host = loopback(&config.ldap_host);
-                    config.http_host = loopback(&config.http_host);
-                    warn!(
-                        "Only admins may sign in, over LDAP on {} and HTTP on {}",
-                        config.ldap_host, config.http_host
-                    );
+                    let configured = config.kerberos_options.on_realm_failure;
+                    let (mode, stays) = chosen_fallback(configured, &e).await;
+                    if let Some(why) = stays {
+                        warn!("{why}");
+                    }
+                    let hosts = (&mut config.ldap_host, &mut config.http_host);
+                    serve_without_realm(hosts, &realm, cause, mode);
                     (None, None)
                 }
             }
@@ -680,6 +710,58 @@ async fn set_up_server(
     let scheduler = Scheduler::new("0 0 * * * * *", sql_pool, log_retention(&config), embedded);
     scheduler.start();
     Ok((server_builder, realm_threads))
+}
+
+/// Whether this server holds the realm's row, answered once the committer's look for another
+/// holder has ended.
+async fn realm_row_held() -> Result<bool, String> {
+    let held = tokio::task::spawn_blocking(|| kerberos_store().realm_row_held()).await;
+    match held {
+        Ok(held) => held.map_err(|e| e.to_string()),
+        Err(e) => Err(format!("the question did not run: {e}")),
+    }
+}
+
+/// `realm_fallback` for the failure `e`; the holder is asked only where its answer decides.
+async fn chosen_fallback(
+    configured: OnRealmFailure,
+    e: &anyhow::Error,
+) -> (DegradedMode, Option<String>) {
+    let lockout_fault = lockout_file_fault(e);
+    let held = match configured == OnRealmFailure::DirectoryOnly && !lockout_fault {
+        true => Some(realm_row_held().await),
+        false => None,
+    };
+    realm_fallback(configured, lockout_fault, held)
+}
+
+/// The stand-in for a realm that did not open. Admin-only moves the two listeners' hosts to
+/// loopback; directory-only leaves them where the configuration put them.
+fn serve_without_realm(
+    (ldap_host, http_host): (&mut String, &mut String),
+    realm: &str,
+    cause: String,
+    mode: DegradedMode,
+) {
+    let degraded = DegradedKerberos::with_mode(realm.to_owned(), cause.clone(), mode);
+    set_kerberos_backend(Arc::new(degraded));
+    match mode {
+        DegradedMode::AdminOnly => {
+            *ldap_host = loopback(ldap_host);
+            *http_host = loopback(http_host);
+            warn!("Only admins may sign in, over LDAP on {ldap_host} and HTTP on {http_host}");
+        }
+        DegradedMode::DirectoryOnly => {
+            warn!(
+                "The Kerberos realm {realm} is closed and this server is directory-only \
+                 ({cause}): the directory is served to everyone, over LDAP on {ldap_host} and \
+                 HTTP on {http_host}; the KDC and kadmin do not serve; changes that need a \
+                 principal are refused. Fix the cause and restart."
+            );
+            let detail = format!("directory-only: {cause}");
+            rows::record_failure(LogKind::KerberosSync, None, &detail);
+        }
+    }
 }
 
 async fn open_realm(
@@ -1260,6 +1342,81 @@ mod tests {
             (true, Some("held".to_owned())),
             "the realm's backend is back after a panic inside the reset"
         );
+    }
+
+    #[test]
+    fn test_directory_only_is_entered_only_by_a_holder_with_no_lockout_file_fault() {
+        use OnRealmFailure::{AdminOnly, DirectoryOnly};
+        let held = [
+            None,
+            Some(Ok(true)),
+            Some(Ok(false)),
+            Some(Err("another server holds it")),
+        ];
+        let admins = || (DegradedMode::AdminOnly, None);
+        let stays = |why: &str| {
+            let line = format!("{STAYS_ADMIN_ONLY}: {why}");
+            (DegradedMode::AdminOnly, Some(line))
+        };
+        let file = || stays(LOCKOUT_FILE_FAULT);
+        let unknown = format!("{HOLD_UNANSWERED}: another server holds it");
+        let entered = (DegradedMode::DirectoryOnly, None);
+        let rows = [
+            (AdminOnly, false, [admins(), admins(), admins(), admins()]),
+            (AdminOnly, true, [admins(), admins(), admins(), admins()]),
+            (DirectoryOnly, true, [file(), file(), file(), file()]),
+            (
+                DirectoryOnly,
+                false,
+                [
+                    stays(HOLD_UNANSWERED),
+                    entered,
+                    stays(NO_REALM_ROW),
+                    stays(&unknown),
+                ],
+            ),
+        ];
+        for (configured, lockout_fault, wants) in rows {
+            for (held, want) in held.into_iter().zip(wants) {
+                let answer = held.map(|held| held.map_err(str::to_owned));
+                assert_eq!(
+                    realm_fallback(configured, lockout_fault, answer),
+                    want,
+                    "{configured:?}, lockout-file fault {lockout_fault}, held {held:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_admin_only_moves_the_listeners_to_loopback_and_directory_only_leaves_them() {
+        let _one = crate::auth_service::tests::ONE_BACKEND.blocking_lock();
+        let down = || Some("down".to_owned());
+        let rows = [
+            (DegradedMode::AdminOnly, ("127.0.0.1", "::1"), down(), None),
+            (
+                DegradedMode::DirectoryOnly,
+                ("192.0.2.7", "2001:db8::7"),
+                None,
+                down(),
+            ),
+        ];
+        for (mode, hosts, unavailable, directory_only) in rows {
+            let (mut ldap, mut http) = ("192.0.2.7".to_owned(), "2001:db8::7".to_owned());
+            let cause = "down".to_owned();
+            serve_without_realm((&mut ldap, &mut http), "EXAMPLE.COM", cause, mode);
+            let backend = kerberos_backend();
+            set_kerberos_backend(Arc::new(NoopKerberos::default()));
+            assert_eq!(
+                (
+                    (ldap.as_str(), http.as_str()),
+                    backend.unavailable(),
+                    backend.directory_only()
+                ),
+                (hosts, unavailable, directory_only),
+                "{mode:?}"
+            );
+        }
     }
 
     #[test]

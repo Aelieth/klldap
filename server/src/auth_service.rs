@@ -39,6 +39,7 @@ use lldap_domain_handlers::password::{
     PasswordChangeError, finish_plain, finish_synced_registration, min_length_of, realm_not_ready,
     record_failed, refuse_unfinishable,
 };
+use lldap_domain_handlers::warn_limited;
 use lldap_domain_model::{error::DomainError, model::UserColumn};
 use lldap_graphql_server::{open_password_envelope, public_key_der_base64};
 use lldap_opaque_handler::OpaqueHandler;
@@ -291,7 +292,7 @@ where
     )
     .await
     {
-        warn!("Error sending email: {:#?}", e);
+        warn_limited!("Error sending email: {:#?}", e);
         debug!("Reset token: {}", token);
         logging::record_as(
             None,
@@ -992,7 +993,7 @@ async fn account_is_disabled<Backend: BackendHandler>(
     }
 }
 
-#[instrument(skip_all, level = "debug", err, ret)]
+#[instrument(skip_all, level = "debug", err(level = "debug"), ret)]
 pub(crate) async fn check_if_token_is_valid<Backend: BackendHandler + OpaqueHandler>(
     state: &AppState<Backend>,
     token_str: &str,
@@ -1085,7 +1086,7 @@ fn refresh_refused(user: &UserId) -> TcpError {
 }
 
 fn mfa_unreadable(user: &UserId, door: Door, e: &DomainError) {
-    warn!(r#"The OU policy of "{user}" could not be read for enable-mfa at {door:?}: {e}"#);
+    warn_limited!(r#"The OU policy of "{user}" could not be read for enable-mfa at {door:?}: {e}"#);
     refuse_unreadable(user, door);
 }
 
@@ -4004,6 +4005,20 @@ pub(crate) mod tests {
             (500, vec![]),
             "the access token's row cannot be written: an error to the caller, and no row says \
              the refresh succeeded"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_junk_token_is_refused_with_its_rows_line_and_none_at_error() {
+        use lldap_domain_handlers::logging::capture::Lines;
+        use tracing::Level;
+        let state = app_state(MockTestBackendHandler::new());
+        let (lines, _guard) = Lines::capture();
+        let refused = check_if_token_is_valid(&state, "junk").await.is_err();
+        let levels: Vec<_> = lines.take().into_iter().map(|line| line.level).collect();
+        assert!(
+            refused && levels.contains(&Level::WARN) && !levels.contains(&Level::ERROR),
+            "{levels:?}"
         );
     }
 }

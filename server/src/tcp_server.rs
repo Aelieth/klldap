@@ -31,6 +31,7 @@ use lldap_domain_handlers::kerberos::{
 use lldap_domain_handlers::logging::{RequestMeta, with_request};
 use lldap_domain_handlers::mfa::MfaPolicy;
 use lldap_domain_handlers::networks::resolve_client;
+use lldap_domain_handlers::warn_limited;
 use lldap_domain_model::error::DomainError;
 use lldap_kerberos::boot::with_port_hint;
 use lldap_keycloak::KeycloakSettings;
@@ -130,7 +131,10 @@ pub(crate) fn error_to_http_response(error: TcpError) -> HttpResponse {
             DomainError::DatabaseError(_)
             | DomainError::DatabaseTransactionError(_)
             | DomainError::InternalError(_)
-            | DomainError::UnknownCryptoError(_) => HttpResponse::InternalServerError(),
+            | DomainError::UnknownCryptoError(_) => {
+                warn_limited!("A request was answered with an internal error: {de}");
+                HttpResponse::InternalServerError()
+            }
             DomainError::Base64DecodeError(_)
             | DomainError::BinarySerializationError(_)
             | DomainError::EntityNotFound(_) => HttpResponse::BadRequest(),
@@ -458,5 +462,21 @@ mod tests {
             ("example.com".to_owned(), String::new()),
             "an answer without the field still parses"
         );
+    }
+
+    #[test]
+    fn test_an_internal_error_is_said_within_the_budget_where_it_is_answered_and_no_refusal() {
+        use lldap_domain_handlers::logging::capture::{BUDGET, Lines};
+        type Failure = fn() -> DomainError;
+        let refusal: Failure = || DomainError::AuthenticationError("for bob".to_owned());
+        let fault: Failure = || DomainError::InternalError("the database is away".to_owned());
+        for (failure, status, said) in [(refusal, 401, 0), (fault, 500, BUDGET)] {
+            let (lines, _guard) = Lines::capture();
+            for _ in 0..100 {
+                let response = error_to_http_response(TcpError::DomainError(failure()));
+                assert_eq!(response.status().as_u16(), status);
+            }
+            assert_eq!(lines.take_loud().len(), said, "{status}");
+        }
     }
 }

@@ -1,3 +1,4 @@
+use crate::sql_policy_read::StatementBound;
 use crate::sql_tables::DbConnection;
 use itertools::Itertools;
 use lldap_auth::opaque::server::ServerSetup;
@@ -8,8 +9,8 @@ use lldap_domain_handlers::lockout::{Lockout, lockout};
 use lldap_domain_handlers::mfa::MfaPolicy;
 use lldap_schema::PublicSchema;
 use sea_orm::sea_query::{Cond, IntoCondition, SimpleExpr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use tracing::warn;
 
 pub(crate) fn bool_to_expr(b: bool) -> Cond {
@@ -73,6 +74,7 @@ pub struct SqlBackendHandler {
     pub(crate) policy_cache: &'static PolicyCache,
     pub(crate) lockout: &'static Lockout,
     policy_changes: Arc<AtomicU64>,
+    pub(crate) statement_bound: Arc<OnceLock<StatementBound>>,
 }
 
 impl SqlBackendHandler {
@@ -87,6 +89,7 @@ impl SqlBackendHandler {
             policy_cache: enforcement::policy_cache(),
             lockout: lockout(),
             policy_changes: Arc::default(),
+            statement_bound: Arc::default(),
         }
     }
 

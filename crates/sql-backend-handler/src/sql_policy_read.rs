@@ -8,7 +8,7 @@ use lldap_domain_handlers::inactivity::Recorded;
 use lldap_domain_handlers::policies::{POLICY_READ_WAIT, PolicyLevel, canonical_ou_key};
 use lldap_domain_model::error::{DomainError, Result};
 use sea_orm::sea_query::Values;
-use sea_orm::sqlx::mysql::MySqlDatabaseError;
+use sea_orm::sqlx::mysql::{MySqlConnection, MySqlDatabaseError};
 use sea_orm::sqlx::{self, MySql, pool::PoolConnection};
 use sea_orm::{
     ConnectionTrait, DbBackend, DbErr, ExecResult, QueryResult, RuntimeErr, Statement,
@@ -23,9 +23,14 @@ use tokio::sync::Mutex;
 pub(crate) const SERVER_BOUND: Duration =
     POLICY_READ_WAIT.saturating_sub(Duration::from_millis(500));
 const READS_ONLY: &str = "a bounded read's session runs reads only";
+const STATEMENT_TIMES: &str = "SHOW SESSION VARIABLES WHERE Variable_name IN \
+                               ('max_statement_time', 'max_execution_time')";
+const NO_STATEMENT_TIME: &str =
+    "the database has neither max_statement_time nor max_execution_time";
 
 type Entry = (User, Vec<PolicyLevel>);
 type Found = (Option<User>, Vec<PolicyLevel>, Option<Recorded>);
+pub(crate) type StatementBound = (&'static str, String);
 
 /// What one bounded read reads: a user and its OU's levels, with the user's activity row or
 /// without, or one OU's levels.
@@ -131,12 +136,13 @@ impl SqlBackendHandler {
             conn: Mutex::new(conn),
             put_back: false,
         };
-        let version = Statement::from_string(DbBackend::MySql, "SELECT VERSION()");
-        let version: String = match session.query_one(version).await? {
-            Some(row) => row.try_get_by_index(0)?,
-            None => String::new(),
+        let (statement, limit) = match self.statement_bound.get() {
+            Some(known) => known.clone(),
+            None => {
+                let asked = statement_bound_on(session.conn.get_mut()).await?;
+                self.statement_bound.get_or_init(|| asked).clone()
+            }
         };
-        let (statement, limit) = statement_bound(&version);
         let bound = format!(
             "SET @klldap_lock_wait = @@SESSION.lock_wait_timeout, \
              @klldap_statement_wait = @@SESSION.{statement}, \
@@ -156,11 +162,34 @@ impl SqlBackendHandler {
 }
 
 /// MariaDB bounds a statement in seconds, MySQL a SELECT in milliseconds.
-fn statement_bound(version: &str) -> (&'static str, String) {
-    match version.to_ascii_lowercase().contains("mariadb") {
-        true => ("max_statement_time", SERVER_BOUND.as_secs_f64().to_string()),
-        false => ("max_execution_time", SERVER_BOUND.as_millis().to_string()),
+fn statement_bound<N: AsRef<[u8]>>(present: &[N]) -> Option<StatementBound> {
+    let has = |name: &str| {
+        let found = |held: &N| held.as_ref().eq_ignore_ascii_case(name.as_bytes());
+        present.iter().any(found)
+    };
+    if has("max_statement_time") {
+        Some(("max_statement_time", SERVER_BOUND.as_secs_f64().to_string()))
+    } else if has("max_execution_time") {
+        Some(("max_execution_time", SERVER_BOUND.as_millis().to_string()))
+    } else {
+        None
     }
+}
+
+/// Sent unprepared, and the names read as bytes, so neither the statement nor the column's
+/// collation can be refused by the driver.
+async fn statement_bound_on(
+    conn: &mut MySqlConnection,
+) -> std::result::Result<StatementBound, DbErr> {
+    let rows = sqlx::Executor::fetch_all(conn, STATEMENT_TIMES)
+        .await
+        .map_err(query_failed)?;
+    let names = rows
+        .iter()
+        .map(|row| sqlx::Row::try_get::<Vec<u8>, usize>(row, 0))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .map_err(query_failed)?;
+    statement_bound(&names).ok_or_else(|| DbErr::Custom(NO_STATEMENT_TIME.to_owned()))
 }
 
 /// MySQL bounds a session, not a transaction: a connection whose bounds are not put back is closed.
@@ -280,16 +309,36 @@ pub(crate) mod tests {
     type Round = (&'static str, Vec<Answer>, bool, (usize, usize));
 
     #[test]
-    fn test_the_statement_bound_follows_the_servers_flavour() {
-        let rows = [
-            ("9.7.0", "max_execution_time", "1500"),
-            ("8.0.39", "max_execution_time", "1500"),
-            ("12.3.1-MariaDB-ubu2404", "max_statement_time", "1.5"),
-            ("10.6.18-mariadb-log", "max_statement_time", "1.5"),
+    fn test_the_statement_bound_follows_the_variables_the_server_has() {
+        type Row = (
+            &'static str,
+            &'static [&'static str],
+            Option<(&'static str, &'static str)>,
+        );
+        let (seconds, millis) = (
+            Some(("max_statement_time", "1.5")),
+            Some(("max_execution_time", "1500")),
+        );
+        let rows: [Row; 7] = [
+            ("MySQL's", &["max_execution_time"], millis),
+            ("MariaDB's", &["max_statement_time"], seconds),
+            (
+                "both",
+                &["max_execution_time", "max_statement_time"],
+                seconds,
+            ),
+            (
+                "both, the other way",
+                &["max_statement_time", "max_execution_time"],
+                seconds,
+            ),
+            ("in capitals", &["MAX_EXECUTION_TIME"], millis),
+            ("neither", &[], None),
+            ("a longer name", &["max_statement_time_ms"], None),
         ];
-        for (version, variable, limit) in rows {
-            let bound = statement_bound(version);
-            assert_eq!(bound, (variable, limit.to_owned()), "{version}");
+        for (label, present, bound) in rows {
+            let bound = bound.map(|(variable, limit)| (variable, limit.to_owned()));
+            assert_eq!(statement_bound(present), bound, "{label}");
         }
         assert_eq!(
             (SERVER_BOUND.as_millis(), SERVER_BOUND.as_secs().max(1)),
@@ -559,11 +608,7 @@ pub(crate) mod tests {
         }
         let mut defaults = 0;
         for conn in &mut conns {
-            let (version,): (String,) = sqlx::query_as("SELECT VERSION()")
-                .fetch_one(&mut **conn)
-                .await
-                .unwrap();
-            let (statement, _) = statement_bound(&version);
+            let (statement, _) = statement_bound_on(conn).await.unwrap();
             let same = format!(
                 "SELECT CAST(@@SESSION.lock_wait_timeout = @@GLOBAL.lock_wait_timeout \
                  AND @@SESSION.{statement} = @@GLOBAL.{statement} AS SIGNED)"
@@ -845,7 +890,9 @@ pub(crate) mod tests {
         type Row = (&'static str, bool, (usize, usize));
         let mut got: Vec<Row> = Vec::new();
         let answered = handler.bounded_entry(&user).await.is_ok();
-        got.push(("answered", answered, mysql_defaults(pool, 2).await));
+        let kept = handler.statement_bound.get().is_some();
+        let defaults = mysql_defaults(pool, 2).await;
+        got.push(("answered, the bound kept", answered && kept, defaults));
         let holder = Holder::take(pool, "ou_policies").await;
         let refused = tokio::time::timeout(WITHIN, handler.bounded_entry(&user)).await;
         let refused = matches!(refused, Ok(Err(e)) if gave_up(&e));
@@ -859,7 +906,7 @@ pub(crate) mod tests {
         assert_eq!(
             got,
             vec![
-                ("answered", true, (2, 2)),
+                ("answered, the bound kept", true, (2, 2)),
                 ("refused by the server", true, (1, 1)),
                 ("dropped by the client", true, (1, 1)),
             ]

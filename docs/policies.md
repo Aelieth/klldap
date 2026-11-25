@@ -581,12 +581,12 @@ entry refuses the start, naming it.
 - Some reads of the policies have no 2-second bound: the admin's policies page, the policy cache's
   refresh, and the server's start. While `ou_policies` or `policies` is locked, they wait as long
   as the database lets them.
-- On MySQL and MariaDB the 2-second bound is set by a different setting on each, chosen by the
-  text of `SELECT VERSION()`: text that contains `mariadb`, in any case, is taken for MariaDB, any
-  other for MySQL. On a MariaDB whose version text lacks `mariadb`, or a MySQL whose version text
-  contains it, every bounded read fails: a sign-in that reads a user the policy cache does not
-  hold yet is refused (`policy: unreadable`), a password change is refused ("the password policy
-  could not be read; try again"), and a save gives no `allowed-networks` warning.
+- On MySQL and MariaDB the 2-second bound is set by a different setting on each, chosen by
+  which of `max_statement_time` (MariaDB) and `max_execution_time` (MySQL) the server has. The
+  server asks once, at its first bounded read, and keeps the answer until it stops. On a server
+  that has neither, every bounded read fails: a sign-in that reads a user the policy cache does
+  not hold yet is refused (`policy: unreadable`), a password change is refused ("the password
+  policy could not be read; try again"), and a save gives no `allowed-networks` warning.
 - A lock's duration runs from the last counted attempt, and a web start counts as one until
   its finish takes it back, so the duration can run from a start that then succeeded.
 - Kerberos already tells whether a principal exists (an unknown one gets a different error);

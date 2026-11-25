@@ -524,27 +524,81 @@ impl WarnLimiter {
 
 static WARN_LIMITER: WarnLimiter = WarnLimiter::new();
 
+#[cfg(any(test, feature = "test-backend-scope"))]
+thread_local! {
+    static THREAD_LIMITER: std::cell::Cell<Option<(&'static WarnLimiter, u64)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// For tests only, through `capture::Lines`: this thread's lines are counted alone from here,
+/// against a whole budget, in one window that does not end by itself.
+#[cfg(any(test, feature = "test-backend-scope"))]
+pub fn count_lines_alone() {
+    let own: &'static WarnLimiter = Box::leak(Box::new(WarnLimiter::new()));
+    THREAD_LIMITER.set(Some((own, seconds_now())));
+}
+
+fn seconds_now() -> u64 {
+    Timestamp::now().as_second().max(0) as u64
+}
+
+/// The limiter to ask, and the second to ask it for.
+fn limiter_now() -> (&'static WarnLimiter, u64) {
+    #[cfg(any(test, feature = "test-backend-scope"))]
+    if let Some(own) = THREAD_LIMITER.get() {
+        return own;
+    }
+    (&WARN_LIMITER, seconds_now())
+}
+
 /// Called on the idle tick, so a flood that stops still prints its `suppressed N` line.
 pub fn flush_suppressed_warnings(now: u64) {
-    if let Some(missed) = WARN_LIMITER.take_suppressed(now) {
+    if let Some(missed) = limiter_now().0.take_suppressed(now) {
         warn!(target: "logs", "suppressed {missed} failure lines");
     }
 }
 
+/// Whether one more line fits the budget; a new window first says what the last one left out.
+#[doc(hidden)]
+pub fn line_fits() -> bool {
+    let (limiter, now) = limiter_now();
+    match limiter.should_print(now) {
+        Print::Yes => true,
+        Print::YesWithSummary(missed) => {
+            warn!(target: "logs", "suppressed {missed} failure lines");
+            true
+        }
+        Print::Suppressed => false,
+    }
+}
+
+/// `tracing::warn!` for a line a request can cause: it shares the failure lines' budget.
+#[macro_export]
+macro_rules! warn_limited {
+    ($($arg:tt)+) => {{
+        if $crate::logging::line_fits() {
+            ::tracing::warn!($($arg)+);
+        }
+    }};
+}
+
+/// `tracing::info!` within the same budget.
+#[macro_export]
+macro_rules! info_limited {
+    ($($arg:tt)+) => {{
+        if $crate::logging::line_fits() {
+            ::tracing::info!($($arg)+);
+        }
+    }};
+}
+
 fn emit(event: &LogEvent) {
     match (event.success, event.kind) {
-        (false, _) => {
-            let now = Timestamp::now().as_second().max(0) as u64;
-            match WARN_LIMITER.should_print(now) {
-                Print::Yes => warn!(target: "logs", "{event}"),
-                Print::YesWithSummary(missed) => {
-                    warn!(target: "logs", "suppressed {missed} failure lines");
-                    warn!(target: "logs", "{event}");
-                }
-                Print::Suppressed => {}
-            }
-        }
-        (true, LogKind::Bind | LogKind::Login | LogKind::TokenRefresh) => {
+        (false, _) => crate::warn_limited!(target: "logs", "{event}"),
+        (
+            true,
+            LogKind::Bind | LogKind::Login | LogKind::TokenRefresh | LogKind::PasswordResetRequest,
+        ) => {
             debug!(target: "logs", "{event}")
         }
         (true, _) => info!(target: "logs", "{event}"),
@@ -558,6 +612,9 @@ fn truncate(s: &str, max_chars: usize) -> String {
         None => cleaned,
     }
 }
+
+#[cfg(any(test, feature = "test-backend-scope"))]
+pub mod capture;
 
 #[cfg(test)]
 mod tests {
@@ -882,5 +939,65 @@ mod tests {
             Some("203.0.113.9INFO pwned")
         );
         assert!(!event.to_string().contains('\n'));
+    }
+
+    #[test]
+    fn test_a_free_text_line_shares_the_failure_lines_budget_and_its_summary() {
+        use capture::{BUDGET, Line, Lines};
+        use tracing::Level;
+        let (lines, _guard) = Lines::capture();
+        for i in 0..30 {
+            crate::warn_limited!("a warning {i}");
+            crate::info_limited!("a notice {i}");
+        }
+        for _ in 0..20 {
+            record_terminal(LogKind::AccessDenied, None, "Invalid JWT");
+            crate::warn_limited!("one more");
+        }
+        let now = Timestamp::now().as_second().max(0) as u64;
+        flush_suppressed_warnings(now + WARN_WINDOW_SECS);
+        let printed = lines.take();
+        let line = |level, target: &str, text: &str| Line {
+            level,
+            target: target.to_owned(),
+            text: text.to_owned(),
+        };
+        let (own, denied) = (module_path!(), "❌ access_denied (system): Invalid JWT");
+        assert_eq!(
+            (printed.len(), &printed[..2], &printed[60..62]),
+            (
+                BUDGET + 1,
+                &[
+                    line(Level::WARN, own, "a warning 0"),
+                    line(Level::INFO, own, "a notice 0")
+                ][..],
+                &[
+                    line(Level::WARN, "logs", denied),
+                    line(Level::WARN, own, "one more")
+                ][..]
+            ),
+            "of 100 lines the first 64 print, each at its own level and target"
+        );
+        assert_eq!(
+            printed.last(),
+            Some(&line(Level::WARN, "logs", "suppressed 36 failure lines")),
+            "the 36 left out are said when the window ends"
+        );
+    }
+
+    #[test]
+    fn test_a_sign_ins_and_a_reset_requests_success_print_at_debug() {
+        use tracing::Level;
+        let (lines, _guard) = capture::Lines::capture();
+        let rows = [
+            (LogKind::Login, Level::DEBUG),
+            (LogKind::PasswordResetRequest, Level::DEBUG),
+            (LogKind::PasswordResetComplete, Level::INFO),
+        ];
+        for (kind, level) in rows {
+            print(&event(kind, Some("bob"), true, None));
+            let levels: Vec<_> = lines.take().into_iter().map(|line| line.level).collect();
+            assert_eq!(levels, vec![level], "{kind}");
+        }
     }
 }

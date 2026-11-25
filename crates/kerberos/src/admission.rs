@@ -1,7 +1,8 @@
 use crate::policy::NOT_FOUND;
 use krb5_kdc::Principal;
 use krb5_kdc::admission::{
-    AsNotice, AsQuestion, AsReason, HostAdmission, KdcRefusal, Mechanism, TgsKind, TgsQuestion,
+    AsNotice, AsQuestion, AsReason, HostAdmission, KdcRefusal, Mechanism, TgsClient, TgsKind,
+    TgsQuestion,
 };
 use krb5_types::{EncTicketPart, HostAddress, PrincipalName, err};
 use lldap_domain::types::UserId;
@@ -22,6 +23,7 @@ const REFUSED: KdcRefusal = KdcRefusal {
     e_text: None,
 };
 const GONE: &str = "the principal is gone";
+const UNREAD: &str = "the principal could not be read";
 
 /// As the KDC answered a client whose entry is gone before the module was asked.
 fn gone() -> KdcRefusal {
@@ -167,6 +169,15 @@ impl KdcVerdict {
             self.cache.carry_success_from_kdc(user, lock_clock());
         }
     }
+
+    /// The row of a subject with no entry to judge, named from the subject.
+    fn subject_row(&self, q: &TgsQuestion<'_>, peer: Option<IpAddr>, detail: &str) {
+        let user = user_named(q.subject, &self.realm, &self.realm);
+        let name = q.subject.unparse_with_realm_lossy(&self.realm);
+        let target = user.as_ref().map_or(name.as_str(), UserId::as_str);
+        let kind = LogKind::AccessDenied;
+        record_kdc_row(user.as_ref(), target, kind, false, peer, detail, false);
+    }
 }
 
 pub(crate) fn ip_of(peer: &HostAddress) -> Option<IpAddr> {
@@ -299,13 +310,16 @@ impl HostAdmission for KdcVerdict {
 
     fn check_tgs(&self, q: &TgsQuestion<'_>) -> Result<(), KdcRefusal> {
         let peer = q.peer.and_then(ip_of);
-        let Some(client) = q.client.principal() else {
-            let user = user_named(q.subject, &self.realm, &self.realm);
-            let name = q.subject.unparse_with_realm_lossy(&self.realm);
-            let target = user.as_ref().map_or(name.as_str(), UserId::as_str);
-            let kind = LogKind::AccessDenied;
-            record_kdc_row(user.as_ref(), target, kind, false, peer, GONE, false);
-            return Err(gone());
+        let client = match q.client {
+            TgsClient::Found(client) => client,
+            TgsClient::NoEntry => {
+                self.subject_row(q, peer, GONE);
+                return Err(gone());
+            }
+            TgsClient::ReadFailed => {
+                self.subject_row(q, peer, UNREAD);
+                return Err(REFUSED);
+            }
         };
         let Some(user) = user_of(client, &self.realm) else {
             return Ok(());
@@ -626,6 +640,15 @@ pub(crate) mod tests {
         let guard = store.read().unwrap();
         let found = |user: &str| TgsClient::Found(guard.get_name(&name(user)).unwrap());
         let client = client.map_or(TgsClient::NoEntry, found);
+        asked_with(&guard, client, subject, kind)
+    }
+
+    fn asked_with(
+        guard: &krb5_kdc::PrincipalStore,
+        client: TgsClient<'_>,
+        subject: &PrincipalName,
+        kind: TgsKind,
+    ) -> Result<(), (i32, Option<String>)> {
         let krbtgt = PrincipalName::new(PrincipalName::NT_SRV_INST, ["krbtgt", REALM]);
         let server = guard.fetch_name(&krbtgt).unwrap().unwrap();
         let mut header = ticket(REALM, "unused");
@@ -2600,5 +2623,32 @@ pub(crate) mod tests {
             ((1, 0), Some(later)),
             "the owed success lands once the database answers"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_subject_whose_entry_could_not_be_read_is_refused_and_not_called_gone() {
+        let (_temp, _embedded, store) = realm(&[ALLOWED_USER]).await;
+        let log = LogGuard::install_on_this_thread();
+        let _inert = EnforcementGuard::none();
+        let user = ALLOWED_USER;
+        let service = PrincipalName::new(PrincipalName::NT_SRV_HST, SERVICE.split('/'));
+        let named = format!("{SERVICE}@{REALM}");
+        let rows = [
+            ("a renewal", name(user), TgsKind::Renew, user),
+            ("a service ticket", name(user), TgsKind::Normal, user),
+            ("an S4U2Proxy", name(user), TgsKind::S4u2Proxy, user),
+            ("no directory user", service, TgsKind::U2u, named.as_str()),
+        ];
+        for (label, subject, kind, target) in rows {
+            let guard = store.read().unwrap();
+            let asked = asked_with(&guard, TgsClient::ReadFailed, &subject, kind);
+            let row = peered(row(LogKind::AccessDenied, false, target, UNREAD));
+            assert_eq!(
+                (asked, kdc_rows(&log)),
+                (Err((err::CLIENT_REVOKED, None)), vec![row]),
+                "{label}"
+            );
+        }
     }
 }

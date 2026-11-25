@@ -586,8 +586,12 @@ mod tests {
     #[tokio::test]
     async fn test_only_an_admin_reads_a_users_sign_in_state() {
         const QUERY: &str = r#"{ user(userId: "bob") { id signInState { locked lockedUntil inactive inactiveSince } } }"#;
-        let until = chrono::Utc.timestamp_opt(1_800_000_600, 0).unwrap();
-        let since = chrono::Utc.timestamp_opt(1_799_913_600, 0).unwrap();
+        let at = |seconds: i64, nanos: u32| chrono::Utc.timestamp_opt(seconds, nanos).unwrap();
+        let (until, since) = (at(1_800_000_600, 0), at(1_799_913_600, 0));
+        let (milli, micro) = (
+            at(1_800_000_600, 120_000_000),
+            at(1_799_913_600, 123_450_000),
+        );
         let state = |locked, locked_until, inactive_since| DomainSignInState {
             locked,
             locked_until,
@@ -623,6 +627,16 @@ mod tests {
                 graphql_value!({"user": {"id": "bob", "signInState": {
                     "locked": false, "lockedUntil": None,
                     "inactive": true, "inactiveSince": "2027-01-14T08:00:00Z"}}}),
+                0,
+            ),
+            (
+                "an admin, both, with fractions: three digits or six, zeros kept",
+                Permission::Admin,
+                "admin",
+                Some(Ok(state(true, Some(milli), Some(micro)))),
+                graphql_value!({"user": {"id": "bob", "signInState": {
+                    "locked": true, "lockedUntil": "2027-01-15T08:10:00.120Z",
+                    "inactive": true, "inactiveSince": "2027-01-14T08:00:00.123450Z"}}}),
                 0,
             ),
             (
@@ -1178,6 +1192,45 @@ mod tests {
             ))
         );
     }
+    #[tokio::test]
+    async fn test_a_log_entry_keeps_the_fraction_of_its_second() {
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_list_log_events()
+            .times(1)
+            .return_once(|_, _, _| {
+                let mut record = log_record(7, LogKind::Bind, "bob");
+                record.event.timestamp = chrono::Utc
+                    .timestamp_opt(1714564800, 123_450_000)
+                    .unwrap()
+                    .naive_utc();
+                Ok(vec![record])
+            });
+        let schema = schema(Query::<MockTestBackendHandler>::new());
+        let context = Context::<MockTestBackendHandler>::new_for_tests(
+            mock,
+            ValidationResults {
+                user: UserId::new("admin"),
+                permission: Permission::Admin,
+            },
+        );
+        assert_eq!(
+            execute(
+                "{ logs { id timestamp } }",
+                None,
+                &schema,
+                &Variables::new(),
+                &context
+            )
+            .await,
+            Ok((
+                graphql_value!({
+                    "logs": [{"id": "7", "timestamp": "2024-05-01T12:00:00.123450Z"}]
+                }),
+                vec![]
+            ))
+        );
+    }
+
     #[tokio::test]
     async fn test_logs_cursors_and_defaults() {
         let mut mock = MockTestBackendHandler::new();

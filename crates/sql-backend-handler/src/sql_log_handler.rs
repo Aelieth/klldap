@@ -1301,6 +1301,49 @@ mod tests {
         }
     }
 
+    fn nanos_after(base: chrono::NaiveDateTime, nanos: i64) -> chrono::NaiveDateTime {
+        base + chrono::Duration::nanoseconds(nanos)
+    }
+
+    #[test]
+    fn test_a_floods_span_is_cut_to_whole_seconds_and_it_ends_after_exactly_the_idle_time() {
+        let base = at(1, 9, 0);
+        let spans = [
+            ("under a second", 999_999_999, "0s"),
+            ("a second", 1_000_000_000, "1s"),
+            (
+                "the last event stamped before the first",
+                -1_999_999_999,
+                "-1s",
+            ),
+        ];
+        for (label, nanos, seconds) in spans {
+            let window = FloodWindow {
+                last: nanos_after(base, nanos),
+                counted: 2,
+                ..FloodWindow::open(base)
+            };
+            assert_eq!(
+                FloodClass::UnknownBind.resolved_detail(&window),
+                format!("unknown-user bind flood resolved: 2 binds, 0 names, {seconds}"),
+                "{label}"
+            );
+        }
+        let idle = FLOOD_IDLE_SECONDS * 1_000_000_000;
+        let edges = [
+            ("one nanosecond short of the idle time", idle - 1, 0),
+            ("the idle time", idle, 1),
+        ];
+        for (label, nanos, resolved) in edges {
+            let mut flood = FloodCoalescer::new(FloodClass::UnknownBind, FLOOD_IDLE_SECONDS);
+            for i in 0..=FLOOD_PASS {
+                flood.keep(&unknown_bind(&format!("g1-{i}"), "10.0.0.9", base));
+            }
+            let rows = flood.flush(nanos_after(base, nanos), false);
+            assert_eq!(resolved_rows(&rows).len(), resolved, "{label}");
+        }
+    }
+
     fn started_rows(rows: &[LogEvent]) -> usize {
         rows.iter()
             .filter(|r| r.detail.as_deref() == Some("unknown-user bind flood started"))

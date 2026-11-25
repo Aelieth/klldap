@@ -1464,6 +1464,31 @@ pub(crate) mod tests {
         );
     }
 
+    fn instant(seconds: i64, nanos: u32) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(seconds, nanos).unwrap()
+    }
+
+    #[test]
+    #[serial]
+    fn test_the_lockouts_clock_is_the_doors_instant_cut_to_whole_microseconds() {
+        use lldap_domain_handlers::lockout::{micros_of, time_of_micros};
+        let guard = EnforcementGuard::none();
+        let rows = [
+            (0, 4_102_444_800_000_000),
+            (123_456_789, 4_102_444_800_123_456),
+            (999_999_999, 4_102_444_800_999_999),
+        ];
+        for (nanos, micros) in rows {
+            guard.pin_clock(instant(4_102_444_800, nanos));
+            let at = lock_clock();
+            assert_eq!(
+                (micros_of(at), time_of_micros(micros)),
+                (micros, Some(at)),
+                "{nanos} ns"
+            );
+        }
+    }
+
     #[test]
     #[serial]
     fn test_the_guard_turns_the_three_item_flags_off_when_it_drops() {

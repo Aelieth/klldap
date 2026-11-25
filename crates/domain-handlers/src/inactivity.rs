@@ -478,8 +478,12 @@ pub(crate) mod tests {
         cache.set_item_flags(flags);
     }
 
+    fn exact(seconds: i64, nanos: u32) -> DateTime<Utc> {
+        DateTime::from_timestamp(seconds, nanos).unwrap()
+    }
+
     fn at(seconds: i64) -> DateTime<Utc> {
-        DateTime::from_timestamp(1_700_000_000 + seconds, 0).unwrap()
+        exact(1_700_000_000 + seconds, 0)
     }
 
     fn naive(seconds: i64) -> NaiveDateTime {
@@ -662,6 +666,79 @@ pub(crate) mod tests {
             assert_eq!(
                 (idle_past_limit(value, since, at(now)), check),
                 (expected, (expected.is_some(), expected == Some(None))),
+                "{label}"
+            );
+        }
+    }
+
+    type IdleRow = (
+        &'static str,
+        &'static str,
+        (i64, u32),
+        (i64, u32),
+        Option<(i64, u32)>,
+    );
+
+    #[test]
+    fn test_a_day_of_the_limit_is_86400_seconds_to_the_nanosecond() {
+        let bob = UserId::new("g1bob");
+        let rows: [IdleRow; 6] = [
+            (
+                "exactly one day",
+                "1",
+                (1_700_000_000, 123_456_789),
+                (1_700_086_400, 123_456_789),
+                None,
+            ),
+            (
+                "one day and one nanosecond",
+                "1",
+                (1_700_000_000, 123_456_789),
+                (1_700_086_400, 123_456_790),
+                Some((1_700_086_400, 123_456_789)),
+            ),
+            (
+                "two days over 2028-02-29",
+                "2",
+                (1_835_352_000, 0),
+                (1_835_524_800, 1),
+                Some((1_835_524_800, 0)),
+            ),
+            (
+                "a day that ends at 2038-01-19T03:14:08Z",
+                "1",
+                (2_147_397_248, 0),
+                (2_147_483_648, 0),
+                None,
+            ),
+            (
+                "the longest limit",
+                "65535",
+                (1_700_000_000, 0),
+                (7_362_224_000, 1),
+                Some((7_362_224_000, 0)),
+            ),
+            (
+                "a day that ends before 1970",
+                "1",
+                (-86_401, 500_000_000),
+                (0, 0),
+                Some((-1, 500_000_000)),
+            ),
+        ];
+        for (label, value, since, now, end) in rows {
+            let since = Some(exact(since.0, since.1));
+            let attempt = Attempt {
+                now: exact(now.0, now.1),
+                ..attempt(&bob, 0)
+            };
+            let end = end.map(|(seconds, nanos)| exact(seconds, nanos));
+            assert_eq!(
+                (
+                    idle_past_limit(value, since, attempt.now),
+                    InactivityCheck.allows(&attempt, value, &state(since)),
+                ),
+                (Some(end), end.is_none()),
                 "{label}"
             );
         }

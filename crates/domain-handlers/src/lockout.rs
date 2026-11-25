@@ -1650,10 +1650,14 @@ mod tests {
         assert_eq!(WRITE_BOUND, Duration::from_millis(250));
     }
 
-    fn at(seconds: i64) -> NaiveDateTime {
-        chrono::DateTime::from_timestamp(1_700_000_000 + seconds, 0)
+    fn exact(seconds: i64, nanos: u32) -> NaiveDateTime {
+        chrono::DateTime::from_timestamp(seconds, nanos)
             .unwrap()
             .naive_utc()
+    }
+
+    fn at(seconds: i64) -> NaiveDateTime {
+        exact(1_700_000_000 + seconds, 0)
     }
 
     fn row(fail_count: u32, failed: Option<i64>, unlocked: Option<i64>) -> LockRow {
@@ -1736,6 +1740,144 @@ mod tests {
                     "{label} at {now}"
                 );
             }
+        }
+    }
+
+    type MicrosRow = (&'static str, i64, u32, i64);
+
+    #[test]
+    fn test_an_instant_is_counted_in_whole_microseconds_downward_from_1970() {
+        let rows: [MicrosRow; 8] = [
+            ("the epoch", 0, 0, 0),
+            (
+                "nanoseconds are cut",
+                1_700_000_000,
+                123_456_789,
+                1_700_000_000_123_456,
+            ),
+            (
+                "the last nanosecond of a second",
+                1_700_000_000,
+                999_999_999,
+                1_700_000_000_999_999,
+            ),
+            ("half a microsecond before 1970", -1, 999_999_500, -1),
+            (
+                "a second and a half before 1970",
+                -2,
+                500_000_000,
+                -1_500_000,
+            ),
+            (
+                "2028-02-29T12:00:00.000001Z",
+                1_835_438_400,
+                1_000,
+                1_835_438_400_000_001,
+            ),
+            (
+                "2038-01-19T03:14:08Z",
+                2_147_483_648,
+                0,
+                2_147_483_648_000_000,
+            ),
+            (
+                "9999-12-30T22:00:00.999999999Z",
+                253_402_207_200,
+                999_999_999,
+                253_402_207_200_999_999,
+            ),
+        ];
+        for (label, seconds, nanos, micros) in rows {
+            let cut = exact(seconds, nanos / 1_000 * 1_000);
+            assert_eq!(
+                (micros_of(exact(seconds, nanos)), time_of_micros(micros)),
+                (micros, Some(cut)),
+                "{label}"
+            );
+        }
+        assert_eq!(
+            [i64::MIN, i64::MAX].map(time_of_micros),
+            [None, None],
+            "no instant is that far"
+        );
+    }
+
+    type EndRow = (&'static str, (i64, u32), u32, (i64, u32), bool);
+
+    #[test]
+    fn test_a_lock_ends_its_duration_after_the_last_failure_to_the_nanosecond() {
+        let rows: [EndRow; 8] = [
+            (
+                "one nanosecond before the end",
+                (1_700_000_000, 999_999_000),
+                60,
+                (1_700_000_060, 999_998_999),
+                true,
+            ),
+            (
+                "the end",
+                (1_700_000_000, 999_999_000),
+                60,
+                (1_700_000_060, 999_999_000),
+                false,
+            ),
+            (
+                "one nanosecond after the end",
+                (1_700_000_000, 999_999_000),
+                60,
+                (1_700_000_060, 999_999_001),
+                false,
+            ),
+            (
+                "across 2038-01-19T03:14:08Z",
+                (2_147_483_647, 500_000_000),
+                1,
+                (2_147_483_648, 499_999_999),
+                true,
+            ),
+            (
+                "the longest duration, one nanosecond before its end",
+                (1_700_000_000, 0),
+                u32::MAX,
+                (5_994_967_294, 999_999_999),
+                true,
+            ),
+            (
+                "the longest duration, at its end",
+                (1_700_000_000, 0),
+                u32::MAX,
+                (5_994_967_295, 0),
+                false,
+            ),
+            (
+                "before 1970, one nanosecond before the end",
+                (-100, 500_000_000),
+                60,
+                (-40, 499_999_999),
+                true,
+            ),
+            (
+                "before 1970, the end",
+                (-100, 500_000_000),
+                60,
+                (-40, 500_000_000),
+                false,
+            ),
+        ];
+        for (label, failed, duration, now, locked) in rows {
+            let policy = policy(1, duration);
+            let row = LockRow {
+                fail_count: 1,
+                last_failed: Some(exact(failed.0, failed.1)),
+                ..LockRow::default()
+            };
+            let end = exact(failed.0 + i64::from(duration), failed.1);
+            let now = exact(now.0, now.1);
+            assert_eq!(
+                (row.lock_end(policy), row.locked(policy, now)),
+                (Some(end), locked),
+                "{label}"
+            );
         }
     }
 

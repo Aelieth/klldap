@@ -596,6 +596,24 @@ mod tests {
     }
 
     #[test]
+    fn test_the_check_judges_the_second_an_instant_falls_in_also_before_1970() {
+        let check = LoginHoursCheck::on(cache_in(TimeZone::UTC));
+        let bob = UserId::new("g1bob");
+        let rows = [
+            ("mon 08:00-18:00", "2026-11-16T07:59:59.999999999Z", false),
+            ("mon 08:00-18:00", "2026-11-16T17:59:59.999999999Z", true),
+            ("wed 23:00-24:00", "1969-12-31T23:59:59.5Z", true),
+            ("thu 00:00-01:00", "1969-12-31T23:59:59.5Z", false),
+            ("tue 03:14-03:15", "2038-01-19T03:14:08Z", true),
+        ];
+        for (value, at, allowed) in rows {
+            let attempt = attempt(&bob, Door::LdapBind, at);
+            let got = check.allows(&attempt, value, &UserState::default());
+            assert_eq!(got, allowed, "{value} at {at}");
+        }
+    }
+
+    #[test]
     fn test_a_stored_value_that_does_not_parse_is_refused_as_unreadable() {
         let cache = cache_in(TimeZone::UTC);
         let checks: Vec<Arc<dyn ItemCheck>> = vec![Arc::new(LoginHoursCheck::on(cache))];

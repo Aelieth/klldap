@@ -218,9 +218,20 @@ pub(crate) mod tests {
     const DAY: i64 = 86_400;
     const WRONG: &str = "Wrong-Pass-1";
 
-    fn at(seconds: i64) -> NaiveDateTime {
-        let at = DateTime::from_timestamp(1_700_000_000 + seconds, 0).unwrap();
+    fn exact(seconds: i64, nanos: u32) -> NaiveDateTime {
+        let at = DateTime::from_timestamp(seconds, nanos).unwrap();
         at.naive_utc()
+    }
+
+    fn at(seconds: i64) -> NaiveDateTime {
+        exact(1_700_000_000 + seconds, 0)
+    }
+
+    fn success_at(at: NaiveDateTime) -> Recorded {
+        Recorded {
+            last_success: Some(at.and_utc()),
+            reenabled_at: None,
+        }
     }
 
     fn after(start: DateTime<Utc>, seconds: i64) -> DateTime<Utc> {
@@ -381,6 +392,113 @@ pub(crate) mod tests {
             (vec![(Recording::Off, 1), (Recording::Off, 0)], None),
             "a time left from a live period: the first start sets it off, a second changes nothing"
         );
+    }
+
+    #[test]
+    fn test_the_recording_time_is_kept_as_utc_text_with_six_digits() {
+        let written = [
+            ("the epoch", 0, 0, "1970-01-01T00:00:00.000000Z"),
+            (
+                "nanoseconds are cut",
+                1_700_000_000,
+                123_456_789,
+                "2023-11-14T22:13:20.123456Z",
+            ),
+            (
+                "the last nanosecond of a second",
+                1_700_000_000,
+                999_999_999,
+                "2023-11-14T22:13:20.999999Z",
+            ),
+            (
+                "half a microsecond before 1970",
+                -1,
+                999_999_500,
+                "1969-12-31T23:59:59.999999Z",
+            ),
+            (
+                "a leap day",
+                1_835_438_400,
+                1_000,
+                "2028-02-29T12:00:00.000001Z",
+            ),
+            (
+                "2038-01-19T03:14:08Z",
+                2_147_483_648,
+                0,
+                "2038-01-19T03:14:08.000000Z",
+            ),
+            (
+                "the last instant",
+                253_402_207_200,
+                999_999_999,
+                "9999-12-30T22:00:00.999999Z",
+            ),
+        ];
+        for (label, seconds, nanos, text) in written {
+            let cut = exact(seconds, nanos / 1_000 * 1_000);
+            assert_eq!(
+                (
+                    recording_text(exact(seconds, nanos)).as_str(),
+                    recording_of(text).unwrap()
+                ),
+                (text, Some(cut)),
+                "{label}"
+            );
+        }
+        let read = [
+            ("off", None),
+            ("2023-11-14T22:13:20Z", Some((1_700_000_000, 0))),
+            ("2023-11-14T22:13:20+00:00", Some((1_700_000_000, 0))),
+            (
+                "2023-11-14T23:13:20.5+01:00",
+                Some((1_700_000_000, 500_000_000)),
+            ),
+        ];
+        for (text, at) in read {
+            let at = at.map(|(seconds, nanos)| exact(seconds, nanos));
+            assert_eq!(recording_of(text).unwrap(), at, "{text}");
+        }
+        let unread = recording_of("soon");
+        let says = "inactivity_recording_since holds \"soon\": ";
+        assert!(
+            matches!(&unread, Err(DomainError::InternalError(e)) if e.starts_with(says)),
+            "{unread:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_keeps_a_success_as_text_with_the_fraction_it_was_given() {
+        let pool = get_initialized_db().await;
+        let handler = SqlBackendHandler::new(generate_random_private_key(), pool.clone());
+        let user = UserId::new("g1text");
+        let request = CreateUserRequest {
+            user_id: user.clone(),
+            email: "g1text@example.com".into(),
+            ..Default::default()
+        };
+        handler.create_user(request).await.unwrap();
+        let rows = [
+            (0, 0, "2023-11-14 22:13:20"),
+            (1, 120_000_000, "2023-11-14 22:13:21.120"),
+            (2, 123_450_000, "2023-11-14 22:13:22.123450"),
+            (3, 123_456_789, "2023-11-14 22:13:23.123456789"),
+        ];
+        for (seconds, nanos, text) in rows {
+            let at = exact(1_700_000_000 + seconds, nanos);
+            handler.write_success(&user, at).await.unwrap();
+            let column = "SELECT last_success FROM user_activity WHERE user_id = 'g1text'";
+            let column = Statement::from_string(DbBackend::Sqlite, column.to_owned());
+            let kept = pool.query_one(column).await.unwrap().unwrap();
+            assert_eq!(
+                (
+                    kept.try_get_by_index::<String>(0).unwrap().as_str(),
+                    stored(&pool, "g1text").await
+                ),
+                (text, vec![success_at(at)]),
+                "{text}"
+            );
+        }
     }
 
     #[tokio::test]

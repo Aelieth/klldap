@@ -7339,6 +7339,9 @@ mod tests {
                 Some("default".to_owned())
             )
         );
+        for seconds in [0, 2_147_483_648, u32::MAX] {
+            assert_eq!(time(seconds), when(i64::from(seconds)), "{seconds}");
+        }
         let refused = principal_row(row(u32::MAX, None)).unwrap_err();
         assert!(
             matches!(&refused, KerberosStoreError::Refused(why) if why.contains("key version")),

@@ -1772,6 +1772,15 @@ mod tests {
     }
 
     #[test]
+    fn test_an_attempt_at_the_kdc_is_made_at_the_second_the_kdc_gives() {
+        let bob = UserId::new("bob");
+        for now in [0, 1_700_000_000, 2_147_483_648, u32::MAX] {
+            let attempt = Attempt::at_kdc(&bob, Door::KerberosAs, None, now);
+            assert_eq!(attempt.now, at(i64::from(now) - 1_700_000_000), "{now}");
+        }
+    }
+
+    #[test]
     fn test_the_mfa_item_check_refuses_nothing_at_any_door() {
         let bob = UserId::new("bob");
         let items = [item("enable-mfa", "always")];

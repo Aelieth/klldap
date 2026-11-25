@@ -97,20 +97,55 @@ pub(crate) async fn note_window(
     }
 }
 
+const WINDOWS: &str = "SELECT user_id, peer, opened_at, until_at FROM mfa_windows";
+/// The rows after one in the order of the table's key: the user, the address, the opening.
+const LATER: &str = "user_id > ? OR (user_id = ? AND (peer > ? OR (peer = ? AND opened_at > ?)))";
+
 pub(crate) async fn read_windows(
     db: &impl ConnectionTrait,
     user: Option<&UserId>,
 ) -> Result<Vec<(UserId, ProofWindow)>> {
     let backend = db.get_database_backend();
-    let select = "SELECT user_id, peer, opened_at, until_at FROM mfa_windows";
     let query = match user {
         Some(user) => statement(
             backend,
-            &format!("{select} WHERE user_id = ?"),
+            &format!("{WINDOWS} WHERE user_id = ?"),
             vec![Value::from(user.as_str().to_owned())],
         ),
-        None => Statement::from_string(backend, select.to_owned()),
+        None => Statement::from_string(backend, WINDOWS.to_owned()),
     };
+    windows_of(db, query).await
+}
+
+/// One page of everyone's windows in key order, the rows after `after`.
+pub(crate) async fn read_windows_after(
+    db: &impl ConnectionTrait,
+    after: Option<&(UserId, ProofWindow)>,
+    limit: usize,
+) -> Result<Vec<(UserId, ProofWindow)>> {
+    let backend = db.get_database_backend();
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let page = format!("ORDER BY user_id, peer, opened_at LIMIT {limit}");
+    let query = match after {
+        Some((user, window)) => {
+            let user = Value::from(user.as_str().to_owned());
+            let peer = Value::from(window.peer.clone());
+            let opened = Value::from(window.opened_at);
+            statement(
+                backend,
+                &format!("{WINDOWS} WHERE {LATER} {page}"),
+                vec![user.clone(), user, peer.clone(), peer, opened],
+            )
+        }
+        None => Statement::from_string(backend, format!("{WINDOWS} {page}")),
+    };
+    windows_of(db, query).await
+}
+
+async fn windows_of(
+    db: &impl ConnectionTrait,
+    query: Statement,
+) -> Result<Vec<(UserId, ProofWindow)>> {
     let rows = db.query_all(query).await?;
     let of_row = |row: &sea_orm::QueryResult| -> Result<(UserId, ProofWindow)> {
         let user: String = row.try_get_by_index(0)?;
@@ -353,6 +388,7 @@ pub(crate) mod tests {
             "ten proofs at once open one window; ten inside it all reach its new end, an \
              overlapping row allowed"
         );
+        window_pages_lane(pool).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -737,6 +773,54 @@ pub(crate) mod tests {
             ),
             "the bind, the web login and a replacement's finish stand, and each one's row says \
              the proof was not stored"
+        );
+    }
+
+    /// Any backend: everyone's windows a page at a time, the lane's own rows told by their names.
+    pub(crate) async fn window_pages_lane(pool: &DbConnection) {
+        use lldap_domain_handlers::handler::PolicyBackendHandler;
+        init_table(pool).await.expect("init");
+        let handler = SqlBackendHandler::new(generate_random_private_key(), pool.clone());
+        let handler = doors::own(handler);
+        let stored = [
+            ("r1wb", "", NOW),
+            ("r1wa", "192.0.2.9", NOW + 2000),
+            ("r1wa", "", NOW + 1000),
+            ("r1wa", "192.0.2.9", NOW),
+            ("r1wa", "", NOW),
+        ];
+        for name in ["r1wa", "r1wb"] {
+            insert_user_no_password(&handler, name).await;
+        }
+        for (user, peer, at) in stored {
+            let user = UserId::new(user);
+            note_window(pool, &user, peer, at, at + WINDOW)
+                .await
+                .unwrap();
+        }
+        let mut read: Vec<(UserId, ProofWindow)> = Vec::new();
+        loop {
+            let page = handler.read_proof_windows_after(read.last(), 1).await;
+            let page = page.unwrap();
+            if page.is_empty() {
+                break;
+            }
+            read.extend(page);
+        }
+        let ours = read
+            .iter()
+            .filter(|(user, _)| user.as_str().starts_with("r1w"));
+        let keys = ours.map(|(user, w)| (user.as_str(), w.peer.as_str(), w.opened_at));
+        assert_eq!(
+            keys.collect::<Vec<_>>(),
+            vec![
+                ("r1wa", "", NOW),
+                ("r1wa", "", NOW + 1000),
+                ("r1wa", "192.0.2.9", NOW),
+                ("r1wa", "192.0.2.9", NOW + 2000),
+                ("r1wb", "", NOW),
+            ],
+            "pages of one: each row once, by the user, then the address, then the opening"
         );
     }
 }

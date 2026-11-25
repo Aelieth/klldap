@@ -1,8 +1,8 @@
-use crate::sql_activity_handler::read_activity_on;
+use crate::sql_activity_handler::{read_activity_after_on, read_activity_on};
 use crate::sql_backend_handler::SqlBackendHandler;
 use crate::sql_lockout_handler::CountingStart;
 use crate::sql_log_handler::to_active_model;
-use crate::sql_mfa_windows::read_windows;
+use crate::sql_mfa_windows::{read_windows, read_windows_after};
 use crate::sql_tables::DbConnection;
 use async_trait::async_trait;
 use lldap_domain::types::{User, UserId};
@@ -448,6 +448,22 @@ impl PolicyBackendHandler for SqlBackendHandler {
 
     async fn read_activity(&self, user: Option<&UserId>) -> Result<Vec<(UserId, Recorded)>> {
         read_activity_on(&self.sql_pool, user).await
+    }
+
+    async fn read_proof_windows_after(
+        &self,
+        after: Option<&(UserId, ProofWindow)>,
+        limit: usize,
+    ) -> Result<Vec<(UserId, ProofWindow)>> {
+        read_windows_after(&self.sql_pool, after, limit).await
+    }
+
+    async fn read_activity_after(
+        &self,
+        after: Option<&UserId>,
+        limit: usize,
+    ) -> Result<Vec<(UserId, Recorded)>> {
+        read_activity_after_on(&self.sql_pool, after, limit).await
     }
 
     #[instrument(skip_all, level = "debug", err(level = "debug"))]

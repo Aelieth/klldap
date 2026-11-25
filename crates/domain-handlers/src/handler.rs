@@ -305,6 +305,35 @@ pub trait PolicyBackendHandler: Send + Sync {
     async fn read_activity(&self, _user: Option<&UserId>) -> Result<Vec<(UserId, Recorded)>> {
         Ok(Vec::new())
     }
+    /// Everyone's windows in the order of their key: the user, the address, the opening. A page
+    /// shorter than `limit` is the last. Without paging: all, per page.
+    async fn read_proof_windows_after(
+        &self,
+        after: Option<&(UserId, ProofWindow)>,
+        limit: usize,
+    ) -> Result<Vec<(UserId, ProofWindow)>> {
+        let key = |(user, window): &(UserId, ProofWindow)| {
+            (user.clone(), window.peer.clone(), window.opened_at)
+        };
+        let mut rows = self.read_proof_windows(None).await?;
+        rows.sort_by_cached_key(key);
+        let after = after.map(key);
+        let later =
+            |row: &(UserId, ProofWindow)| after.as_ref().is_none_or(|after| key(row) > *after);
+        Ok(rows.into_iter().filter(later).take(limit).collect())
+    }
+    /// Everyone's inactivity-days rows in user-id order; a page shorter than `limit` is the last.
+    /// Without paging: all, per page.
+    async fn read_activity_after(
+        &self,
+        after: Option<&UserId>,
+        limit: usize,
+    ) -> Result<Vec<(UserId, Recorded)>> {
+        let mut rows = self.read_activity(None).await?;
+        rows.sort_by_key(|(user, _)| user.clone());
+        let later = |(user, _): &(UserId, Recorded)| after.is_none_or(|after| user > after);
+        Ok(rows.into_iter().filter(later).take(limit).collect())
+    }
     /// `bounded_policy_entry` with the user's activity row, in the same bounded read.
     async fn bounded_activity_entry(
         &self,

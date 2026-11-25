@@ -67,20 +67,48 @@ pub(crate) fn reenable_statement(backend: DbBackend, user: &UserId, at: Timestam
     statement(backend, &sql, vec![name(user), at.into(), at.into()])
 }
 
+const ACTIVITY: &str = "SELECT user_id, last_success, reenabled_at FROM user_activity";
+
 pub(crate) async fn read_activity_on(
     db: &impl ConnectionTrait,
     user: Option<&UserId>,
 ) -> Result<Vec<(UserId, Recorded)>> {
     let backend = db.get_database_backend();
-    let select = "SELECT user_id, last_success, reenabled_at FROM user_activity";
     let query = match user {
         Some(user) => statement(
             backend,
-            &format!("{select} WHERE user_id = ?"),
+            &format!("{ACTIVITY} WHERE user_id = ?"),
             vec![name(user)],
         ),
-        None => Statement::from_string(backend, select.to_owned()),
+        None => Statement::from_string(backend, ACTIVITY.to_owned()),
     };
+    activity_of(db, query).await
+}
+
+/// One page of everyone's rows in user-id order, the rows after `after`.
+pub(crate) async fn read_activity_after_on(
+    db: &impl ConnectionTrait,
+    after: Option<&UserId>,
+    limit: usize,
+) -> Result<Vec<(UserId, Recorded)>> {
+    let backend = db.get_database_backend();
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    let page = format!("ORDER BY user_id LIMIT {limit}");
+    let query = match after {
+        Some(after) => statement(
+            backend,
+            &format!("{ACTIVITY} WHERE user_id > ? {page}"),
+            vec![name(after)],
+        ),
+        None => Statement::from_string(backend, format!("{ACTIVITY} {page}")),
+    };
+    activity_of(db, query).await
+}
+
+async fn activity_of(
+    db: &impl ConnectionTrait,
+    query: Statement,
+) -> Result<Vec<(UserId, Recorded)>> {
     let rows = db.query_all(query).await?;
     let of_row = |row: &sea_orm::QueryResult| -> Result<(UserId, Recorded)> {
         let at = |index: usize| -> std::result::Result<Option<Timestamp>, DbErr> {
@@ -333,6 +361,7 @@ pub(crate) mod tests {
             vec![],
             "the row goes with its user"
         );
+        activity_pages_lane(pool).await;
     }
 
     /// Any backend: two servers on one database, each with its own memory.
@@ -785,6 +814,51 @@ pub(crate) mod tests {
             ),
             (true, one_each),
             "one account_reenable row each; an unknown user writes none"
+        );
+    }
+
+    /// Any backend: everyone's rows a page at a time, the lane's own rows told by their names.
+    pub(crate) async fn activity_pages_lane(pool: &DbConnection) {
+        use lldap_domain_handlers::handler::PolicyBackendHandler;
+        init_table(pool).await.unwrap();
+        let handler = SqlBackendHandler::new(generate_random_private_key(), pool.clone());
+        let handler = doors::own(handler);
+        let names = ["r1e", "r1a", "r1d", "r1b", "r1c"];
+        for (seconds, name) in (0..).zip(names) {
+            let request = CreateUserRequest {
+                user_id: UserId::new(name),
+                email: format!("{name}@example.com").into(),
+                ..Default::default()
+            };
+            handler.create_user(request).await.unwrap();
+            let user = UserId::new(name);
+            handler.write_success(&user, at(seconds)).await.unwrap();
+        }
+        let mut read: Vec<(UserId, Recorded)> = Vec::new();
+        loop {
+            let last = read.last().map(|(user, _)| user);
+            let page = handler.read_activity_after(last, 2).await.unwrap();
+            let short = page.len() < 2;
+            read.extend(page);
+            if short {
+                break;
+            }
+        }
+        let ours = read
+            .iter()
+            .filter(|(user, _)| names.contains(&user.as_str()));
+        let rows = ours.map(|(user, row)| (user.as_str(), *row));
+        let row = |name: &'static str, seconds| (name, success_at(at(seconds)));
+        assert_eq!(
+            rows.collect::<Vec<_>>(),
+            vec![
+                row("r1a", 1),
+                row("r1b", 3),
+                row("r1c", 4),
+                row("r1d", 2),
+                row("r1e", 0)
+            ],
+            "pages of two: each user's own row once, in user-id order"
         );
     }
 }

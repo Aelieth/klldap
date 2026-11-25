@@ -7,6 +7,7 @@ use lldap_domain_handlers::enforcement::{self, PolicyCache};
 use lldap_domain_handlers::kdc_proof::ProofSettings;
 use lldap_domain_handlers::lockout::{Lockout, lockout};
 use lldap_domain_handlers::mfa::MfaPolicy;
+use lldap_opaque_handler::StretchGate;
 use lldap_schema::PublicSchema;
 use sea_orm::sea_query::{Cond, IntoCondition, SimpleExpr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -73,6 +74,7 @@ pub struct SqlBackendHandler {
     pub(crate) codes_written: Arc<AtomicBool>,
     pub(crate) policy_cache: &'static PolicyCache,
     pub(crate) lockout: &'static Lockout,
+    pub(crate) stretch_gate: &'static StretchGate,
     policy_changes: Arc<AtomicU64>,
     pub(crate) statement_bound: Arc<OnceLock<StatementBound>>,
 }
@@ -88,6 +90,7 @@ impl SqlBackendHandler {
             codes_written: Arc::new(AtomicBool::new(true)),
             policy_cache: enforcement::policy_cache(),
             lockout: lockout(),
+            stretch_gate: enforcement::stretch_gate(),
             policy_changes: Arc::default(),
             statement_bound: Arc::default(),
         }
@@ -96,6 +99,12 @@ impl SqlBackendHandler {
     /// The process's view and queue unless a test gives its own.
     pub fn with_lockout(mut self, lockout: &'static Lockout) -> Self {
         self.lockout = lockout;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_stretch_gate(mut self, stretch_gate: &'static StretchGate) -> Self {
+        self.stretch_gate = stretch_gate;
         self
     }
 

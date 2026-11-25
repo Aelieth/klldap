@@ -72,6 +72,10 @@ pub(crate) async fn bind(
             code: LdapResultCode::Unavailable,
             message: cause,
         }),
+        Err(DomainError::Busy(cause)) => Err(LdapError {
+            code: LdapResultCode::Busy,
+            message: cause,
+        }),
         Err(e) => {
             say_fault(&e);
             Err(LdapError {
@@ -973,14 +977,22 @@ pub mod tests {
         type Failure = fn() -> DomainError;
         let refusal: Failure = || DomainError::AuthenticationError("for bob".to_owned());
         let fault: Failure = || DomainError::InternalError("the database is away".to_owned());
-        for (label, failure, said) in [("a refusal", refusal, 0), ("a fault", fault, BUDGET)] {
+        let busy: Failure = || DomainError::Busy("no permit".to_owned());
+        type Code = fn() -> LdapResultCode;
+        let wrong: Code = || LdapResultCode::InvalidCredentials;
+        let later: Code = || LdapResultCode::Busy;
+        let rows = [
+            ("a refusal", refusal, wrong, 0),
+            ("a fault", fault, wrong, BUDGET),
+            ("no permit to try the password", busy, later, 0),
+        ];
+        for (label, failure, code, said) in rows {
             let mut mock = MockTestBackendHandler::new();
             mock.expect_bind().returning(move |_| Err(failure()));
             let (lines, _guard) = Lines::capture();
             for _ in 0..100 {
                 let answered = bind(&mock, UserId::new("bob"), "pass").await;
-                let code = answered.map_err(|e| e.code);
-                assert_eq!(code, Err(LdapResultCode::InvalidCredentials), "{label}");
+                assert_eq!(answered.map_err(|e| e.code), Err(code()), "{label}");
             }
             assert_eq!(lines.take_loud().len(), said, "{label}");
         }

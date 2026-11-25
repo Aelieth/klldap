@@ -174,6 +174,7 @@ impl EnforcementGuard {
         set_test_clock(None);
         hold_utc();
         policy_cache().replace(Entries::default());
+        policy_cache().reset_door_reads();
         policy_cache().set_mfa_item_live(false);
         policy_cache().set_item_flags(ItemFlags::default());
         policy_cache().reset_activity_reads();
@@ -206,6 +207,7 @@ impl Drop for EnforcementGuard {
         set_test_clock(None);
         hold_utc();
         policy_cache().replace(Entries::default());
+        policy_cache().reset_door_reads();
         policy_cache().set_mfa_item_live(false);
         policy_cache().set_item_flags(ItemFlags::default());
         policy_cache().reset_activity_reads();

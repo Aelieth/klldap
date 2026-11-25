@@ -150,6 +150,10 @@ pub fn proved_sync<T>(f: impl FnOnce() -> T) -> T {
     PROVED.sync_scope((), f)
 }
 
+pub fn credential_proved() -> bool {
+    PROVED.try_with(|_| ()).is_ok()
+}
+
 pub async fn with_request<F: Future>(meta: RequestMeta, f: F) -> F::Output {
     REQUEST.scope(meta, f).await
 }
@@ -440,7 +444,7 @@ fn build(
             .map(|f| truncate(f, MAX_NAME_LEN)),
         detail: detail.map(|d| truncate(d, MAX_DETAIL_LEN)),
         source: meta.client_address,
-        proved: PROVED.try_with(|_| ()).is_ok(),
+        proved: credential_proved(),
     }
 }
 

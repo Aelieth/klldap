@@ -21,6 +21,8 @@ pub enum DomainError {
     EntityNotFound(String),
     #[error("Kerberos KDC unavailable: {0}")]
     KdcUnavailable(String),
+    #[error("Server busy: {0}")]
+    Busy(String),
     #[error("Internal error: `{0}`")]
     InternalError(String),
 }

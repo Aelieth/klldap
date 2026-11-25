@@ -54,6 +54,8 @@ const FLOOD_USERS_PER_SOURCE: usize = 16;
 const MANY_SOURCES: &str = " from many sources";
 
 pub(crate) const UNKNOWN_USER_DETAIL: &str = "unknown user";
+/// A bind turned away before its password was tried: keyed by its source alone.
+pub(crate) const BUSY_DETAIL: &str = "server busy";
 const UNREADABLE_DETAIL: &str = "policy: unreadable";
 const DISABLED_DETAIL: &str = "account disabled";
 const USER_AT_BIND: [&str; 4] = [
@@ -1667,6 +1669,7 @@ mod tests {
         let base = at(1, 9, 0);
         let rows = [
             (LogKind::Bind, Protocol::Ldap, "invalid credentials", "bind"),
+            (LogKind::Bind, Protocol::Http, BUSY_DETAIL, "bind"),
             (
                 LogKind::Login,
                 Protocol::Http,
@@ -1771,6 +1774,7 @@ mod tests {
             (LogKind::Bind, Protocol::Ldap, "account disabled", true),
             (LogKind::Bind, Protocol::Ldap, "ou mismatch", true),
             (LogKind::Bind, Protocol::Ldap, "policy: unreadable", false),
+            (LogKind::Bind, Protocol::Ldap, BUSY_DETAIL, false),
             (LogKind::Bind, Protocol::Ldap, "SASL not supported", false),
             (LogKind::Login, Protocol::Http, "locked out", true),
             (LogKind::Login, Protocol::Http, "account disabled", true),

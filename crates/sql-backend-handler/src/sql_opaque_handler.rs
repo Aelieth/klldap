@@ -1,5 +1,5 @@
 use crate::SqlBackendHandler;
-use crate::sql_log_handler::UNKNOWN_USER_DETAIL;
+use crate::sql_log_handler::{BUSY_DETAIL, UNKNOWN_USER_DETAIL};
 use crate::sql_mfa_handler::{TotpRejection, now_unix};
 use crate::sql_mfa_windows::with_proof;
 use crate::sql_used_starts::{CLOCK_TOLERANCE_SECS, take_start_id};
@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use base64::Engine;
 use lldap_auth::opaque;
 use lldap_domain::types::{GroupId, LoginOutcome, UserId};
-use lldap_domain_handlers::enforcement::{Attempt, Door, admit, door_read};
+use lldap_domain_handlers::enforcement::{Attempt, Door, admit, before_credential, door_read};
 use lldap_domain_handlers::handler::{BindRequest, LoginHandler};
 use lldap_domain_handlers::instant::Timestamp;
 use lldap_domain_handlers::kerberos::{
@@ -24,7 +24,9 @@ use lldap_domain_model::{
     model::{self, UserColumn},
 };
 use lldap_mfa::{MFA_ENROLLMENT_REQUIRED, TOTP_CODE_REQUIRED, split_totp_suffix, without_password};
-use lldap_opaque_handler::{OpaqueHandler, STRETCH_FAILED, login, registration, stretch};
+use lldap_opaque_handler::{
+    OpaqueHandler, STRETCH_BUSY, STRETCH_FAILED, StretchError, StretchGate, login, registration,
+};
 use sea_orm::{
     ActiveModelTrait, ActiveValue, ConnectionTrait, DbErr, EntityTrait, QuerySelect,
     TransactionTrait,
@@ -33,18 +35,37 @@ use tracing::{debug, info, instrument, warn};
 
 type SqlOpaqueHandler = SqlBackendHandler;
 
-#[instrument(skip_all, level = "debug", err(level = "debug"), fields(username = %username.as_str()))]
+/// A bind's password found wrong, or not tried: no stretch permit in time, or a stretch that
+/// did not complete.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unmatched {
+    Wrong,
+    Busy,
+    NotRun,
+}
+
+fn stretched(answer: std::result::Result<Result<()>, StretchError>) -> Option<Unmatched> {
+    match answer {
+        Ok(Ok(())) => None,
+        Ok(Err(_)) => Some(Unmatched::Wrong),
+        Err(StretchError::Busy) => Some(Unmatched::Busy),
+        Err(StretchError::Failed) => Some(Unmatched::NotRun),
+    }
+}
+
+#[instrument(skip_all, level = "debug", fields(username = %username.as_str()))]
 async fn passwords_match(
+    gate: &StretchGate,
     password_file_bytes: &[u8],
     clear_password: &str,
     opaque_setup: &opaque::server::ServerSetup,
     username: &UserId,
-) -> Result<()> {
+) -> Option<Unmatched> {
     let password_file_bytes = password_file_bytes.to_vec();
     let clear_password = clear_password.to_owned();
     let opaque_setup = opaque_setup.clone();
     let username = username.clone();
-    stretch(move || {
+    let answer = gate.stretch(move || -> Result<()> {
         use opaque::{client, server};
         let mut rng = rand::rngs::OsRng;
         let client_login_start_result = client::login::start_login(&clear_password, &mut rng)?;
@@ -64,9 +85,8 @@ async fn passwords_match(
             &mut rng,
         )?;
         Ok(())
-    })
-    .await
-    .map_err(|_| DomainError::InternalError(STRETCH_FAILED.to_string()))?
+    });
+    stretched(answer.await)
 }
 
 const LOGIN_STATE_KEY_INFO: &[u8] = b"lldap-opaque-login-state-v1";
@@ -243,6 +263,18 @@ pub(crate) fn invalid_credentials(user_id: &UserId) -> DomainError {
     DomainError::AuthenticationError(format!(r#"for user "{}""#, user_id))
 }
 
+fn unknown_user(name: &UserId) -> DomainError {
+    debug!(r#"User "{}" doesn't exist or has no password"#, name);
+    logging::record_as(
+        Some(name),
+        LogKind::Bind,
+        None,
+        false,
+        Some(UNKNOWN_USER_DETAIL),
+    );
+    invalid_credentials(name)
+}
+
 impl SqlBackendHandler {
     /// A refusal is the door's one row and answers as the wrong-credentials error. The items are
     /// judged at the instant the lockout was.
@@ -318,6 +350,30 @@ impl SqlBackendHandler {
             _ => refusal_while_degraded(user, false, unavailable),
         };
         cause.map_or(Ok(()), |cause| Err(DomainError::KdcUnavailable(cause)))
+    }
+
+    /// Only a wrong password is counted; a bind with no stretch permit has its own row and answer.
+    async fn refuse_unmatched(
+        &self,
+        name: &UserId,
+        unmatched: Unmatched,
+        lock: Option<&LockState>,
+        door: Door,
+        now: Timestamp,
+    ) -> DomainError {
+        let row = |detail| logging::record_as(Some(name), LogKind::Bind, None, false, Some(detail));
+        match unmatched {
+            Unmatched::Wrong => {
+                row("invalid credentials");
+                self.count_failure(lock, door, now).await;
+                invalid_credentials(name)
+            }
+            Unmatched::Busy => {
+                row(BUSY_DETAIL);
+                DomainError::Busy(STRETCH_BUSY.to_owned())
+            }
+            Unmatched::NotRun => DomainError::InternalError(STRETCH_FAILED.to_owned()),
+        }
     }
 
     /// The bind once its password matched.
@@ -509,7 +565,9 @@ impl LoginHandler for SqlBackendHandler {
             );
             return Err(invalid_credentials(&name));
         }
-        let requirement = self.door_requirement(&name, LogKind::Bind).await?;
+        let Some(requirement) = self.bind_requirement(&name).await? else {
+            return Err(unknown_user(&name));
+        };
         // An enrolled user binds with password:code; the password is checked first either way.
         let (password, code) = match requirement {
             MfaRequirement::Totp => match split_totp_suffix(&password) {
@@ -520,15 +578,7 @@ impl LoginHandler for SqlBackendHandler {
         };
         let password_file = door_read(self.get_password_file_for_user(name.clone()));
         let Some(password_hash) = password_file.await? else {
-            debug!(r#"User "{}" doesn't exist or has no password"#, &name);
-            logging::record_as(
-                Some(&name),
-                LogKind::Bind,
-                None,
-                false,
-                Some(UNKNOWN_USER_DETAIL),
-            );
-            return Err(invalid_credentials(&name));
+            return Err(unknown_user(&name));
         };
         let (now, door) = (lock_clock(), Door::of_bind());
         let lock = self
@@ -540,19 +590,11 @@ impl LoginHandler for SqlBackendHandler {
             return Err(invalid_credentials(&name));
         }
         debug!(r#"Login attempt for "{}""#, &name);
-        if passwords_match(&password_hash, password, &self.opaque_setup, &name)
-            .await
-            .is_err()
-        {
-            logging::record_as(
-                Some(&name),
-                LogKind::Bind,
-                None,
-                false,
-                Some("invalid credentials"),
-            );
-            self.count_failure(lock.as_ref(), door, now).await;
-            return Err(invalid_credentials(&name));
+        let (gate, setup) = (self.stretch_gate, &self.opaque_setup);
+        let unmatched = passwords_match(gate, &password_hash, password, setup, &name).await;
+        if let Some(unmatched) = unmatched {
+            let refused = self.refuse_unmatched(&name, unmatched, lock.as_ref(), door, now);
+            return Err(refused.await);
         }
         let proved = self.bind_proved(&name, requirement, code, lock.as_ref(), door, now);
         logging::proved(proved).await
@@ -692,10 +734,15 @@ impl OpaqueHandler for SqlOpaqueHandler {
             _ => false,
         };
         let now = lock_clock();
-        let lock = self
-            .lock_state(&username)
-            .await
-            .map_err(|e| Self::lock_unreadable(&username, LogKind::Login, e))?;
+        // A proof that did not verify is no credential, and its name, if no user, has no lock.
+        let lock = match verified.is_ok() {
+            true => self.lock_state(&username).await,
+            false => before_credential(self.lock_state(&username)).await,
+        };
+        let lock = match lock {
+            Err(DomainError::EntityNotFound(_)) if verified.is_err() => None,
+            lock => lock.map_err(|e| Self::lock_unreadable(&username, LogKind::Login, e))?,
+        };
         // Judged before the proof's result shows: a locked user gets the failed proof's answer.
         if lock.as_ref().is_some_and(|lock| lock.locked(now)) {
             self.refuse_locked(&username, LogKind::Login);
@@ -3083,5 +3130,83 @@ mod tests {
             "the LDAP bind, the simple login, the web start and the web finish, the one \
              connection held: each is given up at the bound as a read that failed, with no row"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_bind_with_no_stretch_permit_in_time_is_answered_busy_and_counts_nothing() {
+        use crate::sql_lockout_handler::tests as doors;
+        use lldap_domain_handlers::lockout::{DURATION, THRESHOLD};
+        const USER: &str = "r1busy";
+        let log = LogGuard::install_on_this_thread();
+        let h = doors::handler().await;
+        doors::user_in(&h, USER, "r1busyou").await;
+        doors::policy_on(&h, "r1busyou", &[(THRESHOLD, "3"), (DURATION, "0")]).await;
+        q31_rows(&log, USER);
+        for (label, waiters) in [("no place to wait", 0), ("no permit within the wait", 1)] {
+            let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+            let wait = std::time::Duration::from_millis(50);
+            let gate = StretchGate::on(permits, waiters, wait);
+            let h = h.clone().with_stretch_gate(Box::leak(Box::new(gate)));
+            let answered = doors::bind_as(&h, USER, doors::RIGHT).await;
+            let busy = DomainError::Busy(STRETCH_BUSY.to_owned());
+            assert_eq!(
+                (
+                    answered.map_err(said),
+                    q31_rows(&log, USER),
+                    counted(&h, USER),
+                    h.lockout.pending(&UserId::new(USER))
+                ),
+                (
+                    Err(said(busy)),
+                    vec![(LogKind::Bind, false, Some(BUSY_DETAIL.to_owned()))],
+                    0,
+                    false
+                ),
+                "{label}: the right password under a threshold; the one row, nothing counted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_stretch_that_began_and_did_not_complete_is_no_wrong_password() {
+        use crate::sql_lockout_handler::tests as doors;
+        use lldap_domain_handlers::lockout::{DURATION, THRESHOLD};
+        const USER: &str = "r1stretch";
+        let log = LogGuard::install_on_this_thread();
+        let h = doors::handler().await;
+        doors::user_in(&h, USER, "r1stretchou").await;
+        doors::policy_on(&h, "r1stretchou", &[(THRESHOLD, "3"), (DURATION, "0")]).await;
+        let user = UserId::new(USER);
+        let lock = h.lock_state(&user).await.unwrap();
+        type Answer = std::result::Result<Result<()>, StretchError>;
+        type Row = (&'static str, Answer, Option<&'static str>, DomainError);
+        let rows: [Row; 2] = [
+            (
+                "the work ran and refused the password",
+                Ok(Err(invalid_credentials(&user))),
+                Some("invalid credentials"),
+                invalid_credentials(&user),
+            ),
+            (
+                "the work began and did not complete",
+                Err(StretchError::Failed),
+                None,
+                DomainError::InternalError(STRETCH_FAILED.to_owned()),
+            ),
+        ];
+        q31_rows(&log, USER);
+        for (label, answer, detail, error) in rows {
+            let (unmatched, door, now) = (stretched(answer).unwrap(), Door::LdapBind, lock_clock());
+            let refused = h.refuse_unmatched(&user, unmatched, lock.as_ref(), door, now);
+            let refused = said(refused.await);
+            let row = detail.map(|detail| (LogKind::Bind, false, Some(detail.to_owned())));
+            assert_eq!(
+                (refused, q31_rows(&log, USER), counted(&h, USER)),
+                (said(error), row.into_iter().collect(), 1),
+                "{label}: the one wrong password is the one count"
+            );
+        }
     }
 }

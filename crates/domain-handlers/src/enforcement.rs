@@ -28,6 +28,7 @@ use jiff::tz::TimeZone;
 use lldap_domain::requests::{CreateGroupRequest, UpdateUserRequest};
 use lldap_domain::types::{Attribute, GroupDetails, MFA_TYPE_TOTP, User, UserId, Uuid, user_ou};
 use lldap_domain_model::error::{DomainError, Result};
+use lldap_opaque_handler::StretchGate;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -42,6 +43,9 @@ pub const FILL_GAP: Duration = Duration::from_millis(250);
 pub const FILL_BACKOFF_LIMIT: Duration = Duration::from_secs(30);
 pub const FILL_CHUNK: usize = 500;
 pub const OVERLAY_FOLD: usize = 1024;
+/// How long a name read as no user is answered so without a read, and how many are held.
+pub const MISS_HOLD: Duration = Duration::from_secs(5);
+pub const MISS_CAP: usize = 4096;
 const MARK_PASSES: usize = 4;
 const FLAG_OFF: u8 = 0;
 const FLAG_ON: u8 = 1;
@@ -59,6 +63,19 @@ pub const BUILT_IN: &str = "built in";
 /// A read that gave up within its bound, by the client's timer or the database's own.
 pub fn gave_up(e: &DomainError) -> bool {
     matches!(e, DomainError::InternalError(detail) if detail == POLICY_UNANSWERED)
+}
+
+tokio::task_local! {
+    static UNPROVED: ();
+}
+
+/// A door's read before its credential: only inside is a name lately read as no user answered so.
+pub async fn before_credential<F: Future>(f: F) -> F::Output {
+    UNPROVED.scope((), f).await
+}
+
+fn memory_asked() -> bool {
+    UNPROVED.try_with(|_| ()).is_ok() && !logging::credential_proved()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -554,6 +571,7 @@ pub struct PolicyCache {
     writers: tokio::sync::Mutex<()>,
     touched: Mutex<Option<HashSet<UserId>>>,
     marked: Mutex<Marks>,
+    missed: Mutex<Missed>,
     read_failed: AtomicBool,
     lockout: AtomicU8,
     mfa: RwLock<Option<MfaPolicy>>,
@@ -573,6 +591,12 @@ struct Marks {
     users: HashMap<UserId, u64>,
 }
 
+#[derive(Default)]
+struct Missed {
+    names: HashMap<UserId, tokio::time::Instant>,
+    cleared: u64,
+}
+
 /// Holds the writers' lock; once it is let go, marks still in the set go to the filler.
 pub(crate) struct Taking<'a> {
     cache: &'a PolicyCache,
@@ -583,7 +607,7 @@ impl Drop for Taking<'_> {
     fn drop(&mut self) {
         drop(self.writers.take());
         if !self.cache.marks().users.is_empty() {
-            self.cache.fill.notify_one();
+            self.cache.wake_for_marks();
         }
     }
 }
@@ -618,6 +642,7 @@ impl PolicyCache {
             writers: tokio::sync::Mutex::new(()),
             touched: Mutex::new(None),
             marked: Mutex::default(),
+            missed: Mutex::default(),
             read_failed: AtomicBool::new(false),
             lockout: AtomicU8::new(FLAG_OFF),
             mfa: RwLock::new(None),
@@ -766,6 +791,7 @@ impl PolicyCache {
             base: Arc::new(next),
             over: HashMap::new(),
         });
+        self.forget_misses();
     }
 
     fn swap(&self, next: Snapshot) {
@@ -832,6 +858,7 @@ impl PolicyCache {
         forget_writes(self, &next);
         forget_rereads(self, &next);
         self.swap(next);
+        self.forget_misses();
     }
 
     pub fn put_user(&self, user: &UserId, ou_key: &str, items: Arc<[EffectiveItem]>) {
@@ -907,6 +934,68 @@ impl PolicyCache {
         self.fill.notify_one();
     }
 
+    fn wake_for_marks(&self) {
+        self.fill.notify_one();
+    }
+
+    fn missed(&self) -> std::sync::MutexGuard<'_, Missed> {
+        self.missed.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn missed_lately(&self, user: &UserId) -> Result<u64> {
+        let missed = self.missed();
+        let held = |at: &tokio::time::Instant| at.elapsed() < MISS_HOLD;
+        match memory_asked() && missed.names.get(user).is_some_and(held) {
+            true => Err(DomainError::EntityNotFound(user.to_string())),
+            false => Ok(missed.cleared),
+        }
+    }
+
+    fn note_read<T>(&self, user: &UserId, cleared: u64, read: &Result<T>) {
+        match read {
+            Ok(_) => {
+                self.missed().names.remove(user);
+                if !self.marked(user) {
+                    self.mark(user);
+                }
+                self.wake_for_marks();
+            }
+            Err(DomainError::EntityNotFound(_)) => {
+                let mut missed = self.missed();
+                if missed.cleared != cleared {
+                    return;
+                }
+                if missed.names.len() >= MISS_CAP {
+                    missed.names.retain(|_, at| at.elapsed() < MISS_HOLD);
+                }
+                if missed.names.len() < MISS_CAP {
+                    let now = tokio::time::Instant::now();
+                    missed.names.insert(user.clone(), now);
+                }
+            }
+            Err(_) => {}
+        }
+    }
+
+    fn forget_miss(&self, user: &UserId) {
+        let mut missed = self.missed();
+        missed.names.remove(user);
+        missed.cleared += 1;
+    }
+
+    fn forget_misses(&self) {
+        let mut missed = self.missed();
+        missed.names.clear();
+        missed.cleared += 1;
+    }
+
+    /// For tests only: no user marked and no name remembered, as before a start.
+    #[cfg(any(test, feature = "test-backend-scope"))]
+    pub fn reset_door_reads(&self) {
+        self.marks().users.clear();
+        self.forget_misses();
+    }
+
     pub async fn poked(&self) {
         self.fill.notified().await;
     }
@@ -935,6 +1024,22 @@ pub(crate) async fn bounded<T>(wait: Duration, read: impl Future<Output = Result
 /// is a failed read.
 pub async fn door_read<T>(read: impl Future<Output = Result<T>>) -> Result<T> {
     bounded(POLICY_READ_WAIT, read).await
+}
+
+/// Starting values, to be set from the low-spec row: the binds that may wait for a stretch
+/// permit at one time, and how long each may wait.
+pub const STRETCH_WAITERS: usize = 32;
+pub const STRETCH_WAIT: Duration = POLICY_READ_WAIT;
+
+static STRETCH_GATE: LazyLock<StretchGate> = LazyLock::new(|| {
+    // Under test the clients' own stretches run in this process, on the same permits.
+    let in_tests = cfg!(any(test, feature = "test-backend-scope"));
+    let times = if in_tests { 150 } else { 1 };
+    StretchGate::new(STRETCH_WAITERS, STRETCH_WAIT * times)
+});
+
+pub fn stretch_gate() -> &'static StretchGate {
+    &STRETCH_GATE
 }
 
 type UserEntry = (String, Arc<[EffectiveItem]>, User);
@@ -1417,6 +1522,7 @@ pub async fn user_written<H>(handler: &H, cache: &PolicyCache, user: &UserId)
 where
     H: UserBackendHandler + PolicyBackendHandler + ?Sized,
 {
+    cache.forget_miss(user);
     if !judged(&live_checks(&item_checks(), cache), user) {
         return;
     }
@@ -1453,6 +1559,7 @@ pub async fn follow_commit<H>(
 ) where
     H: UserBackendHandler + PolicyBackendHandler + ?Sized,
 {
+    users.iter().for_each(|user| cache.forget_miss(user));
     let checks = live_checks(&item_checks(), cache);
     let ours: Vec<&UserId> = users.iter().filter(|user| judged(&checks, user)).collect();
     if ours.is_empty() {
@@ -1506,7 +1613,19 @@ where
     if let Some(items) = cache.get().shared_items_of(user) {
         return Ok(items);
     }
-    Ok(user_entry(handler, user).await?.1)
+    let entry = read_through(cache, user, user_entry(handler, user)).await?;
+    Ok(entry.1)
+}
+
+async fn read_through<T>(
+    cache: &PolicyCache,
+    user: &UserId,
+    read: impl Future<Output = Result<T>>,
+) -> Result<T> {
+    let cleared = cache.missed_lately(user)?;
+    let read = read.await;
+    cache.note_read(user, cleared, &read);
+    read
 }
 
 /// The items and inactivity's start; a user the cache lacks costs one bounded read for both.
@@ -1526,9 +1645,8 @@ where
     if let Some(items) = entries.shared_items_of(user) {
         return Ok((items, cached_active_since(cache, entries.facts_of(user))));
     }
-    let read = tokio::time::timeout(POLICY_READ_WAIT, handler.bounded_activity_entry(user));
-    let unanswered = DomainError::InternalError(POLICY_UNANSWERED.to_owned());
-    let (details, levels, recorded) = read.await.map_err(|_| unanswered)??;
+    let read = bounded(POLICY_READ_WAIT, handler.bounded_activity_entry(user));
+    let (details, levels, recorded) = read_through(cache, user, read).await?;
     let items = resolve_effective_items(POLICY_ITEM_CATALOG, &levels).into();
     let created = from_naive(details.creation_date);
     Ok((
@@ -2517,6 +2635,7 @@ mod tests {
         proofs_parked: AtomicBool,
         parked: Mutex<HashSet<&'static str>>,
         chunk_takes: Duration,
+        arrives: Mutex<Option<&'static PolicyCache>>,
     }
 
     impl Directory {
@@ -2560,6 +2679,11 @@ mod tests {
 
         fn park(&self, read: &'static str) {
             self.parked.lock().unwrap().insert(read);
+        }
+
+        fn make(&self, name: &str) {
+            let mut users = self.users.lock().unwrap();
+            users.insert(UserId::new(name), user(name));
         }
 
         fn unpark(&self) {
@@ -2666,6 +2790,11 @@ mod tests {
             }
             if let Some(cache) = *self.restless.lock().unwrap() {
                 cache.mark(user_id);
+            }
+            let arrives = self.arrives.lock().unwrap().take();
+            if let Some(cache) = arrives {
+                self.make(user_id.as_str());
+                user_written(self, cache, user_id).await;
             }
             found.ok_or_else(|| DomainError::EntityNotFound(user_id.to_string()))
         }
@@ -4410,6 +4539,7 @@ mod tests {
             turn(policy_cache(), true);
             policy_cache().set_recording(Recording::Since(recording));
             policy_cache().replace(Entries::default());
+            policy_cache().reset_door_reads();
             Self
         }
     }
@@ -4420,6 +4550,7 @@ mod tests {
             turn(policy_cache(), false);
             policy_cache().reset_activity_reads();
             policy_cache().replace(Entries::default());
+            policy_cache().reset_door_reads();
         }
     }
 
@@ -5187,6 +5318,186 @@ mod tests {
             (true, [true, false, true]),
             "the fill lists Late alone: Other's reread is forgotten; one still running is kept \
              for its own end"
+        );
+    }
+
+    const GHOST: &str = "r1ghost";
+    const MADE: &str = "r1made";
+
+    fn entry_reads(directory: &Directory) -> u64 {
+        let (alone, joined) = (&directory.entry_reads, &directory.activity_entry_reads);
+        alone.load(Ordering::Relaxed) + joined.load(Ordering::Relaxed)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_name_that_is_no_user_costs_one_read_until_the_hold_ends() {
+        let ghost = UserId::new(GHOST);
+        let rows = [("the items", false), ("the items and the activity", true)];
+        for (label, activity) in rows {
+            let (cache, directory) = (PolicyCache::new(), Directory::default());
+            let ask = || before_credential(resolve_entry(&directory, &cache, &ghost, activity));
+            let mut not_found = 0;
+            for _ in 0..100 {
+                let answer = ask().await;
+                not_found += usize::from(matches!(answer, Err(DomainError::EntityNotFound(_))));
+            }
+            let held = entry_reads(&directory);
+            tokio::time::advance(MISS_HOLD).await;
+            let later = ask().await.is_err();
+            assert_eq!(
+                (not_found, held, later, entry_reads(&directory)),
+                (100, 1, true, 2),
+                "{label}: a hundred asks inside the hold are one read, each answered not found; \
+                 the first ask after the hold reads again"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_read_that_failed_or_gave_up_is_not_remembered() {
+        let ghost = UserId::new(GHOST);
+        for answer in [NO_ANSWER, LOCK_ERROR, DOWN] {
+            let (cache, directory) = (PolicyCache::new(), Directory::default());
+            directory.policy_read.store(answer, Ordering::Relaxed);
+            for _ in 0..2 {
+                let _ = before_credential(resolve_items(&directory, &cache, &ghost)).await;
+            }
+            assert_eq!(
+                (entry_reads(&directory), cache.missed().names.len()),
+                (2, 0),
+                "{answer}: the next ask reads again"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_user_written_here_is_found_at_the_next_ask_after_its_miss() {
+        let made = UserId::new(MADE);
+        let rows = [("a write of the user", false), ("a commit of it", true)];
+        for (label, committed) in rows {
+            let (cache, directory) = (PolicyCache::new(), Directory::default());
+            let ask = || before_credential(resolve_items(&directory, &cache, &made));
+            let missed = ask().await.is_err();
+            directory.make(MADE);
+            match committed {
+                true => {
+                    follow_commit(&directory, &cache, std::slice::from_ref(&made), &Ok(())).await
+                }
+                false => user_written(&directory, &cache, &made).await,
+            }
+            assert_eq!(
+                (missed, ask().await.is_ok()),
+                (true, true),
+                "{label}: no check judges the user, and its miss is forgotten all the same"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_fill_forgets_every_miss() {
+        let (cache, directory) = (PolicyCache::new(), Directory::default());
+        let ghost = UserId::new(GHOST);
+        let ask = || before_credential(resolve_items(&directory, &cache, &ghost));
+        let _ = ask().await;
+        fill_policy_cache(&directory, &cache).await.unwrap();
+        let _ = ask().await;
+        assert_eq!(
+            entry_reads(&directory),
+            2,
+            "the ask after the fill's swap is a read again"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_the_miss_memory_keeps_no_name_past_its_cap_until_names_age_out() {
+        let (cache, directory) = (PolicyCache::new(), Directory::default());
+        let kept = async |n: usize| {
+            let name = UserId::new(&format!("r1name{n}"));
+            let _ = before_credential(resolve_items(&directory, &cache, &name)).await;
+            cache.missed().names.contains_key(&name)
+        };
+        let mut held = 0;
+        for n in 0..MISS_CAP + 10 {
+            held += usize::from(kept(n).await);
+        }
+        let full = (held, cache.missed().names.len());
+        tokio::time::advance(MISS_HOLD).await;
+        let aged = (kept(MISS_CAP + 10).await, cache.missed().names.len());
+        assert_eq!(
+            (full, aged),
+            ((MISS_CAP, MISS_CAP), (true, 1)),
+            "the ten names past the cap are not kept; once the held names age out, a new one is"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_remembered_miss_is_answered_only_before_a_credential_is_proved() {
+        let made = UserId::new(MADE);
+        type Row = (&'static str, bool, bool, bool);
+        let rows: [Row; 3] = [
+            ("a door before its credential", true, false, false),
+            ("a request in no door's scope", false, false, true),
+            ("a door once its credential is proved", true, true, true),
+        ];
+        for (label, at_door, proved, found) in rows {
+            let (cache, directory) = (PolicyCache::new(), Directory::default());
+            let _ = resolve_items(&directory, &cache, &made).await;
+            directory.make(MADE);
+            let read = resolve_items(&directory, &cache, &made);
+            let read = match (at_door, proved) {
+                (true, true) => logging::proved(before_credential(read)).await,
+                (true, false) => before_credential(read).await,
+                (false, _) => read.await,
+            };
+            assert_eq!(
+                read.is_ok(),
+                found,
+                "{label}: a user made by another server since the miss"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_miss_read_before_a_write_of_the_user_here_is_not_kept_after_it() {
+        let cache: &'static PolicyCache = Box::leak(Box::new(PolicyCache::new()));
+        let directory = Directory::default();
+        let made = UserId::new(MADE);
+        *directory.arrives.lock().unwrap() = Some(cache);
+        let ask = || before_credential(resolve_items(&directory, cache, &made));
+        let first = ask().await.is_ok();
+        assert_eq!(
+            (first, ask().await.is_ok()),
+            (false, true),
+            "the read began before the write and answers not found; the next ask reads the user"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_user_a_door_finds_and_the_cache_lacks_is_stored_by_a_marks_only_round() {
+        let cache = PolicyCache::new();
+        let directory = Directory::knowing(&[LATE]).listing(&[OTHER]);
+        let (late, other) = (UserId::new(LATE), UserId::new(OTHER));
+        resolve_items(&directory, &cache, &late).await.unwrap();
+        let asked = cache.refill.load(Ordering::Acquire);
+        let woken = (cache.marked(&late), poked(&cache).await, asked);
+        let at_door = entry_reads(&directory);
+        let failed = fill_round(&directory, &cache, false).await;
+        let by_round = entry_reads(&directory) - at_door;
+        resolve_items(&directory, &cache, &late).await.unwrap();
+        let after = entry_reads(&directory) - at_door - by_round;
+        assert_eq!(
+            (woken, (at_door, by_round, after), failed),
+            ((true, true, false), (1, 1, 0), false),
+            "the door reads once, marks the user and wakes the filler with no whole fill asked; \
+             the round reads the user once more and stores it; the next sign-in reads nothing"
+        );
+        assert_eq!(
+            (
+                ou_of(&cache, &other),
+                directory.user_lists.load(Ordering::Relaxed)
+            ),
+            (None, 0),
+            "the listing, which holds another user, was never read"
         );
     }
 }

@@ -1,16 +1,22 @@
-use crate::sql_backend_handler::tests::insert_user_no_password;
+use crate::SqlBackendHandler;
+use crate::sql_backend_handler::tests::{get_initialized_db, insert_user_no_password};
 use crate::sql_lockout_handler::tests as doors;
-use lldap_domain::types::{LoginOutcome, UserId};
+use lldap_auth::opaque::server::generate_random_private_key;
+use lldap_domain::requests::CreateUserRequest;
+use lldap_domain::types::{Attribute, LoginOutcome, UserId};
 use lldap_domain_handlers::enforcement::{Door, ItemFlags, policy_cache};
+use lldap_domain_handlers::handler::UserBackendHandler;
 use lldap_domain_handlers::instant::Timestamp;
 use lldap_domain_handlers::lockout::{DURATION, LOCKED_OUT, THRESHOLD};
 use lldap_domain_handlers::logging::LogKind;
-use lldap_domain_handlers::mfa::MfaPolicy;
-use lldap_opaque_handler::OpaqueHandler;
+use lldap_domain_handlers::logging::capture::Lines;
+use lldap_domain_handlers::mfa::{ENABLE_MFA, MfaPolicy};
+use lldap_opaque_handler::{OpaqueHandler, prepare_registration};
 use lldap_test_utils::enforcement::EnforcementGuard;
 use lldap_test_utils::recording_log::LogGuard;
 use pretty_assertions::assert_eq;
 use serial_test::serial;
+use std::sync::{Arc, Mutex};
 
 const WRONG: &str = "Wrong-Pass-1";
 const OUTSIDE: &str = "policy: login-hours (outside login hours)";
@@ -254,4 +260,123 @@ async fn test_an_enrolled_user_refused_when_the_sign_in_starts_is_asked_for_no_c
         "refused when it starts: a wrong password's answer and its one row, no code asked; \
          admitted: the code step"
     );
+}
+
+fn bind_row(user: &str, detail: &str) -> Row {
+    let (_, user, detail) = row(user, detail);
+    (LogKind::Bind, user, detail)
+}
+
+#[tokio::test]
+#[serial]
+async fn test_a_bind_whose_enable_mfa_read_finds_no_user_answers_unknown_user_at_once() {
+    let log = LogGuard::install_on_this_thread();
+    let statements = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mut pool = get_initialized_db().await;
+    let seen = statements.clone();
+    pool.set_metric_callback(move |info| {
+        seen.lock().unwrap().push(info.statement.sql.clone());
+    });
+    let h = doors::own(SqlBackendHandler::new(generate_random_private_key(), pool));
+    doors::policy_on(&h, "r1askou", &[(ENABLE_MFA, "always")]).await;
+    statements.lock().unwrap().clear();
+    for _ in 0..100 {
+        assert!(!doors::bind(&h, "r1nobody", doors::RIGHT).await);
+    }
+    let sql = statements.lock().unwrap();
+    let of_users = |text: &&String| text.contains(r#"FROM "users""#);
+    assert_eq!(
+        (
+            doors::rows(&log, &[LogKind::Bind]),
+            sql.iter().filter(of_users).count()
+        ),
+        (vec![bind_row("r1nobody", "unknown user"); 100], 1),
+        "a hundred binds of one name inside the hold: each its unknown-user row, and one read of \
+         the users in all, the enable-mfa read; no enrolment and no password file is read"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_a_remembered_miss_refuses_the_bind_and_is_not_asked_once_a_proof_verified() {
+    let log = LogGuard::install_on_this_thread();
+    let (pool, key) = (get_initialized_db().await, generate_random_private_key());
+    let here = doors::own(SqlBackendHandler::new(key.clone(), pool.clone()));
+    let elsewhere = doors::own(SqlBackendHandler::new(key, pool));
+    doors::policy_on(&here, "r1lateou", &[(ENABLE_MFA, "always")]).await;
+    let user = UserId::new("r1late");
+    // The slow part of the user's making comes first, so that the rest fits inside the hold.
+    let prepared = prepare_registration(&elsewhere, user.clone(), doors::RIGHT.as_bytes());
+    let (_, registration) = prepared.await.unwrap();
+    assert!(!doors::bind(&here, "r1late", doors::RIGHT).await);
+    let request = CreateUserRequest {
+        user_id: user,
+        email: "r1late@example.com".to_owned().into(),
+        attributes: vec![Attribute {
+            name: "ou".into(),
+            value: "r1lateou".to_owned().into(),
+        }],
+        ..Default::default()
+    };
+    elsewhere.create_user(request).await.unwrap();
+    elsewhere.registration_finish(registration).await.unwrap();
+    doors::rows(&log, &[LogKind::Bind]);
+    let bound = doors::bind(&here, "r1late", doors::RIGHT).await;
+    let at_bind = doors::rows(&log, &[LogKind::Bind]);
+    let confined = LoginOutcome::Authenticated {
+        user_id: UserId::new("r1late"),
+        mfa_enrollment_pending: true,
+    };
+    assert_eq!(
+        (
+            bound,
+            at_bind,
+            doors::web(&here, "r1late", doors::RIGHT, None).await
+        ),
+        (
+            false,
+            vec![bind_row("r1late", "unknown user")],
+            Ok(confined)
+        ),
+        "a user made by another server inside the hold: its bind is answered from the miss; its \
+         web sign-in, the proof verified, is read and judged by its OU's always"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_at_a_finish_a_name_that_is_no_user_has_no_lock_only_if_its_proof_did_not_verify() {
+    let log = LogGuard::install_on_this_thread();
+    let h = doors::handler().await;
+    doors::user_in(&h, "r1real", "r1lockou").await;
+    doors::user_in(&h, "r1gone", "r1lockou").await;
+    doors::policy_on(&h, "r1lockou", &[(THRESHOLD, "3"), (DURATION, "0")]).await;
+    let real = doors::start(&h, "r1real", doors::RIGHT).await;
+    let ghost = doors::start(&h, "r1ghost", doors::RIGHT).await;
+    let mut unverified = doors::finish_request(real, doors::RIGHT, None).unwrap();
+    unverified.server_data = ghost.1.server_data;
+    let gone = doors::start(&h, "r1gone", doors::RIGHT).await;
+    let verified = doors::finish_request(gone, doors::RIGHT, None).unwrap();
+    h.delete_user(&UserId::new("r1gone")).await.unwrap();
+    doors::rows(&log, &[LogKind::Login]);
+    let (lines, _guard) = Lines::capture();
+    let rows = [
+        ("r1ghost", unverified, "invalid credentials", 0),
+        ("r1gone", verified, "policy: unreadable", 1),
+    ];
+    for (user, finish, detail, said) in rows {
+        let refused = h.login_finish(finish).await.is_err();
+        let others = lines.take_loud().into_iter();
+        assert_eq!(
+            (
+                refused,
+                doors::rows(&log, &[LogKind::Login]),
+                others.filter(|line| line.target != "logs").count()
+            ),
+            (true, vec![row(user, detail)], said),
+            "{user}: with a threshold live, a proof that fails for a name with no account is a \
+             wrong password's row and no line beside it; a proof that verifies for a user gone \
+             since its start is refused as unreadable, with its line"
+        );
+    }
 }

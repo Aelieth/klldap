@@ -138,7 +138,9 @@ pub(crate) fn error_to_http_response(error: TcpError) -> HttpResponse {
             DomainError::Base64DecodeError(_)
             | DomainError::BinarySerializationError(_)
             | DomainError::EntityNotFound(_) => HttpResponse::BadRequest(),
-            DomainError::KdcUnavailable(_) => HttpResponse::ServiceUnavailable(),
+            DomainError::KdcUnavailable(_) | DomainError::Busy(_) => {
+                HttpResponse::ServiceUnavailable()
+            }
         },
         TcpError::BadRequest(_) => HttpResponse::BadRequest(),
         TcpError::NotFoundError(_) => HttpResponse::NotFound(),
@@ -470,7 +472,8 @@ mod tests {
         type Failure = fn() -> DomainError;
         let refusal: Failure = || DomainError::AuthenticationError("for bob".to_owned());
         let fault: Failure = || DomainError::InternalError("the database is away".to_owned());
-        for (failure, status, said) in [(refusal, 401, 0), (fault, 500, BUDGET)] {
+        let busy: Failure = || DomainError::Busy("no permit".to_owned());
+        for (failure, status, said) in [(refusal, 401, 0), (fault, 500, BUDGET), (busy, 503, 0)] {
             let (lines, _guard) = Lines::capture();
             for _ in 0..100 {
                 let response = error_to_http_response(TcpError::DomainError(failure()));

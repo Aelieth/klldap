@@ -6,7 +6,9 @@ use crate::sql_totp_steps::{Mark, clear_used, mark_in, mark_used, refund, reserv
 use crate::sql_used_proofs::take_proof_id;
 use async_trait::async_trait;
 use lldap_domain::types::{MFA_TYPE_TOTP, TotpEnrollmentStart, UserId};
-use lldap_domain_handlers::enforcement::{UNREADABLE, door_read, mfa_item_matters, resolve_items};
+use lldap_domain_handlers::enforcement::{
+    UNREADABLE, before_credential, door_read, mfa_item_matters, resolve_items,
+};
 use lldap_domain_handlers::handler::MfaBackendHandler;
 use lldap_domain_handlers::logging::{self, LogKind};
 use lldap_domain_handlers::mfa::{
@@ -232,19 +234,25 @@ impl SqlBackendHandler {
         }))
     }
 
-    /// The user's resolved `enable_mfa`.
-    pub(crate) async fn user_mfa_policy(&self, user_id: &UserId) -> Result<MfaPolicy> {
+    /// The user's resolved `enable_mfa`; `None` when the OU's read found no user of that name.
+    async fn found_mfa_policy(&self, user_id: &UserId) -> Result<Option<MfaPolicy>> {
         let (server, cache) = (self.mfa_policy, self.policy_cache);
         match mfa_item_matters(cache, server) {
-            Some(false) => return Ok(resolve::<EnableMfa>(server, &[]).0),
+            Some(false) => return Ok(Some(resolve::<EnableMfa>(server, &[]).0)),
             None => return Err(DomainError::InternalError(OU_ITEM_NOT_READ.to_owned())),
             Some(true) => {}
         }
         match resolve_items(self, cache, user_id).await {
-            Ok(items) => Ok(resolve::<EnableMfa>(server, &items).0),
-            Err(DomainError::EntityNotFound(_)) => Ok(resolve::<EnableMfa>(server, &[]).0),
+            Ok(items) => Ok(Some(resolve::<EnableMfa>(server, &items).0)),
+            Err(DomainError::EntityNotFound(_)) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// The user's resolved `enable_mfa`.
+    pub(crate) async fn user_mfa_policy(&self, user_id: &UserId) -> Result<MfaPolicy> {
+        let found = self.found_mfa_policy(user_id).await?;
+        Ok(found.unwrap_or_else(|| resolve::<EnableMfa>(self.mfa_policy, &[]).0))
     }
 
     async fn requirement_under(
@@ -259,14 +267,31 @@ impl SqlBackendHandler {
         Ok(mfa_requirement(policy, status.as_ref()))
     }
 
+    fn mfa_unreadable(user_id: &UserId, kind: LogKind, e: &DomainError) -> DomainError {
+        warn_limited!(r#"The OU policy of "{user_id}" could not be read for enable-mfa: {e}"#);
+        let detail = format!("policy: {UNREADABLE}");
+        logging::record_as(Some(user_id), kind, None, false, Some(&detail));
+        invalid_credentials(user_id)
+    }
+
     /// At a door, an OU item that cannot be read refuses with the door's own row.
     pub(crate) async fn door_policy(&self, user_id: &UserId, kind: LogKind) -> Result<MfaPolicy> {
-        self.user_mfa_policy(user_id).await.map_err(|e| {
-            warn_limited!(r#"The OU policy of "{user_id}" could not be read for enable-mfa: {e}"#);
-            let detail = format!("policy: {UNREADABLE}");
-            logging::record_as(Some(user_id), kind, None, false, Some(&detail));
-            invalid_credentials(user_id)
-        })
+        let policy = self.user_mfa_policy(user_id).await;
+        policy.map_err(|e| Self::mfa_unreadable(user_id, kind, &e))
+    }
+
+    /// Before any password: `None` for a name the enable-mfa read finds, or lately found, no user.
+    pub(crate) async fn bind_requirement(
+        &self,
+        user_id: &UserId,
+    ) -> Result<Option<MfaRequirement>> {
+        let found = before_credential(self.found_mfa_policy(user_id)).await;
+        let found = found.map_err(|e| Self::mfa_unreadable(user_id, LogKind::Bind, &e))?;
+        let Some(policy) = found else {
+            return Ok(None);
+        };
+        let requirement = door_read(self.requirement_under(policy, user_id));
+        requirement.await.map(Some)
     }
 
     pub(crate) async fn door_requirement(

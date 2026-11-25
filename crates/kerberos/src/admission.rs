@@ -156,7 +156,7 @@ impl KdcVerdict {
         if step.lock_logged {
             let detail = lock_detail(Door::KerberosAs);
             let kind = LogKind::AccountLock;
-            record_kdc_row(None, user.as_str(), kind, true, peer, &detail);
+            record_kdc_row(None, user.as_str(), kind, true, peer, &detail, false);
         }
         self.lockout.carry_from_kdc(user, step);
     }
@@ -206,6 +206,11 @@ fn mechanism_name(mechanism: Mechanism) -> &'static str {
         Mechanism::Pkinit => "PKINIT",
         Mechanism::Otp => "OTP",
     }
+}
+
+/// Pre-authentication passed, or was not required, before this notice.
+fn proved(n: &AsNotice) -> bool {
+    matches!(n.reason, AsReason::PolicyRefused | AsReason::Issued)
 }
 
 fn notice_detail(n: &AsNotice, said: Option<&str>) -> String {
@@ -260,6 +265,7 @@ impl HostAdmission for KdcVerdict {
                 false,
                 peer,
                 &detail,
+                false,
             );
         } else {
             AS_REFUSAL.with(|held| *held.borrow_mut() = Some((q.client.id(), detail)));
@@ -283,7 +289,8 @@ impl HostAdmission for KdcVerdict {
         let peer = n.peer.as_ref().and_then(ip_of);
         let issued = n.reason == AsReason::Issued;
         let detail = notice_detail(&n, said.as_deref());
-        record_kdc_row(user.as_ref(), target, LogKind::Login, issued, peer, &detail);
+        let (kind, proved) = (LogKind::Login, proved(&n));
+        record_kdc_row(user.as_ref(), target, kind, issued, peer, &detail, proved);
         if let Some(user) = &user {
             self.count(user, &n, peer);
             self.note_issued(user, &n);
@@ -297,7 +304,7 @@ impl HostAdmission for KdcVerdict {
             let name = q.subject.unparse_with_realm_lossy(&self.realm);
             let target = user.as_ref().map_or(name.as_str(), UserId::as_str);
             let kind = LogKind::AccessDenied;
-            record_kdc_row(user.as_ref(), target, kind, false, peer, GONE);
+            record_kdc_row(user.as_ref(), target, kind, false, peer, GONE, false);
             return Err(gone());
         };
         let Some(user) = user_of(client, &self.realm) else {
@@ -328,6 +335,7 @@ impl HostAdmission for KdcVerdict {
             false,
             peer,
             &detail,
+            false,
         );
         Err(answer)
     }
@@ -867,6 +875,7 @@ pub(crate) mod tests {
             (
                 notice(AsReason::Issued, 0, Some(Mechanism::EncTimestamp)),
                 true,
+                true,
                 "ticket issued (encrypted timestamp)",
             ),
             (
@@ -875,6 +884,7 @@ pub(crate) mod tests {
                     err::PREAUTH_FAILED,
                     Some(Mechanism::EncChallenge),
                 ),
+                false,
                 false,
                 "pre-authentication failed (encrypted challenge)",
             ),
@@ -885,28 +895,42 @@ pub(crate) mod tests {
                     Some(Mechanism::Otp),
                 ),
                 false,
+                false,
                 "pre-authentication not completed (OTP)",
             ),
             (
                 notice(AsReason::PolicyRefused, err::POLICY, None),
                 false,
+                true,
                 "refused after pre-authentication, code 12",
             ),
             (
                 notice(AsReason::EntryRefused, err::CLIENT_REVOKED, None),
+                false,
                 false,
                 "refused by the entry check, code 18",
             ),
             (
                 notice(AsReason::HostRefused, err::CLIENT_REVOKED, None),
                 false,
+                false,
                 NOT_SAID,
             ),
         ];
-        for (n, success, detail) in rows {
+        for (n, success, proved, detail) in rows {
             verdict.as_notice(n);
+            let events = log.recorder().take_events();
+            let marks: Vec<_> = events.iter().map(|e| e.proved).collect();
+            let rows = events.into_iter();
+            let rows: Vec<KdcRow> = rows
+                .map(|e| (e.kind, e.success, e.target, e.peer, e.detail))
+                .collect();
             let expected = vec![peered(row(LogKind::Login, success, REFUSED_USER, detail))];
-            assert_eq!(kdc_rows(&log), expected, "{detail}");
+            assert_eq!(
+                (rows, marks),
+                (expected, vec![proved]),
+                "{detail}: the row, and whether pre-authentication passed before it"
+            );
         }
         let more = Some(Mechanism::Spake);
         verdict.as_notice(notice(

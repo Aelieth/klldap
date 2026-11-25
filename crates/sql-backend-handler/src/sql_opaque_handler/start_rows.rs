@@ -6,6 +6,7 @@ use lldap_domain_handlers::instant::Timestamp;
 use lldap_domain_handlers::lockout::{DURATION, LOCKED_OUT, THRESHOLD};
 use lldap_domain_handlers::logging::LogKind;
 use lldap_domain_handlers::mfa::MfaPolicy;
+use lldap_opaque_handler::OpaqueHandler;
 use lldap_test_utils::enforcement::EnforcementGuard;
 use lldap_test_utils::recording_log::LogGuard;
 use pretty_assertions::assert_eq;
@@ -70,6 +71,58 @@ async fn test_the_items_are_judged_when_a_web_sign_in_starts() {
         (admitted, seen(&guard)),
         (signed_in("f5same"), vec![(Door::WebLogin, false); 2]),
         "admitted: judged when it starts and again after the password; the same password signs in"
+    );
+}
+
+/// The sign-in rows with their marks: was a password or a proof verified before the row.
+fn marks(log: &LogGuard) -> Vec<(LogKind, Option<String>, bool)> {
+    let events = log.recorder().take_events().into_iter();
+    let doors = events.filter(|e| matches!(e.kind, LogKind::Bind | LogKind::Login));
+    doors.map(|e| (e.kind, e.detail, e.proved)).collect()
+}
+
+#[tokio::test]
+#[serial]
+async fn test_a_row_is_marked_proved_only_after_the_password_or_the_proof_verified() {
+    let log = LogGuard::install_on_this_thread();
+    let h = doors::handler().await;
+    doors::user_in(&h, "r1mark", "r1markou").await;
+    let allowing = EnforcementGuard::allowing(&["r1mark"], "login-hours");
+    let _ = doors::bind_as(&h, "r1mark", WRONG).await;
+    let _ = doors::bind_as(&h, "r1mark", doors::RIGHT).await;
+    let first = doors::start(&h, "r1mark", doors::RIGHT).await;
+    let second = doors::start(&h, "r1mark", doors::RIGHT).await;
+    let mut crossed = doors::finish_request(first, doors::RIGHT, None).unwrap();
+    crossed.server_data = second.1.server_data;
+    let _ = h.login_finish(crossed).await;
+    let started = doors::start(&h, "r1mark", doors::RIGHT).await;
+    drop(allowing);
+    let admitted = marks(&log);
+    let _refusing = EnforcementGuard::refusing(&["r1mark"], "login-hours");
+    let _ = doors::bind_as(&h, "r1mark", doors::RIGHT).await;
+    let finish = doors::finish_request(started, doors::RIGHT, None).unwrap();
+    let _ = h.login_finish(finish).await;
+    doors::start(&h, "r1mark", doors::RIGHT).await;
+    let wrong = Some("invalid credentials".to_owned());
+    let hours = Some("policy: login-hours".to_owned());
+    assert_eq!(
+        admitted,
+        vec![
+            (LogKind::Bind, wrong.clone(), false),
+            (LogKind::Bind, None, true),
+            (LogKind::Login, wrong, false),
+        ],
+        "a wrong password at the bind, a right one, and a finish whose proof does not verify"
+    );
+    assert_eq!(
+        marks(&log),
+        vec![
+            (LogKind::Bind, hours.clone(), true),
+            (LogKind::Login, hours.clone(), true),
+            (LogKind::Login, hours, false),
+        ],
+        "refused by an item: the bind after its password, the finish after its proof, and the \
+         start, which comes before any"
     );
 }
 

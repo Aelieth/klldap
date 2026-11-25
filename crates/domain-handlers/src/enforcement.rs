@@ -1505,6 +1505,7 @@ pub fn record_kdc_row(
     success: bool,
     peer: Option<IpAddr>,
     detail: &str,
+    proved: bool,
 ) {
     let meta = RequestMeta {
         protocol: Protocol::Kerberos,
@@ -1512,8 +1513,10 @@ pub fn record_kdc_row(
         client_address: peer,
         ..RequestMeta::default()
     };
-    logging::with_request_sync(meta, || {
-        logging::record_as(user, kind, Some(target), success, Some(detail));
+    let row = || logging::record_as(user, kind, Some(target), success, Some(detail));
+    logging::with_request_sync(meta, || match proved {
+        true => logging::proved_sync(row),
+        false => row(),
     });
 }
 

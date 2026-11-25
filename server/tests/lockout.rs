@@ -38,16 +38,24 @@ fn failed_login_rows(db_url: &str) -> i64 {
     )
 }
 
-fn settled_rows(db_url: &str, want: i64) -> i64 {
-    let mut rows = failed_login_rows(db_url);
+fn login_floods_started(db_url: &str) -> i64 {
+    query_i64(
+        db_url,
+        "SELECT COUNT(*) FROM logs WHERE kind = 'sign_in_flood' AND protocol = 'http' \
+         AND target IS NULL AND detail = 'login flood started'",
+    )
+}
+
+fn settled(rows: impl Fn() -> i64, want: i64) -> i64 {
+    let mut seen = rows();
     for _ in 0..20 {
-        if rows >= want {
+        if seen >= want {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
-        rows = failed_login_rows(db_url);
+        seen = rows();
     }
-    rows
+    seen
 }
 
 fn login_start(
@@ -140,7 +148,7 @@ fn test_lockout_facts_at_web_login() {
         stopped, 50,
         "a wrong password must fail in the OPAQUE client"
     );
-    let app_rows = settled_rows(&db, 1);
+    let app_rows = settled(|| failed_login_rows(&db), 1);
     report.push(format!(
         "L1.web-app: 50 wrong passwords as the web app sends them: {app_rows} failure rows | when enforced: each one counts"
     ));
@@ -157,13 +165,14 @@ fn test_lockout_facts_at_web_login() {
             "a mismatched finish must fail, got {status}"
         );
     }
-    let forged_rows = settled_rows(&db, app_rows + 10) - app_rows;
+    let flood_rows = settled(|| login_floods_started(&db), 1);
+    let forged_rows = failed_login_rows(&db) - app_rows;
     report.push(format!(
-        "L1.web-finish: 10 finishes that fail at the server: {forged_rows} failure rows | when enforced: each one counts"
+        "L1.web-finish: 10 finishes that fail at the server: {forged_rows} failure rows, {flood_rows} flood started | when enforced: each one counts"
     ));
-    if forged_rows != 10 {
+    if (forged_rows, flood_rows) != (8, 1) {
         report.push(format!(
-            "FINDING L1.web-finish-rows: {forged_rows} rows for 10 failed finishes"
+            "FINDING L1.web-finish-rows: {forged_rows} rows and {flood_rows} flood started rows for 10 failed finishes"
         ));
     }
 
@@ -181,8 +190,9 @@ fn test_lockout_facts_at_web_login() {
         "today a wrong password typed in the web app never reaches the server"
     );
     assert_eq!(
-        forged_rows, 10,
-        "today each failed finish writes one failure row"
+        (forged_rows, flood_rows),
+        (8, 1),
+        "the first 8 failed finishes from one address write a row each, the ninth opens a flood"
     );
     assert!(
         allowed,

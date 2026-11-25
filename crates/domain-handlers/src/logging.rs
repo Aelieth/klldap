@@ -82,6 +82,7 @@ pub enum LogKind {
     AccountLock,
     AccountUnlock,
     AccountReenable,
+    SignInFlood,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -129,6 +130,7 @@ impl RequestMeta {
 tokio::task_local! {
     static REQUEST: RequestMeta;
     static WITHOUT_SESSION: ();
+    static PROVED: ();
 }
 
 pub const NO_SESSION: &str = "no session";
@@ -137,6 +139,15 @@ pub const NO_PASSWORD: &str = "no password given";
 /// Every row written inside says in its detail that no session was made.
 pub async fn without_session<F: Future>(f: F) -> F::Output {
     WITHOUT_SESSION.scope((), f).await
+}
+
+/// Every row written inside says that a credential was proved before it.
+pub async fn proved<F: Future>(f: F) -> F::Output {
+    PROVED.scope((), f).await
+}
+
+pub fn proved_sync<T>(f: impl FnOnce() -> T) -> T {
+    PROVED.sync_scope((), f)
 }
 
 pub async fn with_request<F: Future>(meta: RequestMeta, f: F) -> F::Output {
@@ -184,6 +195,10 @@ pub struct LogEvent {
     pub peer: Option<String>,
     pub forwarded_for: Option<String>,
     pub detail: Option<String>,
+    /// The client's address as the networks check judges it; never stored.
+    pub source: Option<IpAddr>,
+    /// A credential was proved before this row; never stored.
+    pub proved: bool,
 }
 
 impl fmt::Display for LogEvent {
@@ -424,6 +439,8 @@ fn build(
             .as_deref()
             .map(|f| truncate(f, MAX_NAME_LEN)),
         detail: detail.map(|d| truncate(d, MAX_DETAIL_LEN)),
+        source: meta.client_address,
+        proved: PROVED.try_with(|_| ()).is_ok(),
     }
 }
 
@@ -707,6 +724,41 @@ mod tests {
         }
         let without = RequestMeta::http(None, forwarded);
         assert_eq!(without.client_address, None, "no peer, no address");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_row_carries_the_judged_address_and_whether_a_credential_was_proved() {
+        let (recorder, _guard) = install_recorder();
+        let judged: IpAddr = "203.0.113.9".parse().unwrap();
+        let meta = RequestMeta {
+            client_address: Some(judged),
+            ..RequestMeta::http(Some("192.0.2.10".parse().unwrap()), None)
+        };
+        let refused = || record_failure(LogKind::Login, Some("bob"), "invalid credentials");
+        with_request(meta, async {
+            refused();
+            proved(async { refused() }).await;
+            proved_sync(refused);
+            refused();
+        })
+        .await;
+        refused();
+        let events = recorder.0.lock().unwrap().clone();
+        let seen: Vec<_> = events.iter().map(|e| (e.source, e.proved)).collect();
+        let inside = |mark: bool| (Some(judged), mark);
+        assert_eq!(
+            seen,
+            vec![
+                inside(false),
+                inside(true),
+                inside(true),
+                inside(false),
+                (None, false)
+            ],
+            "before the scope, in it, in the plain one, after it, and with no request"
+        );
+        assert_eq!(events[1].peer.as_deref(), Some("192.0.2.10"));
     }
 
     #[tokio::test]

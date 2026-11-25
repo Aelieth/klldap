@@ -128,7 +128,6 @@ async fn get_refresh<Backend>(
 where
     Backend: TcpBackendHandler + BackendHandler + 'static,
 {
-    let jwt_key = &data.jwt_key;
     let (refresh_token_hash, user) = get_refresh_token(request)?;
     let found = data
         .get_tcp_handler()
@@ -146,6 +145,18 @@ where
             "Invalid refresh token".to_string(),
         )));
     }
+    logging::proved(refresh_found(data, user)).await
+}
+
+/// The refresh once its token was found.
+async fn refresh_found<Backend>(
+    data: web::Data<AppState<Backend>>,
+    user: UserId,
+) -> TcpResult<HttpResponse>
+where
+    Backend: TcpBackendHandler + BackendHandler + 'static,
+{
+    let jwt_key = &data.jwt_key;
     let mut path = data.server_url.path().to_string();
     if !path.ends_with('/') {
         path.push('/');

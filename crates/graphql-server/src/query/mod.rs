@@ -992,6 +992,8 @@ mod tests {
                 peer: Some("10.0.0.5".to_owned()),
                 forwarded_for: None,
                 detail: (kind == LogKind::AccessDenied).then(|| "Unauthorized write".to_owned()),
+                source: None,
+                proved: false,
             },
         }
     }

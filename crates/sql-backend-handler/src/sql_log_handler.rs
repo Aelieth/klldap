@@ -6,6 +6,7 @@ use lldap_domain_handlers::handler::LogBackendHandler;
 use lldap_domain_handlers::instant::{
     SignedDuration, Timestamp, days, earlier, from_naive, to_naive,
 };
+use lldap_domain_handlers::lockout::LOCKED_OUT;
 use lldap_domain_handlers::logging::{
     LogActivity, LogBucket, LogCursor, LogDimension, LogEvent, LogFilter, LogKind, LogRecord,
     LogSink, NO_PASSWORD, NoopLogSink, Protocol, flush_suppressed_warnings, set_log_sink,
@@ -19,8 +20,10 @@ use sea_orm::{
     FromQueryResult, Order, QueryFilter, QueryOrder, QuerySelect, QueryTrait, Select,
     sea_query::{Expr, SimpleExpr},
 };
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::net::IpAddr;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,6 +37,7 @@ const QUEUE_CAPACITY: usize = 4096;
 const BATCH_SIZE: usize = 256;
 const DELETE_CHUNK: u64 = 1000;
 const COALESCE_CAP: usize = 4096;
+const SIGN_IN_FLOOD_CAP: usize = 512;
 const LINGER: Duration = Duration::from_millis(250);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 // The writer wakes at least this often so an idle flood window can resolve itself and the
@@ -44,8 +48,22 @@ const FLOOD_PASS: u64 = 8;
 // distinct bursts from the same source.
 const FLOOD_IDLE_SECONDS: i64 = 20;
 const FLOOD_ACTOR_CAP: usize = 64;
+/// The users of one source that hold a window of their own at a time, in each class; at 0
+/// every row is keyed by its source alone.
+const FLOOD_USERS_PER_SOURCE: usize = 16;
+const MANY_SOURCES: &str = " from many sources";
 
 pub(crate) const UNKNOWN_USER_DETAIL: &str = "unknown user";
+const UNREADABLE_DETAIL: &str = "policy: unreadable";
+const DISABLED_DETAIL: &str = "account disabled";
+const USER_AT_BIND: [&str; 4] = [
+    "invalid credentials",
+    LOCKED_OUT,
+    DISABLED_DETAIL,
+    "ou mismatch",
+];
+const USER_AT_START: [&str; 3] = [LOCKED_OUT, DISABLED_DETAIL, "policy: "];
+const USER_AT_RESET: [&str; 2] = [DISABLED_DETAIL, "could not send email"];
 
 /// Both limits are off at 0.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -97,11 +115,7 @@ pub fn start_log_writer(
         pool,
         sink.dropped.clone(),
         retention,
-        WriterCoalescers {
-            bind: BindCoalescer::new(bind_coalesce_seconds),
-            bind_flood: FloodCoalescer::new(FloodClass::UnknownBind, FLOOD_IDLE_SECONDS),
-            denied_flood: FloodCoalescer::new(FloodClass::AccessDenied, FLOOD_IDLE_SECONDS),
-        },
+        WriterCoalescers::new(bind_coalesce_seconds, FLOOD_IDLE_SECONDS),
         WRITER_TICK,
     ));
     set_log_sink(sink.clone());
@@ -173,43 +187,130 @@ struct FloodWindow {
     counted: u64,
     actors: HashSet<u64>,
     more_actors: bool,
+    wide: bool,
+    row: LogEvent,
 }
 
 impl FloodWindow {
-    fn open(timestamp: Timestamp) -> Self {
+    /// With no key the window is its class's kind-wide one.
+    fn open(class: FloodClass, key: Option<&FloodKey>, event: &LogEvent) -> Self {
+        let peer = event.peer.clone().filter(|_| key.is_some());
+        let judged = event.source.map(|source| source.to_string());
+        let judged = judged.filter(|judged| key.is_some() && peer.as_ref() != Some(judged));
+        let row = LogEvent {
+            timestamp: event.timestamp,
+            kind: class.kind(),
+            success: false,
+            protocol: event.protocol,
+            actor: key.and_then(|key| key.actor.clone()),
+            target: key.and_then(|key| key.user.clone()),
+            peer,
+            forwarded_for: judged,
+            detail: None,
+            source: None,
+            proved: false,
+        };
         Self {
-            started: timestamp,
-            last: timestamp,
-            passed: 1,
+            started: event.timestamp,
+            last: event.timestamp,
+            passed: 0,
             counted: 0,
             actors: HashSet::new(),
             more_actors: false,
+            wide: key.is_none(),
+            row,
         }
+    }
+
+    fn passes(&mut self, at: Timestamp, pass: u64) -> bool {
+        self.last = at;
+        if self.passed == pass {
+            return false;
+        }
+        self.passed += 1;
+        true
+    }
+
+    fn count(&mut self, name: u64) {
+        self.counted += 1;
+        if self.actors.len() < FLOOD_ACTOR_CAP {
+            self.actors.insert(name);
+        } else {
+            self.more_actors = true;
+        }
+    }
+
+    fn flood_row(&self, timestamp: Timestamp, detail: String) -> LogEvent {
+        let event = LogEvent {
+            timestamp,
+            detail: Some(detail),
+            ..self.row.clone()
+        };
+        warn!(target: "logs", "{event}");
+        event
+    }
+
+    fn started_row(&self, class: FloodClass) -> LogEvent {
+        self.flood_row(self.last, class.started_detail(self.wide))
+    }
+
+    fn resolved_row(&self, class: FloodClass) -> Option<LogEvent> {
+        (self.counted > 0).then(|| self.flood_row(self.last, class.resolved_detail(self)))
     }
 }
 
-// The two abuse floods the writer brackets: a unique-name bind spray and an access-denied
-// flood (authenticated abuse or a junk-JWT spammer). Both coalesce the same way; the class
-// only picks the noun and the row kind.
+fn hashed(name: impl Hash) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    name.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn many(wide: bool) -> &'static str {
+    if wide { MANY_SOURCES } else { "" }
+}
+
+// The floods the writer brackets: a unique-name bind spray, an access-denied flood
+// (authenticated abuse or a junk-JWT spammer), and each kind of sign-in refused before a
+// credential was proved. All coalesce the same way; the class picks the texts and the row kind.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum FloodClass {
     UnknownBind,
     AccessDenied,
+    Bind,
+    Login,
+    TokenRefresh,
+    ResetRequest,
+    ResetComplete,
 }
 
 impl FloodClass {
+    const ALL: [Self; 7] = [
+        Self::UnknownBind,
+        Self::AccessDenied,
+        Self::Bind,
+        Self::Login,
+        Self::TokenRefresh,
+        Self::ResetRequest,
+        Self::ResetComplete,
+    ];
+
     fn classify(event: &LogEvent) -> Option<Self> {
+        if event.success {
+            return None;
+        }
+        let unknown = matches!(
+            event.detail.as_deref(),
+            Some(UNKNOWN_USER_DETAIL | NO_PASSWORD)
+        );
         match event.kind {
-            LogKind::Bind
-                if !event.success
-                    && matches!(
-                        event.detail.as_deref(),
-                        Some(UNKNOWN_USER_DETAIL | NO_PASSWORD)
-                    ) =>
-            {
-                Some(Self::UnknownBind)
-            }
-            LogKind::AccessDenied if !event.success => Some(Self::AccessDenied),
+            LogKind::Bind if unknown => Some(Self::UnknownBind),
+            LogKind::AccessDenied => Some(Self::AccessDenied),
+            _ if event.proved => None,
+            LogKind::Bind => Some(Self::Bind),
+            LogKind::Login => Some(Self::Login),
+            LogKind::TokenRefresh => Some(Self::TokenRefresh),
+            LogKind::PasswordResetRequest => Some(Self::ResetRequest),
+            LogKind::PasswordResetComplete => Some(Self::ResetComplete),
             _ => None,
         }
     }
@@ -218,14 +319,31 @@ impl FloodClass {
         match self {
             Self::UnknownBind => LogKind::BindFlood,
             Self::AccessDenied => LogKind::AccessDeniedFlood,
+            _ => LogKind::SignInFlood,
         }
     }
 
-    fn started_detail(self) -> &'static str {
+    fn cap(self) -> usize {
         match self {
-            Self::UnknownBind => "unknown-user bind flood started",
-            Self::AccessDenied => "access-denied flood started",
+            Self::UnknownBind | Self::AccessDenied => COALESCE_CAP,
+            _ => SIGN_IN_FLOOD_CAP,
         }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::UnknownBind => "unknown-user bind flood",
+            Self::AccessDenied => "access-denied flood",
+            Self::Bind => "bind flood",
+            Self::Login => "login flood",
+            Self::TokenRefresh => "token_refresh flood",
+            Self::ResetRequest => "password_reset_request flood",
+            Self::ResetComplete => "password_reset_complete flood",
+        }
+    }
+
+    fn started_detail(self, wide: bool) -> String {
+        format!("{}{} started", self.label(), many(wide))
     }
 
     fn resolved_detail(self, window: &FloodWindow) -> String {
@@ -234,50 +352,63 @@ impl FloodClass {
         let (noun, who) = match self {
             Self::UnknownBind => ("binds", "names"),
             Self::AccessDenied => ("denials", "actors"),
+            _ => ("refusals", "names"),
         };
-        let label = match self {
-            Self::UnknownBind => "unknown-user bind flood resolved",
-            Self::AccessDenied => "access-denied flood resolved",
-        };
+        let who = if window.wide { "sources" } else { who };
         format!(
-            "{label}: {} {noun}, {}{more} {who}, {seconds}s",
+            "{}{} resolved: {} {noun}, {}{more} {who}, {seconds}s",
+            self.label(),
+            many(window.wide),
             window.counted,
             window.actors.len(),
         )
     }
+
+    fn name(self, wide: bool, event: &LogEvent) -> u64 {
+        match (wide, self) {
+            (true, _) => hashed(event.source),
+            (false, Self::AccessDenied) => hashed(&event.actor),
+            (false, _) => hashed(event.actor.as_ref().or(event.target.as_ref())),
+        }
+    }
+}
+
+/// The user a refused sign-in is about, where the door that wrote the row had found that
+/// user; any other row is keyed by its source alone.
+fn known_user(class: FloodClass, event: &LogEvent) -> Option<&str> {
+    let detail = event.detail.as_deref()?;
+    let says = |known: &[&str]| known.iter().any(|said| detail.starts_with(*said));
+    match (class, event.protocol) {
+        (FloodClass::Bind, _) if says(&USER_AT_BIND) => event.actor.as_deref(),
+        (FloodClass::Login, Protocol::Kerberos) => event.target.as_deref(),
+        (FloodClass::Login, _) if says(&USER_AT_START) && !says(&[UNREADABLE_DETAIL]) => {
+            event.actor.as_deref()
+        }
+        (FloodClass::ResetRequest, _) if says(&USER_AT_RESET) => event.target.as_deref(),
+        _ => None,
+    }
 }
 
 // A flood must not push real history out of max_entries: failures beyond the first few per
-// source are dropped and the incident is bracketed by a "started" row and a "resolved" row
-// with the totals. One incident per source lives until it goes quiet for FLOOD_IDLE_SECONDS;
-// events that do not belong to this class pass through untouched.
+// key are dropped and the incident is bracketed by a "started" row and a "resolved" row with
+// the totals. One incident per key lives until it goes quiet for FLOOD_IDLE_SECONDS; other
+// classes' events pass untouched. A key met while the table is full is counted in the class's
+// one kind-wide window for its protocol.
 struct FloodCoalescer {
     class: FloodClass,
     idle: SignedDuration,
+    users_per_source: usize,
     windows: HashMap<FloodKey, FloodWindow>,
+    wide: HashMap<Protocol, FloodWindow>,
     ready: Vec<LogEvent>,
 }
 
-#[derive(PartialEq, Eq, Hash)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct FloodKey {
-    peer: Option<String>,
-    actor: Option<String>,
+    source: Option<IpAddr>,
     protocol: Protocol,
-}
-
-impl FloodKey {
-    /// A kadmin refusal coalesces only on the caller's own principal, keyed by the caller.
-    fn of(event: &LogEvent) -> Option<Self> {
-        let kadmin = event.protocol == Protocol::Kadmin;
-        if kadmin && (event.actor.is_none() || event.actor != event.target) {
-            return None;
-        }
-        Some(Self {
-            peer: event.peer.clone(),
-            actor: event.actor.clone().filter(|_| kadmin),
-            protocol: event.protocol,
-        })
-    }
+    actor: Option<String>,
+    user: Option<String>,
 }
 
 impl FloodCoalescer {
@@ -285,108 +416,119 @@ impl FloodCoalescer {
         Self {
             class,
             idle: SignedDuration::from_secs(idle_seconds),
+            users_per_source: FLOOD_USERS_PER_SOURCE,
             windows: HashMap::new(),
+            wide: HashMap::new(),
             ready: Vec::new(),
         }
     }
 
+    /// A kadmin refusal coalesces only on the caller's own principal, keyed by the caller.
+    fn key(&self, event: &LogEvent) -> Option<FloodKey> {
+        let kadmin = event.protocol == Protocol::Kadmin;
+        if kadmin && (event.actor.is_none() || event.actor != event.target) {
+            return None;
+        }
+        let plain = FloodKey {
+            source: event.source,
+            protocol: event.protocol,
+            actor: event.actor.clone().filter(|_| kadmin),
+            user: None,
+        };
+        let Some(user) = known_user(self.class, event) else {
+            return Some(plain);
+        };
+        let own = FloodKey {
+            user: Some(user.to_owned()),
+            ..plain.clone()
+        };
+        let room = || self.users_of(event.source) < self.users_per_source;
+        Some(if self.windows.contains_key(&own) || room() {
+            own
+        } else {
+            plain
+        })
+    }
+
+    fn users_of(&self, source: Option<IpAddr>) -> usize {
+        let keys = self.windows.keys();
+        keys.filter(|key| key.source == source && key.user.is_some())
+            .count()
+    }
+
+    fn window(&mut self, key: FloodKey, event: &LogEvent) -> (&mut FloodWindow, u64) {
+        let class = self.class;
+        if self.windows.len() >= class.cap() && !self.windows.contains_key(&key) {
+            let open = || FloodWindow::open(class, None, event);
+            return (self.wide.entry(event.protocol).or_insert_with(open), 0);
+        }
+        let window = match self.windows.entry(key) {
+            Entry::Occupied(held) => held.into_mut(),
+            Entry::Vacant(free) => {
+                let window = FloodWindow::open(class, Some(free.key()), event);
+                free.insert(window)
+            }
+        };
+        (window, FLOOD_PASS)
+    }
+
     fn keep(&mut self, event: &LogEvent) -> bool {
-        if FloodClass::classify(event) != Some(self.class) {
+        let class = self.class;
+        if FloodClass::classify(event) != Some(class) {
             return true;
         }
-        let Some(key) = FloodKey::of(event) else {
+        let Some(key) = self.key(event) else {
             return true;
         };
-        let Some(entry) = self.windows.get_mut(&key) else {
-            if self.windows.len() >= COALESCE_CAP {
-                self.flush_into_ready(event.timestamp, true);
-            }
-            self.windows.insert(key, FloodWindow::open(event.timestamp));
-            return true;
-        };
-        entry.last = event.timestamp;
-        if entry.passed < FLOOD_PASS {
-            entry.passed += 1;
+        let (window, pass) = self.window(key, event);
+        if window.passes(event.timestamp, pass) {
             return true;
         }
         // The first dropped event opens the incident, visible to an admin at once.
-        if entry.counted == 0 {
-            let row = self.started_event(&key, event.timestamp);
-            self.ready.push(row);
-        }
-        let entry = self.windows.get_mut(&key).expect("window just inserted");
-        entry.counted += 1;
-        if entry.actors.len() < FLOOD_ACTOR_CAP {
-            let mut hasher = DefaultHasher::new();
-            event.actor.hash(&mut hasher);
-            entry.actors.insert(hasher.finish());
-        } else {
-            entry.more_actors = true;
-        }
+        let started = (window.counted == 0).then(|| window.started_row(class));
+        window.count(class.name(window.wide, event));
+        self.ready.extend(started);
         false
     }
 
     fn flush(&mut self, now: Timestamp, all: bool) -> Vec<LogEvent> {
-        self.flush_into_ready(now, all);
-        std::mem::take(&mut self.ready)
-    }
-
-    fn flush_into_ready(&mut self, now: Timestamp, all: bool) {
-        let ready = &mut self.ready;
-        let idle = self.idle;
-        let class = self.class;
-        self.windows.retain(|key, entry| {
-            if !all && now - entry.last < idle {
+        let (class, idle, ready) = (self.class, self.idle, &mut self.ready);
+        let mut open = |window: &FloodWindow| {
+            if !all && now - window.last < idle {
                 return true;
             }
-            if let Some(row) = resolved_event(class, key, entry) {
-                ready.push(row);
-            }
+            ready.extend(window.resolved_row(class));
             false
-        });
-    }
-
-    fn started_event(&self, key: &FloodKey, timestamp: Timestamp) -> LogEvent {
-        let event = LogEvent {
-            timestamp,
-            kind: self.class.kind(),
-            success: false,
-            protocol: key.protocol,
-            actor: key.actor.clone(),
-            target: None,
-            peer: key.peer.clone(),
-            forwarded_for: None,
-            detail: Some(self.class.started_detail().to_owned()),
         };
-        warn!(target: "logs", "{event}");
-        event
+        self.windows.retain(|_, window| open(window));
+        self.wide.retain(|_, window| open(window));
+        std::mem::take(&mut self.ready)
     }
-}
-
-fn resolved_event(class: FloodClass, key: &FloodKey, window: &FloodWindow) -> Option<LogEvent> {
-    if window.counted == 0 {
-        return None;
-    }
-    let event = LogEvent {
-        timestamp: window.last,
-        kind: class.kind(),
-        success: false,
-        protocol: key.protocol,
-        actor: key.actor.clone(),
-        target: None,
-        peer: key.peer.clone(),
-        forwarded_for: None,
-        detail: Some(class.resolved_detail(window)),
-    };
-    warn!(target: "logs", "{event}");
-    Some(event)
 }
 
 // The writer owns its coalescers so the request path never locks.
 struct WriterCoalescers {
     bind: BindCoalescer,
-    bind_flood: FloodCoalescer,
-    denied_flood: FloodCoalescer,
+    floods: [FloodCoalescer; 7],
+}
+
+impl WriterCoalescers {
+    fn new(bind_coalesce_seconds: u32, flood_idle_seconds: i64) -> Self {
+        let flood = |class| FloodCoalescer::new(class, flood_idle_seconds);
+        Self {
+            bind: BindCoalescer::new(bind_coalesce_seconds),
+            floods: FloodClass::ALL.map(flood),
+        }
+    }
+
+    fn keep(&mut self, event: &LogEvent) -> bool {
+        self.bind.keep(event) && self.floods.iter_mut().all(|flood| flood.keep(event))
+    }
+
+    fn flush(&mut self, now: Timestamp, all: bool) -> Vec<LogEvent> {
+        let floods = self.floods.iter_mut();
+        floods.flat_map(|flood| flood.flush(now, all)).collect()
+    }
 }
 
 // One INSERT per batch: a trickle lingers a moment to fill a batch, a full queue drains
@@ -396,14 +538,9 @@ async fn run_writer(
     pool: DbConnection,
     dropped: Arc<AtomicU64>,
     retention: LogRetention,
-    coalescers: WriterCoalescers,
+    mut coalescers: WriterCoalescers,
     tick: Duration,
 ) {
-    let WriterCoalescers {
-        mut bind,
-        mut bind_flood,
-        mut denied_flood,
-    } = coalescers;
     let mut buffer = Vec::with_capacity(BATCH_SIZE);
     let mut inserted_since_trim = 0u64;
     loop {
@@ -421,14 +558,12 @@ async fn run_writer(
                         }
                     }
                 }
-                buffer.retain(|event| {
-                    bind.keep(event) && bind_flood.keep(event) && denied_flood.keep(event)
-                });
+                buffer.retain(|event| coalescers.keep(event));
             }
             Err(_) => {}
         }
         let now = Timestamp::now();
-        bind.prune(now);
+        coalescers.bind.prune(now);
         flush_suppressed_warnings(now.as_second().max(0) as u64);
         let lost = dropped.swap(0, Ordering::Relaxed);
         let mut rows = Vec::with_capacity(buffer.len() + 1);
@@ -436,18 +571,8 @@ async fn run_writer(
             rows.push(to_active_model(gap_event(lost)));
         }
         rows.extend(buffer.drain(..).map(to_active_model));
-        rows.extend(
-            bind_flood
-                .flush(now, false)
-                .into_iter()
-                .map(to_active_model),
-        );
-        rows.extend(
-            denied_flood
-                .flush(now, false)
-                .into_iter()
-                .map(to_active_model),
-        );
+        let floods = coalescers.flush(now, false);
+        rows.extend(floods.into_iter().map(to_active_model));
         let batch = rows.len() as u64;
         match insert_rows(&pool, rows).await {
             Ok(()) => inserted_since_trim += batch,
@@ -466,9 +591,7 @@ async fn run_writer(
         }
     }
     // The channel is closed: pending flood windows become rows, never lost.
-    let now = Timestamp::now();
-    let mut rows = bind_flood.flush(now, true);
-    rows.extend(denied_flood.flush(now, true));
+    let rows = coalescers.flush(Timestamp::now(), true);
     let rows = rows.into_iter().map(to_active_model).collect::<Vec<_>>();
     if let Err(e) = insert_rows(&pool, rows).await {
         warn!("Could not persist the final log events: {e}");
@@ -491,6 +614,8 @@ fn gap_event(lost: u64) -> LogEvent {
         peer: None,
         forwarded_for: None,
         detail: Some(format!("dropped events: {lost}")),
+        source: None,
+        proved: false,
     }
 }
 
@@ -770,6 +895,8 @@ fn from_model(row: model::logs::Model) -> Option<LogRecord> {
             peer: row.peer,
             forwarded_for: row.forwarded_for,
             detail: row.detail,
+            source: None,
+            proved: false,
         },
     })
 }
@@ -887,6 +1014,8 @@ mod tests {
             peer: Some("127.0.0.1".to_owned()),
             forwarded_for: None,
             detail: None,
+            source: "127.0.0.1".parse().ok(),
+            proved: false,
         }
     }
 
@@ -922,11 +1051,7 @@ mod tests {
             pool.clone(),
             sink.dropped.clone(),
             LogRetention::default(),
-            WriterCoalescers {
-                bind: BindCoalescer::new(0),
-                bind_flood: FloodCoalescer::new(FloodClass::UnknownBind, FLOOD_IDLE_SECONDS),
-                denied_flood: FloodCoalescer::new(FloodClass::AccessDenied, FLOOD_IDLE_SECONDS),
-            },
+            WriterCoalescers::new(0, FLOOD_IDLE_SECONDS),
             WRITER_TICK,
         ));
         for name in ["bob", "carol", "dave"] {
@@ -955,11 +1080,7 @@ mod tests {
             pool.clone(),
             sink.dropped.clone(),
             LogRetention::default(),
-            WriterCoalescers {
-                bind: BindCoalescer::new(0),
-                bind_flood: FloodCoalescer::new(FloodClass::UnknownBind, FLOOD_IDLE_SECONDS),
-                denied_flood: FloodCoalescer::new(FloodClass::AccessDenied, FLOOD_IDLE_SECONDS),
-            },
+            WriterCoalescers::new(0, FLOOD_IDLE_SECONDS),
             WRITER_TICK,
         ));
         drop(sink);
@@ -989,11 +1110,7 @@ mod tests {
             pool.clone(),
             dropped.clone(),
             LogRetention::default(),
-            WriterCoalescers {
-                bind: BindCoalescer::new(0),
-                bind_flood: FloodCoalescer::new(FloodClass::UnknownBind, FLOOD_IDLE_SECONDS),
-                denied_flood: FloodCoalescer::new(FloodClass::AccessDenied, FLOOD_IDLE_SECONDS),
-            },
+            WriterCoalescers::new(0, FLOOD_IDLE_SECONDS),
             WRITER_TICK,
         ));
         drop(sink);
@@ -1299,9 +1416,35 @@ mod tests {
         LogEvent {
             success: false,
             detail: Some(UNKNOWN_USER_DETAIL.to_owned()),
-            peer: Some(peer.to_owned()),
-            ..event_at(LogKind::Bind, actor, timestamp)
+            ..sent_from(peer, event_at(LogKind::Bind, actor, timestamp))
         }
+    }
+
+    /// The row as sent from that address, with no proxy between.
+    fn sent_from(peer: &str, row: LogEvent) -> LogEvent {
+        LogEvent {
+            peer: Some(peer.to_owned()),
+            source: peer.parse().ok(),
+            ..row
+        }
+    }
+
+    /// A refused sign-in by bob from 127.0.0.1, no credential proved before it.
+    fn refusal(kind: LogKind, protocol: Protocol, detail: &str, timestamp: Timestamp) -> LogEvent {
+        LogEvent {
+            success: false,
+            protocol,
+            detail: Some(detail.to_owned()),
+            ..event_at(kind, "bob", timestamp)
+        }
+    }
+
+    fn kept(flood: &mut FloodCoalescer, row: &LogEvent, times: usize) -> usize {
+        (0..times).filter(|_| flood.keep(row)).count()
+    }
+
+    fn details(rows: &[LogEvent]) -> Vec<&str> {
+        rows.iter().filter_map(|r| r.detail.as_deref()).collect()
     }
 
     fn nanos_after(base: Timestamp, nanos: i64) -> Timestamp {
@@ -1324,7 +1467,12 @@ mod tests {
             let window = FloodWindow {
                 last: nanos_after(base, nanos),
                 counted: 2,
-                ..FloodWindow::open(base)
+                wide: false,
+                ..FloodWindow::open(
+                    FloodClass::UnknownBind,
+                    None,
+                    &unknown_bind("x", "10.0.0.9", base),
+                )
             };
             assert_eq!(
                 FloodClass::UnknownBind.resolved_detail(&window),
@@ -1404,6 +1552,7 @@ mod tests {
         assert!(!opened[0].success);
         assert_eq!(opened[0].actor, None);
         assert_eq!(opened[0].peer.as_deref(), Some("10.0.0.1"));
+        assert_eq!(opened[0].forwarded_for, None, "the peer is the source");
         assert_eq!(opened[0].protocol, Protocol::Ldap);
         assert_eq!(
             opened[0].detail.as_deref(),
@@ -1465,11 +1614,6 @@ mod tests {
         let mut flood = FloodCoalescer::new(FloodClass::UnknownBind, FLOOD_IDLE_SECONDS);
         let base = at(1, 9, 0);
         for _ in 0..20 {
-            let wrong_password = LogEvent {
-                detail: Some("invalid credentials".to_owned()),
-                ..unknown_bind("bob", "10.0.0.1", base)
-            };
-            assert!(flood.keep(&wrong_password));
             let success = LogEvent {
                 success: true,
                 detail: None,
@@ -1491,32 +1635,260 @@ mod tests {
     }
 
     #[test]
-    fn test_a_sign_in_refused_by_an_item_or_the_lock_is_kept_every_time() {
+    fn test_a_refusal_before_a_credential_is_proved_coalesces_past_the_first_eight() {
         let base = at(1, 9, 0);
-        let refused = |protocol, detail: &str| LogEvent {
-            kind: LogKind::Login,
-            protocol,
-            target: Some("bob".to_owned()),
-            detail: Some(detail.to_owned()),
-            ..unknown_bind("bob", "10.0.0.1", base)
-        };
         let rows = [
-            refused(Protocol::Http, "policy: login-hours (outside login hours)"),
-            refused(Protocol::Http, "policy: unreadable"),
-            refused(Protocol::Http, "locked out"),
-            refused(
-                Protocol::Kerberos,
-                "policy: allowed-networks (address not allowed)",
+            (LogKind::Bind, Protocol::Ldap, "invalid credentials", "bind"),
+            (
+                LogKind::Login,
+                Protocol::Http,
+                "policy: login-hours (outside login hours)",
+                "login",
+            ),
+            (LogKind::Login, Protocol::Kerberos, "locked out", "login"),
+            (
+                LogKind::TokenRefresh,
+                Protocol::Http,
+                "invalid refresh token",
+                "token_refresh",
+            ),
+            (
+                LogKind::PasswordResetRequest,
+                Protocol::Http,
+                "unknown user",
+                "password_reset_request",
+            ),
+            (
+                LogKind::PasswordResetComplete,
+                Protocol::Http,
+                "wrong or expired reset token",
+                "password_reset_complete",
             ),
         ];
-        for class in [FloodClass::UnknownBind, FloodClass::AccessDenied] {
+        for (kind, protocol, detail, label) in rows {
+            let row = refusal(kind, protocol, detail, base);
+            let class = FloodClass::classify(&row).unwrap();
             let mut flood = FloodCoalescer::new(class, FLOOD_IDLE_SECONDS);
-            for row in &rows {
-                let kept: Vec<bool> = (0..20).map(|_| flood.keep(row)).collect();
-                assert_eq!(kept, vec![true; 20], "{row}");
-            }
-            assert!(flood.flush(base, true).is_empty());
+            let passed = kept(&mut flood, &row, 20);
+            let rows = flood.flush(base, true);
+            let kinds: Vec<_> = rows.iter().map(|r| r.kind).collect();
+            let started = format!("{label} flood started");
+            let resolved = format!("{label} flood resolved: 12 refusals, 1 names, 0s");
+            assert_eq!(
+                (passed, kinds, details(&rows)),
+                (
+                    8,
+                    vec![LogKind::SignInFlood; 2],
+                    vec![started.as_str(), resolved.as_str()]
+                ),
+                "{row}"
+            );
         }
+    }
+
+    #[test]
+    fn test_a_refusal_after_a_credential_was_proved_is_kept_every_time() {
+        let base = at(1, 9, 0);
+        let rows = [
+            (
+                LogKind::Bind,
+                Protocol::Ldap,
+                "policy: login-hours (outside login hours)",
+            ),
+            (LogKind::Bind, Protocol::Http, "totp code required"),
+            (LogKind::Bind, Protocol::Ldap, "invalid totp"),
+            (LogKind::Login, Protocol::Http, "policy: unreadable"),
+            (LogKind::Login, Protocol::Http, "totp attempts exceeded"),
+            (
+                LogKind::Login,
+                Protocol::Kerberos,
+                "refused after pre-authentication, code 12",
+            ),
+            (LogKind::TokenRefresh, Protocol::Http, "account disabled"),
+        ];
+        let mut coalescers = WriterCoalescers::new(0, FLOOD_IDLE_SECONDS);
+        for (kind, protocol, detail) in rows {
+            let row = LogEvent {
+                proved: true,
+                ..refusal(kind, protocol, detail, base)
+            };
+            let passed = (0..20).filter(|_| coalescers.keep(&row)).count();
+            assert_eq!(passed, 20, "{row}");
+        }
+        assert_eq!(coalescers.flush(base, true), vec![]);
+    }
+
+    #[test]
+    fn test_unknown_names_and_a_users_wrong_passwords_do_not_share_a_window() {
+        let base = at(1, 9, 0);
+        let mut coalescers = WriterCoalescers::new(0, FLOOD_IDLE_SECONDS);
+        let spray = |i: usize| unknown_bind(&format!("spray-{i}"), "10.0.0.1", base);
+        let unknown = (0..20).filter(|i| coalescers.keep(&spray(*i))).count();
+        let wrong = refusal(LogKind::Bind, Protocol::Ldap, "invalid credentials", base);
+        let wrong = sent_from("10.0.0.1", wrong);
+        let known = (0..20).filter(|_| coalescers.keep(&wrong)).count();
+        assert_eq!(
+            (unknown, known),
+            (8, 8),
+            "a name spray does not use up the first eight of a user's failed binds from its source"
+        );
+    }
+
+    #[test]
+    fn test_each_known_user_keeps_a_first_eight_per_source_and_a_claimed_name_does_not() {
+        let base = at(1, 9, 0);
+        let rows = [
+            (LogKind::Bind, Protocol::Ldap, "invalid credentials", true),
+            (LogKind::Bind, Protocol::Http, "locked out", true),
+            (LogKind::Bind, Protocol::Ldap, "account disabled", true),
+            (LogKind::Bind, Protocol::Ldap, "ou mismatch", true),
+            (LogKind::Bind, Protocol::Ldap, "policy: unreadable", false),
+            (LogKind::Bind, Protocol::Ldap, "SASL not supported", false),
+            (LogKind::Login, Protocol::Http, "locked out", true),
+            (LogKind::Login, Protocol::Http, "account disabled", true),
+            (
+                LogKind::Login,
+                Protocol::Http,
+                "policy: login-hours (outside login hours)",
+                true,
+            ),
+            (LogKind::Login, Protocol::Http, "policy: unreadable", false),
+            (LogKind::Login, Protocol::Http, "invalid credentials", false),
+            (
+                LogKind::Login,
+                Protocol::Kerberos,
+                "pre-authentication failed (encrypted timestamp)",
+                true,
+            ),
+            (
+                LogKind::TokenRefresh,
+                Protocol::Http,
+                "invalid refresh token",
+                false,
+            ),
+            (
+                LogKind::PasswordResetRequest,
+                Protocol::Http,
+                "account disabled",
+                true,
+            ),
+            (
+                LogKind::PasswordResetRequest,
+                Protocol::Http,
+                "unknown user",
+                false,
+            ),
+            (
+                LogKind::PasswordResetComplete,
+                Protocol::Http,
+                "wrong or expired reset token",
+                false,
+            ),
+        ];
+        for (kind, protocol, detail, own) in rows {
+            let about = |user: &str| LogEvent {
+                actor: (kind != LogKind::PasswordResetRequest).then(|| user.to_owned()),
+                target: Some(user.to_owned()),
+                ..refusal(kind, protocol, detail, base)
+            };
+            let class = FloodClass::classify(&about("ann")).unwrap();
+            let mut flood = FloodCoalescer::new(class, FLOOD_IDLE_SECONDS);
+            let passed = kept(&mut flood, &about("ann"), 10) + kept(&mut flood, &about("bob"), 10);
+            assert_eq!(
+                passed,
+                if own { 16 } else { 8 },
+                "{kind} over {protocol}, {detail}: two names, ten refusals each, one source"
+            );
+        }
+    }
+
+    fn wrong_password(user: &str, peer: &str, timestamp: Timestamp) -> LogEvent {
+        let wrong = refusal(
+            LogKind::Bind,
+            Protocol::Ldap,
+            "invalid credentials",
+            timestamp,
+        );
+        LogEvent {
+            actor: Some(user.to_owned()),
+            ..sent_from(peer, wrong)
+        }
+    }
+
+    #[test]
+    fn test_a_source_holds_a_window_each_for_sixteen_users_and_its_own_for_the_rest() {
+        let base = at(1, 9, 0);
+        let mut flood = FloodCoalescer::new(FloodClass::Bind, FLOOD_IDLE_SECONDS);
+        let user = |i: usize| format!("u{i:02}");
+        let passed: Vec<_> = (0..FLOOD_USERS_PER_SOURCE + 2)
+            .map(|i| kept(&mut flood, &wrong_password(&user(i), "10.0.0.1", base), 10))
+            .collect();
+        let elsewhere = kept(&mut flood, &wrong_password("u99", "10.0.0.2", base), 10);
+        let open = flood.flush(base, false);
+        let resolved_early = open.iter().filter(|r| counted(r) > 0).count();
+        let mut closed = flood.flush(base, true);
+        closed.sort_by_key(|r| r.target.clone());
+        let shown: Vec<_> = closed
+            .iter()
+            .map(|r| (r.target.clone(), counted(r)))
+            .collect();
+        let mut expected = vec![(None, 12)];
+        expected.extend((0..FLOOD_USERS_PER_SOURCE).map(|i| (Some(user(i)), 2)));
+        expected.push((Some("u99".to_owned()), 2));
+        assert_eq!(
+            (passed, elsewhere, resolved_early, shown),
+            (
+                [vec![8; FLOOD_USERS_PER_SOURCE], vec![8, 0]].concat(),
+                8,
+                0,
+                expected
+            ),
+            "the users past the sixteenth share the source's own window; another source's user \
+             has its own; no window is resolved to make room"
+        );
+        assert_eq!(
+            closed[0].detail.as_deref(),
+            Some("bind flood resolved: 12 refusals, 2 names, 0s")
+        );
+    }
+
+    #[test]
+    fn test_with_no_user_windows_every_row_is_keyed_by_its_source_alone() {
+        let base = at(1, 9, 0);
+        let mut flood = FloodCoalescer {
+            users_per_source: 0,
+            ..FloodCoalescer::new(FloodClass::Bind, FLOOD_IDLE_SECONDS)
+        };
+        let passed = kept(&mut flood, &wrong_password("ann", "10.0.0.1", base), 10)
+            + kept(&mut flood, &wrong_password("bob", "10.0.0.1", base), 10);
+        let rows = flood.flush(base, true);
+        let targets: Vec<_> = rows.iter().map(|r| r.target.as_deref()).collect();
+        assert_eq!(
+            (passed, targets, details(&rows)),
+            (
+                8,
+                vec![None; 2],
+                vec![
+                    "bind flood started",
+                    "bind flood resolved: 12 refusals, 2 names, 0s"
+                ]
+            )
+        );
+    }
+
+    #[test]
+    fn test_the_judged_address_and_the_proved_mark_are_not_stored() {
+        let row = event_at(LogKind::Login, "bob", at(1, 9, 0));
+        let marked = LogEvent {
+            source: "203.0.113.9".parse().ok(),
+            proved: true,
+            ..row.clone()
+        };
+        let plain = LogEvent {
+            source: None,
+            ..row
+        };
+        assert_eq!(to_active_model(marked), to_active_model(plain));
     }
 
     #[test]
@@ -1593,32 +1965,121 @@ mod tests {
         );
     }
 
+    /// The count a `resolved` row carries; 0 for any other row.
+    fn counted(row: &LogEvent) -> u64 {
+        let detail = row.detail.as_deref().unwrap_or_default();
+        let totals = detail
+            .split_once("resolved: ")
+            .map_or("", |(_, totals)| totals);
+        let count = totals.split(' ').next().and_then(|n| n.parse().ok());
+        count.unwrap_or(0)
+    }
+
+    #[test]
+    fn test_a_window_is_keyed_by_the_judged_address_whatever_the_socket_peer() {
+        let base = at(1, 9, 0);
+        let rows = [
+            unknown_bind("ghost", "10.0.0.1", base),
+            denial(None, "10.0.0.1", base),
+            refusal(LogKind::Login, Protocol::Http, "invalid credentials", base),
+        ];
+        let through = |row: &LogEvent, peer: &str, source: &str| LogEvent {
+            peer: Some(peer.to_owned()),
+            source: source.parse().ok(),
+            ..row.clone()
+        };
+        for row in rows {
+            let class = FloodClass::classify(&row).unwrap();
+            let mut flood = FloodCoalescer::new(class, FLOOD_IDLE_SECONDS);
+            for _ in 0..10 {
+                flood.keep(&through(&row, "10.0.0.1", "203.0.113.1"));
+                flood.keep(&through(&row, "10.0.0.1", "203.0.113.2"));
+                flood.keep(&through(&row, "10.0.0.2", "203.0.113.2"));
+            }
+            let rows = flood.flush(base, true);
+            let mut resolved: Vec<_> = rows
+                .iter()
+                .filter(|r| counted(r) > 0)
+                .map(|r| (r.peer.as_deref(), r.forwarded_for.as_deref(), counted(r)))
+                .collect();
+            resolved.sort();
+            assert_eq!(
+                resolved,
+                vec![
+                    (Some("10.0.0.1"), Some("203.0.113.1"), 2),
+                    (Some("10.0.0.1"), Some("203.0.113.2"), 12),
+                ],
+                "{class:?}: two sources behind one peer have a window each and one source behind \
+                 two peers has one; the row names its first event's peer and the judged address"
+            );
+        }
+    }
+
+    fn address(i: usize) -> String {
+        format!("10.{}.{}.{}", 1 + i / 65536, i / 256 % 256, i % 256)
+    }
+
+    #[test]
+    fn test_a_full_table_opens_one_kind_wide_window_and_resolves_no_other() {
+        let base = at(1, 9, 0);
+        let idle = SignedDuration::from_secs(FLOOD_IDLE_SECONDS);
+        let wrong = refusal(LogKind::Login, Protocol::Http, "invalid credentials", base);
+        let rows = [
+            (
+                unknown_bind("ghost", "10.0.0.1", base),
+                COALESCE_CAP,
+                "unknown-user bind flood",
+                "binds, 1 names",
+            ),
+            (
+                denial(None, "10.0.0.1", base),
+                COALESCE_CAP,
+                "access-denied flood",
+                "denials, 1 actors",
+            ),
+            (wrong, SIGN_IN_FLOOD_CAP, "login flood", "refusals, 1 names"),
+        ];
+        for (row, cap, label, counts) in rows {
+            let class = FloodClass::classify(&row).unwrap();
+            let mut flood = FloodCoalescer::new(class, FLOOD_IDLE_SECONDS);
+            let from = |i: usize| sent_from(&address(i), row.clone());
+            kept(&mut flood, &sent_from("10.0.0.1", row.clone()), 10);
+            for i in 1..cap {
+                flood.keep(&from(i));
+            }
+            let beyond = [cap, cap + 1, cap + 1, cap + 2].map(|i| flood.keep(&from(i)));
+            let held = flood.keep(&from(1));
+            let open = flood.flush(base, false);
+            let windows = flood.windows.len();
+            let wide = open.last().map(|r| (r.kind, r.peer.clone()));
+            let closed = flood.flush(base + idle, false);
+            let noun = counts.split(',').next().unwrap_or_default();
+            let said = [
+                format!("{label} started"),
+                format!("{label} from many sources started"),
+                format!("{label} resolved: 2 {counts}, 0s"),
+                format!("{label} from many sources resolved: 4 {noun}, 3 sources, 0s"),
+            ];
+            assert_eq!(
+                (beyond, held, windows, wide),
+                ([false; 4], true, cap, Some((class.kind(), None))),
+                "{label}: past {cap} windows a new key is counted in the one kind-wide window, \
+                 which keeps no row and names no peer; a key with a window keeps its own"
+            );
+            assert_eq!(
+                (details(&open), details(&closed)),
+                (
+                    vec![said[0].as_str(), said[1].as_str()],
+                    vec![said[2].as_str(), said[3].as_str()]
+                ),
+                "{label}: nothing resolves until the idle time has passed"
+            );
+        }
+    }
+
     #[test]
     fn test_coalescers_cap_their_maps() {
-        let mut flood = FloodCoalescer::new(FloodClass::UnknownBind, FLOOD_IDLE_SECONDS);
         let base = at(1, 9, 0);
-        for i in 0..10 {
-            flood.keep(&unknown_bind(&format!("a{i}"), "10.0.0.1", base));
-        }
-        for i in 0..(COALESCE_CAP - 1) {
-            flood.keep(&unknown_bind(
-                "x",
-                &format!("10.1.{}.{}", i / 256, i % 256),
-                base,
-            ));
-        }
-        // The cap flush resolves the counted window before the map resets.
-        assert!(flood.keep(&unknown_bind("y", "10.2.0.1", base)));
-        let rows = flood.flush(base, false);
-        assert_eq!(started_rows(&rows), 1);
-        let resolved = resolved_rows(&rows);
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(resolved[0].peer.as_deref(), Some("10.0.0.1"));
-        assert_eq!(
-            resolved[0].detail.as_deref(),
-            Some("unknown-user bind flood resolved: 2 binds, 2 names, 0s")
-        );
-
         let mut flood = FloodCoalescer::new(FloodClass::UnknownBind, FLOOD_IDLE_SECONDS);
         for i in 0..(8 + FLOOD_ACTOR_CAP + 10) {
             flood.keep(&unknown_bind(&format!("spray-{i}"), "10.0.0.1", base));
@@ -1634,17 +2095,7 @@ mod tests {
         let mut coalescer = BindCoalescer::new(300);
         let now = Timestamp::now();
         for i in 0..(COALESCE_CAP + 80) {
-            let bind = LogEvent {
-                timestamp: now,
-                kind: LogKind::Bind,
-                success: true,
-                protocol: Protocol::Ldap,
-                actor: Some(format!("u{i}")),
-                target: None,
-                peer: Some("127.0.0.1".to_owned()),
-                forwarded_for: None,
-                detail: None,
-            };
+            let bind = event_at(LogKind::Bind, &format!("u{i}"), now);
             assert!(coalescer.keep(&bind));
         }
         assert!(coalescer.cached() <= COALESCE_CAP);
@@ -1655,9 +2106,8 @@ mod tests {
         LogEvent {
             success: false,
             detail: Some("Unauthorized".to_owned()),
-            peer: Some(peer.to_owned()),
             actor: actor.map(str::to_owned),
-            ..event_at(LogKind::AccessDenied, actor.unwrap_or("nobody"), timestamp)
+            ..sent_from(peer, event_at(LogKind::AccessDenied, "nobody", timestamp))
         }
     }
 
@@ -1808,6 +2258,8 @@ mod tests {
             detail: Some(format!(
                 "kadmin purge_keys on {target} by {caller}: PROTECT_PRINCIPAL"
             )),
+            source: None,
+            proved: false,
         }
     }
 
@@ -1922,11 +2374,7 @@ mod tests {
             pool.clone(),
             sink.dropped.clone(),
             LogRetention::default(),
-            WriterCoalescers {
-                bind: BindCoalescer::new(0),
-                bind_flood: FloodCoalescer::new(FloodClass::UnknownBind, FLOOD_IDLE_SECONDS),
-                denied_flood: FloodCoalescer::new(FloodClass::AccessDenied, FLOOD_IDLE_SECONDS),
-            },
+            WriterCoalescers::new(0, FLOOD_IDLE_SECONDS),
             WRITER_TICK,
         ));
         let now = Timestamp::now();
@@ -1965,6 +2413,11 @@ mod tests {
         );
     }
 
+    fn sign_in_floods(stored: &[model::logs::Model]) -> Vec<&str> {
+        let floods = stored.iter().filter(|r| r.kind == "sign_in_flood");
+        floods.filter_map(|r| r.detail.as_deref()).collect()
+    }
+
     #[tokio::test]
     async fn test_writer_brackets_a_flood_on_shutdown_and_on_idle() {
         let pool = get_initialized_db().await;
@@ -1974,21 +2427,31 @@ mod tests {
             pool.clone(),
             sink.dropped.clone(),
             LogRetention::default(),
-            WriterCoalescers {
-                bind: BindCoalescer::new(0),
-                bind_flood: FloodCoalescer::new(FloodClass::UnknownBind, FLOOD_IDLE_SECONDS),
-                denied_flood: FloodCoalescer::new(FloodClass::AccessDenied, FLOOD_IDLE_SECONDS),
-            },
+            WriterCoalescers::new(0, FLOOD_IDLE_SECONDS),
             WRITER_TICK,
         ));
         let base = Timestamp::now();
+        let wrong = refusal(LogKind::Login, Protocol::Http, "invalid credentials", base);
         for i in 0..12 {
             sink.record(unknown_bind(&format!("flood-{i}"), "10.0.0.9", base));
+            sink.record(wrong.clone());
         }
         drop(sink);
         task.await.unwrap();
 
         let stored = rows(&pool).await;
+        let logins = stored.iter().filter(|r| r.kind == "login").count();
+        assert_eq!(
+            (logins, sign_in_floods(&stored)),
+            (
+                8,
+                vec![
+                    "login flood started",
+                    "login flood resolved: 4 refusals, 1 names, 0s"
+                ]
+            ),
+            "a sign-in refused before a credential is bracketed as an unknown name is"
+        );
         let binds = stored.iter().filter(|r| r.kind == "bind").count();
         let started = stored
             .iter()
@@ -2021,20 +2484,23 @@ mod tests {
             pool.clone(),
             sink.dropped.clone(),
             LogRetention::default(),
-            WriterCoalescers {
-                bind: BindCoalescer::new(0),
-                bind_flood: FloodCoalescer::new(FloodClass::UnknownBind, 1),
-                denied_flood: FloodCoalescer::new(FloodClass::AccessDenied, 1),
-            },
+            WriterCoalescers::new(0, 1),
             std::time::Duration::from_millis(100),
         ));
         let now = Timestamp::now();
+        let wrong = refusal(LogKind::Login, Protocol::Http, "invalid credentials", now);
         for i in 0..12 {
             sink.record(unknown_bind(&format!("flood-{i}"), "10.0.0.9", now));
+            sink.record(wrong.clone());
         }
         // No closing event: the writer's tick must resolve the idle window on its own.
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
         let stored = rows(&pool).await;
+        assert_eq!(
+            sign_in_floods(&stored).len(),
+            2,
+            "a refused sign-in's window opened and resolved on the idle timer too"
+        );
         let started = stored
             .iter()
             .filter(|r| r.detail.as_deref() == Some("unknown-user bind flood started"))
@@ -2143,11 +2609,7 @@ mod tests {
             pool.clone(),
             dropped.clone(),
             retention,
-            WriterCoalescers {
-                bind: BindCoalescer::new(0),
-                bind_flood: FloodCoalescer::new(FloodClass::UnknownBind, FLOOD_IDLE_SECONDS),
-                denied_flood: FloodCoalescer::new(FloodClass::AccessDenied, FLOOD_IDLE_SECONDS),
-            },
+            WriterCoalescers::new(0, FLOOD_IDLE_SECONDS),
             WRITER_TICK,
         ));
         for i in 0..(trim_interval(retention.max_entries) + 5) {
@@ -2455,6 +2917,40 @@ mod tests {
         assert_eq!(nobody.failures_since_last_success, 0);
     }
 
+    #[tokio::test]
+    async fn test_log_activity_counts_the_rows_the_writer_stored() {
+        use lldap_auth::opaque::server::generate_random_private_key;
+        use lldap_domain_handlers::logging::LOGIN_KINDS;
+
+        let pool = get_initialized_db().await;
+        let (sink, rx) = channel_sink(64);
+        let task = tokio::spawn(run_writer(
+            rx,
+            pool.clone(),
+            sink.dropped.clone(),
+            LogRetention::default(),
+            WriterCoalescers::new(0, FLOOD_IDLE_SECONDS),
+            WRITER_TICK,
+        ));
+        let now = Timestamp::now();
+        let wrong = refusal(LogKind::Bind, Protocol::Ldap, "invalid credentials", now);
+        for _ in 0..12 {
+            sink.record(wrong.clone());
+        }
+        drop(sink);
+        task.await.unwrap();
+
+        let handler = SqlBackendHandler::new(generate_random_private_key(), pool);
+        let activity = handler
+            .log_activity(&UserId::new("bob"), LOGIN_KINDS.to_vec(), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            activity.failures_since_last_success, 8,
+            "12 wrong passwords from one source: 8 rows, the other 4 in the flood's count"
+        );
+    }
+
     // The activity lookups must stay index seeks: they are the shape a lockout policy calls.
     #[tokio::test]
     async fn test_activity_queries_use_the_actor_index_on_sqlite() {
@@ -2501,11 +2997,7 @@ mod tests {
             pool.clone(),
             sink.dropped.clone(),
             LogRetention::default(),
-            WriterCoalescers {
-                bind: BindCoalescer::new(300),
-                bind_flood: FloodCoalescer::new(FloodClass::UnknownBind, FLOOD_IDLE_SECONDS),
-                denied_flood: FloodCoalescer::new(FloodClass::AccessDenied, FLOOD_IDLE_SECONDS),
-            },
+            WriterCoalescers::new(300, FLOOD_IDLE_SECONDS),
             WRITER_TICK,
         ));
         let base = at(1, 9, 0);
@@ -2579,11 +3071,7 @@ mod tests {
             pool.clone(),
             sink.dropped.clone(),
             LogRetention::default(),
-            WriterCoalescers {
-                bind: BindCoalescer::new(0),
-                bind_flood: FloodCoalescer::new(FloodClass::UnknownBind, FLOOD_IDLE_SECONDS),
-                denied_flood: FloodCoalescer::new(FloodClass::AccessDenied, FLOOD_IDLE_SECONDS),
-            },
+            WriterCoalescers::new(0, FLOOD_IDLE_SECONDS),
             WRITER_TICK,
         ));
         sink.record(bind(0, "10.0.0.1", true));

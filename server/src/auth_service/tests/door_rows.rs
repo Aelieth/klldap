@@ -133,6 +133,46 @@ async fn test_a_locked_users_refresh_and_token_use_are_refused_with_401_and_one_
 }
 
 #[tokio::test]
+async fn test_a_refresh_row_is_marked_proved_only_once_its_token_was_found() {
+    let _backend = ONE_BACKEND.lock().await;
+    let log = LogGuard::install_on_this_thread();
+    let _guard = EnforcementGuard::default_checks();
+    let handler = sql_handler_with(&[("r1fresh", "r1fresh-pass-1")]).await;
+    let lock = [(THRESHOLD, "1"), (DURATION, "0")];
+    policy_on(&handler, "r1 lock", "", &lock).await;
+    let wrong = BindRequest {
+        name: UserId::new("r1fresh"),
+        password: "r1fresh-wrong-1".to_owned(),
+    };
+    let _ = handler.bind(wrong).await;
+    let _ = log.recorder().take_events();
+    let state = app_state(handler.clone());
+    let request = actix_web::test::TestRequest::get()
+        .insert_header(("refresh-token", "r1-not-held+r1fresh"))
+        .to_http_request();
+    let not_held = get_refresh_handler(state.clone(), request).await;
+    let locked = refreshed_by(&handler, &state, "r1fresh").await;
+    handler.clear_ou_policy("").await.unwrap();
+    let events = log.recorder().take_events().into_iter();
+    let marks: Vec<_> = events
+        .filter(|e| e.kind == LogKind::TokenRefresh)
+        .map(|e| (e.detail, e.proved))
+        .collect();
+    assert_eq!(
+        (not_held.status().as_u16(), locked.status().as_u16(), marks),
+        (
+            401,
+            401,
+            vec![
+                (Some("invalid refresh token".to_owned()), false),
+                (Some(LOCKED_OUT.to_owned()), true),
+            ]
+        ),
+        "a token the server does not hold, then a held token of a locked user"
+    );
+}
+
+#[tokio::test]
 async fn test_an_inactive_users_refresh_and_token_use_are_refused_with_401_and_one_row_each() {
     let _backend = ONE_BACKEND.lock().await;
     let log = LogGuard::install_on_this_thread();

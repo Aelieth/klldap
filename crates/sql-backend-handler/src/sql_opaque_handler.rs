@@ -12,7 +12,7 @@ use lldap_domain_handlers::instant::Timestamp;
 use lldap_domain_handlers::kerberos::{
     LDAP_ADMINS_ONLY, kerberos_backend, refusal_while_degraded, require_kdc_ready,
 };
-use lldap_domain_handlers::lockout::{Step, lock_clock};
+use lldap_domain_handlers::lockout::{LockState, Step, lock_clock};
 use lldap_domain_handlers::logging::{self, LogKind, NO_PASSWORD};
 use lldap_domain_handlers::mfa::MfaRequirement;
 use lldap_domain_model::{
@@ -265,6 +265,174 @@ impl SqlBackendHandler {
         };
         cause.map_or(Ok(()), |cause| Err(DomainError::KdcUnavailable(cause)))
     }
+
+    /// The bind once its password matched.
+    async fn bind_proved(
+        &self,
+        name: &UserId,
+        requirement: MfaRequirement,
+        code: Option<&str>,
+        lock: Option<&LockState>,
+        door: Door,
+        now: Timestamp,
+    ) -> Result<()> {
+        // Judged without the factor before any answer that only a right password gets.
+        self.admit_at(name, door, false, now).await?;
+        match (requirement, code) {
+            (MfaRequirement::None, _) => {
+                self.admit_while_degraded(name, door).await?;
+                logging::record_as(Some(name), LogKind::Bind, None, true, None);
+                self.count_success(lock, door, now).await;
+                self.note_activity(name, now).await;
+                Ok(())
+            }
+            (MfaRequirement::Enrollment, _) => {
+                logging::record_as(
+                    Some(name),
+                    LogKind::Bind,
+                    None,
+                    false,
+                    Some("mfa enrollment required"),
+                );
+                Err(DomainError::AuthenticationError(format!(
+                    r#"{MFA_ENROLLMENT_REQUIRED} for user "{name}""#
+                )))
+            }
+            (MfaRequirement::Totp, None) => {
+                debug!(r#"Bind for "{}" carries no TOTP code"#, name);
+                logging::record_as(
+                    Some(name),
+                    LogKind::Bind,
+                    None,
+                    false,
+                    Some("totp code required"),
+                );
+                Err(DomainError::AuthenticationError(format!(
+                    r#"{TOTP_CODE_REQUIRED} for user "{name}""#
+                )))
+            }
+            (MfaRequirement::Totp, Some(code)) => match self.verify_user_totp(name, code).await? {
+                Ok(()) => {
+                    self.admit_at(name, door, true, now).await?;
+                    self.admit_while_degraded(name, door).await?;
+                    let stored = self.note_proof(name, now_unix()).await;
+                    let detail = with_proof("totp", stored);
+                    logging::record_as(Some(name), LogKind::Bind, None, true, Some(&detail));
+                    self.count_success(lock, door, now).await;
+                    self.note_activity(name, now).await;
+                    Ok(())
+                }
+                Err(rejection) => {
+                    logging::record_as(
+                        Some(name),
+                        LogKind::Bind,
+                        None,
+                        false,
+                        Some(rejection.detail()),
+                    );
+                    if rejection == TotpRejection::Invalid {
+                        self.count_failure(lock, door, now).await;
+                    }
+                    Err(rejection.into_error(name))
+                }
+            },
+        }
+    }
+
+    /// The web login's finish once its proof verified.
+    async fn finish_proved(
+        &self,
+        username: UserId,
+        lock: Option<LockState>,
+        foreign: Option<u64>,
+        totp_code: Option<String>,
+        now: Timestamp,
+    ) -> Result<LoginOutcome> {
+        let split = match foreign {
+            Some(id) => self.lockout.split(&username, id, false),
+            None => Step::default(),
+        };
+        let admitted = self.admit_at(&username, Door::WebLogin, false, now);
+        if admitted.await.is_err() {
+            return Err(Self::refuse_finish());
+        }
+        let requirement = match self.door_requirement(&username, LogKind::Login).await {
+            Err(DomainError::AuthenticationError(_)) => {
+                return Err(Self::refuse_finish());
+            }
+            requirement => requirement?,
+        };
+        let (detail, mfa_enrollment_pending) = match requirement {
+            MfaRequirement::None => (None, false),
+            MfaRequirement::Enrollment => (Some("mfa enrollment pending"), true),
+            MfaRequirement::Totp => match totp_code.as_deref() {
+                // A right password with no code is its own failure row, then the code step.
+                None => {
+                    debug!(r#"OPAQUE login for "{}" awaits the TOTP code"#, &username);
+                    logging::record_as(
+                        Some(&username),
+                        LogKind::Login,
+                        None,
+                        false,
+                        Some("totp code required"),
+                    );
+                    self.lockout.carry(self, &username, split).await;
+                    return Ok(LoginOutcome::TotpRequired);
+                }
+                Some(code) => match self.verify_user_totp(&username, code).await? {
+                    Ok(()) => (Some("totp"), false),
+                    Err(rejection) => {
+                        warn!(
+                            r#"TOTP refused for "{}": {}"#,
+                            &username,
+                            rejection.detail()
+                        );
+                        logging::record_as(
+                            Some(&username),
+                            LogKind::Login,
+                            None,
+                            false,
+                            Some(rejection.detail()),
+                        );
+                        if rejection == TotpRejection::Invalid {
+                            self.count_failure(lock.as_ref(), Door::WebLogin, now).await;
+                        }
+                        return Err(rejection.into_error(&username));
+                    }
+                },
+            },
+        };
+        let second_factor = detail == Some("totp");
+        if second_factor
+            && self
+                .admit_at(&username, Door::WebLogin, true, now)
+                .await
+                .is_err()
+        {
+            return Err(Self::refuse_finish());
+        }
+        self.admit_while_degraded(&username, Door::WebLogin).await?;
+        let stored = !second_factor || self.note_proof(&username, now_unix()).await;
+        let detail = detail.map(|detail| with_proof(detail, stored));
+        info!(r#"OPAQUE login successful for "{}""#, &username);
+        logging::record_as(
+            Some(&username),
+            LogKind::Login,
+            None,
+            true,
+            detail.as_deref(),
+        );
+        self.count_success(lock.as_ref(), Door::WebLogin, now).await;
+        self.note_activity(&username, now).await;
+        if let Some(id) = foreign {
+            let step = self.lockout.split(&username, id, true);
+            self.lockout.carry(self, &username, step).await;
+        }
+        Ok(LoginOutcome::Authenticated {
+            user_id: username,
+            mfa_enrollment_pending,
+        })
+    }
 }
 
 #[async_trait]
@@ -331,67 +499,8 @@ impl LoginHandler for SqlBackendHandler {
             self.count_failure(lock.as_ref(), door, now).await;
             return Err(invalid_credentials(&name));
         }
-        // Judged without the factor before any answer that only a right password gets.
-        self.admit_at(&name, door, false, now).await?;
-        match (requirement, code) {
-            (MfaRequirement::None, _) => {
-                self.admit_while_degraded(&name, door).await?;
-                logging::record_as(Some(&name), LogKind::Bind, None, true, None);
-                self.count_success(lock.as_ref(), door, now).await;
-                self.note_activity(&name, now).await;
-                Ok(())
-            }
-            (MfaRequirement::Enrollment, _) => {
-                logging::record_as(
-                    Some(&name),
-                    LogKind::Bind,
-                    None,
-                    false,
-                    Some("mfa enrollment required"),
-                );
-                Err(DomainError::AuthenticationError(format!(
-                    r#"{MFA_ENROLLMENT_REQUIRED} for user "{name}""#
-                )))
-            }
-            (MfaRequirement::Totp, None) => {
-                debug!(r#"Bind for "{}" carries no TOTP code"#, &name);
-                logging::record_as(
-                    Some(&name),
-                    LogKind::Bind,
-                    None,
-                    false,
-                    Some("totp code required"),
-                );
-                Err(DomainError::AuthenticationError(format!(
-                    r#"{TOTP_CODE_REQUIRED} for user "{name}""#
-                )))
-            }
-            (MfaRequirement::Totp, Some(code)) => match self.verify_user_totp(&name, code).await? {
-                Ok(()) => {
-                    self.admit_at(&name, door, true, now).await?;
-                    self.admit_while_degraded(&name, door).await?;
-                    let stored = self.note_proof(&name, now_unix()).await;
-                    let detail = with_proof("totp", stored);
-                    logging::record_as(Some(&name), LogKind::Bind, None, true, Some(&detail));
-                    self.count_success(lock.as_ref(), door, now).await;
-                    self.note_activity(&name, now).await;
-                    Ok(())
-                }
-                Err(rejection) => {
-                    logging::record_as(
-                        Some(&name),
-                        LogKind::Bind,
-                        None,
-                        false,
-                        Some(rejection.detail()),
-                    );
-                    if rejection == TotpRejection::Invalid {
-                        self.count_failure(lock.as_ref(), door, now).await;
-                    }
-                    Err(rejection.into_error(&name))
-                }
-            },
-        }
+        let proved = self.bind_proved(&name, requirement, code, lock.as_ref(), door, now);
+        logging::proved(proved).await
     }
 }
 
@@ -550,90 +659,8 @@ impl OpaqueHandler for SqlOpaqueHandler {
             return Err(e.into());
         }
         let foreign = overlay.filter(|_| !found);
-        let split = match foreign {
-            Some(id) => self.lockout.split(&username, id, false),
-            None => Step::default(),
-        };
-        let admitted = self.admit_at(&username, Door::WebLogin, false, now);
-        if admitted.await.is_err() {
-            return Err(Self::refuse_finish());
-        }
-        let requirement = match self.door_requirement(&username, LogKind::Login).await {
-            Err(DomainError::AuthenticationError(_)) => {
-                return Err(Self::refuse_finish());
-            }
-            requirement => requirement?,
-        };
-        let (detail, mfa_enrollment_pending) = match requirement {
-            MfaRequirement::None => (None, false),
-            MfaRequirement::Enrollment => (Some("mfa enrollment pending"), true),
-            MfaRequirement::Totp => match totp_code.as_deref() {
-                // A right password with no code is its own failure row, then the code step.
-                None => {
-                    debug!(r#"OPAQUE login for "{}" awaits the TOTP code"#, &username);
-                    logging::record_as(
-                        Some(&username),
-                        LogKind::Login,
-                        None,
-                        false,
-                        Some("totp code required"),
-                    );
-                    self.lockout.carry(self, &username, split).await;
-                    return Ok(LoginOutcome::TotpRequired);
-                }
-                Some(code) => match self.verify_user_totp(&username, code).await? {
-                    Ok(()) => (Some("totp"), false),
-                    Err(rejection) => {
-                        warn!(
-                            r#"TOTP refused for "{}": {}"#,
-                            &username,
-                            rejection.detail()
-                        );
-                        logging::record_as(
-                            Some(&username),
-                            LogKind::Login,
-                            None,
-                            false,
-                            Some(rejection.detail()),
-                        );
-                        if rejection == TotpRejection::Invalid {
-                            self.count_failure(lock.as_ref(), Door::WebLogin, now).await;
-                        }
-                        return Err(rejection.into_error(&username));
-                    }
-                },
-            },
-        };
-        let second_factor = detail == Some("totp");
-        if second_factor
-            && self
-                .admit_at(&username, Door::WebLogin, true, now)
-                .await
-                .is_err()
-        {
-            return Err(Self::refuse_finish());
-        }
-        self.admit_while_degraded(&username, Door::WebLogin).await?;
-        let stored = !second_factor || self.note_proof(&username, now_unix()).await;
-        let detail = detail.map(|detail| with_proof(detail, stored));
-        info!(r#"OPAQUE login successful for "{}""#, &username);
-        logging::record_as(
-            Some(&username),
-            LogKind::Login,
-            None,
-            true,
-            detail.as_deref(),
-        );
-        self.count_success(lock.as_ref(), Door::WebLogin, now).await;
-        self.note_activity(&username, now).await;
-        if let Some(id) = foreign {
-            let step = self.lockout.split(&username, id, true);
-            self.lockout.carry(self, &username, step).await;
-        }
-        Ok(LoginOutcome::Authenticated {
-            user_id: username,
-            mfa_enrollment_pending,
-        })
+        let proved = self.finish_proved(username, lock, foreign, totp_code, now);
+        logging::proved(proved).await
     }
 
     #[instrument(skip_all, level = "debug", err)]

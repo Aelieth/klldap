@@ -62,6 +62,7 @@ pub enum GraphQLLogKind {
     AccountLock,
     AccountUnlock,
     AccountReenable,
+    SignInFlood,
 }
 
 #[derive(

@@ -1,6 +1,7 @@
 // What a password page sends, run as the admin: the start key, the finish envelope and status, and
-// GraphQL's syncKerberosPassword or createUser. BROWSER_FINISH_MODE add|swap puts
-// BROWSER_FINISH_ENVELOPE into the finish body. Values are never printed.
+// GraphQL's syncKerberosPassword or createUser; for the create page also whether it shows the
+// Kerberos switch. BROWSER_FINISH_MODE add|swap puts BROWSER_FINISH_ENVELOPE into the finish body.
+// Values are never printed.
 
 import { spawn } from "node:child_process";
 import { readdirSync } from "node:fs";
@@ -33,6 +34,7 @@ const wire = {
   graphqlSeal: "no",
   createSent: "no",
   createSync: "none",
+  createSwitch: "none",
 };
 const startIds = new Set();
 
@@ -305,6 +307,8 @@ async function openChange() {
 async function openCreate() {
   await goto("/users/create");
   await waitFor(`!!document.querySelector("#username") && !!document.querySelector('input[name="mail"]')`, "create form");
+  const shown = await evalValue(`!!document.querySelector('label[for="kerberossync_toggle"]')`);
+  wire.createSwitch = shown ? "shown" : "absent";
   if (!(await setValues([["#username", who], ['input[name="mail"]', mail]]))) {
     throw fail("create form", "the user name or mail field is missing");
   }
@@ -339,6 +343,7 @@ try {
     `WIRE start-key=${wire.startKey} finish-envelope=${wire.finishEnvelope} rewrite=${wire.rewrite} finish-status=${wire.finishStatus} graphql-seal=${wire.graphqlSeal} create-sent=${wire.createSent} page=${page}`,
   );
   if (pageKind === "create") say(`CREATE kerberossync=${wire.createSync}`);
+  if (pageKind === "create") say(`SWITCH kerberos=${wire.createSwitch}`);
   if (alert) say(`ALERT ${redact(alert).slice(0, 400)}`);
 } catch (err) {
   failed = true;

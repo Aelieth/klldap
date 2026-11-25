@@ -481,7 +481,7 @@ print(vals[0] if vals else "absent")' <<<"$out" 2>/dev/null || echo error
 }
 
 pp_off_create_page() {
-    local row="U1.krb-off-create-page" user="${PP_RUN}w" pw sent attr login=no
+    local row="U1.krb-off-create-page" user="${PP_RUN}w" pw sent attr login=no shown ctl
     local want="WIRE start-key=no finish-envelope=no rewrite=none finish-status=200 graphql-seal=no create-sent=yes page=done"
     if ! docker image inspect "$PP_BROWSER_IMAGE" >/dev/null 2>&1; then
         p_skip "[$row] browser image absent: ${PP_BROWSER_IMAGE}; the create page did not run"
@@ -496,6 +496,16 @@ pp_off_create_page() {
         p_ok "[$row] Kerberos disabled: the create page's createUser carries no kerberossync, the user has none, and its password logs in"
     else
         p_bad "[$row] $PP_WIRE ${PP_ALERT:+(alert: $PP_ALERT) }; ${sent:-no CREATE line}; kerberossync=$attr login=$login; want $want, CREATE kerberossync=no, absent, yes"
+    fi
+    row="U1.krb-off-create-switch"
+    shown="$(grep -m1 '^SWITCH ' "$PP_D/wire-off-create.out" 2>/dev/null)"
+    ctl="$(grep -m1 '^SWITCH ' "$PP_D/wire-create-new.out" 2>/dev/null)"
+    if [ "$ctl" != "SWITCH kerberos=shown" ]; then
+        p_bad "[$row] control: the create page of the gate's server, Kerberos on, did not show the switch (${ctl:-no SWITCH line in wire-create-new.out}), so its absence is not trusted"
+    elif [ "$shown" = "SWITCH kerberos=absent" ]; then
+        p_ok "[$row] Kerberos disabled: the create page has no Kerberos switch (no label for kerberossync_toggle); control: the create page of the gate's server, Kerberos on, has it"
+    else
+        p_bad "[$row] ${shown:-no SWITCH line (see wire-off-create.err)}; want SWITCH kerberos=absent"
     fi
 }
 

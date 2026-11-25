@@ -3907,8 +3907,10 @@ pub(crate) mod tests {
         const LOST: &str = "the answer to COMMIT was lost";
         let db = db().await;
         insert_realm(&db.pool, 5, true).await;
+        // A beat's commit to a file can take longer than the short step on a loaded host.
         let timings = Timings {
             lost_after: Duration::from_secs(5),
+            step: Duration::from_secs(1),
             ..short_timings()
         };
         let (lost_tx, cause) = watch::channel(None);

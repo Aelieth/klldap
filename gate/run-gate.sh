@@ -18,6 +18,14 @@
 #   GATE_KILL_IMAGE   image with the test hooks (`make test-kill-points`): the server of the
 #                     kdc-verdict phase, which fails without it, and of the password-kill
 #                     phase, whose kill rows are skipped without it
+#   GATE_LOWSPEC_SECONDS / GATE_LOWSPEC_SENDERS / GATE_LOWSPEC_SETTLE / GATE_LOWSPEC_CPUSET /
+#   GATE_LOWSPEC_BIND_WAIT / GATE_LOWSPEC_KINDS
+#                     the low-spec phase: the seconds (20; a baseline uses 60) and parallel senders (8) of each flood, the
+#                     quiet seconds after it (25), the core its server is pinned to (0), the seconds
+#                     an ordinary bind is waited for (30), some of its kinds
+#   GATE_LOWSPEC_MAX_ROWS / GATE_LOWSPEC_MAX_MEM_MB / GATE_LOWSPEC_MAX_BIND_MS
+#                     its thresholds, each for every kind: one-to-one log rows, megabytes of memory
+#                     growth, milliseconds of an ordinary bind. Unset: reported as measured
 
 set -uo pipefail
 

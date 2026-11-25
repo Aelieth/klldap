@@ -50,7 +50,7 @@ runs the SQLite gate on the rootless image.
 
 `make gate` builds that image and runs `gate/run-gate.sh` against it: the real
 container, entrypoint and all, exercised as CLI invocations (`ldapsearch`, `ldapmodify`,
-`kinit`, GraphQL over HTTP) through 34 phases — fresh boot, environment validation,
+`kinit`, GraphQL over HTTP) through 35 phases — fresh boot, environment validation,
 a custom `LLDAP_UID`/`LLDAP_GID` boot, GraphQL auth, OU lifecycle, the OU policies (their API,
 each item at the doors, login hours and inactivity, the lockout, allowed networks), the TOTP
 second factor, Kerberos lifecycle (principal, kinit, disable, re-enable), kadmin on directory
@@ -70,6 +70,12 @@ inside its transaction and a real lldap-cli run. It needs docker, the OpenLDAP c
   `mariadb:12.3` on `127.0.0.1`, set `KLLDAP_TEST_DATABASE_URL`, and run the
   ignored lane tests on one thread. The container is removed with its volume.
 - `make gate-phase PHASE=kerberos` runs the phases whose name contains the string.
+- The low-spec phase (SQLite lane only) holds a server of its own to 1 CPU and 256 MB, floods it
+  with each kind of request that needs no credential, and prints per kind the event-log rows
+  written, the server's memory growth and the time of an ordinary bind meanwhile. Its thresholds
+  (`GATE_LOWSPEC_MAX_ROWS`, `GATE_LOWSPEC_MAX_MEM_MB`, `GATE_LOWSPEC_MAX_BIND_MS`) are set from a
+  baseline run and until then the numbers are reported as measured; where docker cannot set the
+  limits the phase is skipped and says why.
 - Results land in `gate/results/<run id>/`, one directory per phase with the exact
   requests, responses and container logs. `GATE_KEEP=1` leaves the containers running.
 - `GATE_LLDAP_CLI=/path/to/lldap-cli` enables the lldap-cli phase;

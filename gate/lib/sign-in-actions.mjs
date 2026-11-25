@@ -1,7 +1,8 @@
 // The user page's sign-in state and its buttons, through the gate's headless browser. Each step
 // prints what it saw (ROW <name> SEEN <what>) and the phase judges it. BROWSER_MODE admin: the
 // locked, fresh and (with BROWSER_IDLE) inactive users' pages, Unlock, and the re-enable modal's
-// Cancel; own: a user's own page; reenable: "Yes, re-enable" on the inactive user's page.
+// Cancel, once it has opened and while it opens; own: a user's own page; reenable: "Yes,
+// re-enable" on the inactive user's page.
 // browser-policies.mjs is the model.
 
 import { spawn } from "node:child_process";
@@ -261,6 +262,39 @@ async function adminPage() {
   await waitFor(`!document.querySelector(${JSON.stringify(modal)})?.classList.contains("show")`, `${modal} hidden`);
   const result = await resultLine();
   row("reenable-modal", "SEEN", `${title} | ${body} | Cancel | ${result ? `result line '${result}'` : "no result line"}`);
+  currentStep = "reenable-early-cancel";
+  await openUser(idle, true);
+  await waitFor(`!!document.getElementById("reenable-user")`, "#reenable-user");
+  // One Cancel as soon as Bootstrap begins to open (show.bs.modal), never waiting for shown.bs.modal.
+  const when = await evalValue(`new Promise((resolve) => {
+    const box = document.querySelector(${JSON.stringify(modal)});
+    window.gateEarly = { shown: false, hidden: false };
+    box.addEventListener("shown.bs.modal", () => { window.gateEarly.shown = true; }, { once: true });
+    box.addEventListener("hidden.bs.modal", () => { window.gateEarly.hidden = true; }, { once: true });
+    box.addEventListener("show.bs.modal", () => setTimeout(() => {
+      const cancel = [...box.querySelectorAll("button")].find((b) => b.textContent.includes("Cancel"));
+      const shown = window.gateEarly.shown;
+      cancel.click();
+      resolve(shown ? "after shown.bs.modal" : "before shown.bs.modal");
+    }, 0), { once: true });
+    document.getElementById("reenable-user").click();
+  })`);
+  await waitFor(`window.gateEarly.shown || window.gateEarly.hidden`, `${modal} opened`);
+  try {
+    await waitFor(`window.gateEarly.hidden`, `${modal} hidden`, 5000);
+  } catch {
+    // The row says what is still there.
+  }
+  const end = await evalValue(`(() => {
+    const left = [];
+    if (!window.gateEarly.hidden) left.push("no hidden.bs.modal");
+    if (document.querySelector(${JSON.stringify(modal)})?.classList.contains("show")) left.push("still shown");
+    if (document.querySelector(".modal-backdrop")) left.push("backdrop left");
+    if (document.body.classList.contains("modal-open")) left.push("body still modal-open");
+    return left.length ? left.join(", ") : "closed";
+  })()`);
+  const early = await resultLine();
+  row("reenable-early-cancel", "SEEN", `Cancel ${when} | ${end} | ${early ? `result line '${early}'` : "no result line"}`);
 }
 
 async function ownPage() {

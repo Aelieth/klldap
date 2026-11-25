@@ -1,5 +1,6 @@
 #![allow(clippy::empty_docs)]
 
+use std::{cell::Cell, rc::Rc};
 use wasm_bindgen::prelude::*;
 use yew::NodeRef;
 
@@ -24,7 +25,53 @@ extern "C" {
 #[derive(Default)]
 pub struct ModalHandle {
     node_ref: NodeRef,
-    modal: Option<Modal>,
+    modal: Option<Bound>,
+}
+
+const OPENED: &str = "shown.bs.modal";
+
+struct Dialog {
+    modal: Modal,
+    close_asked: Cell<bool>,
+}
+
+/// Bootstrap's `hide()` does nothing while the opening transition runs, so a close asked then
+/// is carried out when `shown.bs.modal` says the opening has ended.
+struct Bound {
+    dialog: Rc<Dialog>,
+    node: web_sys::Element,
+    on_opened: Closure<dyn FnMut()>,
+}
+
+impl Bound {
+    fn new(node: web_sys::Element) -> Self {
+        let dialog = Rc::new(Dialog {
+            modal: Modal::new(node.clone()),
+            close_asked: Cell::new(false),
+        });
+        let opened = dialog.clone();
+        let on_opened = Closure::<dyn FnMut()>::new(move || {
+            if opened.close_asked.take() {
+                opened.modal.hide();
+            }
+        });
+        let listener = on_opened.as_ref().unchecked_ref();
+        let _ = node.add_event_listener_with_callback(OPENED, listener);
+        Self {
+            dialog,
+            node,
+            on_opened,
+        }
+    }
+}
+
+impl Drop for Bound {
+    fn drop(&mut self) {
+        let listener = self.on_opened.as_ref().unchecked_ref();
+        let _ = self
+            .node
+            .remove_event_listener_with_callback(OPENED, listener);
+    }
 }
 
 impl ModalHandle {
@@ -38,7 +85,7 @@ impl ModalHandle {
 
     pub fn init_on_first_render(&mut self, first_render: bool) {
         if first_render {
-            self.modal = Some(Modal::new(
+            self.modal = Some(Bound::new(
                 self.node_ref
                     .cast::<web_sys::Element>()
                     .expect("Modal node is not an element"),
@@ -51,19 +98,21 @@ impl ModalHandle {
         if self.modal.is_none()
             && let Some(node) = self.node_ref.cast::<web_sys::Element>()
         {
-            self.modal = Some(Modal::new(node));
+            self.modal = Some(Bound::new(node));
         }
     }
 
     pub fn show(&self) {
-        if let Some(modal) = &self.modal {
-            modal.show();
+        if let Some(bound) = &self.modal {
+            bound.dialog.close_asked.set(false);
+            bound.dialog.modal.show();
         }
     }
 
     pub fn hide(&self) {
-        if let Some(modal) = &self.modal {
-            modal.hide();
+        if let Some(bound) = &self.modal {
+            bound.dialog.close_asked.set(true);
+            bound.dialog.modal.hide();
         }
     }
 }

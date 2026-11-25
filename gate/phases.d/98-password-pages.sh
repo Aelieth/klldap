@@ -828,8 +828,17 @@ pp_actions() {
         else
             p_bad "[$row] $got; ACCOUNT_REENABLE rows after Cancel: ${i:-unread} (want 0)"
         fi
+        row="U1.actions-reenable-early-cancel"
+        got="$(pp_act_row admin reenable-early-cancel)"
+        if [ "$got" = "ROW reenable-early-cancel SEEN Cancel before shown.bs.modal | closed | no result line" ] &&
+            [ "$i" = 0 ]; then
+            p_ok "[$row] Re-enable on $PP_IDLE's page, then one Cancel while the dialog is still opening (before shown.bs.modal): it closes when the opening ends (hidden.bs.modal, no backdrop left), with no result line and no ACCOUNT_REENABLE row"
+        else
+            p_bad "[$row] $got; ACCOUNT_REENABLE rows after Cancel: ${i:-unread} (want 0)"
+        fi
     else
         p_skip "[U1.actions-reenable-cancel] $(pp_act_unaged)"
+        p_skip "[U1.actions-reenable-early-cancel] $(pp_act_unaged)"
     fi
     pp_act_page own own "$PP_FRESH"
     pp_act_said own buttons-own U1.actions-own-page "locked=none inactive=none unlock=none reenable=none" \

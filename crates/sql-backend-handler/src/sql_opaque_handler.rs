@@ -245,6 +245,7 @@ pub(crate) async fn user_disabled_in(
     member_of(db, user_id, "lldap_disabled").await
 }
 
+/// The group of this name in any case, as a group name filter reads it.
 async fn member_of(
     db: &impl ConnectionTrait,
     user_id: &UserId,
@@ -254,7 +255,7 @@ async fn member_of(
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 
     let Some(group) = groups::Entity::find()
-        .filter(groups::Column::DisplayName.eq(group_name))
+        .filter(groups::Column::LowercaseDisplayName.eq(group_name.to_lowercase()))
         .one(db)
         .await?
     else {
@@ -1116,6 +1117,46 @@ mod tests {
         assert!(
             !msg.to_lowercase().contains("disabled"),
             "must not leak account-disabled to the client: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_a_case_twin_of_the_disabled_or_admin_group_is_that_group() {
+        use lldap_domain_handlers::handler::UserBackendHandler;
+        let sql_pool = get_initialized_db().await;
+        let handler = SqlOpaqueHandler::new(generate_random_private_key(), sql_pool.clone());
+        insert_user(&handler, "p7off", "p7off00").await;
+        insert_user(&handler, "p7admin", "p7admin00").await;
+        let disabled = insert_group(&handler, "LLDAP_Disabled").await;
+        let admins = insert_group(&handler, "LLDAP_ADMIN").await;
+        insert_membership(&handler, disabled, "p7off").await;
+        insert_membership(&handler, admins, "p7admin").await;
+        let (off, admin) = (UserId::new("p7off"), UserId::new("p7admin"));
+        let read = (
+            handler.is_user_disabled(&off).await.unwrap(),
+            user_disabled_in(&sql_pool, &off).await.unwrap(),
+            handler.is_user_disabled(&admin).await.unwrap(),
+            handler.is_member_of(&admin, "lldap_admin").await.unwrap(),
+            handler.is_member_of(&off, "lldap_admin").await.unwrap(),
+        );
+        let bound = (
+            handler.bind(bind_request("p7off", "p7off00")).await.is_ok(),
+            handler
+                .bind(bind_request("p7admin", "p7admin00"))
+                .await
+                .is_ok(),
+        );
+        let last = |done: Result<()>| {
+            done.is_err_and(|e| e.to_string().contains("last member of lldap_admin"))
+        };
+        let removed = last(handler.remove_user_from_group(&admin, admins).await);
+        let deleted = last(handler.delete_user(&admin).await);
+        assert_eq!(
+            (read, bound, removed, deleted),
+            ((true, true, false, true, false), (false, true), true, true),
+            "LLDAP_Disabled and LLDAP_ADMIN where the built-in groups are absent: the door's and \
+             the Kerberos status's disabled reads, the admin read and both last-admin guards find \
+             them"
         );
     }
 

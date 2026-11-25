@@ -5,7 +5,7 @@ use chrono::{DateTime, TimeZone, Utc};
 use juniper::{FieldResult, GraphQLObject, graphql_object};
 use lldap_access_control::UserReadableBackendHandler;
 use lldap_domain::types::{
-    MFA_TYPE_TOTP, User as DomainUser, UserAndGroups as DomainUserAndGroups,
+    GroupName, MFA_TYPE_TOTP, User as DomainUser, UserAndGroups as DomainUserAndGroups,
 };
 use lldap_domain_handlers::handler::{
     BackendHandler, LockoutBackendHandler, MfaBackendHandler, SignInState as DomainSignInState,
@@ -178,9 +178,10 @@ impl<Handler: BackendHandler + OpaqueHandler> User<Handler> {
 
     /// Whether the user is a member of the built-in lldap_disabled group.
     fn is_disabled(&self) -> bool {
+        let disabled = |name: &str| GroupName::from(name) == GroupName::from("lldap_disabled");
         self.groups
             .as_ref()
-            .is_some_and(|groups| groups.iter().any(|g| g.display_name == "lldap_disabled"))
+            .is_some_and(|groups| groups.iter().any(|g| disabled(g.display_name.as_str())))
     }
 
     /// Whether the user has a second factor enrolled (admin or self).

@@ -250,10 +250,9 @@ pub fn get_user_attribute(
             "*" => panic!("Matched {attribute}, * should have been expanded"),
             // Virtual attributes driven by built-in group membership.
             s if s.eq_ignore_ascii_case("logindisabled") => {
-                if groups.is_some_and(|gs| {
-                    gs.iter()
-                        .any(|g| g.display_name.as_str() == "lldap_disabled")
-                }) {
+                if groups
+                    .is_some_and(|gs| gs.iter().any(|g| g.display_name == "lldap_disabled".into()))
+                {
                     vec![b"TRUE".to_vec()]
                 } else {
                     return None;
@@ -749,6 +748,37 @@ mod tests {
             Some(&vec![b"19700101000000.000000000Z".to_vec()]),
             "generalized time"
         );
+    }
+
+    #[test]
+    fn test_login_disabled_follows_the_disabled_group_in_any_case() {
+        let epoch = chrono::Utc.timestamp_opt(0, 0).unwrap().naive_utc();
+        let member_of = |name: &str| GroupDetails {
+            group_id: lldap_domain::types::GroupId(7),
+            display_name: name.into(),
+            creation_date: epoch,
+            uuid: lldap_domain::types::Uuid::from_name_and_date(name, &epoch),
+            attributes: vec![],
+            modified_date: epoch,
+        };
+        let rows = [
+            ("lldap_disabled", Some(vec![b"TRUE".to_vec()])),
+            ("LLDAP_Disabled", Some(vec![b"TRUE".to_vec()])),
+            ("LLDAP_DISABLED", Some(vec![b"TRUE".to_vec()])),
+            ("lldap_disabled_x", None),
+        ];
+        for (name, expected) in rows {
+            let groups = [member_of(name)];
+            let got = get_user_attribute(
+                &sample_user(),
+                &AttributeName::from("loginDisabled"),
+                "dc=example,dc=com",
+                Some(&groups[..]),
+                &[],
+                PublicSchema::shared(),
+            );
+            assert_eq!(got, expected, "{name}");
+        }
     }
 
     #[test]

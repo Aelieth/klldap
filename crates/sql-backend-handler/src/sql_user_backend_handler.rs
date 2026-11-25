@@ -9,8 +9,8 @@ use itertools::Itertools;
 use lldap_domain::{
     requests::{CreateUserRequest, UpdateUserRequest},
     types::{
-        Attribute, AttributeName, AttributeValue, Cardinality, GroupDetails, GroupId, Serialized,
-        User, UserAndGroups, UserId, Uuid, kerberos_sync_enabled,
+        Attribute, AttributeName, AttributeValue, Cardinality, GroupDetails, GroupId, GroupName,
+        Serialized, User, UserAndGroups, UserId, Uuid, kerberos_sync_enabled,
     },
 };
 use lldap_domain_handlers::enforcement::moves_ou;
@@ -744,10 +744,18 @@ fn status_left_not_ready() -> &'static str {
     }
 }
 
+fn is_admin_group(name: &str) -> bool {
+    GroupName::from(name) == GroupName::from("lldap_admin")
+}
+
+fn is_disabled_group(name: &str) -> bool {
+    GroupName::from(name) == GroupName::from("lldap_disabled")
+}
+
 impl SqlBackendHandler {
     /// Whether `user_id` has sync, read for an `lldap_disabled` change only.
     async fn synced_for_status(&self, user_id: &UserId, group: Option<&str>) -> Result<bool> {
-        if group != Some("lldap_disabled") {
+        if !group.is_some_and(is_disabled_group) {
             return Ok(false);
         }
         let user = self.get_user_details(user_id).await?;
@@ -847,7 +855,7 @@ impl SqlBackendHandler {
             // The last member of lldap_admin cannot be removed, whoever asks.
             let group_details = model::Group::find_by_id(group_id).one(transaction).await?;
             if let Some(g) = &group_details
-                && g.display_name.as_str() == "lldap_admin"
+                && g.display_name == "lldap_admin".into()
             {
                 let current_count = model::Membership::find()
                     .filter(model::MembershipColumn::GroupId.eq(group_id))
@@ -1123,7 +1131,7 @@ impl UserBackendHandler for SqlBackendHandler {
         let target_group_details = self.get_group_details(group_id).await?;
 
         let target_name = target_group_details.display_name.as_str();
-        if target_name != "lldap_disabled" {
+        if !is_disabled_group(target_name) {
             require_kdc_ready()?;
         }
         let has_admin = user_groups
@@ -1133,8 +1141,8 @@ impl UserBackendHandler for SqlBackendHandler {
             .iter()
             .any(|g| g.display_name == "lldap_disabled".into());
 
-        if (target_name == "lldap_admin" && has_disabled)
-            || (target_name == "lldap_disabled" && has_admin)
+        if (is_admin_group(target_name) && has_disabled)
+            || (is_disabled_group(target_name) && has_admin)
         {
             return Err(DomainError::InternalError(
                 "A user cannot be in both lldap_admin and lldap_disabled groups".to_string(),
@@ -1143,7 +1151,7 @@ impl UserBackendHandler for SqlBackendHandler {
 
         let state = kerberos_state();
         let synced = self.synced_for_status(user_id, Some(target_name)).await?;
-        if target_name == "lldap_disabled"
+        if is_disabled_group(target_name)
             && let Some(done) =
                 commit_status(&state, user_id, group_id, true, (target_name, synced)).await
         {
@@ -1179,7 +1187,7 @@ impl UserBackendHandler for SqlBackendHandler {
             .await
             .ok()
             .map(|g| g.display_name.as_str().to_owned());
-        if group_name.as_deref() != Some("lldap_disabled") {
+        if !group_name.as_deref().is_some_and(is_disabled_group) {
             require_kdc_ready()?;
         }
         let state = kerberos_state();
@@ -1187,7 +1195,7 @@ impl UserBackendHandler for SqlBackendHandler {
             .synced_for_status(user_id, group_name.as_deref())
             .await?;
         let name = group_name.as_deref().unwrap_or_default();
-        if name == "lldap_disabled"
+        if is_disabled_group(name)
             && let Some(done) =
                 commit_status(&state, user_id, group_id, false, (name, synced)).await
         {
@@ -2785,6 +2793,7 @@ mod tests {
         use lldap_test_utils::recording_log::LogGuard;
         type Logged = (LogKind, bool, Option<String>);
         type Row = (
+            &'static str,
             Life,
             bool,
             Option<CommitError>,
@@ -2804,6 +2813,7 @@ mod tests {
         let again = format!("Kerberos KDC unavailable: {ANSWER_UNSETTLED}; try again");
         let rows: Vec<Row> = vec![
             (
+                "lldap_disabled",
                 Life::Disable,
                 true,
                 None,
@@ -2812,6 +2822,7 @@ mod tests {
                 done(LogKind::MembershipAdd),
             ),
             (
+                "lldap_disabled",
                 Life::Enable,
                 true,
                 None,
@@ -2820,6 +2831,7 @@ mod tests {
                 done(LogKind::MembershipRemove),
             ),
             (
+                "lldap_disabled",
                 Life::Disable,
                 true,
                 lost(),
@@ -2828,6 +2840,7 @@ mod tests {
                 failed(LogKind::MembershipAdd, "disable"),
             ),
             (
+                "lldap_disabled",
                 Life::Enable,
                 true,
                 lost(),
@@ -2836,6 +2849,7 @@ mod tests {
                 failed(LogKind::MembershipRemove, "enable"),
             ),
             (
+                "lldap_disabled",
                 Life::Disable,
                 false,
                 None,
@@ -2844,6 +2858,7 @@ mod tests {
                 done(LogKind::MembershipAdd),
             ),
             (
+                "lldap_disabled",
                 Life::Disable,
                 false,
                 lost(),
@@ -2852,6 +2867,7 @@ mod tests {
                 failed(LogKind::MembershipAdd, "disable"),
             ),
             (
+                "lldap_disabled",
                 Life::Disable,
                 false,
                 Some(CommitError::Unsettled(ANSWER_UNSETTLED.to_owned())),
@@ -2859,15 +2875,33 @@ mod tests {
                 false,
                 vec![(LogKind::MembershipAdd, false, Some(again.clone()))],
             ),
+            (
+                "LLDAP_Disabled",
+                Life::Disable,
+                true,
+                None,
+                None,
+                true,
+                done(LogKind::MembershipAdd),
+            ),
+            (
+                "LLDAP_Disabled",
+                Life::Enable,
+                true,
+                None,
+                None,
+                false,
+                done(LogKind::MembershipRemove),
+            ),
         ];
-        for (step, synced, answer, refusal, member, logged) in rows {
+        for (name, step, synced, answer, refusal, member, logged) in rows {
             let fixture = TestFixture::new().await;
             let accepting = RecordingGuard::install();
             if synced {
                 let on = sync_request("patrick", 1);
                 fixture.handler.update_user(on).await.unwrap();
             }
-            let group = insert_group(&fixture.handler, "lldap_disabled").await;
+            let group = insert_group(&fixture.handler, name).await;
             if matches!(step, Life::Enable) {
                 let patrick = UserId::new("patrick");
                 fixture
@@ -2922,7 +2956,7 @@ mod tests {
                     events
                 ),
                 (true, member, one_change, logged),
-                "{step:?}, synced {synced}: {got:?}"
+                "{name}, {step:?}, synced {synced}: {got:?}"
             );
         }
     }
@@ -3095,6 +3129,25 @@ mod tests {
             "{created}"
         );
         fixture.handler.create_user(request(0)).await.unwrap();
+    }
+
+    #[test]
+    fn test_the_admin_and_disabled_groups_are_named_in_any_case() {
+        let rows = [
+            ("lldap_admin", true, false),
+            ("LLDAP_Admin", true, false),
+            ("lldap_disabled", false, true),
+            ("LLDAP_DISABLED", false, true),
+            ("lldap_admins", false, false),
+            ("lldap_mfa_disabled", false, false),
+        ];
+        for (name, admin, disabled) in rows {
+            assert_eq!(
+                (is_admin_group(name), is_disabled_group(name)),
+                (admin, disabled),
+                "{name}"
+            );
+        }
     }
 
     #[tokio::test]

@@ -926,7 +926,7 @@ async fn statuses_in(db: &impl ConnectionTrait) -> Result<Vec<(UserId, bool)>, D
         .all(db)
         .await?;
     let group = model::Group::find()
-        .filter(model::GroupColumn::DisplayName.eq("lldap_disabled"))
+        .filter(model::GroupColumn::LowercaseDisplayName.eq("lldap_disabled"))
         .one(db)
         .await?;
     let disabled: Vec<UserId> = match group {
@@ -2293,30 +2293,39 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_each_synced_user_and_its_lldap_disabled_are_read_in_one_step() {
-        let db = db().await;
-        insert_alice(&db.pool).await;
-        let step = Duration::from_secs(1);
-        let mut got = vec![read_statuses(&db.pool, step).await.unwrap()];
-        turn_sync_on(&db.pool, "alice").await;
-        got.push(read_statuses(&db.pool, step).await.unwrap());
-        for statement in [
-            "INSERT INTO groups (group_id, display_name, lowercase_display_name, creation_date, \
-             uuid, modified_date) VALUES (7, 'lldap_disabled', 'lldap_disabled', \
-             '2026-01-01 00:00:00', 'g7', '2026-01-01 00:00:00')",
-            "INSERT INTO memberships (user_id, group_id) VALUES ('alice', 7)",
-        ] {
-            db.pool.execute_unprepared(statement).await.unwrap();
+        for name in ["lldap_disabled", "LLDAP_Disabled"] {
+            let db = db().await;
+            insert_alice(&db.pool).await;
+            let step = Duration::from_secs(1);
+            let mut got = vec![read_statuses(&db.pool, step).await.unwrap()];
+            turn_sync_on(&db.pool, "alice").await;
+            got.push(read_statuses(&db.pool, step).await.unwrap());
+            for statement in [
+                format!(
+                    "INSERT INTO groups (group_id, display_name, lowercase_display_name, \
+                     creation_date, uuid, modified_date) VALUES (7, '{name}', 'lldap_disabled', \
+                     '2026-01-01 00:00:00', 'g7', '2026-01-01 00:00:00')"
+                ),
+                "INSERT INTO memberships (user_id, group_id) VALUES ('alice', 7)".to_owned(),
+            ] {
+                db.pool.execute_unprepared(&statement).await.unwrap();
+            }
+            got.push(read_statuses(&db.pool, step).await.unwrap());
+            let alice = UserId::new("alice");
+            let disabled = read_disabled(&db.pool, &alice, step).await.unwrap();
+            assert_eq!(
+                (got, disabled),
+                (
+                    vec![
+                        Vec::new(),
+                        vec![(alice.clone(), false)],
+                        vec![(alice, true)]
+                    ],
+                    true
+                ),
+                "{name}: the status pass and the one user's read find the group in any case"
+            );
         }
-        got.push(read_statuses(&db.pool, step).await.unwrap());
-        let alice = UserId::new("alice");
-        assert_eq!(
-            got,
-            vec![
-                Vec::new(),
-                vec![(alice.clone(), false)],
-                vec![(alice, true)]
-            ]
-        );
     }
 
     #[tokio::test]

@@ -97,6 +97,13 @@ pub fn keeps_sign_in_result(msg: &Msg) -> bool {
     matches!(msg, Msg::OnSignInAction(_))
 }
 
+/// Whether `name` is the built-in group `group`, in any case, as the server compares them.
+pub fn is_group(name: &str, group: &str) -> bool {
+    name.chars()
+        .flat_map(char::to_lowercase)
+        .eq(group.chars().flat_map(char::to_lowercase))
+}
+
 impl CommonComponent<UserDetails> for UserDetails {
     fn handle_msg(
         &mut self,
@@ -111,7 +118,7 @@ impl CommonComponent<UserDetails> for UserDetails {
                     self.lldap_disabled_group_id = user
                         .groups
                         .iter()
-                        .find(|g| g.display_name == "lldap_disabled")
+                        .find(|g| is_group(&g.display_name, "lldap_disabled"))
                         .map(|g| g.id);
                     self.user_and_schema = Some((user, data.schema.user_schema.attributes));
                 }
@@ -202,7 +209,7 @@ impl CommonComponent<UserDetails> for UserDetails {
                 self.lldap_disabled_group_id = data
                     .groups
                     .into_iter()
-                    .find(|g| g.display_name == "lldap_disabled")
+                    .find(|g| is_group(&g.display_name, "lldap_disabled"))
                     .map(|g| g.id);
                 return Ok(true);
             }
@@ -215,7 +222,7 @@ impl CommonComponent<UserDetails> for UserDetails {
                 if let Some(group) = data
                     .groups
                     .into_iter()
-                    .find(|g| g.display_name == "lldap_disabled")
+                    .find(|g| is_group(&g.display_name, "lldap_disabled"))
                 {
                     self.lldap_disabled_group_id = Some(group.id);
                     self.common.call_graphql::<AddUserToGroup, _>(
@@ -278,7 +285,10 @@ impl Component for UserDetails {
         match (&self.user_and_schema, &self.common.error) {
             (Some((u, schema)), error) => {
                 let can_change_password = ctx.props().is_admin || ctx.props().is_self;
-                let is_disabled = u.groups.iter().any(|g| g.display_name == "lldap_disabled");
+                let is_disabled = u
+                    .groups
+                    .iter()
+                    .any(|g| is_group(&g.display_name, "lldap_disabled"));
                 let mfa_enrolled = u.mfa_enrolled.unwrap_or(false);
                 // Under "always" an account may not be left without a factor.
                 let own_reset_blocked =
@@ -385,7 +395,7 @@ impl Component for UserDetails {
                   user={u.clone()}
                   user_attributes_schema={schema.clone()}
                   is_admin={ctx.props().is_admin}
-                  is_edited_user_admin={u.groups.iter().any(|g| g.display_name == "lldap_admin")}
+                  is_edited_user_admin={u.groups.iter().any(|g| is_group(&g.display_name, "lldap_admin"))}
                   on_updated={link.callback(|_| Msg::Refresh)}
                   />
 
@@ -516,6 +526,20 @@ mod tests {
         ];
         for (label, msg, kept) in rows {
             assert_eq!(keeps_sign_in_result(&msg), kept, "{label}");
+        }
+    }
+
+    #[test]
+    fn test_the_built_in_groups_are_found_in_any_case() {
+        let rows = [
+            ("lldap_disabled", "lldap_disabled", true),
+            ("LLDAP_Disabled", "lldap_disabled", true),
+            ("LLDAP_ADMIN", "lldap_admin", true),
+            ("lldap_admins", "lldap_admin", false),
+            ("lldap_mfa_disabled", "lldap_disabled", false),
+        ];
+        for (name, group, found) in rows {
+            assert_eq!(is_group(name, group), found, "{name} {group}");
         }
     }
 

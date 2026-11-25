@@ -349,13 +349,11 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             ))?;
         let target_user_id = UserId::new(&user_id);
         let target_group_id = GroupId(group_id);
-        let group_name = handler
+        let admins = handler
             .get_group_details(target_group_id)
             .await
-            .ok()
-            .map(|d| d.display_name.to_string())
-            .unwrap_or_default();
-        if group_name == "lldap_admin" {
+            .is_ok_and(|d| d.display_name == "lldap_admin".into());
+        if admins {
             if let Ok(members) = handler
                 .list_users(Some(UserRequestFilter::MemberOfId(target_group_id)), false)
                 .await
@@ -1591,6 +1589,51 @@ mod tests {
             .unwrap();
         assert_eq!(errors.len(), 0, "{errors:?}");
         assert_eq!(value, graphql_value!({"reenableUser": {"ok": true}}));
+    }
+
+    #[tokio::test]
+    async fn test_the_last_member_of_the_admin_group_stays_whatever_its_case() {
+        const LAST: &str = "Cannot remove the last member of lldap_admin";
+        let rows = [
+            ("lldap_admin", Some(LAST)),
+            ("LLDAP_Admin", Some(LAST)),
+            ("lldap_admins", None),
+        ];
+        for (name, refused) in rows {
+            let mut mock = MockTestBackendHandler::new();
+            mock.expect_get_group_details()
+                .with(eq(GroupId(1)))
+                .returning(move |_| {
+                    Ok(GroupDetails {
+                        group_id: GroupId(1),
+                        display_name: GroupName::from(name),
+                        creation_date: epoch(),
+                        uuid: Uuid::from_name_and_date(name, &epoch()),
+                        attributes: vec![],
+                        modified_date: epoch(),
+                    })
+                });
+            mock.expect_list_users().returning(|_, _| {
+                Ok(vec![UserAndGroups {
+                    user: sample_user("bob", vec![]),
+                    groups: None,
+                }])
+            });
+            mock.expect_remove_user_from_group()
+                .times(usize::from(refused.is_none()))
+                .returning(|_, _| Ok(()));
+            let context = admin_context(mock);
+            let query = r#"mutation { removeUserFromGroup(userId: "bob", groupId: 1) { ok } }"#;
+            let (_, errors) = execute(query, None, &root_schema(), &Variables::new(), &context)
+                .await
+                .unwrap();
+            let said: Vec<_> = errors
+                .iter()
+                .map(|e| e.error().message().to_owned())
+                .collect();
+            let refused: Vec<String> = refused.into_iter().map(str::to_owned).collect();
+            assert_eq!(said, refused, "{name}");
+        }
     }
 
     #[tokio::test]

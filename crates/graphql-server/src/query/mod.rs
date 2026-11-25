@@ -787,6 +787,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_a_listed_user_is_disabled_by_the_disabled_group_in_any_case() {
+        let rows = [
+            (
+                "lldap_disabled",
+                graphql_value!({"users": [{"id": "bob", "isDisabled": true}]}),
+            ),
+            (
+                "LLDAP_Disabled",
+                graphql_value!({"users": [{"id": "bob", "isDisabled": true}]}),
+            ),
+            (
+                "lldap_disabled_x",
+                graphql_value!({"users": [{"id": "bob", "isDisabled": false}]}),
+            ),
+        ];
+        let schema = schema(Query::<MockTestBackendHandler>::new());
+        for (name, expected) in rows {
+            let mut mock = MockTestBackendHandler::new();
+            setup_default_schema(&mut mock);
+            mock.expect_list_users().returning(move |_, _| {
+                let at = chrono::Utc.timestamp_nanos(42).naive_utc();
+                Ok(vec![lldap_domain::types::UserAndGroups {
+                    user: user_named(&UserId::new("bob")),
+                    groups: Some(vec![GroupDetails {
+                        group_id: GroupId(7),
+                        display_name: name.into(),
+                        creation_date: at,
+                        uuid: lldap_domain::types::Uuid::from_name_and_date(name, &at),
+                        attributes: Vec::new(),
+                        modified_date: at,
+                    }]),
+                }])
+            });
+            let context = Context::<MockTestBackendHandler>::new_for_tests(
+                mock,
+                ValidationResults {
+                    user: UserId::new("admin"),
+                    permission: Permission::Admin,
+                },
+            );
+            let query = r#"{ users { id isDisabled } }"#;
+            let (value, errors) = execute(query, None, &schema, &Variables::new(), &context)
+                .await
+                .unwrap();
+            assert_eq!((value, errors.len()), (expected, 0), "{name}: {errors:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn list_users() {
         const QUERY: &str = r#"{
         users(where: {

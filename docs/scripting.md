@@ -86,6 +86,14 @@ the only one. A client that ignores the field keeps today's check of 8, so for a
 sync it lets a password under a higher minimum through. When the user's policy cannot be
 read, the start is refused (400) with "the password policy could not be read; try again".
 
+The finish, `/auth/opaque/register/finish`, is taken once, within two minutes of its start,
+and only with the bearer token the start was sent with. A second finish for one start, one
+with another token, and a late one are refused (401); the client makes a new start. For a
+user with `kerberosSync` the envelope's OAEP label is
+`klldap-kerberos-envelope-v2:<user id in lower case>:<server_data>`, with `server_data` as
+the start answered it, so an envelope opens only for its own start; a Rust client gets the
+whole finish from `lldap_auth::kerberos_envelope::finish_with_envelope`.
+
 ### Getting a token
 
 You'll need a JWT (authentication token) to issue GraphQL queries. Your view of

@@ -385,10 +385,13 @@ ACL text, read at boot.
   - For a user with `kerberosSync`, the start answer carries
     `kerberos_envelope_key`, the server's RSA public key. The client seals the
     new password to it with RSA-OAEP-SHA-256 and the OAEP label
-    `klldap-kerberos-envelope-v1:<user id>` (the user id in lower case), and
-    sends it as `kerberos_password_envelope` in the finish. The server opens it
-    with the label of the user the registration is for, so an envelope sealed
-    for another user does not open (400). It then registers the password
+    `klldap-kerberos-envelope-v2:<user id>:<server_data>` (the user id in lower
+    case; `server_data` as the start answered it), and sends it as
+    `kerberos_password_envelope` in the finish. The server opens it with the
+    label of the user the registration is for and of the start the finish
+    carries, so an envelope sealed for another user or for another start does
+    not open (400, "the Kerberos password envelope did not open"). It then
+    registers the password
     itself, ignoring the client's OPAQUE upload, and changes the directory
     record and the Kerberos keys in one transaction, as above. A password
     shorter than the user's minimum, or with a NUL character, is refused (400),
@@ -398,6 +401,16 @@ ACL text, read at boot.
     same before it opens the envelope. Each refusal writes one `password_change` failure row.
   - A finish of a synced user without an envelope is refused (400, "reload the
     page and retry"): a page cached from an older version sends none.
+  - A finish is taken once, within two minutes of its start, and only with the
+    token its start was made with, for every user. A finish with no valid
+    token is refused as the start is (401). A finish with another token, a
+    second finish for one start, and a finish whose start another server
+    process answered are refused (401, "this registration cannot be finished;
+    start again"); a later one is refused with "the registration took too
+    long; start again". Each of these writes one `password_change` failure
+    row. A page whose token was refreshed between its two requests is told to
+    start again. The server keeps a finished start's id and expiry, nothing
+    else, in the table `used_registration_starts` for a few minutes.
   - Every start answer carries `password_min_length`, the user's minimum, and
     the pages and the tool refuse a shorter password before the finish
     ([scripting.md](scripting.md)).

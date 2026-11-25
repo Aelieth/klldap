@@ -1,4 +1,4 @@
-use crate::{configuration::LdapsOptions, tls};
+use crate::{configuration::LdapsOptions, tcp_server::Health, tls};
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use futures_util::SinkExt;
 use ldap3_proto::{
@@ -8,6 +8,7 @@ use ldap3_proto::{
         LdapSearchScope,
     },
 };
+use lldap_domain_handlers::kerberos::RealmHealth;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
@@ -186,15 +187,52 @@ pub async fn check_ldaps(host: &str, ldaps_options: &LdapsOptions) -> Result<()>
     .await
 }
 
+/// The Kerberos state a 2xx `/health` names; anything else is the line the command prints.
+fn health_answer(status: reqwest::StatusCode, body: &str) -> Result<String> {
+    let health = serde_json::from_str::<Health>(body).ok();
+    match (status.is_success(), health) {
+        (true, Some(health)) => Ok(health.kerberos),
+        (true, None) => bail!("{status}: /health did not name the Kerberos state: {body}"),
+        (false, Some(health)) => {
+            let cause = health.cause.map(|cause| format!(": {cause}"));
+            let cause = cause.unwrap_or_default();
+            bail!("{status}: Kerberos is {}{cause}", health.kerberos)
+        }
+        (false, None) => bail!("{status}: {body}"),
+    }
+}
+
 #[instrument(level = "info", err)]
-pub async fn check_api(host: &str, port: u16) -> Result<()> {
+pub async fn check_api(host: &str, port: u16) -> Result<String> {
     let response = reqwest::get(format!("http://{host}:{port}/health")).await?;
     let status = response.status();
-    if !status.is_success() {
-        bail!("{status}: {}", response.text().await.unwrap_or_default());
+    let state = health_answer(status, &response.text().await.unwrap_or_default())?;
+    info!("Success: Kerberos is {state}");
+    Ok(state)
+}
+
+/// The KDC connect and the keytab check are for a realm the server says is ready.
+pub fn asks_the_kdc(enabled: bool, state: Option<&str>) -> bool {
+    enabled && state == Some(RealmHealth::Ready.word())
+}
+
+const FAILED: &str = "Healthcheck failed";
+
+/// `--kerberos` refuses every state but ready, by the server's word and never by the KDC's.
+pub fn verdict(
+    kerberos: bool,
+    state: Option<&str>,
+    legs_failed: bool,
+) -> std::result::Result<(), String> {
+    let not_ready = kerberos && state != Some(RealmHealth::Ready.word());
+    match (state, not_ready, legs_failed) {
+        (Some(state), true, _) => Err(format!(
+            "{FAILED}: --kerberos passes only a ready Kerberos realm, and this server's is \
+             {state}"
+        )),
+        (None, true, _) | (_, false, true) => Err(FAILED.to_owned()),
+        (_, false, false) => Ok(()),
     }
-    info!("Success");
-    Ok(())
 }
 
 /// The Kerberos leg: the KDC must accept TCP on its port and the admin keytab that
@@ -245,5 +283,88 @@ mod tests {
         assert!(any_failed([elapsed]));
         assert!(any_failed([Ok(Err(anyhow!("down")))]));
         assert!(!any_failed([Ok(Ok(())), Ok(Ok(()))]));
+    }
+
+    #[test]
+    fn test_the_answer_of_health_is_the_state_or_the_line_the_command_prints() {
+        use reqwest::StatusCode;
+        let ok = StatusCode::OK;
+        let down = StatusCode::SERVICE_UNAVAILABLE;
+        let rows = [
+            (ok, r#"{"kerberos":"ready"}"#, Ok("ready")),
+            (
+                ok,
+                r#"{"kerberos":"directory-only","cause":"closed"}"#,
+                Ok("directory-only"),
+            ),
+            (
+                down,
+                r#"{"kerberos":"admin-only","cause":"closed"}"#,
+                Err("503 Service Unavailable: Kerberos is admin-only: closed"),
+            ),
+            (
+                down,
+                r#"{"kerberos":"lost"}"#,
+                Err("503 Service Unavailable: Kerberos is lost"),
+            ),
+            (down, "busy", Err("503 Service Unavailable: busy")),
+            (
+                ok,
+                "",
+                Err("200 OK: /health did not name the Kerberos state: "),
+            ),
+        ];
+        for (status, body, want) in rows {
+            let got = health_answer(status, body).map_err(|e| e.to_string());
+            let want = want.map(str::to_owned).map_err(str::to_owned);
+            assert_eq!(got, want, "{body}");
+        }
+    }
+
+    #[test]
+    fn test_the_plain_command_passes_a_directory_only_server_and_the_flag_wants_a_ready_realm() {
+        let flag_line = |state: &str| {
+            Err(format!(
+                "Healthcheck failed: --kerberos passes only a ready Kerberos realm, and this \
+                 server's is {state}"
+            ))
+        };
+        let failed = || Err("Healthcheck failed".to_owned());
+        let rows = [
+            (false, Some("ready"), false, true, Ok(())),
+            (false, Some("ready"), true, true, failed()),
+            (false, Some("directory-only"), false, false, Ok(())),
+            (false, Some("directory-only"), true, false, failed()),
+            (false, Some("disabled"), false, false, Ok(())),
+            (false, None, true, false, failed()),
+            (true, Some("ready"), false, true, Ok(())),
+            (true, Some("ready"), true, true, failed()),
+            (
+                true,
+                Some("directory-only"),
+                false,
+                false,
+                flag_line("directory-only"),
+            ),
+            (
+                true,
+                Some("directory-only"),
+                true,
+                false,
+                flag_line("directory-only"),
+            ),
+            (true, Some("disabled"), false, false, flag_line("disabled")),
+            (true, None, true, false, failed()),
+            (true, None, false, false, failed()),
+        ];
+        for (kerberos, state, legs_failed, kdc, want) in rows {
+            let row = format!("--kerberos {kerberos}, {state:?}, a leg failed {legs_failed}");
+            let got = (
+                asks_the_kdc(true, state),
+                verdict(kerberos, state, legs_failed),
+            );
+            assert_eq!(got, (kdc, want), "{row}");
+            assert!(!asks_the_kdc(false, state), "Kerberos off here: {row}");
+        }
     }
 }

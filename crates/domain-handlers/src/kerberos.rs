@@ -731,6 +731,91 @@ pub fn unsettled_answer(cause: &str) -> DomainError {
     DomainError::KdcUnavailable(format!("{cause}; try again"))
 }
 
+pub const REALM_NOT_OPEN: &str = "the Kerberos realm did not open; the server log has the cause";
+pub const REALM_LOST: &str = "the Kerberos realm was lost; the server log has the cause";
+const KDC_NOT_SERVING: &str = "the Kerberos KDC is not serving";
+
+/// The realm's state as `/health` and `kerberosInfo` name it, with the full cause where it has one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RealmHealth {
+    Disabled,
+    Ready,
+    Unsettled(String),
+    Lost(String),
+    AdminOnly(String),
+    DirectoryOnly(String),
+}
+
+impl RealmHealth {
+    pub fn word(&self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Ready => "ready",
+            Self::Unsettled(_) => "unsettled",
+            Self::Lost(_) => "lost",
+            Self::AdminOnly(_) => "admin-only",
+            Self::DirectoryOnly(_) => "directory-only",
+        }
+    }
+
+    pub fn cause(&self) -> Option<&str> {
+        match self {
+            Self::Disabled | Self::Ready => None,
+            Self::Unsettled(cause)
+            | Self::Lost(cause)
+            | Self::AdminOnly(cause)
+            | Self::DirectoryOnly(cause) => Some(cause),
+        }
+    }
+
+    /// What `/health` answers 200 for.
+    pub fn healthy(&self) -> bool {
+        matches!(self, Self::Disabled | Self::Ready | Self::DirectoryOnly(_))
+    }
+
+    fn or_lost(self, lost: Option<String>) -> Self {
+        match (self, lost) {
+            (Self::Disabled, _) => Self::Disabled,
+            (_, Some(cause)) => Self::Lost(cause),
+            (own, None) => own,
+        }
+    }
+}
+
+fn health_of(backend: &dyn KerberosSync) -> RealmHealth {
+    match settled_state_of(backend) {
+        KerberosState::Disabled => RealmHealth::Disabled,
+        KerberosState::Ready => RealmHealth::Ready,
+        KerberosState::NotReady(cause) if backend.ready() => RealmHealth::Unsettled(cause),
+        KerberosState::NotReady(_) => closed_health(backend),
+    }
+}
+
+fn closed_health(backend: &dyn KerberosSync) -> RealmHealth {
+    let admins = backend.unavailable().map(RealmHealth::AdminOnly);
+    let everyone = || backend.directory_only().map(RealmHealth::DirectoryOnly);
+    let stopped = || RealmHealth::Lost(KDC_NOT_SERVING.to_owned());
+    admins.or_else(everyone).unwrap_or_else(stopped)
+}
+
+/// The state of this server's realm. The store is asked after the backend, so a realm lost
+/// between the two is named lost.
+pub fn realm_health() -> RealmHealth {
+    let own = health_of(&*kerberos_backend());
+    own.or_lost(kerberos_store().realm_not_held())
+}
+
+/// The cause as an open endpoint or an ordinary user may read it: it names no path and no count.
+pub fn public_cause(health: &RealmHealth) -> Option<String> {
+    let text = match health {
+        RealmHealth::Disabled | RealmHealth::Ready => return None,
+        RealmHealth::Unsettled(_) => ANSWER_UNSETTLED,
+        RealmHealth::Lost(_) => REALM_LOST,
+        RealmHealth::AdminOnly(_) | RealmHealth::DirectoryOnly(_) => REALM_NOT_OPEN,
+    };
+    Some(text.to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1258,6 +1343,67 @@ mod tests {
             ),
             "unsettled: held for directory writes, not settled for a change to both stores"
         );
+    }
+
+    #[test]
+    fn test_the_realms_health_names_each_state_and_keeps_the_full_cause_for_admins() {
+        use DegradedMode::{AdminOnly, DirectoryOnly};
+        type Row = (
+            Arc<dyn KerberosSync>,
+            Option<&'static str>,
+            (&'static str, Option<&'static str>, bool),
+            Option<&'static str>,
+        );
+        let off = || Arc::new(NoopKerberos::default());
+        let rows: [Row; 9] = [
+            (off(), None, ("disabled", None, true), None),
+            (off(), Some("gone"), ("disabled", None, true), None),
+            (Arc::new(Up(true)), None, ("ready", None, true), None),
+            (
+                Arc::new(Unsettled),
+                None,
+                ("unsettled", Some(ANSWER_UNSETTLED), false),
+                Some(ANSWER_UNSETTLED),
+            ),
+            (
+                Arc::new(Up(true)),
+                Some("gone"),
+                ("lost", Some("gone"), false),
+                Some(REALM_LOST),
+            ),
+            (
+                Arc::new(Up(false)),
+                None,
+                ("lost", Some(KDC_NOT_SERVING), false),
+                Some(REALM_LOST),
+            ),
+            (
+                degraded(AdminOnly),
+                None,
+                ("admin-only", Some("down"), false),
+                Some(REALM_NOT_OPEN),
+            ),
+            (
+                degraded(DirectoryOnly),
+                None,
+                ("directory-only", Some("down"), true),
+                Some(REALM_NOT_OPEN),
+            ),
+            (
+                degraded(DirectoryOnly),
+                Some("gone"),
+                ("lost", Some("gone"), false),
+                Some(REALM_LOST),
+            ),
+        ];
+        for (backend, lost, health, public) in rows {
+            let got = health_of(&*backend).or_lost(lost.map(str::to_owned));
+            assert_eq!(
+                ((got.word(), got.cause(), got.healthy()), public_cause(&got)),
+                (health, public.map(str::to_owned)),
+                "lost: {lost:?}"
+            );
+        }
     }
 
     #[test]

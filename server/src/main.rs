@@ -18,7 +18,10 @@ mod tcp_server;
 mod tls;
 
 use crate::{
-    cli::{Command, PolicyUnlinkOpts, ReenableOpts, RunOpts, TestEmailOpts, UnlockOpts},
+    cli::{
+        Command, HealthCommandOpts, PolicyUnlinkOpts, ReenableOpts, RunOpts, TestEmailOpts,
+        UnlockOpts,
+    },
     configuration::{Configuration, OnRealmFailure, compare_private_key_hashes},
     database_string::DatabaseUrl,
     db_cleaner::Scheduler,
@@ -965,8 +968,9 @@ async fn send_test_email_command(opts: TestEmailOpts) -> Result<()> {
         .context("Could not send email: {:#}")
 }
 
-async fn run_healthcheck(opts: RunOpts) -> Result<()> {
+async fn run_healthcheck(opts: HealthCommandOpts) -> Result<()> {
     debug!("CLI: {:#?}", &opts);
+    let kerberos = opts.kerberos;
     let config = configuration::init(opts)?;
     logging::init(&config)?;
 
@@ -974,21 +978,26 @@ async fn run_healthcheck(opts: RunOpts) -> Result<()> {
 
     use tokio::time::timeout;
     let delay = Duration::from_millis(3000);
-    let kerberos = async {
-        if config.kerberos_options.enabled {
-            healthcheck::check_kerberos(
-                &client_address(
-                    &config.kerberos_options.kdc_host,
-                    config.kerberos_options.kdc_port,
-                ),
-                &config.kerberos_options.admin_keytab,
-            )
-            .await
-        } else {
-            Ok(())
-        }
+    let options = &config.kerberos_options;
+    // The KDC is asked only once the server has said its realm is ready.
+    let realm = async {
+        let api = timeout(
+            delay,
+            healthcheck::check_api(&config.healthcheck_options.http_host, config.http_port),
+        )
+        .await;
+        let state = api.as_ref().ok().and_then(|read| read.as_deref().ok());
+        let kdc = match healthcheck::asks_the_kdc(options.enabled, state) {
+            true => {
+                let address = client_address(&options.kdc_host, options.kdc_port);
+                let leg = healthcheck::check_kerberos(&address, &options.admin_keytab);
+                timeout(delay, leg).await
+            }
+            false => Ok(Ok(())),
+        };
+        (api, kdc)
     };
-    let (ldap, ldaps, api, kerberos) = tokio::join!(
+    let (ldap, ldaps, (api, kdc)) = tokio::join!(
         timeout(
             delay,
             healthcheck::check_ldap(&config.healthcheck_options.ldap_host, config.ldap_port)
@@ -997,17 +1006,15 @@ async fn run_healthcheck(opts: RunOpts) -> Result<()> {
             delay,
             healthcheck::check_ldaps(&config.healthcheck_options.ldap_host, &config.ldaps_options)
         ),
-        timeout(
-            delay,
-            healthcheck::check_api(&config.healthcheck_options.http_host, config.http_port)
-        ),
-        timeout(delay, kerberos),
+        realm,
     );
-    if healthcheck::any_failed([ldap, ldaps, api, kerberos]) {
-        bail!("Healthcheck failed")
-    } else {
-        Ok(())
-    }
+    let (state, api) = match api {
+        Ok(Ok(state)) => (Some(state), Ok(Ok(()))),
+        Ok(Err(e)) => (None, Ok(Err(e))),
+        Err(elapsed) => (None, Err(elapsed)),
+    };
+    let legs_failed = healthcheck::any_failed([ldap, ldaps, api, kdc]);
+    healthcheck::verdict(kerberos, state.as_deref(), legs_failed).map_err(|line| anyhow!(line))
 }
 
 async fn create_schema_command(opts: RunOpts) -> Result<()> {
@@ -1134,6 +1141,25 @@ mod tests {
             };
             let config_file = opts.run.general_config.config_file.as_str();
             assert_eq!((opts.ou.as_str(), config_file), (ou, "c.toml"));
+        }
+    }
+
+    #[test]
+    fn test_healthcheck_takes_the_kerberos_flag() {
+        use clap::Parser;
+        for (flag, kerberos) in [(None, false), (Some("--kerberos"), true)] {
+            let args = ["lldap", "healthcheck", "--config-file", "c.toml"];
+            let args = args.into_iter().chain(flag);
+            let opts = match cli::CLIOpts::try_parse_from(args).unwrap().command {
+                Command::HealthCheck(opts) => opts,
+                other => panic!("{flag:?}: {other:?}"),
+            };
+            let config_file = opts.run.general_config.config_file.as_str();
+            assert_eq!(
+                (opts.kerberos, config_file),
+                (kerberos, "c.toml"),
+                "{flag:?}"
+            );
         }
     }
 

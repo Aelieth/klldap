@@ -25,7 +25,9 @@ use lldap_domain_handlers::enforcement::{mfa_can_be_on, policy_cache};
 use lldap_domain_handlers::handler::{
     BackendHandler, LoginHandler, MfaBackendHandler, PolicyBackendHandler,
 };
-use lldap_domain_handlers::kerberos::{KerberosSync, domain_from_base_dn, kerberos_backend};
+use lldap_domain_handlers::kerberos::{
+    RealmHealth, domain_from_base_dn, public_cause, realm_health,
+};
 use lldap_domain_handlers::logging::{RequestMeta, with_request};
 use lldap_domain_handlers::mfa::MfaPolicy;
 use lldap_domain_handlers::networks::resolve_client;
@@ -33,6 +35,7 @@ use lldap_domain_model::error::DomainError;
 use lldap_kerberos::boot::with_port_hint;
 use lldap_keycloak::KeycloakSettings;
 use lldap_opaque_handler::OpaqueHandler;
+use serde::{Deserialize, Serialize};
 use sha2::Sha512;
 use std::collections::HashSet;
 use std::net::IpAddr;
@@ -99,15 +102,22 @@ pub enum TcpError {
 
 pub type TcpResult<T> = std::result::Result<T, TcpError>;
 
-/// Not held, or held while its last write is unsettled.
-fn health_cause(kerberos: &dyn KerberosSync) -> Option<String> {
-    kerberos.unavailable().or_else(|| kerberos.unsettled())
+/// The body of `/health`, as the server writes it and `lldap healthcheck` reads it.
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub(crate) struct Health {
+    pub kerberos: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<String>,
 }
 
-fn health(unavailable: Option<String>) -> HttpResponse {
-    match unavailable {
-        Some(cause) => HttpResponse::ServiceUnavailable().body(cause),
-        None => HttpResponse::Ok().finish(),
+fn health(realm: &RealmHealth) -> HttpResponse {
+    let body = Health {
+        kerberos: realm.word().to_owned(),
+        cause: public_cause(realm),
+    };
+    match realm.healthy() {
+        true => HttpResponse::Ok().json(body),
+        false => HttpResponse::ServiceUnavailable().json(body),
     }
 }
 
@@ -222,10 +232,7 @@ fn http_config<Backend>(
         domain,
         keycloak,
     }))
-    .route(
-        "/health",
-        web::get().to(async || health(health_cause(&*kerberos_backend()))),
-    )
+    .route("/health", web::get().to(async || health(&realm_health())))
     .route("/settings", web::get().to(get_settings::<Backend>))
     .service(
         web::scope("/auth")
@@ -388,13 +395,36 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     #[actix_web::test]
-    async fn test_health_names_the_cause() {
-        let cause = "the Kerberos realm did not open";
-        for (unavailable, status, body) in [(None, 200, ""), (Some(cause.to_owned()), 503, cause)] {
-            let response = health(unavailable);
+    async fn test_health_names_the_state_and_keeps_the_full_cause_out_of_the_body() {
+        use lldap_domain_handlers::kerberos::{ANSWER_UNSETTLED, REALM_LOST, REALM_NOT_OPEN};
+        let full = || "stash /data/kerberos/.k5.EXAMPLE.COM, 3 records".to_owned();
+        let rows = [
+            (RealmHealth::Disabled, 200, None),
+            (RealmHealth::Ready, 200, None),
+            (
+                RealmHealth::Unsettled(ANSWER_UNSETTLED.to_owned()),
+                503,
+                Some(ANSWER_UNSETTLED),
+            ),
+            (RealmHealth::Lost(full()), 503, Some(REALM_LOST)),
+            (RealmHealth::AdminOnly(full()), 503, Some(REALM_NOT_OPEN)),
+            (
+                RealmHealth::DirectoryOnly(full()),
+                200,
+                Some(REALM_NOT_OPEN),
+            ),
+        ];
+        for (realm, status, cause) in rows {
+            let state = realm.word();
+            let body = match cause {
+                Some(cause) => format!(r#"{{"kerberos":"{state}","cause":"{cause}"}}"#),
+                None => format!(r#"{{"kerberos":"{state}"}}"#),
+            };
+            let response = health(&realm);
             let got_status = response.status().as_u16();
             let got_body = to_bytes(response.into_body()).await.unwrap();
-            assert_eq!((got_status, &got_body[..]), (status, body.as_bytes()));
+            let got_body = String::from_utf8_lossy(&got_body).into_owned();
+            assert_eq!((got_status, got_body), (status, body), "{state}");
         }
     }
 
@@ -428,32 +458,5 @@ mod tests {
             ("example.com".to_owned(), String::new()),
             "an answer without the field still parses"
         );
-    }
-
-    #[actix_web::test]
-    async fn test_health_names_an_unsettled_write_too() {
-        use lldap_domain_handlers::kerberos::{ANSWER_UNSETTLED, DegradedKerberos, NoopKerberos};
-        use lldap_test_utils::recording_kerberos::RecordingKerberos;
-        let realm = || "EXAMPLE.COM".to_owned();
-        let backends: [(Arc<dyn KerberosSync>, u16, &str); 4] = [
-            (Arc::new(NoopKerberos::default()), 200, ""),
-            (RecordingKerberos::new(), 200, ""),
-            (
-                Arc::new(DegradedKerberos::new(realm(), "down".to_owned())),
-                503,
-                "down",
-            ),
-            (
-                RecordingKerberos::unsettled(ANSWER_UNSETTLED),
-                503,
-                ANSWER_UNSETTLED,
-            ),
-        ];
-        for (backend, status, body) in backends {
-            let response = health(health_cause(&*backend));
-            let got_status = response.status().as_u16();
-            let got_body = to_bytes(response.into_body()).await.unwrap();
-            assert_eq!((got_status, &got_body[..]), (status, body.as_bytes()));
-        }
     }
 }

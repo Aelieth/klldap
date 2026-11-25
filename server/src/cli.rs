@@ -146,7 +146,7 @@ pub enum Command {
         name = "healthcheck",
         about = "Test whether the LDAP and GraphQL server are responsive"
     )]
-    HealthCheck(RunOpts),
+    HealthCheck(HealthCommandOpts),
     #[clap(name = "send_test_email", about = "Send a test email")]
     SendTestEmail(TestEmailOpts),
     #[clap(name = "create_schema", about = "Create database schema")]
@@ -166,6 +166,18 @@ pub enum Command {
         about = "Restart a user's inactivity count now; a running server sees it within 30 seconds"
     )]
     Reenable(ReenableOpts),
+}
+
+#[derive(Debug, Parser, Clone)]
+pub struct HealthCommandOpts {
+    #[clap(flatten)]
+    pub run: RunOpts,
+
+    #[clap(
+        long,
+        help = "Also fail unless the server says its Kerberos realm is ready (not disabled, directory-only or admin-only)"
+    )]
+    pub kerberos: bool,
 }
 
 #[derive(Debug, Parser, Clone)]

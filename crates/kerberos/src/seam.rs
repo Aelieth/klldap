@@ -2805,7 +2805,7 @@ mod tests {
         };
         let cached = |user: &str| {
             let entries = policy_cache().get();
-            entries.ous_of_users.get(&UserId::new(user)).cloned()
+            entries.ou_of(&UserId::new(user)).map(str::to_owned)
         };
         let labs = || Some("people\\labs".to_owned());
         let people = || Some("people".to_owned());

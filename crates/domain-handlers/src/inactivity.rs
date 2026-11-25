@@ -261,8 +261,8 @@ impl PolicyCache {
             self.mark(user);
             return;
         };
-        self.edit(|entries| {
-            if let Some(facts) = entries.facts.get_mut(user) {
+        self.edit(user, |over| {
+            if let Some(facts) = over.facts.as_mut() {
                 let recorded = facts.recorded.unwrap_or_default();
                 facts.recorded = Some(Recorded {
                     last_success: recorded.last_success.max(Some(at)),

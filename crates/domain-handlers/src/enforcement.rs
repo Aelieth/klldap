@@ -39,6 +39,7 @@ use tracing::warn;
 pub const POLICY_REFILL: Duration = Duration::from_secs(30);
 pub const FILL_GAP: Duration = Duration::from_millis(250);
 pub const FILL_BACKOFF_LIMIT: Duration = Duration::from_secs(30);
+pub const OVERLAY_FOLD: usize = 1024;
 const MARK_PASSES: usize = 4;
 const FLAG_OFF: u8 = 0;
 const FLAG_ON: u8 = 1;
@@ -393,14 +394,21 @@ pub fn mfa_item_matters(cache: &PolicyCache, server: Option<MfaPolicy>) -> Optio
 /// The user's resolved value from memory alone.
 pub fn cached_mfa_policy(
     cache: &PolicyCache,
-    entries: &Entries,
+    entries: &Snapshot,
     user: &UserId,
+) -> Option<MfaPolicy> {
+    mfa_policy_from(cache, entries.items_of(user))
+}
+
+pub(crate) fn mfa_policy_from(
+    cache: &PolicyCache,
+    items: Option<&[EffectiveItem]>,
 ) -> Option<MfaPolicy> {
     let server = cache.mfa_policy();
     let resolved = |items: &[EffectiveItem]| resolve::<EnableMfa>(server, items).0;
     match mfa_item_matters(cache, server)? {
         false => Some(resolved(&[])),
-        true => entries.items_of(user).map(resolved),
+        true => items.map(resolved),
     }
 }
 
@@ -437,11 +445,105 @@ impl Entries {
             .map(|windows| &windows[..])
             .unwrap_or_default()
     }
+
+    fn of(&self, user: &UserId) -> Over {
+        let ou = self.ous_of_users.get(user);
+        Over {
+            items: ou.and_then(|ou_key| self.items_of_ous.get(ou_key)).cloned(),
+            ou: ou.cloned(),
+            facts: self.facts.get(user).cloned(),
+            windows: self.windows.get(user).cloned().unwrap_or_default(),
+        }
+    }
 }
 
-/// Swapped whole: a reader holds the old entries or the new ones, never none.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Over {
+    pub(crate) ou: Option<String>,
+    pub(crate) items: Option<Arc<[EffectiveItem]>>,
+    pub(crate) facts: Option<UserFacts>,
+    pub(crate) windows: Arc<[ProofWindow]>,
+}
+
+/// A fill's entries and, over them, the users edited since; never changed once made.
+#[derive(Clone, Debug, Default)]
+pub struct Snapshot {
+    base: Arc<Entries>,
+    over: HashMap<UserId, Arc<Over>>,
+}
+
+impl Snapshot {
+    pub fn items_of(&self, user: &UserId) -> Option<&[EffectiveItem]> {
+        match self.over.get(user) {
+            Some(over) => over.items.as_deref(),
+            None => self.base.items_of(user),
+        }
+    }
+
+    pub fn facts_of(&self, user: &UserId) -> Option<&UserFacts> {
+        match self.over.get(user) {
+            Some(over) => over.facts.as_ref(),
+            None => self.base.facts_of(user),
+        }
+    }
+
+    pub fn windows_of(&self, user: &UserId) -> &[ProofWindow] {
+        match self.over.get(user) {
+            Some(over) => &over.windows,
+            None => self.base.windows_of(user),
+        }
+    }
+
+    pub fn ou_of(&self, user: &UserId) -> Option<&str> {
+        match self.over.get(user) {
+            Some(over) => over.ou.as_deref(),
+            None => self.base.ous_of_users.get(user).map(String::as_str),
+        }
+    }
+
+    /// For tests only: every user's OU, the edited users' over the fill's.
+    #[cfg(any(test, feature = "test-backend-scope"))]
+    pub fn ous_of_users(&self) -> HashMap<UserId, String> {
+        let mut ous = self.base.ous_of_users.clone();
+        for (user, over) in &self.over {
+            match &over.ou {
+                Some(ou) => ous.insert(user.clone(), ou.clone()),
+                None => ous.remove(user),
+            };
+        }
+        ous
+    }
+
+    fn shared_items_of(&self, user: &UserId) -> Option<Arc<[EffectiveItem]>> {
+        match self.over.get(user) {
+            Some(over) => over.items.clone(),
+            None => {
+                let ou_key = self.base.ous_of_users.get(user)?;
+                self.base.items_of_ous.get(ou_key).cloned()
+            }
+        }
+    }
+
+    fn of(&self, user: &UserId) -> Over {
+        match self.over.get(user) {
+            Some(over) => Over::clone(over),
+            None => self.base.of(user),
+        }
+    }
+
+    fn with(&self, user: &UserId, over: Over) -> Self {
+        let mut next = self.clone();
+        match over == self.base.of(user) {
+            true => next.over.remove(user),
+            false => next.over.insert(user.clone(), Arc::new(over)),
+        };
+        next
+    }
+}
+
+/// Swapped whole: a reader holds the old snapshot or the new one, never none.
 pub struct PolicyCache {
-    current: RwLock<Arc<Entries>>,
+    current: RwLock<Arc<Snapshot>>,
     generation: AtomicU64,
     reads: AtomicU64,
     fill: Notify,
@@ -621,14 +723,14 @@ impl PolicyCache {
         }
     }
 
-    pub(crate) fn current(&self) -> Arc<Entries> {
+    pub(crate) fn current(&self) -> Arc<Snapshot> {
         self.current
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
-    pub fn get(&self) -> Arc<Entries> {
+    pub fn get(&self) -> Arc<Snapshot> {
         self.reads.fetch_add(1, Ordering::Relaxed);
         self.current()
     }
@@ -642,36 +744,48 @@ impl PolicyCache {
     }
 
     pub fn replace(&self, next: Entries) {
+        self.swap(Snapshot {
+            base: Arc::new(next),
+            over: HashMap::new(),
+        });
+    }
+
+    fn swap(&self, next: Snapshot) {
         let next = Arc::new(next);
         *self.current.write().unwrap_or_else(PoisonError::into_inner) = next;
         self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
-    pub(crate) fn edit(&self, change: impl FnOnce(&mut Entries)) {
-        let mut next = Entries::clone(&self.current());
-        change(&mut next);
-        self.replace(next);
+    /// Under the writers' lock; a change that leaves the user as held swaps nothing.
+    pub(crate) fn edit(&self, user: &UserId, change: impl FnOnce(&mut Over)) {
+        let held = self.current();
+        let was = held.of(user);
+        let mut now = was.clone();
+        change(&mut now);
+        if now == was {
+            return;
+        }
+        let next = held.with(user, now);
+        let large = next.over.len() > OVERLAY_FOLD;
+        self.swap(next);
+        if large {
+            self.poke_fill();
+        }
     }
 
     pub fn put_user(&self, user: &UserId, ou_key: &str, items: Arc<[EffectiveItem]>) {
-        self.edit(|entries| {
-            entries.ous_of_users.insert(user.clone(), ou_key.to_owned());
-            entries.items_of_ous.insert(ou_key.to_owned(), items);
+        self.edit(user, |over| {
+            over.ou = Some(ou_key.to_owned());
+            over.items = Some(items);
         });
     }
 
     pub fn put_facts(&self, user: &UserId, facts: UserFacts) {
-        self.edit(|entries| {
-            entries.facts.insert(user.clone(), facts);
-        });
+        self.edit(user, |over| over.facts = Some(facts));
     }
 
     pub fn remove_user(&self, user: &UserId) {
-        self.edit(|entries| {
-            entries.ous_of_users.remove(user);
-            entries.facts.remove(user);
-            entries.windows.remove(user);
-        });
+        self.edit(user, |over| *over = Over::default());
     }
 
     pub(crate) fn note_read_failed(&self) {
@@ -1293,10 +1407,8 @@ pub async fn resolve_items<H>(
 where
     H: UserBackendHandler + PolicyBackendHandler + ?Sized,
 {
-    let entries = cache.get();
-    let held = entries.ous_of_users.get(user);
-    if let Some(items) = held.and_then(|ou_key| entries.items_of_ous.get(ou_key)) {
-        return Ok(items.clone());
+    if let Some(items) = cache.get().shared_items_of(user) {
+        return Ok(items);
     }
     Ok(user_entry(handler, user).await?.1)
 }
@@ -1315,12 +1427,8 @@ where
         return Ok((resolve_items(handler, cache, user).await?, None));
     }
     let entries = cache.get();
-    let held = entries.ous_of_users.get(user);
-    if let Some(items) = held.and_then(|ou_key| entries.items_of_ous.get(ou_key)) {
-        return Ok((
-            items.clone(),
-            cached_active_since(cache, entries.facts_of(user)),
-        ));
+    if let Some(items) = entries.shared_items_of(user) {
+        return Ok((items, cached_active_since(cache, entries.facts_of(user))));
     }
     let read = tokio::time::timeout(POLICY_READ_WAIT, handler.bounded_activity_entry(user));
     let unanswered = DomainError::InternalError(POLICY_UNANSWERED.to_owned());
@@ -2082,24 +2190,113 @@ mod tests {
     }
 
     #[test]
-    fn test_an_edit_swaps_a_copy_and_a_held_reader_keeps_its_entries() {
+    fn test_an_edit_swaps_the_overlay_alone_and_a_held_reader_keeps_its_entries() {
+        let (bob, amy) = (UserId::new("bob"), UserId::new("amy"));
+        let hours = [item("login-hours", "")];
+        type Edit = fn(&PolicyCache, &UserId);
+        let rows: [(&str, Edit); 4] = [
+            ("put_user", |cache, bob| {
+                cache.put_user(bob, LABS, Vec::new().into())
+            }),
+            ("put_facts", |cache, bob| {
+                cache.put_facts(bob, UserFacts::of(&user("bob"), std::iter::empty()))
+            }),
+            ("put_window", |cache, bob| cache.put_window(bob, opened())),
+            ("remove_user", |cache, bob| cache.remove_user(bob)),
+        ];
+        for (label, edit) in rows {
+            let cache = PolicyCache::new();
+            cache.replace(entries(
+                &[("bob", "people"), ("amy", "people")],
+                &[("people", &hours[..])],
+            ));
+            let (held, generation) = (cache.get(), cache.generation());
+            let was = held.of(&bob);
+            edit(&cache, &bob);
+            let now = cache.get();
+            assert_eq!(
+                (
+                    Arc::ptr_eq(&held.base, &now.base),
+                    held.of(&bob) == was,
+                    now.of(&bob) != was,
+                    now.of(&amy) == held.of(&amy),
+                    now.over.len(),
+                    cache.generation() - generation,
+                ),
+                (true, true, true, true, 1, 1),
+                "{label}: one swap that shares the fill's entries; the held reader's user and the \
+                 other user are as they were"
+            );
+        }
+    }
+
+    #[test]
+    fn test_an_edit_of_one_user_leaves_its_ous_items_to_the_others_as_filled() {
         let cache = PolicyCache::new();
-        let hours: Arc<[EffectiveItem]> = vec![item("login-hours", "")].into();
-        cache.put_user(&UserId::new("bob"), "people", hours.clone());
+        let (bob, amy) = (UserId::new("bob"), UserId::new("amy"));
+        let filled = [item("login-hours", "")];
+        let read = [item("login-hours", "mon 08:00-09:00")];
+        cache.replace(entries(
+            &[("bob", "people"), ("amy", "people")],
+            &[("people", &filled[..])],
+        ));
+        cache.put_user(&bob, "people", read.to_vec().into());
         let held = cache.get();
-        let generation = cache.generation();
-        cache.put_user(&UserId::new("bob"), "people\\labs", hours.clone());
-        cache.remove_user(&UserId::new("bob"));
-        let now = cache.get();
         assert_eq!(
-            (
-                held.ous_of_users.get(&UserId::new("bob")).cloned(),
-                now.ous_of_users.get(&UserId::new("bob")).cloned(),
-                cache.generation() - generation,
-            ),
-            (Some("people".to_owned()), None, 2)
+            (held.items_of(&bob), held.items_of(&amy)),
+            (Some(&read[..]), Some(&filled[..])),
+            "the edited user's items alone: the OU's other users keep the fill's until the next"
         );
-        assert_eq!(now.items_of_ous.len(), 2, "the OUs' items stay");
+    }
+
+    #[tokio::test]
+    async fn test_the_overlay_asks_a_whole_fill_once_it_is_large_and_a_fill_folds_it() {
+        let cache = PolicyCache::new();
+        let items: Arc<[EffectiveItem]> = Vec::new().into();
+        let name = |n: usize| UserId::new(&format!("r1fold{n}"));
+        let edit = |n: usize| cache.put_user(&name(n), "people", items.clone());
+        for n in 0..OVERLAY_FOLD {
+            edit(n);
+        }
+        let at_the_limit = (cache.get().over.len(), poked(&cache).await);
+        edit(OVERLAY_FOLD);
+        let asked = cache.refill.load(Ordering::Acquire);
+        let past_it = (cache.get().over.len(), asked, poked(&cache).await);
+        cache.remove_user(&name(0));
+        let undone = cache.get().over.len();
+        fill_policy_cache(&Directory::default(), &cache)
+            .await
+            .unwrap();
+        assert_eq!(
+            (at_the_limit, past_it, undone, cache.get().over.len()),
+            (
+                (OVERLAY_FOLD, false),
+                (OVERLAY_FOLD + 1, true, true),
+                OVERLAY_FOLD,
+                0
+            ),
+            "past the fold size an edit asks a whole fill; an edit back to what the fill holds \
+             leaves the overlay; the fill empties it"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_a_reread_that_changes_nothing_swaps_nothing() {
+        let _judging = Judging::only(&[LATE, OTHER]);
+        let cache = PolicyCache::new();
+        let directory = Directory::knowing(&[LATE, OTHER]).listing(&[LATE, OTHER]);
+        fill_policy_cache(&directory, &cache).await.unwrap();
+        let generation = cache.generation();
+        for n in 0..2_000 {
+            let user = UserId::new([LATE, OTHER][n % 2]);
+            user_written(&directory, &cache, &user).await;
+        }
+        assert_eq!(
+            (cache.generation() - generation, poked(&cache).await),
+            (0, false),
+            "2,000 re-reads of users as the cache holds them: no swap, and no fill asked"
+        );
     }
 
     struct Names(&'static [&'static str]);
@@ -2787,7 +2984,7 @@ mod tests {
     }
 
     fn ou_of(cache: &PolicyCache, user: &UserId) -> Option<String> {
-        cache.get().ous_of_users.get(user).cloned()
+        cache.get().ou_of(user).map(str::to_owned)
     }
 
     async fn returns(hook: impl Future<Output = ()>) -> bool {

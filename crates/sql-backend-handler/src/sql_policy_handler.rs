@@ -1191,14 +1191,14 @@ mod tests {
         let root = policy(&handler, "Root", &[("enable-mfa", "enabled")]).await;
         let labs = policy(&handler, "Labs", &[("enable-mfa", "always")]).await;
         assert_eq!(
-            cache.get().ous_of_users.len(),
+            cache.get().ous_of_users().len(),
             0,
             "while no OU sets an enforced item the writes fill nothing"
         );
         handler.set_ou_policy("", root).await.unwrap();
         handler.set_ou_policy("people\\labs", labs).await.unwrap();
         assert_eq!(
-            cache.get().ous_of_users.len(),
+            cache.get().ous_of_users().len(),
             2,
             "the first OU to set enable-mfa fills the cache at once"
         );
@@ -1207,7 +1207,7 @@ mod tests {
         fill_policy_cache(&handler, cache).await.unwrap();
         let ous: BTreeMap<_, _> = cache
             .get()
-            .ous_of_users
+            .ous_of_users()
             .iter()
             .map(|(user, ou)| (user.as_str().to_owned(), ou.clone()))
             .collect();
@@ -1298,7 +1298,7 @@ mod tests {
         let (kept, gone) = (UserId::new("e0kept"), UserId::new("e0gone"));
         let held = || {
             let entries = cache.get();
-            let ou = |user: &UserId| entries.ous_of_users.get(user).cloned();
+            let ou = |user: &UserId| entries.ou_of(user).map(str::to_owned);
             (ou(&kept), ou(&gone))
         };
         let stale = || (None, Some("people".to_owned()));
@@ -1354,7 +1354,7 @@ mod tests {
         user_written(&handler, cache, &user).await;
         let entries = cache.get();
         assert_eq!(
-            entries.ous_of_users.get(&user).map(String::as_str),
+            entries.ou_of(&user),
             Some("people\\labs"),
             "the delete's hook, run last, re-reads and keeps the user that exists again"
         );

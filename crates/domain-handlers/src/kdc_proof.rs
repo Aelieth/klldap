@@ -1,8 +1,9 @@
 use crate::enforcement::{
-    Entries, PolicyCache, UserFacts, cached_mfa_policy, mfa_can_be_on, user_written,
+    Entries, PolicyCache, Snapshot, UserFacts, mfa_can_be_on, mfa_policy_from, user_written,
 };
 use crate::handler::{PolicyBackendHandler, UserBackendHandler};
 use crate::mfa::{MfaEnrollmentStatus, MfaPolicy, MfaRequirement, mfa_requirement};
+use crate::policies::EffectiveItem;
 use lldap_domain::types::UserId;
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -73,10 +74,18 @@ pub fn proof_required(policy: MfaPolicy, facts: &UserFacts) -> bool {
 }
 
 /// From memory alone; a user whose value or facts are not known is not required.
-pub fn known_required(cache: &PolicyCache, entries: &Entries, user: &UserId) -> bool {
-    let policy = cached_mfa_policy(cache, entries, user);
+pub fn known_required(cache: &PolicyCache, entries: &Snapshot, user: &UserId) -> bool {
+    required_by(cache, entries.items_of(user), entries.facts_of(user))
+}
+
+fn required_by(
+    cache: &PolicyCache,
+    items: Option<&[EffectiveItem]>,
+    facts: Option<&UserFacts>,
+) -> bool {
+    let policy = mfa_policy_from(cache, items);
     let required = |(policy, facts): (MfaPolicy, &UserFacts)| proof_required(policy, facts);
-    policy.zip(entries.facts_of(user)).is_some_and(required)
+    policy.zip(facts).is_some_and(required)
 }
 
 /// Kerberos is on and some resolved value can ask a factor.
@@ -181,18 +190,16 @@ impl PolicyCache {
             self.mark(user);
             return;
         };
-        self.edit(|entries| {
-            let mut windows = entries.windows_of(user).to_vec();
+        self.edit(user, |over| {
+            let mut windows = over.windows.to_vec();
             windows.push(window);
-            entries.windows.insert(user.clone(), windows.into());
+            over.windows = windows.into();
         });
     }
 
     /// Only under the writers' lock, as `take_marks` holds it.
     fn put_windows(&self, user: &UserId, windows: Vec<ProofWindow>) {
-        self.edit(|entries| {
-            entries.windows.insert(user.clone(), windows.into());
-        });
+        self.edit(user, |over| over.windows = windows.into());
     }
 
     pub fn serve_windows(&self, store: Arc<dyn ProofStore>, runtime: tokio::runtime::Handle) {
@@ -252,10 +259,11 @@ where
     let held: &Entries = entries;
     let required = held
         .facts
-        .keys()
-        .filter(|user| known_required(cache, held, user));
-    let mut windows: HashMap<UserId, Vec<ProofWindow>> =
-        required.map(|user| (user.clone(), Vec::new())).collect();
+        .iter()
+        .filter(|(user, facts)| required_by(cache, held.items_of(user), Some(*facts)));
+    let mut windows: HashMap<UserId, Vec<ProofWindow>> = required
+        .map(|(user, _)| (user.clone(), Vec::new()))
+        .collect();
     if windows.is_empty() {
         return;
     }
@@ -516,11 +524,7 @@ mod tests {
             assert_eq!(proof_at_as(&cache, &user, NOW, None), verdict, "{label}");
         }
         let cache = cache_with(None, "always", &enrolled, &[]);
-        let mut entries = (*cache.get()).clone();
-        entries
-            .items_of_ous
-            .insert("people".to_owned(), vec![unsourced("always")].into());
-        cache.replace(entries);
+        cache.put_user(&user, "people", vec![unsourced("always")].into());
         assert_eq!(
             proof_at_as(&cache, &user, NOW, None),
             NotAsked,

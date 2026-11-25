@@ -2090,6 +2090,41 @@ pub(crate) mod tests {
         (factor, required, cached)
     }
 
+    const DOORS: [&str; 6] = [
+        "LDAP bind",
+        "simple login",
+        "web login",
+        "token refresh",
+        "token use",
+        "Kerberos AS",
+    ];
+
+    /// Per door, whether the right password alone is taken and nothing more is asked.
+    async fn free_at_doors(
+        h: &SqlBackendHandler,
+        name: &str,
+        now: u64,
+    ) -> Vec<(&'static str, bool)> {
+        use lldap_domain_handlers::kdc_proof::{ProofVerdict, proof_at_as};
+        let user = UserId::new(name);
+        let at_as = proof_at_as(h.policy_cache, &user, now as i64, None);
+        let ldap = RequestMeta::ldap(None, None);
+        let simple = RequestMeta::http(None, None);
+        let signed_in = LoginOutcome::Authenticated {
+            user_id: user.clone(),
+            mfa_enrollment_pending: false,
+        };
+        let free = [
+            with_request(ldap, doors::bind(h, name, doors::RIGHT)).await,
+            with_request(simple, doors::bind(h, name, doors::RIGHT)).await,
+            doors::web(h, name, doors::RIGHT, None).await == Ok(signed_in),
+            h.mfa_requirement(&user).await.unwrap() == MfaRequirement::None,
+            !h.enrollment_pending(&user).await.unwrap(),
+            at_as == ProofVerdict::NotAsked,
+        ];
+        DOORS.into_iter().zip(free).collect()
+    }
+
     /// Every database: a protected case twin takes the exempt group's own name, and its members
     /// then stand as members added to the exempt group do.
     pub(crate) async fn exempt_rename_lane(pool: &DbConnection) {
@@ -2107,8 +2142,10 @@ pub(crate) mod tests {
             doors::user_in(&h, name, "w16ou").await;
             doors::enroll(&h, name, at).await;
         }
+        doors::user_in(&h, "w16dee", "w16ou").await;
         let twin = insert_group(&h, TWIN).await;
         insert_membership(&h, twin, "w16amy").await;
+        insert_membership(&h, twin, "w16dee").await;
         fill_policy_cache(&h, h.policy_cache).await.unwrap();
         let rename = |name: &str| UpdateGroupRequest {
             group_id: twin,
@@ -2122,6 +2159,7 @@ pub(crate) mod tests {
             h.delete_group(twin).await.is_err(),
         ];
         let before = standing(&h, "w16amy").await;
+        let held = free_at_doors(&h, "w16dee", at).await;
         let _ = doors::rows(&log, &[]);
         h.update_group(rename(MFA_DISABLED_GROUP)).await.unwrap();
         let renamed = doors::rows(&log, &[LogKind::GroupUpdate]);
@@ -2129,8 +2167,9 @@ pub(crate) mod tests {
         insert_membership(&h, twin, "w16cal").await;
         let cal = standing(&h, "w16cal").await;
         let warned = exempt_group_twin(&h).await.unwrap();
+        let freed = free_at_doors(&h, "w16dee", at).await;
         let totp = Some(MFA_TYPE_TOTP.to_owned());
-        let detail = "display_name; members exempt from MFA: 1";
+        let detail = "display_name; members exempt from MFA: 2";
         assert_eq!(
             (refused, before),
             ([true; 3], (totp.clone(), MfaRequirement::Totp, Some(false))),
@@ -2149,6 +2188,13 @@ pub(crate) mod tests {
                 None
             ),
             "the rename's one row; a renamed-in member stands as an added one; no warning"
+        );
+        let all = |free: bool| DOORS.map(|door| (door, free)).to_vec();
+        assert_eq!(
+            (held, freed),
+            (all(false), all(true)),
+            "per door: a member of the group named in another case, not enrolled, is held to \
+             the factor; once the group has the exact name, its password alone is taken"
         );
     }
 

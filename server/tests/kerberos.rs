@@ -1116,8 +1116,8 @@ fn kerberos_client_case_fold() {
     expect_ok(&kinit(&realm.krb, FIRST), "kinit livebob, fold off");
 }
 
-fn seal_for(key: &str, user: &str, password: &str) -> String {
-    seal_kerberos_envelope(key, user, password).expect("seal")
+fn seal_for(key: &str, user: &str, server_data: &str, password: &str) -> String {
+    seal_kerberos_envelope(key, user, server_data, password).expect("seal")
 }
 
 #[test]
@@ -1261,9 +1261,9 @@ fn kerberos_web_password_path() {
         ),
     ];
     for (row, user, upload, envelope, status, says, now, refused) in rows {
-        let (key, got, body) = register_sealed(&http, &base, &token, user, upload, |key| {
+        let (key, got, body) = register_sealed(&http, &base, &token, user, upload, |key, start| {
             envelope.map(|(sealed_for, password)| {
-                seal_for(key.unwrap_or(any_key.as_str()), sealed_for, password)
+                seal_for(key.unwrap_or(any_key.as_str()), sealed_for, start, password)
             })
         });
         assert_eq!(key.is_some(), user == SYNCED, "{row}: the start's key");

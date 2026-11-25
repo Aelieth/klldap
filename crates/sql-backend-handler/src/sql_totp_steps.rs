@@ -4,6 +4,7 @@ use crate::sql_mfa_handler::now_unix;
 use crate::sql_mfa_windows::prune_windows;
 use crate::sql_tables::DbConnection;
 use crate::sql_used_proofs::prune_used_proofs;
+use crate::sql_used_starts::prune_used_starts;
 use lldap_domain::types::UserId;
 use lldap_domain_model::error::{DomainError, Result};
 use lldap_domain_model::model::{self, TotpStepsColumn};
@@ -231,11 +232,12 @@ impl SqlBackendHandler {
         let both = async {
             let steps = prune(&self.sql_pool, current_step()).await?;
             let proofs = prune_used_proofs(&self.sql_pool, now_unix()).await?;
+            let starts = prune_used_starts(&self.sql_pool, now_unix()).await?;
             let windows = match self.proofs {
                 Some(settings) => prune_windows(&self.sql_pool, now_unix() - settings.kept).await?,
                 None => 0,
             };
-            Ok::<u64, DomainError>(steps + proofs + windows)
+            Ok::<u64, DomainError>(steps + proofs + starts + windows)
         };
         let pruned = tokio::time::timeout(PRUNE_BOUND, both)
             .await
@@ -549,12 +551,17 @@ pub(crate) mod tests {
         ];
         assert_eq!(
             (pruned, deletes()),
-            ([true, true], 2),
-            "one prune of both tables at start, then none until a row is written"
+            ([true, true], 3),
+            "one prune of the steps, the proofs and the starts at start, then none until a row \
+             is written"
         );
         handler.note_codes_written();
         handler.prune_totp_steps().await.unwrap();
-        assert_eq!(deletes(), 2, "a row written: the next tick prunes both");
+        assert_eq!(
+            deletes(),
+            3,
+            "a row written: the next tick prunes the three"
+        );
     }
 
     #[tokio::test]

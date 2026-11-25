@@ -3,7 +3,7 @@ use lldap_domain_model::error::Result;
 use lldap_mfa::ENROLLMENT_PROOF_CLOCK_TOLERANCE_SECS;
 use sea_orm::{ConnectionTrait, DbBackend, Statement, Value};
 
-fn hex(id: &[u8; 16]) -> String {
+pub(crate) fn hex(id: &[u8; 16]) -> String {
     id.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 

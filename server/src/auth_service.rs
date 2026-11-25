@@ -20,6 +20,7 @@ use lldap_access_control::{ReadonlyBackendHandler, UserReadableBackendHandler};
 use lldap_auth::{
     JWTClaims,
     access_control::{Permission, ValidationResults},
+    kerberos_envelope::EnvelopeUnopened,
     login, password_reset, registration,
 };
 use lldap_domain::types::{GroupDetails, GroupName, LoginOutcome, UserId, kerberos_sync_enabled};
@@ -36,12 +37,12 @@ use lldap_domain_handlers::logging::{self, LogKind, with_actor};
 use lldap_domain_handlers::mfa::{MfaPolicy, MfaRequirement, MfaResetReason};
 use lldap_domain_handlers::password::{
     PasswordChangeError, finish_plain, finish_synced_registration, min_length_of, realm_not_ready,
-    record_failed,
+    record_failed, refuse_unfinishable,
 };
 use lldap_domain_model::{error::DomainError, model::UserColumn};
 use lldap_graphql_server::{open_password_envelope, public_key_der_base64};
 use lldap_opaque_handler::OpaqueHandler;
-use sha2::Sha512;
+use sha2::{Digest, Sha256, Sha512};
 use std::{
     collections::HashSet,
     hash::Hash,
@@ -633,41 +634,52 @@ where
         .unwrap_or_else(error_to_http_response)
 }
 
+const NOT_AUTHORIZED: &str = "Not authorized to change the user's password";
+
+async fn password_bearer<Backend>(
+    request: &HttpRequest,
+    payload: &mut actix_web::dev::Payload,
+    data: &AppState<Backend>,
+) -> TcpResult<(ValidationResults, registration::Presenter)>
+where
+    Backend: BackendHandler + OpaqueHandler + 'static,
+{
+    use actix_web::FromRequest;
+    let bearer = BearerAuth::from_request(request, payload).await.ok();
+    // A rejected token is recorded by checked_token; only a missing one is not.
+    let checked = match bearer {
+        Some(bearer) => checked_token(data, bearer.token()).await.ok(),
+        None => {
+            logging::record_failure(LogKind::AccessDenied, None, NOT_AUTHORIZED);
+            None
+        }
+    };
+    let (validation, claims) =
+        checked.ok_or_else(|| TcpError::UnauthorizedError(NOT_AUTHORIZED.to_string()))?;
+    let presenter = registration::Presenter {
+        actor: validation.user.clone(),
+        session: claims.jti.into_bytes(),
+        reset: claims.password_reset,
+    };
+    Ok((validation, presenter))
+}
+
 #[instrument(skip_all, level = "debug")]
 async fn opaque_register_start<Backend>(
-    request: actix_web::HttpRequest,
-    payload: actix_web::web::Payload,
-    data: web::Data<AppState<Backend>>,
+    request: &HttpRequest,
+    payload: &mut actix_web::dev::Payload,
+    data: &AppState<Backend>,
 ) -> TcpResult<registration::ServerRegistrationStart>
 where
     Backend: BackendHandler + OpaqueHandler + 'static,
 {
     use actix_web::FromRequest;
-    let inner_payload = &mut payload.into_inner();
-    let bearer = BearerAuth::from_request(&request, inner_payload).await.ok();
-    // A rejected token is recorded by check_if_token_is_valid; only a missing one is not.
-    let validation_result = match bearer {
-        Some(bearer) => check_if_token_is_valid(&data, bearer.token()).await.ok(),
-        None => {
-            logging::record_failure(
-                LogKind::AccessDenied,
-                None,
-                "Not authorized to change the user's password",
-            );
-            None
-        }
-    }
-    .ok_or_else(|| {
-        TcpError::UnauthorizedError("Not authorized to change the user's password".to_string())
-    })?;
+    let (validation_result, by) = password_bearer(request, payload, data).await?;
     let registration_start_request =
-        web::Json::<registration::ClientRegistrationStartRequest>::from_request(
-            &request,
-            inner_payload,
-        )
-        .await
-        .map_err(|e| TcpError::BadRequest(format!("{e:#?}")))?
-        .into_inner();
+        web::Json::<registration::ClientRegistrationStartRequest>::from_request(request, payload)
+            .await
+            .map_err(|e| TcpError::BadRequest(format!("{e:#?}")))?
+            .into_inner();
     let user_id = &registration_start_request.username;
     let user_is_admin = data
         .get_readonly_handler()
@@ -681,15 +693,14 @@ where
             LogKind::AccessDenied,
             Some(user_id.as_str()),
             false,
-            Some("Not authorized to change the user's password"),
+            Some(NOT_AUTHORIZED),
         );
-        return Err(TcpError::UnauthorizedError(
-            "Not authorized to change the user's password".to_string(),
-        ));
+        return Err(TcpError::UnauthorizedError(NOT_AUTHORIZED.to_string()));
     }
     start_answer(
         data.get_password_handler(),
         registration_start_request,
+        by,
         settled_state(),
         public_key_der_base64,
     )
@@ -699,6 +710,7 @@ where
 async fn start_answer(
     handler: &(impl OpaqueHandler + UserReadableBackendHandler + PolicyBackendHandler),
     request: registration::ClientRegistrationStartRequest,
+    by: registration::Presenter,
     state: KerberosState,
     key: impl FnOnce() -> String,
 ) -> TcpResult<registration::ServerRegistrationStart> {
@@ -707,12 +719,18 @@ async fn start_answer(
     let min = min_length_of(handler, &user_id)
         .await
         .map_err(password_change_error)?;
-    let response = handler.registration_start(request).await?;
+    let answered = kerberos_envelope_key.as_deref().map(envelope_key_hash);
+    let response = handler.registration_start_by(request, by, answered).await?;
     Ok(registration::ServerRegistrationStart {
         response,
         kerberos_envelope_key,
         password_min_length: Some(min as u32),
     })
+}
+
+/// What a start seals of the envelope key it answers with, and its finish compares.
+fn envelope_key_hash(key: &str) -> [u8; 32] {
+    Sha256::digest(key.as_bytes()).into()
 }
 
 /// Only a user with Kerberos sync gets the key; anyone else's start answer has none.
@@ -758,7 +776,7 @@ async fn opaque_register_start_handler<Backend>(
 where
     Backend: BackendHandler + OpaqueHandler + 'static,
 {
-    opaque_register_start(request, payload, data)
+    opaque_register_start(&request, &mut payload.into_inner(), &data)
         .await
         .map(|res| ApiResult::Left(web::Json(res)))
         .unwrap_or_else(error_to_api_response)
@@ -768,15 +786,15 @@ const ENVELOPE_WITHOUT_SYNC: &str =
     "a Kerberos password envelope is taken only for a user with Kerberos sync";
 const ENVELOPE_MISSING: &str =
     "a user with Kerberos sync needs the Kerberos password envelope; reload the page and retry";
-const ENVELOPE_UNOPENED: &str = "the Kerberos password envelope did not open";
 const RESET_FOR_ANOTHER: &str = "Password reset token does not match the registered user";
 
 /// A synced user's sealed password is registered by the server, in one transaction with the keys.
 async fn finish_registration<Handler>(
     handler: &Handler,
-    reset_user: Option<&UserId>,
+    presenter: &registration::Presenter,
     body: registration::ClientRegistrationFinish,
-    open: impl FnOnce(&str, &UserId) -> anyhow::Result<Zeroizing<String>>,
+    this_key: impl FnOnce() -> String,
+    open: impl FnOnce(&str, &UserId, &str) -> Result<Zeroizing<String>, EnvelopeUnopened>,
 ) -> TcpResult<UserId>
 where
     Handler: OpaqueHandler + UserReadableBackendHandler + PolicyBackendHandler,
@@ -785,8 +803,11 @@ where
         request,
         kerberos_password_envelope,
     } = body;
-    let user_id = handler.registration_user(&request).await?;
-    if reset_user.is_some_and(|reset_user| *reset_user != user_id) {
+    let registration::Claim {
+        user: user_id,
+        envelope_key,
+    } = handler.registration_claim(&request, presenter).await?;
+    if presenter.reset && presenter.actor != user_id {
         logging::record_failure(
             LogKind::AccessDenied,
             Some(user_id.as_str()),
@@ -816,12 +837,15 @@ where
             KerberosState::NotReady(cause) => return Err(not_ready(&user_id, cause)),
         },
     };
+    if envelope_key != Some(envelope_key_hash(&this_key())) {
+        return Err(refuse_unfinishable(&user_id).into());
+    }
     let min = min_length_of(handler, &user_id)
         .await
         .map_err(password_change_error)?;
-    let password = open(&envelope, &user_id).map_err(|e| {
-        warn!("A Kerberos password envelope for {user_id} did not open: {e}");
-        refused_change(&user_id, format!("{ENVELOPE_UNOPENED}: {e}"))
+    let password = open(&envelope, &user_id, &request.server_data).map_err(|unopened| {
+        warn!("A Kerberos password envelope for {user_id} did not open");
+        refused_change(&user_id, unopened.to_string())
     })?;
     match finish_synced_registration(handler, &user_id, &password, min).await {
         Ok(()) => {
@@ -854,40 +878,39 @@ fn password_change_error(e: PasswordChangeError) -> TcpError {
 
 #[instrument(skip_all, level = "debug")]
 async fn opaque_register_finish<Backend>(
-    http_request: HttpRequest,
-    data: web::Data<AppState<Backend>>,
-    request: web::Json<registration::ClientRegistrationFinish>,
+    http_request: &HttpRequest,
+    payload: &mut actix_web::dev::Payload,
+    data: &AppState<Backend>,
 ) -> TcpResult<HttpResponse>
 where
     Backend: TcpBackendHandler + BackendHandler + OpaqueHandler + 'static,
 {
     use actix_web::FromRequest;
-    // The ceremony authenticates itself through server_data; the bearer only names the actor
-    // and, after a reset e-mail, marks the registration as a recovery.
-    let claims = BearerAuth::from_request(&http_request, &mut actix_web::dev::Payload::None)
-        .await
-        .ok()
-        .and_then(|bearer| verified_claims(&data.jwt_key, bearer.token()));
-    let actor = claims.as_ref().map(|claims| UserId::new(&claims.user));
-    let reset_user = claims
-        .filter(|claims| claims.password_reset)
-        .map(|claims| UserId::new(&claims.user));
+    // The finish is taken only from the session that made the start.
+    let (_, presenter) = password_bearer(http_request, payload, data).await?;
+    let body =
+        web::Json::<registration::ClientRegistrationFinish>::from_request(http_request, payload)
+            .await
+            .map_err(|e| TcpError::BadRequest(format!("{e:#?}")))?
+            .into_inner();
+    let actor = Some(presenter.actor.clone());
     with_actor(
         actor.clone(),
         finish_registration(
             data.get_password_handler(),
-            reset_user.as_ref(),
-            request.into_inner(),
+            &presenter,
+            body,
+            public_key_der_base64,
             open_password_envelope,
         ),
     )
     .await?;
     // A recovery clears the second factor only once the new password is committed.
-    if let Some(user_id) = reset_user {
+    if presenter.reset {
         with_actor(
             actor,
             data.get_mfa_handler()
-                .reset_user_mfa(&user_id, MfaResetReason::PasswordReset),
+                .reset_user_mfa(&presenter.actor, MfaResetReason::PasswordReset),
         )
         .await?;
     }
@@ -896,13 +919,13 @@ where
 
 async fn opaque_register_finish_handler<Backend>(
     http_request: HttpRequest,
+    payload: web::Payload,
     data: web::Data<AppState<Backend>>,
-    request: web::Json<registration::ClientRegistrationFinish>,
 ) -> HttpResponse
 where
     Backend: TcpBackendHandler + BackendHandler + OpaqueHandler + 'static,
 {
-    opaque_register_finish(http_request, data, request)
+    opaque_register_finish(&http_request, &mut payload.into_inner(), &data)
         .await
         .unwrap_or_else(error_to_http_response)
 }
@@ -975,18 +998,19 @@ async fn account_is_disabled<Backend: BackendHandler>(
     }
 }
 
-// Signature and expiry only: names the user without the blacklist and disabled-account
-// checks, and without recording anything.
-fn verified_claims(jwt_key: &Hmac<Sha512>, token_str: &str) -> Option<JWTClaims> {
-    let token: Token<_> = VerifyWithKey::verify_with_key(token_str, jwt_key).ok()?;
-    (token.claims().exp > Utc::now()).then(|| token.claims().clone())
-}
-
 #[instrument(skip_all, level = "debug", err, ret)]
 pub(crate) async fn check_if_token_is_valid<Backend: BackendHandler + OpaqueHandler>(
     state: &AppState<Backend>,
     token_str: &str,
 ) -> Result<ValidationResults, actix_web::Error> {
+    let checked = checked_token(state, token_str).await;
+    checked.map(|(validation, _)| validation)
+}
+
+async fn checked_token<Backend: BackendHandler + OpaqueHandler>(
+    state: &AppState<Backend>,
+    token_str: &str,
+) -> Result<(ValidationResults, JWTClaims), actix_web::Error> {
     let token: Token<_> =
         VerifyWithKey::verify_with_key(token_str, &state.jwt_key).map_err(|_| {
             // Recorded (not terminal-only) so a junk-JWT flood is visible and coalesces.
@@ -1048,7 +1072,7 @@ pub(crate) async fn check_if_token_is_valid<Backend: BackendHandler + OpaqueHand
         return Err(ErrorServiceUnavailable(cause));
     }
     admit_token_use(state.backend_handler.unsafe_get_handler(), &validation.user).await?;
-    Ok(validation)
+    Ok((validation, token.claims().clone()))
 }
 
 const ACCESS_REFUSED: &str = "Access refused";
@@ -1205,20 +1229,47 @@ pub(crate) mod tests {
         }
     }
 
-    fn never_opened(_: &str, _: &UserId) -> anyhow::Result<Zeroizing<String>> {
+    type Opened = Result<Zeroizing<String>, EnvelopeUnopened>;
+
+    fn never_opened(_: &str, _: &UserId, _: &str) -> Opened {
         unreachable!("no envelope was sent")
     }
 
-    // Stands in for the RSA envelope: "for:<user>" opens only for that user.
-    fn open_as(
-        password: &'static str,
-    ) -> impl Fn(&str, &UserId) -> anyhow::Result<Zeroizing<String>> {
-        move |envelope, user| match envelope.strip_prefix("for:") {
-            Some(sealed_for) if sealed_for == user.as_str() => {
+    // Stands in for the RSA envelope: "for:<user>@<server data>" opens only for that user's start.
+    fn open_as(password: &'static str) -> impl Fn(&str, &UserId, &str) -> Opened {
+        move |envelope, user, server_data| {
+            if envelope == format!("for:{user}@{server_data}") {
                 Ok(Zeroizing::new(password.to_owned()))
+            } else {
+                Err(EnvelopeUnopened)
             }
-            _ => anyhow::bail!("Decryption failed"),
         }
+    }
+
+    const KEY: &str = "the key";
+
+    fn the_key() -> String {
+        KEY.to_owned()
+    }
+
+    fn presenter(user: &str, reset: bool) -> registration::Presenter {
+        registration::Presenter {
+            actor: UserId::new(user),
+            session: [7; 16],
+            reset,
+        }
+    }
+
+    fn claimed(user: &str, key: Option<&str>) -> registration::Claim {
+        registration::Claim {
+            user: UserId::new(user),
+            envelope_key: key.map(envelope_key_hash),
+        }
+    }
+
+    fn unfinishable() -> (u16, String) {
+        let text = lldap_domain_handlers::password::REGISTRATION_UNFINISHABLE;
+        (401, format!("`Authentication error {text}`"))
     }
 
     #[tokio::test]
@@ -1384,10 +1435,10 @@ pub(crate) mod tests {
         ];
         for (row, reset, target, expected) in rows {
             let mut mock = MockTestBackendHandler::new();
-            mock.expect_registration_user()
+            mock.expect_registration_claim()
                 .times(1)
-                .returning(move |_| match target {
-                    Ok(user) => Ok(UserId::new(user)),
+                .returning(move |_, _| match target {
+                    Ok(user) => Ok(claimed(user, None)),
                     Err(()) => Err(DomainError::InternalError("not sealed".to_owned())),
                 });
             let written = usize::from(expected.is_ok());
@@ -1397,8 +1448,9 @@ pub(crate) mod tests {
             mock.expect_registration_finish()
                 .times(written)
                 .returning(|_| Ok(UserId::new("alice")));
-            let reset = reset.map(UserId::new);
-            let got = finish_registration(&mock, reset.as_ref(), finish_body(None), never_opened)
+            let by = presenter(reset.unwrap_or("admin"), reset.is_some());
+            let finish = finish_registration(&mock, &by, finish_body(None), the_key, never_opened);
+            let got = finish
                 .await
                 .map_err(|e| error_to_http_response(e).status().as_u16());
             assert_eq!(got, expected.map(|()| alice_id.clone()), "{row}");
@@ -1413,6 +1465,7 @@ pub(crate) mod tests {
         use lldap_domain_handlers::password::PASSWORD_HAS_NUL;
         use lldap_test_utils::recording_log::LogGuard;
         const OPENED: &str = "Opened-pass-1";
+        const UNOPENED: &str = "the Kerberos password envelope did not open";
         const REFUSAL: &str = "password policy: min_length 40";
         use lldap_test_utils::recording_kerberos::{DEGRADED_CAUSE, DegradedGuard, NotReadyGuard};
         enum Kdc {
@@ -1459,7 +1512,7 @@ pub(crate) mod tests {
             (
                 "no sync, an envelope",
                 false,
-                Some("for:alice"),
+                Some("for:alice@sealed"),
                 OPENED,
                 Kdc::Ready,
                 400,
@@ -1479,17 +1532,27 @@ pub(crate) mod tests {
             (
                 "sync, sealed for bob",
                 true,
-                Some("for:bob"),
+                Some("for:bob@sealed"),
                 OPENED,
                 Kdc::Ready,
                 400,
                 false,
-                Some("the Kerberos password envelope did not open: Decryption failed"),
+                Some(UNOPENED),
+            ),
+            (
+                "sync, sealed for alice's other start",
+                true,
+                Some("for:alice@another"),
+                OPENED,
+                Kdc::Ready,
+                400,
+                false,
+                Some(UNOPENED),
             ),
             (
                 "sync, Kerberos disabled: never opened",
                 true,
-                Some("for:alice"),
+                Some("for:alice@sealed"),
                 OPENED,
                 Kdc::Disabled,
                 400,
@@ -1499,7 +1562,7 @@ pub(crate) mod tests {
             (
                 "sync, the KDC not ready: never opened",
                 true,
-                Some("for:alice"),
+                Some("for:alice@sealed"),
                 OPENED,
                 Kdc::NotReady,
                 503,
@@ -1519,7 +1582,7 @@ pub(crate) mod tests {
             (
                 "sync, directory-only: never opened",
                 true,
-                Some("for:alice"),
+                Some("for:alice@sealed"),
                 OPENED,
                 Kdc::DirectoryOnly,
                 503,
@@ -1539,7 +1602,7 @@ pub(crate) mod tests {
             (
                 "sync, the last write unsettled: never opened",
                 true,
-                Some("for:alice"),
+                Some("for:alice@sealed"),
                 OPENED,
                 Kdc::Unsettled,
                 503,
@@ -1569,7 +1632,7 @@ pub(crate) mod tests {
             (
                 "sync, too short",
                 true,
-                Some("for:alice"),
+                Some("for:alice@sealed"),
                 "Short-7",
                 Kdc::Ready,
                 400,
@@ -1579,7 +1642,7 @@ pub(crate) mod tests {
             (
                 "sync, a NUL in nine characters",
                 true,
-                Some("for:alice"),
+                Some("for:alice@sealed"),
                 "a\0aaaaaaa",
                 Kdc::Ready,
                 400,
@@ -1589,7 +1652,7 @@ pub(crate) mod tests {
             (
                 "sync, Kerberos's check refuses",
                 true,
-                Some("for:alice"),
+                Some("for:alice@sealed"),
                 OPENED,
                 Kdc::Refusing,
                 400,
@@ -1599,7 +1662,7 @@ pub(crate) mod tests {
             (
                 "sync, the commit is refused",
                 true,
-                Some("for:alice"),
+                Some("for:alice@sealed"),
                 OPENED,
                 refused,
                 400,
@@ -1609,7 +1672,7 @@ pub(crate) mod tests {
             (
                 "sync, the sync changed before the commit",
                 true,
-                Some("for:alice"),
+                Some("for:alice@sealed"),
                 OPENED,
                 changed,
                 400,
@@ -1619,7 +1682,7 @@ pub(crate) mod tests {
             (
                 "sync, the commit fails",
                 true,
-                Some("for:alice"),
+                Some("for:alice@sealed"),
                 OPENED,
                 failed,
                 500,
@@ -1629,7 +1692,7 @@ pub(crate) mod tests {
             (
                 "sync, committed",
                 true,
-                Some("for:alice"),
+                Some("for:alice@sealed"),
                 OPENED,
                 Kdc::Ready,
                 200,
@@ -1668,9 +1731,9 @@ pub(crate) mod tests {
             let plain_realm = matches!(kdc, Kdc::Ready) || directory_only;
             let upstream = !sync && envelope.is_none() && plain_realm;
             let mut mock = MockTestBackendHandler::new();
-            mock.expect_registration_user()
+            mock.expect_registration_claim()
                 .times(1)
-                .returning(|_| Ok(UserId::new("alice")));
+                .returning(|_, _| Ok(claimed("alice", Some(KEY))));
             mock.expect_get_user_details()
                 .with(eq(UserId::new("alice")))
                 .times(1)
@@ -1685,10 +1748,12 @@ pub(crate) mod tests {
                 .times(usize::from(committed))
                 .returning(move |_| Ok(start.clone()));
             let opened = Cell::new(false);
-            let finish = finish_registration(&mock, None, finish_body(envelope), |sealed, user| {
+            let open = |sealed: &str, user: &UserId, start: &str| {
                 opened.set(true);
-                open_as(password)(sealed, user)
-            });
+                open_as(password)(sealed, user, start)
+            };
+            let by = presenter("row-reader", false);
+            let finish = finish_registration(&mock, &by, finish_body(envelope), the_key, open);
             let got = with_actor(reader(), finish)
                 .await
                 .map_err(|e| error_to_http_response(e).status().as_u16());
@@ -1739,14 +1804,15 @@ pub(crate) mod tests {
 
         let ready = RecordingGuard::install();
         let mut mock = MockTestBackendHandler::new();
-        mock.expect_registration_user()
-            .returning(|_| Ok(UserId::new("alice")));
+        mock.expect_registration_claim()
+            .returning(|_, _| Ok(claimed("alice", None)));
         mock.expect_get_user_details()
             .returning(|_| Ok(alice(false)));
         mock.expect_registration_finish()
             .times(1)
             .returning(|_| Err(DomainError::InternalError("the disk is full".to_owned())));
-        let stored = finish_registration(&mock, None, finish_body(None), never_opened);
+        let by = presenter("row-reader", false);
+        let stored = finish_registration(&mock, &by, finish_body(None), the_key, never_opened);
         let stored = with_actor(reader(), stored)
             .await
             .map_err(|e| error_to_http_response(e).status().as_u16());
@@ -1759,11 +1825,11 @@ pub(crate) mod tests {
         drop(ready);
 
         let mut mock = MockTestBackendHandler::new();
-        mock.expect_registration_user()
-            .returning(|_| Ok(UserId::new("alice")));
+        mock.expect_registration_claim()
+            .returning(|_, _| Ok(claimed("alice", None)));
         mock.expect_get_user_details().times(0);
-        let bob = UserId::new("bob");
-        let reset = finish_registration(&mock, Some(&bob), finish_body(None), never_opened);
+        let bob = presenter("bob", true);
+        let reset = finish_registration(&mock, &bob, finish_body(None), the_key, never_opened);
         let reset = with_actor(reader(), reset)
             .await
             .map_err(|e| error_to_http_response(e).status().as_u16());
@@ -1831,9 +1897,9 @@ pub(crate) mod tests {
             let guard = RecordingGuard::install();
             let committed = status == 200;
             let mut mock = MockTestBackendHandler::new();
-            mock.expect_registration_user()
+            mock.expect_registration_claim()
                 .times(1)
-                .returning(|_| Ok(UserId::new("alice")));
+                .returning(|_, _| Ok(claimed("alice", Some(KEY))));
             mock.expect_get_user_details()
                 .with(eq(UserId::new("alice")))
                 .times(1)
@@ -1851,11 +1917,15 @@ pub(crate) mod tests {
                 .times(usize::from(committed))
                 .returning(move |_| Ok(start.clone()));
             let opened = Cell::new(false);
-            let finish =
-                finish_registration(&mock, None, finish_body(Some("for:alice")), |e, u| {
-                    opened.set(true);
-                    open_as(password)(e, u)
-                });
+            let open = |sealed: &str, user: &UserId, start: &str| {
+                opened.set(true);
+                open_as(password)(sealed, user, start)
+            };
+            let (by, body) = (
+                presenter("alice", false),
+                finish_body(Some("for:alice@sealed")),
+            );
+            let finish = finish_registration(&mock, &by, body, the_key, open);
             let got = finish
                 .await
                 .map_err(|e| error_to_http_response(e).status().as_u16());
@@ -1924,9 +1994,14 @@ pub(crate) mod tests {
                     entry.ok_or_else(|| DomainError::InternalError("down".to_owned()))
                 });
             let start = start_response();
-            mock.expect_registration_start()
+            let sealed = (
+                presenter("admin", false),
+                sync.then(|| envelope_key_hash(KEY)),
+            );
+            mock.expect_registration_start_by()
+                .withf(move |_, by, key| (by, key) == (&sealed.0, &sealed.1))
                 .times(usize::from(expected.is_ok()))
-                .returning(move |_| Ok(start.clone()));
+                .returning(move |_, _, _| Ok(start.clone()));
             let mut rng = rand::rngs::OsRng;
             let request = registration::ClientRegistrationStartRequest {
                 username: UserId::new("alice"),
@@ -1937,15 +2012,14 @@ pub(crate) mod tests {
                 .unwrap()
                 .message,
             };
-            let got = start_answer(&mock, request, KerberosState::Ready, || {
-                "the key".to_owned()
-            })
-            .await
-            .map(|answer| (answer.kerberos_envelope_key, answer.password_min_length))
-            .map_err(|e| {
-                let text = e.to_string();
-                (error_to_http_response(e).status().as_u16(), text)
-            });
+            let by = presenter("admin", false);
+            let got = start_answer(&mock, request, by, KerberosState::Ready, the_key)
+                .await
+                .map(|answer| (answer.kerberos_envelope_key, answer.password_min_length))
+                .map_err(|e| {
+                    let text = e.to_string();
+                    (error_to_http_response(e).status().as_u16(), text)
+                });
             let rows: Vec<_> = log
                 .recorder()
                 .take_events()
@@ -2047,14 +2121,38 @@ pub(crate) mod tests {
             .to_owned()
     }
 
+    /// The finish route's status and body for `body`, presented with `bearer`.
+    async fn finished<B>(
+        state: &web::Data<AppState<B>>,
+        bearer: Option<&str>,
+        body: &registration::ClientRegistrationFinish,
+    ) -> (u16, String)
+    where
+        B: TcpBackendHandler + BackendHandler + OpaqueHandler + 'static,
+    {
+        let request = actix_web::test::TestRequest::post().set_json(body);
+        let request = match bearer {
+            Some(token) => request.insert_header(("Authorization", format!("Bearer {token}"))),
+            None => request,
+        };
+        let (request, mut payload) = request.to_http_parts();
+        let response = opaque_register_finish(&request, &mut payload, state).await;
+        let (status, body) = answered(response.unwrap_or_else(error_to_http_response)).await;
+        (status, String::from_utf8(body).unwrap())
+    }
+
     #[actix_web::test]
     async fn test_the_finish_route_refuses_a_reset_for_another_user_before_any_write() {
         let _backend = ONE_BACKEND.lock().await;
+        let _guard = EnforcementGuard::none();
         for (sealed_for, status, writes) in [("alice", 200, 1), ("bob", 401, 0)] {
             let mut mock = MockTestBackendHandler::new();
-            mock.expect_registration_user()
+            mock.expect_get_user_groups()
+                .returning(|_| Ok(HashSet::new()));
+            mock.expect_registration_claim()
+                .withf(|_, by| by.reset && by.actor == UserId::new("alice"))
                 .times(1)
-                .returning(move |_| Ok(UserId::new(sealed_for)));
+                .returning(move |_, _| Ok(claimed(sealed_for, None)));
             mock.expect_get_user_details()
                 .times(writes)
                 .returning(|_| Ok(alice(false)));
@@ -2066,17 +2164,279 @@ pub(crate) mod tests {
                 .returning(|_, _| Ok(()));
             let state = app_state(mock);
             let token = reset_token(&state.jwt_key, "alice");
-            let request = actix_web::test::TestRequest::post()
-                .insert_header(("Authorization", format!("Bearer {token}")))
-                .to_http_request();
-            let response =
-                opaque_register_finish_handler(request, state, web::Json(finish_body(None))).await;
+            let (got, _) = finished(&state, Some(&token), &finish_body(None)).await;
+            assert_eq!(got, status, "sealed for {sealed_for}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_start_answered_with_another_key_is_refused_before_the_envelope_is_opened() {
+        let _backend = ONE_BACKEND.lock().await;
+        use lldap_domain_handlers::password::REGISTRATION_UNFINISHABLE;
+        use lldap_test_utils::recording_log::LogGuard;
+        let rows = [
+            ("this process's key", Some(KEY), Ok(())),
+            (
+                "another process's key",
+                Some("another key"),
+                Err(unfinishable()),
+            ),
+            ("a start that answered no key", None, Err(unfinishable())),
+        ];
+        let log = LogGuard::install_on_this_thread();
+        for (row, answered_key, expected) in rows {
+            let guard = RecordingGuard::install();
+            let opens = usize::from(expected.is_ok());
+            let mut mock = MockTestBackendHandler::new();
+            mock.expect_registration_claim()
+                .times(1)
+                .returning(move |_, _| Ok(claimed("alice", answered_key)));
+            mock.expect_get_user_details()
+                .times(1)
+                .returning(|_| Ok(alice(true)));
+            mock.expect_bounded_policy_entry()
+                .times(opens)
+                .returning(|uid| Ok(minimum_entry(uid, PASSWORD_MIN_LENGTH)));
+            let start = start_response();
+            mock.expect_registration_start()
+                .times(opens)
+                .returning(move |_| Ok(start.clone()));
+            let opened = Cell::new(0);
+            let open = |sealed: &str, user: &UserId, start: &str| {
+                opened.set(opened.get() + 1);
+                open_as("Opened-pass-1")(sealed, user, start)
+            };
+            let (by, body) = (
+                presenter("alice", false),
+                finish_body(Some("for:alice@sealed")),
+            );
+            let finish = finish_registration(&mock, &by, body, the_key, open);
+            let got = finish.await.map(drop).map_err(|e| {
+                let text = e.to_string();
+                (error_to_http_response(e).status().as_u16(), text)
+            });
+            let rows: Vec<_> = log
+                .recorder()
+                .take_events()
+                .into_iter()
+                .filter(|e| e.kind == LogKind::PasswordChange && !e.success)
+                .map(|e| (e.target, e.detail))
+                .collect();
+            let one_row = expected.is_err().then(|| {
+                let detail = REGISTRATION_UNFINISHABLE.to_owned();
+                (Some("alice".to_owned()), Some(detail))
+            });
             assert_eq!(
-                response.status().as_u16(),
-                status,
-                "sealed for {sealed_for}"
+                (got, opened.get(), guard.recorder().take_ops().len(), rows),
+                (
+                    expected,
+                    opens,
+                    opens,
+                    one_row.into_iter().collect::<Vec<_>>()
+                ),
+                "{row}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_an_envelope_that_does_not_open_has_one_text_in_the_answer_and_the_row() {
+        let _backend = ONE_BACKEND.lock().await;
+        use lldap_test_utils::recording_log::LogGuard;
+        const UNOPENED: &str = "the Kerberos password envelope did not open";
+        let log = LogGuard::install_on_this_thread();
+        let guard = RecordingGuard::install();
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_registration_claim()
+            .returning(|_, _| Ok(claimed("alice", Some(KEY))));
+        mock.expect_get_user_details()
+            .returning(|_| Ok(alice(true)));
+        mock.expect_bounded_policy_entry()
+            .returning(|uid| Ok(minimum_entry(uid, PASSWORD_MIN_LENGTH)));
+        let (by, body) = (presenter("alice", false), finish_body(Some("sealed")));
+        let unopened = |_: &str, _: &UserId, _: &str| Err(EnvelopeUnopened);
+        let refused = finish_registration(&mock, &by, body, the_key, unopened)
+            .await
+            .unwrap_err();
+        let text = refused.to_string();
+        let rows: Vec<_> = log
+            .recorder()
+            .take_events()
+            .into_iter()
+            .filter(|e| !e.success)
+            .map(|e| (e.kind, e.target, e.detail))
+            .collect();
+        let row = (
+            LogKind::PasswordChange,
+            Some("alice".to_owned()),
+            Some(UNOPENED.to_owned()),
+        );
+        assert_eq!(
+            (
+                error_to_http_response(refused).status().as_u16(),
+                text,
+                rows,
+                guard.recorder().take_ops()
+            ),
+            (400, format!("Bad request: `{UNOPENED}`"), vec![row], vec![])
+        );
+    }
+
+    /// The start route as `bearer`, and the finish body a client makes of its answer.
+    async fn started<B>(
+        state: &web::Data<AppState<B>>,
+        bearer: &str,
+        user: &str,
+        password: &str,
+    ) -> registration::ClientRegistrationFinish
+    where
+        B: BackendHandler + OpaqueHandler + 'static,
+    {
+        let mut rng = rand::rngs::OsRng;
+        let start = opaque::client::registration::start_registration(password.as_bytes(), &mut rng)
+            .unwrap();
+        let body = registration::ClientRegistrationStartRequest {
+            username: UserId::new(user),
+            registration_start_request: start.message,
+        };
+        let (request, mut payload) = actix_web::test::TestRequest::post()
+            .insert_header(("Authorization", format!("Bearer {bearer}")))
+            .set_json(body)
+            .to_http_parts();
+        let answer = opaque_register_start(&request, &mut payload, state)
+            .await
+            .unwrap();
+        let finish = opaque::client::registration::finish_registration(
+            start.state,
+            password.as_bytes(),
+            answer.response.registration_response,
+            &mut rng,
+        )
+        .unwrap();
+        registration::ClientRegistrationFinish {
+            request: registration::ClientRegistrationFinishRequest {
+                server_data: answer.response.server_data,
+                registration_upload: finish.message,
+            },
+            kerberos_password_envelope: None,
+        }
+    }
+
+    async fn binds(
+        handler: &lldap_sql_backend_handler::SqlBackendHandler,
+        user: &str,
+        password: &str,
+    ) -> bool {
+        let request = BindRequest {
+            name: UserId::new(user),
+            password: password.to_owned(),
+        };
+        handler.bind(request).await.is_ok()
+    }
+
+    #[tokio::test]
+    async fn test_a_finish_without_its_starts_session_is_refused_before_any_write() {
+        use lldap_domain_handlers::handler::{GroupBackendHandler, UserBackendHandler};
+        use lldap_domain_handlers::password::REGISTRATION_UNFINISHABLE;
+        use lldap_test_utils::recording_log::LogGuard;
+        const ANN: &str = "r2ann";
+        let _backend = ONE_BACKEND.lock().await;
+        let _guard = EnforcementGuard::none();
+        let users = [(ANN, "r2ann-pass-0"), ("r2ben", "r2ben-pass-0")];
+        let handler = sql_handler_with(&users).await;
+        let state = app_state(handler.clone());
+        let key = &state.jwt_key;
+        let unauthorized = (401, format!("Unauthorized: `{NOT_AUTHORIZED}`"));
+        let denied = (LogKind::AccessDenied, None, Some(NOT_AUTHORIZED.to_owned()));
+        let unfinished = (
+            LogKind::PasswordChange,
+            Some(ANN.to_owned()),
+            Some(REGISTRATION_UNFINISHABLE.to_owned()),
+        );
+        let rows = [
+            ("no bearer", None, unauthorized.clone(), denied),
+            (
+                "another user's session",
+                Some(session_token(key, "r2ben")),
+                unfinishable(),
+                unfinished.clone(),
+            ),
+            (
+                "the same user's other session",
+                Some(session_token(key, ANN)),
+                unfinishable(),
+                unfinished.clone(),
+            ),
+            (
+                "the same user's reset token",
+                Some(reset_token(key, ANN)),
+                unfinishable(),
+                unfinished.clone(),
+            ),
+        ];
+        let log = LogGuard::install_on_this_thread();
+        let failures = || -> Vec<_> {
+            let events = log.recorder().take_events().into_iter();
+            let failed = events.filter(|e| !e.success);
+            failed.map(|e| (e.kind, e.target, e.detail)).collect()
+        };
+        let mut current = "r2ann-pass-0".to_owned();
+        for (n, (row, other, refusal, refusal_row)) in rows.into_iter().enumerate() {
+            let own = session_token(key, ANN);
+            let new = format!("r2ann-pass-{}", n + 1);
+            let body = started(&state, &own, ANN, &new).await;
+            let _ = failures();
+            let refused = finished(&state, other.as_deref(), &body).await;
+            assert_eq!(
+                (refused, failures(), binds(&handler, ANN, &current).await),
+                (refusal, vec![refusal_row], true),
+                "{row}: refused with one row, and the password stays"
+            );
+            let taken = finished(&state, Some(&own), &body).await;
+            let again = finished(&state, Some(&own), &body).await;
+            assert_eq!(
+                (taken.0, again, failures(), binds(&handler, ANN, &new).await),
+                (200, unfinishable(), vec![unfinished.clone()], true),
+                "{row}: the start's own session finishes it once"
+            );
+            current = new;
+        }
+
+        let own = session_token(key, ANN);
+        let ann = UserId::new(ANN);
+        let (_, request) = lldap_opaque_handler::prepare_registration(&handler, ann.clone(), b"x")
+            .await
+            .unwrap();
+        let in_process = registration::ClientRegistrationFinish {
+            request,
+            kerberos_password_envelope: None,
+        };
+        let in_process = finished(&state, Some(&own), &in_process).await;
+        assert_eq!(
+            (in_process, failures()),
+            (unfinishable(), vec![unfinished]),
+            "a start made in process"
+        );
+
+        let body = started(&state, &own, ANN, "r2ann-pass-8").await;
+        let logged_out = default_hash(own.as_str());
+        state.jwt_blacklist.write().unwrap().insert(logged_out);
+        let logged_out = finished(&state, Some(&own), &body).await;
+        let own = session_token(key, ANN);
+        let body = started(&state, &own, ANN, "r2ann-pass-9").await;
+        let group = lldap_domain::requests::CreateGroupRequest {
+            display_name: "lldap_disabled".into(),
+            ..Default::default()
+        };
+        let group = handler.create_group(group).await.unwrap();
+        handler.add_user_to_group(&ann, group).await.unwrap();
+        let disabled = finished(&state, Some(&own), &body).await;
+        handler.remove_user_from_group(&ann, group).await.unwrap();
+        assert_eq!(
+            (logged_out, disabled, binds(&handler, ANN, &current).await),
+            (unauthorized.clone(), unauthorized, true),
+            "a session logged out, and an account disabled, between the two requests"
+        );
     }
 
     /// A directory on SQLite with these users and their passwords, as the server keeps it.

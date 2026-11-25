@@ -1,9 +1,9 @@
-//! RSA envelope for a synced user's new password, under an OAEP label naming that user.
+//! RSA envelope for a synced user's new password, under an OAEP label naming that user and the
+//! registration start it finishes.
 
-use anyhow::Result;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use lldap_auth::kerberos_envelope::open_kerberos_envelope;
+use lldap_auth::kerberos_envelope::{EnvelopeUnopened, open_kerberos_envelope};
 use lldap_auth::types::UserId;
 use rsa::pkcs1::EncodeRsaPublicKey;
 use rsa::{Generate, PrivateKey, PublicKey};
@@ -38,9 +38,13 @@ pub fn public_key_der_base64() -> String {
     STANDARD.encode(der.as_bytes())
 }
 
-/// Opens an envelope sealed for `user`; one sealed for anyone else does not open.
-pub fn open_password_envelope(envelope: &str, user: &UserId) -> Result<Zeroizing<String>> {
-    open_kerberos_envelope(&KEYPAIR.0, envelope, user)
+/// Opens an envelope sealed for `user` and the start that answered `server_data`.
+pub fn open_password_envelope(
+    envelope: &str,
+    user: &UserId,
+    server_data: &str,
+) -> Result<Zeroizing<String>, EnvelopeUnopened> {
+    open_kerberos_envelope(&KEYPAIR.0, envelope, user, server_data)
 }
 
 #[cfg(test)]
@@ -54,91 +58,63 @@ mod tests {
     use rsa::pkcs1::DecodeRsaPublicKey;
     use rsa::sha2::Sha256;
 
+    const START: &str = "c3RhcnQgb25l";
+
     fn transport_key() -> PublicKey {
         let der = STANDARD.decode(public_key_der_base64()).unwrap();
         PublicKey::from_pkcs1_der(&der).unwrap()
     }
 
-    fn seal(label: Option<&str>, plain: &[u8]) -> rsa::Result<Vec<u8>> {
-        let padding = match label {
-            Some(user) => Oaep::<Sha256>::new_with_label(
-                kerberos_envelope_label(&UserId::new(user)).into_bytes(),
-            ),
-            None => Oaep::<Sha256>::new(),
-        };
-        transport_key().encrypt(&mut SysRng, padding, plain)
+    fn seal(user: &str, plain: &[u8]) -> rsa::Result<Vec<u8>> {
+        let label = kerberos_envelope_label(&UserId::new(user), START).into_bytes();
+        transport_key().encrypt(&mut SysRng, Oaep::<Sha256>::new_with_label(label), plain)
     }
 
     #[test]
-    fn test_an_envelope_opens_only_for_the_user_it_was_sealed_for() {
-        let staple = b"correct horse battery staple";
-        let sealed = seal(Some("alice"), staple).unwrap();
-        let mut flipped = sealed.clone();
+    fn test_an_envelope_opens_only_for_the_user_and_the_start_it_was_sealed_for() {
+        const STAPLE: &str = "correct horse battery staple";
+        let mut flipped = seal("alice", STAPLE.as_bytes()).unwrap();
         *flipped.last_mut().unwrap() ^= 1;
-        let typed = |username| {
-            seal_kerberos_envelope(
-                &public_key_der_base64(),
-                username,
-                "correct horse battery staple",
-            )
-            .unwrap()
+        let typed = |username, start| {
+            seal_kerberos_envelope(&public_key_der_base64(), username, start, STAPLE).unwrap()
         };
         let rows = [
             (
                 "sealed by the pages' seal for the id as typed, Alice",
-                typed("Alice"),
-                Ok("correct horse battery staple"),
+                typed("Alice", START),
+                Ok(STAPLE),
             ),
             (
                 "sealed by the pages' seal for bob",
-                typed("bob"),
-                Err("Decryption failed"),
+                typed("bob", START),
+                Err(EnvelopeUnopened),
             ),
             (
-                "sealed for bob",
-                STANDARD.encode(seal(Some("bob"), staple).unwrap()),
-                Err("Decryption failed"),
-            ),
-            (
-                "sealed without a label",
-                STANDARD.encode(seal(None, staple).unwrap()),
-                Err("Decryption failed"),
+                "sealed by the pages' seal for alice's other start",
+                typed("alice", "c3RhcnQgdHdv"),
+                Err(EnvelopeUnopened),
             ),
             (
                 "one byte flipped",
                 STANDARD.encode(&flipped),
-                Err("Decryption failed"),
-            ),
-            (
-                "not base64",
-                "not base64!".to_owned(),
-                Err("Base64 decode failed"),
-            ),
-            (
-                "not UTF-8",
-                STANDARD.encode(seal(Some("alice"), b"\xff\xfeA").unwrap()),
-                Err("UTF-8 decode failed"),
+                Err(EnvelopeUnopened),
             ),
         ];
         for (case, wire, expected) in rows {
-            let opened: Result<Zeroizing<String>> =
-                open_password_envelope(&wire, &UserId::new("alice"));
-            let got = opened
-                .map(|password| password.as_str().to_owned())
-                .map_err(|e| e.to_string());
-            let expected = expected.map(str::to_owned).map_err(str::to_owned);
-            assert_eq!(got, expected, "{case}");
+            let got = open_password_envelope(&wire, &UserId::new("alice"), START)
+                .map(|password| password.as_str().to_owned());
+            assert_eq!(got, expected.map(str::to_owned), "{case}");
         }
     }
 
     #[test]
     fn test_the_envelope_holds_the_bytes_the_pages_allow() {
         let fits = vec![b'a'; KERBEROS_ENVELOPE_MAX_BYTES];
-        let sealed = STANDARD.encode(seal(Some("alice"), &fits).unwrap());
-        let opened = open_password_envelope(&sealed, &UserId::new("alice")).unwrap();
+        let sealed = STANDARD.encode(seal("alice", &fits).unwrap());
+        let opened = open_password_envelope(&sealed, &UserId::new("alice"), START).unwrap();
         assert_eq!(opened.len(), KERBEROS_ENVELOPE_MAX_BYTES);
         let over = vec![b'a'; KERBEROS_ENVELOPE_MAX_BYTES + 1];
-        assert!(seal(Some("alice"), &over).is_err());
+        assert!(seal("alice", &over).is_err());
         assert_eq!(
             PrivateKey::DEFAULT_BITS / 8 - 2 * 32 - 2,
             KERBEROS_ENVELOPE_MAX_BYTES

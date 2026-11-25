@@ -168,14 +168,15 @@ pub fn register_password_over_http(
         .expect("register finish status");
 }
 
-// The pages' ceremony: `seal` makes the finish's envelope from the start answer's key.
+// The pages' ceremony: `seal` makes the finish's envelope from the start answer's key and its
+// server data.
 pub fn register_sealed(
     client: &Client,
     base_url: &str,
     bearer: &str,
     username: &str,
     password: &str,
-    seal: impl FnOnce(Option<&str>) -> Option<String>,
+    seal: impl FnOnce(Option<&str>, &str) -> Option<String>,
 ) -> (Option<String>, StatusCode, String) {
     let mut rng = rand::rngs::OsRng;
     let start = opaque::client::registration::start_registration(password.as_bytes(), &mut rng)
@@ -201,6 +202,7 @@ pub fn register_sealed(
     )
     .expect("registration finish");
     let key = answer.kerberos_envelope_key;
+    let kerberos_password_envelope = seal(key.as_deref(), &answer.response.server_data);
     let response = client
         .post(format!("{base_url}/auth/opaque/register/finish"))
         .bearer_auth(bearer)
@@ -209,7 +211,7 @@ pub fn register_sealed(
                 server_data: answer.response.server_data,
                 registration_upload: finish.message,
             },
-            kerberos_password_envelope: seal(key.as_deref()),
+            kerberos_password_envelope,
         })
         .send()
         .expect("register finish send");

@@ -69,6 +69,7 @@ fn test_each_kind_of_state_opens_only_as_its_own_kind_at_the_routes() {
 
     let finished = client
         .post(format!("{url}/auth/opaque/register/finish"))
+        .bearer_auth(&admin)
         .json(&registration::ClientRegistrationFinishRequest {
             server_data: login_state,
             registration_upload: upload,

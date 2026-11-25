@@ -132,9 +132,17 @@ mockall::mock! {
         async fn registration_finish(
             &self, request: registration::ClientRegistrationFinishRequest
         ) -> Result<UserId>;
-        async fn registration_user(
-            &self, request: &registration::ClientRegistrationFinishRequest
-        ) -> Result<UserId>;
+        async fn registration_start_by(
+            &self,
+            request: registration::ClientRegistrationStartRequest,
+            by: registration::Presenter,
+            envelope_key: Option<[u8; 32]>,
+        ) -> Result<registration::ServerRegistrationStartResponse>;
+        async fn registration_claim(
+            &self,
+            request: &registration::ClientRegistrationFinishRequest,
+            presenter: &registration::Presenter,
+        ) -> Result<registration::Claim>;
     }
     #[async_trait]
     impl PosixBackendHandler for TestBackendHandler {

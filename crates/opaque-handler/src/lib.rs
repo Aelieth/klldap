@@ -49,11 +49,19 @@ pub trait OpaqueHandler: Send + Sync {
         &self,
         request: registration::ClientRegistrationFinishRequest,
     ) -> Result<UserId>;
-    /// The user a finish request registers for, read from its sealed server data; writes nothing.
-    async fn registration_user(
+    /// A web or tool start: its server data also seals who made it and the envelope key answered.
+    async fn registration_start_by(
+        &self,
+        request: registration::ClientRegistrationStartRequest,
+        by: registration::Presenter,
+        envelope_key: Option<[u8; 32]>,
+    ) -> Result<registration::ServerRegistrationStartResponse>;
+    /// A web or tool finish, taken once, in time, and only from the session that made its start.
+    async fn registration_claim(
         &self,
         request: &registration::ClientRegistrationFinishRequest,
-    ) -> Result<UserId>;
+        presenter: &registration::Presenter,
+    ) -> Result<registration::Claim>;
 }
 
 /// Runs the OPAQUE registration ceremony in-process, playing the client against `handler`.

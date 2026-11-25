@@ -187,11 +187,35 @@ pub mod login {
 pub mod registration {
     use super::{types::UserId, *};
 
+    /// Who makes a web or tool start and presents its finish: a token's user, its id, its kind.
+    #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+    pub struct Presenter {
+        pub actor: UserId,
+        pub session: [u8; 16],
+        pub reset: bool,
+    }
+
+    #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+    pub struct StartBinding {
+        pub id: [u8; 16],
+        pub by: Presenter,
+        /// SHA-256 of the envelope key the start answered with.
+        pub envelope_key: Option<[u8; 32]>,
+    }
+
     #[derive(Serialize, Deserialize, Clone)]
     pub struct ServerData {
         pub username: UserId,
-        /// The start, in seconds since the Unix epoch: a finish must follow it within ten minutes.
+        /// The start, in seconds since the Unix epoch.
         pub issued_at: i64,
+        /// None for a start made in process: its finish never leaves the call.
+        pub start: Option<StartBinding>,
+    }
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub struct Claim {
+        pub user: UserId,
+        pub envelope_key: Option<[u8; 32]>,
     }
 
     #[derive(Serialize, Deserialize, Clone)]
@@ -213,13 +237,16 @@ pub mod registration {
         pub registration_upload: opaque::server::registration::RegistrationUpload,
     }
 
-    pub const KERBEROS_ENVELOPE_LABEL_PREFIX: &str = "klldap-kerberos-envelope-v1:";
+    pub const KERBEROS_ENVELOPE_LABEL_PREFIX: &str = "klldap-kerberos-envelope-v2:";
     /// RSA-3072 with OAEP-SHA-256 seals at most 384 - 2 * 32 - 2 bytes.
     pub const KERBEROS_ENVELOPE_MAX_BYTES: usize = 318;
 
-    /// The OAEP label of a password envelope: one key, one purpose, one user.
-    pub fn kerberos_envelope_label(user: &UserId) -> String {
-        format!("{KERBEROS_ENVELOPE_LABEL_PREFIX}{}", user.as_str())
+    /// The OAEP label of a password envelope: one key, one purpose, one user, one start.
+    pub fn kerberos_envelope_label(user: &UserId, server_data: &str) -> String {
+        format!(
+            "{KERBEROS_ENVELOPE_LABEL_PREFIX}{}:{server_data}",
+            user.as_str()
+        )
     }
 
     pub fn fits_kerberos_envelope(password: &str) -> bool {

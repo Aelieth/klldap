@@ -17,6 +17,7 @@ pub(crate) mod sql_posix_backend_handler;
 pub(crate) mod sql_schema_backend_handler;
 pub(crate) mod sql_totp_steps;
 pub(crate) mod sql_used_proofs;
+pub(crate) mod sql_used_starts;
 pub(crate) mod sql_user_backend_handler;
 pub use lldap_domain_handlers::handler::PosixSettings;
 pub use lldap_opaque_handler::register_password;

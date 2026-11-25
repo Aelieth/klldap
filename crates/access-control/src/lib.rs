@@ -459,11 +459,23 @@ impl<Inner: OpaqueHandler + Send + Sync> OpaqueHandler for AccessControlledBacke
         self.handler.registration_finish(request).await
     }
 
-    async fn registration_user(
+    async fn registration_start_by(
+        &self,
+        request: registration::ClientRegistrationStartRequest,
+        by: registration::Presenter,
+        envelope_key: Option<[u8; 32]>,
+    ) -> Result<registration::ServerRegistrationStartResponse> {
+        self.handler
+            .registration_start_by(request, by, envelope_key)
+            .await
+    }
+
+    async fn registration_claim(
         &self,
         request: &registration::ClientRegistrationFinishRequest,
-    ) -> Result<UserId> {
-        self.handler.registration_user(request).await
+        presenter: &registration::Presenter,
+    ) -> Result<registration::Claim> {
+        self.handler.registration_claim(request, presenter).await
     }
 }
 

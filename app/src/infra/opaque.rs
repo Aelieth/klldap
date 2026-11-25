@@ -3,7 +3,7 @@
 //! check and the two-factor pages. Each caller stashes the returned state in its own
 //! component field between the start and finish steps.
 
-use crate::infra::encrypt::seal_kerberos_envelope;
+use crate::infra::encrypt::finish_with_envelope;
 use anyhow::{Context, Result, bail};
 use lldap_auth::{
     PASSWORD_LENGTH_UNIT, PASSWORD_MIN_LENGTH, PasswordShapeError, login, opaque, password_shape,
@@ -114,16 +114,16 @@ pub fn finish_registration(
         &mut rng,
     )
     .context("Error during registration")?;
-    let kerberos_password_envelope = kerberos_envelope_key
-        .map(|key| seal_kerberos_envelope(&key, username, password))
-        .transpose()?;
-    Ok(registration::ClientRegistrationFinish {
-        request: registration::ClientRegistrationFinishRequest {
-            server_data: response.server_data,
-            registration_upload: finish.message,
-        },
-        kerberos_password_envelope,
-    })
+    let request = registration::ClientRegistrationFinishRequest {
+        server_data: response.server_data,
+        registration_upload: finish.message,
+    };
+    finish_with_envelope(
+        request,
+        kerberos_envelope_key.as_deref(),
+        username,
+        password,
+    )
 }
 
 /// Begins a login: returns the client state to stash and the start request to POST.

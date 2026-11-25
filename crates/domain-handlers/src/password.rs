@@ -32,6 +32,7 @@ pub const PASSWORD_MIN_LENGTH_ITEM: &str = "password-min-length";
 pub const PASSWORD_POLICY_UNREADABLE: &str = "the password policy could not be read; try again";
 pub const PASSWORD_NEEDS_THE_REALM: &str =
     "a password is changed only by the server that holds the Kerberos realm; try again";
+pub const REGISTRATION_UNFINISHABLE: &str = "this registration cannot be finished; start again";
 
 const MIN_LENGTH_NOT_A_NUMBER: &str = "the stored password-min-length is not a number";
 
@@ -265,6 +266,13 @@ pub fn record_failed(kind: LogKind, user: &UserId, error: &PasswordChangeError) 
         e => e.to_string(),
     };
     logging::record_failure(kind, Some(user.as_str()), &detail);
+}
+
+/// The one answer and row of a web or tool finish refused before its envelope is opened.
+pub fn refuse_unfinishable(user: &UserId) -> DomainError {
+    let target = Some(user.as_str());
+    logging::record_failure(LogKind::PasswordChange, target, REGISTRATION_UNFINISHABLE);
+    DomainError::AuthenticationError(REGISTRATION_UNFINISHABLE.to_owned())
 }
 
 pub fn realm_not_ready(cause: &str) -> PasswordChangeError {
@@ -555,10 +563,21 @@ mod tests {
         ) -> lldap_domain_model::error::Result<UserId> {
             unreachable!("a short password reached the directory")
         }
-        async fn registration_user(
+        async fn registration_start_by(
+            &self,
+            _: lldap_opaque_handler::registration::ClientRegistrationStartRequest,
+            _: lldap_opaque_handler::registration::Presenter,
+            _: Option<[u8; 32]>,
+        ) -> lldap_domain_model::error::Result<
+            lldap_opaque_handler::registration::ServerRegistrationStartResponse,
+        > {
+            unreachable!("a short password reached the directory")
+        }
+        async fn registration_claim(
             &self,
             _: &lldap_opaque_handler::registration::ClientRegistrationFinishRequest,
-        ) -> lldap_domain_model::error::Result<UserId> {
+            _: &lldap_opaque_handler::registration::Presenter,
+        ) -> lldap_domain_model::error::Result<lldap_opaque_handler::registration::Claim> {
             unreachable!("a short password reached the directory")
         }
     }
@@ -669,10 +688,21 @@ mod tests {
         ) -> lldap_domain_model::error::Result<UserId> {
             unreachable!("nothing was derived")
         }
-        async fn registration_user(
+        async fn registration_start_by(
+            &self,
+            _: lldap_opaque_handler::registration::ClientRegistrationStartRequest,
+            _: lldap_opaque_handler::registration::Presenter,
+            _: Option<[u8; 32]>,
+        ) -> lldap_domain_model::error::Result<
+            lldap_opaque_handler::registration::ServerRegistrationStartResponse,
+        > {
+            unreachable!()
+        }
+        async fn registration_claim(
             &self,
             _: &lldap_opaque_handler::registration::ClientRegistrationFinishRequest,
-        ) -> lldap_domain_model::error::Result<UserId> {
+            _: &lldap_opaque_handler::registration::Presenter,
+        ) -> lldap_domain_model::error::Result<lldap_opaque_handler::registration::Claim> {
             unreachable!()
         }
     }
@@ -972,10 +1002,21 @@ mod tests {
                 None => unreachable!("the record was stored although the switch is on"),
             }
         }
-        async fn registration_user(
+        async fn registration_start_by(
+            &self,
+            _: lldap_opaque_handler::registration::ClientRegistrationStartRequest,
+            _: lldap_opaque_handler::registration::Presenter,
+            _: Option<[u8; 32]>,
+        ) -> lldap_domain_model::error::Result<
+            lldap_opaque_handler::registration::ServerRegistrationStartResponse,
+        > {
+            unreachable!()
+        }
+        async fn registration_claim(
             &self,
             _: &lldap_opaque_handler::registration::ClientRegistrationFinishRequest,
-        ) -> lldap_domain_model::error::Result<UserId> {
+            _: &lldap_opaque_handler::registration::Presenter,
+        ) -> lldap_domain_model::error::Result<lldap_opaque_handler::registration::Claim> {
             unreachable!()
         }
     }

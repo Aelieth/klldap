@@ -2,6 +2,7 @@ use crate::SqlBackendHandler;
 use crate::sql_log_handler::UNKNOWN_USER_DETAIL;
 use crate::sql_mfa_handler::{TotpRejection, now_unix};
 use crate::sql_mfa_windows::with_proof;
+use crate::sql_used_starts::{CLOCK_TOLERANCE_SECS, take_start_id};
 use crate::sql_user_backend_handler::sync_still_off;
 use async_trait::async_trait;
 use base64::Engine;
@@ -16,6 +17,7 @@ use lldap_domain_handlers::kerberos::{
 use lldap_domain_handlers::lockout::{LockState, Step, lock_clock};
 use lldap_domain_handlers::logging::{self, LogKind, NO_PASSWORD};
 use lldap_domain_handlers::mfa::MfaRequirement;
+use lldap_domain_handlers::password::refuse_unfinishable;
 use lldap_domain_model::{
     error::{DomainError, Result},
     model::{self, UserColumn},
@@ -68,9 +70,11 @@ async fn passwords_match(
 
 const LOGIN_STATE_KEY_INFO: &[u8] = b"lldap-opaque-login-state-v1";
 const REGISTRATION_STATE_KEY_INFO: &[u8] = b"lldap-opaque-registration-state-v1";
-/// A finish must follow its start within ten minutes.
-const REGISTRATION_MAX_AGE: i64 = 600;
+/// A finish must follow its start within two minutes.
+const REGISTRATION_MAX_AGE: i64 = 120;
 const REGISTRATION_TOO_LONG: &str = "the registration took too long; start again";
+const REGISTRATION_UNMARKED: &str =
+    "this registration could not be recorded as finished; try again";
 
 /// bincode as `bincode::serialize` writes it, refusing trailing bytes.
 fn decode_exact<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> bincode::Result<T> {
@@ -94,23 +98,49 @@ impl SqlBackendHandler {
         Ok(orion::aead::SecretKey::from_slice(&key)?)
     }
 
-    fn registration_within_age(&self, server_data: &str, now: i64) -> Result<UserId> {
+    fn open_registration(&self, server_data: &str) -> Result<registration::ServerData> {
         let secret_key = self.get_orion_secret_key(REGISTRATION_STATE_KEY_INFO)?;
-        let registration::ServerData {
-            username,
-            issued_at,
-        } = decode_exact(&orion::aead::open(
+        Ok(decode_exact(&orion::aead::open(
             &secret_key,
             &base64::engine::general_purpose::STANDARD.decode(server_data)?,
-        )?)?;
-        if now - issued_at > REGISTRATION_MAX_AGE {
-            let target = Some(username.as_str());
-            logging::record_failure(LogKind::PasswordChange, target, REGISTRATION_TOO_LONG);
-            return Err(DomainError::AuthenticationError(
-                REGISTRATION_TOO_LONG.to_owned(),
-            ));
-        }
-        Ok(username)
+        )?)?)
+    }
+
+    fn start_registration(
+        &self,
+        request: registration::ClientRegistrationStartRequest,
+        start: Option<registration::StartBinding>,
+    ) -> Result<registration::ServerRegistrationStartResponse> {
+        let start_response = opaque::server::registration::start_registration(
+            &self.opaque_setup,
+            request.registration_start_request,
+            &request.username,
+        )?;
+        let secret_key = self.get_orion_secret_key(REGISTRATION_STATE_KEY_INFO)?;
+        let server_data = registration::ServerData {
+            username: request.username,
+            issued_at: now_unix(),
+            start,
+        };
+        let encrypted_state = orion::aead::seal(&secret_key, &bincode::serialize(&server_data)?)?;
+        Ok(registration::ServerRegistrationStartResponse {
+            server_data: base64::engine::general_purpose::STANDARD.encode(encrypted_state),
+            registration_response: start_response.message,
+        })
+    }
+
+    fn took_too_long(user: &UserId) -> DomainError {
+        let target = Some(user.as_str());
+        logging::record_failure(LogKind::PasswordChange, target, REGISTRATION_TOO_LONG);
+        DomainError::AuthenticationError(REGISTRATION_TOO_LONG.to_owned())
+    }
+
+    /// Fails closed: a start that cannot be marked is not finished.
+    fn unmarked(user: &UserId, e: &DomainError) -> DomainError {
+        warn!("The used registration starts could not be read or written for {user}: {e}");
+        let target = Some(user.as_str());
+        logging::record_failure(LogKind::PasswordChange, target, REGISTRATION_UNMARKED);
+        DomainError::AuthenticationError(REGISTRATION_UNMARKED.to_owned())
     }
 
     #[instrument(skip(self), level = "debug", err)]
@@ -691,21 +721,7 @@ impl OpaqueHandler for SqlOpaqueHandler {
         &self,
         request: registration::ClientRegistrationStartRequest,
     ) -> Result<registration::ServerRegistrationStartResponse> {
-        let start_response = opaque::server::registration::start_registration(
-            &self.opaque_setup,
-            request.registration_start_request,
-            &request.username,
-        )?;
-        let secret_key = self.get_orion_secret_key(REGISTRATION_STATE_KEY_INFO)?;
-        let server_data = registration::ServerData {
-            username: request.username,
-            issued_at: chrono::Utc::now().timestamp(),
-        };
-        let encrypted_state = orion::aead::seal(&secret_key, &bincode::serialize(&server_data)?)?;
-        Ok(registration::ServerRegistrationStartResponse {
-            server_data: base64::engine::general_purpose::STANDARD.encode(encrypted_state),
-            registration_response: start_response.message,
-        })
+        self.start_registration(request, None)
     }
 
     #[instrument(skip_all, level = "debug", err)]
@@ -714,11 +730,8 @@ impl OpaqueHandler for SqlOpaqueHandler {
         request: registration::ClientRegistrationFinishRequest,
     ) -> Result<UserId> {
         require_kdc_ready()?;
-        let secret_key = self.get_orion_secret_key(REGISTRATION_STATE_KEY_INFO)?;
-        let registration::ServerData { username, .. } = decode_exact(&orion::aead::open(
-            &secret_key,
-            &base64::engine::general_purpose::STANDARD.decode(&request.server_data)?,
-        )?)?;
+        let registration::ServerData { username, .. } =
+            self.open_registration(&request.server_data)?;
 
         let password_file =
             opaque::server::registration::get_password_file(request.registration_upload);
@@ -742,11 +755,51 @@ impl OpaqueHandler for SqlOpaqueHandler {
     }
 
     #[instrument(skip_all, level = "debug", err)]
-    async fn registration_user(
+    async fn registration_start_by(
+        &self,
+        request: registration::ClientRegistrationStartRequest,
+        by: registration::Presenter,
+        envelope_key: Option<[u8; 32]>,
+    ) -> Result<registration::ServerRegistrationStartResponse> {
+        let mut id = [0u8; 16];
+        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut id);
+        let start = registration::StartBinding {
+            id,
+            by,
+            envelope_key,
+        };
+        self.start_registration(request, Some(start))
+    }
+
+    #[instrument(skip_all, level = "debug", err)]
+    async fn registration_claim(
         &self,
         request: &registration::ClientRegistrationFinishRequest,
-    ) -> Result<UserId> {
-        self.registration_within_age(&request.server_data, chrono::Utc::now().timestamp())
+        presenter: &registration::Presenter,
+    ) -> Result<registration::Claim> {
+        let registration::ServerData {
+            username,
+            issued_at,
+            start,
+        } = self.open_registration(&request.server_data)?;
+        let Some(start) = start.filter(|start| start.by == *presenter) else {
+            return Err(refuse_unfinishable(&username));
+        };
+        if now_unix() - issued_at > REGISTRATION_MAX_AGE {
+            return Err(Self::took_too_long(&username));
+        }
+        let expires_at = issued_at + REGISTRATION_MAX_AGE + CLOCK_TOLERANCE_SECS;
+        match take_start_id(&self.sql_pool, &start.id, expires_at).await {
+            Ok(true) => {
+                self.note_codes_written();
+                Ok(registration::Claim {
+                    user: username,
+                    envelope_key: start.envelope_key,
+                })
+            }
+            Ok(false) => Err(refuse_unfinishable(&username)),
+            Err(e) => Err(Self::unmarked(&username, &e)),
+        }
     }
 }
 
@@ -764,7 +817,9 @@ mod tests {
     use crate::sql_backend_handler::tests::{
         get_initialized_db, insert_group, insert_membership, insert_user, insert_user_no_password,
     };
+    use crate::sql_used_starts::tests::{kept, session, web_registration};
     use lldap_domain_handlers::handler::MfaBackendHandler;
+    use lldap_domain_handlers::password::REGISTRATION_UNFINISHABLE;
     use lldap_opaque_handler::register_password;
 
     async fn attempt_login(
@@ -1297,38 +1352,211 @@ mod tests {
         }
     }
 
+    fn one_row(detail: &str) -> Vec<(LogKind, Option<String>, Option<String>)> {
+        vec![(
+            LogKind::PasswordChange,
+            Some("bob".to_owned()),
+            Some(detail.to_owned()),
+        )]
+    }
+
+    fn failures(log: &LogGuard) -> Vec<(LogKind, Option<String>, Option<String>)> {
+        let events = log.recorder().take_events().into_iter();
+        let failed = events.filter(|e| !e.success);
+        failed.map(|e| (e.kind, e.target, e.detail)).collect()
+    }
+
+    fn unfinishable() -> String {
+        DomainError::AuthenticationError(REGISTRATION_UNFINISHABLE.to_owned()).to_string()
+    }
+
     #[tokio::test]
     #[serial]
-    async fn test_registration_user_opens_the_server_data_and_writes_nothing() {
-        let handler =
-            SqlOpaqueHandler::new(generate_random_private_key(), get_initialized_db().await);
+    async fn test_a_start_is_finished_once() {
+        let setup = generate_random_private_key();
+        let handler = SqlOpaqueHandler::new(setup.clone(), get_initialized_db().await);
         insert_user(&handler, "bob", "bob00").await;
         let bob = UserId::new("bob");
         let before = handler
             .get_password_file_for_user(bob.clone())
             .await
             .unwrap();
-        let request = client_registration(&handler, "bob", "bob-new-1").await;
-        assert_eq!(handler.registration_user(&request).await.unwrap(), bob);
+        let admin = session("admin", 1);
+        let key = Some([9u8; 32]);
+        let request = web_registration(&handler, "bob", "bob-new-1", &admin, key).await;
+        let claim = registration::Claim {
+            user: bob.clone(),
+            envelope_key: key,
+        };
+        let log = LogGuard::install_on_this_thread();
+        assert_eq!(
+            handler.registration_claim(&request, &admin).await.unwrap(),
+            claim
+        );
+        assert_eq!((kept(&handler.sql_pool).await, failures(&log)), (1, vec![]));
         assert_eq!(
             handler
                 .get_password_file_for_user(bob.clone())
                 .await
                 .unwrap(),
-            before
+            before,
+            "a claim writes its mark and nothing of the user"
         );
+        let restarted = SqlOpaqueHandler::new(setup, handler.sql_pool.clone());
+        for (label, server) in [("the same server", &handler), ("a restart", &restarted)] {
+            let again = server.registration_claim(&request, &admin).await;
+            assert_eq!(
+                (
+                    again.map_err(|e| e.to_string()),
+                    failures(&log),
+                    kept(&handler.sql_pool).await
+                ),
+                (Err(unfinishable()), one_row(REGISTRATION_UNFINISHABLE), 1),
+                "{label}"
+            );
+        }
+        drop(log);
         attempt_login(&handler, "bob", "bob00", None).await.unwrap();
 
         let other =
             SqlOpaqueHandler::new(generate_random_private_key(), get_initialized_db().await);
         let mut garbled = request.clone();
         garbled.server_data = "bm90IHNlYWxlZA==".to_owned();
-        for (label, handler, request) in [
-            ("another server's key", &other, &request),
-            ("not sealed", &handler, &garbled),
+        for (label, server, request, marks) in [
+            ("another server's key", &other, &request, 0),
+            ("not sealed", &handler, &garbled, 1),
         ] {
-            assert!(handler.registration_user(request).await.is_err(), "{label}");
+            let claimed = server.registration_claim(request, &admin).await;
+            assert_eq!(
+                (claimed.is_err(), kept(&server.sql_pool).await),
+                (true, marks),
+                "{label}"
+            );
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_finish_from_another_session_is_refused_and_takes_no_mark() {
+        let handler =
+            SqlOpaqueHandler::new(generate_random_private_key(), get_initialized_db().await);
+        let reset = |user: &str, id: u8| registration::Presenter {
+            reset: true,
+            ..session(user, id)
+        };
+        let rows = [
+            ("another user", session("bob", 1), session("carol", 1)),
+            (
+                "the same user's other session",
+                session("bob", 1),
+                session("bob", 2),
+            ),
+            (
+                "a session token on a reset start",
+                reset("bob", 1),
+                session("bob", 1),
+            ),
+            (
+                "a reset token on a session start",
+                session("bob", 1),
+                reset("bob", 1),
+            ),
+        ];
+        let log = LogGuard::install_on_this_thread();
+        for (n, (row, by, presenter)) in rows.into_iter().enumerate() {
+            let request = web_registration(&handler, "bob", "bob-new-1", &by, None).await;
+            let refused = handler.registration_claim(&request, &presenter).await;
+            assert_eq!(
+                (
+                    refused.map_err(|e| e.to_string()),
+                    failures(&log),
+                    kept(&handler.sql_pool).await
+                ),
+                (
+                    Err(unfinishable()),
+                    one_row(REGISTRATION_UNFINISHABLE),
+                    n as i64
+                ),
+                "{row}"
+            );
+            let taken = handler.registration_claim(&request, &by).await;
+            assert_eq!(
+                (taken.is_ok(), kept(&handler.sql_pool).await),
+                (true, n as i64 + 1),
+                "{row}: the start's own session still finishes it"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_start_made_in_process_is_not_taken_at_the_web_finish() {
+        let handler =
+            SqlOpaqueHandler::new(generate_random_private_key(), get_initialized_db().await);
+        let request = client_registration(&handler, "bob", "bob-new-1").await;
+        let log = LogGuard::install_on_this_thread();
+        let refused = handler
+            .registration_claim(&request, &session("bob", 1))
+            .await;
+        assert_eq!(
+            (
+                refused.map_err(|e| e.to_string()),
+                failures(&log),
+                kept(&handler.sql_pool).await
+            ),
+            (Err(unfinishable()), one_row(REGISTRATION_UNFINISHABLE), 0)
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_the_in_process_doors_take_no_mark() {
+        let handler =
+            SqlOpaqueHandler::new(generate_random_private_key(), get_initialized_db().await);
+        insert_user_no_password(&handler, "bob").await;
+        let request = client_registration(&handler, "bob", "bob-new-1").await;
+        let sealed = handler.open_registration(&request.server_data).unwrap();
+        assert!(sealed.start.is_none());
+        for label in ["the first write", "the same request again"] {
+            let written = handler.registration_finish(request.clone()).await;
+            assert_eq!(
+                (written.is_ok(), kept(&handler.sql_pool).await),
+                (true, 0),
+                "{label}"
+            );
+        }
+        register_password(&handler, UserId::new("bob"), b"bob-next-1")
+            .await
+            .unwrap();
+        assert_eq!(kept(&handler.sql_pool).await, 0);
+        attempt_login(&handler, "bob", "bob-next-1", None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_start_that_cannot_be_marked_refuses_the_finish_with_one_row() {
+        use sea_orm::{DbBackend, Statement};
+        let handler =
+            SqlOpaqueHandler::new(generate_random_private_key(), get_initialized_db().await);
+        let bob = session("bob", 1);
+        let request = web_registration(&handler, "bob", "bob-new-1", &bob, None).await;
+        let rename = |from: &str, to: &str| {
+            let sql = format!("ALTER TABLE {from} RENAME TO {to}");
+            Statement::from_string(DbBackend::Sqlite, sql)
+        };
+        let (table, away) = ("used_registration_starts", "used_registration_starts_away");
+        handler.sql_pool.execute(rename(table, away)).await.unwrap();
+        let log = LogGuard::install_on_this_thread();
+        let refused = handler.registration_claim(&request, &bob).await;
+        let unmarked = DomainError::AuthenticationError(REGISTRATION_UNMARKED.to_owned());
+        assert_eq!(
+            (refused.map_err(|e| e.to_string()), failures(&log)),
+            (Err(unmarked.to_string()), one_row(REGISTRATION_UNMARKED))
+        );
+        handler.sql_pool.execute(rename(away, table)).await.unwrap();
+        handler.registration_claim(&request, &bob).await.unwrap();
     }
 
     async fn login_state(handler: &SqlOpaqueHandler, user: &str) -> String {
@@ -1457,7 +1685,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn test_registration_user_opens_only_its_own_kind() {
+    async fn test_a_claim_opens_only_its_own_kind() {
         let handler =
             SqlOpaqueHandler::new(generate_random_private_key(), get_initialized_db().await);
         insert_user(&handler, "bob", "bob00").await;
@@ -1465,7 +1693,9 @@ mod tests {
             server_data: login_state(&handler, "bob").await,
             ..client_registration(&handler, "bob", "bob-other-1").await
         };
-        assert!(handler.registration_user(&mixed).await.is_err());
+        let claimed = handler.registration_claim(&mixed, &session("bob", 1)).await;
+        assert!(claimed.is_err());
+        assert_eq!(kept(&handler.sql_pool).await, 0);
     }
 
     #[tokio::test]
@@ -1486,9 +1716,10 @@ mod tests {
         };
         let long_name = format!("{}bob", "\u{1}".repeat(600));
         let login = login_state(&handler, &long_name).await;
+        let by = session("bob", 1);
         assert!(
             handler
-                .registration_user(&finish_with(login.clone()))
+                .registration_claim(&finish_with(login.clone()), &by)
                 .await
                 .is_err()
         );
@@ -1503,7 +1734,7 @@ mod tests {
         let enrollment_bytes = URL_SAFE_NO_PAD.decode(&enrollment).unwrap();
         assert!(
             handler
-                .registration_user(&finish_with(STANDARD.encode(&enrollment_bytes)))
+                .registration_claim(&finish_with(STANDARD.encode(&enrollment_bytes)), &by)
                 .await
                 .is_err()
         );
@@ -1530,7 +1761,7 @@ mod tests {
         }
         let proof = lldap_mfa::seal_enrollment_proof(&key, "bob", now).unwrap();
         let refused = handler
-            .registration_user(&finish_with(proof.clone()))
+            .registration_claim(&finish_with(proof.clone()), &by)
             .await
             .unwrap_err();
         assert!(
@@ -1584,70 +1815,72 @@ mod tests {
         );
     }
 
-    fn sealed_at(handler: &SqlOpaqueHandler, user: &UserId, issued_at: i64) -> String {
+    fn sealed_at(handler: &SqlOpaqueHandler, user: &UserId, issued_at: i64, id: u8) -> String {
         let key = handler
             .get_orion_secret_key(REGISTRATION_STATE_KEY_INFO)
             .unwrap();
         let data = registration::ServerData {
             username: user.clone(),
             issued_at,
+            start: Some(registration::StartBinding {
+                id: [id; 16],
+                by: session("bob", 1),
+                envelope_key: None,
+            }),
         };
         let sealed = orion::aead::seal(&key, &bincode::serialize(&data).unwrap()).unwrap();
         base64::engine::general_purpose::STANDARD.encode(sealed)
     }
 
-    // A finish must follow its start within ten minutes, checked by KLLDAP's `registration_user`.
     #[tokio::test]
     #[serial]
-    async fn test_a_finish_must_follow_its_start_within_ten_minutes() {
+    async fn test_a_finish_must_follow_its_start_within_two_minutes() {
         let handler =
             SqlOpaqueHandler::new(generate_random_private_key(), get_initialized_db().await);
         insert_user(&handler, "bob", "bob00").await;
         let bob = UserId::new("bob");
-        let now = chrono::Utc::now().timestamp();
+        let now = AT as i64;
+        let _clock = pin_clock(now);
         let request = client_registration(&handler, "bob", "bob-new-1").await;
-        let issued = |age: i64| registration::ClientRegistrationFinishRequest {
-            server_data: sealed_at(&handler, &bob, now - age),
+        let issued = |age: i64, id: u8| registration::ClientRegistrationFinishRequest {
+            server_data: sealed_at(&handler, &bob, now - age, id),
             ..request.clone()
         };
         let rows = [
             ("just started", 0, true),
-            ("nine minutes", 540, true),
-            ("eleven minutes", 660, false),
+            ("ninety seconds", 90, true),
+            ("two minutes", 120, true),
+            ("a second over two minutes", 121, false),
+            ("nine minutes", 540, false),
             ("a day", 86_400, false),
         ];
         let log = LogGuard::install_on_this_thread();
-        for (label, age, opens) in rows {
-            let got = handler.registration_user(&issued(age)).await;
-            let refused = got
-                .as_ref()
-                .err()
-                .map(|e| e.to_string().contains(REGISTRATION_TOO_LONG));
-            let failures: Vec<_> = log
-                .recorder()
-                .take_events()
-                .into_iter()
-                .filter(|e| !e.success)
-                .map(|e| (e.kind, e.target, e.detail))
-                .collect();
-            let row = (
-                LogKind::PasswordChange,
-                Some("bob".to_owned()),
-                Some(REGISTRATION_TOO_LONG.to_owned()),
-            );
+        let mut marks = 0;
+        for (id, (label, age, opens)) in (1u8..).zip(rows) {
+            let got = handler
+                .registration_claim(&issued(age, id), &session("bob", 1))
+                .await;
+            let too_long = DomainError::AuthenticationError(REGISTRATION_TOO_LONG.to_owned());
+            let expected = if opens {
+                Ok(bob.clone())
+            } else {
+                Err(too_long.to_string())
+            };
+            let row = one_row(REGISTRATION_TOO_LONG);
+            marks += i64::from(opens);
             assert_eq!(
-                (got.is_ok(), refused, failures),
                 (
-                    opens,
-                    (!opens).then_some(true),
-                    (!opens).then_some(row).into_iter().collect::<Vec<_>>()
+                    got.map(|claim| claim.user).map_err(|e| e.to_string()),
+                    failures(&log),
+                    kept(&handler.sql_pool).await
                 ),
+                (expected, if opens { vec![] } else { row }, marks),
                 "{label}"
             );
         }
         drop(log);
         attempt_login(&handler, "bob", "bob00", None).await.unwrap();
-        handler.registration_finish(issued(0)).await.unwrap();
+        handler.registration_finish(issued(0, 9)).await.unwrap();
         attempt_login(&handler, "bob", "bob-new-1", None)
             .await
             .unwrap();

@@ -47,6 +47,8 @@ const FLOOD_PASS: u64 = 8;
 // A flood window is one incident: it resolves after this much quiet, which also separates
 // distinct bursts from the same source.
 const FLOOD_IDLE_SECONDS: i64 = 20;
+// At most one log_gap row in this many seconds: later drops are said together.
+const GAP_WINDOW_SECONDS: i64 = 10;
 const FLOOD_ACTOR_CAP: usize = 64;
 /// The users of one source that hold a window of their own at a time, in each class; at 0
 /// every row is keyed by its source alone.
@@ -556,8 +558,28 @@ impl Outage {
     }
 }
 
+/// The dropped events not yet said by a `log_gap` row: the first are said at once, the ones
+/// that follow together when the window ends or the writer stops.
+#[derive(Default)]
+struct Gaps {
+    pending: u64,
+    said_at: Option<i64>,
+}
+
+impl Gaps {
+    fn due(&mut self, lost: u64, now: i64, stopping: bool) -> Option<u64> {
+        self.pending += lost;
+        let open = self.said_at.is_some_and(|at| now - at < GAP_WINDOW_SECONDS);
+        if self.pending == 0 || (open && !stopping) {
+            return None;
+        }
+        self.said_at = Some(now);
+        Some(std::mem::take(&mut self.pending))
+    }
+}
+
 // One INSERT per batch: a trickle lingers a moment to fill a batch, a full queue drains
-// back-to-back at insert speed. Dropped events surface as a log_gap row.
+// back-to-back at insert speed. Dropped events surface as log_gap rows, one a window.
 async fn run_writer(
     mut rx: mpsc::Receiver<LogEvent>,
     pool: DbConnection,
@@ -569,6 +591,7 @@ async fn run_writer(
     let mut buffer = Vec::with_capacity(BATCH_SIZE);
     let mut inserted_since_trim = 0u64;
     let mut outage = Outage::default();
+    let mut gaps = Gaps::default();
     loop {
         // The tick lets an idle flood window resolve itself and the warn limiter flush even
         // when no new event is driving the loop.
@@ -592,8 +615,9 @@ async fn run_writer(
         coalescers.bind.prune(now);
         flush_suppressed_warnings(now.as_second().max(0) as u64);
         let lost = dropped.swap(0, Ordering::Relaxed);
+        let gap = gaps.due(lost, now.as_second(), false);
         let mut rows = Vec::with_capacity(buffer.len() + 1);
-        if lost > 0 {
+        if let Some(lost) = gap {
             rows.push(to_active_model(gap_event(lost)));
         }
         rows.extend(buffer.drain(..).map(to_active_model));
@@ -601,14 +625,16 @@ async fn run_writer(
         rows.extend(floods.into_iter().map(to_active_model));
         let batch = rows.len() as u64;
         match insert_rows(&pool, rows).await {
+            Ok(()) if batch == 0 => {}
             Ok(()) => {
                 inserted_since_trim += batch;
                 outage.ended();
             }
             Err(e) => {
-                // A failed batch counts as dropped, so the next gap row still accounts for it.
-                dropped.fetch_add(batch, Ordering::Relaxed);
-                outage.failed(batch - u64::from(lost > 0), &e);
+                // A failed batch counts as dropped, its gap row for the events it stood for.
+                let own = batch - u64::from(gap.is_some());
+                dropped.fetch_add(own + gap.unwrap_or(0), Ordering::Relaxed);
+                outage.failed(own, &e);
             }
         }
         if retention.max_entries > 0 && inserted_since_trim >= trim_interval(retention.max_entries)
@@ -619,9 +645,12 @@ async fn run_writer(
             }
         }
     }
-    // The channel is closed: pending flood windows become rows, never lost.
-    let rows = coalescers.flush(Timestamp::now(), true);
-    let rows = rows.into_iter().map(to_active_model).collect::<Vec<_>>();
+    // The channel is closed: pending flood windows and unsaid drops become rows, never lost.
+    let now = Timestamp::now();
+    let lost = dropped.swap(0, Ordering::Relaxed);
+    let gap = gaps.due(lost, now.as_second(), true).map(gap_event);
+    let rows = gap.into_iter().chain(coalescers.flush(now, true));
+    let rows = rows.map(to_active_model).collect::<Vec<_>>();
     if let Err(e) = insert_rows(&pool, rows).await {
         warn!("Could not persist the final log events: {e}");
     }
@@ -3167,27 +3196,76 @@ mod tests {
             WriterCoalescers::new(0, FLOOD_IDLE_SECONDS),
             Duration::from_millis(1),
         ));
-        sink.record(event(LogKind::UserCreate, "bob", 0));
-        let gaps = |seen: &[Line]| seen.iter().filter(|l| l.text.contains("log_gap")).count();
         let mut seen = Vec::new();
-        lines_until(&lines, &mut seen, |seen| gaps(seen) >= 10).await;
+        for actor in ["bob", "carol", "dave"] {
+            sink.record(event(LogKind::UserCreate, actor, 0));
+            tokio::time::sleep(LINGER * 2).await;
+            seen.extend(lines.take_loud());
+        }
         pool.execute(rename("logs_away", "logs")).await.unwrap();
+        sink.record(event(LogKind::UserCreate, "erin", 0));
         let stored_again = |seen: &[Line]| seen.iter().any(|l| l.level == Level::INFO);
         lines_until(&lines, &mut seen, stored_again).await;
         drop(sink);
         task.await.unwrap();
+        let gaps = rows(&pool)
+            .await
+            .into_iter()
+            .filter(|row| row.kind == "log_gap");
+        let gaps: Vec<_> = gaps.map(|row| row.detail).collect();
+        assert_eq!(
+            gaps,
+            vec![Some("dropped events: 3".to_owned())],
+            "the three lost events are said by one row, though a gap row failed with them"
+        );
         let own = seen.iter().filter(|l| l.target != "logs");
         let own: Vec<_> = own.map(|l| (l.level, l.text.as_str())).collect();
         let levels: Vec<_> = own.iter().map(|(level, _)| *level).collect();
         assert_eq!(
             levels,
             vec![Level::WARN, Level::INFO],
-            "ten and more failed passes, then a good one: {own:?}"
+            "three failed passes, then a good one: {own:?}"
         );
         let (started, ended) = (own[0].1, own[1].1);
         assert!(
-            started.starts_with("Log events are not being stored (") && ended.ends_with(": 1 lost"),
+            started.starts_with("Log events are not being stored (") && ended.ends_with(": 3 lost"),
             "{own:?}"
         );
+    }
+
+    #[test]
+    fn test_dropped_events_are_said_at_once_then_once_a_window_and_all_when_the_writer_stops() {
+        let rows = [
+            ("nothing dropped", 0, 0, false, None),
+            ("the first drops are said at once", 5, 0, false, Some(5)),
+            ("drops inside the window wait", 7, 3, false, None),
+            ("and more of them", 2, GAP_WINDOW_SECONDS - 1, false, None),
+            (
+                "the window's end says them together",
+                1,
+                GAP_WINDOW_SECONDS,
+                false,
+                Some(10),
+            ),
+            (
+                "a new window holds again",
+                4,
+                GAP_WINDOW_SECONDS + 1,
+                false,
+                None,
+            ),
+            (
+                "a stopping writer says what is left",
+                0,
+                GAP_WINDOW_SECONDS + 2,
+                true,
+                Some(4),
+            ),
+            ("and nothing twice", 0, GAP_WINDOW_SECONDS + 3, true, None),
+        ];
+        let mut gaps = Gaps::default();
+        for (label, lost, now, stopping, said) in rows {
+            assert_eq!(gaps.due(lost, now, stopping), said, "{label}");
+        }
     }
 }

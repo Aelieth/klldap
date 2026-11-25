@@ -2,6 +2,7 @@ use crate::SqlBackendHandler;
 use crate::sql_log_handler::UNKNOWN_USER_DETAIL;
 use crate::sql_mfa_handler::{TotpRejection, now_unix};
 use crate::sql_mfa_windows::with_proof;
+use crate::sql_user_backend_handler::sync_still_off;
 use async_trait::async_trait;
 use base64::Engine;
 use lldap_auth::opaque;
@@ -21,7 +22,10 @@ use lldap_domain_model::{
 };
 use lldap_mfa::{MFA_ENROLLMENT_REQUIRED, TOTP_CODE_REQUIRED, split_totp_suffix, without_password};
 use lldap_opaque_handler::{OpaqueHandler, STRETCH_FAILED, login, registration, stretch};
-use sea_orm::{ActiveModelTrait, ActiveValue, ConnectionTrait, DbErr, EntityTrait, QuerySelect};
+use sea_orm::{
+    ActiveModelTrait, ActiveValue, ConnectionTrait, DbErr, EntityTrait, QuerySelect,
+    TransactionTrait,
+};
 use tracing::{debug, info, instrument, warn};
 
 type SqlOpaqueHandler = SqlBackendHandler;
@@ -242,6 +246,25 @@ impl SqlBackendHandler {
     /// is already queued; the run loop writes it well inside the start's hold.
     fn refuse_finish() -> DomainError {
         opaque::AuthenticationError::failed_proof().into()
+    }
+
+    /// The password of a user read without sync in directory-only: the user's row is written
+    /// first, then `sync_still_off`, in one transaction.
+    async fn finish_with_sync_off(
+        &self,
+        user_update: model::users::ActiveModel,
+        user: &UserId,
+    ) -> Result<()> {
+        let user = user.clone();
+        self.sql_pool
+            .transaction::<_, (), DomainError>(|transaction| {
+                Box::pin(async move {
+                    user_update.update(transaction).await?;
+                    sync_still_off(transaction, &user).await
+                })
+            })
+            .await?;
+        Ok(())
     }
 
     /// While the realm is unavailable only admins get in; a refusal is the door's one row.
@@ -707,7 +730,12 @@ impl OpaqueHandler for SqlOpaqueHandler {
             modified_date: ActiveValue::Set(now),
             ..Default::default()
         };
-        user_update.update(&self.sql_pool).await?;
+        match kerberos_backend().directory_only() {
+            Some(_) => self.finish_with_sync_off(user_update, &username).await?,
+            None => {
+                user_update.update(&self.sql_pool).await?;
+            }
+        }
         info!(r#"Successfully (re)set password for "{}""#, &username);
         logging::record(LogKind::PasswordChange, Some(username.as_str()), None);
         Ok(username)
@@ -1763,7 +1791,6 @@ mod tests {
         insert_user(&handler, "e1admin", "e1admin00").await;
         let admins = insert_group(&handler, "lldap_admin").await;
         insert_membership(&handler, admins, "e1admin").await;
-        let _kdc = DegradedGuard::install();
         let rows = [
             (
                 "the LDAP bind",
@@ -1784,61 +1811,69 @@ mod tests {
                 Protocol::Http,
             ),
         ];
-        for (label, door, kind, protocol) in rows {
-            for user in ["e1down", "e1admin"] {
-                let password = format!("{user}00");
-                let meta = match protocol {
-                    Protocol::Ldap => RequestMeta::ldap(None, None),
-                    _ => RequestMeta::http(None, None),
-                };
-                let answered = with_request(meta, async {
-                    match door {
-                        Door::WebLogin => attempt_login(&handler, user, &password, None)
-                            .await
-                            .map(drop),
-                        _ => handler.bind(bind_request(user, &password)).await,
-                    }
-                })
-                .await;
-                let rows: Vec<_> = log
-                    .recorder()
-                    .take_events()
-                    .into_iter()
-                    .filter(|e| e.actor.as_deref() == Some(user))
-                    .map(|e| (e.kind, e.success, e.protocol, e.target, e.detail))
-                    .collect();
-                let (answer, expected) = match (user, door) {
-                    ("e1admin", _) => (Ok(()), (kind, true, protocol, None, None)),
-                    (_, Door::LdapBind) => (
-                        Err(DEGRADED_CAUSE.to_owned()),
-                        (
-                            LogKind::AccessDenied,
-                            false,
-                            protocol,
-                            Some(user.to_owned()),
-                            Some(LDAP_ADMINS_ONLY.to_owned()),
+        for directory_only in [false, true] {
+            let _kdc = match directory_only {
+                true => DegradedGuard::install_directory_only(),
+                false => DegradedGuard::install(),
+            };
+            for (label, door, kind, protocol) in rows {
+                for user in ["e1down", "e1admin"] {
+                    let password = format!("{user}00");
+                    let meta = match protocol {
+                        Protocol::Ldap => RequestMeta::ldap(None, None),
+                        _ => RequestMeta::http(None, None),
+                    };
+                    let answered = with_request(meta, async {
+                        match door {
+                            Door::WebLogin => attempt_login(&handler, user, &password, None)
+                                .await
+                                .map(drop),
+                            _ => handler.bind(bind_request(user, &password)).await,
+                        }
+                    })
+                    .await;
+                    let rows: Vec<_> = log
+                        .recorder()
+                        .take_events()
+                        .into_iter()
+                        .filter(|e| e.actor.as_deref() == Some(user))
+                        .map(|e| (e.kind, e.success, e.protocol, e.target, e.detail))
+                        .collect();
+                    let (answer, expected) = match (user, door) {
+                        ("e1admin", _) => (Ok(()), (kind, true, protocol, None, None)),
+                        _ if directory_only => (Ok(()), (kind, true, protocol, None, None)),
+                        (_, Door::LdapBind) => (
+                            Err(DEGRADED_CAUSE.to_owned()),
+                            (
+                                LogKind::AccessDenied,
+                                false,
+                                protocol,
+                                Some(user.to_owned()),
+                                Some(LDAP_ADMINS_ONLY.to_owned()),
+                            ),
                         ),
-                    ),
-                    _ => (
-                        Err(DEGRADED_CAUSE.to_owned()),
-                        (
-                            LogKind::AccessDenied,
-                            false,
-                            protocol,
-                            None,
-                            Some(ADMINS_ONLY.to_owned()),
+                        _ => (
+                            Err(DEGRADED_CAUSE.to_owned()),
+                            (
+                                LogKind::AccessDenied,
+                                false,
+                                protocol,
+                                None,
+                                Some(ADMINS_ONLY.to_owned()),
+                            ),
                         ),
-                    ),
-                };
-                let answered = answered.map_err(|e| match e {
-                    DomainError::KdcUnavailable(cause) => cause,
-                    other => format!("not KdcUnavailable: {other}"),
-                });
-                assert_eq!(
-                    (answered, rows),
-                    (answer, vec![expected]),
-                    "{label}, {user}: one row, and no success row for a refusal"
-                );
+                    };
+                    let answered = answered.map_err(|e| match e {
+                        DomainError::KdcUnavailable(cause) => cause,
+                        other => format!("not KdcUnavailable: {other}"),
+                    });
+                    assert_eq!(
+                        (answered, rows),
+                        (answer, vec![expected]),
+                        "{label}, {user}, directory-only {directory_only}: one row, and no \
+                         success row for a refusal"
+                    );
+                }
             }
         }
     }

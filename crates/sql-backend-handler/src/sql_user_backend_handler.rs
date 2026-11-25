@@ -2,6 +2,7 @@ use crate::sql_backend_handler::{
     SqlBackendHandler, attribute_value_to_db_bytes, bool_to_expr, describe_changes,
     get_repeated_filter, is_backend_writable_readonly_attribute,
 };
+use crate::sql_kerberos_committer::synced_on;
 use crate::sql_log_handler::to_active_model;
 use async_trait::async_trait;
 use itertools::Itertools;
@@ -17,11 +18,13 @@ use lldap_domain_handlers::handler::{
     GroupBackendHandler, ReadSchemaBackendHandler, SubStringFilter, SystemConfigBackendHandler,
     UserBackendHandler, UserListerBackendHandler, UserRequestFilter,
 };
+use lldap_domain_handlers::instant::{Timestamp, to_naive};
 use lldap_domain_handlers::kerberos::{
     CREATE_WITHOUT_SYNC, CommitError, HostRow, KerberosState, LEFT_FOR_THE_START_PASS,
-    STATUS_LEFT_DISABLED, STATUS_LEFT_NOT_READY, SYNC_CHANGED, SYNC_ON_NEEDS_KERBEROS, UserChange,
-    UserStep, kerberos_backend, kerberos_state, require_kdc_ready, require_settled, sync_refused,
-    unsettled_answer, validate_directory_username, validate_kerberos_username, while_disabled,
+    STATUS_LEFT_DIRECTORY_ONLY, STATUS_LEFT_DISABLED, STATUS_LEFT_NOT_READY, SYNC_CHANGED,
+    SYNC_ON_NEEDS_KERBEROS, UserChange, UserStep, kerberos_backend, kerberos_state,
+    require_kdc_ready, require_settled, sync_refused, unsettled_answer,
+    validate_directory_username, validate_kerberos_username, while_disabled,
 };
 use lldap_domain_handlers::logging::{self, LogKind};
 use lldap_domain_handlers::mfa::MFA_DISABLED_GROUP;
@@ -528,6 +531,15 @@ fn left_for_the_start_pass(user: &UserId, detail: &str) {
     logging::record(LogKind::KerberosSync, Some(user.as_str()), Some(detail));
 }
 
+/// A plain write in directory-only, after it wrote the user's row in `transaction`: a sync change
+/// has waited for that row or is read here, and sync on rolls the write back (`SYNC_CHANGED`).
+pub(crate) async fn sync_still_off(transaction: &DatabaseTransaction, user: &UserId) -> Result<()> {
+    match synced_on(transaction, user).await? {
+        true => Err(DomainError::InternalError(SYNC_CHANGED.to_owned())),
+        false => Ok(()),
+    }
+}
+
 async fn commit_life_step(
     user: &UserId,
     step: UserStep,
@@ -650,8 +662,15 @@ async fn commit_status(
 fn status_left(state: &KerberosState, user: &UserId) {
     match state {
         KerberosState::Disabled => left_for_the_start_pass(user, STATUS_LEFT_DISABLED),
-        KerberosState::NotReady(_) => left_for_the_start_pass(user, STATUS_LEFT_NOT_READY),
+        KerberosState::NotReady(_) => left_for_the_start_pass(user, status_left_not_ready()),
         KerberosState::Ready => {}
+    }
+}
+
+fn status_left_not_ready() -> &'static str {
+    match kerberos_backend().directory_only() {
+        Some(_) => STATUS_LEFT_DIRECTORY_ONLY,
+        None => STATUS_LEFT_NOT_READY,
     }
 }
 
@@ -663,6 +682,34 @@ impl SqlBackendHandler {
         }
         let user = self.get_user_details(user_id).await?;
         Ok(kerberos_sync_enabled(&user.attributes))
+    }
+
+    /// The delete of a user read without sync in directory-only: the user's row is written first,
+    /// then `sync_still_off`, then the delete, in one transaction. The rows deleted.
+    async fn delete_with_sync_off(&self, user_id: &UserId) -> Result<u64> {
+        let user = user_id.clone();
+        let deleted = self
+            .sql_pool
+            .transaction::<_, u64, DomainError>(|transaction| {
+                Box::pin(async move {
+                    let now = to_naive(Timestamp::now());
+                    model::User::update_many()
+                        .col_expr(UserColumn::ModifiedDate, Expr::value(now))
+                        .filter(ColumnTrait::eq(&UserColumn::UserId, user.clone()))
+                        .exec(transaction)
+                        .await?;
+                    sync_still_off(transaction, &user).await?;
+                    let deleted = model::User::delete_by_id(user).exec(transaction).await?;
+                    Ok(deleted.rows_affected)
+                })
+            })
+            .await;
+        deleted.map_err(|e| match DomainError::from(e) {
+            DomainError::InternalError(why) if why == SYNC_CHANGED => {
+                refused(LogKind::UserDelete, user_id, why)
+            }
+            e => e,
+        })
     }
 
     /// The forced reset of an admin whose Kerberos cannot take part: the password, the sync turned
@@ -977,10 +1024,16 @@ impl UserBackendHandler for SqlBackendHandler {
             return done;
         }
 
-        let res = model::User::delete_by_id(user_id.clone())
-            .exec(&self.sql_pool)
-            .await?;
-        if res.rows_affected == 0 {
+        let deleted = match kerberos_backend().directory_only() {
+            Some(_) => self.delete_with_sync_off(user_id).await?,
+            None => {
+                let res = model::User::delete_by_id(user_id.clone())
+                    .exec(&self.sql_pool)
+                    .await?;
+                res.rows_affected
+            }
+        };
+        if deleted == 0 {
             return Err(DomainError::EntityNotFound(format!(
                 "No such user: '{user_id}'"
             )));
@@ -2235,6 +2288,7 @@ mod tests {
         SyncOn,
         SyncOff,
         SyncOffAgain,
+        SyncKept,
         SyncedPassword,
         DeleteSynced,
         DeleteUnsynced,
@@ -2277,6 +2331,10 @@ mod tests {
             Life::SyncOn => ("John", handler.update_user(sync_request("John", 1)).await),
             Life::SyncOff | Life::SyncOffAgain => {
                 ("bob", handler.update_user(sync_request("bob", 0)).await)
+            }
+            Life::SyncKept => {
+                let kept = sync_request("patrick", 1);
+                ("patrick", handler.update_user(kept).await)
             }
             Life::SyncedPassword => {
                 let patrick = UserId::new("patrick");
@@ -2458,11 +2516,44 @@ mod tests {
                 plain(Life::DeleteUnsynced, LogKind::UserDelete, None),
             ]
         };
+        let directory_only = {
+            let password = realm_not_ready(DEGRADED_CAUSE).to_string();
+            let again = format!("Kerberos KDC unavailable: {DEGRADED_CAUSE}; try again");
+            let refused = |step, kind, after| {
+                let logged = vec![failed(kind, &again)];
+                (step, Some(again.clone()), after, logged)
+            };
+            let membership = |step, kind| {
+                let logged = vec![done(kind), left_as(STATUS_LEFT_DIRECTORY_ONLY)];
+                (step, None, Some(true), logged)
+            };
+            let plain = |step, kind, after| (step, None, after, vec![done(kind)]);
+            let synced_password = vec![failed(LogKind::PasswordChange, &password)];
+            vec![
+                refused(Life::CreateSynced, LogKind::UserCreate, None),
+                plain(Life::CreateUnsynced, LogKind::UserCreate, Some(false)),
+                refused(Life::SyncOn, LogKind::UserUpdate, Some(false)),
+                refused(Life::SyncOff, LogKind::UserUpdate, Some(true)),
+                plain(Life::SyncKept, LogKind::UserUpdate, Some(true)),
+                (
+                    Life::SyncedPassword,
+                    Some(password.clone()),
+                    Some(true),
+                    synced_password,
+                ),
+                membership(Life::Disable, LogKind::MembershipAdd),
+                membership(Life::Enable, LogKind::MembershipRemove),
+                plain(Life::PlainPassword, LogKind::PasswordChange, Some(false)),
+                refused(Life::DeleteSynced, LogKind::UserDelete, Some(true)),
+                plain(Life::DeleteUnsynced, LogKind::UserDelete, None),
+            ]
+        };
         let starting = "the Kerberos KDC is still starting; retry shortly";
         let states = [
             ("disabled", disabled),
             ("starting", not_ready(starting)),
             ("degraded", not_ready(DEGRADED_CAUSE)),
+            ("directory-only", directory_only),
             ("unsettled", unsettled),
         ];
         for (state, rows) in states {
@@ -2477,6 +2568,7 @@ mod tests {
             let _guards = (
                 (state == "starting").then(NotReadyGuard::install),
                 (state == "degraded").then(DegradedGuard::install),
+                (state == "directory-only").then(DegradedGuard::install_directory_only),
                 (state == "unsettled").then(|| RecordingGuard::install_unsettled(ANSWER_UNSETTLED)),
             );
             let log = LogGuard::install_on_this_thread();
@@ -2505,6 +2597,62 @@ mod tests {
                     "{state}, {step:?}: {got:?}"
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_plain_write_in_directory_only_is_rolled_back_where_sync_is_on() {
+        use lldap_opaque_handler::{OpaqueHandler, prepare_registration};
+        use lldap_test_utils::recording_kerberos::DegradedGuard;
+        use lldap_test_utils::recording_log::LogGuard;
+        let fixture = TestFixture::new().await;
+        let accepting = RecordingGuard::install();
+        let on = sync_request("bob", 1);
+        fixture.handler.update_user(on).await.unwrap();
+        drop(accepting);
+        let _closed = DegradedGuard::install_directory_only();
+        let log = LogGuard::install_on_this_thread();
+        let changed = format!("Internal error: `{SYNC_CHANGED}`");
+        for (name, synced) in [("bob", true), ("John", false)] {
+            let user = UserId::new(name);
+            let (record, request) =
+                prepare_registration(&fixture.handler, user.clone(), b"Plain-Pass-1")
+                    .await
+                    .unwrap();
+            let finished = fixture.handler.registration_finish(request).await;
+            let row = model::User::find_by_id(user.clone())
+                .one(&fixture.handler.sql_pool)
+                .await
+                .unwrap();
+            let stored = row.and_then(|row| row.password_hash) == Some(record);
+            let deleted = fixture.handler.delete_with_sync_off(&user).await;
+            let left = fixture.handler.get_user_details(&user).await.is_ok();
+            let refusals: Vec<_> = log
+                .recorder()
+                .take_events()
+                .into_iter()
+                .filter(|e| !e.success)
+                .map(|e| (e.kind, e.detail))
+                .collect();
+            let got = (
+                finished.map(drop).map_err(|e| e.to_string()),
+                stored,
+                deleted.map_err(|e| e.to_string()),
+                left,
+                refusals,
+            );
+            let want = match synced {
+                true => (
+                    Err(changed.clone()),
+                    false,
+                    Err(changed.clone()),
+                    true,
+                    vec![(LogKind::UserDelete, Some(SYNC_CHANGED.to_owned()))],
+                ),
+                false => (Ok(()), true, Ok(1), false, vec![]),
+            };
+            assert_eq!(got, want, "{name}, synced {synced}");
         }
     }
 

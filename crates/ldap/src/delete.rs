@@ -1,5 +1,5 @@
 use crate::core::{
-    error::{LdapError, LdapResult},
+    error::{LdapError, LdapResult, unavailable_in_directory_only},
     utils::LdapInfo,
 };
 use crate::dn::{UserOrGroupName, get_user_or_group_id_from_distinguished_name};
@@ -54,13 +54,12 @@ async fn delete_user(
                 message: format!("Error while finding user: {e:?}"),
             },
         })?;
-    backend_handler
-        .delete_user(&user_id)
-        .await
-        .map_err(|e| LdapError {
+    backend_handler.delete_user(&user_id).await.map_err(|e| {
+        unavailable_in_directory_only(&e).unwrap_or_else(|| LdapError {
             code: LdapResultCode::OperationsError,
             message: format!("Error while deleting user: {e:?}"),
-        })?;
+        })
+    })?;
     Ok(vec![make_del_response(
         LdapResultCode::Success,
         String::new(),
@@ -240,6 +239,51 @@ mod tests {
                 r#"Error while deleting user: InternalError("WTF?")"#.to_string()
             )])
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_delete_refused_for_the_realm_is_52_only_in_directory_only() {
+        use lldap_test_utils::recording_kerberos::{DEGRADED_CAUSE, DegradedGuard};
+        let refused = || DomainError::KdcUnavailable(format!("{DEGRADED_CAUSE}; try again"));
+        let rows = [
+            (
+                false,
+                LdapResultCode::OperationsError,
+                format!("Error while deleting user: {:?}", refused()),
+            ),
+            (
+                true,
+                LdapResultCode::Unavailable,
+                format!("Kerberos KDC unavailable: {DEGRADED_CAUSE}; try again"),
+            ),
+        ];
+        for (directory_only, code, message) in rows {
+            let mut mock = MockTestBackendHandler::new();
+            mock.expect_get_user_details()
+                .with(eq(UserId::new("bob")))
+                .return_once(|_| {
+                    Ok(User {
+                        user_id: UserId::new("bob"),
+                        ..Default::default()
+                    })
+                });
+            mock.expect_delete_user()
+                .with(eq(UserId::new("bob")))
+                .times(1)
+                .return_once(move |_| Err(refused()));
+            let mut ldap_handler = setup_bound_admin_handler(mock).await;
+            let _kdc = match directory_only {
+                true => DegradedGuard::install_directory_only(),
+                false => DegradedGuard::install(),
+            };
+            let request = LdapOp::DelRequest("uid=bob,ou=people,dc=example,dc=com".to_owned());
+            assert_eq!(
+                ldap_handler.handle_ldap_message(request).await,
+                Some(vec![make_del_response(code, message)]),
+                "directory-only {directory_only}"
+            );
+        }
     }
 
     #[tokio::test]

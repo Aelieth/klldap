@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use lldap_domain::types::UserId;
 use lldap_domain_handlers::kerberos::{
-    CommitError, DegradedKerberos, Held, HostRow, KerberosSync, PasswordCommit, UserChange,
-    set_thread_kerberos_backend,
+    CommitError, DegradedKerberos, DegradedMode, Held, HostRow, KerberosSync, PasswordCommit,
+    UserChange, set_thread_kerberos_backend,
 };
 use lldap_domain_handlers::password::record_commit_failure;
 use std::sync::{Arc, Mutex};
@@ -276,9 +276,18 @@ pub struct DegradedGuard;
 
 impl DegradedGuard {
     pub fn install() -> Self {
-        set_thread_kerberos_backend(Some(Arc::new(DegradedKerberos::new(
+        Self::installed(DegradedMode::AdminOnly)
+    }
+
+    pub fn install_directory_only() -> Self {
+        Self::installed(DegradedMode::DirectoryOnly)
+    }
+
+    fn installed(mode: DegradedMode) -> Self {
+        set_thread_kerberos_backend(Some(Arc::new(DegradedKerberos::with_mode(
             RECORDER_REALM.to_owned(),
             DEGRADED_CAUSE.to_owned(),
+            mode,
         ))));
         Self
     }

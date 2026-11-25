@@ -3,7 +3,7 @@ use crate::handler::PolicyBackendHandler;
 use crate::instant::Timestamp;
 use crate::kerberos::{
     CREATE_WITHOUT_SYNC, CommitError, Held, HostRow, KerberosState, KerberosSync, PasswordCommit,
-    SYNC_CHANGED, SYNC_OFF_FIRST, kerberos_backend, settled_state, settled_state_of,
+    SYNC_CHANGED, SYNC_OFF_FIRST, kerberos_backend, plain_password_refused, settled_state_of,
     while_disabled,
 };
 use crate::logging::{self, LogKind};
@@ -227,6 +227,7 @@ impl std::error::Error for PasswordChangeError {}
 fn change_error(e: DomainError) -> PasswordChangeError {
     match e {
         DomainError::KdcUnavailable(cause) => PasswordChangeError::Unavailable(cause),
+        DomainError::InternalError(why) if why == SYNC_CHANGED => PasswordChangeError::SyncChanged,
         e => PasswordChangeError::Failed(e.to_string()),
     }
 }
@@ -271,7 +272,7 @@ pub fn realm_not_ready(cause: &str) -> PasswordChangeError {
 }
 
 fn realm_ready(kind: LogKind, user: &UserId) -> Result<(), PasswordChangeError> {
-    let KerberosState::NotReady(cause) = settled_state() else {
+    let Some(cause) = plain_password_refused() else {
         return Ok(());
     };
     Err(refused_with_row(kind, user, realm_not_ready(&cause)))
@@ -786,6 +787,38 @@ mod tests {
             realm_not_ready("down").to_string(),
             "Kerberos KDC unavailable: down; a password is changed only by the server that holds \
              the Kerberos realm; try again"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_in_directory_only_a_plain_change_goes_on_and_a_synced_one_is_refused_first() {
+        use crate::kerberos::{DegradedKerberos, DegradedMode, NoopKerberos, set_kerberos_backend};
+        use std::sync::Arc;
+        let bob = UserId::new("bob");
+        let turned_on = Deriving(
+            lldap_auth::opaque::server::generate_random_private_key(),
+            Some(SYNC_CHANGED),
+        );
+        let (realm, cause) = ("EXAMPLE.COM".to_owned(), "down".to_owned());
+        let closed = DegradedKerberos::with_mode(realm, cause, DegradedMode::DirectoryOnly);
+        set_kerberos_backend(Arc::new(closed));
+        let (off, on, min) = (PasswordSync::Off, PasswordSync::On, PASSWORD_MIN_LENGTH);
+        let got = (
+            change_password_everywhere(&Untouched, &bob, "Short-7", off, min).await,
+            change_password_everywhere(&turned_on, &bob, "Eight-88", off, min).await,
+            change_password_everywhere(&Untouched, &bob, "Eight-88", on, min).await,
+        );
+        set_kerberos_backend(Arc::new(NoopKerberos::default()));
+        assert_eq!(
+            got,
+            (
+                Err(PasswordChangeError::TooShort(8)),
+                Err(PasswordChangeError::SyncChanged),
+                Err(realm_not_ready("down")),
+            ),
+            "a plain change passes to the rules, and the store's SYNC_CHANGED keeps its answer; \
+             a synced one is refused before anything is derived"
         );
     }
 

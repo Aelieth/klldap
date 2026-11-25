@@ -1,6 +1,6 @@
 use crate::{
     core::{
-        error::{LdapError, LdapResult},
+        error::{LdapError, LdapResult, unavailable_in_directory_only},
         utils::{LdapInfo, typed_attribute},
     },
     dn::get_user_id_from_distinguished_name,
@@ -146,13 +146,12 @@ async fn handle_profile_modify(
         }
     }
 
-    writeable_handler
-        .update_user(request)
-        .await
-        .map_err(|e| LdapError {
+    writeable_handler.update_user(request).await.map_err(|e| {
+        unavailable_in_directory_only(&e).unwrap_or_else(|| LdapError {
             code: LdapResultCode::OperationsError,
             message: format!("Error while updating user via LDAP Modify: {e:#?}"),
         })
+    })
 }
 
 fn unwilling(message: String) -> LdapError {
@@ -976,6 +975,16 @@ mod tests {
                 "Unsupported attribute for LDAP Modify: title (supported: givenName, sn, cn, mail, avatar, sshPublicKey, userPassword)",
             ),
             (
+                "Replace of kerberossync: this door never changes sync",
+                "lldap_admin",
+                bob,
+                LdapModifyType::Replace,
+                "kerberossync",
+                &["1"],
+                LdapResultCode::UnwillingToPerform,
+                "Unsupported attribute for LDAP Modify: kerberossync (supported: givenName, sn, cn, mail, avatar, sshPublicKey, userPassword)",
+            ),
+            (
                 "Delete of mail",
                 "lldap_admin",
                 bob,
@@ -1086,6 +1095,46 @@ mod tests {
                     .await,
                 make_modify_failure_response(code, message),
                 "{label}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_modify_refused_for_the_realm_is_52_only_in_directory_only() {
+        use lldap_test_utils::recording_kerberos::{DEGRADED_CAUSE, DegradedGuard};
+        let refused = || DomainError::KdcUnavailable(format!("{DEGRADED_CAUSE}; try again"));
+        let rows = [
+            (
+                false,
+                LdapResultCode::OperationsError,
+                format!(
+                    "Error while updating user via LDAP Modify: {:#?}",
+                    refused()
+                ),
+            ),
+            (
+                true,
+                LdapResultCode::Unavailable,
+                format!("Kerberos KDC unavailable: {DEGRADED_CAUSE}; try again"),
+            ),
+        ];
+        for (directory_only, code, message) in rows {
+            let mut mock = MockTestBackendHandler::new();
+            setup_default_ldap_mock(&mut mock);
+            mock.expect_update_user()
+                .times(1)
+                .return_once(move |_| Err(refused()));
+            let ldap_handler = setup_bound_admin_handler(mock).await;
+            let _kdc = match directory_only {
+                true => DegradedGuard::install_directory_only(),
+                false => DegradedGuard::install(),
+            };
+            let request = modify_request("bob", LdapModifyType::Replace, "cn", &["Bob"]);
+            assert_eq!(
+                ldap_handler.do_modify_request(&request).await,
+                make_modify_failure_response(code, &message),
+                "directory-only {directory_only}"
             );
         }
     }

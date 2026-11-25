@@ -1,6 +1,6 @@
 use crate::{
     core::{
-        error::{LdapError, LdapResult},
+        error::{LdapError, LdapResult, unavailable_in_directory_only},
         utils::{LdapInfo, typed_attribute},
     },
     dn::{
@@ -18,7 +18,7 @@ use lldap_domain::{
     requests::{CreateGroupRequest, CreateUserRequest},
     types::{Attribute, AttributeType, Email, GroupName, UserId},
 };
-use lldap_domain_handlers::kerberos::{KerberosState, settled_state};
+use lldap_domain_handlers::kerberos::plain_password_refused;
 use lldap_domain_handlers::logging::LogKind;
 use lldap_domain_handlers::password::{
     PASSWORD_MIN_LENGTH, PasswordSync, change_password_everywhere, create_synced_user,
@@ -297,7 +297,7 @@ async fn create_user(
         )]);
     }
     if plain_password.is_some()
-        && let KerberosState::NotReady(cause) = settled_state()
+        && let Some(cause) = plain_password_refused()
     {
         let refused = realm_not_ready(&cause);
         record_failed(LogKind::UserCreate, &user_id, &refused);
@@ -307,13 +307,12 @@ async fn create_user(
         record_failed(LogKind::UserCreate, &user_id, &e);
         return Err(password_change_error(e));
     }
-    backend_handler
-        .create_user(request)
-        .await
-        .map_err(|e| LdapError {
+    backend_handler.create_user(request).await.map_err(|e| {
+        unavailable_in_directory_only(&e).unwrap_or_else(|| LdapError {
             code: LdapResultCode::OperationsError,
             message: format!("Could not create user: {e:#?}"),
-        })?;
+        })
+    })?;
 
     if let Some(plain) = plain_password {
         change_password_everywhere(backend_handler, &user_id, plain, PasswordSync::Off, min)
@@ -1150,6 +1149,76 @@ mod tests {
                 vec![(LogKind::UserCreate, false, Some(refused))]
             )
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_plain_add_with_a_password_goes_on_in_directory_only() {
+        use lldap_test_utils::recording_kerberos::DegradedGuard;
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_bounded_policy_levels()
+            .returning(|_| Ok(vec![]));
+        mock.expect_get_user_details()
+            .returning(|u| Err(DomainError::EntityNotFound(u.to_string())));
+        mock.expect_create_user().times(1).return_once(|_| Ok(()));
+        expect_password_registration(&mut mock, "bob");
+        mock.expect_ensure_kerberos_principal_consistency().times(0);
+        let ldap_handler = setup_bound_admin_handler(mock).await;
+        let _closed = DegradedGuard::install_directory_only();
+        let password = vec![LdapPartialAttribute {
+            atype: "userPassword".to_owned(),
+            vals: vec![b"Bob-Pass-1".to_vec()],
+        }];
+        assert_eq!(
+            ldap_handler
+                .create_user_or_group(&mut add_user_request(password))
+                .await,
+            Ok(vec![make_add_response(
+                LdapResultCode::Success,
+                String::new()
+            )])
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_synced_add_refused_for_the_realm_is_52_only_in_directory_only() {
+        use lldap_test_utils::recording_kerberos::{DEGRADED_CAUSE, DegradedGuard};
+        let refused = || DomainError::KdcUnavailable(format!("{DEGRADED_CAUSE}; try again"));
+        let rows = [
+            (
+                false,
+                LdapResultCode::OperationsError,
+                format!("Could not create user: {:#?}", refused()),
+            ),
+            (
+                true,
+                LdapResultCode::Unavailable,
+                format!("Kerberos KDC unavailable: {DEGRADED_CAUSE}; try again"),
+            ),
+        ];
+        for (directory_only, code, message) in rows {
+            let mut mock = MockTestBackendHandler::new();
+            mock.expect_create_user()
+                .times(1)
+                .return_once(move |_| Err(refused()));
+            let ldap_handler = setup_bound_admin_handler(mock).await;
+            let _kdc = match directory_only {
+                true => DegradedGuard::install_directory_only(),
+                false => DegradedGuard::install(),
+            };
+            let synced = vec![LdapPartialAttribute {
+                atype: "kerberossync".to_owned(),
+                vals: vec![b"1".to_vec()],
+            }];
+            assert_eq!(
+                ldap_handler
+                    .create_user_or_group(&mut add_user_request(synced))
+                    .await,
+                Err(LdapError { code, message }),
+                "directory-only {directory_only}"
+            );
+        }
     }
 
     #[tokio::test]

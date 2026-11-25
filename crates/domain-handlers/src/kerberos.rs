@@ -188,6 +188,9 @@ pub const STATUS_LEFT_DISABLED: &str = "Kerberos is disabled: the status of a pr
 pub const STATUS_LEFT_NOT_READY: &str = "the Kerberos realm is not ready: the status of a \
      principal, if there is one, is left for the server that holds the realm, which sets it from \
      lldap_disabled at its next status pass, within a minute, or when the realm opens";
+pub const STATUS_LEFT_DIRECTORY_ONLY: &str = "the Kerberos realm is closed on this server: the \
+     status of a principal, if there is one, is left for the realm's next opening, which sets it \
+     from lldap_disabled before the KDC serves";
 pub const CREATED_FIRST: &str = "another server created the realm first";
 /// A new principal name is a directory user's, or a case twin of one.
 pub const DIRECTORY_USER: &str = "the name belongs to a directory user";
@@ -702,6 +705,16 @@ pub fn settled_state_of(backend: &dyn KerberosSync) -> KerberosState {
 
 pub fn settled_state() -> KerberosState {
     settled_state_of(&*kerberos_backend())
+}
+
+/// Why a password that touches no principal waits for the realm, if it does. In directory-only
+/// it does not: every change to both stores is refused there, so it has none to wait for.
+pub fn plain_password_refused() -> Option<String> {
+    let backend = kerberos_backend();
+    match settled_state_of(&*backend) {
+        KerberosState::NotReady(cause) if backend.directory_only().is_none() => Some(cause),
+        _ => None,
+    }
 }
 
 /// A user change that writes both stores: refused with one row until the realm is settled.

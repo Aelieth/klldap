@@ -759,15 +759,18 @@ fn membership_failed(err: DbErr) -> KerberosStoreError {
     }
 }
 
-/// The user's sync as the doors read it, read in the transaction that writes.
 async fn synced_in(txn: &impl ConnectionTrait, user: &UserId) -> Result<bool, KerberosStoreError> {
+    synced_on(txn, user).await.map_err(row_failed)
+}
+
+/// The user's sync as the doors read it, read in the transaction that writes.
+pub(crate) async fn synced_on(txn: &impl ConnectionTrait, user: &UserId) -> Result<bool, DbErr> {
     let schema = PublicSchema::shared().user_attributes();
     let stored = model::UserAttributes::find()
         .filter(model::UserAttributesColumn::UserId.eq(user))
         .filter(model::UserAttributesColumn::AttributeName.eq(AttributeName::new(KERBEROS_SYNC)))
         .all(txn)
-        .await
-        .map_err(row_failed)?;
+        .await?;
     let attributes: Vec<_> = stored
         .into_iter()
         .filter_map(|row| codec::decode_attribute(row.attribute_name, &row.value, schema).ok())

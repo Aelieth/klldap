@@ -691,6 +691,7 @@ pub mod tests {
     pub(crate) enum Kdc {
         Refusing,
         Offline,
+        DirectoryOnly,
         Answering(Result<(), CommitError>),
     }
 
@@ -706,6 +707,11 @@ pub mod tests {
             ),
             (
                 Kdc::Offline,
+                LdapResultCode::Unavailable,
+                realm_not_ready(DEGRADED_CAUSE).to_string(),
+            ),
+            (
+                Kdc::DirectoryOnly,
                 LdapResultCode::Unavailable,
                 realm_not_ready(DEGRADED_CAUSE).to_string(),
             ),
@@ -747,6 +753,7 @@ pub mod tests {
         match kdc {
             Kdc::Refusing => (Some(RecordingGuard::install_refusing(REFUSAL)), None, false),
             Kdc::Offline => (None, Some(DegradedGuard::install()), false),
+            Kdc::DirectoryOnly => (None, Some(DegradedGuard::install_directory_only()), false),
             Kdc::Answering(answer) => (Some(RecordingGuard::install_answering(answer)), None, true),
         }
     }
@@ -821,6 +828,25 @@ pub mod tests {
             Some(vec![make_extended_response(
                 LdapResultCode::Unavailable,
                 realm_not_ready(DEGRADED_CAUSE).to_string(),
+            )])
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_password_modify_without_sync_goes_on_in_directory_only() {
+        let mut mock = MockTestBackendHandler::new();
+        setup_default_ldap_mock(&mut mock);
+        expect_password_change(&mut mock, "bob");
+        let mut ldap_handler = setup_bound_admin_handler(mock).await;
+        let _closed = DegradedGuard::install_directory_only();
+        assert_eq!(
+            ldap_handler
+                .handle_ldap_message(password_modify_request("bob"))
+                .await,
+            Some(vec![make_extended_response(
+                LdapResultCode::Success,
+                "".to_string()
             )])
         );
     }

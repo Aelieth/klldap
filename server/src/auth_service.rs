@@ -1414,11 +1414,12 @@ pub(crate) mod tests {
         use lldap_test_utils::recording_log::LogGuard;
         const OPENED: &str = "Opened-pass-1";
         const REFUSAL: &str = "password policy: min_length 40";
-        use lldap_test_utils::recording_kerberos::NotReadyGuard;
+        use lldap_test_utils::recording_kerberos::{DEGRADED_CAUSE, DegradedGuard, NotReadyGuard};
         enum Kdc {
             Ready,
             Disabled,
             NotReady,
+            DirectoryOnly,
             Unsettled,
             Refusing,
             Answering(Result<(), CommitError>),
@@ -1428,6 +1429,7 @@ pub(crate) mod tests {
         let starting = starting.to_string();
         let starting = starting.as_str();
         let unsettled = realm_not_ready(ANSWER_UNSETTLED).to_string();
+        let closed = realm_not_ready(DEGRADED_CAUSE).to_string();
         let refused = Kdc::Answering(Err(CommitError::Refused(REFUSAL.to_owned())));
         let changed = Kdc::Answering(Err(CommitError::Refused(SYNC_CHANGED.to_owned())));
         let failed = Kdc::Answering(Err(CommitError::Failed("the batch".to_owned())));
@@ -1513,6 +1515,26 @@ pub(crate) mod tests {
                 503,
                 false,
                 Some(starting),
+            ),
+            (
+                "sync, directory-only: never opened",
+                true,
+                Some("for:alice"),
+                OPENED,
+                Kdc::DirectoryOnly,
+                503,
+                false,
+                Some(closed.as_str()),
+            ),
+            (
+                "no sync, directory-only: the directory write alone",
+                false,
+                None,
+                OPENED,
+                Kdc::DirectoryOnly,
+                200,
+                false,
+                None,
             ),
             (
                 "sync, the last write unsettled: never opened",
@@ -1628,17 +1650,23 @@ pub(crate) mod tests {
         let one_row =
             |kind, detail: &str| vec![(kind, Some("alice".to_owned()), Some(detail.to_owned()))];
         for (row, sync, envelope, password, kdc, status, committed, refusal) in rows {
-            let opens = !matches!(kdc, Kdc::Disabled | Kdc::NotReady | Kdc::Unsettled);
+            let directory_only = matches!(kdc, Kdc::DirectoryOnly);
+            let opens = !matches!(
+                kdc,
+                Kdc::Disabled | Kdc::NotReady | Kdc::Unsettled | Kdc::DirectoryOnly
+            );
             let _not_ready = matches!(kdc, Kdc::NotReady).then(NotReadyGuard::install);
+            let _closed = directory_only.then(DegradedGuard::install_directory_only);
             let guard = match &kdc {
                 Kdc::Ready => Some(RecordingGuard::install()),
-                Kdc::Disabled | Kdc::NotReady => None,
+                Kdc::Disabled | Kdc::NotReady | Kdc::DirectoryOnly => None,
                 Kdc::Unsettled => Some(RecordingGuard::install_unsettled(ANSWER_UNSETTLED)),
                 Kdc::Refusing => Some(RecordingGuard::install_refusing(REFUSAL)),
                 Kdc::Answering(answer) => Some(RecordingGuard::install_answering(answer.clone())),
                 Kdc::Holding(held) => Some(RecordingGuard::install_holding(Err(held.clone()))),
             };
-            let upstream = !sync && envelope.is_none() && matches!(kdc, Kdc::Ready);
+            let plain_realm = matches!(kdc, Kdc::Ready) || directory_only;
+            let upstream = !sync && envelope.is_none() && plain_realm;
             let mut mock = MockTestBackendHandler::new();
             mock.expect_registration_user()
                 .times(1)

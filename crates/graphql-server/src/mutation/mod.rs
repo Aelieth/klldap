@@ -1766,6 +1766,59 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    #[serial]
+    async fn test_export_keytab_is_refused_with_the_cause_while_the_realm_is_closed() {
+        use lldap_test_utils::recording_kerberos::{DEGRADED_CAUSE, DegradedGuard};
+        const QUERY: &str =
+            r#"mutation { exportKeytabForKeycloak(hostname: "kc.example.com") { ok errorMsg } }"#;
+        for directory_only in [false, true] {
+            let _kdc = match directory_only {
+                true => DegradedGuard::install_directory_only(),
+                false => DegradedGuard::install(),
+            };
+            let context = admin_context(MockTestBackendHandler::new());
+            let (value, errors) = execute(QUERY, None, &root_schema(), &Variables::new(), &context)
+                .await
+                .unwrap();
+            let refused = graphql_value!({
+                "exportKeytabForKeycloak": {"ok": false, "errorMsg": DEGRADED_CAUSE}
+            });
+            assert_eq!(
+                (value, errors.len()),
+                (refused, 0),
+                "directory-only {directory_only}: {errors:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_user_change_refused_for_the_realm_is_a_field_error_with_its_text() {
+        use lldap_domain_model::error::DomainError;
+        const REFUSED: &str = "the Kerberos realm did not open: test; try again";
+        let queries = [
+            r#"mutation { createUser(user: {id: "bob", email: "bob@example.com"}) { id } }"#,
+            r#"mutation { updateUser(user: {id: "bob", displayName: "Bob"}) { ok } }"#,
+            r#"mutation { deleteUser(userId: "bob") { ok } }"#,
+        ];
+        for query in queries {
+            let refused = || Err(DomainError::KdcUnavailable(REFUSED.to_owned()));
+            let mut mock = MockTestBackendHandler::new();
+            mock.expect_get_schema()
+                .returning(|| Ok(make_test_schema()));
+            mock.expect_create_user().returning(move |_| refused());
+            mock.expect_update_user().returning(move |_| refused());
+            mock.expect_delete_user().returning(move |_| refused());
+            let context = admin_context(mock);
+            let (_, errors) = execute(query, None, &root_schema(), &Variables::new(), &context)
+                .await
+                .unwrap();
+            let messages: Vec<_> = errors.iter().map(|e| e.error().message()).collect();
+            let text = format!("Kerberos KDC unavailable: {REFUSED}");
+            assert_eq!(messages, [text.as_str()], "{query}");
+        }
+    }
+
     const SET_PASSWORD: &str = r#"mutation($id: String!, $password: String!) { setUserPassword(userId: $id, password: $password) { ok } }"#;
 
     fn expect_registration_start(mock: &mut MockTestBackendHandler, user: &str) {
@@ -1921,6 +1974,7 @@ mod tests {
         enum Kdc {
             Refusing,
             Offline,
+            DirectoryOnly,
             Answering(Result<(), CommitError>),
         }
         let failed = |e| Kdc::Answering(Err(e));
@@ -1931,6 +1985,10 @@ mod tests {
             ),
             (
                 Kdc::Offline,
+                Some(realm_not_ready(DEGRADED_CAUSE).to_string()),
+            ),
+            (
+                Kdc::DirectoryOnly,
                 Some(realm_not_ready(DEGRADED_CAUSE).to_string()),
             ),
             (
@@ -1956,6 +2014,7 @@ mod tests {
             let (guard, _offline) = match &kdc {
                 Kdc::Refusing => (Some(RecordingGuard::install_refusing(REFUSAL)), None),
                 Kdc::Offline => (None, Some(DegradedGuard::install())),
+                Kdc::DirectoryOnly => (None, Some(DegradedGuard::install_directory_only())),
                 Kdc::Answering(answer) => (
                     Some(RecordingGuard::install_answering(answer.clone())),
                     None,

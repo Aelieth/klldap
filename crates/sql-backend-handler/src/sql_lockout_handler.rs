@@ -563,6 +563,13 @@ impl SqlBackendHandler {
                 .await;
         }
     }
+
+    pub(crate) async fn count_nothing(&self, lock: Option<&LockState>, door: Door, at: Timestamp) {
+        if let Some(lock) = lock {
+            self.carry_lock(lock, self.lockout.unchanged(lock, at), door)
+                .await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1650,6 +1657,70 @@ pub(crate) mod tests {
             (got, rows(&log, &[LogKind::Bind, LogKind::AccountLock])),
             (wanted, expected),
             "per step: bound, the stored count; then the rows"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_right_password_an_item_refuses_counts_nothing_and_writes_as_a_wrong_one() {
+        use lldap_domain_handlers::enforcement::{ItemFlags, policy_cache};
+        let guard = EnforcementGuard::default_checks();
+        let statements = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut pool = get_initialized_db().await;
+        let seen = statements.clone();
+        pool.set_metric_callback(move |info| {
+            seen.lock().unwrap().push(info.statement.sql.clone());
+        });
+        let h = own(SqlBackendHandler::new(generate_random_private_key(), pool));
+        user_in(&h, "p3item", "p3itemou").await;
+        let items = [
+            ("login-hours", "mon 08:00-18:00"),
+            (THRESHOLD, "5"),
+            (DURATION, "0"),
+        ];
+        policy_on(&h, "p3itemou", &items).await;
+        policy_cache().set_item_flags(ItemFlags {
+            login_hours: true,
+            ..ItemFlags::default()
+        });
+        guard.pin_clock("2026-11-16T07:00:00Z".parse().unwrap());
+        type Step = (&'static str, &'static str, bool, Option<u32>);
+        let steps: [Step; 4] = [
+            (
+                "wrong: the row read, counted, written",
+                "nope-1",
+                false,
+                Some(1),
+            ),
+            ("wrong again: counted, written", "nope-2", false, Some(2)),
+            (
+                "right, refused by the hours: nothing counted",
+                RIGHT,
+                false,
+                Some(2),
+            ),
+            ("right again, refused again", RIGHT, false, Some(2)),
+        ];
+        let (mut got, mut written) = (Vec::new(), Vec::new());
+        for (label, password, _, _) in steps {
+            statements.lock().unwrap().clear();
+            let bound = bind(&h, "p3item", password).await;
+            let sql = std::mem::take(&mut *statements.lock().unwrap());
+            let rows = sql.into_iter().filter(|s| s.contains("login_lockouts"));
+            written.push(rows.collect::<Vec<_>>());
+            got.push((label, password, bound, stored(&h, "p3item").await));
+        }
+        assert_eq!(got, steps.to_vec(), "per step: bound, the stored count");
+        assert!(
+            written[1].iter().any(|s| s.starts_with("INSERT")),
+            "a wrong password's count is written before it is answered: {:?}",
+            written[1]
+        );
+        assert_eq!(
+            (&written[2], &written[3]),
+            (&written[1], &written[1]),
+            "a refusal after the right password writes the row as it stands, with the statements \
+             a wrong password's count takes"
         );
     }
 

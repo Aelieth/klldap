@@ -338,6 +338,22 @@ impl SqlBackendHandler {
             .map_err(|_| invalid_credentials(user))
     }
 
+    /// The items after a bind's right password; a refusal counts nothing.
+    async fn admit_proved(
+        &self,
+        user: &UserId,
+        door: Door,
+        second_factor: bool,
+        lock: Option<&LockState>,
+        now: Timestamp,
+    ) -> Result<()> {
+        let admitted = self.admit_at(user, door, second_factor, now).await;
+        if admitted.is_err() {
+            self.count_nothing(lock, door, now).await;
+        }
+        admitted
+    }
+
     /// The items, then the enable-mfa value's read, judged when a web sign-in starts, before any
     /// password.
     async fn admitted_at_start(&self, user: &UserId, now: Timestamp) -> bool {
@@ -430,7 +446,7 @@ impl SqlBackendHandler {
         now: Timestamp,
     ) -> Result<()> {
         // Judged without the factor before any answer that only a right password gets.
-        self.admit_at(name, door, false, now).await?;
+        self.admit_proved(name, door, false, lock, now).await?;
         match (requirement, code) {
             (MfaRequirement::None, _) => {
                 self.admit_while_degraded(name, door).await?;
@@ -466,7 +482,7 @@ impl SqlBackendHandler {
             }
             (MfaRequirement::Totp, Some(code)) => match self.verify_user_totp(name, code).await? {
                 Ok(()) => {
-                    self.admit_at(name, door, true, now).await?;
+                    self.admit_proved(name, door, true, lock, now).await?;
                     self.admit_while_degraded(name, door).await?;
                     let stored = self.note_proof(name, now_unix()).await;
                     let detail = with_proof("totp", stored);

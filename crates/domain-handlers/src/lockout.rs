@@ -984,6 +984,29 @@ impl Lockout {
         step
     }
 
+    /// Counts nothing: under a threshold the row is written again as it stands, at once.
+    pub fn unchanged(&self, state: &LockState, at: Timestamp) -> Step {
+        let mut book = self.book();
+        let tick = book.tick();
+        let Some(entry) = book
+            .entries
+            .get_mut(&state.user)
+            .filter(|e| e.uuid == state.uuid)
+        else {
+            return Step::default();
+        };
+        if entry.effective().locked(state.policy, at) || Self::timing(state) != Write::Now {
+            return Step::default();
+        }
+        entry.change(entry.row);
+        entry.touched = tick;
+        self.owe(book, &state.user, Instant::now());
+        Step {
+            write: Write::Now,
+            ..Step::default()
+        }
+    }
+
     /// False when the user is locked by now, the start's own +1 not counted, or when the entry
     /// the door read is gone, so no start is accepted unrecorded.
     pub fn start(&self, state: &LockState, id: u64, at: Timestamp) -> bool {
@@ -2904,6 +2927,64 @@ mod tests {
             (Some(unlocked), Some(unlocked)),
             "an unlock stored by another writer is kept, and taken into the view"
         );
+    }
+
+    #[tokio::test]
+    async fn test_a_step_that_counts_nothing_writes_the_row_as_it_stands_where_a_failure_writes() {
+        const DELAY: Duration = Duration::from_millis(100);
+        let (off, three) = (policy(0, 0), policy(3, 0));
+        let (once, locked) = (row(1, Some(0), None), row(3, Some(0), None));
+        let (now, none) = (
+            Step {
+                write: Write::Now,
+                lock_logged: false,
+            },
+            Step::default(),
+        );
+        type Row = (
+            &'static str,
+            bool,
+            LockoutPolicy,
+            LockRow,
+            Step,
+            LockRow,
+            usize,
+        );
+        let rows: [Row; 5] = [
+            ("a failure", true, three, once, now, once.failed(at(5)), 1),
+            ("nothing counted", false, three, once, now, once, 1),
+            ("no threshold", false, off, once, none, once, 0),
+            ("locked", false, three, locked, none, locked, 0),
+            ("a failure, locked", true, three, locked, none, locked, 0),
+        ];
+        for (label, failure, policy, before, step, after, writes) in rows {
+            let lockout = Lockout::default();
+            let store = Memory::default();
+            let user = bob();
+            store.put(&user, before);
+            lockout.seed(&user, before);
+            *store.delay.lock().unwrap() = DELAY;
+            let judged = state(policy, before);
+            let taken = match failure {
+                true => lockout.failure(&judged, at(5)),
+                false => lockout.unchanged(&judged, at(5)),
+            };
+            let started = Instant::now();
+            lockout.carry(&store, &user, taken).await;
+            let waited = started.elapsed() >= DELAY;
+            assert_eq!(
+                (
+                    taken,
+                    store.calls().len(),
+                    waited,
+                    store.stored(&user),
+                    lockout.row(&user),
+                    lockout.pending(&user)
+                ),
+                (step, writes, writes > 0, Some(after), Some(after), false),
+                "{label}: the step, the writes and the wait for them, the row stored and held"
+            );
+        }
     }
 
     #[tokio::test]

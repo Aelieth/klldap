@@ -80,6 +80,9 @@ const RESET_HAS_NUL: &str = "The forced reset of the admin's password \
 
 const KERBEROS_OFF: &str = "Kerberos is not enabled (kerberos_options.enabled is false)";
 
+/// A wait for a connection of the main pool gives up after this long, on every backend.
+const MAIN_POOL_ACQUIRE: Duration = Duration::from_secs(10);
+
 const OPEN_REALM_WITH_KERBEROS_OFF: &str = "Kerberos is disabled on this server, but this \
     database's Kerberos realm is marked open: another server holds it, or the last server with \
     Kerberos stopped without closing it. On a lone server this is harmless; to close the realm, \
@@ -460,23 +463,27 @@ async fn setup_read_pool(
         .context("while opening the read-only pool for log lookups")
 }
 
-async fn setup_sql_tables(database_url: &DatabaseUrl) -> Result<DatabaseConnection> {
-    let sql_pool = {
-        let num_connections = if database_url.db_type() == "sqlite" {
-            1
-        } else {
-            5
-        };
-        let mut sql_opt = sea_orm::ConnectOptions::new(database_url.to_connect_string());
-        sql_opt
-            .max_connections(num_connections)
-            .sqlx_logging(true)
-            .sqlx_logging_level(log::LevelFilter::Debug);
-        if database_url.db_type() == "sqlite" {
-            sql_opt.map_sqlx_sqlite_opts(sqlite_extra_synchronous);
-        }
-        Database::connect(sql_opt).await?
+/// One connection on SQLite and five elsewhere; a wait for one is bounded on every backend.
+fn main_pool_options(database_url: &DatabaseUrl) -> sea_orm::ConnectOptions {
+    let num_connections = if database_url.db_type() == "sqlite" {
+        1
+    } else {
+        5
     };
+    let mut sql_opt = sea_orm::ConnectOptions::new(database_url.to_connect_string());
+    sql_opt
+        .max_connections(num_connections)
+        .acquire_timeout(MAIN_POOL_ACQUIRE)
+        .sqlx_logging(true)
+        .sqlx_logging_level(log::LevelFilter::Debug);
+    if database_url.db_type() == "sqlite" {
+        sql_opt.map_sqlx_sqlite_opts(sqlite_extra_synchronous);
+    }
+    sql_opt
+}
+
+async fn setup_sql_tables(database_url: &DatabaseUrl) -> Result<DatabaseConnection> {
+    let sql_pool = Database::connect(main_pool_options(database_url)).await?;
     sql_tables::init_table(&sql_pool)
         .await
         .context("while creating base tables")?;
@@ -1688,5 +1695,22 @@ mod tests {
             "password_length's body, the envelope's byte cap and the old password's presence \
              check; any other count of a new password here is a door counting by other means"
         );
+    }
+
+    #[test]
+    fn test_a_wait_for_the_main_pool_gives_up_after_ten_seconds_on_every_backend() {
+        let urls = [
+            "sqlite://users.db?mode=rwc",
+            "postgres://db.example/lldap",
+            "mysql://db.example/lldap",
+        ];
+        for (url, connections) in urls.into_iter().zip([1, 5, 5]) {
+            let options = main_pool_options(&DatabaseUrl::from(url));
+            assert_eq!(
+                (options.get_acquire_timeout(), options.get_max_connections()),
+                (Some(Duration::from_secs(10)), Some(connections)),
+                "{url}"
+            );
+        }
     }
 }

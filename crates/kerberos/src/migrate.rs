@@ -114,7 +114,7 @@ fn import(settings: &RealmSettings, paths: &HostPaths, host: &dyn KerberosStore)
     let store = load_dump_with_stash_path(&text, &paths.stash)
         .map_err(|e| anyhow!("the dump does not load: {e}"))?;
     create_lockout_file(&paths.lockout)
-        .map_err(|e| anyhow!("while creating {}: {e}", paths.lockout.display()))?;
+        .with_context(|| format!("while creating {}", paths.lockout.display()))?;
     let change = store
         .host_full_change()
         .map_err(|e| anyhow!("while sealing the imported realm: {e}"))?;
@@ -384,42 +384,52 @@ mod tests {
 
     #[test]
     fn test_a_realm_that_cannot_migrate_is_refused_untouched() {
-        let rows: [(&str, Spoil, &str, Found); 4] = [
+        let rows: [(&str, Spoil, &str, Found, bool); 5] = [
             (
                 "bad dump",
                 |t| fs::write(t.settings.data_dir.join(DUMP), "not a dump").unwrap(),
                 "does not parse",
                 Found::Dump,
+                false,
             ),
             (
                 "no stash",
                 |t| fs::remove_file(t.settings.data_dir.join(".k5.EXAMPLE.COM")).unwrap(),
                 "has a dump but no stash at",
                 Found::Dump,
+                false,
             ),
             (
                 "other realm",
                 |t| t.settings.realm = "OTHER.TEST".to_owned(),
                 "is for realm EXAMPLE.COM, but this server serves OTHER.TEST",
                 Found::Dump,
+                false,
             ),
             (
                 "no dump",
                 |t| fs::remove_file(t.settings.data_dir.join(DUMP)).unwrap(),
                 "of KLLDAP 0.7.2, which this server cannot open; write its dump to",
                 Found::MitOnly,
+                false,
+            ),
+            (
+                "a lockout file that is not kerber-rust's",
+                |t| fs::write(t.settings.data_dir.join(boot::LOCKOUT_FILE), "not ours").unwrap(),
+                "not a lockout file",
+                Found::Dump,
+                true,
             ),
         ];
-        for (case, spoil, cause, found) in rows {
+        for (case, spoil, cause, found, lockout) in rows {
             let mut temp = TempRealm::new();
             realm_as_mit(&temp);
             spoil(&mut temp);
             let dir = temp.settings.data_dir.clone();
             let paths = boot::host_paths(&temp.settings);
-            let error = format!(
-                "{:#}",
-                migrate(&temp.settings, &paths, temp.host.as_ref()).unwrap_err()
-            );
+            let error = migrate(&temp.settings, &paths, temp.host.as_ref()).unwrap_err();
+            assert_eq!(boot::lockout_file_fault(&error), lockout, "{case}");
+            let error = format!("{error:#}");
             assert!(error.contains(cause), "{case}: {error}");
             assert_eq!(detect(&dir).unwrap(), found, "{case}: nothing moved");
             assert!(held_names(&temp).is_empty(), "{case}: nothing written");

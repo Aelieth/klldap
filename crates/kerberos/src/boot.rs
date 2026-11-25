@@ -289,6 +289,18 @@ fn boot_error(e: StoreError, paths: &HostPaths) -> anyhow::Error {
     }
 }
 
+/// Whether an open failed on kerber-rust's lockout file: missing, unreadable or not its own.
+pub fn lockout_file_fault(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<StoreError>(),
+        Some(
+            StoreError::LockoutMissing { .. }
+                | StoreError::LockoutUnreadable { .. }
+                | StoreError::LockoutForeign { .. }
+        )
+    )
+}
+
 pub(crate) fn admin_principal() -> PrincipalName {
     PrincipalName::new(PrincipalName::NT_PRINCIPAL, ["admin", "admin"])
 }
@@ -611,9 +623,9 @@ mod tests {
     }
 
     #[test]
-    fn test_each_boot_error_names_its_cause() {
+    fn test_each_boot_error_names_its_cause_and_only_the_lockout_file_ones_are_its_fault() {
         type Spoil = fn(&TempRealm);
-        let rows: [(bool, Spoil, &str); 6] = [
+        let rows: [(bool, Spoil, &str, bool); 6] = [
             (
                 false,
                 |t| {
@@ -621,16 +633,19 @@ mod tests {
                     fs::write(t.settings.data_dir.join(".k5.EXAMPLE.COM"), b"key").unwrap();
                 },
                 "is retried by itself; there is none",
+                false,
             ),
             (
                 true,
                 |t| fs::remove_file(t.settings.data_dir.join(".k5.EXAMPLE.COM")).unwrap(),
                 "restore the stash from the backup",
+                false,
             ),
             (
                 true,
                 |t| fs::remove_file(t.settings.data_dir.join(LOCKOUT_FILE)).unwrap(),
                 "create an empty one to count failed logins from zero",
+                true,
             ),
             (
                 true,
@@ -640,19 +655,22 @@ mod tests {
                     fs::create_dir(&path).unwrap();
                 },
                 "cannot be read or written",
+                true,
             ),
             (
                 true,
                 |t| fs::write(t.settings.data_dir.join(LOCKOUT_FILE), "not ours").unwrap(),
                 "is not a kerber-rust lockout file",
+                true,
             ),
             (
                 true,
                 |t| t.host.realm.commit(unopenable_row()).unwrap(),
                 "a Kerberos record in the database does not open",
+                false,
             ),
         ];
-        for (opened, spoil, cause) in rows {
+        for (opened, spoil, cause, lockout) in rows {
             let temp = TempRealm::new();
             let profile = profile(&temp.settings);
             if opened {
@@ -661,16 +679,21 @@ mod tests {
             spoil(&temp);
             let error = open_store(&temp.settings, &profile, temp.host()).unwrap_err();
             assert!(format!("{error:#}").contains(cause), "{cause}: {error:#}");
+            assert_eq!(lockout_file_fault(&error), lockout, "{cause}");
         }
         let temp = TempRealm::new();
         let error = open_store(
             &temp.settings,
             &profile(&temp.settings),
             Arc::new(Unanswered),
-        );
-        let error = format!("{:#}", error.unwrap_err());
+        )
+        .unwrap_err();
+        assert!(!lockout_file_fault(&error), "{error:#}");
+        let error = format!("{error:#}");
         let expected = "the database refused or did not answer the realm's first read or write";
         assert!(error.contains(expected), "{error}");
+        let text = anyhow!("the lockout file is missing");
+        assert!(!lockout_file_fault(&text), "a text alone is no typed cause");
     }
 
     #[test]

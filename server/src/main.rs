@@ -77,6 +77,18 @@ const RESET_HAS_NUL: &str = "The forced reset of the admin's password \
 
 const KERBEROS_OFF: &str = "Kerberos is not enabled (kerberos_options.enabled is false)";
 
+const OPEN_REALM_WITH_KERBEROS_OFF: &str = "Kerberos is disabled on this server, but this \
+    database's Kerberos realm is marked open: another server holds it, or the last server with \
+    Kerberos stopped without closing it. On a lone server this is harmless; to close the realm, \
+    start once with Kerberos enabled, wait out its thirty-five-second watch and stop cleanly. \
+    Beside a holder, every server on one database needs the same kerberos_options.enabled: this \
+    server's deletes, sync changes and lldap_disabled changes reach the realm's principals \
+    through the holder's status pass, within a minute";
+
+fn open_realm_warning(kerberos_enabled: bool, marked_open: bool) -> Option<&'static str> {
+    (!kerberos_enabled && marked_open).then_some(OPEN_REALM_WITH_KERBEROS_OFF)
+}
+
 fn sync_turned_off(cause: &str) -> String {
     format!(
         "Kerberos sync turned off by the forced reset of the admin's password, because {cause}: \
@@ -821,16 +833,10 @@ async fn run_server_command(opts: RunOpts) -> Result<()> {
     info!("Starting LLDAP version {}", env!("CARGO_PKG_VERSION"));
 
     let sql_pool = setup_sql_tables(&config.database_url).await?;
-    if !config.kerberos_options.enabled && realm_marked_open(&sql_pool).await {
-        warn!(
-            "Kerberos is disabled on this server, but this database's Kerberos realm is marked \
-             open: another server holds it, or the last server with Kerberos stopped without \
-             closing it. On a lone server this is harmless; to close the realm, start once with \
-             Kerberos enabled, wait out its thirty-five-second watch and stop cleanly. Beside a \
-             holder, every server on one database needs the same kerberos_options.enabled: this \
-             server's deletes, sync changes and lldap_disabled changes reach the realm's \
-             principals through the holder's status pass, within a minute"
-        );
+    let enabled = config.kerberos_options.enabled;
+    let marked_open = !enabled && realm_marked_open(&sql_pool).await;
+    if let Some(text) = open_realm_warning(enabled, marked_open) {
+        warn!("{text}");
     }
     let committer = config
         .kerberos_options
@@ -1268,6 +1274,23 @@ mod tests {
         ];
         for (host, expected) in rows {
             assert_eq!(loopback(host), expected, "{host}");
+        }
+    }
+
+    #[test]
+    fn test_only_kerberos_disabled_beside_a_realm_marked_open_warns() {
+        let rows = [
+            (true, true, None),
+            (true, false, None),
+            (false, true, Some(OPEN_REALM_WITH_KERBEROS_OFF)),
+            (false, false, None),
+        ];
+        for (enabled, marked_open, expected) in rows {
+            assert_eq!(
+                open_realm_warning(enabled, marked_open),
+                expected,
+                "Kerberos enabled {enabled}, the realm marked open {marked_open}"
+            );
         }
     }
 

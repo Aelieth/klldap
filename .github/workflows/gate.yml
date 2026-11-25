@@ -33,9 +33,9 @@ jobs:
       - name: Checkout sources
         uses: actions/checkout@v6.0.1
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
       - name: Build the test image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile
@@ -45,7 +45,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
       - name: Build the test image with the gate's hooks
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: Dockerfile
@@ -64,7 +64,7 @@ jobs:
         run: GATE_DB=${{ matrix.db }} GATE_KILL_IMAGE=klldap-test-kill gate/run-gate.sh
       - name: Upload gate results
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: gate-results-${{ matrix.db }}
           path: gate/results/

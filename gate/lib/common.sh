@@ -344,6 +344,20 @@ print("one" if ok else "%d %s" % (len(rows), json.dumps(rows)[:300]))' 2>/dev/nu
 
 log_mark() { graphql '{ logs(limit: 1) { id } }' '{}' 2>/dev/null | json_get logs.0.id 2>/dev/null; }
 
+# log_mark_settled: the newest log id once the writer has stored what came before it (two equal
+# reads 6 s apart, the writer's tick being 5 s), so every row before it is counted.
+log_mark_settled() {
+    local a b _
+    a="$(log_mark)"
+    for _ in 1 2 3 4 5; do
+        sleep 6
+        b="$(log_mark)"
+        [ -n "$a" ] && [ "$a" = "$b" ] && break
+        a="$b"
+    done
+    printf '%s\n' "$a"
+}
+
 # flood_quiet <KIND> <PROTOCOL>: wait until no flood window for refused rows of that kind over
 # that protocol can still be open on the server (20 s without a refusal, then the writer's 5 s
 # tick), so the next refusal is the first of its window. Prints the seconds waited; gives up at 60.

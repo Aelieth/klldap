@@ -2,7 +2,8 @@
 // gate's headless browser. Each step prints what it saw (ROW <name> SEEN <what>) and the phase
 // judges it. BROWSER_MODE admin: the admins' notice, the sync switch on the create-user page, a
 // create with it, the switch on BROWSER_SYNCED's page and a save of another attribute there; user:
-// BROWSER_USER's own page, where there is no notice. sign-in-actions.mjs is the model.
+// BROWSER_USER's own page, where there is no notice; delete: BROWSER_NEW and BROWSER_BY_NAME
+// deleted on the users page, the second asked for by name. sign-in-actions.mjs is the model.
 
 import { spawn } from "node:child_process";
 import { readdirSync } from "node:fs";
@@ -16,6 +17,7 @@ const userPass = process.env.BROWSER_PASS || "";
 const user = process.env.BROWSER_USER || "";
 const synced = process.env.BROWSER_SYNCED || "";
 const fresh = process.env.BROWSER_NEW || "";
+const byName = process.env.BROWSER_BY_NAME || "";
 const secrets = [adminPass, userPass].filter((s) => s.length > 0);
 const WAIT_MS = 30000;
 const NOTICE = "kerberos-notice";
@@ -263,6 +265,62 @@ async function userPage() {
   row("notice-user", "SEEN", await notice());
 }
 
+const FOOTER = "#deleteUsersModal .modal-footer button";
+const userRow = (id) => `[...document.querySelectorAll("tbody tr")].find((tr) =>
+  [...tr.querySelectorAll("a")].some((a) => a.textContent.trim() === ${JSON.stringify(id)}))`;
+const buttonIn = (buttons, text) =>
+  `[...document.querySelectorAll(${JSON.stringify(buttons)})].find((b) => b.textContent.trim() === ${JSON.stringify(text)})`;
+
+async function clickIn(buttons, text) {
+  const find = buttonIn(buttons, text);
+  await waitFor(`!!${find} && !${find}.disabled`, `button ${text}`);
+  await evalValue(`${find}.click()`);
+}
+
+// The dialog splits the users on the realm's state, so every read of it has answered first.
+async function deleteByName() {
+  currentStep = "delete-ask";
+  await login("admin", adminPass);
+  await goto("/users", true);
+  const deadline = Date.now() + WAIT_MS;
+  while (infoAsks.size > 0 && Date.now() < deadline) await pause(200);
+  for (const id of [fresh, byName]) {
+    await waitFor(`!!${userRow(id)}`, `the row of ${id}`);
+    await evalValue(`${userRow(id)}.querySelector("input[type=checkbox]").click()`);
+  }
+  await clickIn("button", "Delete 2 Users");
+  await waitFor(
+    `(document.querySelector("#deleteUsersModal .modal-body")?.textContent || "").includes("asked for by name")`,
+    "the sentence that names the users asked for by name",
+  );
+  await clickIn(FOOTER, "Yes, delete them");
+  const title = `document.getElementById("deleteUsersModalLabel")?.textContent.trim()`;
+  await waitFor(`${title} === ${JSON.stringify(`Delete ${byName}?`)}`, `the title Delete ${byName}?`);
+  await waitFor(`!${userRow(fresh)}`, `the row of ${fresh} gone`);
+  const asked = buttonIn(FOOTER, `Delete ${byName}`);
+  const state = async () => {
+    await pause(500);
+    return evalValue(`(() => { const b = ${asked}; return b ? (b.disabled ? "disabled" : "enabled") : "missing"; })()`);
+  };
+  await waitFor(`!!document.querySelector("#deleteUserName")`, "#deleteUserName");
+  const states = [`empty=${await state()}`];
+  await fill("#deleteUserName", byName.slice(0, -1));
+  states.push(`wrong=${await state()}`);
+  await fill("#deleteUserName", byName.toUpperCase());
+  states.push(`name=${await state()}`);
+  row("delete-ask", "SEEN", `title=${await evalValue(title)} | ${fresh}=gone | ${states.join(" ")}`);
+
+  currentStep = "delete-done";
+  await clickIn(FOOTER, `Delete ${byName}`);
+  try {
+    await waitFor(`!${userRow(byName)}`, `the row of ${byName} gone`);
+    row("delete-done", "SEEN", `${byName} gone`);
+  } catch {
+    const said = await evalValue(`(document.querySelector(".alert-danger")?.textContent || "no alert").trim()`);
+    row("delete-done", "SEEN", `${byName} listed | ${said}`);
+  }
+}
+
 async function connect() {
   const home = process.env.HOME || "/tmp/home";
   await mkdir(home, { recursive: true });
@@ -313,6 +371,7 @@ try {
   await connect();
   if (mode === "admin" && synced && fresh) await adminPages();
   else if (mode === "user" && user) await userPage();
+  else if (mode === "delete" && fresh && byName) await deleteByName();
   else throw fail("BROWSER_MODE", `${mode || "unset"} or its users unset`);
 } catch (err) {
   failed = true;

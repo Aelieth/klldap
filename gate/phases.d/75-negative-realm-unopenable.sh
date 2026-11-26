@@ -5,7 +5,8 @@
 # directory-only (the default, the key taken out again): the directory is served to everyone as
 # configured, /health answers 200 and names the state, the KDC and kadmin do not serve, and each
 # change that needs a principal is refused with one sentence at every door, its row keeping the
-# full cause. Moving the stash back and restarting restores the realm; the file ends as it began.
+# full cause; a synced user's confirmed delete leaves its principal to the next opening. Moving
+# the stash back and restarting restores the realm; the file ends as it began.
 
 D="$(phase_dir)"
 DEG_USER="gatedeg"
@@ -30,6 +31,17 @@ D75_STAYS="but this server stays admin-only"
 D75_STATUS="the Kerberos realm is closed on this server: the status of a principal, if there is one, is left for the realm's next opening, which sets it from lldap_disabled before the KDC serves"
 D75_NOTICE="The Kerberos realm did not open and this server is directory-only: the directory is served to everyone."
 D75_LOCKED="The Kerberos realm is not ready: Kerberos sync cannot be changed until it is."
+DEG_GONE="gatedegc"
+DEG_GONE_PASS="GateDegGone2026!"
+DEG_ASKED="gatedegq"
+DEG_ASKED_PASS="GateDegAsked2026!"
+D75_OTHER="confirmUserId names another user than userId; nothing was deleted"
+D75_FOR_SYNC="a confirmed delete is for a user with Kerberos sync, and this user has none now: it was re-created or changed since; nothing was deleted"
+D75_PRINCIPAL_STAYS="the user's Kerberos principal stays until this server's realm opens, which removes it before the KDC serves"
+D75_LEFT="deleted while the Kerberos realm is closed on this server: the principal is marked, and the realm's next opening removes it before the KDC serves"
+D75_REMOVED="removed at start: left by a delete while the realm was closed"
+D75_ASK="title=Delete $DEG_ASKED? | ${DEG_NEW}p=gone | empty=disabled wrong=disabled name=enabled"
+D75_MARKED="" D75_GONE_MARK=""
 D75_PAGE="${CONTAINER}-d75page"
 D75_SUM0="" D75_GID="" D75_DIRONLY=""
 EXTRA_CONTAINERS+=("$D75_PAGE")
@@ -88,16 +100,21 @@ PY
 d75_rows() {
     local got="" i
     for i in $(seq 1 20); do
-        got="$(graphql "query(\$id: ID!, \$t: String!) { logs(filter: {kinds: [$1], target: \$t}, afterId: \$id, limit: 20) { success detail } }" \
-            '{"id": "'"$3"'", "t": "'"$2"'"}' 2>/dev/null | OK="$4" HEAD="$5" python3 -c '
+        got="$(d75_rows_once "$@")"
+        case "$got" in "" | "0 "*) sleep 0.5 ;; *) break ;; esac
+    done
+    printf '%s\n' "${got:-unread}"
+}
+
+# d75_rows_once: d75_rows' answer from one read ("0 []" for none), for a count after log_mark_settled.
+d75_rows_once() {
+    graphql "query(\$id: ID!, \$t: String!) { logs(filter: {kinds: [$1], target: \$t}, afterId: \$id, limit: 20) { success detail } }" \
+        '{"id": "'"$3"'", "t": "'"$2"'"}' 2>/dev/null | OK="$4" HEAD="$5" python3 -c '
 import json, os, sys
 rows = json.load(sys.stdin)["logs"]
 good = [r for r in rows if r.get("success") is (os.environ["OK"] == "true")
         and (r.get("detail") or "").startswith(os.environ["HEAD"])]
-print("one" if len(rows) == 1 and len(good) == 1 else "%d %s" % (len(rows), json.dumps(rows)[:300]))' 2>/dev/null)"
-        case "$got" in "" | "0 "*) sleep 0.5 ;; *) break ;; esac
-    done
-    printf '%s\n' "${got:-unread}"
+print("one" if len(rows) == 1 and len(good) == 1 else "%d %s" % (len(rows), json.dumps(rows)[:300]))' 2>/dev/null
 }
 
 # d75_start_rows <mark>: how many kerberos_sync failure rows after the marker say "directory-only: "
@@ -150,7 +167,7 @@ d75_page() {
             -v "$GATE_ROOT/lib/realm-notice.mjs:/work/realm-notice.mjs:ro" -v "$D:/out" \
             -e HOME=/tmp/home -e BROWSER_OUT=/out -e BROWSER_URL="http://${CONTAINER}:17170" \
             -e BROWSER_MODE="$1" -e BROWSER_USER="$DEG_USER" -e BROWSER_SYNCED="$DEG_SYNC" \
-            -e BROWSER_NEW="${DEG_NEW}p" -e BROWSER_ADMIN_PASS -e BROWSER_PASS \
+            -e BROWSER_NEW="${DEG_NEW}p" -e BROWSER_BY_NAME="$DEG_ASKED" -e BROWSER_ADMIN_PASS -e BROWSER_PASS \
             "$WIRE_IMAGE" /work/realm-notice.mjs >"$D/page-$2.out" 2>"$D/page-$2.err"
     )
     docker rm -f -v "$D75_PAGE" >/dev/null 2>&1 || true
@@ -164,6 +181,129 @@ d75_page_want() {
     else
         p_bad "[P.$2] $4: $got; want 'SEEN $3'"
     fi
+}
+
+d75_listed() { lsearch -b "$BASE_DN" "(uid=$1)" dn 2>/dev/null | grep -c '^dn: '; }
+
+d75_synced_user() {
+    graphql 'mutation($u: CreateUserInput!) { createUser(user: $u) { id } }' \
+        '{"u": {"id": "'"$1"'", "email": "'"$1"'@gate.test", "attributes": [{"name": "kerberossync", "value": ["1"]}]}}' \
+        >"$D/create-$1.json" 2>&1 &&
+        graphql 'mutation($id: String!, $pw: String!) { setUserPassword(userId: $id, password: $pw) { ok } }' \
+            '{"id": "'"$1"'", "pw": "'"$2"'"}' >"$D/setpw-$1.json" 2>&1 &&
+        kinit_pw "$1@$REALM" "$2" >"$D/kinit-$1-before.log" 2>&1
+}
+
+d75_delete() {
+    graphql 'mutation($id: String!, $c: String) { deleteUser(userId: $id, confirmUserId: $c) { ok warnings } }' \
+        '{"id": "'"$1"'", "c": "'"$2"'"}' >"$3" 2>&1
+}
+
+# A step's rows are counted once the writer has stored them; one step's settled mark is the next's.
+d75_confirmed_rows() {
+    local mark after rc rows got warned
+    mark="$(log_mark_settled)"
+    d75_delete "$DEG_GONE" "$DEG_SYNC" "$D/delete-confirm-other.log"
+    rc=$?
+    after="$(log_mark_settled)"
+    rows="$(d75_rows_once USER_DELETE "$DEG_GONE" "$mark" false "")"
+    got="$(d75_listed "$DEG_GONE") $(d75_listed "$DEG_SYNC")"
+    if [ "$rc" != 0 ] && grep -qF "$D75_OTHER" "$D/delete-confirm-other.log" && [ "$got" = "1 1" ] && [ "$rows" = "0 []" ]; then
+        p_ok "[D.delete-confirm-other] deleteUser of $DEG_GONE with confirmUserId $DEG_SYNC is refused (exit $rc) with '$D75_OTHER': both users are there and no user_delete row names $DEG_GONE"
+    else
+        p_bad "[D.delete-confirm-other] exit $rc, $(head -c 300 "$D/delete-confirm-other.log" 2>/dev/null | tr '\n' ' '); entries of $DEG_GONE and $DEG_SYNC: $got; user_delete rows for $DEG_GONE: ${rows:-unread}; want a refusal with '$D75_OTHER', '1 1' and no row"
+    fi
+
+    mark="$after"
+    d75_delete "$DEG_USER" "$DEG_USER" "$D/delete-confirm-unsynced.log"
+    rc=$?
+    after="$(log_mark_settled)"
+    rows="$(d75_rows_once USER_DELETE "$DEG_USER" "$mark" false "$D75_FOR_SYNC")"
+    got="$(d75_listed "$DEG_USER")"
+    if [ "$rc" != 0 ] && grep -qF "$D75_FOR_SYNC" "$D/delete-confirm-unsynced.log" && [ "$got" = 1 ] && [ "$rows" = one ]; then
+        p_ok "[D.delete-confirm-unsynced] a confirmed delete of $DEG_USER, who has no sync, is refused (exit $rc) with '$D75_FOR_SYNC': the user is there, with one user_delete row that says so"
+    else
+        p_bad "[D.delete-confirm-unsynced] exit $rc, $(head -c 300 "$D/delete-confirm-unsynced.log" 2>/dev/null | tr '\n' ' '); entries of $DEG_USER: $got; user_delete rows: ${rows:-unread}; want a refusal with '$D75_FOR_SYNC', 1 entry and one failure row that starts so"
+    fi
+
+    mark="$after"
+    d75_delete "$DEG_GONE" "$DEG_GONE" "$D/delete-confirmed.json"
+    rc=$?
+    log_mark_settled >/dev/null
+    rows="$(d75_rows_once USER_DELETE "$DEG_GONE" "$mark" true "")/$(d75_rows_once KERBEROS_SYNC "$DEG_GONE" "$mark" true "$D75_LEFT")"
+    warned="$(WANT="$D75_PRINCIPAL_STAYS" python3 -c '
+import json, os, sys
+said = json.load(open(sys.argv[1], encoding="utf-8")).get("deleteUser")
+print("yes" if said == {"ok": True, "warnings": [os.environ["WANT"]]} else json.dumps(said)[:300])' "$D/delete-confirmed.json" 2>/dev/null)"
+    got="$(d75_listed "$DEG_GONE")"
+    [ "$got" != 0 ] || D75_MARKED="$DEG_GONE"
+    if [ "$rc" = 0 ] && [ "$warned" = yes ] && [ "$got" = 0 ] && [ "$rows" = one/one ]; then
+        p_ok "[D.delete-confirmed] deleteUser of $DEG_GONE with confirmUserId $DEG_GONE deletes it, warns '$D75_PRINCIPAL_STAYS', and writes one user_delete row and one kerberos_sync row '$D75_LEFT'"
+    else
+        p_bad "[D.delete-confirmed] exit $rc, answer ${warned:-unread}; entries of $DEG_GONE: $got; user_delete/kerberos_sync rows: $rows; want ok with the one warning '$D75_PRINCIPAL_STAYS', no entry and 'one/one'"
+    fi
+}
+
+# D75_GONE_MARK: the settled mark after the page's deletes, before the realm opens again.
+d75_by_name_row() {
+    local mark ask said unsynced asked rows
+    mark="$(log_mark_settled)"
+    d75_page delete delete "$1"
+    D75_GONE_MARK="$(log_mark_settled)"
+    ask="$(d75_page_row delete delete-ask)"
+    said="$(d75_page_row delete delete-done)"
+    unsynced="$(d75_listed "${DEG_NEW}p")"
+    asked="$(d75_listed "$DEG_ASKED")"
+    [ "$asked" != 0 ] || D75_MARKED="$D75_MARKED $DEG_ASKED"
+    if [ "$ask" = "ROW delete-ask SEEN $D75_ASK" ]; then
+        p_ok "[P.delete-by-name] the users page deletes ${DEG_NEW}p at once and asks for $DEG_ASKED by name, its button enabled by the name alone, in any case: $D75_ASK"
+    else
+        p_bad "[P.delete-by-name] $ask; want 'SEEN $D75_ASK' (see page-delete.err)"
+    fi
+    rows="$(d75_rows_once USER_DELETE "${DEG_NEW}p" "$mark" true "")/$(d75_rows_once USER_DELETE "$DEG_ASKED" "$mark" true "")/$(d75_rows_once KERBEROS_SYNC "$DEG_ASKED" "$mark" true "$D75_LEFT")"
+    if [ "$said" = "ROW delete-done SEEN $DEG_ASKED gone" ] && [ "$unsynced $asked" = "0 0" ] && [ "$rows" = one/one/one ]; then
+        p_ok "[P.delete-by-name-done] with the name typed the page deletes $DEG_ASKED with its confirmation: both users are gone, with one user_delete row each and one kerberos_sync row '$D75_LEFT' for $DEG_ASKED"
+    else
+        p_bad "[P.delete-by-name-done] $said; entries of ${DEG_NEW}p and $DEG_ASKED: $unsynced $asked; user_delete, user_delete, kerberos_sync rows: $rows; want '$DEG_ASKED gone', '0 0' and 'one/one/one'"
+    fi
+}
+
+d75_removed_row() {
+    local user pass rows why bad="" said=""
+    if [ -z "$D75_MARKED" ]; then
+        p_skip "[D.delete-confirmed-removed] no synced user was deleted while the realm was closed; not run"
+        return
+    fi
+    log_mark_settled >/dev/null
+    for user in $D75_MARKED; do
+        pass="$DEG_ASKED_PASS"
+        [ "$user" != "$DEG_GONE" ] || pass="$DEG_GONE_PASS"
+        why=""
+        kadmin_q "getprinc $user" >"$D/gone-$user.txt" 2>&1
+        grep -q 'Principal does not exist' "$D/gone-$user.txt" || why="kadmin did not say 'Principal does not exist' (gone-$user.txt); "
+        if kinit_pw "$user@$REALM" "$pass" >"$D/kinit-$user-gone.log" 2>&1 ||
+            ! grep -q 'not found in Kerberos database' "$D/kinit-$user-gone.log"; then
+            why="${why}kinit did not say 'not found in Kerberos database' (kinit-$user-gone.log); "
+        fi
+        rows="$(d75_rows_once KERBEROS_SYNC "$user" "$D75_GONE_MARK" true "$D75_REMOVED")"
+        [ "$rows" = one ] || why="${why}kerberos_sync rows: ${rows:-unread}; "
+        [ -z "$why" ] || bad="$bad $user: $why"
+        said="$said $user"
+    done
+    if [ -z "$bad" ]; then
+        p_ok "[D.delete-confirmed-removed] the realm's opening removed the principal of$said: kadmin and kinit find none, and one kerberos_sync row each says '$D75_REMOVED'"
+    else
+        p_bad "[D.delete-confirmed-removed]$bad want each removed with one row '$D75_REMOVED'"
+    fi
+}
+
+d75_left() {
+    local user
+    for user in "${DEG_NEW}p" "$DEG_GONE" "$DEG_ASKED"; do
+        [ "$(d75_listed "$user")" = 0 ] ||
+            graphql 'mutation($id: String!) { deleteUser(userId: $id) { ok } }' '{"id": "'"$user"'"}' >"$D/delete-left-$user.json" 2>&1 ||
+            p_bad "[D.cleanup] $user could not be deleted once the realm was open (see delete-left-$user.json)"
+    done
 }
 
 # A second server on the gate's database while the gate's server holds the realm (W1): it watches
@@ -473,6 +613,14 @@ if kinit_pw "$DEG_SYNC@$REALM" "$DEG_SYNC_PASS" >"$D/kinit-synced-before.log" 2>
 else
     p_bad "kinit $DEG_SYNC failed before the realm was closed (see kinit-synced-before.log)"
 fi
+d75_made=0
+d75_synced_user "$DEG_GONE" "$DEG_GONE_PASS" || d75_made=1
+d75_synced_user "$DEG_ASKED" "$DEG_ASKED_PASS" || d75_made=1
+if [ "$d75_made" = 0 ]; then
+    p_ok "[D.delete-setup] the synced users $DEG_GONE and $DEG_ASKED are made with a password and get tickets while the realm serves"
+else
+    p_bad "[D.delete-setup] $DEG_GONE or $DEG_ASKED was not made with sync and a password, or got no ticket (see create-, setpw- and kinit-<user>-before files)"
+fi
 D75_GID="$(graphql '{ groups { id displayName } }' '{}' 2>/dev/null | GROUP=lldap_disabled python3 -c '
 import json, os, sys
 groups = json.load(sys.stdin)["groups"]
@@ -739,6 +887,7 @@ d75_directory_only() {
     else
         p_bad "[D.delete-nothing] a search for uid=$DEG_SYNC found $out entries (want 1)"
     fi
+    d75_confirmed_rows
 
     # The pages: the admins' notice, the locked switch on the create page and on a synced user's page.
     d75_page admin admin "$user_pass"
@@ -762,8 +911,7 @@ d75_directory_only() {
     d75_page_want admin details-save "User successfully updated!" "saving another attribute of the synced user works"
     d75_page user user "$user_pass"
     d75_page_want user notice-user "none" "a regular user sees no #kerberos-notice"
-    graphql 'mutation($id: String!) { deleteUser(userId: $id) { ok } }' '{"id": "'"${DEG_NEW}p"'"}' >"$D/delete-page-user.json" 2>&1 ||
-        p_bad "[P.cleanup] the user the page made could not be deleted (see delete-page-user.json)"
+    d75_by_name_row "$user_pass"
 }
 [ -z "$D75_DIRONLY" ] || d75_directory_only
 
@@ -816,9 +964,11 @@ if [ -n "$D75_DIRONLY" ]; then
     else
         p_bad "[D.password-kept] removeUserFromGroup or kinit $DEG_SYNC with the first password failed (see enable.json, kinit-synced-after.log)"
     fi
+    d75_removed_row
 fi
 graphql 'mutation($id: String!) { deleteUser(userId: $id) { ok } }' '{"id": "'"$DEG_SYNC"'"}' >"$D/delete-synced.json" 2>&1 ||
     p_bad "the synced user $DEG_SYNC could not be deleted once the realm was open (see delete-synced.json)"
+d75_left
 
 if [ "$GATE_DB" != postgres ]; then
     p_skip "[W1.second-watch] two servers need one shared database; on $GATE_DB this row is not run"

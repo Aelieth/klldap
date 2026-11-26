@@ -76,6 +76,7 @@ pub trait AdminBackendHandler:
 {
     async fn create_user(&self, request: CreateUserRequest) -> Result<()>;
     async fn delete_user(&self, user_id: &UserId) -> Result<()>;
+    async fn delete_user_confirmed(&self, user_id: &UserId) -> Result<Option<String>>;
     async fn add_user_to_group(&self, user_id: &UserId, group_id: GroupId) -> Result<()>;
     async fn remove_user_from_group(&self, user_id: &UserId, group_id: GroupId) -> Result<()>;
     async fn update_group(&self, request: UpdateGroupRequest) -> Result<()>;
@@ -161,6 +162,9 @@ impl<Handler: BackendHandler + OpaqueHandler> AdminBackendHandler for Handler {
     }
     async fn delete_user(&self, user_id: &UserId) -> Result<()> {
         <Handler as UserBackendHandler>::delete_user(self, user_id).await
+    }
+    async fn delete_user_confirmed(&self, user_id: &UserId) -> Result<Option<String>> {
+        <Handler as UserBackendHandler>::delete_user_confirmed(self, user_id).await
     }
     async fn add_user_to_group(&self, user_id: &UserId, group_id: GroupId) -> Result<()> {
         <Handler as UserBackendHandler>::add_user_to_group(self, user_id, group_id).await

@@ -3,7 +3,6 @@ use sea_orm::{ConnectionTrait, DbErr, Statement, Value};
 
 /// Marks the principal of `name` for the realm's next opening, which removes it whatever user of
 /// that name exists by then. A mark already there is kept with its time.
-#[cfg(test)]
 pub(crate) async fn mark_deleted(
     db: &impl ConnectionTrait,
     name: &str,

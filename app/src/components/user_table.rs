@@ -181,6 +181,13 @@ impl UserTable {
     fn is_user_disabled(user: &User) -> bool {
         user.is_disabled
     }
+
+    fn selected_with_sync(&self) -> Vec<String> {
+        let users = self.users.iter().flatten();
+        let chosen = users.filter(|u| self.bulk_selection.is_selected(&u.id));
+        let synced = chosen.filter(|u| Self::get_kerberos_sync(u));
+        synced.map(|u| u.id.clone()).collect()
+    }
 }
 
 #[derive(Properties, PartialEq)]
@@ -295,6 +302,7 @@ impl Component for UserTable {
                 <div class="col-auto">
                     <DeleteUser
                         selected_users={self.bulk_selection.selected.clone()}
+                        synced_users={self.selected_with_sync()}
                         on_user_deleted={ctx.link().callback(Msg::OnUserDeleted)}
                         on_error={ctx.link().callback(Msg::OnError)}
                     />

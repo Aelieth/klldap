@@ -1,5 +1,5 @@
-mutation DeleteUserQuery($user: String!) {
-  deleteUser(userId: $user) {
+mutation DeleteUserQuery($user: String!, $confirm: String) {
+  deleteUser(userId: $user, confirmUserId: $confirm) {
     ok
   }
 }

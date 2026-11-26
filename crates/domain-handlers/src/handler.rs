@@ -196,6 +196,11 @@ pub trait UserBackendHandler: ReadSchemaBackendHandler {
     async fn create_user(&self, request: CreateUserRequest) -> Result<()>;
     async fn update_user(&self, request: UpdateUserRequest) -> Result<()>;
     async fn delete_user(&self, user_id: &UserId) -> Result<()>;
+    /// `delete_user` with its confirmation, which lets a synced user go while the realm is closed;
+    /// Some: the warning to answer with.
+    async fn delete_user_confirmed(&self, user_id: &UserId) -> Result<Option<String>> {
+        self.delete_user(user_id).await.map(|()| None)
+    }
     async fn add_user_to_group(&self, user_id: &UserId, group_id: GroupId) -> Result<()>;
     async fn remove_user_from_group(&self, user_id: &UserId, group_id: GroupId) -> Result<()>;
     async fn get_user_groups(&self, user_id: &UserId) -> Result<HashSet<GroupDetails>>;

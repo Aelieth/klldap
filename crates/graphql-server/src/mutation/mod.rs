@@ -48,6 +48,10 @@ use std::sync::Arc;
 use tracing::{Instrument, debug, debug_span, info, warn};
 use zeroize::Zeroizing;
 
+/// A confirmation must name the user it deletes, as the page has it retyped.
+const CONFIRMS_ANOTHER_USER: &str = "confirmUserId names another user than userId; nothing was \
+     deleted";
+
 #[derive(PartialEq, Eq, Debug)]
 /// The top-level GraphQL mutation type.
 pub struct Mutation<Handler: BackendHandler + OpaqueHandler> {
@@ -374,10 +378,14 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
         Ok(Success::new())
     }
 
-    async fn delete_user(context: &Context<Handler>, user_id: String) -> FieldResult<Success> {
+    async fn delete_user(
+        context: &Context<Handler>,
+        user_id: String,
+        confirm_user_id: Option<String>,
+    ) -> FieldResult<Success> {
         let span = debug_span!("[GraphQL mutation] delete_user");
         span.in_scope(|| {
-            debug!(?user_id);
+            debug!(?user_id, ?confirm_user_id);
         });
         let user_id_typed = UserId::new(&user_id);
         let handler = context
@@ -387,9 +395,23 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             span.in_scope(|| debug!("Cannot delete current user"));
             return Err("Cannot delete current user".into());
         }
-        handler.delete_user(&user_id_typed).instrument(span).await?;
+        let confirmed = confirm_user_id.map(|named| UserId::new(&named));
+        let warnings: Vec<String> = match confirmed {
+            None => {
+                handler.delete_user(&user_id_typed).instrument(span).await?;
+                Vec::new()
+            }
+            Some(named) if named != user_id_typed => {
+                span.in_scope(|| debug!("{CONFIRMS_ANOTHER_USER}"));
+                return Err(CONFIRMS_ANOTHER_USER.into());
+            }
+            Some(_) => {
+                let deleted = handler.delete_user_confirmed(&user_id_typed);
+                deleted.instrument(span).await?.into_iter().collect()
+            }
+        };
         info!("Deleted user {user_id}");
-        Ok(Success::new())
+        Ok(Success::with_warnings(warnings))
     }
 
     async fn delete_group(context: &Context<Handler>, group_id: i32) -> FieldResult<Success> {
@@ -1871,6 +1893,50 @@ mod tests {
             let messages: Vec<_> = errors.iter().map(|e| e.error().message()).collect();
             let text = format!("Kerberos KDC unavailable: {told}");
             assert_eq!(messages, [text.as_str()], "{query}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_confirmation_naming_the_user_takes_the_confirmed_delete_and_its_warning() {
+        type Row = (&'static str, (usize, usize), Result<juniper::Value, String>);
+        let rows: [Row; 3] = [
+            (
+                r#"mutation { deleteUser(userId: "bob") { ok warnings } }"#,
+                (1, 0),
+                Ok(graphql_value!({"deleteUser": {"ok": true, "warnings": []}})),
+            ),
+            (
+                r#"mutation { deleteUser(userId: "bob", confirmUserId: "Bob") { ok warnings } }"#,
+                (0, 1),
+                Ok(graphql_value!({"deleteUser": {"ok": true, "warnings": ["stays"]}})),
+            ),
+            (
+                r#"mutation { deleteUser(userId: "bob", confirmUserId: "alice") { ok warnings } }"#,
+                (0, 0),
+                Err(CONFIRMS_ANOTHER_USER.to_owned()),
+            ),
+        ];
+        for (query, (plain, confirmed), expected) in rows {
+            let mut mock = MockTestBackendHandler::new();
+            mock.expect_get_schema()
+                .returning(|| Ok(make_test_schema()));
+            mock.expect_delete_user()
+                .with(eq(UserId::new("bob")))
+                .times(plain)
+                .returning(|_| Ok(()));
+            mock.expect_delete_user_confirmed()
+                .with(eq(UserId::new("bob")))
+                .times(confirmed)
+                .returning(|_| Ok(Some("stays".to_owned())));
+            let context = admin_context(mock);
+            let (value, errors) = execute(query, None, &root_schema(), &Variables::new(), &context)
+                .await
+                .unwrap();
+            let got = match errors.first() {
+                Some(e) => Err(e.error().message().to_owned()),
+                None => Ok(value),
+            };
+            assert_eq!(got, expected, "{query}");
         }
     }
 

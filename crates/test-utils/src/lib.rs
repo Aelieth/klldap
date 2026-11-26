@@ -65,6 +65,7 @@ mockall::mock! {
         async fn create_user(&self, request: CreateUserRequest) -> Result<()>;
         async fn update_user(&self, request: UpdateUserRequest) -> Result<()>;
         async fn delete_user(&self, user_id: &UserId) -> Result<()>;
+        async fn delete_user_confirmed(&self, user_id: &UserId) -> Result<Option<String>>;
         async fn get_user_groups(&self, user_id: &UserId) -> Result<HashSet<GroupDetails>>;
         async fn add_user_to_group(&self, user_id: &UserId, group_id: GroupId) -> Result<()>;
         async fn remove_user_from_group(&self, user_id: &UserId, group_id: GroupId) -> Result<()>;

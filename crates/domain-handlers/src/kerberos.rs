@@ -843,6 +843,28 @@ pub fn refusal_row(said: String) -> String {
     }
 }
 
+pub const CONFIRM_THE_DELETE: &str = "or delete the user now and leave its Kerberos principal \
+     until then: confirm the delete on the web page, or give deleteUser a confirmUserId equal to \
+     userId";
+pub const PRINCIPAL_STAYS: &str = "the user's Kerberos principal stays until this server's realm \
+     opens, which removes it before the KDC serves";
+pub const LEFT_UNTIL_THE_REALM_OPENS: &str = "deleted while the Kerberos realm is closed on this \
+     server: the principal is marked, and the realm's next opening removes it before the KDC \
+     serves";
+pub const CONFIRMED_FOR_SYNC: &str = "a confirmed delete is for a user with Kerberos sync, and this \
+     user has none now: it was re-created or changed since; nothing was deleted";
+
+/// A synced user's delete in directory-only without its confirmation: the one text and how to
+/// confirm to the door, the full cause to its row. None outside directory-only.
+pub fn delete_unconfirmed(user: &UserId) -> Option<DomainError> {
+    let (class, full) = directory_only_now()?;
+    let unavailable = |cause: String| DomainError::KdcUnavailable(cause).to_string();
+    let row = format!("{}; {CONFIRM_THE_DELETE}", unavailable(full));
+    crate::logging::record_failure(LogKind::UserDelete, Some(user.as_str()), &row);
+    let told = format!("{}; {CONFIRM_THE_DELETE}", closed_to_writes(class));
+    Some(DomainError::KdcUnavailable(told))
+}
+
 pub const REALM_LOST: &str = "the Kerberos realm was lost; the server log has the cause";
 const KDC_NOT_SERVING: &str = "the Kerberos KDC is not serving";
 
@@ -1602,6 +1624,44 @@ mod tests {
                 "the start pass of the Kerberos realm EXAMPLE.COM failed".to_owned()
             ),
             "a classed context prints its own words alone"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_an_unconfirmed_delete_in_directory_only_says_how_to_confirm() {
+        let bob = UserId::new("bob");
+        let mut got = Vec::new();
+        for mode in [DegradedMode::AdminOnly, DegradedMode::DirectoryOnly] {
+            let logged = Arc::new(Rows::default());
+            crate::logging::set_log_sink(logged.clone());
+            set_kerberos_backend(degraded(mode));
+            let said = delete_unconfirmed(&bob).map(|e| e.to_string());
+            set_kerberos_backend(Arc::new(NoopKerberos::default()));
+            crate::logging::set_log_sink(Arc::new(crate::logging::NoopLogSink));
+            let events = logged.0.lock().unwrap();
+            let rows: Vec<_> = events
+                .iter()
+                .map(|e| (e.kind, e.success, e.detail.clone()))
+                .collect();
+            got.push((said, rows));
+        }
+        let told = "Kerberos KDC unavailable: the realm's records did not open; the change will \
+            be possible when this server's realm opens; or delete the user now and leave its \
+            Kerberos principal until then: confirm the delete on the web page, or give \
+            deleteUser a confirmUserId equal to userId";
+        let row = format!("Kerberos KDC unavailable: down; {CONFIRM_THE_DELETE}");
+        assert_eq!(
+            got,
+            vec![
+                (None, vec![]),
+                (
+                    Some(told.to_owned()),
+                    vec![(LogKind::UserDelete, false, Some(row))]
+                )
+            ],
+            "admin-only: not this refusal; directory-only: the class and how to confirm, the \
+             full cause in the row"
         );
     }
 

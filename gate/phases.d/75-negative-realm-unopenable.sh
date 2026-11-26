@@ -722,7 +722,7 @@ d75_directory_only() {
         p_bad "[D.disabled] lldap_disabled=${D75_GID:-not found}; $(head -c 300 "$D/disable.json" 2>/dev/null); kerberos_sync rows: ${got:-unread}; want ok and one row '$D75_STATUS'"
     fi
 
-    # The synced user's delete: refused at both doors (the confirmed delete is not built).
+    # The synced user's delete without its confirmation: refused at both doors, with how to confirm.
     mark="$(log_mark)"
     graphql 'mutation($id: String!) { deleteUser(userId: $id) { ok } }' '{"id": "'"$DEG_SYNC"'"}' >"$D/delete-graphql.log" 2>&1
     rc=$?

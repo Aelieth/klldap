@@ -398,7 +398,7 @@ type Mutation {
   updateGroup(group: UpdateGroupInput!): Success!
   addUserToGroup(userId: String!, groupId: Int!): Success!
   removeUserFromGroup(userId: String!, groupId: Int!): Success!
-  deleteUser(userId: String!): Success!
+  deleteUser(userId: String!, confirmUserId: String): Success!
   deleteGroup(groupId: Int!): Success!
   createOu(name: String!): Success!
   deleteOu(name: String!): Success!

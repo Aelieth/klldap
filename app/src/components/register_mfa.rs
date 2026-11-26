@@ -160,7 +160,7 @@ pub enum Msg {
     SubmitPassword,
     SubmitGate,
     Submit,
-    AuthenticationStartResponse(Result<Box<login::ServerLoginStartResponse>>),
+    AuthenticationStartResponse(Result<Box<login::ServerLoginStart>>),
     LoginFinishResponse(Result<LoginOutcome>),
     EnrollmentFinishResponse(Result<finish_mfa_enrollment::ResponseData>),
     EnrollmentExpired,
@@ -305,10 +305,11 @@ impl CommonComponent<RegisterMfa> for RegisterMfa {
                     true => FinishFor::EnrollmentProof,
                     false => FinishFor::PasswordCheck,
                 };
-                let request = finish_login(*state, &password, *res, finish_for).map_err(|e| {
-                    error!(&format!("Invalid password: {:#}", e));
-                    anyhow!("Invalid password")
-                })?;
+                let (request, _) =
+                    finish_login(*state, &password, *res, finish_for).map_err(|e| {
+                        error!(&format!("Invalid password: {:#}", e));
+                        anyhow!("Invalid password")
+                    })?;
                 self.pending_code = Some(code);
                 self.common.call_backend(
                     ctx,

@@ -201,7 +201,7 @@ pp_manager() {
 # pp_wire <tag> <change|create> <user> <typed> [<add|swap> <seal order>] [<mail>]: PP_WIRE, PP_ALERT.
 # With PP_OTHER_TOKEN set, a copy of the page's finish goes first with that bearer (PP_OTHER: its
 # status and body); with PP_AGAIN=1 the page's finish goes once more with the page's own token
-# (PP_AGAIN_SAID).
+# (PP_AGAIN_SAID); with PP_RELOAD=1 the admin signs in first and the page is loaded after.
 pp_wire() {
     local tag="$1" kind="$2" user="$3" typed="$4" mode="${5:-}" envelope="${6:-}" mail="${7:-}"
     docker rm -f "$PP_BROWSER_CTN" >/dev/null 2>&1 || true
@@ -215,6 +215,7 @@ pp_wire() {
             -e BROWSER_PAGE="$kind" -e BROWSER_USER="$user" -e BROWSER_TAG="$tag" -e BROWSER_MAIL="$mail" \
             -e BROWSER_FINISH_MODE="$mode" -e BROWSER_ADMIN_PASS -e BROWSER_PASS -e BROWSER_FINISH_ENVELOPE \
             -e BROWSER_FINISH_OTHER_TOKEN -e BROWSER_FINISH_AGAIN="${PP_AGAIN:-}" \
+            -e BROWSER_RELOAD="${PP_RELOAD:-}" \
             "$PP_BROWSER_IMAGE" /work/password-wire.mjs >"$PP_D/wire-$tag.out" 2>"$PP_D/wire-$tag.err"
     )
     PP_WIRE="$(grep -m1 '^WIRE \|^ROW wire FAIL' "$PP_D/wire-$tag.out" 2>/dev/null || echo "no line (see wire-$tag.err)")"
@@ -298,6 +299,23 @@ pp_wire_rows() {
     else
         pp_bind "$PP_PLAIN" "$plain_new" && PP_PLAIN_PASS="$plain_new"
         p_bad "[$row] $PP_WIRE ${PP_ALERT:+(alert: $PP_ALERT) }; $PP_GOT; want $want_plain and bind-new=yes bind-old=no"
+    fi
+}
+
+# A page loaded after its sign-in holds no envelope key: for a synced user it asks for a new
+# sign-in before the finish, and both stores keep the old password.
+pp_reload() {
+    local row="U1.page-reload-signs-in-again" new
+    local want="WIRE start-key=yes finish-envelope=none rewrite=none finish-status=none graphql-seal=no create-sent=no page=stayed"
+    new="$(pp_gen)"
+    PP_RELOAD=1 pp_wire reload change "$PP_SYNC" "$new"
+    pp_sides "$PP_SYNC" "$new" "$PP_SYNC_PASS"
+    if [ "$PP_WIRE" = "$want" ] && [ "$PP_GOT" = "$PP_BOTH_OLD" ] &&
+        grep -qF "is not one this sign-in bound; sign in again" <<<"$PP_ALERT"; then
+        p_ok "[$row] the admin's change page loaded after the sign-in, for a synced user: '$PP_ALERT' before any finish, and bind and kinit keep the old password"
+    else
+        pp_bind "$PP_SYNC" "$new" && PP_SYNC_PASS="$new"
+        p_bad "[$row] $PP_WIRE (alert: ${PP_ALERT:-none}); $PP_GOT; want $want, the sign-in sentence, $PP_BOTH_OLD"
     fi
 }
 
@@ -927,6 +945,7 @@ if pp_setup; then
     pp_manager
     if docker image inspect "$PP_BROWSER_IMAGE" >/dev/null 2>&1; then
         pp_wire_rows
+        pp_reload
         pp_inject_nosync
         pp_swap_label
         pp_swap_other

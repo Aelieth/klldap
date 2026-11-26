@@ -5,6 +5,8 @@
 // held, under the label of that finish's own server data. BROWSER_FINISH_OTHER_TOKEN sends a copy
 // of the held finish with that bearer before the page's own goes on (line OTHER);
 // BROWSER_FINISH_AGAIN=1 sends the page's finish once more with the page's own token (line AGAIN).
+// The admin signs in on the page itself, so the app lands there with no reload and the page holds
+// the envelope key its sign-in bound; BROWSER_RELOAD=1 signs in first and then loads the page.
 // Values are never printed.
 
 import { spawn } from "node:child_process";
@@ -24,6 +26,7 @@ const finishMode = process.env.BROWSER_FINISH_MODE || "";
 const finishEnvelope = process.env.BROWSER_FINISH_ENVELOPE || "";
 const otherToken = process.env.BROWSER_FINISH_OTHER_TOKEN || "";
 const finishAgain = process.env.BROWSER_FINISH_AGAIN === "1";
+const reload = process.env.BROWSER_RELOAD === "1";
 const holdsFinish = Boolean(finishMode || otherToken || finishAgain);
 const LABEL = "klldap-kerberos-envelope-v2";
 const sealOrder = finishEnvelope.startsWith("seal:") ? finishEnvelope.split(":") : null;
@@ -321,9 +324,8 @@ async function setValues(pairs) {
   })()`);
 }
 
-async function login() {
-  await goto("/login");
-  await waitFor(`!!document.querySelector("#username")`, "#username");
+async function signIn() {
+  await waitFor(`location.pathname === "/login" && !!document.querySelector("#username")`, "#username");
   await setValues([
     ["#username", "admin"],
     ["#password", adminPass],
@@ -333,6 +335,22 @@ async function login() {
     `[...document.querySelectorAll("button")].some((b) => b.textContent.includes("Logout"))`,
     "button Logout",
   );
+}
+
+async function login() {
+  await goto("/login");
+  await signIn();
+}
+
+async function signInAt(path) {
+  await send("Page.navigate", { url: `${base}${path}` });
+  await signIn();
+  await waitFor(`location.pathname === ${JSON.stringify(path)}`, `path ${path}`);
+}
+
+async function openPage(path) {
+  if (reload) await goto(path);
+  else await signInAt(path);
 }
 
 async function fillNew(value) {
@@ -354,7 +372,7 @@ async function fillNew(value) {
 }
 
 async function openChange() {
-  await goto(`/user/${who}/password`);
+  await openPage(`/user/${who}/password`);
   await waitFor(
     `[...document.querySelectorAll("h5")].some((h) => h.textContent.includes("Change Password"))`,
     "Change Password",
@@ -362,7 +380,7 @@ async function openChange() {
 }
 
 async function openCreate() {
-  await goto("/users/create");
+  await openPage("/users/create");
   await waitFor(`!!document.querySelector("#username") && !!document.querySelector('input[name="mail"]')`, "create form");
   const shown = await evalValue(`!!document.querySelector('label[for="kerberossync_toggle"]')`);
   wire.createSwitch = shown ? "shown" : "absent";
@@ -385,7 +403,7 @@ async function alertText() {
 let failed = false;
 try {
   await connect();
-  await login();
+  if (reload) await login();
   const leaves = pageKind === "create" ? `location.pathname === "/users"` : `!location.pathname.endsWith("/password")`;
   if (pageKind === "create") await openCreate();
   else await openChange();

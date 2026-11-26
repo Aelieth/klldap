@@ -9,7 +9,21 @@ use lldap_auth::{
     PASSWORD_LENGTH_UNIT, PASSWORD_MIN_LENGTH, PasswordShapeError, login, opaque, password_shape,
     registration,
 };
+use std::cell::RefCell;
 use validator::ValidationError;
+
+thread_local! {
+    /// The envelope key this page's sign-in bound, in the page's memory only: a reload loses it.
+    static SIGNED_IN_KEY: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+pub fn keep_signed_in_key(key: Option<String>) {
+    SIGNED_IN_KEY.with(|held| *held.borrow_mut() = key);
+}
+
+pub fn signed_in_key() -> Option<String> {
+    SIGNED_IN_KEY.with(|held| held.borrow().clone())
+}
 
 pub type RegistrationState = opaque::client::registration::ClientRegistration;
 pub type LoginState = opaque::client::login::ClientLogin;
@@ -91,12 +105,14 @@ pub fn new_user_password_at_the_floor(password: &str) -> Result<(), ValidationEr
 }
 
 /// Completes registration from the stashed state and the server's start
-/// response, producing the finish request to POST.
+/// response, producing the finish request to POST; a synced user's password is sealed only to
+/// the key `seal_to` allows.
 pub fn finish_registration(
     state: RegistrationState,
     username: &str,
     password: &str,
     start: registration::ServerRegistrationStart,
+    seal_to: SealTo<'_>,
 ) -> Result<registration::ClientRegistrationFinish> {
     let registration::ServerRegistrationStart {
         response,
@@ -121,23 +137,28 @@ pub fn finish_registration(
     finish_with_envelope(
         request,
         kerberos_envelope_key.as_deref(),
-        SealTo::Answered,
+        seal_to,
         username,
         password,
     )
 }
 
-/// Begins a login: returns the client state to stash and the start request to POST.
+/// Begins a login that asks for the envelope key: returns the client state to stash and the start
+/// request to POST.
 pub fn begin_login(
     username: &str,
     password: &str,
-) -> Result<(LoginState, login::ClientLoginStartRequest)> {
+) -> Result<(LoginState, login::ClientLoginStart)> {
     let mut rng = rand::rngs::OsRng;
     let start = opaque::client::login::start_login(password, &mut rng)
         .context("Could not initialize login")?;
     let request = login::ClientLoginStartRequest {
         username: username.into(),
         login_start_request: start.message,
+    };
+    let request = login::ClientLoginStart {
+        request,
+        kerberos_envelope_key: Some(true),
     };
     Ok((start.state, request))
 }
@@ -164,35 +185,53 @@ impl FinishFor {
 }
 
 /// Completes the login proof from the stashed state and the server's start response,
-/// producing the finish request to POST; a wrong password fails here, client-side.
+/// producing the finish request to POST and the envelope key the login bound; a wrong password,
+/// or a key the server did not bind, fails here, client-side.
 pub fn finish_login(
     state: LoginState,
     password: &str,
-    response: login::ServerLoginStartResponse,
+    response: login::ServerLoginStart,
     finish_for: FinishFor,
-) -> Result<login::ClientLoginFinishRequest> {
+) -> Result<(login::ClientLoginFinishRequest, Option<String>)> {
     let mut rng = rand::rngs::OsRng;
-    let finish = opaque::client::login::finish_login(
-        state,
-        password.as_bytes(),
-        response.credential_response,
-        &mut rng,
-    )
-    .context("Invalid username or password")?;
+    let (request, bound_key) = login::finish_bound(state, password.as_bytes(), response, &mut rng)
+        .context("Invalid username or password")?;
     let (totp_code, enrollment_proof, session) = finish_for.fields();
-    Ok(login::ClientLoginFinishRequest {
-        server_data: response.server_data,
-        credential_finalization: finish.message,
+    let request = login::ClientLoginFinishRequest {
         totp_code,
         enrollment_proof,
         session,
-    })
+        ..request
+    };
+    Ok((request, bound_key))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lldap_auth::kerberos_envelope::KeyNotBound;
     use lldap_auth::password_length;
+    use lldap_auth::types::UserId;
+
+    const BOB_PASS: &str = "Bob-Password-1";
+
+    fn registered(
+        setup: &opaque::server::ServerSetup,
+        user: &UserId,
+    ) -> opaque::server::ServerRegistration {
+        let mut rng = rand::rngs::OsRng;
+        let (state, request) = begin_registration(user.as_str(), BOB_PASS).unwrap();
+        let start = request.registration_start_request;
+        let answer = opaque::server::registration::start_registration(setup, start, user).unwrap();
+        let upload = opaque::client::registration::finish_registration(
+            state,
+            BOB_PASS.as_bytes(),
+            answer.message,
+            &mut rng,
+        )
+        .unwrap();
+        opaque::server::registration::get_password_file(upload.message)
+    }
 
     #[test]
     fn test_a_password_shorter_than_the_servers_minimum_is_not_finished() {
@@ -415,5 +454,133 @@ mod tests {
             (started(""), started("Bob-Password-1")),
             (Err("the password must not be empty".to_owned()), Ok(()))
         );
+    }
+
+    #[test]
+    fn test_a_page_login_asks_for_the_key_and_gives_only_a_key_the_server_bound() {
+        type Row = (
+            &'static str,
+            Option<&'static str>,
+            Option<&'static str>,
+            Result<Option<&'static str>, &'static str>,
+        );
+        let mut rng = rand::rngs::OsRng;
+        let setup = opaque::server::ServerSetup::new(&mut rng);
+        let bob = UserId::new("bob");
+        let file = registered(&setup, &bob);
+        let refused = "Invalid username or password";
+        let rows: [Row; 4] = [
+            (
+                "the key the server bound",
+                Some("key"),
+                Some("key"),
+                Ok(Some("key")),
+            ),
+            (
+                "another key answered",
+                Some("key"),
+                Some("other"),
+                Err(refused),
+            ),
+            (
+                "a key the server did not bind",
+                None,
+                Some("key"),
+                Err(refused),
+            ),
+            ("none bound, none answered", None, None, Ok(None)),
+        ];
+        for (row, bound, answered, expected) in rows {
+            let (state, start) = begin_login("bob", BOB_PASS).unwrap();
+            assert_eq!(start.kerberos_envelope_key, Some(true), "{row}: asked");
+            let context = login::envelope_key_context(bound);
+            let started = opaque::server::login::start_login_in_context(
+                &mut rng,
+                &setup,
+                Some(file.clone()),
+                start.request.login_start_request,
+                &bob,
+                &context,
+            )
+            .unwrap();
+            let response = login::ServerLoginStart {
+                response: login::ServerLoginStartResponse {
+                    server_data: "sealed".to_owned(),
+                    credential_response: started.message,
+                },
+                kerberos_envelope_key: answered.map(str::to_owned),
+            };
+            let got = finish_login(state, BOB_PASS, response, FinishFor::PasswordCheck)
+                .map(|(request, key)| (request.server_data, request.session, key))
+                .map_err(|e| e.to_string());
+            let expected = expected
+                .map(|key| ("sealed".to_owned(), Some(false), key.map(str::to_owned)))
+                .map_err(str::to_owned);
+            assert_eq!(got, expected, "{row}");
+        }
+    }
+
+    #[test]
+    fn test_a_page_seals_a_synced_users_password_only_to_the_key_its_sign_in_bound() {
+        type Row = (
+            &'static str,
+            Option<&'static str>,
+            SealTo<'static>,
+            Result<bool, String>,
+        );
+        let mut rng = rand::rngs::OsRng;
+        let setup = opaque::server::ServerSetup::new(&mut rng);
+        let bob = UserId::new("bob");
+        let not_bound = Err(KeyNotBound.to_string());
+        let sealed = Err("Base64 decode of the Kerberos envelope key failed".to_owned());
+        let rows: [Row; 6] = [
+            ("no key answered", None, SealTo::Bound(None), Ok(false)),
+            (
+                "another key bound",
+                Some("no key!"),
+                SealTo::Bound(Some("other")),
+                not_bound.clone(),
+            ),
+            (
+                "no key held",
+                Some("no key!"),
+                SealTo::Bound(None),
+                not_bound,
+            ),
+            (
+                "the bound key",
+                Some("no key!"),
+                SealTo::Bound(Some("no key!")),
+                sealed.clone(),
+            ),
+            ("the reset page", Some("no key!"), SealTo::Answered, sealed),
+            ("the reset page, no key", None, SealTo::Answered, Ok(false)),
+        ];
+        for (row, answered, seal_to, expected) in rows {
+            let (state, request) = begin_registration("bob", BOB_PASS).unwrap();
+            let start = request.registration_start_request;
+            let answer = opaque::server::registration::start_registration(&setup, start, &bob);
+            let start = registration::ServerRegistrationStart {
+                response: registration::ServerRegistrationStartResponse {
+                    server_data: "sealed".to_owned(),
+                    registration_response: answer.unwrap().message,
+                },
+                kerberos_envelope_key: answered.map(str::to_owned),
+                password_min_length: None,
+            };
+            let got = finish_registration(state, "bob", BOB_PASS, start, seal_to)
+                .map(|finish| finish.kerberos_password_envelope.is_some())
+                .map_err(|e| e.to_string());
+            assert_eq!(got, expected, "{row}");
+        }
+    }
+
+    #[test]
+    fn test_a_page_holds_the_key_its_sign_in_bound_until_it_signs_out() {
+        assert_eq!(signed_in_key(), None, "a page that has not signed in");
+        keep_signed_in_key(Some("key".to_owned()));
+        assert_eq!(signed_in_key().as_deref(), Some("key"));
+        keep_signed_in_key(None);
+        assert_eq!(signed_in_key(), None, "signed out");
     }
 }

@@ -22,7 +22,7 @@ use crate::{
         user_schema_table::ListUserSchema,
         user_table::UserTable,
     },
-    infra::{api::HostService, cookies::get_cookie},
+    infra::{api::HostService, cookies::get_cookie, opaque::keep_signed_in_key},
 };
 
 use gloo_console::error;
@@ -136,6 +136,7 @@ impl Component for App {
                 }
             }
             Msg::Logout => {
+                keep_signed_in_key(None);
                 self.user_info = None;
                 self.redirect_to = None;
                 self.mfa_enrollment_pending = false;

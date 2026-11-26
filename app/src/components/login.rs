@@ -7,7 +7,7 @@ use crate::{
     infra::{
         api::{HostService, LoginOutcome},
         common_component::{CommonComponent, CommonComponentParts},
-        opaque::{FinishFor, LoginState, begin_login, finish_login},
+        opaque::{FinishFor, LoginState, begin_login, finish_login, keep_signed_in_key},
     },
 };
 use anyhow::{Result, anyhow, bail};
@@ -25,6 +25,7 @@ struct Credentials {
     username: String,
     password: String,
     code: Option<String>,
+    bound_key: Option<String>,
 }
 
 enum Step {
@@ -74,12 +75,7 @@ pub enum Msg {
     SubmitCode,
     BackToPassword,
     AuthenticationRefreshResponse(Result<(String, bool, bool)>),
-    AuthenticationStartResponse(
-        (
-            Box<LoginState>,
-            Result<Box<login::ServerLoginStartResponse>>,
-        ),
-    ),
+    AuthenticationStartResponse((Box<LoginState>, Result<Box<login::ServerLoginStart>>)),
     AuthenticationFinishResponse(Result<LoginOutcome>),
 }
 
@@ -141,6 +137,7 @@ impl CommonComponent<LoginForm> for LoginForm {
                         username,
                         password,
                         code: None,
+                        bound_key: None,
                     },
                 )
             }
@@ -158,6 +155,7 @@ impl CommonComponent<LoginForm> for LoginForm {
                     username: username.clone(),
                     password: password.clone(),
                     code: Some(self.code_form.field_value("totp_code")),
+                    bound_key: None,
                 };
                 self.start_login_attempt(ctx, credentials)
             }
@@ -175,12 +173,15 @@ impl CommonComponent<LoginForm> for LoginForm {
                         return Ok(true);
                     }
                 };
-                let Some(credentials) = self.in_flight.take() else {
+                let Some(mut credentials) = self.in_flight.take() else {
                     bail!("Invalid state");
                 };
                 let finish_for = FinishFor::SignIn(credentials.code.clone());
                 let request = match finish_login(*state, &credentials.password, *res, finish_for) {
-                    Ok(request) => request,
+                    Ok((request, bound_key)) => {
+                        credentials.bound_key = bound_key;
+                        request
+                    }
                     Err(e) => {
                         // Common error, we want to print a full error to the console but only a
                         // simple one to the user.
@@ -215,6 +216,7 @@ impl CommonComponent<LoginForm> for LoginForm {
                         mfa_enrollment_required,
                     }) => {
                         self.back_to_password(None);
+                        keep_signed_in_key(credentials.bound_key);
                         ctx.props()
                             .on_logged_in
                             .emit((user_id, is_admin, mfa_enrollment_required));

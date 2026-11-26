@@ -1,6 +1,7 @@
+use crate::infra::encrypt::SealTo;
 use crate::infra::opaque::{
     FinishFor, LoginState, begin_login, begin_registration, finish_login, finish_registration,
-    new_password_at_the_floor, registration_started,
+    new_password_at_the_floor, registration_started, signed_in_key,
 };
 use crate::{
     components::{
@@ -59,6 +60,7 @@ pub struct ChangePasswordForm {
     common: CommonComponentParts<Self>,
     form: Form<FormModel>,
     opaque_data: OpaqueData,
+    checked_key: Option<String>,
 }
 
 #[derive(Clone, PartialEq, Eq, Properties)]
@@ -70,7 +72,7 @@ pub struct Props {
 pub enum Msg {
     FormUpdate,
     Submit,
-    LoginStartResponse(Result<Box<login::ServerLoginStartResponse>>),
+    LoginStartResponse(Result<Box<login::ServerLoginStart>>),
     LoginFinishResponse(Result<LoginOutcome>),
     RegistrationStartResponse(Result<Box<registration::ServerRegistrationStart>>),
     RegistrationFinishResponse(Result<()>),
@@ -116,8 +118,10 @@ impl CommonComponent<ChangePasswordForm> for ChangePasswordForm {
                 let OpaqueData::Login(state, password) = held else {
                     bail!("Invalid state");
                 };
-                let request = finish_login(*state, &password, *res, FinishFor::PasswordCheck)
-                    .context("Old password verification failed")?;
+                let (request, checked_key) =
+                    finish_login(*state, &password, *res, FinishFor::PasswordCheck)
+                        .context("Old password verification failed")?;
+                self.checked_key = checked_key;
                 self.common.call_backend(
                     ctx,
                     HostService::login_finish(request),
@@ -148,11 +152,17 @@ impl CommonComponent<ChangePasswordForm> for ChangePasswordForm {
                     OpaqueData::Registration(r) => *r,
                     _ => bail!("Invalid state"),
                 };
+                // An admin's page has no check of its own: the key its sign-in bound, if any.
+                let bound = match ctx.props().is_admin {
+                    true => signed_in_key(),
+                    false => self.checked_key.take(),
+                };
                 let req = finish_registration(
                     registration,
                     &ctx.props().username,
                     &self.form.model().password,
                     *res,
+                    SealTo::Bound(bound.as_deref()),
                 )?;
                 self.common.call_backend(
                     ctx,
@@ -191,6 +201,7 @@ impl Component for ChangePasswordForm {
             common: CommonComponentParts::<Self>::create(),
             form: Form::<FormModel>::new(FormModel::default()),
             opaque_data: OpaqueData::None,
+            checked_key: None,
         }
     }
 

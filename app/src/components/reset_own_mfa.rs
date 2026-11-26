@@ -55,7 +55,7 @@ pub struct Props {
 pub enum Msg {
     FormUpdate,
     Submit,
-    AuthenticationStartResponse(Result<Box<login::ServerLoginStartResponse>>),
+    AuthenticationStartResponse(Result<Box<login::ServerLoginStart>>),
     LoginFinishResponse(Result<LoginOutcome>),
     ResetResponse(Result<reset_own_mfa::ResponseData>),
     ModeLoaded(Result<own_mfa::ResponseData>),
@@ -97,7 +97,7 @@ impl CommonComponent<ResetOwnMfaForm> for ResetOwnMfaForm {
                 let Some((state, password, code)) = held else {
                     bail!("Invalid state");
                 };
-                let request = finish_login(*state, &password, *res, FinishFor::PasswordCheck)
+                let (request, _) = finish_login(*state, &password, *res, FinishFor::PasswordCheck)
                     .map_err(|e| {
                         error!(&format!("Invalid password: {:#}", e));
                         anyhow!("Invalid password")

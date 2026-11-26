@@ -1,6 +1,7 @@
 use crate::components::fragments::attribute_order::attribute_priority;
 use crate::infra::opaque::{
     begin_registration, finish_registration, new_user_password_at_the_floor, registration_started,
+    signed_in_key,
 };
 use crate::infra::queries::{
     GetPosixConfig, GetUserAttributesSchema, ListOusQuery, get_posix_config,
@@ -20,7 +21,7 @@ use crate::{
     infra::{
         api::HostService,
         common_component::{CommonComponent, CommonComponentParts},
-        encrypt::check_kerberos_envelope,
+        encrypt::{KeyNotBound, SealTo, check_kerberos_envelope},
         form_utils::{EmailIsRequired, GraphQlAttributeSchema, IsAdmin, read_all_form_attributes},
     },
 };
@@ -176,6 +177,10 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
                 );
                 if sync == Some(true) {
                     check_kerberos_envelope(&model.password)?;
+                    // Before createUser: a page that holds no bound key could not set the password.
+                    if signed_in_key().is_none() {
+                        return Err(KeyNotBound.into());
+                    }
                 }
 
                 let all_values = read_all_form_attributes(
@@ -269,7 +274,9 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
                     .opaque_data
                     .take()
                     .context("Missing registration data")?;
-                let req = finish_registration(state, user_id, &self.form.model().password, *res)
+                let (model, bound) = (self.form.model(), signed_in_key());
+                let seal_to = SealTo::Bound(bound.as_deref());
+                let req = finish_registration(state, user_id, &model.password, *res, seal_to)
                     .map_err(|e| created_without_password(user_id, &format!("{e:#}")))?;
                 self.common.call_backend(
                     ctx,

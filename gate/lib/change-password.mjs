@@ -1,4 +1,5 @@
-// Change-password page. Phase 94's driver is the model. The phase classifies the row.
+// Change-password page. Phase 94's driver is the model. The phase classifies the row. The admin
+// signs in on the page itself, so the page holds the envelope key its sign-in bound.
 
 import { spawn } from "node:child_process";
 import { readdirSync } from "node:fs";
@@ -97,11 +98,6 @@ async function waitFor(expression, selector) {
   throw fail(selector);
 }
 
-async function goto(path) {
-  await send("Page.navigate", { url: `${base}${path}` });
-  await waitFor(`location.pathname === ${JSON.stringify(path)}`, `path ${path}`);
-}
-
 async function clickButton(label) {
   await waitFor(
     `[...document.querySelectorAll("button")].some((b) => b.textContent.includes(${JSON.stringify(label)}) && !b.disabled)`,
@@ -161,9 +157,9 @@ async function connect() {
   await send("Runtime.enable");
 }
 
-async function login() {
-  await goto("/login");
-  await waitFor(`!!document.querySelector("#username")`, "#username");
+async function loginAt(path) {
+  await send("Page.navigate", { url: `${base}${path}` });
+  await waitFor(`location.pathname === "/login" && !!document.querySelector("#username")`, "#username");
   await evalValue(`(() => {
     const proto = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, "value");
     for (const [sel, value] of [["#username", "admin"], ["#password", ${JSON.stringify(adminPass)}]]) {
@@ -179,6 +175,7 @@ async function login() {
     `[...document.querySelectorAll("button")].some((b) => b.textContent.includes("Logout"))`,
     "button Logout",
   );
+  await waitFor(`location.pathname === ${JSON.stringify(path)}`, `path ${path}`);
 }
 
 async function fillNew(value) {
@@ -200,7 +197,7 @@ async function fillNew(value) {
 }
 
 async function openChange() {
-  await goto(`/user/${who}/password`);
+  await loginAt(`/user/${who}/password`);
   await waitFor(
     `[...document.querySelectorAll("h5")].some((h) => h.textContent.includes("Change Password"))`,
     "Change Password",
@@ -210,7 +207,6 @@ async function openChange() {
 let failed = false;
 try {
   await connect();
-  await login();
   await openChange();
   await fillNew(typed);
   await clickButton("Change Password");

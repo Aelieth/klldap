@@ -1,3 +1,4 @@
+use crate::infra::encrypt::SealTo;
 use crate::infra::opaque::{
     begin_registration, finish_registration, new_password_at_the_floor, registration_started,
 };
@@ -87,8 +88,10 @@ impl CommonComponent<ResetPasswordStep2Form> for ResetPasswordStep2Form {
                 let Some(username) = self.username.as_deref() else {
                     bail!("Username not available");
                 };
+                // No password exists to sign in with here: the key as the start answered it.
+                let password = self.form.model().password;
                 let req =
-                    finish_registration(registration, username, &self.form.model().password, *res)?;
+                    finish_registration(registration, username, &password, *res, SealTo::Answered)?;
                 self.common.call_backend(
                     ctx,
                     HostService::register_finish(req),

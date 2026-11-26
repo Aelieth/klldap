@@ -353,11 +353,13 @@ const firstSteps = {
 };
 let currentStep = firstSteps[mode] || "admin-login";
 
-async function login(who, password, row) {
+// From a landing page the app comes back to it after the login, with the key its sign-in bound.
+async function login(who, password, row, landing) {
   currentStep = row;
-  await goto("/login");
+  if (landing) await send("Page.navigate", { url: `${base}${landing}` });
+  else await goto("/login");
+  await waitFor(`location.pathname === "/login" && !!document.querySelector("#username")`, "#username");
   await recordContext();
-  await waitFor(`!!document.querySelector("#username")`, "#username");
   await fill("#username", who);
   await fill("#password", password);
   await clickButton("Login");
@@ -365,12 +367,12 @@ async function login(who, password, row) {
     `[...document.querySelectorAll("button")].some((b) => b.textContent.includes("Logout"))`,
     "button Logout",
   );
+  if (landing) await waitFor(`location.pathname === ${JSON.stringify(landing)}`, `path ${landing}`);
   say(`ROW ${row} PASS`);
 }
 
 async function createUser() {
   currentStep = "create";
-  await goto("/users/create");
   await waitFor(`!!document.querySelector("input[name=mail]")`, "input[name=mail]");
   await fill("#username", userId);
   await fill("input[name=mail]", `${userId}@gate.test`);
@@ -773,7 +775,7 @@ async function pagesAtOne() {
 async function main() {
   await connect();
   if (mode === "create") {
-    await login("admin", adminPass, "admin-login");
+    await login("admin", adminPass, "admin-login", "/users/create");
     await createUser();
   } else if (mode === "change") {
     await login(userId, firstPass, "user-login");

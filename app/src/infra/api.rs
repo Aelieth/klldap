@@ -146,8 +146,8 @@ impl HostService {
     }
 
     pub async fn login_start(
-        request: login::ClientLoginStartRequest,
-    ) -> Result<Box<login::ServerLoginStartResponse>> {
+        request: login::ClientLoginStart,
+    ) -> Result<Box<login::ServerLoginStart>> {
         call_server_json_with_error_message(
             &(base_url() + "/auth/opaque/login/start"),
             RequestType::Post(request),

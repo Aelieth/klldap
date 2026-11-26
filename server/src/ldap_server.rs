@@ -236,6 +236,7 @@ mod tests {
     use lldap_test_utils::enforcement::EnforcementGuard;
     use lldap_test_utils::recording_log::LogGuard;
     use pretty_assertions::assert_eq;
+    use serial_test::serial;
 
     fn bind(user: &str, password: &str) -> LdapOp {
         LdapOp::BindRequest(LdapBindRequest {
@@ -253,6 +254,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_a_failed_bind_keeps_the_connections_identity_and_its_row_names_the_peer() {
         let _backend = ONE_BACKEND.lock().await;
         let users = [("e0first", "e0first-pass-1"), ("e0ldap", "e0ldap-pass-1")];
@@ -361,6 +363,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_a_bind_with_a_name_and_no_password_is_refused_before_any_lookup() {
         use crate::auth_service::tests::doors_directory;
         use lldap_test_utils::MockTestBackendHandler;

@@ -123,6 +123,7 @@ mockall = { workspace = true }
 nix = { version = "0.31", features = ["process", "signal"] }
 pretty_assertions = { workspace = true }
 rsa = "0.10.0"
+serial_test = { workspace = true }
 tempfile = "3"
 uuid = { workspace = true }
 

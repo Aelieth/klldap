@@ -6,6 +6,7 @@ use lldap_domain_handlers::policies::CreatePolicyRequest;
 use lldap_sql_backend_handler::SqlBackendHandler;
 use lldap_test_utils::recording_log::LogGuard;
 use pretty_assertions::assert_eq;
+use serial_test::serial;
 
 const NOT_ALLOWED: &str = "policy: allowed-networks (address not allowed)";
 
@@ -50,6 +51,7 @@ fn row(kind: LogKind, peer: &str, forwarded: Option<&str>, detail: &str) -> Row 
 }
 
 #[tokio::test]
+#[serial]
 async fn test_the_refresh_and_a_tokens_use_admit_inside_and_refuse_outside_with_401_and_one_row() {
     let _backend = ONE_BACKEND.lock().await;
     let log = LogGuard::install_on_this_thread();
@@ -169,6 +171,7 @@ async fn test_a_right_password_from_outside_gets_a_wrong_ones_body_byte_for_byte
 }
 
 #[tokio::test]
+#[serial]
 async fn test_an_enrolled_user_outside_gets_a_wrong_passwords_body_before_any_code() {
     const PASSWORD: &str = "e3code-pass-1";
     let _backend = ONE_BACKEND.lock().await;

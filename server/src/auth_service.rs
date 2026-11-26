@@ -1236,6 +1236,7 @@ pub(crate) mod tests {
     use lldap_test_utils::{MockTestBackendHandler, minimum_entry};
     use mockall::predicate::eq;
     use pretty_assertions::assert_eq;
+    use serial_test::serial;
     use std::cell::Cell;
 
     mod door_rows;
@@ -1640,6 +1641,7 @@ pub(crate) mod tests {
 
     // One test, so no other row swaps the process-wide Kerberos backend under it.
     #[tokio::test]
+    #[serial]
     async fn test_a_synced_users_finish_is_one_transaction_and_takes_only_its_own_envelope() {
         let _backend = ONE_BACKEND.lock().await;
         use lldap_domain_handlers::kerberos::{ANSWER_UNSETTLED, SYNC_CHANGED, closed_to_writes};
@@ -2061,6 +2063,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_a_synced_finish_asks_the_users_minimum_before_it_opens_the_envelope() {
         let _backend = ONE_BACKEND.lock().await;
         use lldap_test_utils::recording_log::LogGuard;
@@ -2149,6 +2152,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_every_start_answers_the_users_minimum_and_an_unreadable_one_refuses() {
         let _backend = ONE_BACKEND.lock().await;
         use lldap_test_utils::recording_log::LogGuard;
@@ -2366,6 +2370,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_a_start_answered_with_another_key_is_refused_before_the_envelope_is_opened() {
         let _backend = ONE_BACKEND.lock().await;
         use lldap_domain_handlers::password::REGISTRATION_UNFINISHABLE;
@@ -2436,6 +2441,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_an_envelope_that_does_not_open_has_one_text_in_the_answer_and_the_row() {
         let _backend = ONE_BACKEND.lock().await;
         use lldap_test_utils::recording_log::LogGuard;
@@ -2531,6 +2537,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_a_finish_without_its_starts_session_is_refused_before_any_write() {
         use lldap_domain_handlers::handler::{GroupBackendHandler, UserBackendHandler};
         use lldap_domain_handlers::password::REGISTRATION_UNFINISHABLE;
@@ -2721,6 +2728,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_a_simple_login_with_no_password_answers_as_any_failure_and_mints_nothing() {
         use lldap_test_utils::recording_log::LogGuard;
         let _backend = ONE_BACKEND.lock().await;
@@ -2882,6 +2890,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_a_policy_refusal_at_the_web_and_simple_login_routes_is_one_row_with_its_peer() {
         use lldap_test_utils::recording_log::LogGuard;
         const PASSWORD: &str = "e0route-pass-1";
@@ -3020,6 +3029,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_a_finish_without_a_session_mints_nothing_in_any_outcome() {
         use lldap_test_utils::recording_log::LogGuard;
         use serde_json::json;
@@ -3196,6 +3206,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_a_finish_without_a_session_refused_while_kerberos_is_down_mints_nothing() {
         use lldap_domain_handlers::kerberos::{
             ADMINS_ONLY, DegradedKerberos, set_thread_kerberos_backend,
@@ -3252,6 +3263,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_the_session_doors_refuse_a_non_admin_while_kerberos_is_down_with_one_row() {
         use lldap_domain_handlers::handler::{GroupBackendHandler, UserBackendHandler};
         use lldap_domain_handlers::kerberos::{
@@ -3348,6 +3360,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_the_refresh_and_token_routes_refuse_by_policy_with_401_and_one_row() {
         use lldap_test_utils::recording_log::LogGuard;
         let _backend = ONE_BACKEND.lock().await;
@@ -3461,6 +3474,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_login_hours_refuse_outside_and_admit_inside_at_the_refresh_and_token_use() {
         use lldap_test_utils::recording_log::LogGuard;
         let _backend = ONE_BACKEND.lock().await;
@@ -3627,6 +3641,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_a_logout_acts_only_on_a_refresh_token_the_server_holds_for_that_user() {
         use lldap_test_utils::recording_log::LogGuard;
         let _backend = ONE_BACKEND.lock().await;
@@ -3710,6 +3725,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_a_reset_token_of_an_inactive_user_is_refused_where_register_start_checks_it() {
         use lldap_test_utils::recording_log::LogGuard;
         let _backend = ONE_BACKEND.lock().await;
@@ -3963,6 +3979,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_a_policy_read_error_refuses_the_refresh_and_the_token_with_one_row() {
         use lldap_domain_handlers::enforcement::POLICY_UNANSWERED;
         use lldap_test_utils::recording_log::LogGuard;
@@ -4016,6 +4033,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_an_unreadable_mfa_value_refuses_the_refresh_and_the_token_with_one_row() {
         use lldap_test_utils::recording_log::LogGuard;
         let _backend = ONE_BACKEND.lock().await;
@@ -4106,6 +4124,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_a_read_that_never_answers_is_given_up_at_the_bound_at_each_token_door() {
         use actix_web::test::TestRequest;
         use lldap_domain_handlers::policies::POLICY_READ_WAIT;
@@ -4172,6 +4191,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_a_refresh_whose_token_is_not_stored_answers_500_with_no_success_row() {
         use lldap_test_utils::recording_log::LogGuard;
         use sea_orm::{ConnectionTrait, Statement};
@@ -4327,6 +4347,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_a_reset_token_is_refused_as_an_invalid_one_where_no_password_is_set() {
         use lldap_test_utils::recording_log::LogGuard;
         let _backend = ONE_BACKEND.lock().await;

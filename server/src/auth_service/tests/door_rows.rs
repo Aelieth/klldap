@@ -6,6 +6,7 @@ use lldap_domain_handlers::policies::CreatePolicyRequest;
 use lldap_sql_backend_handler::SqlBackendHandler;
 use lldap_test_utils::recording_log::LogGuard;
 use pretty_assertions::assert_eq;
+use serial_test::serial;
 
 const LOCKED_OUT: &str = "locked out";
 const INACTIVE: &str = "policy: inactivity-days (inactive)";
@@ -91,6 +92,7 @@ async fn held_at_the_doors(handler: &SqlBackendHandler, log: &LogGuard, user: &s
 }
 
 #[tokio::test]
+#[serial]
 async fn test_a_locked_users_refresh_and_token_use_are_refused_with_401_and_one_row_each() {
     let _backend = ONE_BACKEND.lock().await;
     let log = LogGuard::install_on_this_thread();
@@ -133,6 +135,7 @@ async fn test_a_locked_users_refresh_and_token_use_are_refused_with_401_and_one_
 }
 
 #[tokio::test]
+#[serial]
 async fn test_a_refresh_row_is_marked_proved_only_once_its_token_was_found() {
     let _backend = ONE_BACKEND.lock().await;
     let log = LogGuard::install_on_this_thread();
@@ -173,6 +176,7 @@ async fn test_a_refresh_row_is_marked_proved_only_once_its_token_was_found() {
 }
 
 #[tokio::test]
+#[serial]
 async fn test_an_inactive_users_refresh_and_token_use_are_refused_with_401_and_one_row_each() {
     let _backend = ONE_BACKEND.lock().await;
     let log = LogGuard::install_on_this_thread();
@@ -205,6 +209,7 @@ async fn test_an_inactive_users_refresh_and_token_use_are_refused_with_401_and_o
 }
 
 #[tokio::test]
+#[serial]
 async fn test_an_ous_always_holds_the_refresh_and_a_tokens_use_to_enrolment_as_server_wide() {
     let _backend = ONE_BACKEND.lock().await;
     let log = LogGuard::install_on_this_thread();

@@ -484,16 +484,47 @@ pub type ApiResult<M> = actix_web::Either<web::Json<M>, HttpResponse>;
 #[instrument(skip_all, level = "debug")]
 async fn opaque_login_start<Backend>(
     data: web::Data<AppState<Backend>>,
-    request: web::Json<login::ClientLoginStartRequest>,
-) -> ApiResult<login::ServerLoginStartResponse>
+    request: web::Json<login::ClientLoginStart>,
+) -> ApiResult<login::ServerLoginStart>
 where
     Backend: OpaqueHandler + 'static,
 {
-    data.get_opaque_handler()
-        .login_start(request.into_inner())
-        .await
-        .map(|res| ApiResult::Left(web::Json(res)))
-        .unwrap_or_else(error_to_api_response)
+    login_start_bound(
+        data.get_opaque_handler(),
+        request.into_inner(),
+        settled_state,
+        public_key_der_base64,
+    )
+    .await
+    .map(|res| ApiResult::Left(web::Json(res)))
+    .unwrap_or_else(error_to_api_response)
+}
+
+/// A start that asks is bound to the key a register start would answer now, whoever the user is.
+async fn login_start_bound(
+    handler: &impl OpaqueHandler,
+    start: login::ClientLoginStart,
+    state: impl FnOnce() -> KerberosState,
+    key: impl FnOnce() -> String,
+) -> TcpResult<login::ServerLoginStart> {
+    let login::ClientLoginStart {
+        request,
+        kerberos_envelope_key: asked,
+    } = start;
+    if asked != Some(true) {
+        let response = handler.login_start(request).await?;
+        return Ok(login::ServerLoginStart {
+            response,
+            kerberos_envelope_key: None,
+        });
+    }
+    let kerberos_envelope_key = (state() == KerberosState::Ready).then(key);
+    let context = login::envelope_key_context(kerberos_envelope_key.as_deref());
+    let response = handler.login_start_in_context(request, context).await?;
+    Ok(login::ServerLoginStart {
+        response,
+        kerberos_envelope_key,
+    })
 }
 
 #[instrument(skip_all, level = "debug")]
@@ -1418,6 +1449,123 @@ pub(crate) mod tests {
                 serde_json::from_value(wire).unwrap();
             assert_eq!(serde_json::to_value(upstream).unwrap(), plain);
         }
+    }
+
+    fn login_start_body(asked: Option<bool>) -> login::ClientLoginStart {
+        let start = opaque::client::login::start_login("s3cret-pass", &mut rand::rngs::OsRng);
+        login::ClientLoginStart {
+            request: login::ClientLoginStartRequest {
+                username: UserId::new("alice"),
+                login_start_request: start.unwrap().message,
+            },
+            kerberos_envelope_key: asked,
+        }
+    }
+
+    fn login_start_response() -> login::ServerLoginStartResponse {
+        let mut rng = rand::rngs::OsRng;
+        let setup = opaque::server::ServerSetup::new(&mut rng);
+        let request = login_start_body(None).request;
+        let started = opaque::server::login::start_login(
+            &mut rng,
+            &setup,
+            None,
+            request.login_start_request,
+            &request.username,
+        );
+        login::ServerLoginStartResponse {
+            server_data: "sealed".to_owned(),
+            credential_response: started.unwrap().message,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_login_start_that_asks_is_bound_to_the_envelope_key_whoever_the_user_is() {
+        use KerberosState as K;
+        type Row = (
+            &'static str,
+            Option<bool>,
+            KerberosState,
+            Option<&'static str>,
+        );
+        let rows: [Row; 5] = [
+            ("asked, the realm ready", Some(true), K::Ready, Some(KEY)),
+            (
+                "asked, the realm not ready",
+                Some(true),
+                K::NotReady("starting".to_owned()),
+                None,
+            ),
+            ("asked, Kerberos disabled", Some(true), K::Disabled, None),
+            ("not asked", None, K::Ready, None),
+            ("asked not to", Some(false), K::Ready, None),
+        ];
+        for (row, asked, state, answered) in rows {
+            let mut mock = MockTestBackendHandler::new();
+            let response = login_start_response();
+            if asked == Some(true) {
+                let context = login::envelope_key_context(answered);
+                mock.expect_login_start_in_context()
+                    .withf(move |_, bound| *bound == context)
+                    .times(1)
+                    .return_once(move |_, _| Ok(response));
+            } else {
+                mock.expect_login_start()
+                    .times(1)
+                    .return_once(move |_| Ok(response));
+            }
+            let (judged, made) = (Cell::new(false), Cell::new(false));
+            let realm = || {
+                judged.set(true);
+                state
+            };
+            let key = || {
+                made.set(true);
+                the_key()
+            };
+            let body = login_start_body(asked);
+            let answer = login_start_bound(&mock, body, realm, key).await.unwrap();
+            let wire = serde_json::to_value(&answer).unwrap();
+            let mut fields: Vec<_> = wire.as_object().unwrap().keys().cloned().collect();
+            fields.sort();
+            let mut want = vec!["credential_response", "server_data"];
+            if answered.is_some() {
+                want.insert(1, "kerberos_envelope_key");
+            }
+            assert_eq!(
+                (
+                    answer.kerberos_envelope_key.as_deref(),
+                    fields,
+                    judged.get(),
+                    made.get()
+                ),
+                (
+                    answered,
+                    want.into_iter().map(str::to_owned).collect::<Vec<_>>(),
+                    asked == Some(true),
+                    answered.is_some()
+                ),
+                "{row}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_a_login_start_body_asks_for_the_key_only_in_its_own_field() {
+        let body = login_start_body(None);
+        let plain = serde_json::to_value(&body.request).unwrap();
+        let mut asked = plain.clone();
+        asked["kerberos_envelope_key"] = true.into();
+        let read = |wire: &serde_json::Value| {
+            let start: login::ClientLoginStart = serde_json::from_value(wire.clone()).unwrap();
+            (start.kerberos_envelope_key, start.request.username)
+        };
+        let alice = UserId::new("alice");
+        assert_eq!(serde_json::to_value(&body).unwrap(), plain);
+        assert_eq!(
+            (read(&plain), read(&asked)),
+            ((None, alice.clone()), (Some(true), alice))
+        );
     }
 
     fn finish_request() -> registration::ClientRegistrationFinishRequest {
@@ -2833,14 +2981,14 @@ pub(crate) mod tests {
             username: UserId::new(user),
             login_start_request: start.message,
         };
-        match opaque_login_start(state.clone(), web::Json(request)).await {
+        match opaque_login_start(state.clone(), web::Json(request.into())).await {
             actix_web::Either::Left(web::Json(started)) => {
                 let body = serde_json::to_value(&started).unwrap();
                 let keys = body.as_object().unwrap().keys().cloned().collect();
                 let finished = opaque::client::login::finish_login(
                     start.state,
                     password.as_bytes(),
-                    started.credential_response,
+                    started.response.credential_response,
                     &mut rng,
                 );
                 (200, keys, finished.is_ok())

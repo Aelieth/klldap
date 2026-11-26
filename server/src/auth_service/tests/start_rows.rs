@@ -13,12 +13,13 @@ async fn start_shape(
         username: UserId::new(user),
         login_start_request: start.message,
     };
+    let json = web::Json(login::ClientLoginStart::from(request));
     let meta = RequestMeta::http(Some("192.0.2.65".parse().unwrap()), None);
-    match with_request(meta, opaque_login_start(state.clone(), web::Json(request))).await {
+    match with_request(meta, opaque_login_start(state.clone(), json)).await {
         actix_web::Either::Left(answer) => {
             let body = serde_json::to_value(&answer.0).unwrap();
             let keys = body.as_object().unwrap().keys().cloned().collect();
-            (200, keys, answer.0.server_data.len())
+            (200, keys, answer.0.response.server_data.len())
         }
         actix_web::Either::Right(response) => (response.status().as_u16(), vec![], 0),
     }

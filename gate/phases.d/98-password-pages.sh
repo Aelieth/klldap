@@ -198,6 +198,31 @@ pp_manager() {
     fi
 }
 
+# The tool given a password signs in by OPAQUE, which writes a login row and no bind row, and seals
+# only to the envelope key that login bound.
+pp_tool_login() {
+    local row="U1.tool-opaque-login" new mark logins="" binds=""
+    new="$(pp_gen)"
+    mark="$(log_mark)"
+    gexec /app/lldap_set_password --base-url http://127.0.0.1:17170 --admin-username "$PP_PM" \
+        --admin-password "$PP_PM_PASS" --username "$PP_SYNC" --password "$new" \
+        </dev/null >"$PP_D/tool-login.log" 2>&1
+    pp_sides "$PP_SYNC" "$new" "$PP_SYNC_PASS"
+    for _ in $(seq 1 20); do
+        logins="$(log_rows "id > ${mark:-0} AND kind = 'login' AND actor = '$PP_PM' AND success")"
+        binds="$(log_rows "id > ${mark:-0} AND kind = 'bind' AND actor = '$PP_PM'")"
+        [ "$logins" = 1 ] && break
+        sleep 0.5
+    done
+    if [ "$PP_GOT" = "$PP_BOTH_NEW" ] && [ "$logins $binds" = "1 0" ]; then
+        PP_SYNC_PASS="$new"
+        p_ok "[$row] the tool given the password manager's password: one successful login row and no bind row for $PP_PM, and bind and kinit take $PP_SYNC's new password"
+    else
+        pp_bind "$PP_SYNC" "$new" && PP_SYNC_PASS="$new"
+        p_bad "[$row] $PP_GOT; login rows ${logins:-unread}, bind rows ${binds:-unread}; want $PP_BOTH_NEW, 1 and 0 (see tool-login.log)"
+    fi
+}
+
 # pp_wire <tag> <change|create> <user> <typed> [<add|swap> <seal order>] [<mail>]: PP_WIRE, PP_ALERT.
 # With PP_OTHER_TOKEN set, a copy of the page's finish goes first with that bearer (PP_OTHER: its
 # status and body); with PP_AGAIN=1 the page's finish goes once more with the page's own token
@@ -943,6 +968,7 @@ if pp_setup; then
     pp_gone
     pp_floor
     pp_manager
+    pp_tool_login
     if docker image inspect "$PP_BROWSER_IMAGE" >/dev/null 2>&1; then
         pp_wire_rows
         pp_reload

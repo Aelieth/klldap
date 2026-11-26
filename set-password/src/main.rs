@@ -1,12 +1,13 @@
 #![forbid(unsafe_code)]
 
 use std::env;
+use std::io::{BufRead, Write};
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
 use lldap_auth::kerberos_envelope::{SealTo, finish_with_envelope};
 use lldap_auth::{
-    PASSWORD_LENGTH_UNIT, PASSWORD_MIN_LENGTH, PasswordShapeError, opaque, password_shape,
+    PASSWORD_LENGTH_UNIT, PASSWORD_MIN_LENGTH, PasswordShapeError, login, opaque, password_shape,
     registration,
 };
 use reqwest::Url;
@@ -21,7 +22,10 @@ pub struct CliOpts {
     #[clap(long, default_value = "admin", help = "Admin username")]
     pub admin_username: String,
 
-    #[clap(long, help = "Admin password")]
+    #[clap(
+        long,
+        help = "Admin password, proved to the server by an OPAQUE login. With a second factor, the code is asked next"
+    )]
     pub admin_password: Option<String>,
 
     #[clap(short, long, help = "Connection token (JWT)")]
@@ -50,31 +54,133 @@ fn append_to_url(base_url: &Url, path: &str) -> Url {
     new_url
 }
 
-fn get_token(base_url: &Url, username: &str, password: &str) -> Result<String> {
-    let client = reqwest::blocking::Client::new();
-    let response = client
-        .post(append_to_url(base_url, "auth/simple/login"))
-        .header(reqwest::header::CONTENT_TYPE, "application/json")
-        .body(
-            serde_json::to_string(&lldap_auth::login::ClientSimpleLoginRequest {
-                username: username.into(),
-                password: password.to_string(),
-                enrollment_proof: None,
-            })
-            .expect("Failed to encode the username/password as json to log in"),
-        )
-        .send()?
-        .error_for_status()?;
-    Ok(serde_json::from_str::<lldap_auth::login::ServerLoginResponse>(&response.text()?)?.token)
+/// A token as given, or the admin's OPAQUE login and the envelope key it bound.
+#[derive(Debug, PartialEq, Eq)]
+enum SignedIn {
+    Token(String),
+    Login {
+        token: String,
+        bound_key: Option<String>,
+    },
 }
 
-fn call_server(url: Url, token: &str, body: impl Serialize) -> Result<String> {
+impl SignedIn {
+    fn bearer(&self) -> &str {
+        match self {
+            SignedIn::Token(token) | SignedIn::Login { token, .. } => token,
+        }
+    }
+
+    /// A token binds no key: the tool given one seals to the key as the start answers it.
+    fn seal_to(&self) -> SealTo<'_> {
+        match self {
+            SignedIn::Token(_) => SealTo::Answered,
+            SignedIn::Login { bound_key, .. } => SealTo::Bound(bound_key.as_deref()),
+        }
+    }
+}
+
+const ENROLL_FIRST: &str = "the admin must enroll a second factor first, through the web interface";
+
+#[derive(Debug, PartialEq, Eq)]
+enum Finished {
+    Token(String),
+    CodeRequired,
+}
+
+fn finished(body: &str) -> Result<Finished> {
+    let challenge = serde_json::from_str::<login::ServerMfaRequiredResponse>(body);
+    if challenge.is_ok_and(|challenge| challenge.mfa_required) {
+        return Ok(Finished::CodeRequired);
+    }
+    let answer: login::ServerLoginResponse =
+        serde_json::from_str(body).context("Could not parse the login's answer")?;
+    if answer.mfa_enrollment_required == Some(true) {
+        bail!("{ENROLL_FIRST}");
+    }
+    Ok(Finished::Token(answer.token))
+}
+
+fn login_start(
+    username: &str,
+    password: &str,
+) -> Result<(opaque::client::login::ClientLogin, login::ClientLoginStart)> {
+    let start = opaque::client::login::start_login(password, &mut rand::rngs::OsRng)
+        .context("Could not start the login")?;
+    let request = login::ClientLoginStart {
+        request: login::ClientLoginStartRequest {
+            username: username.into(),
+            login_start_request: start.message,
+        },
+        kerberos_envelope_key: Some(true),
+    };
+    Ok((start.state, request))
+}
+
+fn login_once(
+    base_url: &Url,
+    username: &str,
+    password: &str,
+    totp_code: Option<String>,
+) -> Result<(Finished, Option<String>)> {
+    let (state, request) = login_start(username, password)?;
+    let started = call_server(
+        append_to_url(base_url, "auth/opaque/login/start"),
+        None,
+        request,
+    )?;
+    let answer: login::ServerLoginStart =
+        serde_json::from_str(&started).context("Could not parse the login's start")?;
+    let (request, bound_key) =
+        login::finish_bound(state, password.as_bytes(), answer, &mut rand::rngs::OsRng)
+            .context("Invalid username or password")?;
+    let request = login::ClientLoginFinishRequest {
+        totp_code,
+        ..request
+    };
+    let body = call_server(
+        append_to_url(base_url, "auth/opaque/login/finish"),
+        None,
+        request,
+    )?;
+    Ok((finished(&body)?, bound_key))
+}
+
+/// An admin with a second factor is asked the code, as the web login asks, and signs in again.
+fn sign_in(
+    base_url: &Url,
+    username: &str,
+    password: &str,
+    ask_code: impl FnOnce() -> Result<String>,
+) -> Result<SignedIn> {
+    let (first, bound_key) = login_once(base_url, username, password, None)?;
+    let (answer, bound_key) = match first {
+        Finished::CodeRequired => login_once(base_url, username, password, Some(ask_code()?))?,
+        signed_in => (signed_in, bound_key),
+    };
+    let Finished::Token(token) = answer else {
+        bail!("The server asked for the code again");
+    };
+    Ok(SignedIn::Login { token, bound_key })
+}
+
+fn read_code(admin: &str) -> Result<String> {
+    eprint!("Code from {admin}'s authenticator: ");
+    std::io::stderr().flush()?;
+    let mut code = String::new();
+    std::io::stdin().lock().read_line(&mut code)?;
+    Ok(code.trim().to_owned())
+}
+
+fn call_server(url: Url, token: Option<&str>, body: impl Serialize) -> Result<String> {
     let client = reqwest::blocking::Client::new();
-    let request = client
+    let mut request = client
         .post(url)
         .header("Content-Type", "application/json")
-        .bearer_auth(token)
         .body(serde_json::to_string(&body)?);
+    if let Some(token) = token {
+        request = request.bearer_auth(token);
+    }
     let response = request.send()?;
     let status = response.status();
     let text = response.text()?;
@@ -92,7 +198,7 @@ pub fn register_start(
     let request = Some(request);
     let data = call_server(
         append_to_url(base_url, "auth/opaque/register/start"),
-        token,
+        Some(token),
         request,
     )?;
     serde_json::from_str(&data).context("Could not parse response")
@@ -125,7 +231,7 @@ pub fn register_finish(
     let request = Some(request);
     call_server(
         append_to_url(base_url, "auth/opaque/register/finish"),
-        token,
+        Some(token),
         request,
     )
     .map(|_| ())
@@ -144,13 +250,16 @@ fn main() -> Result<()> {
         opts.base_url.scheme() == "http" || opts.base_url.scheme() == "https",
         "Base URL should start with `http://` or `https://`"
     );
-    let token = match (opts.token.as_ref(), opts.admin_password.as_ref()) {
-        (Some(token), _) => token.clone(),
-        (None, Some(password)) => {
-            get_token(&opts.base_url, &opts.admin_username, password).context("While logging in")?
+    let signed_in = match (opts.token.as_ref(), opts.admin_password.as_ref()) {
+        (Some(token), _) => SignedIn::Token(token.clone()),
+        (None, Some(admin_password)) => {
+            let admin = &opts.admin_username;
+            let ask_code = || read_code(admin);
+            sign_in(&opts.base_url, admin, admin_password, ask_code).context("While logging in")?
         }
         (None, None) => bail!("Either the token or the admin password is required"),
     };
+    let token = signed_in.bearer();
 
     let mut rng = rand::rngs::OsRng;
     let registration_start_request =
@@ -164,7 +273,7 @@ fn main() -> Result<()> {
         response: res,
         kerberos_envelope_key,
         password_min_length,
-    } = register_start(&opts.base_url, &token, start_request)?;
+    } = register_start(&opts.base_url, token, start_request)?;
     check_min_length(&password, password_min_length, opts.bypass_password_policy)?;
 
     let registration_finish = opaque::client::registration::finish_registration(
@@ -179,9 +288,10 @@ fn main() -> Result<()> {
         registration_upload: registration_finish.message,
     };
     let key = kerberos_envelope_key.as_deref();
-    let req = finish_with_envelope(request, key, SealTo::Answered, &opts.username, &password)?;
+    let seal_to = signed_in.seal_to();
+    let req = finish_with_envelope(request, key, seal_to, &opts.username, &password)?;
 
-    register_finish(&opts.base_url, &token, req)?;
+    register_finish(&opts.base_url, token, req)?;
 
     println!("Successfully changed {}'s password", &opts.username);
     Ok(())
@@ -190,7 +300,123 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lldap_auth::kerberos_envelope::KeyNotBound;
     use lldap_auth::password_length;
+    use lldap_auth::types::UserId;
+
+    const BOB_PASS: &str = "Bob-Password-1";
+
+    fn finish_request() -> registration::ClientRegistrationFinishRequest {
+        let mut rng = rand::rngs::OsRng;
+        let password = BOB_PASS.as_bytes();
+        let start = opaque::client::registration::start_registration(password, &mut rng).unwrap();
+        let setup = opaque::server::ServerSetup::new(&mut rng);
+        let bob = UserId::new("bob");
+        let answer =
+            opaque::server::registration::start_registration(&setup, start.message, &bob).unwrap();
+        let finish = opaque::client::registration::finish_registration(
+            start.state,
+            password,
+            answer.message,
+            &mut rng,
+        )
+        .unwrap();
+        registration::ClientRegistrationFinishRequest {
+            server_data: "sealed".to_owned(),
+            registration_upload: finish.message,
+        }
+    }
+
+    #[test]
+    fn test_the_tool_seals_only_to_the_key_its_login_bound() {
+        type Row = (
+            &'static str,
+            SignedIn,
+            Option<&'static str>,
+            Result<bool, String>,
+        );
+        let token = || SignedIn::Token("t".to_owned());
+        let logged_in = |key: Option<&str>| SignedIn::Login {
+            token: "t".to_owned(),
+            bound_key: key.map(str::to_owned),
+        };
+        let not_bound = Err(KeyNotBound.to_string());
+        let sealed = Err("Base64 decode of the Kerberos envelope key failed".to_owned());
+        let rows: [Row; 6] = [
+            (
+                "a token, a key answered",
+                token(),
+                Some("no key!"),
+                sealed.clone(),
+            ),
+            ("a token, none answered", token(), None, Ok(false)),
+            (
+                "the login's own key",
+                logged_in(Some("no key!")),
+                Some("no key!"),
+                sealed,
+            ),
+            (
+                "another key",
+                logged_in(Some("other")),
+                Some("no key!"),
+                not_bound.clone(),
+            ),
+            (
+                "the login bound none",
+                logged_in(None),
+                Some("no key!"),
+                not_bound,
+            ),
+            ("none answered", logged_in(Some("no key!")), None, Ok(false)),
+        ];
+        let request = finish_request();
+        for (row, signed_in, answered, expected) in rows {
+            assert_eq!(signed_in.bearer(), "t", "{row}");
+            let seal_to = signed_in.seal_to();
+            let got = finish_with_envelope(request.clone(), answered, seal_to, "bob", BOB_PASS)
+                .map(|finish| finish.kerberos_password_envelope.is_some())
+                .map_err(|e| e.to_string());
+            assert_eq!(got, expected, "{row}");
+        }
+    }
+
+    #[test]
+    fn test_the_tools_login_takes_a_token_or_asks_the_code() {
+        let unread = "Could not parse the login's answer";
+        let rows = [
+            (
+                r#"{"token": "t", "refreshToken": "r"}"#,
+                Ok(Finished::Token("t".to_owned())),
+            ),
+            (
+                r#"{"token": "t", "mfaEnrollmentRequired": true}"#,
+                Err(ENROLL_FIRST),
+            ),
+            (r#"{"mfaRequired": true}"#, Ok(Finished::CodeRequired)),
+            (r#"{"mfaRequired": false}"#, Err(unread)),
+            (r#"{"verified": true}"#, Err(unread)),
+        ];
+        for (body, expected) in rows {
+            let got = finished(body).map_err(|e| e.to_string());
+            assert_eq!(got, expected.map_err(str::to_owned), "{body}");
+        }
+    }
+
+    #[test]
+    fn test_the_tools_login_start_asks_for_the_key_and_carries_no_password() {
+        let (_, start) = login_start("admin", "Admin-Pass-1").unwrap();
+        let wire = serde_json::to_value(&start).unwrap();
+        let text = wire.to_string();
+        assert_eq!(
+            (
+                wire["kerberos_envelope_key"].as_bool(),
+                wire["username"].as_str(),
+                text.contains("Admin-Pass-1")
+            ),
+            (Some(true), Some("admin"), false)
+        );
+    }
 
     #[test]
     fn test_the_tool_counts_a_new_password_as_password_length() {

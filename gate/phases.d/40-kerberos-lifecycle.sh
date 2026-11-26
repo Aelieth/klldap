@@ -124,7 +124,7 @@ ENV_PLAIN="gateenvplain"
 ENV_SET='mutation($id: String!, $pw: String!) { setUserPassword(userId: $id, password: $pw) { ok } }'
 ENV_BOTH_NEW="bind-new=yes bind-old=no kinit-new=yes kinit-old=no"
 ENV_BOTH_OLD="bind-new=no bind-old=yes kinit-new=no kinit-old=yes"
-ENV_OLD="" ENV_PLAIN_OLD="" ENV_KEY="" ENV_GOT="" ENV_MADE=""
+ENV_OLD="" ENV_PLAIN_OLD="" ENV_GOT="" ENV_MADE=""
 env_gen() { python3 -c 'import secrets; print("Ge" + secrets.token_hex(10) + "!")'; }
 env_bind() { t ldapwhoami -x -H "$(ldap_url)" -D "uid=$1,ou=people,$BASE_DN" -w "$2" >/dev/null 2>&1; }
 env_sides() {
@@ -170,11 +170,7 @@ env_nosync() {
     local new sealed bn=no bo=no made=no mark
     local want="WIRE start-key=no finish-envelope=no rewrite=added finish-status=400 graphql-seal=no create-sent=no page=stayed"
     new="$(env_gen)"
-    sealed="$(wire_seal "$ENV_KEY" "$new" "$ENV_PLAIN")"
-    [ -n "$sealed" ] || {
-        p_bad "[U1.env-nosync-refused] no seal order could be made: the transport key is empty"
-        return
-    }
+    sealed="$(wire_seal "$new" "$ENV_PLAIN")"
     mark="$(log_mark)"
     wire_page env-nosync change "$ENV_PLAIN" "$new" add "$sealed"
     env_bind "$ENV_PLAIN" "$new" && bn=yes
@@ -194,11 +190,7 @@ env_other() {
     local typed sealed mark
     local want="WIRE start-key=yes finish-envelope=yes rewrite=swapped finish-status=400 graphql-seal=no create-sent=no page=stayed"
     typed="$(env_gen)"
-    sealed="$(wire_seal "$ENV_KEY" "$typed" "$ENV_PLAIN")"
-    [ -n "$sealed" ] || {
-        p_bad "[U1.env-other-label] no seal order could be made: the transport key is empty"
-        return
-    }
+    sealed="$(wire_seal "$typed" "$ENV_PLAIN")"
     mark="$(log_mark)"
     wire_page env-other change "$ENV_USER" "$typed" swap "$sealed"
     env_sides "$ENV_USER" "$typed" "$ENV_OLD"
@@ -218,14 +210,8 @@ else
     if env_setup; then
         ENV_MADE=1
         env_synced
-        graphql '{ kerberosInfo { publicKeyDerBase64 } }' >"$D/envelope-key.json" 2>&1 &&
-            ENV_KEY="$(json_get kerberosInfo.publicKeyDerBase64 <"$D/envelope-key.json" 2>/dev/null)"
-        if [ -n "$ENV_KEY" ]; then
-            env_nosync
-            env_other
-        else
-            p_skip "[U1.env-key] no transport key (see envelope-key.json): the two refused-envelope rows did not run"
-        fi
+        env_nosync
+        env_other
     fi
     for u in "$ENV_USER" "$ENV_PLAIN"; do
         graphql 'mutation($id: String!) { deleteUser(userId: $id) { ok } }' '{"id": "'"$u"'"}' \

@@ -1,5 +1,5 @@
 use crate::common::{
-    auth::{get_token, get_token_for, register_sealed, register_start_status},
+    auth::{bound_envelope_key, get_token, get_token_for, register_sealed, register_start_status},
     env,
     fixture::{LLDAPFixture, exec_sql, free_port, query_i64},
 };
@@ -1315,17 +1315,8 @@ fn kerberos_web_password_path() {
         "M: a wrong password answers as an unknown user does"
     );
 
-    let info = gql(
-        &http,
-        &base,
-        &token,
-        "{ kerberosInfo { publicKeyDerBase64 } }",
-        json!({}),
-    );
-    let any_key = info["data"]["kerberosInfo"]["publicKeyDerBase64"]
-        .as_str()
-        .unwrap_or_else(|| panic!("{info}"))
-        .to_owned();
+    let bound = bound_envelope_key(&http, &base, &env::admin_dn(), &env::admin_password())
+        .expect("the admin's sign-in is bound to the envelope key");
     type Row = (
         &'static str,
         &'static str,
@@ -1409,12 +1400,11 @@ fn kerberos_web_password_path() {
         ),
     ];
     for (row, user, upload, envelope, status, says, now, refused) in rows {
-        let (key, got, body) = register_sealed(&http, &base, &token, user, upload, |key, start| {
-            envelope.map(|(sealed_for, password)| {
-                seal_for(key.unwrap_or(any_key.as_str()), sealed_for, start, password)
-            })
+        let (key, got, body) = register_sealed(&http, &base, &token, user, upload, |_, start| {
+            envelope.map(|(sealed_for, password)| seal_for(&bound, sealed_for, start, password))
         });
-        assert_eq!(key.is_some(), user == SYNCED, "{row}: the start's key");
+        let bound_for_synced = (user == SYNCED).then_some(bound.as_str());
+        assert_eq!(key.as_deref(), bound_for_synced, "{row}: the start's key");
         assert_eq!(got.as_u16(), status, "{row}: {body}");
         assert!(body.contains(says), "{row}: {body}");
         assert_eq!(bind_rc(&ldap, user, now), 0, "{row}: bind with {now}");

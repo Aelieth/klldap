@@ -124,6 +124,42 @@ fn opaque_login_finish(
     )
 }
 
+// A sign-in that asks for the envelope key, finished: the key it bound, as the pages hold it.
+pub fn bound_envelope_key(
+    client: &Client,
+    base_url: &str,
+    username: &str,
+    password: &str,
+) -> Option<String> {
+    let mut rng = rand::rngs::OsRng;
+    let start = opaque::client::login::start_login(password, &mut rng).expect("login start");
+    let answer: login::ServerLoginStart = client
+        .post(format!("{base_url}/auth/opaque/login/start"))
+        .json(&login::ClientLoginStart {
+            request: login::ClientLoginStartRequest {
+                username: UserId::new(username),
+                login_start_request: start.message,
+            },
+            kerberos_envelope_key: Some(true),
+        })
+        .send()
+        .expect("login start send")
+        .error_for_status()
+        .expect("login start status")
+        .json()
+        .expect("login start json");
+    let (finish, key) = login::finish_bound(start.state, password.as_bytes(), answer, &mut rng)
+        .expect("login finish bound to the key it was answered");
+    client
+        .post(format!("{base_url}/auth/opaque/login/finish"))
+        .json(&finish)
+        .send()
+        .expect("login finish send")
+        .error_for_status()
+        .expect("login finish status");
+    key
+}
+
 // Sets a password through the OPAQUE registration endpoints with the given bearer.
 pub fn register_password_over_http(
     client: &Client,

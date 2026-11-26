@@ -422,15 +422,14 @@ kinit_pw() {
 
 WIRE_IMAGE="mcr.microsoft.com/playwright@sha256:766137e2d9caad4744187e53cdc89320ba6f2eb57cff097374020944b44dd0a9"
 
-# wire_seal <key> <plaintext> <label user>, wire_seal_in <key> <label user> (plaintext on stdin): a
-# seal order for wire_page. The page's driver seals it when it holds the page's finish, under the
-# label klldap-kerberos-envelope-v2:<label user>:<that finish's server data>, so the envelope belongs
-# to the start the page's own session made and goes out once, with that session.
-wire_seal() { printf '%s' "$2" | wire_seal_in "$1" "$3"; }
+# wire_seal <plaintext> <label user>, wire_seal_in <label user> (plaintext on stdin): a seal order
+# for wire_page. The page's driver seals it when it holds the page's finish, to the key the page's
+# sign-in bound, under the label klldap-kerberos-envelope-v2:<label user>:<that finish's server
+# data>, so the envelope belongs to the start the page's own session made and goes out once.
+wire_seal() { printf '%s' "$1" | wire_seal_in "$2"; }
 
 wire_seal_in() {
-    [ -n "$1" ] || return 1
-    printf 'seal:%s:%s:%s\n' "$1" "$2" "$(base64 -w0)"
+    printf 'seal:%s:%s\n' "$1" "$(base64 -w0)"
 }
 
 # wire_page <tag> <change|create> <user> <typed> [<add|swap> <envelope or seal order>] [<mail>]:

@@ -15,7 +15,7 @@ PP_PM="${PP_RUN}m" PP_SYNC="${PP_RUN}s" PP_PLAIN="${PP_RUN}p" PP_BIG="${PP_RUN}b
 PP_GONE_MUT='mutation($u: String!, $e: String!) { syncKerberosPassword(userId: $u, encryptedPassword: $e) }'
 PP_SET='mutation($id: String!, $pw: String!) { setUserPassword(userId: $id, password: $pw) { ok } }'
 PP_UPD='mutation($u: UpdateUserInput!) { updateUser(user: $u) { ok } }'
-PP_KEY="" PP_GOT="" PP_WIRE="" PP_ALERT="" PP_OTHER="" PP_AGAIN_SAID=""
+PP_GOT="" PP_WIRE="" PP_ALERT="" PP_OTHER="" PP_AGAIN_SAID=""
 PP_UNFINISHABLE="this registration cannot be finished; start again"
 PP_BOTH_NEW="bind-new=yes bind-old=no kinit-new=yes kinit-old=no"
 PP_BOTH_OLD="bind-new=no bind-old=yes kinit-new=no kinit-old=yes"
@@ -66,8 +66,8 @@ pp_binds() {
     PP_GOT="bind-new=$bn bind-old=$bo"
 }
 
-# pp_seal <password> <label user>: a seal order; the page's driver seals it for the page's own start.
-pp_seal() { wire_seal "$PP_KEY" "$1" "$2"; }
+# pp_seal <password> <label user>: a seal order, sealed to the key the page's sign-in bound.
+pp_seal() { wire_seal "$1" "$2"; }
 
 pp_register() {
     local tok="$1" user="$2" pw="$3"
@@ -112,11 +112,6 @@ print("yes" if os.environ["U"] in [u["id"] for u in json.load(sys.stdin)["users"
 
 pp_setup() {
     local pm_gid
-    graphql '{ kerberosInfo { publicKeyDerBase64 } }' >"$PP_D/key.json" 2>&1 &&
-        PP_KEY="$(json_get kerberosInfo.publicKeyDerBase64 <"$PP_D/key.json")" && [ -n "$PP_KEY" ] || {
-        p_bad "[U1.pages-setup] no transport key (see key.json)"
-        return 1
-    }
     pm_gid="$(graphql '{ groups { id displayName } }' '{}' | GROUP=lldap_password_manager python3 -c '
 import json, os, sys
 groups = json.load(sys.stdin)["groups"]
@@ -349,10 +344,6 @@ pp_inject_nosync() {
     local want="WIRE start-key=no finish-envelope=no rewrite=added finish-status=400 graphql-seal=no create-sent=no page=stayed"
     new="$(pp_gen)"
     sealed="$(pp_seal "$new" "$PP_PLAIN")"
-    [ -n "$sealed" ] || {
-        p_bad "[$row] no seal order could be made: the transport key is empty"
-        return
-    }
     mark="$(log_mark)"
     pp_wire plain-add change "$PP_PLAIN" "$new" add "$sealed"
     pp_binds "$PP_PLAIN" "$new" "$PP_PLAIN_PASS"
@@ -372,10 +363,6 @@ pp_swap_label() {
     local want="WIRE start-key=yes finish-envelope=yes rewrite=swapped finish-status=200 graphql-seal=no create-sent=no page=done"
     typed="$(pp_gen)" p2="$(pp_gen)"
     sealed="$(pp_seal "$p2" "$PP_SYNC")"
-    [ -n "$sealed" ] || {
-        p_bad "[$row] no seal order could be made: the transport key is empty"
-        return
-    }
     pp_wire sync-label change "$PP_SYNC" "$typed" swap "$sealed"
     pp_sides "$PP_SYNC" "$p2" "$PP_SYNC_PASS"
     pp_bind "$PP_SYNC" "$typed" && t_bind=yes
@@ -394,10 +381,6 @@ pp_swap_other() {
     local want="WIRE start-key=yes finish-envelope=yes rewrite=swapped finish-status=400 graphql-seal=no create-sent=no page=stayed"
     typed="$(pp_gen)"
     sealed="$(pp_seal "$typed" "$PP_PLAIN")"
-    [ -n "$sealed" ] || {
-        p_bad "[$row] no seal order could be made: the transport key is empty"
-        return
-    }
     mark="$(log_mark)"
     pp_wire sync-other change "$PP_SYNC" "$typed" swap "$sealed"
     pp_sides "$PP_SYNC" "$typed" "$PP_SYNC_PASS"

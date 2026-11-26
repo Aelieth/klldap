@@ -1,8 +1,8 @@
 // What a password page sends, run as the admin: the start key, the finish envelope and status, and
 // GraphQL's syncKerberosPassword or createUser; for the create page also whether it shows the
 // Kerberos switch. BROWSER_FINISH_MODE add|swap puts BROWSER_FINISH_ENVELOPE into the finish body;
-// an envelope "seal:<key>:<user>:<plaintext, base64>" is sealed here, when the page's finish is
-// held, under the label of that finish's own server data. BROWSER_FINISH_OTHER_TOKEN sends a copy
+// an envelope "seal:<user>:<plaintext, base64>" is sealed to the key the page's sign-in bound, when
+// the page's finish is held, under that finish's server data. BROWSER_FINISH_OTHER_TOKEN sends a copy
 // of the held finish with that bearer before the page's own goes on (line OTHER);
 // BROWSER_FINISH_AGAIN=1 sends the page's finish once more with the page's own token (line AGAIN).
 // The admin signs in on the page itself, so the app lands there with no reload and the page holds
@@ -30,11 +30,12 @@ const reload = process.env.BROWSER_RELOAD === "1";
 const holdsFinish = Boolean(finishMode || otherToken || finishAgain);
 const LABEL = "klldap-kerberos-envelope-v2";
 const sealOrder = finishEnvelope.startsWith("seal:") ? finishEnvelope.split(":") : null;
-const sealedPlain = sealOrder ? Buffer.from(sealOrder[3] || "", "base64").toString("utf8") : "";
+const sealedPlain = sealOrder ? Buffer.from(sealOrder[2] || "", "base64").toString("utf8") : "";
 const secrets = [adminPass, typed, finishEnvelope, otherToken, sealedPlain].filter((s) => s.length > 0);
 const WAIT_MS = 30000;
 const START = "/auth/opaque/register/start";
 const FINISH = "/auth/opaque/register/finish";
+const LOGIN_START = "/auth/opaque/login/start";
 
 let chrome;
 let ws;
@@ -51,6 +52,9 @@ const wire = {
   createSwitch: "none",
 };
 const startIds = new Set();
+const loginStartIds = new Set();
+let loginKey = Promise.resolve("");
+let boundKey = "";
 let sentFinish = "";
 
 function say(line) {
@@ -110,12 +114,13 @@ function hasEnvelope(body) {
   return body.includes('"kerberos_password_envelope"') ? "yes" : "no";
 }
 
-// The envelope the finish carries: the given one, or the order's plaintext sealed to the order's
-// key for the order's user and this finish's server data.
+// The envelope the finish carries: the given one, or the order's plaintext sealed to the key the
+// page's sign-in bound, for the order's user and this finish's server data.
 function envelopeFor(serverData) {
   if (!sealOrder) return finishEnvelope;
-  const [, key, user, plain] = sealOrder;
-  const publicKey = createPublicKey({ key: Buffer.from(key, "base64"), format: "der", type: "pkcs1" });
+  const [, user, plain] = sealOrder;
+  if (!boundKey) throw fail("seal", "the sign-in bound no envelope key");
+  const publicKey = createPublicKey({ key: Buffer.from(boundKey, "base64"), format: "der", type: "pkcs1" });
   const sealed = publicEncrypt(
     {
       key: publicKey,
@@ -185,6 +190,7 @@ function onEvent(msg) {
     const url = params.request?.url || "";
     const body = postBody(params.request);
     if (url.includes(START)) startIds.add(params.requestId);
+    if (url.includes(LOGIN_START)) loginStartIds.add(params.requestId);
     if (url.includes(FINISH) && !holdsFinish) wire.finishEnvelope = hasEnvelope(body);
     if (url.includes("/api/graphql") && body.includes("syncKerberosPassword")) wire.graphqlSeal = "yes";
     if (url.includes("/api/graphql") && body.includes("createUser")) {
@@ -194,6 +200,11 @@ function onEvent(msg) {
   }
   if (msg.method === "Network.responseReceived" && (params.response?.url || "").includes(FINISH)) {
     wire.finishStatus = String(params.response.status);
+  }
+  if (msg.method === "Network.loadingFinished" && loginStartIds.has(params.requestId)) {
+    loginKey = send("Network.getResponseBody", { requestId: params.requestId })
+      .then((res) => JSON.parse(res.body || "{}").kerberos_envelope_key || "")
+      .catch(() => "");
   }
   if (msg.method === "Network.loadingFinished" && startIds.has(params.requestId)) {
     send("Network.getResponseBody", { requestId: params.requestId })
@@ -335,6 +346,7 @@ async function signIn() {
     `[...document.querySelectorAll("button")].some((b) => b.textContent.includes("Logout"))`,
     "button Logout",
   );
+  boundKey = await loginKey;
 }
 
 async function login() {

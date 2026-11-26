@@ -822,7 +822,7 @@ w1_min_page() {
 }
 
 w1_min_web() {
-    local short long typed key sealed
+    local short long typed sealed
     if ! docker image inspect "$WIRE_IMAGE" >/dev/null 2>&1; then
         w1_say min-web-page SKIP "browser image absent: $WIRE_IMAGE"
         w1_say min-web-finish SKIP "browser image absent: $WIRE_IMAGE"
@@ -834,16 +834,10 @@ w1_min_web() {
     w1_min_page min-web-page "$short" \
         "WIRE start-key=yes finish-envelope=none rewrite=none finish-status=none graphql-seal=no create-sent=no page=stayed" \
         "$MIN_PAGE" "$short"
-    key="$(graphql '{ kerberosInfo { publicKeyDerBase64 } }' 2>"$D/min-key.err" | json_get kerberosInfo.publicKeyDerBase64 2>>"$D/min-key.err")"
-    sealed=""
-    [ -z "$key" ] || sealed="$(printf '%s' "$short" | wire_seal_in "$key" "$MIN_USER")"
-    if [ -z "$sealed" ]; then
-        w1_say min-web-finish FAIL "not run: no transport key (see min-key.err)"
-    else
-        w1_min_page min-web-finish "$typed" \
-            "WIRE start-key=yes finish-envelope=yes rewrite=swapped finish-status=400 graphql-seal=no create-sent=no page=stayed" \
-            "$MIN_SAID" "$short" swap "$sealed"
-    fi
+    sealed="$(printf '%s' "$short" | wire_seal_in "$MIN_USER")"
+    w1_min_page min-web-finish "$typed" \
+        "WIRE start-key=yes finish-envelope=yes rewrite=swapped finish-status=400 graphql-seal=no create-sent=no page=stayed" \
+        "$MIN_SAID" "$short" swap "$sealed"
     wire_page min-web-done change "$MIN_USER" "$long"
     w1_sides "$long" "$min_dir" "$min_krb" "$MIN_USER" "$MIN_DN" min-web-done
     w1_min_track "$long"
@@ -1050,19 +1044,13 @@ w1_nul_row nul-modify "$refused" "exit=${ldap_code} $(w1_file "$D/nul-modify.log
 if ! docker image inspect "$WIRE_IMAGE" >/dev/null 2>&1; then
     w1_say nul-web SKIP "browser image absent: $WIRE_IMAGE"
 else
-    NUL_KEY="$(graphql '{ kerberosInfo { publicKeyDerBase64 } }' 2>"$D/nul-key.err" | json_get kerberosInfo.publicKeyDerBase64 2>>"$D/nul-key.err")"
-    NUL_SEALED=""
-    [ -z "$NUL_KEY" ] || NUL_SEALED="$(w1_nul_bytes | wire_seal_in "$NUL_KEY" "$NUL")"
+    NUL_SEALED="$(w1_nul_bytes | wire_seal_in "$NUL")"
     W1_MARK="$(log_mark)"
     refused=no
-    if [ -z "$NUL_SEALED" ]; then
-        WIRE_LINE="not run: no transport key (see nul-key.err)" WIRE_ALERT=""
-    else
-        wire_page nul-web change "$NUL" "$(w1_gen 24)" swap "$NUL_SEALED"
-        if [ "$WIRE_LINE" = "WIRE start-key=yes finish-envelope=yes rewrite=swapped finish-status=400 graphql-seal=no create-sent=no page=stayed" ] \
-            && grep -qF "$NUL_SAID" <<<"$WIRE_ALERT"; then
-            refused=yes
-        fi
+    wire_page nul-web change "$NUL" "$(w1_gen 24)" swap "$NUL_SEALED"
+    if [ "$WIRE_LINE" = "WIRE start-key=yes finish-envelope=yes rewrite=swapped finish-status=400 graphql-seal=no create-sent=no page=stayed" ] \
+        && grep -qF "$NUL_SAID" <<<"$WIRE_ALERT"; then
+        refused=yes
     fi
     w1_nul_row nul-web "$refused" "$WIRE_LINE ${WIRE_ALERT:+alert: $WIRE_ALERT}" \
         PASSWORD_CHANGE "$NUL" "$NUL_SAID" "$W1_MARK" HTTP

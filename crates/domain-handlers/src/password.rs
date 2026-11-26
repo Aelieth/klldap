@@ -543,6 +543,14 @@ mod tests {
         {
             unreachable!("a short password reached the directory")
         }
+        async fn login_start_in_context(
+            &self,
+            _: lldap_opaque_handler::login::ClientLoginStartRequest,
+            _: Vec<u8>,
+        ) -> lldap_domain_model::error::Result<lldap_opaque_handler::login::ServerLoginStartResponse>
+        {
+            unreachable!("a short password reached the directory")
+        }
         async fn login_finish(
             &self,
             _: lldap_opaque_handler::login::ClientLoginFinishRequest,
@@ -664,6 +672,14 @@ mod tests {
         async fn login_start(
             &self,
             _: lldap_opaque_handler::login::ClientLoginStartRequest,
+        ) -> lldap_domain_model::error::Result<lldap_opaque_handler::login::ServerLoginStartResponse>
+        {
+            unreachable!()
+        }
+        async fn login_start_in_context(
+            &self,
+            _: lldap_opaque_handler::login::ClientLoginStartRequest,
+            _: Vec<u8>,
         ) -> lldap_domain_model::error::Result<lldap_opaque_handler::login::ServerLoginStartResponse>
         {
             unreachable!()
@@ -991,6 +1007,14 @@ mod tests {
         async fn login_start(
             &self,
             _: lldap_opaque_handler::login::ClientLoginStartRequest,
+        ) -> lldap_domain_model::error::Result<lldap_opaque_handler::login::ServerLoginStartResponse>
+        {
+            unreachable!()
+        }
+        async fn login_start_in_context(
+            &self,
+            _: lldap_opaque_handler::login::ClientLoginStartRequest,
+            _: Vec<u8>,
         ) -> lldap_domain_model::error::Result<lldap_opaque_handler::login::ServerLoginStartResponse>
         {
             unreachable!()

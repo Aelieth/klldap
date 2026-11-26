@@ -660,12 +660,11 @@ impl LoginHandler for SqlBackendHandler {
     }
 }
 
-#[async_trait]
-impl OpaqueHandler for SqlOpaqueHandler {
-    #[instrument(skip_all, level = "debug", err(level = "debug"))]
-    async fn login_start(
+impl SqlBackendHandler {
+    async fn start_login_in(
         &self,
         request: login::ClientLoginStartRequest,
+        context: &[u8],
     ) -> Result<login::ServerLoginStartResponse> {
         let user_id = request.username;
 
@@ -731,12 +730,13 @@ impl OpaqueHandler for SqlOpaqueHandler {
             None => None,
         };
 
-        let start_response = opaque::server::login::start_login(
+        let start_response = opaque::server::login::start_login_in_context(
             &mut rng,
             &self.opaque_setup,
             maybe_password_file,
             request.login_start_request,
             &user_id,
+            context,
         )?;
         let secret_key = self.get_orion_secret_key(LOGIN_STATE_KEY_INFO)?;
         let mut id = [0u8; 16];
@@ -754,6 +754,26 @@ impl OpaqueHandler for SqlOpaqueHandler {
             server_data: base64::engine::general_purpose::STANDARD.encode(encrypted_state),
             credential_response: start_response.message,
         })
+    }
+}
+
+#[async_trait]
+impl OpaqueHandler for SqlOpaqueHandler {
+    #[instrument(skip_all, level = "debug", err(level = "debug"))]
+    async fn login_start(
+        &self,
+        request: login::ClientLoginStartRequest,
+    ) -> Result<login::ServerLoginStartResponse> {
+        self.start_login_in(request, &[]).await
+    }
+
+    #[instrument(name = "login_start", skip_all, level = "debug", err(level = "debug"))]
+    async fn login_start_in_context(
+        &self,
+        request: login::ClientLoginStartRequest,
+        context: Vec<u8>,
+    ) -> Result<login::ServerLoginStartResponse> {
+        self.start_login_in(request, &context).await
     }
 
     #[instrument(skip_all, level = "debug", err(level = "debug"))]
@@ -997,6 +1017,56 @@ mod tests {
             .unwrap_err();
         attempt_login(&backend_handler, "bob", "bob00", None).await?;
         Ok(())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_start_in_a_context_signs_in_only_a_client_in_that_context() {
+        let sql_pool = get_initialized_db().await;
+        crate::logging::init_for_tests();
+        let handler = SqlBackendHandler::new(generate_random_private_key(), sql_pool);
+        insert_user(&handler, "bob", "bob00").await;
+        let bound = b"klldap-kerberos-envelope-key-v1:none".to_vec();
+        let rows = [
+            ("the same context", bound.clone(), bound.clone(), true),
+            ("another context", bound.clone(), b"another".to_vec(), false),
+            ("none at the client", bound, Vec::new(), false),
+            ("none at either", Vec::new(), Vec::new(), true),
+        ];
+        let mut rng = rand::rngs::OsRng;
+        for (row, at_server, at_client, signs_in) in rows {
+            let start = opaque::client::login::start_login("bob00", &mut rng).unwrap();
+            let request = login::ClientLoginStartRequest {
+                username: UserId::new("bob"),
+                login_start_request: start.message,
+            };
+            let started = handler
+                .login_start_in_context(request, at_server)
+                .await
+                .unwrap();
+            let finished = opaque::client::login::finish_login_in_context(
+                start.state,
+                b"bob00",
+                started.credential_response,
+                &at_client,
+                &mut rng,
+            );
+            let signed_in = match finished {
+                Ok(finish) => {
+                    let request = login::ClientLoginFinishRequest {
+                        server_data: started.server_data,
+                        credential_finalization: finish.message,
+                        totp_code: None,
+                        enrollment_proof: None,
+                        session: None,
+                    };
+                    let outcome = handler.login_finish(request).await;
+                    matches!(outcome, Ok(LoginOutcome::Authenticated { .. }))
+                }
+                Err(_) => false,
+            };
+            assert_eq!(signed_in, signs_in, "{row}");
+        }
     }
 
     #[tokio::test]

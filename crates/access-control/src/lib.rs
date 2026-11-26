@@ -445,6 +445,14 @@ impl<Inner: OpaqueHandler + Send + Sync> OpaqueHandler for AccessControlledBacke
         self.handler.login_start(request).await
     }
 
+    async fn login_start_in_context(
+        &self,
+        request: login::ClientLoginStartRequest,
+        context: Vec<u8>,
+    ) -> Result<login::ServerLoginStartResponse> {
+        self.handler.login_start_in_context(request, context).await
+    }
+
     async fn login_finish(&self, request: login::ClientLoginFinishRequest) -> Result<LoginOutcome> {
         self.handler.login_finish(request).await
     }

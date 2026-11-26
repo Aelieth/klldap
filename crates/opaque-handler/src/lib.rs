@@ -94,6 +94,12 @@ pub trait OpaqueHandler: Send + Sync {
         &self,
         request: login::ClientLoginStartRequest,
     ) -> Result<login::ServerLoginStartResponse>;
+    /// A start whose `context` the client must also bind, or its login does not finish.
+    async fn login_start_in_context(
+        &self,
+        request: login::ClientLoginStartRequest,
+        context: Vec<u8>,
+    ) -> Result<login::ServerLoginStartResponse>;
     async fn login_finish(&self, request: login::ClientLoginFinishRequest) -> Result<LoginOutcome>;
     async fn registration_start(
         &self,

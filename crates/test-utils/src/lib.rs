@@ -127,6 +127,9 @@ mockall::mock! {
         async fn login_start(
             &self, request: login::ClientLoginStartRequest
         ) -> Result<login::ServerLoginStartResponse>;
+        async fn login_start_in_context(
+            &self, request: login::ClientLoginStartRequest, context: Vec<u8>
+        ) -> Result<login::ServerLoginStartResponse>;
         async fn login_finish(&self, request: login::ClientLoginFinishRequest) -> Result<LoginOutcome>;
         async fn registration_start(
             &self, request: registration::ClientRegistrationStartRequest

@@ -29,9 +29,10 @@ release candidate. Further testing and verification come before it is promoted.
   `deleteUser` takes `confirmUserId`, equal to `userId` in any case, and the users page asks for
   each such user's name in turn. The user is deleted, and in the same transaction its principal is
   marked in the new table `kerberos_delete_marks` (made at start, with no schema number) with one
-  `kerberos_sync` row; the answer's `warnings` say that the principal stays until the realm opens.
-  The realm's next opening removes each marked principal before the KDC serves, and until then the
-  KDC refuses the name. Without the confirmation, and at an LDAP Delete, the delete is refused. A
+  `kerberos_sync` row; the database deletes the principal with the user, and the answer's
+  `warnings` say so. The realm's next opening clears the marks; a principal still marked there is
+  removed before the KDC serves, and until then the KDC refuses the name. Without the confirmation,
+  and at an LDAP Delete, the delete is refused. A
   confirmation that names another user, or one for a user who has no sync now, deletes nothing;
   outside directory-only `confirmUserId` changes nothing but that check.
 

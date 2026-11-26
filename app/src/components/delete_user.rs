@@ -19,8 +19,8 @@ use yew::prelude::*;
 )]
 pub struct DeleteUserQuery;
 
-const PRINCIPAL_STAYS: &str = "The Kerberos realm is closed on this server: the user is deleted \
-    now, and its Kerberos principal stays until the realm opens, which removes it.";
+const PRINCIPAL_STAYS: &str = "The Kerberos realm is closed on this server: the user and its \
+    Kerberos principal are deleted now.";
 
 /// The users deleted at the first "yes", and those asked for by name one at a time after it: the
 /// synced ones, on a directory-only server only.

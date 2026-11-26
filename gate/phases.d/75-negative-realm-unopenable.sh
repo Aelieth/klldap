@@ -37,8 +37,8 @@ DEG_ASKED="gatedegq"
 DEG_ASKED_PASS="GateDegAsked2026!"
 D75_OTHER="confirmUserId names another user than userId; nothing was deleted"
 D75_FOR_SYNC="a confirmed delete is for a user with Kerberos sync, and this user has none now: it was re-created or changed since; nothing was deleted"
-D75_PRINCIPAL_STAYS="the user's Kerberos principal stays until this server's realm opens, which removes it before the KDC serves"
-D75_LEFT="deleted while the Kerberos realm is closed on this server: the principal is marked, and the realm's next opening removes it before the KDC serves"
+D75_PRINCIPAL_STAYS="the user's Kerberos principal is deleted with it"
+D75_LEFT="deleted while the Kerberos realm is closed on this server: the principal is deleted with the user, and the realm's next opening clears its mark"
 D75_REMOVED="removed at start: left by a delete while the realm was closed"
 D75_ASK="title=Delete $DEG_ASKED? | ${DEG_NEW}p=gone | empty=disabled wrong=disabled name=enabled"
 D75_MARKED="" D75_GONE_MARK=""
@@ -286,14 +286,14 @@ d75_removed_row() {
             why="${why}kinit did not say 'not found in Kerberos database' (kinit-$user-gone.log); "
         fi
         rows="$(d75_rows_once KERBEROS_SYNC "$user" "$D75_GONE_MARK" true "$D75_REMOVED")"
-        [ "$rows" = one ] || why="${why}kerberos_sync rows: ${rows:-unread}; "
+        [ "$rows" = "0 []" ] || why="${why}kerberos_sync rows '$D75_REMOVED': ${rows:-unread}, want none (the principal went with the user); "
         [ -z "$why" ] || bad="$bad $user: $why"
         said="$said $user"
     done
     if [ -z "$bad" ]; then
-        p_ok "[D.delete-confirmed-removed] the realm's opening removed the principal of$said: kadmin and kinit find none, and one kerberos_sync row each says '$D75_REMOVED'"
+        p_ok "[D.delete-confirmed-removed] after the realm's opening kadmin and kinit find no principal of$said, which went with its user; the opening wrote no '$D75_REMOVED' row for it"
     else
-        p_bad "[D.delete-confirmed-removed]$bad want each removed with one row '$D75_REMOVED'"
+        p_bad "[D.delete-confirmed-removed]$bad want each principal gone with its user and no '$D75_REMOVED' row"
     fi
 }
 

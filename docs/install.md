@@ -265,8 +265,8 @@ upgrade which you want:
   password, and creating such a user and turning sync on or off are refused
   (LDAP 52, HTTP 503) until the realm opens. Nothing is queued. Such a user is
   deleted only with a confirmation, on the web page or with `deleteUser`'s
-  `confirmUserId`; its principal then stays until the realm opens, and an LDAP
-  Delete is refused.
+  `confirmUserId`, which deletes its principal with it, and an LDAP Delete is
+  refused.
 - `/health` now answers a JSON object and 200 for such a server, and the
   image's healthcheck calls it healthy. A monitor that relied on `/health`
   answering 503, or on the container turning unhealthy, for a closed realm

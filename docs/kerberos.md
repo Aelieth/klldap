@@ -85,13 +85,15 @@ the realm beside it, and it serves the directory with Kerberos closed:
   keeps the full cause. The Keycloak keytab export is refused too, and answers
   the admin with the cause.
 - Deleting a user with `kerberosSync` needs a confirmation, because its
-  principal cannot go with it. An LDAP Delete of such a user is refused, and so
+  principal is deleted with it while the realm cannot take part. An LDAP
+  Delete of such a user is refused, and so
   is a GraphQL `deleteUser` without `confirmUserId`: the text above, then "or
-  delete the user now and leave its Kerberos principal until then: confirm the
-  delete on the web page, or give deleteUser a confirmUserId equal to userId".
-  `deleteUser(userId: "bob", confirmUserId: "bob")` deletes the user and
-  answers, in `warnings`, "the user's Kerberos principal stays until this
-  server's realm opens, which removes it before the KDC serves". The users
+  delete the user and its Kerberos principal now: confirm the delete on the web
+  page, or give deleteUser a confirmUserId equal to userId".
+  `deleteUser(userId: "bob", confirmUserId: "bob")` deletes the user and, with
+  it, its Kerberos principal (the database deletes a principal with its user),
+  and answers, in `warnings`, "the user's Kerberos principal is deleted with
+  it". The realm's next opening clears the delete's mark. The users
   page asks for the name of each such user in turn. The two names compare as
   user ids do, in any case. A confirmation that names another user, or one
   for a user who has no `kerberosSync` now (it was re-created or changed after

@@ -843,14 +843,11 @@ pub fn refusal_row(said: String) -> String {
     }
 }
 
-pub const CONFIRM_THE_DELETE: &str = "or delete the user now and leave its Kerberos principal \
-     until then: confirm the delete on the web page, or give deleteUser a confirmUserId equal to \
-     userId";
-pub const PRINCIPAL_STAYS: &str = "the user's Kerberos principal stays until this server's realm \
-     opens, which removes it before the KDC serves";
+pub const CONFIRM_THE_DELETE: &str = "or delete the user and its Kerberos principal now: \
+     confirm the delete on the web page, or give deleteUser a confirmUserId equal to userId";
+pub const PRINCIPAL_STAYS: &str = "the user's Kerberos principal is deleted with it";
 pub const LEFT_UNTIL_THE_REALM_OPENS: &str = "deleted while the Kerberos realm is closed on this \
-     server: the principal is marked, and the realm's next opening removes it before the KDC \
-     serves";
+     server: the principal is deleted with the user, and the realm's next opening clears its mark";
 pub const CONFIRMED_FOR_SYNC: &str = "a confirmed delete is for a user with Kerberos sync, and this \
      user has none now: it was re-created or changed since; nothing was deleted";
 
@@ -1647,9 +1644,9 @@ mod tests {
             got.push((said, rows));
         }
         let told = "Kerberos KDC unavailable: the realm's records did not open; the change will \
-            be possible when this server's realm opens; or delete the user now and leave its \
-            Kerberos principal until then: confirm the delete on the web page, or give \
-            deleteUser a confirmUserId equal to userId";
+            be possible when this server's realm opens; or delete the user and its Kerberos \
+            principal now: confirm the delete on the web page, or give deleteUser a \
+            confirmUserId equal to userId";
         let row = format!("Kerberos KDC unavailable: down; {CONFIRM_THE_DELETE}");
         assert_eq!(
             got,

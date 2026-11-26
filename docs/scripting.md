@@ -47,8 +47,9 @@ Beyond LLDAP's users, groups, attributes and object classes, the schema exposes:
 - POSIX: `posixSettings`, `setPosixSettings`, and the bulk re-assignment mutations
   (`reassignUserUidNumbers`, `reassignUserGidNumbers`, `reassignUserHomedirectories`,
   `reassignUserLoginshells`, `reassignGidNumbers`).
-- Kerberos: `kerberosInfo` (the RSA public key a synced user's password is sealed
-  to; see [kerberos.md](kerberos.md)), `exportKeytabForKeycloak`.
+- Kerberos: `kerberosInfo` (whether Kerberos is enabled and the realm's state; the key a
+  synced user's password is sealed to comes only from a start, see below and
+  [kerberos.md](kerberos.md)), `exportKeytabForKeycloak`.
 - Keycloak: `keycloakSuggestedConfig`, `keycloakConfig`, `testKeycloakConnection`,
   `saveKeycloakConfig`, `pushRealmToKeycloak`.
 - Event log (admin-only): `logs(filter, limit, beforeId, afterId)` for rows,

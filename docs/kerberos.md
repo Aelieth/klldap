@@ -464,6 +464,24 @@ ACL text, read at boot.
     OPAQUE binds the key there. Serve the web port over TLS (behind a reverse
     proxy; the listener is plain HTTP) for both. The pages themselves come over
     the same connection as the key, so TLS is required for every page too.
+  - GraphQL serves no envelope key: `kerberosInfo` has no
+    `publicKeyDerBase64` field. A client gets the key only from a register
+    start's answer, or from a login start that asks for it, which binds it.
+  - KLLDAP's own copies of a password on the sign-in and password paths are
+    wiped when they are dropped: on the server, the password of
+    `/auth/simple/login` and of an LDAP simple bind (the decoded request's copy
+    included), the copy a bind's check of the password works on, and the
+    opened envelope; in the web app, the current and the new password once a
+    page takes them out of its form; in `lldap_set_password`, both passwords,
+    taken out of its parsed options at once. Copies that a library or the
+    platform owns are not wiped: the HTTP body buffers and the JSON reader's
+    copies; GraphQL's parsed variables, and the query text when a password is
+    written in it; the LDAP library's decode copies and read buffer; in the
+    browser the input fields, the form library's model and each copy of it a
+    page reads, and everything on the JavaScript side; in the tool the
+    process's arguments and environment (`--password`, `--admin-password`,
+    `LLDAP_USER_PASSWORD`), the argument parser's own copies and the HTTP
+    client's body.
   - A finish of a synced user without an envelope is refused (400, "reload the
     page and retry"): a page cached from an older version sends none.
   - A finish is taken once, within two minutes of its start, and only with the
@@ -486,7 +504,7 @@ ACL text, read at boot.
   - The key is 3072 bits, made anew at every start in the background; the log
     line "Made the 3072-bit RSA key in `<ms>` ms" gives the time, and a start
     that comes before it is ready waits for it. The `kerberosInfo` query
-    returns the same key, `enabled`, false when the configuration disables
+    returns `enabled`, false when the configuration disables
     Kerberos, `state`, the realm's state as `/health` names it, for every
     signed-in user, and `cause`, the full cause, for admins only. The pages
     lock the Kerberos switch unless the state is `ready` or `disabled`. The

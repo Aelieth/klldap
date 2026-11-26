@@ -94,6 +94,21 @@ user with `kerberosSync` the envelope's OAEP label is
 the start answered it, so an envelope opens only for its own start; a Rust client gets the
 whole finish from `lldap_auth::kerberos_envelope::finish_with_envelope`.
 
+`lldap_set_password` given `--admin-password` signs in at `/auth/opaque/login/start` and
+`/finish` as the web login does, so the admin's password does not reach the server; for an
+admin with a second factor it reads the code from its terminal (one line of standard input)
+and signs in again with it, and an admin who must still enroll one is refused, as before. That
+login asks for the envelope key, and the tool seals a synced user's new password only to the
+key the login bound. Given `--token`, it seals to the key as the start answers it; nothing
+binds the key then, so give it an `https://` URL. A script asks for the key with
+`"kerberos_envelope_key": true` in the login start's body. The answer then carries
+`kerberos_envelope_key`, and the client finishes the login in the OPAQUE context
+`klldap-kerberos-envelope-key-v1:` followed by the 32 bytes of SHA-256 of that text, or by
+`none` when the answer has no key; a login finished in another context fails at the client. A
+Rust client gets the finish from `lldap_auth::login::finish_bound`, and tells
+`finish_with_envelope` which key it may seal to (`SealTo::Bound` with the key its login bound,
+or `SealTo::Answered`).
+
 ### Getting a token
 
 You'll need a JWT (authentication token) to issue GraphQL queries. Your view of

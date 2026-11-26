@@ -112,10 +112,12 @@ yourpassword:123456
 That combined form is for LDAP simple bind and `/auth/simple/login`; the web login's
 password field takes the password alone (the combined form fails there as a wrong password,
 and the page says the code comes next). The change-password page takes the current
-password alone too. At LDAP simple bind and `/auth/simple/login` a sign-in whose password
-part is empty (`:` and the six digits alone, or nothing at all) is refused as `no password
-given` before the name is looked up, whoever the user is: LDAP answers 53
-(*unwillingToPerform*), `/auth/simple/login` 401 as for a wrong password.
+password alone too, and so does `lldap_set_password --admin-password`, which signs in as the
+web login does and asks for the code on its terminal. At LDAP simple bind and
+`/auth/simple/login` a sign-in whose password part is empty (`:` and the six digits alone, or
+nothing at all) is refused as `no password given` before the name is looked up, whoever the
+user is: LDAP answers 53 (*unwillingToPerform*), `/auth/simple/login` 401 as for a wrong
+password.
 
 | Door | Code missing | Code wrong | Code replayed / attempts spent |
 |---|---|---|---|

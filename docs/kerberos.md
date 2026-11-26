@@ -440,6 +440,30 @@ ACL text, read at boot.
     `kerberosSync` (400, naming both ways on) and gives no key; with the realm
     closed or its last write unsettled it answers 503. The finish refuses the
     same before it opens the envelope. Each refusal writes one `password_change` failure row.
+  - The pages, and `lldap_set_password` given `--admin-password`, seal only to
+    a key bound to a sign-in of their own. A login start
+    (`/auth/opaque/login/start`) whose body carries
+    `"kerberos_envelope_key": true` is answered with the key, the one a
+    register start would answer now, and the server starts the OPAQUE login in
+    the context `klldap-kerberos-envelope-key-v1:` followed by the SHA-256 of
+    the key's base64 text, or by `none` when it answers no key (Kerberos
+    disabled, or the realm not ready). The client finishes the login in the
+    context of the key it received, so the login finishes only when both sides
+    hold the same key. The server keeps nothing of it. Every login of the web
+    app asks. The page keeps the key its sign-in bound in its memory, and the
+    admin's change page and the create page seal only to it: after a reload
+    they hold none, and after the server restarted the key answered is a new
+    one. Either way they ask for a new sign-in before any finish ("the
+    server's Kerberos envelope key is not one this sign-in bound; sign in
+    again"); the create page that holds none asks before it creates the user.
+    The change page of a user who is not an admin binds the key in its own
+    check of the current password. A user without `kerberosSync` needs no
+    key, so nothing changes for such a user.
+  - The e-mail reset page and `lldap_set_password --token` have no password to
+    sign in with: they seal to the key as the start answers it, and nothing in
+    OPAQUE binds the key there. Serve the web port over TLS (behind a reverse
+    proxy; the listener is plain HTTP) for both. The pages themselves come over
+    the same connection as the key, so TLS is required for every page too.
   - A finish of a synced user without an envelope is refused (400, "reload the
     page and retry"): a page cached from an older version sends none.
   - A finish is taken once, within two minutes of its start, and only with the

@@ -104,6 +104,10 @@ user and that start; the LDAP and GraphQL password paths already hold it. The se
 OPAQUE record and the keys from it in one transaction and drops it when the request
 ends. For any other user the web UI sends no seal, so the server never sees the
 password. KLLDAP keeps no copy; the KDC stores its own keys in its own database.
+The pages and `lldap_set_password` given an admin password seal only to the key their own
+OPAQUE sign-in bound as the login's context; the e-mail reset page and the tool given a token
+seal to the key as the start answers it, so the web port needs TLS
+([kerberos.md](kerberos.md)).
 
 The optional TOTP second factor ([mfa.md](mfa.md)) is checked in the login handler:
 `SqlBackendHandler::bind` splits `password:code`, and `login_finish` takes the code the web

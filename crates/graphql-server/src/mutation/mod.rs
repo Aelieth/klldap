@@ -353,16 +353,12 @@ impl<Handler: FullHandler + OpaqueHandler> Mutation<Handler> {
             ))?;
         let target_user_id = UserId::new(&user_id);
         let target_group_id = GroupId(group_id);
-        let admins = handler
-            .get_group_details(target_group_id)
-            .await
-            .is_ok_and(|d| d.display_name == "lldap_admin".into());
-        if admins {
-            if let Ok(members) = handler
+        let group = handler.get_group_details(target_group_id).await?;
+        if group.display_name == "lldap_admin".into() {
+            let members = handler
                 .list_users(Some(UserRequestFilter::MemberOfId(target_group_id)), false)
-                .await
-                && members.len() <= 1
-            {
+                .await?;
+            if members.len() <= 1 {
                 span.in_scope(|| debug!("Cannot remove the last member of lldap_admin"));
                 return Err("Cannot remove the last member of lldap_admin".into());
             }
@@ -1661,6 +1657,68 @@ mod tests {
                 .collect();
             let refused: Vec<String> = refused.into_iter().map(str::to_owned).collect();
             assert_eq!(said, refused, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_read_refuses_a_removal_from_a_group_before_any_change() {
+        use lldap_domain_model::error::DomainError;
+        let down = || DomainError::InternalError("down".to_owned());
+        for (label, details_read, members_read) in
+            [("details", false, true), ("members", true, false)]
+        {
+            let mut mock = MockTestBackendHandler::new();
+            mock.expect_get_group_details()
+                .returning(move |_| match details_read {
+                    false => Err(down()),
+                    true => Ok(GroupDetails {
+                        group_id: GroupId(1),
+                        display_name: GroupName::from("lldap_admin"),
+                        creation_date: epoch(),
+                        uuid: Uuid::from_name_and_date("lldap_admin", &epoch()),
+                        attributes: vec![],
+                        modified_date: epoch(),
+                    }),
+                });
+            mock.expect_list_users()
+                .returning(move |_, _| match members_read {
+                    false => Err(down()),
+                    true => Ok(vec![]),
+                });
+            mock.expect_remove_user_from_group().times(0);
+            let context = admin_context(mock);
+            let query = r#"mutation { removeUserFromGroup(userId: "bob", groupId: 1) { ok } }"#;
+            let (_, errors) = execute(query, None, &root_schema(), &Variables::new(), &context)
+                .await
+                .unwrap();
+            assert_eq!(errors.len(), 1, "{label}: {errors:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_failed_list_refuses_an_ou_delete_before_any_change() {
+        use lldap_domain_model::error::DomainError;
+        let down = || DomainError::InternalError("down".to_owned());
+        for (label, users_read) in [("users", false), ("groups", true)] {
+            let mut mock = MockTestBackendHandler::new();
+            mock.expect_get_allowed_ous()
+                .returning(|| Ok(vec!["people".into(), "groups".into(), "labs".into()]));
+            mock.expect_list_users()
+                .returning(move |_, _| match users_read {
+                    false => Err(down()),
+                    true => Ok(vec![]),
+                });
+            mock.expect_list_groups().returning(move |_| Err(down()));
+            mock.expect_update_user().times(0);
+            mock.expect_update_group().times(0);
+            mock.expect_set_system_config().times(0);
+            mock.expect_delete_ou_policy_state().times(0);
+            let context = admin_context(mock);
+            let query = r#"mutation { deleteOu(name: "labs") { ok } }"#;
+            let (_, errors) = execute(query, None, &root_schema(), &Variables::new(), &context)
+                .await
+                .unwrap();
+            assert_eq!(errors.len(), 1, "{label}: {errors:?}");
         }
     }
 

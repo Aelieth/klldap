@@ -127,50 +127,54 @@ pub(super) async fn delete_ou<Handler: FullHandler + OpaqueHandler>(
         )
         .into());
     }
-    // Members of the deleted OU fall back to the default OUs, best effort.
-    if let Ok(users) = handler.list_users(None, false).await {
-        for user in users.into_iter().map(|u| u.user) {
-            if !is_in_ou(&user.attributes, &name_lower) {
-                continue;
-            }
-            let request = UpdateUserRequest {
-                user_id: user.user_id.clone(),
-                insert_attributes: vec![ou_attribute("people")],
-                ..Default::default()
-            };
-            match handler.update_user(request).await {
-                Ok(()) => info!(
-                    "Reassigned user {} from deleted OU '{name}' to 'people'",
-                    user.user_id
-                ),
-                Err(e) => warn!(
-                    "Failed to reassign user {} from deleted OU '{name}': {e}",
-                    user.user_id
-                ),
-            }
+    // Members fall back to the default OUs; nothing changes unless both lists are read.
+    let users = handler
+        .list_users(None, false)
+        .await
+        .map_err(|e| anyhow!("Failed to list the users of OU '{name}': {e}"))?;
+    let groups = handler
+        .list_groups(None)
+        .await
+        .map_err(|e| anyhow!("Failed to list the groups of OU '{name}': {e}"))?;
+    for user in users.into_iter().map(|u| u.user) {
+        if !is_in_ou(&user.attributes, &name_lower) {
+            continue;
+        }
+        let request = UpdateUserRequest {
+            user_id: user.user_id.clone(),
+            insert_attributes: vec![ou_attribute("people")],
+            ..Default::default()
+        };
+        match handler.update_user(request).await {
+            Ok(()) => info!(
+                "Reassigned user {} from deleted OU '{name}' to 'people'",
+                user.user_id
+            ),
+            Err(e) => warn!(
+                "Failed to reassign user {} from deleted OU '{name}': {e}",
+                user.user_id
+            ),
         }
     }
-    if let Ok(groups) = handler.list_groups(None).await {
-        for group in groups {
-            if !is_in_ou(&group.attributes, &name_lower) {
-                continue;
-            }
-            let request = UpdateGroupRequest {
-                group_id: group.id,
-                display_name: None,
-                delete_attributes: vec![],
-                insert_attributes: vec![ou_attribute("groups")],
-            };
-            match handler.update_group(request).await {
-                Ok(()) => info!(
-                    "Reassigned group {} from deleted OU '{name}' to 'groups'",
-                    group.id.0
-                ),
-                Err(e) => warn!(
-                    "Failed to reassign group {} from deleted OU '{name}': {e}",
-                    group.id.0
-                ),
-            }
+    for group in groups {
+        if !is_in_ou(&group.attributes, &name_lower) {
+            continue;
+        }
+        let request = UpdateGroupRequest {
+            group_id: group.id,
+            display_name: None,
+            delete_attributes: vec![],
+            insert_attributes: vec![ou_attribute("groups")],
+        };
+        match handler.update_group(request).await {
+            Ok(()) => info!(
+                "Reassigned group {} from deleted OU '{name}' to 'groups'",
+                group.id.0
+            ),
+            Err(e) => warn!(
+                "Failed to reassign group {} from deleted OU '{name}': {e}",
+                group.id.0
+            ),
         }
     }
     ous.retain(|ou| ou.to_lowercase() != name_lower);

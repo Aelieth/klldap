@@ -447,6 +447,37 @@ fn host_rows(user: &UserId, record: &[u8], create: Option<CreateUserRequest>) ->
     rows
 }
 
+/// The first start's admin, and a forced reset without sync while the realm cannot take part.
+pub async fn register_password(
+    handler: &(impl OpaqueHandler + ?Sized),
+    username: UserId,
+    password: &[u8],
+) -> Result<(), DomainError> {
+    let (_, request) = prepare_registration(handler, username, password).await?;
+    handler.registration_finish(request).await.map(|_| ())
+}
+
+#[async_trait::async_trait]
+pub trait WritePasswordWithoutSync {
+    /// The record, the sync turned off and `row`, in one transaction.
+    async fn write_password_without_sync(
+        &self,
+        user: &UserId,
+        record: Vec<u8>,
+        row: logging::LogEvent,
+    ) -> Result<(), DomainError>;
+}
+
+pub async fn reset_password_without_sync(
+    handler: &(impl OpaqueHandler + WritePasswordWithoutSync + ?Sized),
+    user: &UserId,
+    password: &[u8],
+    row: logging::LogEvent,
+) -> Result<(), DomainError> {
+    let (record, _) = prepare_registration(handler, user.clone(), password).await?;
+    handler.write_password_without_sync(user, record, row).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1071,6 +1102,24 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl WritePasswordWithoutSync for Deriving {
+        async fn write_password_without_sync(
+            &self,
+            user: &UserId,
+            record: Vec<u8>,
+            row: logging::LogEvent,
+        ) -> Result<(), DomainError> {
+            let detail = row.detail.unwrap_or_default();
+            let written = format!(
+                "{}, a record: {}, {detail}",
+                user.as_str(),
+                !record.is_empty()
+            );
+            Err(DomainError::InternalError(written))
+        }
+    }
+
     struct Holding(Option<CommitError>);
 
     #[async_trait::async_trait]
@@ -1142,6 +1191,39 @@ mod tests {
                         PASSWORD_CHANGE_IN_PROGRESS.to_owned()
                     ),
                 ]
+            )
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_a_password_set_without_the_realm_takes_no_hold_no_rule_and_no_row() {
+        use crate::kerberos::{NoopKerberos, set_kerberos_backend};
+        let bob = UserId::new("bob");
+        let rows = std::sync::Arc::new(Rows::default());
+        logging::set_log_sink(rows.clone());
+        set_kerberos_backend(std::sync::Arc::new(Holding(Some(CommitError::Busy))));
+        let key = lldap_auth::opaque::server::generate_random_private_key;
+        let stored = Deriving(key(), Some("the record reached its write"));
+        let registered = register_password(&stored, bob.clone(), b"abc").await;
+        let row = logging::event(LogKind::KerberosSync, Some("bob"), true, Some("sync off"));
+        let reset = reset_password_without_sync(&Deriving(key(), None), &bob, b"abc", row).await;
+        set_kerberos_backend(std::sync::Arc::new(NoopKerberos::default()));
+        logging::set_log_sink(std::sync::Arc::new(logging::NoopLogSink));
+        let written = |what: &str| -> Result<(), String> {
+            Err(DomainError::InternalError(what.to_owned()).to_string())
+        };
+        let logged = rows.0.lock().unwrap().len();
+        assert_eq!(
+            (
+                registered.map_err(|e| e.to_string()),
+                reset.map_err(|e| e.to_string()),
+                logged
+            ),
+            (
+                written("the record reached its write"),
+                written("bob, a record: true, sync off"),
+                0
             )
         );
     }

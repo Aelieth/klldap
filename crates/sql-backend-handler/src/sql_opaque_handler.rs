@@ -954,8 +954,7 @@ mod tests {
     };
     use crate::sql_used_starts::tests::{kept, session, web_registration};
     use lldap_domain_handlers::handler::MfaBackendHandler;
-    use lldap_domain_handlers::password::REGISTRATION_UNFINISHABLE;
-    use lldap_opaque_handler::register_password;
+    use lldap_domain_handlers::password::{REGISTRATION_UNFINISHABLE, register_password};
 
     async fn attempt_login(
         opaque_handler: &SqlOpaqueHandler,

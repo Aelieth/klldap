@@ -599,11 +599,12 @@ pub(crate) mod tests {
     use lldap_domain_handlers::mfa::{
         MFA_DISABLED_GROUP, MfaPolicy, MfaRequirement, MfaResetReason,
     };
+    use lldap_domain_handlers::password::register_password;
     use lldap_domain_handlers::policies::{CreatePolicyRequest, PolicyId, UpdatePolicyRequest};
     use lldap_mfa::{
         TOTP_MAX_ATTEMPTS_PER_STEP, TOTP_STEP_SECS, TOTP_TOO_MANY_ATTEMPTS, format_code, totp_code,
     };
-    use lldap_opaque_handler::{OpaqueHandler, register_password};
+    use lldap_opaque_handler::OpaqueHandler;
     use lldap_test_utils::enforcement::EnforcementGuard;
     use lldap_test_utils::recording_log::LogGuard;
     use pretty_assertions::assert_eq;

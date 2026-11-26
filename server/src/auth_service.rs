@@ -2657,7 +2657,7 @@ pub(crate) mod tests {
             };
             handler.create_user(request).await.unwrap();
             let id = UserId::new(user);
-            lldap_opaque_handler::register_password(&handler, id, password.as_bytes())
+            lldap_domain_handlers::password::register_password(&handler, id, password.as_bytes())
                 .await
                 .unwrap();
         }

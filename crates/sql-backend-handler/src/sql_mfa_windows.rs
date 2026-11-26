@@ -243,8 +243,8 @@ pub(crate) mod tests {
         LogKind, Protocol, RequestMeta, with_request, without_session,
     };
     use lldap_domain_handlers::mfa::{ENABLE_MFA, MfaPolicy, MfaResetReason};
+    use lldap_domain_handlers::password::register_password;
     use lldap_mfa::{format_code, totp_code};
-    use lldap_opaque_handler::register_password;
     use lldap_test_utils::recording_log::LogGuard;
     use pretty_assertions::assert_eq;
     use serial_test::serial;

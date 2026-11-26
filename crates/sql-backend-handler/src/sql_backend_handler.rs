@@ -227,7 +227,7 @@ pub mod tests {
 
     pub async fn insert_user(handler: &SqlBackendHandler, name: &str, pass: &str) {
         insert_user_no_password(handler, name).await;
-        lldap_opaque_handler::register_password(handler, name.into(), pass.as_bytes())
+        lldap_domain_handlers::password::register_password(handler, name.into(), pass.as_bytes())
             .await
             .unwrap();
     }

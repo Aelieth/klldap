@@ -56,7 +56,7 @@ use lldap_domain_handlers::lockout::{UNLOCKED_BY_TOOL, lock_clock, lockout, star
 use lldap_domain_handlers::logging::{self as rows, LogKind, event, record};
 use lldap_domain_handlers::password::{
     PASSWORD_MIN_LENGTH, PasswordChangeError, PasswordSync, change_password_everywhere,
-    min_length_for_user, password_rules,
+    min_length_for_user, password_rules, reset_password_without_sync,
 };
 use lldap_kerberos::boot::{RealmSettings, cause_class, client_address, lockout_file_fault};
 use lldap_kerberos::embedded::{EmbeddedKerberos, FOLLOW_EVERY, Opened, RealmThreads, Records};
@@ -165,8 +165,7 @@ async fn reset_without_realm(
                 true,
                 Some(&detail),
             );
-            handler
-                .reset_password_without_sync(admin, password, row)
+            reset_password_without_sync(handler, admin, password, row)
                 .instrument(reset_span(config))
                 .await
         }

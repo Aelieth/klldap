@@ -124,16 +124,6 @@ pub trait OpaqueHandler: Send + Sync {
     ) -> Result<registration::Claim>;
 }
 
-/// Runs the OPAQUE registration ceremony in-process, playing the client against `handler`.
-pub async fn register_password(
-    handler: &(impl OpaqueHandler + ?Sized),
-    username: UserId,
-    password: &[u8],
-) -> Result<()> {
-    let (_, request) = prepare_registration(handler, username, password).await?;
-    handler.registration_finish(request).await.map(|_| ())
-}
-
 /// The ceremony up to its one write, `registration_finish(request)`. The record that write
 /// stores is returned beside the request.
 pub async fn prepare_registration(

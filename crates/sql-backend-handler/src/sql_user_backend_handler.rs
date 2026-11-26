@@ -30,6 +30,7 @@ use lldap_domain_handlers::kerberos::{
 };
 use lldap_domain_handlers::logging::{self, LogKind};
 use lldap_domain_handlers::mfa::MFA_DISABLED_GROUP;
+use lldap_domain_handlers::password::WritePasswordWithoutSync;
 use lldap_domain_model::{
     error::{DomainError, Result},
     model::{self, GroupColumn, UserColumn, codec, system_config},
@@ -905,17 +906,16 @@ impl SqlBackendHandler {
         }
         Ok(warning)
     }
+}
 
-    /// The forced reset of an admin whose Kerberos cannot take part: the password, the sync turned
-    /// off and `row`, in one transaction.
-    pub async fn reset_password_without_sync(
+#[async_trait]
+impl WritePasswordWithoutSync for SqlBackendHandler {
+    async fn write_password_without_sync(
         &self,
         user_id: &UserId,
-        password: &[u8],
+        record: Vec<u8>,
         row: logging::LogEvent,
     ) -> Result<()> {
-        let (record, _) =
-            lldap_opaque_handler::prepare_registration(self, user_id.clone(), password).await?;
         let (user, printed) = (user_id.clone(), row.clone());
         self.sql_pool
             .transaction::<_, (), DomainError>(|transaction| {
@@ -953,7 +953,9 @@ impl SqlBackendHandler {
         logging::print(&printed);
         Ok(())
     }
+}
 
+impl SqlBackendHandler {
     /// A membership change on the caller's transaction, which the Kerberos committer also runs.
     pub(crate) async fn change_membership_in(
         transaction: &DatabaseTransaction,
@@ -3136,6 +3138,7 @@ mod tests {
     #[serial]
     async fn test_a_reset_without_kerberos_sets_the_password_and_turns_sync_off_together() {
         use lldap_domain_handlers::handler::{BindRequest, LoginHandler};
+        use lldap_domain_handlers::password::reset_password_without_sync;
         let fixture = TestFixture::new().await;
         let bob = UserId::new("bob");
         let accepting = RecordingGuard::install();
@@ -3152,15 +3155,16 @@ mod tests {
         drop(accepting);
         let row =
             |user: &str| logging::event(LogKind::KerberosSync, Some(user), true, Some("sync off"));
-        let reset = fixture
-            .handler
-            .reset_password_without_sync(&bob, b"Bob-Reset-1", row("bob"))
-            .await;
+        let reset =
+            reset_password_without_sync(&fixture.handler, &bob, b"Bob-Reset-1", row("bob")).await;
         let nobody = UserId::new("nobody");
-        let gone = fixture
-            .handler
-            .reset_password_without_sync(&nobody, b"Nobody-Reset-1", row("nobody"))
-            .await;
+        let gone = reset_password_without_sync(
+            &fixture.handler,
+            &nobody,
+            b"Nobody-Reset-1",
+            row("nobody"),
+        )
+        .await;
         let details = fixture.handler.get_user_details(&bob).await.unwrap();
         let bound = fixture
             .handler

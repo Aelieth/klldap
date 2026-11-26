@@ -48,6 +48,7 @@ const KADMIND_START: Duration = Duration::from_secs(10);
 const WRITE_WAIT: Duration = Duration::from_secs(10);
 const USER_GONE: &str = "user gone";
 const NO_SYNC: &str = "no sync";
+pub(crate) const LEFT_BY_A_DELETE: &str = "left by a delete while the realm was closed";
 const DISABLED_AT_START: &str =
     "disabled at start: a directory user without Kerberos sync has a principal";
 const STATE_UNREAD: &str = "the user's lldap_disabled membership was not read";
@@ -376,6 +377,13 @@ impl EmbeddedKerberos {
         let serial = self.writes.clone().lock_owned().await;
         let (swept, aliases, followed, cleared) = tokio::task::spawn_blocking(move || {
             let _serial = serial;
+            let read = own
+                .host
+                .delete_marks()
+                .map_err(|e| anyhow!("while reading the delete marks at start: {e}"))?;
+            let left = left_by_deletes();
+            left.fill(&read);
+            let marks: HashSet<String> = read.iter().cloned().collect();
             let (swept, aliases, listed) = {
                 let store = own
                     .store
@@ -392,7 +400,8 @@ impl EmbeddedKerberos {
                     .map(|(user, sync)| (user.into_string(), sync))
                     .collect();
                 let listed = alias_rows(&store, &own.realm);
-                (sweep_plan(&store, &own.realm, &directory), aliases, listed)
+                let plan = sweep_plan(&store, &own.realm, &directory, &marks);
+                (plan, aliases, listed)
             };
             let mut filled = 0;
             for part in listed.chunks(chunk) {
@@ -406,13 +415,17 @@ impl EmbeddedKerberos {
             }
             for part in swept.chunks(chunk) {
                 let rows = swept_rows(part, &own.realm);
+                let names_done: Vec<String> =
+                    part.iter().filter_map(|one| one.mark.clone()).collect();
                 let mut store = own
                     .store
                     .write()
                     .map_err(|_| anyhow!("the principal store was poisoned"))?;
-                let logged = rows.iter().cloned().map(HostRow::Log).collect();
+                let logged = rows.iter().cloned().map(HostRow::Log);
+                let clears = names_done.iter().cloned().map(HostRow::ClearDeleteMark);
+                let host_rows = logged.chain(clears).collect();
                 store
-                    .change_committing(committing_with(own.host.as_ref(), logged), |s| {
+                    .change_committing(committing_with(own.host.as_ref(), host_rows), |s| {
                         for one in part {
                             match one.sweep {
                                 Sweep::Mark => {
@@ -430,7 +443,19 @@ impl EmbeddedKerberos {
                     .and_then(|done| done)
                     .map_err(|e| anyhow!("while sweeping the Kerberos principals at start: {e}"))?;
                 drop(store);
+                left.removed(&names_done);
                 rows.iter().for_each(logging::print);
+            }
+            let swept_marks: HashSet<&String> =
+                swept.iter().filter_map(|one| one.mark.as_ref()).collect();
+            let unswept: Vec<String> = read
+                .iter()
+                .filter(|name| !swept_marks.contains(name))
+                .cloned()
+                .collect();
+            for part in unswept.chunks(chunk) {
+                clear_marks(&own, part)?;
+                left.removed(part);
             }
             let cleared = clear_policies(&own, chunk);
             let marked: Vec<_> = swept
@@ -1574,6 +1599,53 @@ fn poisoned() -> StoreError {
     StoreError::InvalidArgument("the principal store was poisoned by a panic".to_owned())
 }
 
+/// Names whose delete marks the start pass read and has not cleared: the admission refuses them.
+#[derive(Default)]
+pub(crate) struct LeftByDeletes(RwLock<HashSet<String>>);
+
+impl LeftByDeletes {
+    pub(crate) fn fill(&self, names: &[String]) {
+        let mut left = self.0.write().unwrap_or_else(|e| e.into_inner());
+        left.extend(names.iter().cloned());
+    }
+
+    pub(crate) fn removed(&self, names: &[String]) {
+        let mut left = self.0.write().unwrap_or_else(|e| e.into_inner());
+        for name in names {
+            left.remove(name);
+        }
+    }
+
+    #[cfg(any(test, not(feature = "test-admission")))]
+    pub(crate) fn holds(&self, name: &str) -> bool {
+        let left = self.0.read().unwrap_or_else(|e| e.into_inner());
+        left.contains(name)
+    }
+}
+
+pub(crate) fn left_by_deletes() -> &'static LeftByDeletes {
+    static LEFT: OnceLock<LeftByDeletes> = OnceLock::new();
+    LEFT.get_or_init(LeftByDeletes::default)
+}
+
+fn clear_marks(own: &Own, names: &[String]) -> Result<()> {
+    let rows = names
+        .iter()
+        .cloned()
+        .map(HostRow::ClearDeleteMark)
+        .collect();
+    let mut store = own
+        .store
+        .write()
+        .map_err(|_| anyhow!("the principal store was poisoned"))?;
+    store
+        .change_committing(committing_with(own.host.as_ref(), rows), |_| {
+            Ok::<_, StoreError>(())
+        })
+        .and_then(|done| done)
+        .map_err(|e| anyhow!("while clearing the delete marks at start: {e}"))
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct StartPass {
     pub marked: usize,
@@ -1596,6 +1668,7 @@ struct Swept {
     pw_expire: u32,
     policy: Option<String>,
     sweep: Sweep,
+    mark: Option<String>,
 }
 
 impl Swept {
@@ -1618,10 +1691,12 @@ fn sweep_of(owned: bool, locked: bool, user: Option<bool>) -> Option<Sweep> {
     }
 }
 
+/// A one-part name a delete marked is removed whatever user of the name exists now.
 fn sweep_plan(
     store: &PrincipalStore,
     realm: &str,
     directory: &HashMap<String, bool>,
+    marks: &HashSet<String>,
 ) -> Vec<Swept> {
     store
         .ids()
@@ -1629,16 +1704,22 @@ fn sweep_plan(
         .filter_map(|id| store.get_raw(id))
         .filter(|p| p.realm == realm && p.alias_target().is_none())
         .filter_map(|p| {
-            let user = (p.name.name_string.len() == 1)
+            let one = (p.name.name_string.len() == 1)
                 .then(|| p.name.try_components_joined())
-                .flatten()
-                .and_then(|one| directory.get(&one).copied());
+                .flatten();
+            let user = one.as_ref().and_then(|one| directory.get(one).copied());
+            let mark = one.filter(|one| marks.contains(one));
+            let sweep = match mark {
+                Some(_) => Sweep::Remove(LEFT_BY_A_DELETE),
+                None => sweep_of(p.host_owned(), p.locked(), user)?,
+            };
             Some(Swept {
                 name: p.name.clone(),
                 target: p.name.unparse_no_realm_lossy(),
                 pw_expire: p.pw_expire,
                 policy: p.pw_policy.clone(),
-                sweep: sweep_of(p.host_owned(), p.locked(), user)?,
+                sweep,
+                mark,
             })
         })
         .collect()
@@ -1854,6 +1935,8 @@ pub(crate) mod tests {
         pub(crate) unsettled: std::sync::Mutex<Option<String>>,
         fault_after: std::sync::Mutex<Option<(usize, Fault)>>,
         logged: std::sync::Mutex<Vec<logging::LogEvent>>,
+        marks: std::sync::Mutex<Vec<String>>,
+        marks_unread: AtomicBool,
     }
 
     /// The realm's first commit, once: refused, or written with its answer lost.
@@ -1912,6 +1995,16 @@ pub(crate) mod tests {
 
         pub(crate) fn set_offered(&self, users: &[&str]) {
             *self.offered.lock().unwrap() = users.iter().map(|u| (*u).to_owned()).collect();
+        }
+
+        pub(crate) fn set_marks(&self, marks: Option<&[&str]>) {
+            self.marks_unread.store(marks.is_none(), Ordering::Relaxed);
+            let names = marks.unwrap_or_default().iter().map(|n| (*n).to_owned());
+            *self.marks.lock().unwrap() = names.collect();
+        }
+
+        pub(crate) fn marks(&self) -> Vec<String> {
+            self.marks.lock().unwrap().clone()
         }
 
         pub(crate) fn set_directory(&self, disabled: Option<&[&str]>) {
@@ -2001,6 +2094,9 @@ pub(crate) mod tests {
                         records.insert(user.as_str().to_owned(), record.clone());
                     }
                     HostRow::Log(event) => self.logged.lock().unwrap().push(event.clone()),
+                    HostRow::ClearDeleteMark(name) => {
+                        self.marks.lock().unwrap().retain(|mark| mark != name);
+                    }
                     _ => {}
                 }
             }
@@ -2057,6 +2153,13 @@ pub(crate) mod tests {
             let sync = self.sync.lock().unwrap();
             let present = users.iter().filter(|u| sync.contains_key(u.as_str()));
             Ok(present.cloned().collect())
+        }
+
+        fn delete_marks(&self) -> Result<Vec<String>, KerberosStoreError> {
+            match self.marks_unread.load(Ordering::Relaxed) {
+                true => Err(unanswered_db()),
+                false => Ok(self.marks()),
+            }
         }
 
         fn start_pass_committed(&self) {
@@ -2572,6 +2675,91 @@ pub(crate) mod tests {
                 .is_some_and(|p| p.host_owned()),
             "the upgrade's mark survives a reload"
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_the_start_pass_removes_what_a_delete_left_whatever_user_has_the_name_now() {
+        let temp = TempRealm::new();
+        let (embedded, store) = temp.embedded();
+        for user in ["leftsync", "leftgone", "kept"] {
+            synced(&embedded, &UserId::new(user), "A-Password-1")
+                .await
+                .unwrap();
+        }
+        let users: Vec<(UserId, bool)> = [("leftsync", true), ("kept", true)]
+            .into_iter()
+            .map(|(user, sync)| (UserId::new(user), sync))
+            .collect();
+        let names = ["leftgone", "leftnone", "leftsync"];
+        let held = || names.map(|name| left_by_deletes().holds(name));
+        let state = |user: &str| (user.to_owned(), marked(&store, user));
+        let cleared = || {
+            let rows = temp.host.rows().into_iter();
+            let mut rows: Vec<_> = rows
+                .filter(|row| row.starts_with("clear the delete"))
+                .collect();
+            rows.sort();
+            rows
+        };
+
+        temp.host.set_marks(None);
+        let unread = embedded.start_pass(users.clone()).await;
+        temp.host.set_marks(Some(&names));
+        temp.host.set_fault(Some(Fault::Failed));
+        let failed = embedded.start_pass(users.clone()).await;
+        temp.host.set_fault(None);
+        assert_eq!(
+            (
+                unread.is_err(),
+                failed.is_err(),
+                held(),
+                temp.host.marks().len(),
+                [state("leftsync"), state("leftgone")]
+            ),
+            (
+                true,
+                true,
+                [true; 3],
+                3,
+                [
+                    ("leftsync".to_owned(), Some((true, false))),
+                    ("leftgone".to_owned(), Some((true, false)))
+                ]
+            ),
+            "unread marks fail the pass; a removal that did not commit keeps its principal, its \
+             mark and the name refused"
+        );
+
+        let pass = embedded.start_pass(users.clone()).await.unwrap();
+        let said = format!("removed at start: {LEFT_BY_A_DELETE}");
+        let logged = temp.host.logged().into_iter();
+        let ours = logged.filter(|(_, _, detail)| detail.as_deref() == Some(said.as_str()));
+        let mut removed: Vec<_> = ours.map(|(_, target, _)| target).collect();
+        removed.sort();
+        let gone = |name: &str| format!("clear the delete mark of {name}");
+        assert_eq!(
+            (
+                pass.removed,
+                [state("leftsync"), state("leftgone"), state("kept")],
+                (temp.host.marks(), held(), cleared()),
+                removed,
+            ),
+            (
+                2,
+                [
+                    ("leftsync".to_owned(), None),
+                    ("leftgone".to_owned(), None),
+                    ("kept".to_owned(), Some((true, false))),
+                ],
+                (Vec::new(), [false; 3], names.map(gone).to_vec()),
+                vec![Some("leftgone".to_owned()), Some("leftsync".to_owned())],
+            ),
+            "the re-created synced user's old principal goes too; each mark goes with its commit"
+        );
+        let writes = temp.own_writes();
+        let again = embedded.start_pass(users).await.unwrap();
+        assert_eq!((again, temp.own_writes()), (StartPass::default(), writes));
     }
 
     #[tokio::test]

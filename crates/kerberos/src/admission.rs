@@ -1,3 +1,4 @@
+use crate::embedded::{LeftByDeletes, left_by_deletes};
 use crate::otp::{Outcome, notes};
 use crate::policy::NOT_FOUND;
 use krb5_kdc::admission::{
@@ -30,6 +31,7 @@ const REFUSED: KdcRefusal = KdcRefusal {
 };
 const GONE: &str = "the principal is gone";
 const UNREAD: &str = "the principal could not be read";
+const DELETED_WHILE_CLOSED: &str = "the user was deleted while the realm was closed";
 
 /// As the KDC answered a client whose entry is gone before the module was asked.
 fn gone() -> KdcRefusal {
@@ -154,6 +156,7 @@ pub(crate) struct KdcVerdict {
     realm: String,
     cache: &'static PolicyCache,
     lockout: &'static Lockout,
+    left: &'static LeftByDeletes,
 }
 
 impl KdcVerdict {
@@ -162,6 +165,7 @@ impl KdcVerdict {
             realm: realm.to_owned(),
             cache: policy_cache(),
             lockout: lockout(),
+            left: left_by_deletes(),
         }
     }
 
@@ -171,7 +175,22 @@ impl KdcVerdict {
             realm: realm.to_owned(),
             cache,
             lockout,
+            left: left_by_deletes(),
         }
+    }
+
+    fn judge_user(
+        &self,
+        user: &UserId,
+        door: Door,
+        peer: Option<IpAddr>,
+        now: u32,
+    ) -> Result<(), String> {
+        if self.left.holds(user.as_str()) {
+            return Err(DELETED_WHILE_CLOSED.to_owned());
+        }
+        let verdict = self.judge_items(user, door, peer, now);
+        verdict.map_err(|refusal| refusal.detail())
     }
 
     fn confirm_lock(&self, user: &UserId, refusal: &Refusal) {
@@ -333,8 +352,8 @@ impl HostAdmission for KdcVerdict {
             Door::KerberosAs
         };
         let peer = q.peer.and_then(ip_of);
-        let (detail, answer) = match self.judge_items(&user, door, peer, q.now) {
-            Err(refusal) => (refusal.detail(), REFUSED),
+        let (detail, answer) = match self.judge_user(&user, door, peer, q.now) {
+            Err(detail) => (detail, REFUSED),
             Ok(()) if q.s4u2self => return Ok(()),
             Ok(()) if proofs_live(self.cache) && factor_held(self.cache, &user) => return Ok(()),
             Ok(()) => {
@@ -422,10 +441,9 @@ impl HostAdmission for KdcVerdict {
             return Ok(());
         };
         let door = tgs_door(q.kind);
-        let Err(refusal) = self.judge_items(&user, door, peer, q.now) else {
+        let Err(detail) = self.judge_user(&user, door, peer, q.now) else {
             return Ok(());
         };
-        let detail = refusal.detail();
         let by = || {
             let realm = String::from_utf8_lossy(q.ticket.crealm.as_bytes());
             Some(q.ticket.cname.unparse_with_realm_lossy(&realm))
@@ -1154,6 +1172,39 @@ pub(crate) mod tests {
             (((0, None), Ok(()), Err(err::CLIENT_REVOKED)), 0, true),
             "no check: AS and TGS as today, the cache is not read, no filler starts; a subject \
              whose entry is gone is refused whatever is registered"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_name_a_delete_left_is_refused_at_as_and_tgs_while_no_item_is_on() {
+        let (_temp, _embedded, store) = realm(&[REFUSED_USER, ALLOWED_USER]).await;
+        let _guard = EnforcementGuard::none();
+        let log = LogGuard::install_on_this_thread();
+        let left: &'static LeftByDeletes = Box::leak(Box::default());
+        left.fill(&[REFUSED_USER.to_owned()]);
+        let verdict = KdcVerdict {
+            left,
+            ..KdcVerdict::new(REALM)
+        };
+        let asked = |user: &str| {
+            let at_tgs = tgs_asks_of(&verdict, &store, Some(user), user, TgsKind::Renew);
+            (as_asks_of(&verdict, &store, user, false), at_tgs)
+        };
+        let revoked = Err(err::CLIENT_REVOKED);
+        let (a, b) = (REFUSED_USER, ALLOWED_USER);
+        let denied = peered(row(LogKind::AccessDenied, false, a, DELETED_WHILE_CLOSED));
+        let got = [asked(a), asked(b)];
+        assert_eq!(
+            (got, kdc_rows(&log)),
+            ([(revoked, revoked), (Ok(()), Ok(()))], vec![denied]),
+            "refused with no item on; the AS row waits for the notice, the TGS row is written"
+        );
+        left.removed(&[REFUSED_USER.to_owned()]);
+        assert_eq!(
+            (asked(a), kdc_rows(&log)),
+            ((Ok(()), Ok(())), vec![]),
+            "once its mark is cleared the name is judged as any other"
         );
     }
 

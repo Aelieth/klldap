@@ -234,6 +234,8 @@ pub enum HostRow {
         user: UserId,
         at: Timestamp,
     },
+    /// The delete mark of this principal name goes, in the commit that removes the principal.
+    ClearDeleteMark(String),
 }
 
 pub type UserOf = Arc<dyn Fn(&str) -> Option<UserId> + Send + Sync>;
@@ -277,6 +279,7 @@ impl HostRow {
             } => format!("add {user} to group {}", group.0),
             Self::Membership { user, group, .. } => format!("remove {user} from group {}", group.0),
             Self::Unlock { user, .. } => format!("unlock {user}"),
+            Self::ClearDeleteMark(name) => format!("clear the delete mark of {name}"),
         }
     }
 }
@@ -686,6 +689,10 @@ pub trait KerberosStore: Send + Sync {
     fn realm_unsettled(&self) -> Option<String> {
         None
     }
+    /// The principal names a delete left while the realm was closed, read outside any transaction.
+    fn delete_marks(&self) -> Result<Vec<String>, KerberosStoreError> {
+        Err(KerberosStoreError::NotReady(NO_HOST_ROWS.to_owned()))
+    }
     /// Whether this server holds the realm's row, answered once its look for another holder has
     /// ended; false: the database has no realm row to hold.
     fn realm_row_held(&self) -> Result<bool, KerberosStoreError> {
@@ -1016,7 +1023,7 @@ mod tests {
         use crate::logging::{LogKind, event};
         let now = Timestamp::UNIX_EPOCH;
         let bob = UserId::new("bob");
-        let rows: [(HostRow, &str, bool, bool); 12] = [
+        let rows: [(HostRow, &str, bool, bool); 13] = [
             (
                 HostRow::Unlock {
                     user: bob.clone(),
@@ -1068,6 +1075,12 @@ mod tests {
                 false,
             ),
             (HostRow::DeleteUser(bob.clone()), "delete bob", false, true),
+            (
+                HostRow::ClearDeleteMark("bob".to_owned()),
+                "clear the delete mark of bob",
+                false,
+                false,
+            ),
             (
                 HostRow::SyncIs(UserId::new("Bob"), true),
                 "synced bob",

@@ -2446,6 +2446,7 @@ async fn drop_lockout_tables(pool: &DbConnection) {
         "used_registration_starts",
         "used_login_starts",
         "mfa_windows",
+        "kerberos_delete_marks",
     ] {
         pool.execute(sea_orm::Statement::from_string(
             backend,
@@ -2517,6 +2518,12 @@ async fn expect_lockout_tables(pool: &DbConnection) {
     ))
     .await
     .expect("mfa_windows restored");
+    pool.execute(sea_orm::Statement::from_string(
+        backend,
+        "SELECT principal_name, deleted_at FROM kerberos_delete_marks LIMIT 1".to_owned(),
+    ))
+    .await
+    .expect("kerberos_delete_marks restored");
     let period = pool
         .query_one(sea_orm::Statement::from_string(
             backend,
@@ -4112,6 +4119,28 @@ async fn test_mysql_ten_finishes_of_one_login_start_at_once_take_it_once() {
         return;
     };
     crate::sql_used_starts::tests::login_starts_lane(&pool).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+#[ignore = "needs a scratch Postgres via KLLDAP_TEST_DATABASE_URL (gate postgres lane)"]
+async fn test_postgres_a_delete_mark_is_kept_once_and_cleared_by_name() {
+    let _lane = PG_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_postgres().await else {
+        return;
+    };
+    crate::sql_delete_marks::tests::marks_lane(&pool).await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+#[ignore = "needs a scratch MySQL via KLLDAP_TEST_DATABASE_URL (mysql lane)"]
+async fn test_mysql_a_delete_mark_is_kept_once_and_cleared_by_name() {
+    let _lane = MYSQL_LANE_LOCK.lock().await;
+    let Some(pool) = connect_scratch_mysql().await else {
+        return;
+    };
+    crate::sql_delete_marks::tests::marks_lane(&pool).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -2,6 +2,7 @@
 pub(crate) mod logging;
 pub(crate) mod sql_activity_handler;
 pub(crate) mod sql_backend_handler;
+pub(crate) mod sql_delete_marks;
 pub(crate) mod sql_durability;
 pub(crate) mod sql_group_backend_handler;
 pub(crate) mod sql_kerberos_committer;

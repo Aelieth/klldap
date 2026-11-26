@@ -239,6 +239,13 @@ pub(crate) enum MfaWindows {
     UntilAt,
 }
 
+#[derive(DeriveIden, Clone, Copy)]
+pub(crate) enum KerberosDeleteMarks {
+    Table,
+    PrincipalName,
+    DeletedAt,
+}
+
 // Metadata about the SQL DB.
 #[derive(DeriveIden)]
 pub(crate) enum Metadata {
@@ -2086,6 +2093,7 @@ pub(crate) async fn ensure_v13_additions(pool: &DbConnection) -> Result<(), DbEr
     ensure_inactivity_recording(&transaction, backend).await?;
     ensure_code_at_kinit(&transaction, backend).await?;
     ensure_mfa_changed_at(&transaction, backend).await?;
+    ensure_kerberos_delete_marks(&transaction, backend).await?;
     transaction.commit().await
 }
 
@@ -2468,6 +2476,38 @@ async fn ensure_mfa_windows(
                             .to(Users::Table, Users::UserId)
                             .on_delete(ForeignKeyAction::Cascade)
                             .on_update(ForeignKeyAction::Cascade),
+                    ),
+            ),
+        )
+        .await?;
+    Ok(())
+}
+
+/// The principals deleted users left while the realm was closed; no key to the user, who is gone.
+async fn ensure_kerberos_delete_marks(
+    transaction: &DatabaseTransaction,
+    backend: sea_orm::DbBackend,
+) -> Result<(), DbErr> {
+    let table = KerberosDeleteMarks::Table;
+    if !relation_missing(transaction, backend, table.into_iden()).await? {
+        return Ok(());
+    }
+    transaction
+        .execute(
+            backend.build(
+                Table::create()
+                    .table(table)
+                    .if_not_exists()
+                    .col(
+                        ColumnDef::new(KerberosDeleteMarks::PrincipalName)
+                            .string_len(255)
+                            .not_null()
+                            .primary_key(),
+                    )
+                    .col(
+                        ColumnDef::new(KerberosDeleteMarks::DeletedAt)
+                            .big_integer()
+                            .not_null(),
                     ),
             ),
         )

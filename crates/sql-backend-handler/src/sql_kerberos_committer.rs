@@ -1,4 +1,5 @@
 use crate::sql_backend_handler::SqlBackendHandler;
+use crate::sql_delete_marks::{clear_delete_mark, delete_marks};
 use crate::sql_kerberos_handler::{
     KerberosSqlError, RealmHold, alias_chain, clear_open, commit_batch_with_transaction,
     fill_alias_targets, heartbeat, load_realm, mysql_locked_hold, mysql_realm_probe,
@@ -99,6 +100,7 @@ enum Job {
         Vec<(String, String)>,
         oneshot::Sender<Result<u64, KerberosStoreError>>,
     ),
+    Marks(oneshot::Sender<Result<Vec<String>, KerberosStoreError>>),
     Shutdown(oneshot::Sender<()>),
 }
 
@@ -174,6 +176,14 @@ impl KerberosStore for CommitterStore {
         let (tx, rx) = oneshot::channel();
         self.tx
             .blocking_send(Job::FillAliases(rows.to_vec(), tx))
+            .map_err(|_| stopped())?;
+        rx.blocking_recv().map_err(|_| stopped())?
+    }
+
+    fn delete_marks(&self) -> Result<Vec<String>, KerberosStoreError> {
+        let (tx, rx) = oneshot::channel();
+        self.tx
+            .blocking_send(Job::Marks(tx))
             .map_err(|_| stopped())?;
         rx.blocking_recv().map_err(|_| stopped())?
     }
@@ -430,6 +440,9 @@ async fn run(
             }
             Incoming::Job(Job::FillAliases(rows, reply)) => {
                 let _ = reply.send(fill_aliases(&pool, &phase, &rows, timings.step).await);
+            }
+            Incoming::Job(Job::Marks(reply)) => {
+                let _ = reply.send(read_marks(&pool, timings.step).await);
             }
             Incoming::Job(Job::Shutdown(reply)) => {
                 clear_held(&pool, &phase, timings.step).await;
@@ -744,6 +757,9 @@ async fn write_host_rows(
                     txn.execute(statement).await.map_err(row_failed)?;
                 }
             }
+            HostRow::ClearDeleteMark(name) => {
+                clear_delete_mark(txn, name).await.map_err(row_failed)?;
+            }
         }
     }
     Ok(())
@@ -904,6 +920,18 @@ async fn read_synced(
         || KerberosStoreError::Failed(late(step)),
         synced_in(pool, user),
     )
+    .await
+}
+
+async fn read_marks(
+    pool: &DbConnection,
+    step: Duration,
+) -> Result<Vec<String>, KerberosStoreError> {
+    within(step, || KerberosStoreError::Failed(late(step)), async {
+        delete_marks(pool)
+            .await
+            .map_err(|err| KerberosStoreError::Failed(err.to_string()))
+    })
     .await
 }
 
@@ -2951,6 +2979,64 @@ pub(crate) mod tests {
                 generation,
             );
             assert_eq!(after, expected, "{label}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_the_marks_are_read_and_a_mark_goes_only_with_the_commit_that_carries_it() {
+        use crate::sql_delete_marks::mark_deleted;
+        let removed = || RealmBatch {
+            upsert_principals: Vec::new(),
+            delete_principals: vec!["alice".to_owned()],
+            put_policies: Vec::new(),
+            delete_policies: Vec::new(),
+            realm: None,
+        };
+        let db = db().await;
+        insert_alice(&db.pool).await;
+        insert_realm(&db.pool, 5, true).await;
+        let txn = db.pool.begin().await.unwrap();
+        commit_batch_with_transaction(&txn, &batch(), 5)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        for name in ["alice", "ann"] {
+            mark_deleted(&db.pool, name, 1_700_000_000).await.unwrap();
+        }
+        let clear = |name: &str| HostRow::ClearDeleteMark(name.to_owned());
+        let gone = HostRow::DeleteUser(UserId::new("nobody"));
+        type Row = (&'static str, Vec<HostRow>, bool, &'static [&'static str]);
+        let rows: [Row; 2] = [
+            (
+                "refused: the mark stays",
+                vec![clear("ann"), gone],
+                false,
+                &["alice", "ann"],
+            ),
+            (
+                "committed with the removal",
+                vec![clear("alice")],
+                true,
+                &["ann"],
+            ),
+        ];
+        let timings = short_timings();
+        let (lost_tx, _lost) = watch::channel(None);
+        for (label, host, committed, marks) in rows {
+            let (reply, answered) = oneshot::channel();
+            let held = Phase::Held(fresh(6, true, &timings));
+            let watches = (&lost_tx, &quiet());
+            commit_job(&db.pool, held, &host, removed(), reply, watches, &timings).await;
+            let got = answered.await.unwrap();
+            let (realm, _) = load_realm(&db.other).await.unwrap();
+            let read = read_marks(&db.other, timings.step).await.unwrap();
+            let marks: Vec<String> = marks.iter().map(|name| (*name).to_owned()).collect();
+            assert_eq!(
+                (got.is_ok(), read, realm.principals.len()),
+                (committed, marks, usize::from(!committed)),
+                "{label}"
+            );
         }
     }
 

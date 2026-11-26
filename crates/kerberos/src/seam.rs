@@ -155,6 +155,7 @@ pub(crate) trait Host: KerberosStore {
     fn user_synced(&self, user: &UserId) -> Result<bool, KerberosStoreError>;
     fn synced_statuses(&self) -> Result<Vec<(UserId, SyncedStatus)>, KerberosStoreError>;
     fn directory_users(&self, users: &[UserId]) -> Result<Vec<UserId>, KerberosStoreError>;
+    fn delete_marks(&self) -> Result<Vec<String>, KerberosStoreError>;
     /// Until the start pass has committed, only the bootstrap may come from outside.
     fn start_pass_committed(&self);
     fn fill_alias_targets(&self, rows: &[(String, String)]) -> Result<u64, KerberosStoreError>;
@@ -740,6 +741,10 @@ impl Host for SqlRealm {
 
     fn directory_users(&self, users: &[UserId]) -> Result<Vec<UserId>, KerberosStoreError> {
         self.store.directory_users(users).map_err(store_error)
+    }
+
+    fn delete_marks(&self) -> Result<Vec<String>, KerberosStoreError> {
+        self.store.delete_marks().map_err(store_error)
     }
 
     fn start_pass_committed(&self) {
@@ -1434,6 +1439,61 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let url = format!("sqlite://{}?mode=rwc", dir.join("u0.db").display());
         owned_rows_on(&|runtime| sqlite_one_connection(&url, runtime));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[serial]
+    fn test_the_start_pass_reads_and_clears_the_delete_marks_through_the_committer_on_sqlite() {
+        let dir = std::env::temp_dir().join(format!("klldap-marks-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("sqlite://{}?mode=rwc", dir.join("marks.db").display());
+        let runtime = runtime();
+        let temp = TempRealm::new();
+        let (committer, pool) =
+            committer_on(&|runtime| sqlite_one_connection(&url, runtime), &runtime);
+        add_user(&pool, &runtime, "markann");
+        let host = Arc::new(SqlRealm::new(committer.store()));
+        host.start_pass_committed();
+        let profile = boot::profile(&temp.settings);
+        let store = krb5_kdc::shared_dump(
+            boot::open_store(&temp.settings, &profile, host.clone()).unwrap(),
+        );
+        let ready = Arc::new(AtomicBool::new(true));
+        let embedded = EmbeddedKerberos::new(store.clone(), &temp.settings, ready, host.clone());
+        let ann = UserId::new("markann");
+        runtime
+            .block_on(synced(&embedded, &ann, "A-Password-1"))
+            .unwrap();
+        for name in ["markann", "marknone"] {
+            let insert = format!(
+                "INSERT INTO kerberos_delete_marks (principal_name, deleted_at) \
+                 VALUES ('{name}', 1700000000)"
+            );
+            sql(&pool, &runtime, &insert);
+        }
+        let read = host.delete_marks().unwrap();
+        let pass = runtime
+            .block_on(embedded.start_pass(vec![(ann, true)]))
+            .unwrap();
+        assert_eq!(
+            (
+                read,
+                pass.removed,
+                state(&store, "markann"),
+                host.delete_marks().unwrap()
+            ),
+            (
+                vec!["markann".to_owned(), "marknone".to_owned()],
+                1,
+                None,
+                Vec::<String>::new()
+            ),
+            "the synced user's principal goes with its mark; a mark with no principal goes in a \
+             change of directory rows alone"
+        );
+        drop((embedded, store, host));
+        runtime.block_on(committer.shutdown());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -61,18 +61,28 @@ impl GraphQLClient {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct User {
     pub user_input: create_user::CreateUserInput,
-    pub password: Option<String>,
+    pub password: Option<Zeroizing<String>>,
     pub dn: String,
+}
+
+impl std::fmt::Debug for User {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("User")
+            .field("user_input", &self.user_input)
+            .field("password", &self.password.as_ref().map(|_| "***********"))
+            .field("dn", &self.dn)
+            .finish()
+    }
 }
 
 impl User {
     // https://github.com/graphql-rust/graphql-client/issues/386
     pub fn new(
         user_input: create_user::CreateUserInput,
-        password: Option<String>,
+        password: Option<Zeroizing<String>>,
         dn: String,
     ) -> User {
         User {
@@ -514,4 +524,29 @@ fn get_lldap_server(client: &Client) -> Result<String> {
             .unwrap()
             .unwrap(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_a_users_debug_prints_no_password() {
+        let input = CreateUserInput {
+            id: "bob".to_owned(),
+            email: Some("bob@example.com".to_owned()),
+            display_name: None,
+            first_name: None,
+            last_name: None,
+            avatar: None,
+            attributes: None,
+        };
+        let held: Option<Zeroizing<String>> = Some(Zeroizing::new("Imported-Pass-1".to_owned()));
+        let printed = format!("{:?}", User::new(input, held, "uid=bob".to_owned()));
+        assert!(!printed.contains("Imported-Pass-1"), "{printed}");
+        assert!(
+            printed.contains(r#"password: Some("***********")"#),
+            "{printed}"
+        );
+    }
 }

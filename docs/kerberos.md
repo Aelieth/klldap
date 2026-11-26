@@ -473,7 +473,9 @@ ACL text, read at boot.
     included), the copy a bind's check of the password works on, and the
     opened envelope; in the web app, the current and the new password once a
     page takes them out of its form; in `lldap_set_password`, both passwords,
-    taken out of its parsed options at once. Copies that a library or the
+    taken out of its parsed options at once; in the migration tool, the two
+    passwords it asks for and each `userPassword` value it reads, taken out of
+    the source directory's entry. Copies that a library or the
     platform owns are not wiped: the HTTP body buffers and the JSON reader's
     copies; GraphQL's parsed variables, and the query text when a password is
     written in it; the LDAP library's decode copies and read buffer; in the
@@ -481,7 +483,8 @@ ACL text, read at boot.
     page reads, and everything on the JavaScript side; in the tool the
     process's arguments and environment (`--password`, `--admin-password`,
     `LLDAP_USER_PASSWORD`), the argument parser's own copies and the HTTP
-    client's body.
+    client's body; in the migration tool the prompt library's answers and the
+    LDAP library's decode copies of a search.
   - A finish of a synced user without an envelope is refused (400, "reload the
     page and retry"): a page cached from an older version sends none.
   - A finish is taken once, within two minutes of its start, and only with the

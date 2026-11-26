@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use ldap3::{ResultEntry, SearchEntry};
+use lldap_auth::zeroize::Zeroizing;
 use requestty::{Question, prompt_one};
 use smallvec::SmallVec;
 
@@ -128,7 +129,7 @@ fn bind_ldap(
             })
             .build();
         let answer = prompt_one(question)?;
-        answer.as_string().unwrap().to_owned()
+        Zeroizing::new(answer.as_string().unwrap().to_owned())
     };
     if let Err(e) = ldap_connection
         .simple_bind(&binddn, &password)
@@ -141,11 +142,24 @@ fn bind_ldap(
     }
 }
 
+/// Moves the entry's password values out to be wiped: the first of userPassword, else of password.
+fn take_password(entry: &mut SearchEntry) -> Option<Zeroizing<String>> {
+    let mut taken: Option<Zeroizing<String>> = None;
+    for attr in ["userPassword", "password"] {
+        let mut values = Zeroizing::new(entry.attrs.remove(attr).unwrap_or_default());
+        drop(Zeroizing::new(entry.bin_attrs.remove(attr)));
+        if taken.is_none() && values.first().is_some_and(|value| !value.is_empty()) {
+            taken = Some(Zeroizing::new(std::mem::take(&mut values[0])));
+        }
+    }
+    taken
+}
+
 impl TryFrom<ResultEntry> for User {
     type Error = anyhow::Error;
 
     fn try_from(value: ResultEntry) -> Result<Self> {
-        let entry = SearchEntry::construct(value);
+        let mut entry = SearchEntry::construct(value);
         let get_required_attribute = |attr| {
             entry
                 .attrs
@@ -185,8 +199,7 @@ impl TryFrom<ResultEntry> for User {
             .map(|v| v.iter().map(|s| s.as_bytes().to_vec()).collect::<Vec<_>>())
             .or_else(|| entry.bin_attrs.get("jpegPhoto").cloned())
             .and_then(|v| v.into_iter().next().filter(|s| !s.is_empty()));
-        let password =
-            get_optional_attribute("userPassword").or_else(|| get_optional_attribute("password"));
+        let password = take_password(&mut entry);
         Ok(User::new(
             crate::lldap::CreateUserInput {
                 id,
@@ -434,4 +447,53 @@ pub fn get_ldap_connection() -> Result<LdapClient, anyhow::Error> {
         connection: ldap_connection,
         domain: domain.to_owned(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn entry_with(user_password: &[&str], password: &[&str]) -> SearchEntry {
+        let mut attrs = HashMap::from([("cn".to_owned(), vec!["bob".to_owned()])]);
+        for (name, values) in [("userPassword", user_password), ("password", password)] {
+            if !values.is_empty() {
+                let owned = values.iter().map(|value| (*value).to_owned()).collect();
+                attrs.insert(name.to_owned(), owned);
+            }
+        }
+        SearchEntry {
+            dn: "uid=bob,ou=people,dc=example,dc=com".to_owned(),
+            attrs,
+            bin_attrs: HashMap::from([("userPassword".to_owned(), vec![vec![0xff, 0xfe]])]),
+        }
+    }
+
+    #[test]
+    fn test_the_password_read_is_moved_out_of_the_entry_into_a_wiping_type() {
+        type Row<'a> = (&'a [&'a str], &'a [&'a str], Option<&'a str>);
+        let rows: [Row; 5] = [
+            (&["first", "second"], &[], Some("first")),
+            (&["first"], &["other"], Some("first")),
+            (&[""], &["other"], Some("other")),
+            (&[], &[""], None),
+            (&[], &[], None),
+        ];
+        for (user_password, password, want) in rows {
+            let mut entry = entry_with(user_password, password);
+            let taken: Option<Zeroizing<String>> = take_password(&mut entry);
+            assert_eq!(
+                taken.as_deref().map(String::as_str),
+                want,
+                "{user_password:?} {password:?}"
+            );
+            let left: Vec<&str> = entry
+                .attrs
+                .keys()
+                .chain(entry.bin_attrs.keys())
+                .map(String::as_str)
+                .collect();
+            assert_eq!(left, ["cn"], "no password value is left in the entry");
+        }
+    }
 }

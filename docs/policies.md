@@ -264,7 +264,11 @@ seconds of a sign-in attempt for its name is answered `unknown user` there until
 With several servers on one database (only with Kerberos disabled), each server counts the
 attempts it sees exactly, the servers agree within 30 seconds, and a guesser who spreads the
 attempts over N servers gets at most N times the threshold before every server refuses. A
-table that cannot be read refuses the attempt (`policy: unreadable`).
+table that cannot be read refuses the attempt (`policy: unreadable`). A server reads the rows
+the others wrote 500 users at a time, each read given up after 2 seconds; one given up leaves
+the server judging with the rows it read before until its next read, about 30 seconds later,
+and the server log says
+`The lockout view was not refreshed: the database did not answer in time`.
 
 ## Password length
 

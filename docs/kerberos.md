@@ -75,13 +75,35 @@ the realm beside it, and it serves the directory with Kerberos closed:
   enrolment.
 - A change that needs a principal is refused, and nothing is written or
   queued: a password change of a user with `kerberosSync` at every door,
-  creating a user with `kerberosSync`, turning `kerberosSync` on or off, and
-  deleting a user with `kerberosSync`. The answer is LDAP result 52
-  (unavailable), HTTP 503, or a GraphQL error, with one text: "Kerberos KDC
-  unavailable: the Kerberos realm did not open; the server log has the cause;
-  the change will be possible when this server's realm opens". It names no
-  file and no count. The refusal's log row keeps the full cause. The Keycloak
-  keytab export is refused too, and answers the admin with the cause.
+  creating a user with `kerberosSync`, and turning `kerberosSync` on or off.
+  The answer is LDAP result 52 (unavailable), HTTP 503, or a GraphQL error,
+  with one text: "Kerberos KDC unavailable: `<class>`; the change will be
+  possible when this server's realm opens", where `<class>` is the kind of
+  cause (see [Health](#health)), for example "Kerberos KDC unavailable: the
+  realm's records did not open; the change will be possible when this
+  server's realm opens". It names no file and no count. The refusal's log row
+  keeps the full cause. The Keycloak keytab export is refused too, and answers
+  the admin with the cause.
+- Deleting a user with `kerberosSync` needs a confirmation, because its
+  principal cannot go with it. An LDAP Delete of such a user is refused, and so
+  is a GraphQL `deleteUser` without `confirmUserId`: the text above, then "or
+  delete the user now and leave its Kerberos principal until then: confirm the
+  delete on the web page, or give deleteUser a confirmUserId equal to userId".
+  `deleteUser(userId: "bob", confirmUserId: "bob")` deletes the user and
+  answers, in `warnings`, "the user's Kerberos principal stays until this
+  server's realm opens, which removes it before the KDC serves". The users
+  page asks for the name of each such user in turn. The two names compare as
+  user ids do, in any case. A confirmation that names another user, or one
+  for a user who has no `kerberosSync` now (it was re-created or changed after
+  the page read it), is refused and deletes nothing. Outside directory-only
+  `confirmUserId` changes nothing but the check that it names the user.
+- A confirmed delete marks the principal in the table `kerberos_delete_marks`
+  (its name and the time), in the delete's own transaction, and writes one
+  `kerberos_sync` row. At the realm's next opening the start pass removes each
+  marked principal before the KDC serves, whatever user of that name exists
+  by then, and clears its mark in the same commit; a user of that name with
+  `kerberosSync` gets a new principal at its next password change. Until its
+  mark is cleared the KDC refuses the name, at AS and TGS alike.
 - A change of a synced user's `lldap_disabled` membership commits, and the
   principal's status is left for the realm's next opening (see
   [Principals](#principals)).
@@ -149,10 +171,22 @@ the server log, and admins read it in the web interface's notice and in
 |---|---|---|
 | `disabled` (Kerberos disabled in the configuration) | 200 | none |
 | `ready` | 200 | none |
-| `directory-only` | 200 | "the Kerberos realm did not open; the server log has the cause" |
+| `directory-only` | 200 | the kind of cause, below |
 | `admin-only` | 503 | the same |
 | `unsettled` (the answer to the last Kerberos write is lost, see [Principals](#principals)) | 503 | "the answer to this server's last Kerberos write was lost and is not yet settled" |
 | `lost` (the realm was lost; the server is about to exit) | 503 | "the Kerberos realm was lost; the server log has the cause" |
+
+The kind of cause of a realm that did not open, which `/health` and the
+refusals in directory-only name:
+
+| `cause` | The step that failed |
+|---|---|
+| "the Kerberos data directory cannot be used" | `data_dir` could not be created or read |
+| "the realm's records did not open" | the realm's rows, the stash, the lockout file, the 0.7.2 import, the key roll, the admin keytab or `krb5.conf`; any other failure of the open |
+| "the start pass failed" | reconciling the principals, or the start pass |
+| "the KDC did not start" | a KDC or kadmin port, the kadmin ACL, or the KDC and kadmind themselves |
+| "the database's durability setting is unsafe" | SQLite's `synchronous` is not `EXTRA`, or it could not be read |
+| "this database holds no Kerberos realm yet" | a server that stays admin-only on a database the realm has never opened on |
 
 `lldap healthcheck` asks LDAP, LDAPS when enabled, and `/health`:
 
@@ -255,7 +289,9 @@ ACL text, read at boot.
   answer (code 18, `CLIENT_NOT_FOUND`); the refusal rows are described in
   [logging.md](logging.md). A request whose subject's entry could not be read
   is refused too (code 18, no text; the row says `the principal could not be
-  read`): MIT goes on with such a request.
+  read`): MIT goes on with such a request. So is a request for a name whose
+  delete mark the start pass has read and not cleared (code 18, the row says
+  `the user was deleted while the realm was closed`).
 - Users in `lldap_disabled` have their principal disabled (`DISALLOW_ALL_TIX`).
   Leaving the group re-enables it. With the realm ready, the membership of a
   user with `kerberosSync`, its log row and the principal's status are written
@@ -294,8 +330,11 @@ ACL text, read at boot.
 - Deleting a user with `kerberosSync`, and turning the switch off, change the
   directory and the principal in one database transaction: both change, or
   neither, and one `user_delete` or `user_update` log row covers both. On a
-  server whose realm did not open they are refused (see
-  [When the realm cannot open](#when-the-realm-cannot-open)). A change that finds the switch other than it read it writes
+  server whose realm did not open both are refused, except that a
+  directory-only server deletes such a user once the delete is confirmed and
+  leaves the principal to the realm's next opening (see
+  [directory-only](#directory-only)).
+  A change that finds the switch other than it read it writes
   nothing and answers "the user's Kerberos sync changed; try again"; so does a
   password change that finds the switch turned off when it commits, and a
   password change of a user without sync that finds it turned on: such a

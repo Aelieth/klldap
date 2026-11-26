@@ -52,13 +52,14 @@ the dump (`DELETE FROM system_config;`), or the insert stops on the duplicate
 `allowedous` key.
 
 The script also dumps `policies`, `ou_policies`, `kerberos_policies`,
-`kerberos_realm`, `kerberos_principals`, `login_lockouts`, `user_activity` (each user's last
-successful sign-in and re-enable, for `inactivity-days`) and `mfa_windows` (the windows a
-second factor opened for Kerberos). It leaves out `totp_steps`,
+`kerberos_realm`, `kerberos_principals`, `kerberos_delete_marks` (the principals of synced
+users deleted while the realm was closed, which its next opening removes), `login_lockouts`,
+`user_activity` (each user's last successful sign-in and re-enable, for `inactivity-days`) and
+`mfa_windows` (the windows a second factor opened for Kerberos). It leaves out `totp_steps`,
 `mfa_used_proofs`, `used_registration_starts` and `used_login_starts`: their rows live minutes, and a moved
 database starts without them.
-The three `kerberos_*`
-tables are the Kerberos realm. **The master-key file `.k5.<REALM>` in `kerberos_options.data_dir` must
+The three tables `kerberos_realm`,
+`kerberos_principals` and `kerberos_policies` are the Kerberos realm. **The master-key file `.k5.<REALM>` in `kerberos_options.data_dir` must
 travel with the database.** Every realm record is sealed under it. If the
 database holds the realm and that file is missing, the realm does not open.
 The server comes up directory-only (or admin-only, as configured), and the

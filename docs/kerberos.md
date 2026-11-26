@@ -699,10 +699,10 @@ and each one writes its `login` row.
 
 - **The armor's age:** any unexpired ticket of the user works as armor, so the password proof
   behind a code may be as old as `ticket_lifetime` (24 hours by default), not five minutes.
-- **S4U2Self and user-to-user:** the KDC hands the policy no indicators for an S4U2Self
-  request, so a ticket with `mfa` gets an S4U2Self ticket only inside a window; and for
-  user-to-user it hands the second ticket's, so user-to-user is judged by the window and the
-  asking ticket's shape, not by its `mfa`.
+- **S4U2Self and requests with a second ticket:** the KDC hands the policy no indicators for
+  an S4U2Self request, so a ticket with `mfa` gets an S4U2Self ticket only inside a window; and
+  a request that carries a second ticket (user-to-user, S4U2Proxy) is judged by the window and
+  the asking ticket's shape, not by an `mfa` mark.
 - **Clients not tested:** only MIT's `kinit` in the image runs the two commands in the gate.
   Windows, Heimdal, macOS, Java (Keycloak's Kerberos password login among them), pam_krb5 and
   SSSD's own login are not tested; for them the window is the way. SSSD with

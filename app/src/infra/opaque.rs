@@ -3,7 +3,7 @@
 //! check and the two-factor pages. Each caller stashes the returned state in its own
 //! component field between the start and finish steps.
 
-use crate::infra::encrypt::finish_with_envelope;
+use crate::infra::encrypt::{SealTo, finish_with_envelope};
 use anyhow::{Context, Result, bail};
 use lldap_auth::{
     PASSWORD_LENGTH_UNIT, PASSWORD_MIN_LENGTH, PasswordShapeError, login, opaque, password_shape,
@@ -121,6 +121,7 @@ pub fn finish_registration(
     finish_with_envelope(
         request,
         kerberos_envelope_key.as_deref(),
+        SealTo::Answered,
         username,
         password,
     )

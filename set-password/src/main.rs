@@ -4,7 +4,7 @@ use std::env;
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
-use lldap_auth::kerberos_envelope::finish_with_envelope;
+use lldap_auth::kerberos_envelope::{SealTo, finish_with_envelope};
 use lldap_auth::{
     PASSWORD_LENGTH_UNIT, PASSWORD_MIN_LENGTH, PasswordShapeError, opaque, password_shape,
     registration,
@@ -179,7 +179,7 @@ fn main() -> Result<()> {
         registration_upload: registration_finish.message,
     };
     let key = kerberos_envelope_key.as_deref();
-    let req = finish_with_envelope(request, key, &opts.username, &password)?;
+    let req = finish_with_envelope(request, key, SealTo::Answered, &opts.username, &password)?;
 
     register_finish(&opts.base_url, &token, req)?;
 

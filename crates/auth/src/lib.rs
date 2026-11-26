@@ -101,6 +101,75 @@ pub mod login {
         pub credential_response: opaque::client::login::CredentialResponse,
     }
 
+    /// login/start's body: upstream's, and whether to answer the Kerberos envelope key.
+    #[derive(Serialize, Deserialize, Clone)]
+    pub struct ClientLoginStart {
+        #[serde(flatten)]
+        pub request: ClientLoginStartRequest,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub kerberos_envelope_key: Option<bool>,
+    }
+
+    impl From<ClientLoginStartRequest> for ClientLoginStart {
+        fn from(request: ClientLoginStartRequest) -> Self {
+            Self {
+                request,
+                kerberos_envelope_key: None,
+            }
+        }
+    }
+
+    /// login/start's answer: upstream's, and the envelope key the login is bound to.
+    #[derive(Serialize, Deserialize, Clone)]
+    pub struct ServerLoginStart {
+        #[serde(flatten)]
+        pub response: ServerLoginStartResponse,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub kerberos_envelope_key: Option<String>,
+    }
+
+    const ENVELOPE_KEY_CONTEXT: &[u8] = b"klldap-kerberos-envelope-key-v1:";
+
+    /// SHA-256 of the key's text as the start answered it, or `none` when it answered none.
+    pub fn envelope_key_context(key: Option<&str>) -> Vec<u8> {
+        use sha2::{Digest, Sha256};
+        let mut context = ENVELOPE_KEY_CONTEXT.to_vec();
+        match key {
+            Some(key) => context.extend_from_slice(&Sha256::digest(key.as_bytes())),
+            None => context.extend_from_slice(b"none"),
+        }
+        context
+    }
+
+    /// The client's finish, only when the server bound the key it answered; gives that key.
+    pub fn finish_bound<R: rand::RngCore + rand::CryptoRng>(
+        state: opaque::client::login::ClientLogin,
+        password: &[u8],
+        answer: ServerLoginStart,
+        rng: &mut R,
+    ) -> opaque::AuthenticationResult<(ClientLoginFinishRequest, Option<String>)> {
+        let ServerLoginStart {
+            response,
+            kerberos_envelope_key: key,
+        } = answer;
+        let context = envelope_key_context(key.as_deref());
+        let finish = opaque::client::login::finish_login_in_context(
+            state,
+            password,
+            response.credential_response,
+            &context,
+            rng,
+        )?;
+        let request = ClientLoginFinishRequest {
+            server_data: response.server_data,
+            credential_finalization: finish.message,
+            totp_code: None,
+            enrollment_proof: None,
+            session: None,
+        };
+        Ok((request, key))
+    }
+
     #[derive(Serialize, Deserialize, Clone)]
     pub struct ClientLoginFinishRequest {
         pub server_data: String,
@@ -458,5 +527,21 @@ mod tests {
             ]
         );
         assert_eq!(PASSWORD_MIN_LENGTH, 8);
+    }
+
+    #[test]
+    fn test_a_login_binds_the_hash_of_the_key_it_was_answered_or_none() {
+        use sha2::{Digest, Sha256};
+        let prefix = b"klldap-kerberos-envelope-key-v1:".to_vec();
+        let key = "MIIBigKCAYEA";
+        let hashed = [prefix.clone(), Sha256::digest(key.as_bytes()).to_vec()].concat();
+        let none = [prefix, b"none".to_vec()].concat();
+        let got = [Some(key), Some("MIIBigKCAYEB"), None].map(login::envelope_key_context);
+        assert_eq!((&got[0], &got[2]), (&hashed, &none));
+        assert_ne!(got[0], got[1], "another key, another context");
+        assert!(
+            !got[2].is_empty(),
+            "an empty context is a start that did not ask"
+        );
     }
 }

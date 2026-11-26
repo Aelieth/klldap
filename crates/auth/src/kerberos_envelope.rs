@@ -46,15 +46,41 @@ pub fn seal_kerberos_envelope(
     Ok(STANDARD.encode(sealed))
 }
 
-/// The finish a client sends: when its start answered a key, with `password` sealed to that key
-/// for the server data this finish carries.
+/// Which key a client seals a synced user's password to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SealTo<'a> {
+    /// Only the key a login of this client bound; `None` when it holds none.
+    Bound(Option<&'a str>),
+    /// The key as the start answered it: the e-mail reset page, and the tool given a token.
+    Answered,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("the server's Kerberos envelope key is not one this sign-in bound; sign in again")]
+pub struct KeyNotBound;
+
+pub fn sealing_key<'k>(
+    answered: Option<&'k str>,
+    seal_to: SealTo<'_>,
+) -> Result<Option<&'k str>, KeyNotBound> {
+    match (answered, seal_to) {
+        (None, _) => Ok(None),
+        (Some(key), SealTo::Answered) => Ok(Some(key)),
+        (Some(key), SealTo::Bound(Some(bound))) if bound == key => Ok(Some(key)),
+        (Some(_), SealTo::Bound(_)) => Err(KeyNotBound),
+    }
+}
+
+/// The finish a client sends: when its start answered a key it may seal to, with `password`
+/// sealed to that key for the server data this finish carries.
 pub fn finish_with_envelope(
     request: ClientRegistrationFinishRequest,
     key: Option<&str>,
+    seal_to: SealTo<'_>,
     username: &str,
     password: &str,
 ) -> Result<ClientRegistrationFinish> {
-    let kerberos_password_envelope = key
+    let kerberos_password_envelope = sealing_key(key, seal_to)?
         .map(|key| seal_kerberos_envelope(key, username, &request.server_data, password))
         .transpose()?;
     Ok(ClientRegistrationFinish {
@@ -187,17 +213,56 @@ mod tests {
             server_data: START.to_owned(),
             registration_upload: upload.clone(),
         };
-        let plain = finish_with_envelope(request(), None, "Alice", STAPLE).unwrap();
+        let public_key = public();
+        let key = public_key.as_str();
+        let finish = |answered: Option<&str>, seal_to| {
+            finish_with_envelope(request(), answered, seal_to, "Alice", STAPLE)
+        };
+        let plain = finish(None, SealTo::Bound(None)).unwrap();
         assert_eq!(plain.kerberos_password_envelope, None);
-        let sealed = finish_with_envelope(request(), Some(&public()), "Alice", STAPLE).unwrap();
-        let envelope = sealed.kerberos_password_envelope.unwrap();
+        for seal_to in [SealTo::Answered, SealTo::Bound(Some(key))] {
+            let sealed = finish(Some(key), seal_to).unwrap();
+            let envelope = sealed.kerberos_password_envelope.unwrap();
+            assert_eq!(
+                (
+                    sealed.request.server_data.as_str(),
+                    opened(&envelope, "alice", START),
+                    opened(&envelope, "alice", OTHER_START)
+                ),
+                (START, Ok(STAPLE.to_owned()), Err(EnvelopeUnopened)),
+                "{seal_to:?}"
+            );
+        }
+        for seal_to in [SealTo::Bound(None), SealTo::Bound(Some("another key"))] {
+            let refused = finish(Some(key), seal_to).map(drop);
+            let said = refused.map_err(|e| e.to_string());
+            assert_eq!(said, Err(KeyNotBound.to_string()), "{seal_to:?}");
+        }
+    }
+
+    #[test]
+    fn test_a_client_seals_only_to_a_key_its_sign_in_bound() {
+        use SealTo::{Answered, Bound};
+        type Row = (
+            Option<&'static str>,
+            SealTo<'static>,
+            Result<Option<&'static str>, KeyNotBound>,
+        );
+        let rows: [Row; 7] = [
+            (None, Bound(None), Ok(None)),
+            (None, Bound(Some("key")), Ok(None)),
+            (None, Answered, Ok(None)),
+            (Some("key"), Bound(Some("key")), Ok(Some("key"))),
+            (Some("key"), Bound(Some("another key")), Err(KeyNotBound)),
+            (Some("key"), Bound(None), Err(KeyNotBound)),
+            (Some("key"), Answered, Ok(Some("key"))),
+        ];
+        let got =
+            rows.map(|(answered, seal_to, _)| (answered, seal_to, sealing_key(answered, seal_to)));
+        assert_eq!(got, rows);
         assert_eq!(
-            (
-                sealed.request.server_data.as_str(),
-                opened(&envelope, "alice", START),
-                opened(&envelope, "alice", OTHER_START)
-            ),
-            (START, Ok(STAPLE.to_owned()), Err(EnvelopeUnopened))
+            KeyNotBound.to_string(),
+            "the server's Kerberos envelope key is not one this sign-in bound; sign in again"
         );
     }
 

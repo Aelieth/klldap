@@ -125,12 +125,21 @@ pub mod client {
             login_response: CredentialResponse,
             rng: &mut R,
         ) -> AuthenticationResult<ClientLoginFinishResult> {
-            Ok(login_start.finish(
-                rng,
-                password,
-                login_response,
-                ClientLoginFinishParameters::default(),
-            )?)
+            finish_login_in_context(login_start, password, login_response, &[], rng)
+        }
+
+        pub fn finish_login_in_context<R: RngCore + CryptoRng>(
+            login_start: ClientLogin,
+            password: &[u8],
+            login_response: CredentialResponse,
+            context: &[u8],
+            rng: &mut R,
+        ) -> AuthenticationResult<ClientLoginFinishResult> {
+            let parameters = ClientLoginFinishParameters {
+                context: Some(context),
+                ..Default::default()
+            };
+            Ok(login_start.finish(rng, password, login_response, parameters)?)
         }
     }
 }
@@ -185,13 +194,35 @@ pub mod server {
             credential_request: CredentialRequest,
             username: &UserId,
         ) -> AuthenticationResult<ServerLoginStartResult> {
+            start_login_in_context(
+                rng,
+                server_setup,
+                password_file,
+                credential_request,
+                username,
+                &[],
+            )
+        }
+
+        pub fn start_login_in_context<R: RngCore + CryptoRng>(
+            rng: &mut R,
+            server_setup: &ServerSetup,
+            password_file: Option<ServerRegistration>,
+            credential_request: CredentialRequest,
+            username: &UserId,
+            context: &[u8],
+        ) -> AuthenticationResult<ServerLoginStartResult> {
+            let parameters = ServerLoginParameters {
+                context: Some(context),
+                ..Default::default()
+            };
             Ok(ServerLogin::start(
                 rng,
                 server_setup,
                 password_file,
                 credential_request,
                 username.as_str().as_bytes(),
-                ServerLoginParameters::default(),
+                parameters,
             )?)
         }
 
@@ -201,5 +232,132 @@ pub mod server {
         ) -> AuthenticationResult<ServerLoginFinishResult> {
             Ok(login_start.finish(credential_finalization, ServerLoginParameters::default())?)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::login::{ServerLoginStart, ServerLoginStartResponse, envelope_key_context};
+
+    const PASSWORD: &str = "correct horse battery staple";
+
+    fn registered(setup: &server::ServerSetup, user: &UserId) -> server::ServerRegistration {
+        let mut rng = rand::rngs::OsRng;
+        let password = PASSWORD.as_bytes();
+        let start = client::registration::start_registration(password, &mut rng).unwrap();
+        let answer = server::registration::start_registration(setup, start.message, user).unwrap();
+        let upload = client::registration::finish_registration(
+            start.state,
+            password,
+            answer.message,
+            &mut rng,
+        )
+        .unwrap();
+        server::registration::get_password_file(upload.message)
+    }
+
+    #[test]
+    fn test_a_login_finishes_only_when_both_sides_hold_the_same_envelope_key() {
+        type Row = (
+            &'static str,
+            Vec<u8>,
+            Option<&'static str>,
+            &'static str,
+            bool,
+        );
+        let mut rng = rand::rngs::OsRng;
+        let setup = server::ServerSetup::new(&mut rng);
+        let alice = UserId::new("alice");
+        let file = registered(&setup, &alice);
+        let (key, other) = (Some("the server's key"), Some("another key"));
+        let bound = envelope_key_context(key);
+        let rows: [Row; 7] = [
+            ("the same key", bound.clone(), key, PASSWORD, true),
+            (
+                "another key in the answer",
+                bound.clone(),
+                other,
+                PASSWORD,
+                false,
+            ),
+            (
+                "the key taken out of the answer",
+                bound.clone(),
+                None,
+                PASSWORD,
+                false,
+            ),
+            (
+                "the ask taken out of the start",
+                Vec::new(),
+                None,
+                PASSWORD,
+                false,
+            ),
+            ("a key put into an answer", Vec::new(), key, PASSWORD, false),
+            (
+                "none on both sides",
+                envelope_key_context(None),
+                None,
+                PASSWORD,
+                true,
+            ),
+            (
+                "the same key and a wrong password",
+                bound,
+                key,
+                "wrong password",
+                false,
+            ),
+        ];
+        for (row, context, answered, password, finishes) in rows {
+            let start = client::login::start_login(password, &mut rng).unwrap();
+            let file = Some(file.clone());
+            let started = server::login::start_login_in_context(
+                &mut rng,
+                &setup,
+                file,
+                start.message,
+                &alice,
+                &context,
+            )
+            .unwrap();
+            let answer = ServerLoginStart {
+                response: ServerLoginStartResponse {
+                    server_data: String::new(),
+                    credential_response: started.message,
+                },
+                kerberos_envelope_key: answered.map(str::to_owned),
+            };
+            let finished =
+                crate::login::finish_bound(start.state, password.as_bytes(), answer, &mut rng);
+            let got = finished.and_then(|(request, held)| {
+                server::login::finish_login(started.state, request.credential_finalization)?;
+                Ok(held)
+            });
+            let want = finishes.then(|| answered.map(str::to_owned));
+            assert_eq!(got.ok(), want, "{row}");
+        }
+    }
+
+    #[test]
+    fn test_a_start_in_no_context_is_todays_login() {
+        let mut rng = rand::rngs::OsRng;
+        let setup = server::ServerSetup::new(&mut rng);
+        let alice = UserId::new("alice");
+        let file = registered(&setup, &alice);
+        let start = client::login::start_login(PASSWORD, &mut rng).unwrap();
+        let started =
+            server::login::start_login(&mut rng, &setup, Some(file), start.message, &alice)
+                .unwrap();
+        let finish = client::login::finish_login(
+            start.state,
+            PASSWORD.as_bytes(),
+            started.message,
+            &mut rng,
+        )
+        .unwrap();
+        assert!(server::login::finish_login(started.state, finish.message).is_ok());
     }
 }

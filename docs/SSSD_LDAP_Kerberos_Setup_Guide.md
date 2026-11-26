@@ -247,6 +247,10 @@ filter_groups = root,bin,daemon,sys,adm,disk,mem,kmem,wheel
 
 - Prefer **StartTLS** (`ldap_id_use_start_tls = true`) over plain LDAP.
 - Set `krb5_validate = true` after deploying a host keytab.
+- Do not turn on `krb5_use_fast` where a user who turned on the code at kinit signs in: SSSD
+  armors with the host's keytab, which the code at kinit refuses; for SSSD the window stays the
+  way, so within the window after a sign-in with the code at a directory door SSSD's login gets
+  that user's ticket ([kerberos.md](kerberos.md#a-second-factor-and-kinit)).
 - Use a dedicated bind user with minimal privileges (a member of `lldap_strict_readonly`).
 - Consider changing `access_provider` to `ldap` for group-based access control.
 

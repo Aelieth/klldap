@@ -680,6 +680,20 @@ mc_once() {
 }
 
 # mc_check <id> <got> <want> <label> [mc_once's arguments]
+# mc_mark: the newest log id once the writer has stored what came before it (two equal reads
+# 6 s apart, the writer's tick being 5 s), so a row of an earlier step is never after the mark.
+mc_mark() {
+    local a b _
+    a="$(log_mark)"
+    for _ in 1 2 3 4 5; do
+        sleep 6
+        b="$(log_mark)"
+        [ -n "$a" ] && [ "$a" = "$b" ] && break
+        a="$b"
+    done
+    printf '%s\n' "$a"
+}
+
 mc_check() {
     local id="$1" got="$2" want="$3" label="$4"
     shift 4
@@ -764,18 +778,18 @@ mc_zero_rows() {
     fi
     p_ok "[K.C.offer] each user who turned on the code at kinit: the principal carries the otp string (kadmin getstrs)"
 
-    mark="$(log_mark)"
+    mark="$(mc_mark)"
     got="$(mc_kinit armor "$MC_ZERO" "$c1" /tmp/mc-armor-c1 pass -l 5m)"
     mc_check armor "$got" ok "kinit -l 5m with the password: a ticket in the cache" false LOGIN "$c1" "totp code required (armor ticket" "$mark"
     read -r life renew <<<"$(mc_life "$MC_ZERO" /tmp/mc-armor-c1)"
     mc_check armor-life "$(mc_short "$life" "$renew")" short "klist: the armor ticket lives five minutes at most and renews no further"
-    mark="$(log_mark)"
+    mark="$(mc_mark)"
     got="$(mk_kvno mc-armor "$MC_ZERO" /tmp/mc-armor-c1)"
     mk_refused_tgs C.armor-kvno "$got" "$c1" "$mark" "kvno with the armor ticket: '$MK_SAYS'" mc-armor
     got="$(mc_renew armor "$MC_ZERO" /tmp/mc-armor-c1)"
     mc_check armor-renew "$got" policy "kinit -R of the armor ticket: '$MK_SAYS'"
     mc_code "$c1"
-    mark="$(log_mark)"
+    mark="$(mc_mark)"
     got="$(mc_kinit code "$MC_ZERO" "$c1" /tmp/mc-full-c1 "$MC_CODE" -T /tmp/mc-armor-c1)"
     mc_check code "$got" ok "kinit -T with the armor ticket, the code alone at its prompt: a ticket, on a server with no window at all" true LOGIN "$c1" "ticket issued (OTP)" "$mark"
     got="$(grep -cF 'Enter OTP Token Value' "$D/kinit-code.log" 2>/dev/null) $(grep -cF 'Password for' "$D/kinit-code.log" 2>/dev/null)"
@@ -790,13 +804,13 @@ mc_zero_rows() {
     mc_code "$c2"
     code="$MC_CODE"
     got="$got $(mc_kinit code-c2 "$MC_ZERO" "$c2" /tmp/mc-full-c2 "$code" -T /tmp/mc-armor-c2)"
-    mark="$(log_mark)"
+    mark="$(mc_mark)"
     got="$got $(mc_kinit replay "$MC_ZERO" "$c2" /tmp/mc-again-c2 "$code" -T /tmp/mc-armor-c2)"
     mc_check replay "$got" "ok ok preauth" "the same right code twice at kinit -T: the second is 'Preauthentication failed'" false LOGIN "$c2" "totp replayed (OTP)" "$mark"
     mc_code "$c2"
     code="$MC_CODE"
     got="$(mc_bind "$c2" "$code" && echo bound)"
-    mark="$(log_mark)"
+    mark="$(mc_mark)"
     got="$got $(mc_kinit door-then-kdc "$MC_ZERO" "$c2" /tmp/mc-door-c2 "$code" -T /tmp/mc-armor-c2)"
     mc_check door-then-kdc "$got" "bound preauth" "a code taken by an LDAP bind (password:code), then typed at kinit -T: refused" false LOGIN "$c2" "totp replayed (OTP)" "$mark"
     mc_code "$c2"
@@ -807,13 +821,13 @@ mc_zero_rows() {
 
     flood_quiet LOGIN KERBEROS >/dev/null
     mc_code "$c3"
-    mark="$(log_mark)"
+    mark="$(mc_mark)"
     got="$(mc_kinit foreign "$MC_ZERO" "$c3" /tmp/mc-full-c3 "$MC_CODE" -T /tmp/mc-hostarmor)"
     mc_check foreign "$got" preauth "kinit -T armored by the admin keytab's ticket, with the user's right code: refused" false LOGIN "$c3" "armor is not the user's own ticket: admin/admin@$REALM (OTP)" "$mark"
-    mark="$(log_mark)"
+    mark="$(mc_mark)"
     got="$(mc_kinit password-only "$MC_ZERO" "$c3" /tmp/mc-pw-c3 pass)"
     mc_check password-only "$got" policy "a plain kinit with the right password and no code: '$MK_SAYS' after the password" false LOGIN "$c3" "$MK_DETAIL" "$mark"
-    mark="$(log_mark)"
+    mark="$(mc_mark)"
     got="$(mc_kinit password-wrong "$MC_ZERO" "$c3" /tmp/mc-pw-c3 "Wrong$MK_PASS")"
     mc_check password-wrong "$got" incorrect "a plain kinit with a wrong password: 'Password incorrect'" false LOGIN "$c3" "pre-authentication failed (" "$mark"
     mc_code "$c3"
@@ -826,7 +840,7 @@ mc_zero_rows() {
     got="$got $(mc_kinit lock-1 "$MC_ZERO" "$d" /tmp/mc-pw-d "Wrong$MK_PASS")"
     mc_code "$d"
     wrong="$(printf '%06d' $(((10#$MC_CODE + 1) % 1000000)))"
-    mark="$(log_mark)"
+    mark="$(mc_mark)"
     got="$got $(mc_kinit lock-2 "$MC_ZERO" "$d" /tmp/mc-full-d "$wrong" -T /tmp/mc-armor-d)"
     if ! mc_once false LOGIN "$d" "invalid totp (OTP)" "$mark"; then
         p_bad "[K.C.wrong-code] a wrong code at kinit -T: $FAIL_WHY"
@@ -835,14 +849,14 @@ mc_zero_rows() {
     fi
     got="$got $(mc_kinit lock-3 "$MC_ZERO" "$d" /tmp/mc-pw-d "Wrong$MK_PASS")"
     mc_code "$d"
-    mark="$(log_mark)"
+    mark="$(mc_mark)"
     got="$got $(mc_kinit locked "$MC_ZERO" "$d" /tmp/mc-full-d "$MC_CODE" -T /tmp/mc-armor-d)"
     mc_check locked "$got" "ok incorrect preauth incorrect revoked" "an OU that locks at three: a wrong password, a wrong code and a wrong password each count, and the third locks; kinit -T with the right code is then 'credentials have been revoked'" false LOGIN "$d" "locked out" "$mark"
 
     flood_quiet LOGIN KERBEROS >/dev/null
     got="$(mc_kinit armor-p "$MC_ZERO" "$p" /tmp/mc-armor-p leak -l 5m)"
     mc_code "$p"
-    mark="$(log_mark)"
+    mark="$(mc_mark)"
     got="$got $(mc_kinit typed-password "$MC_ZERO" "$p" /tmp/mc-full-p "leak:$MC_CODE" -T /tmp/mc-armor-p)"
     mc_check typed-password "$got" "ok preauth" "the password, a colon and the code typed at the code prompt: refused" false LOGIN "$p" "no six-digit code (OTP)" "$mark"
     docker logs "$MC_ZERO" >"$D/zero-server.log" 2>&1
@@ -872,7 +886,7 @@ mc_short_rows() {
     mc_code "$v"
     got="$got $(mc_bind "$v" "$MC_CODE" && echo bound)"
     opened="$(date +%s)"
-    mark="$(log_mark)"
+    mark="$(mc_mark)"
     got="$got $(mk_kvno mc-before-bind "$MK_SHORT" /tmp/mc-armor-v1)"
     mc_check bind-after-armor "$got" "ok bound policy" "an armor ticket, then a bind with password:code a few seconds later: the window covers its time, yet kvno is '$MK_SAYS'"
     got="$(mc_kinit window-plain "$MK_SHORT" "$v" /tmp/mc-plain-v pass)"
@@ -886,7 +900,7 @@ mc_short_rows() {
     mk_wait "$opened" 62
     got="$got $(mk_kvno mc-window-code "$MK_SHORT" /tmp/mc-full-v) $(mc_renew window-code "$MK_SHORT" /tmp/mc-full-v)"
     mc_check code-outlives-window "$got" "ok ok ok" "kinit -T with the code, then 62 s after the window opened: kvno and kinit -R work (no window involved)"
-    mark="$(log_mark)"
+    mark="$(mc_mark)"
     got="$(mc_kinit window-gone "$MK_SHORT" "$v" /tmp/mc-plain-v2 pass)"
     mc_check window-gone "$got" policy "and a plain kinit then: '$MK_SAYS' after the password" false LOGIN "$v" "$MK_DETAIL" "$mark"
 }
@@ -942,7 +956,7 @@ mc_two_rows() {
     mc_code "$n"
     code="$MC_CODE"
     out="$(mc_simple "$two" "$n" "$code")"
-    mark="$(log_mark)"
+    mark="$(mc_mark)"
     got="$(grep -q '^200 token' <<<"$out" && echo signed || echo "'$out'")"
     got="$got $(mc_kinit two-door-then-kdc "$CONTAINER" "$n" /tmp/mc-again-n "$code" -T /tmp/mc-armor-n)"
     mc_check two-door-then-kdc "$got" "signed preauth" "two servers on postgres: a code taken at the second server's door is refused at the main server's kinit -T" false LOGIN "$n" "totp replayed (OTP)" "$mark"

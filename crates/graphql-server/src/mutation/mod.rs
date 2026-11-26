@@ -1845,17 +1845,17 @@ mod tests {
     async fn test_a_user_change_refused_for_the_realm_is_a_field_error_with_its_text() {
         use lldap_domain_handlers::kerberos::closed_to_writes;
         use lldap_domain_model::error::DomainError;
-        use lldap_test_utils::recording_kerberos::DEGRADED_CAUSE;
+        use lldap_test_utils::recording_kerberos::DEGRADED_CLASS;
         let queries = [
             r#"mutation { createUser(user: {id: "bob", email: "bob@example.com"}) { id } }"#,
             r#"mutation { updateUser(user: {id: "bob", displayName: "Bob"}) { ok } }"#,
             r#"mutation { deleteUser(userId: "bob") { ok } }"#,
         ];
         for query in queries {
-            let told = closed_to_writes(DEGRADED_CAUSE);
+            let told = closed_to_writes(DEGRADED_CLASS);
             let refused = || {
                 Err(DomainError::KdcUnavailable(closed_to_writes(
-                    DEGRADED_CAUSE,
+                    DEGRADED_CLASS,
                 )))
             };
             let mut mock = MockTestBackendHandler::new();
@@ -2023,7 +2023,7 @@ mod tests {
         use lldap_domain_handlers::password::{
             PASSWORD_CHANGE_IN_PROGRESS, RESULT_UNKNOWN, realm_not_ready,
         };
-        use lldap_test_utils::recording_kerberos::{DEGRADED_CAUSE, DegradedGuard};
+        use lldap_test_utils::recording_kerberos::{DEGRADED_CAUSE, DEGRADED_CLASS, DegradedGuard};
         use lldap_test_utils::recording_log::LogGuard;
         const REFUSAL: &str = "password policy: min_length 40";
         #[derive(Debug)]
@@ -2047,7 +2047,7 @@ mod tests {
                 Kdc::DirectoryOnly,
                 Some(format!(
                     "Kerberos KDC unavailable: {}",
-                    closed_to_writes(DEGRADED_CAUSE)
+                    closed_to_writes(DEGRADED_CLASS)
                 )),
             ),
             (

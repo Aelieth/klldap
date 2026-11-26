@@ -2512,7 +2512,9 @@ mod tests {
     async fn test_each_life_step_with_kerberos_disabled_not_ready_or_unsettled() {
         use lldap_domain_handlers::kerberos::{ANSWER_UNSETTLED, SYNC_OFF_FIRST, closed_to_writes};
         use lldap_domain_handlers::password::realm_not_ready;
-        use lldap_test_utils::recording_kerberos::{DEGRADED_CAUSE, DegradedGuard, NotReadyGuard};
+        use lldap_test_utils::recording_kerberos::{
+            DEGRADED_CAUSE, DEGRADED_CLASS, DegradedGuard, NotReadyGuard,
+        };
         use lldap_test_utils::recording_log::LogGuard;
         type Logged = (LogKind, bool, Option<String>);
         type Row = (Life, Option<String>, Option<bool>, Vec<Logged>);
@@ -2645,7 +2647,7 @@ mod tests {
         };
         let directory_only = {
             let unavailable = |cause: &str| format!("Kerberos KDC unavailable: {cause}");
-            let told = unavailable(&closed_to_writes(DEGRADED_CAUSE));
+            let told = unavailable(&closed_to_writes(DEGRADED_CLASS));
             let full = unavailable(DEGRADED_CAUSE);
             let refused = |step, kind, after| {
                 let logged = vec![failed(kind, &full)];

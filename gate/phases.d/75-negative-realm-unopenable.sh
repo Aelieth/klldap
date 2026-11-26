@@ -18,10 +18,11 @@ DEG_GROUP="gatedeg-group"
 STASH="/var/kerberos/krb5kdc/.k5.$REALM"
 CONF="/data/lldap_config.toml"
 D75_KEY='on_realm_failure = "admin-only"'
-D75_PUBLIC="the Kerberos realm did not open; the server log has the cause"
+D75_PUBLIC="the realm's records did not open"
 D75_TOLD="Kerberos KDC unavailable: $D75_PUBLIC; the change will be possible when this server's realm opens"
 D75_FULL="Kerberos KDC unavailable: the Kerberos realm $REALM did not open"
 D75_503="503 Service Unavailable: Kerberos is admin-only: $D75_PUBLIC"
+D75_503_NO_REALM="503 Service Unavailable: Kerberos is admin-only: this database holds no Kerberos realm yet"
 D75_FLAG="--kerberos passes only a ready Kerberos realm, and this server's is directory-only"
 D75_ADMINS="Only admins may sign in"
 D75_OPEN_LINE="is closed and this server is directory-only"
@@ -446,11 +447,11 @@ rw_fresh_row() {
     gexec_in "$RW_FRESH" bash -c "</dev/tcp/127.0.0.1/17170 && </dev/tcp/127.0.0.1/3890" 2>/dev/null && inner=open
     { [ -z "$ip" ] || t bash -c "</dev/tcp/$ip/17170" 2>/dev/null || t bash -c "</dev/tcp/$ip/3890" 2>/dev/null; } && outer=open
     if [ -n "$said" ] && grep -qF "$RW_NO_ROW" "$D/$RW_FRESH.log" && grep -qF "$RW_MIT" "$D/$RW_FRESH.log" &&
-        ! grep -qF "$D75_OPEN_LINE" "$D/$RW_FRESH.log" && [ "$rc" != 0 ] && grep -qF "$D75_503" "$D/fresh-health.log" &&
+        ! grep -qF "$D75_OPEN_LINE" "$D/$RW_FRESH.log" && [ "$rc" != 0 ] && grep -qF "$D75_503_NO_REALM" "$D/fresh-health.log" &&
         [ "$inner" = open ] && [ "$outer" = closed ]; then
-        p_ok "[$row] a server that cannot open, on a $GATE_DB database that has never held a realm: admin-only though the key is at its default; its log says '$RW_NO_ROW'; the healthcheck fails with '$D75_503'; HTTP and LDAP answer on its loopback only"
+        p_ok "[$row] a server that cannot open, on a $GATE_DB database that has never held a realm: admin-only though the key is at its default; its log says '$RW_NO_ROW'; the healthcheck fails with '$D75_503_NO_REALM'; HTTP and LDAP answer on its loopback only"
     else
-        p_bad "[$row] admin-only line: ${said:-no}; healthcheck exit $rc; its loopback $inner, its address ${ip:-unread} $outer; want '$D75_ADMINS', '$RW_NO_ROW' and '$RW_MIT' in $RW_FRESH.log, no '$D75_OPEN_LINE', a failed healthcheck with '$D75_503' (fresh-health.log), loopback open and its address closed"
+        p_bad "[$row] admin-only line: ${said:-no}; healthcheck exit $rc; its loopback $inner, its address ${ip:-unread} $outer; want '$D75_ADMINS', '$RW_NO_ROW' and '$RW_MIT' in $RW_FRESH.log, no '$D75_OPEN_LINE', a failed healthcheck with '$D75_503_NO_REALM' (fresh-health.log), loopback open and its address closed"
     fi
     rw_fresh_gone
 }

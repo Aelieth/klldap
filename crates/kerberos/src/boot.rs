@@ -7,6 +7,7 @@ use krb5_crypto::EncryptionType;
 use krb5_kdc::host::{HostPaths, KerberosStore};
 use krb5_kdc::{Acl, AdminSpec, Error as StoreError, PrincipalStore, SharedDump};
 use krb5_types::PrincipalName;
+use lldap_domain_handlers::kerberos::{CauseClass, Classed};
 use minijinja::{Environment, context};
 use std::fs;
 use std::io;
@@ -149,17 +150,23 @@ pub(crate) fn open(settings: &RealmSettings, host: Arc<dyn Host>) -> Result<Open
     };
     let kdc_udp = krb5_kdc::bind_udp_listeners(std::slice::from_ref(&kdc_addr))
         .map_err(|e| with_port_hint(e, settings.kdc_port))
-        .with_context(|| format!("while binding the KDC on UDP {kdc_addr:?}"))?;
+        .with_context(|| {
+            let doing = format!("while binding the KDC on UDP {kdc_addr:?}");
+            CauseClass::KdcStart.said(doing)
+        })?;
     let kdc_tcp = krb5_kdc::bind_tcp_listeners(std::slice::from_ref(&kdc_addr))
         .map_err(|e| with_port_hint(e, settings.kdc_port))
-        .with_context(|| format!("while binding the KDC on TCP {kdc_addr:?}"))?;
+        .with_context(|| {
+            let doing = format!("while binding the KDC on TCP {kdc_addr:?}");
+            CauseClass::KdcStart.said(doing)
+        })?;
     let kadmin = TcpListener::bind((settings.kadmin_host.as_str(), settings.kadmin_port))
         .map_err(|e| with_port_hint(e, settings.kadmin_port))
         .with_context(|| {
-            format!(
+            CauseClass::KdcStart.said(format!(
                 "while binding kadmin on {}:{}",
                 settings.kadmin_host, settings.kadmin_port
-            )
+            ))
         })?;
     Ok(OpenRealm {
         store: krb5_kdc::shared_dump(store),
@@ -316,6 +323,12 @@ fn boot_error(e: StoreError, paths: &HostPaths) -> anyhow::Error {
     }
 }
 
+/// The class the failed part of a start named, else the realm's records.
+pub fn cause_class(e: &anyhow::Error) -> CauseClass {
+    e.downcast_ref::<Classed>()
+        .map_or(CauseClass::Records, |classed| classed.class)
+}
+
 /// Whether an open failed on kerber-rust's lockout file: missing, unreadable or not its own.
 pub fn lockout_file_fault(e: &anyhow::Error) -> bool {
     matches!(
@@ -367,12 +380,12 @@ pub(crate) fn profile(settings: &RealmSettings) -> ProfileSet {
 fn acl(realm: &str, extra: Option<&Path>) -> Result<Acl> {
     let mut text = format!("admin/admin@{realm} *\n");
     if let Some(path) = extra {
-        text.push_str(
-            &fs::read_to_string(path)
-                .with_context(|| format!("while reading {}", path.display()))?,
-        );
+        text.push_str(&fs::read_to_string(path).with_context(|| {
+            CauseClass::KdcStart.said(format!("while reading {}", path.display()))
+        })?);
     }
-    Acl::parse_with_realm(&text, realm).context("while parsing the kadmin ACL")
+    let parsing = CauseClass::KdcStart.said("while parsing the kadmin ACL");
+    Acl::parse_with_realm(&text, realm).context(parsing)
 }
 
 fn write_client_config(settings: &RealmSettings) -> Result<()> {
@@ -415,9 +428,13 @@ fn write_client_config(settings: &RealmSettings) -> Result<()> {
 fn secure_dir(dir: &Path) -> Result<()> {
     let created = created_chain(dir);
     let existed = created.is_empty();
-    fs::create_dir_all(dir).with_context(|| format!("while creating {}", dir.display()))?;
+    let unusable = |doing: &str| {
+        let said = format!("while {doing} {}", dir.display());
+        CauseClass::DataDirectory.said(said)
+    };
+    fs::create_dir_all(dir).with_context(|| unusable("creating"))?;
     let mode = fs::metadata(dir)
-        .with_context(|| format!("while reading {}", dir.display()))?
+        .with_context(|| unusable("reading"))?
         .permissions()
         .mode()
         & 0o777;
@@ -707,6 +724,7 @@ mod tests {
             let error = open_store(&temp.settings, &profile, temp.host()).unwrap_err();
             assert!(format!("{error:#}").contains(cause), "{cause}: {error:#}");
             assert_eq!(lockout_file_fault(&error), lockout, "{cause}");
+            assert_eq!(cause_class(&error), CauseClass::Records, "{cause}");
         }
         let temp = TempRealm::new();
         let error = open_store(
@@ -721,6 +739,63 @@ mod tests {
         assert!(error.contains(expected), "{error}");
         let text = anyhow!("the lockout file is missing");
         assert!(!lockout_file_fault(&text), "a text alone is no typed cause");
+    }
+
+    #[test]
+    fn test_the_part_of_an_open_that_failed_names_the_class_and_keeps_its_words() {
+        use CauseClass::{DataDirectory, Durability, KdcStart, Records};
+        type Spoil = fn(&mut TempRealm, u16);
+        let held = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        let port = held.local_addr().unwrap().port();
+        let rows: [(Spoil, &str, CauseClass); 3] = [
+            (
+                |t, _| {
+                    let data_dir = &t.settings.data_dir;
+                    fs::create_dir_all(data_dir.parent().unwrap()).unwrap();
+                    fs::write(data_dir, b"a file").unwrap();
+                },
+                "while creating",
+                DataDirectory,
+            ),
+            (
+                |t, port| t.settings.kdc_port = port,
+                "while binding the KDC on UDP",
+                KdcStart,
+            ),
+            (
+                |t, _| t.settings.kadmin_acl = Some(t.settings.data_dir.with_file_name("no-acl")),
+                "no-acl",
+                KdcStart,
+            ),
+        ];
+        for (spoil, said, class) in rows {
+            let mut temp = TempRealm::new();
+            spoil(&mut temp, port);
+            let error = match open(&temp.settings, temp.own()) {
+                Ok(_) => panic!("{said}: the open went through"),
+                Err(e) => e,
+            };
+            let text = format!("{error:#}");
+            let got = (cause_class(&error), text.contains(said));
+            assert_eq!(
+                (got, text.contains(class.text())),
+                ((class, true), false),
+                "{text}"
+            );
+        }
+        drop(held);
+        let read = Err::<(), _>(io::Error::other("no answer"));
+        let durability = read
+            .context(Durability.said("while reading database durability"))
+            .context("the Kerberos realm EXAMPLE.COM did not open")
+            .unwrap_err();
+        let said = "the Kerberos realm EXAMPLE.COM did not open: while reading database \
+                    durability: no answer";
+        assert_eq!(
+            (cause_class(&durability), format!("{durability:#}")),
+            (Durability, said.to_owned())
+        );
+        assert_eq!(cause_class(&anyhow!("no part named it")), Records);
     }
 
     #[test]

@@ -125,6 +125,10 @@ pub trait KerberosSync: Send + Sync {
     fn directory_only(&self) -> Option<String> {
         None
     }
+    /// The kind of the cause `unavailable` or `directory_only` gives, for those not shown it.
+    fn cause_class(&self) -> Option<CauseClass> {
+        None
+    }
     /// Why a held realm still refuses a change to both stores: its last write is unsettled.
     fn unsettled(&self) -> Option<String> {
         None
@@ -405,10 +409,55 @@ pub enum DegradedMode {
     DirectoryOnly,
 }
 
+/// The kind of cause of a realm that did not open, as anyone may read it: no path, no count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CauseClass {
+    DataDirectory,
+    Records,
+    StartPass,
+    KdcStart,
+    Durability,
+    NoRealm,
+}
+
+impl CauseClass {
+    pub const fn text(self) -> &'static str {
+        match self {
+            Self::DataDirectory => "the Kerberos data directory cannot be used",
+            Self::Records => "the realm's records did not open",
+            Self::StartPass => "the start pass failed",
+            Self::KdcStart => "the KDC did not start",
+            Self::Durability => "the database's durability setting is unsafe",
+            Self::NoRealm => "this database holds no Kerberos realm yet",
+        }
+    }
+
+    /// An error context that prints `said` alone and carries this class for a downcast.
+    pub fn said(self, said: impl Into<String>) -> Classed {
+        Classed {
+            class: self,
+            said: said.into(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Classed {
+    pub class: CauseClass,
+    said: String,
+}
+
+impl std::fmt::Display for Classed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.said)
+    }
+}
+
 pub struct DegradedKerberos {
     realm: String,
     cause: String,
     mode: DegradedMode,
+    class: CauseClass,
 }
 
 impl DegradedKerberos {
@@ -416,8 +465,19 @@ impl DegradedKerberos {
         Self::with_mode(realm, cause, DegradedMode::AdminOnly)
     }
 
+    /// A cause of the class `Records` until `closed_by` names another.
     pub fn with_mode(realm: String, cause: String, mode: DegradedMode) -> Self {
-        Self { realm, cause, mode }
+        let class = CauseClass::Records;
+        Self {
+            realm,
+            cause,
+            mode,
+            class,
+        }
+    }
+
+    pub fn closed_by(self, class: CauseClass) -> Self {
+        Self { class, ..self }
     }
 
     fn cause_in(&self, mode: DegradedMode) -> Option<String> {
@@ -435,6 +495,9 @@ impl KerberosSync for DegradedKerberos {
     }
     fn directory_only(&self) -> Option<String> {
         self.cause_in(DegradedMode::DirectoryOnly)
+    }
+    fn cause_class(&self) -> Option<CauseClass> {
+        Some(self.class)
     }
     fn realm(&self) -> &str {
         &self.realm
@@ -741,17 +804,25 @@ pub fn unsettled_answer(cause: &str) -> DomainError {
 
 pub const OPENS_WITH_THE_REALM: &str = "the change will be possible when this server's realm opens";
 
-/// What every door tells a write refused for the realm's sake in directory-only; never `full`.
-pub fn closed_to_writes(full: &str) -> String {
-    let closed = RealmHealth::DirectoryOnly(full.to_owned());
-    let public = public_cause(&closed).unwrap_or_default();
-    format!("{public}; {OPENS_WITH_THE_REALM}")
+/// What every door tells a write refused for the realm's sake in directory-only: the class only.
+pub fn closed_to_writes(class: CauseClass) -> String {
+    format!("{}; {OPENS_WITH_THE_REALM}", class.text())
+}
+
+fn class_of(backend: &dyn KerberosSync) -> CauseClass {
+    backend.cause_class().unwrap_or(CauseClass::Records)
+}
+
+pub fn directory_only_now() -> Option<(CauseClass, String)> {
+    let backend = kerberos_backend();
+    let full = backend.directory_only()?;
+    Some((class_of(&*backend), full))
 }
 
 /// A refusal for the realm's sake: `cause` and `then`; in directory-only, `closed_to_writes`.
 pub fn refusal_text(cause: &str, then: &str) -> String {
-    match kerberos_backend().directory_only() {
-        Some(full) => closed_to_writes(&full),
+    match directory_only_now() {
+        Some((class, _)) => closed_to_writes(class),
         None => format!("{cause}; {then}"),
     }
 }
@@ -759,13 +830,12 @@ pub fn refusal_text(cause: &str, then: &str) -> String {
 /// The row of a refusal that answered `said`: `said`; in directory-only, with the full cause.
 pub fn refusal_row(said: String) -> String {
     let answer = |text: String| DomainError::KdcUnavailable(text).to_string();
-    match kerberos_backend().directory_only() {
-        Some(full) if said == answer(closed_to_writes(&full)) => answer(full),
+    match directory_only_now() {
+        Some((class, full)) if said == answer(closed_to_writes(class)) => answer(full),
         _ => said,
     }
 }
 
-pub const REALM_NOT_OPEN: &str = "the Kerberos realm did not open; the server log has the cause";
 pub const REALM_LOST: &str = "the Kerberos realm was lost; the server log has the cause";
 const KDC_NOT_SERVING: &str = "the Kerberos KDC is not serving";
 
@@ -776,8 +846,8 @@ pub enum RealmHealth {
     Ready,
     Unsettled(String),
     Lost(String),
-    AdminOnly(String),
-    DirectoryOnly(String),
+    AdminOnly(CauseClass, String),
+    DirectoryOnly(CauseClass, String),
 }
 
 impl RealmHealth {
@@ -787,8 +857,8 @@ impl RealmHealth {
             Self::Ready => "ready",
             Self::Unsettled(_) => "unsettled",
             Self::Lost(_) => "lost",
-            Self::AdminOnly(_) => "admin-only",
-            Self::DirectoryOnly(_) => "directory-only",
+            Self::AdminOnly(..) => "admin-only",
+            Self::DirectoryOnly(..) => "directory-only",
         }
     }
 
@@ -797,14 +867,14 @@ impl RealmHealth {
             Self::Disabled | Self::Ready => None,
             Self::Unsettled(cause)
             | Self::Lost(cause)
-            | Self::AdminOnly(cause)
-            | Self::DirectoryOnly(cause) => Some(cause),
+            | Self::AdminOnly(_, cause)
+            | Self::DirectoryOnly(_, cause) => Some(cause),
         }
     }
 
     /// What `/health` answers 200 for.
     pub fn healthy(&self) -> bool {
-        matches!(self, Self::Disabled | Self::Ready | Self::DirectoryOnly(_))
+        matches!(self, Self::Disabled | Self::Ready | Self::DirectoryOnly(..))
     }
 
     fn or_lost(self, lost: Option<String>) -> Self {
@@ -826,8 +896,14 @@ fn health_of(backend: &dyn KerberosSync) -> RealmHealth {
 }
 
 fn closed_health(backend: &dyn KerberosSync) -> RealmHealth {
-    let admins = backend.unavailable().map(RealmHealth::AdminOnly);
-    let everyone = || backend.directory_only().map(RealmHealth::DirectoryOnly);
+    let class = class_of(backend);
+    let admins = backend
+        .unavailable()
+        .map(|full| RealmHealth::AdminOnly(class, full));
+    let everyone = || {
+        let full = backend.directory_only();
+        full.map(|full| RealmHealth::DirectoryOnly(class, full))
+    };
     let stopped = || RealmHealth::Lost(KDC_NOT_SERVING.to_owned());
     admins.or_else(everyone).unwrap_or_else(stopped)
 }
@@ -845,7 +921,7 @@ pub fn public_cause(health: &RealmHealth) -> Option<String> {
         RealmHealth::Disabled | RealmHealth::Ready => return None,
         RealmHealth::Unsettled(_) => ANSWER_UNSETTLED,
         RealmHealth::Lost(_) => REALM_LOST,
-        RealmHealth::AdminOnly(_) | RealmHealth::DirectoryOnly(_) => REALM_NOT_OPEN,
+        RealmHealth::AdminOnly(class, _) | RealmHealth::DirectoryOnly(class, _) => class.text(),
     };
     Some(text.to_owned())
 }
@@ -1250,8 +1326,8 @@ mod tests {
             Option<&'static str>,
         );
         const AGAIN: &str = "Kerberos KDC unavailable: down; try again";
-        const CLOSED: &str = "Kerberos KDC unavailable: the Kerberos realm did not open; the \
-            server log has the cause; the change will be possible when this server's realm opens";
+        const CLOSED: &str = "Kerberos KDC unavailable: the realm's records did not open; the \
+            change will be possible when this server's realm opens";
         let down = || Some("down".to_owned());
         let refused = |said: &str| Err(said.to_owned());
         let rows: [Row; 3] = [
@@ -1411,6 +1487,7 @@ mod tests {
             Option<&'static str>,
         );
         let off = || Arc::new(NoopKerberos::default());
+        let not_open = Some(CauseClass::Records.text());
         let rows: [Row; 9] = [
             (off(), None, ("disabled", None, true), None),
             (off(), Some("gone"), ("disabled", None, true), None),
@@ -1437,13 +1514,13 @@ mod tests {
                 degraded(AdminOnly),
                 None,
                 ("admin-only", Some("down"), false),
-                Some(REALM_NOT_OPEN),
+                not_open,
             ),
             (
                 degraded(DirectoryOnly),
                 None,
                 ("directory-only", Some("down"), true),
-                Some(REALM_NOT_OPEN),
+                not_open,
             ),
             (
                 degraded(DirectoryOnly),
@@ -1460,6 +1537,59 @@ mod tests {
                 "lost: {lost:?}"
             );
         }
+    }
+
+    #[test]
+    #[serial]
+    fn test_each_cause_class_is_said_in_public_and_the_full_cause_kept_in_the_row() {
+        use CauseClass::{DataDirectory, Durability, KdcStart, NoRealm, Records, StartPass};
+        let full = "the stash /data/krb5kdc/.k5.EXAMPLE.COM is missing (3 records)";
+        let rows = [
+            (DataDirectory, "the Kerberos data directory cannot be used"),
+            (Records, "the realm's records did not open"),
+            (StartPass, "the start pass failed"),
+            (KdcStart, "the KDC did not start"),
+            (Durability, "the database's durability setting is unsafe"),
+            (NoRealm, "this database holds no Kerberos realm yet"),
+        ];
+        let answer = |text: &str| DomainError::KdcUnavailable(text.to_owned()).to_string();
+        let again = format!("{full}; try again");
+        for (class, said) in rows {
+            let told = format!("{said}; {OPENS_WITH_THE_REALM}");
+            let mut got = Vec::new();
+            for mode in [DegradedMode::AdminOnly, DegradedMode::DirectoryOnly] {
+                let realm = "EXAMPLE.COM".to_owned();
+                let closed = DegradedKerberos::with_mode(realm, full.to_owned(), mode);
+                let backend: Arc<dyn KerberosSync> = Arc::new(closed.closed_by(class));
+                let health = health_of(&*backend);
+                set_kerberos_backend(backend);
+                let refused = refusal_text(full, "try again");
+                got.push((
+                    health.cause().map(str::to_owned),
+                    public_cause(&health),
+                    refusal_row(answer(&refused)),
+                    refused,
+                ));
+            }
+            set_kerberos_backend(Arc::new(NoopKerberos::default()));
+            let shown = || (Some(full.to_owned()), Some(said.to_owned()));
+            let admins = (shown().0, shown().1, answer(&again), again.clone());
+            let everyone = (shown().0, shown().1, answer(full), told.clone());
+            assert_eq!(
+                (got, closed_to_writes(class)),
+                (vec![admins, everyone], told),
+                "{class:?}: the class to the door and /health, the full cause to the row"
+            );
+        }
+        let context = StartPass.said("the start pass of the Kerberos realm EXAMPLE.COM failed");
+        assert_eq!(
+            (context.class, context.to_string()),
+            (
+                StartPass,
+                "the start pass of the Kerberos realm EXAMPLE.COM failed".to_owned()
+            ),
+            "a classed context prints its own words alone"
+        );
     }
 
     #[test]

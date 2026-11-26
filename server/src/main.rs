@@ -49,8 +49,8 @@ use lldap_domain_handlers::enforcement::{
 };
 use lldap_domain_handlers::inactivity::REENABLED_BY_TOOL;
 use lldap_domain_handlers::kerberos::{
-    DegradedKerberos, DegradedMode, KerberosSync, NoopKerberos, kerberos_backend, kerberos_store,
-    set_kerberos_backend,
+    CauseClass, DegradedKerberos, DegradedMode, KerberosSync, NoopKerberos, kerberos_backend,
+    kerberos_store, set_kerberos_backend,
 };
 use lldap_domain_handlers::lockout::{UNLOCKED_BY_TOOL, lock_clock, lockout, start_lockout};
 use lldap_domain_handlers::logging::{self as rows, LogKind, event, record};
@@ -58,7 +58,7 @@ use lldap_domain_handlers::password::{
     PASSWORD_MIN_LENGTH, PasswordChangeError, PasswordSync, change_password_everywhere,
     min_length_for_user, password_rules,
 };
-use lldap_kerberos::boot::{RealmSettings, client_address, lockout_file_fault};
+use lldap_kerberos::boot::{RealmSettings, cause_class, client_address, lockout_file_fault};
 use lldap_kerberos::embedded::{EmbeddedKerberos, FOLLOW_EVERY, Opened, RealmThreads, Records};
 
 use lldap_domain_handlers::handler::{
@@ -99,7 +99,7 @@ const STAYS_ADMIN_ONLY: &str = "kerberos_options.on_realm_failure is directory-o
     server stays admin-only";
 const LOCKOUT_FILE_FAULT: &str =
     "the Kerberos lockout file is missing, unreadable or another realm's";
-const NO_REALM_ROW: &str = "this database holds no Kerberos realm yet";
+const NO_REALM_ROW: &str = CauseClass::NoRealm.text();
 const HOLD_UNANSWERED: &str = "whether this server holds the realm's row is not known";
 
 /// What a server whose realm did not open goes on serving and, where the configuration asked for
@@ -122,6 +122,14 @@ fn realm_fallback(
             Some(Err(e)) => stays(&format!("{HOLD_UNANSWERED}: {e}")),
             None => stays(HOLD_UNANSWERED),
         },
+    }
+}
+
+/// The class of the failure; where the holder says the database has no realm row, that instead.
+fn closed_class(failed: CauseClass, held: Option<&Result<bool, String>>) -> CauseClass {
+    match held {
+        Some(Ok(false)) => CauseClass::NoRealm,
+        _ => failed,
     }
 }
 
@@ -629,7 +637,7 @@ async fn set_up_server(
             let settings = config.kerberos_settings()?;
             let durable = warn_database_durability(&sql_pool)
                 .await
-                .context("while reading database durability");
+                .context(CauseClass::Durability.said("while reading database durability"));
             let records = Records {
                 handler: Arc::new(backend_handler.clone()),
                 policies: Arc::new(backend_handler.clone()),
@@ -651,9 +659,9 @@ async fn set_up_server(
                     let passing = format!("the start pass of the Kerberos realm {realm} failed");
                     let passes = async || {
                         let reconciled = reconcile_principals(&backend_handler, &embedded).await;
-                        reconciled.context(reconciling.clone())?;
+                        reconciled.context(CauseClass::StartPass.said(reconciling.clone()))?;
                         let passed = start_pass(&backend_handler, &embedded).await;
-                        passed.context(passing.clone())
+                        passed.context(CauseClass::StartPass.said(passing.clone()))
                     };
                     let with_realm = async |sync: PasswordSync| {
                         reset_with_realm(&backend_handler, &config, sync).await
@@ -668,12 +676,17 @@ async fn set_up_server(
                             bail!(RESTART_WITHOUT_FORCE);
                         }
                         None => match embedded.unavailable() {
-                            Some(lost) => Err(anyhow!("{lost}").context(format!(
-                                "the KDC of the Kerberos realm {realm} was not started"
-                            ))),
+                            Some(lost) => {
+                                Err(anyhow!("{lost}").context(CauseClass::KdcStart.said(format!(
+                                    "the KDC of the Kerberos realm {realm} was not started"
+                                ))))
+                            }
                             None => serve_realm(opened)
                                 .await
-                                .with_context(|| format!("the Kerberos realm {realm} did not open"))
+                                .with_context(|| {
+                                    let said = format!("the Kerberos realm {realm} did not open");
+                                    CauseClass::KdcStart.said(said)
+                                })
                                 .map(|threads| {
                                     let turns = embedded.follow_every(FOLLOW_EVERY);
                                     (threads.following(turns), embedded)
@@ -696,12 +709,12 @@ async fn set_up_server(
                         }
                     }
                     let configured = config.kerberos_options.on_realm_failure;
-                    let (mode, stays) = chosen_fallback(configured, &e).await;
+                    let (mode, stays, class) = chosen_fallback(configured, &e).await;
                     if let Some(why) = stays {
                         warn!("{why}");
                     }
                     let hosts = (&mut config.ldap_host, &mut config.http_host);
-                    serve_without_realm(hosts, &realm, cause, mode);
+                    serve_without_realm(hosts, &realm, (class, cause), mode);
                     (None, None)
                 }
             }
@@ -732,17 +745,20 @@ async fn realm_row_held() -> Result<bool, String> {
     }
 }
 
-/// `realm_fallback` for the failure `e`; the holder is asked only where its answer decides.
+/// `realm_fallback` for the failure `e`, and its cause's class; the holder is asked only where
+/// its answer decides.
 async fn chosen_fallback(
     configured: OnRealmFailure,
     e: &anyhow::Error,
-) -> (DegradedMode, Option<String>) {
+) -> (DegradedMode, Option<String>, CauseClass) {
     let lockout_fault = lockout_file_fault(e);
     let held = match configured == OnRealmFailure::DirectoryOnly && !lockout_fault {
         true => Some(realm_row_held().await),
         false => None,
     };
-    realm_fallback(configured, lockout_fault, held)
+    let class = closed_class(cause_class(e), held.as_ref());
+    let (mode, stays) = realm_fallback(configured, lockout_fault, held);
+    (mode, stays, class)
 }
 
 /// The stand-in for a realm that did not open. Admin-only moves the two listeners' hosts to
@@ -750,11 +766,11 @@ async fn chosen_fallback(
 fn serve_without_realm(
     (ldap_host, http_host): (&mut String, &mut String),
     realm: &str,
-    cause: String,
+    (class, cause): (CauseClass, String),
     mode: DegradedMode,
 ) {
     let degraded = DegradedKerberos::with_mode(realm.to_owned(), cause.clone(), mode);
-    set_kerberos_backend(Arc::new(degraded));
+    set_kerberos_backend(Arc::new(degraded.closed_by(class)));
     match mode {
         DegradedMode::AdminOnly => {
             *ldap_host = loopback(ldap_host);
@@ -1426,17 +1442,24 @@ mod tests {
         let _one = crate::auth_service::tests::ONE_BACKEND.blocking_lock();
         let down = || Some("down".to_owned());
         let rows = [
-            (DegradedMode::AdminOnly, ("127.0.0.1", "::1"), down(), None),
+            (
+                DegradedMode::AdminOnly,
+                CauseClass::NoRealm,
+                ("127.0.0.1", "::1"),
+                down(),
+                None,
+            ),
             (
                 DegradedMode::DirectoryOnly,
+                CauseClass::StartPass,
                 ("192.0.2.7", "2001:db8::7"),
                 None,
                 down(),
             ),
         ];
-        for (mode, hosts, unavailable, directory_only) in rows {
+        for (mode, class, hosts, unavailable, directory_only) in rows {
             let (mut ldap, mut http) = ("192.0.2.7".to_owned(), "2001:db8::7".to_owned());
-            let cause = "down".to_owned();
+            let cause = (class, "down".to_owned());
             serve_without_realm((&mut ldap, &mut http), "EXAMPLE.COM", cause, mode);
             let backend = kerberos_backend();
             set_kerberos_backend(Arc::new(NoopKerberos::default()));
@@ -1444,12 +1467,28 @@ mod tests {
                 (
                     (ldap.as_str(), http.as_str()),
                     backend.unavailable(),
-                    backend.directory_only()
+                    backend.directory_only(),
+                    backend.cause_class()
                 ),
-                (hosts, unavailable, directory_only),
+                (hosts, unavailable, directory_only, Some(class)),
                 "{mode:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_the_class_is_the_failures_unless_the_holder_says_no_realm_row() {
+        use CauseClass::{KdcStart, NoRealm};
+        let rows = [
+            (None, KdcStart),
+            (Some(Ok(true)), KdcStart),
+            (Some(Ok(false)), NoRealm),
+            (Some(Err("another server holds it".to_owned())), KdcStart),
+        ];
+        for (held, class) in rows {
+            assert_eq!(closed_class(KdcStart, held.as_ref()), class, "{held:?}");
+        }
+        assert_eq!(NO_REALM_ROW, "this database holds no Kerberos realm yet");
     }
 
     #[test]

@@ -1488,7 +1488,9 @@ pub(crate) mod tests {
         const OPENED: &str = "Opened-pass-1";
         const UNOPENED: &str = "the Kerberos password envelope did not open";
         const REFUSAL: &str = "password policy: min_length 40";
-        use lldap_test_utils::recording_kerberos::{DEGRADED_CAUSE, DegradedGuard, NotReadyGuard};
+        use lldap_test_utils::recording_kerberos::{
+            DEGRADED_CAUSE, DEGRADED_CLASS, DegradedGuard, NotReadyGuard,
+        };
         enum Kdc {
             Ready,
             Disabled,
@@ -1506,7 +1508,7 @@ pub(crate) mod tests {
         let closed = format!("Kerberos KDC unavailable: {DEGRADED_CAUSE}");
         let told = format!(
             "`Kerberos KDC unavailable: {}`",
-            closed_to_writes(DEGRADED_CAUSE)
+            closed_to_writes(DEGRADED_CLASS)
         );
         let refused = Kdc::Answering(Err(CommitError::Refused(REFUSAL.to_owned())));
         let changed = Kdc::Answering(Err(CommitError::Refused(SYNC_CHANGED.to_owned())));

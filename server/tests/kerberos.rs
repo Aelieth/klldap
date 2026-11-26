@@ -581,11 +581,12 @@ fn health(http: &Client, base: &str) -> (StatusCode, Value) {
 }
 
 const ON_REALM_FAILURE: &str = "LLDAP_KERBEROS_OPTIONS__ON_REALM_FAILURE";
-const NOT_OPEN: &str = "the Kerberos realm did not open; the server log has the cause";
+const KDC_NOT_STARTED: &str = "the KDC did not start";
+const NO_REALM_YET: &str = "this database holds no Kerberos realm yet";
 
-/// The body of `/health` for a realm that did not open: the state, and no path or count.
-fn closed(state: &str) -> Value {
-    json!({"kerberos": state, "cause": NOT_OPEN})
+/// The body of `/health` for a realm that did not open: the state and the class, no path or count.
+fn closed(state: &str, class: &str) -> Value {
+    json!({"kerberos": state, "cause": class})
 }
 
 fn ready() -> (StatusCode, Value) {
@@ -644,7 +645,10 @@ fn kerberos_closed_realm_admin_only() {
     let ldap_url = realm.fixture.ldap_url();
 
     let holder = realm.fixture.restart_after(|| hold_kdc(kdc_port));
-    let down = (StatusCode::SERVICE_UNAVAILABLE, closed("admin-only"));
+    let down = (
+        StatusCode::SERVICE_UNAVAILABLE,
+        closed("admin-only", KDC_NOT_STARTED),
+    );
     assert_eq!(health(&http, &base), down);
     assert_log_line(
         &realm.fixture,
@@ -659,7 +663,7 @@ fn kerberos_closed_realm_admin_only() {
     );
     assert!(
         check_text.contains(&format!(
-            "503 Service Unavailable: Kerberos is admin-only: {NOT_OPEN}"
+            "503 Service Unavailable: Kerberos is admin-only: {KDC_NOT_STARTED}"
         )),
         "{check_text}"
     );
@@ -738,7 +742,7 @@ fn kerberos_closed_realm_directory_only() {
     let ldap_url = realm.fixture.ldap_url();
 
     let holder = realm.fixture.restart_after(|| hold_kdc(kdc_port));
-    let serving = (StatusCode::OK, closed("directory-only"));
+    let serving = (StatusCode::OK, closed("directory-only", KDC_NOT_STARTED));
     assert_eq!(health(&http, &base), serving);
     assert_log_line(
         &realm.fixture,
@@ -1161,7 +1165,10 @@ fn kerberos_refuses_a_dump_whose_user_is_missing() {
     let base = realm.fixture.http_url();
     assert_eq!(
         health(&http, &base),
-        (StatusCode::SERVICE_UNAVAILABLE, closed("admin-only")),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            closed("admin-only", NO_REALM_YET)
+        ),
         "a database with no realm yet stays admin-only under the default on_realm_failure"
     );
     let info = gql(
@@ -1611,7 +1618,7 @@ fn kerberos_forced_reset_of_a_synced_admin() {
         turned_off(),
         warned(realm.fixture.server_log()),
     );
-    let open_to_all = (StatusCode::OK, closed("directory-only"));
+    let open_to_all = (StatusCode::OK, closed("directory-only", KDC_NOT_STARTED));
     assert_eq!(
         realm_closed,
         (open_to_all, 0, 49, 0, 1, 1),
@@ -1858,7 +1865,10 @@ fn kerberos_forced_reset_of_an_admin_without_sync_waits_for_the_realm() {
             resets() - before
         ),
         (
-            (StatusCode::SERVICE_UNAVAILABLE, closed("admin-only")),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                closed("admin-only", KDC_NOT_STARTED)
+            ),
             0,
             49,
             1

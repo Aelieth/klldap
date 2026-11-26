@@ -1184,10 +1184,10 @@ mod tests {
     #[serial]
     async fn test_a_synced_add_refused_for_the_realm_is_52_only_in_directory_only() {
         use lldap_domain_handlers::kerberos::closed_to_writes;
-        use lldap_test_utils::recording_kerberos::{DEGRADED_CAUSE, DegradedGuard};
+        use lldap_test_utils::recording_kerberos::{DEGRADED_CAUSE, DEGRADED_CLASS, DegradedGuard};
         let refused = |directory_only| {
             DomainError::KdcUnavailable(match directory_only {
-                true => closed_to_writes(DEGRADED_CAUSE),
+                true => closed_to_writes(DEGRADED_CLASS),
                 false => format!("{DEGRADED_CAUSE}; try again"),
             })
         };

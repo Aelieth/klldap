@@ -824,7 +824,8 @@ mod tests {
     #[serial_test::serial]
     async fn test_in_directory_only_a_plain_change_goes_on_and_a_synced_one_is_refused_first() {
         use crate::kerberos::{
-            DegradedKerberos, DegradedMode, NoopKerberos, closed_to_writes, set_kerberos_backend,
+            CauseClass, DegradedKerberos, DegradedMode, NoopKerberos, closed_to_writes,
+            set_kerberos_backend,
         };
         use std::sync::Arc;
         let bob = UserId::new("bob");
@@ -834,7 +835,7 @@ mod tests {
         );
         let (realm, cause) = ("EXAMPLE.COM".to_owned(), "down".to_owned());
         let closed = DegradedKerberos::with_mode(realm, cause, DegradedMode::DirectoryOnly);
-        set_kerberos_backend(Arc::new(closed));
+        set_kerberos_backend(Arc::new(closed.closed_by(CauseClass::KdcStart)));
         let (off, on, min) = (PasswordSync::Off, PasswordSync::On, PASSWORD_MIN_LENGTH);
         let plain = (
             change_password_everywhere(&Untouched, &bob, "Short-7", off, min).await,
@@ -860,7 +861,7 @@ mod tests {
             .iter()
             .map(|e| (e.kind, e.success, e.detail.clone().unwrap_or_default()))
             .collect();
-        let told = closed_to_writes("down");
+        let told = closed_to_writes(CauseClass::KdcStart);
         assert_eq!(
             (synced, logged, told.contains("down")),
             (

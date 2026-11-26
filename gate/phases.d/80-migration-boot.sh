@@ -258,8 +258,8 @@ for _ in $(seq 1 90); do
     sleep 1
 done
 # The key is at its default, directory-only, and this database has never held a realm: the server
-# stays admin-only and says why. /health names the state and the public cause, never the path.
-MIG_B_503="503 Service Unavailable: Kerberos is admin-only: the Kerberos realm did not open; the server log has the cause"
+# stays admin-only and says why. /health names the state and the cause's class, never the path.
+MIG_B_503="503 Service Unavailable: Kerberos is admin-only: this database holds no Kerberos realm yet"
 MIG_B_STAYS="kerberos_options.on_realm_failure is directory-only, but this server stays admin-only: this database holds no Kerberos realm yet"
 docker exec "$MIG_B" /app/lldap healthcheck --config-file /data/lldap_config.toml >"$D/branch-b-health.log" 2>&1
 mig_b_plain=$?

@@ -402,8 +402,9 @@ mod tests {
 
     #[actix_web::test]
     async fn test_health_names_the_state_and_keeps_the_full_cause_out_of_the_body() {
-        use lldap_domain_handlers::kerberos::{ANSWER_UNSETTLED, REALM_LOST, REALM_NOT_OPEN};
+        use lldap_domain_handlers::kerberos::{ANSWER_UNSETTLED, CauseClass, REALM_LOST};
         let full = || "stash /data/kerberos/.k5.EXAMPLE.COM, 3 records".to_owned();
+        let (records, kdc) = (CauseClass::Records, CauseClass::KdcStart);
         let rows = [
             (RealmHealth::Disabled, 200, None),
             (RealmHealth::Ready, 200, None),
@@ -413,11 +414,15 @@ mod tests {
                 Some(ANSWER_UNSETTLED),
             ),
             (RealmHealth::Lost(full()), 503, Some(REALM_LOST)),
-            (RealmHealth::AdminOnly(full()), 503, Some(REALM_NOT_OPEN)),
             (
-                RealmHealth::DirectoryOnly(full()),
+                RealmHealth::AdminOnly(records, full()),
+                503,
+                Some(records.text()),
+            ),
+            (
+                RealmHealth::DirectoryOnly(kdc, full()),
                 200,
-                Some(REALM_NOT_OPEN),
+                Some(kdc.text()),
             ),
         ];
         for (realm, status, cause) in rows {

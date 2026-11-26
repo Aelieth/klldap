@@ -271,7 +271,7 @@ pub mod tests {
         PASSWORD_CHANGE_IN_PROGRESS, RESULT_UNKNOWN, realm_not_ready,
     };
     use lldap_test_utils::recording_kerberos::{
-        DEGRADED_CAUSE, DegradedGuard, KerberosOp, RecordingGuard,
+        DEGRADED_CAUSE, DEGRADED_CLASS, DegradedGuard, KerberosOp, RecordingGuard,
     };
     use lldap_test_utils::{MockTestBackendHandler, setup_default_ldap_mock};
     use mockall::predicate::eq;
@@ -736,7 +736,7 @@ pub mod tests {
                 LdapResultCode::Unavailable,
                 format!(
                     "Kerberos KDC unavailable: {}",
-                    closed_to_writes(DEGRADED_CAUSE)
+                    closed_to_writes(DEGRADED_CLASS)
                 ),
             ),
             (

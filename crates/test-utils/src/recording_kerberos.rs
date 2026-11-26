@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use lldap_domain::types::UserId;
 use lldap_domain_handlers::kerberos::{
-    CommitError, DegradedKerberos, DegradedMode, Held, HostRow, KerberosSync, PasswordCommit,
-    UserChange, set_thread_kerberos_backend,
+    CauseClass, CommitError, DegradedKerberos, DegradedMode, Held, HostRow, KerberosSync,
+    PasswordCommit, UserChange, set_thread_kerberos_backend,
 };
 use lldap_domain_handlers::password::record_commit_failure;
 use std::sync::{Arc, Mutex};
@@ -271,6 +271,7 @@ impl Drop for NotReadyGuard {
 }
 
 pub const DEGRADED_CAUSE: &str = "the Kerberos realm did not open: test";
+pub const DEGRADED_CLASS: CauseClass = CauseClass::Records;
 
 pub struct DegradedGuard;
 
@@ -284,11 +285,9 @@ impl DegradedGuard {
     }
 
     fn installed(mode: DegradedMode) -> Self {
-        set_thread_kerberos_backend(Some(Arc::new(DegradedKerberos::with_mode(
-            RECORDER_REALM.to_owned(),
-            DEGRADED_CAUSE.to_owned(),
-            mode,
-        ))));
+        let degraded =
+            DegradedKerberos::with_mode(RECORDER_REALM.to_owned(), DEGRADED_CAUSE.to_owned(), mode);
+        set_thread_kerberos_backend(Some(Arc::new(degraded.closed_by(DEGRADED_CLASS))));
         Self
     }
 }

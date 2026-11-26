@@ -25,7 +25,7 @@ pub struct CliOpts {
 
     #[clap(
         long,
-        help = "Admin password, proved to the server by an OPAQUE login. With a second factor, the code is asked next"
+        help = "Admin password, proved to the server by an OPAQUE login. With a second factor, the code is taken from the environment variable LLDAP_ADMIN_TOTP_CODE when it is set, else asked next"
     )]
     pub admin_password: Option<String>,
 
@@ -130,7 +130,7 @@ fn login_once(
     base_url: &Url,
     username: &str,
     password: &str,
-    totp_code: Option<String>,
+    totp_code: Option<&str>,
 ) -> Result<(Finished, Option<String>)> {
     let (state, request) = login_start(username, password)?;
     let started = call_server(
@@ -144,7 +144,7 @@ fn login_once(
         login::finish_bound(state, password.as_bytes(), answer, &mut rand::rngs::OsRng)
             .context("Invalid username or password")?;
     let request = login::ClientLoginFinishRequest {
-        totp_code,
+        totp_code: totp_code.map(str::to_owned),
         ..request
     };
     let body = call_server(
@@ -160,11 +160,14 @@ fn sign_in(
     base_url: &Url,
     username: &str,
     password: &str,
-    ask_code: impl FnOnce() -> Result<String>,
+    ask_code: impl FnOnce() -> Result<Zeroizing<String>>,
 ) -> Result<SignedIn> {
     let (first, bound_key) = login_once(base_url, username, password, None)?;
     let (answer, bound_key) = match first {
-        Finished::CodeRequired => login_once(base_url, username, password, Some(ask_code()?))?,
+        Finished::CodeRequired => {
+            let code = ask_code()?;
+            login_once(base_url, username, password, Some(code.as_str()))?
+        }
         signed_in => (signed_in, bound_key),
     };
     let Finished::Token(token) = answer else {
@@ -173,12 +176,36 @@ fn sign_in(
     Ok(SignedIn::Login { token, bound_key })
 }
 
-fn read_code(admin: &str) -> Result<String> {
+fn read_code(admin: &str) -> Result<Zeroizing<String>> {
     eprint!("Code from {admin}'s authenticator: ");
     std::io::stderr().flush()?;
-    let mut code = String::new();
-    std::io::stdin().lock().read_line(&mut code)?;
-    Ok(code.trim().to_owned())
+    let mut line = Zeroizing::new(String::new());
+    std::io::stdin().lock().read_line(&mut line)?;
+    Ok(line)
+}
+
+const ADMIN_TOTP_CODE: &str = "LLDAP_ADMIN_TOTP_CODE";
+
+/// LLDAP_ADMIN_TOTP_CODE when it is set, six ASCII digits; else the line `ask` reads, as typed.
+fn admin_code(
+    set: Option<Zeroizing<String>>,
+    ask: impl FnOnce() -> Result<Zeroizing<String>>,
+) -> Result<Zeroizing<String>> {
+    let Some(value) = set else {
+        return Ok(Zeroizing::new(ask()?.trim().to_owned()));
+    };
+    let code = value.trim();
+    ensure!(
+        code.len() == 6 && code.bytes().all(|b| b.is_ascii_digit()),
+        "{ADMIN_TOTP_CODE} is not a six-digit code"
+    );
+    Ok(Zeroizing::new(code.to_owned()))
+}
+
+/// LLDAP_ADMIN_TOTP_CODE, read once; a value that is not Unicode reads as empty.
+fn admin_code_set() -> Option<Zeroizing<String>> {
+    let value = env::var_os(ADMIN_TOTP_CODE)?;
+    Some(Zeroizing::new(value.into_string().unwrap_or_default()))
 }
 
 fn call_server(url: Url, token: Option<&str>, body: impl Serialize) -> Result<String> {
@@ -262,7 +289,7 @@ fn main() -> Result<()> {
         (Some(token), _) => SignedIn::Token(token.clone()),
         (None, Some(admin_password)) => {
             let admin = &opts.admin_username;
-            let ask_code = || read_code(admin);
+            let ask_code = || admin_code(admin_code_set(), || read_code(admin));
             sign_in(&opts.base_url, admin, admin_password, ask_code).context("While logging in")?
         }
         (None, None) => bail!("Either the token or the admin password is required"),
@@ -435,6 +462,68 @@ mod tests {
         for (body, expected) in rows {
             let got = finished(body).map_err(|e| e.to_string());
             assert_eq!(got, expected.map_err(str::to_owned), "{body}");
+        }
+    }
+
+    #[test]
+    fn test_the_admins_code_is_taken_from_the_variable_when_it_is_set_else_asked() {
+        const SET_NOT_SIX: &str = "LLDAP_ADMIN_TOTP_CODE is not a six-digit code";
+        type Row = (
+            &'static str,
+            Option<&'static str>,
+            &'static str,
+            Result<&'static str, &'static str>,
+            bool,
+        );
+        const LINE: &str = "654321\n";
+        let rows: [Row; 8] = [
+            ("set", Some("123456"), LINE, Ok("123456"), false),
+            (
+                "set, spaces around",
+                Some(" 123456 "),
+                LINE,
+                Ok("123456"),
+                false,
+            ),
+            ("unset", None, LINE, Ok("654321"), true),
+            ("unset, typed as it is", None, "65432 \n", Ok("65432"), true),
+            ("set and empty", Some(""), LINE, Err(SET_NOT_SIX), false),
+            (
+                "set, five digits",
+                Some("12345"),
+                LINE,
+                Err(SET_NOT_SIX),
+                false,
+            ),
+            (
+                "set, not digits",
+                Some("12345a"),
+                LINE,
+                Err(SET_NOT_SIX),
+                false,
+            ),
+            (
+                "set, with a password",
+                Some("Pass-1:123456"),
+                LINE,
+                Err(SET_NOT_SIX),
+                false,
+            ),
+        ];
+        for (row, set, typed, expected, asks) in rows {
+            let asked = std::cell::Cell::new(false);
+            let ask = || -> Result<Zeroizing<String>> {
+                asked.set(true);
+                Ok(Zeroizing::new(typed.to_owned()))
+            };
+            let set = set.map(|value| Zeroizing::new(value.to_owned()));
+            let code: Result<Zeroizing<String>> = admin_code(set, ask);
+            let got = code
+                .as_deref()
+                .map(String::as_str)
+                .map_err(|e| e.to_string());
+            let expected = expected.map_err(str::to_owned);
+            assert_eq!((got, asked.get()), (expected, asks), "{row}");
         }
     }
 

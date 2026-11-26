@@ -97,8 +97,10 @@ whole finish from `lldap_auth::kerberos_envelope::finish_with_envelope`.
 
 `lldap_set_password` given `--admin-password` signs in at `/auth/opaque/login/start` and
 `/finish` as the web login does, so the admin's password does not reach the server; for an
-admin with a second factor it reads the code from its terminal (one line of standard input)
-and signs in again with it, and an admin who must still enroll one is refused, as before. That
+admin with a second factor it takes the code from the environment variable
+`LLDAP_ADMIN_TOTP_CODE` when that is set (six digits, or the tool stops before it signs in
+again), else reads it from its terminal (one line of standard input), and signs in again with
+it, and an admin who must still enroll one is refused, as before. That
 login asks for the envelope key, and the tool seals a synced user's new password only to the
 key the login bound. Given `--token`, it seals to the key as the start answers it; nothing
 binds the key then, so give it an `https://` URL. A script asks for the key with

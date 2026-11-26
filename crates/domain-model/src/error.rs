@@ -1,5 +1,8 @@
 use thiserror::Error;
 
+/// What a read or a write given up at its bound answers, and the row detail that says so.
+pub const NOT_ANSWERED: &str = "the database did not answer in time";
+
 #[allow(clippy::enum_variant_names)]
 #[derive(Error, Debug)]
 pub enum DomainError {
@@ -23,6 +26,9 @@ pub enum DomainError {
     KdcUnavailable(String),
     #[error("Server busy: {0}")]
     Busy(String),
+    /// Given up at its bound, by the server's timer or the database's own.
+    #[error("{}", NOT_ANSWERED)]
+    NotAnswered,
     #[error("Internal error: `{0}`")]
     InternalError(String),
 }

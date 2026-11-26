@@ -1,4 +1,3 @@
-use crate::enforcement::POLICY_UNANSWERED;
 use crate::handler::PolicyBackendHandler;
 use crate::instant::Timestamp;
 use crate::kerberos::{
@@ -112,10 +111,9 @@ pub async fn min_length_for_ou_key(
 async fn within_the_bound<T>(
     read: impl std::future::Future<Output = Result<T, DomainError>>,
 ) -> Result<T, DomainError> {
-    let unanswered = || DomainError::InternalError(POLICY_UNANSWERED.to_owned());
     tokio::time::timeout(POLICY_READ_WAIT, read)
         .await
-        .map_err(|_| unanswered())?
+        .map_err(|_| DomainError::NotAnswered)?
 }
 
 pub fn min_length_in(items: &[EffectiveItem]) -> Result<usize, DomainError> {
@@ -1481,7 +1479,6 @@ mod tests {
     }
 
     mod stalled {
-        use crate::enforcement::POLICY_UNANSWERED;
         use crate::handler::PolicyBackendHandler;
         use crate::policies::{
             CreatePolicyRequest, OuPolicyState, Policy, PolicyId, PolicyLevel, UpdatePolicyRequest,
@@ -1502,12 +1499,11 @@ mod tests {
 
         impl Stalled {
             async fn answer(&self) -> DomainError {
-                let detail = match self.0 {
+                match self.0 {
                     Answer::Never => std::future::pending().await,
-                    Answer::ItsOwnBound => POLICY_UNANSWERED,
-                    Answer::Down => "down",
-                };
-                DomainError::InternalError(detail.to_owned())
+                    Answer::ItsOwnBound => DomainError::NotAnswered,
+                    Answer::Down => DomainError::InternalError("down".to_owned()),
+                }
             }
         }
 
@@ -1582,8 +1578,7 @@ mod tests {
     async fn test_a_minimum_read_past_its_bound_refuses_each_door_with_its_one_row() {
         use stalled::Answer::{Down, ItsOwnBound, Never};
         const UNREADABLE: &str = "the password policy could not be read; try again";
-        const UNANSWERED: &str =
-            "Internal error: `the policy read did not answer within its bound`";
+        use lldap_domain_model::error::NOT_ANSWERED;
         const DOWN: &str = "Internal error: `down`";
         const WITHIN: std::time::Duration = std::time::Duration::from_secs(4);
         type Door = (&'static str, Caller, Option<LogKind>);
@@ -1612,7 +1607,7 @@ mod tests {
                 let (text, written) = match (kind, answer) {
                     (Some(kind), _) => (UNREADABLE, vec![(kind, false, Some(UNREADABLE.into()))]),
                     (None, Down) => (DOWN, vec![]),
-                    (None, _) => (UNANSWERED, vec![]),
+                    (None, _) => (NOT_ANSWERED, vec![]),
                 };
                 let waited = (answer == Never, true);
                 want.push((door, answer, Err(text.to_owned()), written, waited));

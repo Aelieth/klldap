@@ -1,12 +1,11 @@
-use crate::enforcement::{
-    ALLOWED_NETWORKS, Attempt, Door, ItemCheck, POLICY_UNANSWERED, PolicyCache, UserState,
-};
+use crate::enforcement::{ALLOWED_NETWORKS, Attempt, Door, ItemCheck, PolicyCache, UserState};
 use crate::handler::PolicyBackendHandler;
 use crate::logging;
 use crate::policies::{
     POLICY_ITEM_CATALOG, POLICY_READ_WAIT, Policy, PolicyLevel, ou_display, resolve_effective_items,
 };
 use lldap_domain::types::UserId;
+use lldap_domain_model::error::NOT_ANSWERED;
 use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
@@ -249,7 +248,7 @@ where
             return Vec::new();
         }
         Err(_) => {
-            warn!("The list that applies to {author} was not read: {POLICY_UNANSWERED}");
+            warn!("The list that applies to {author} was not read: {NOT_ANSWERED}");
             return Vec::new();
         }
     };

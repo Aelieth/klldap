@@ -24,7 +24,9 @@ use lldap_auth::{
     login, password_reset, registration,
 };
 use lldap_domain::types::{GroupDetails, GroupName, LoginOutcome, UserId, kerberos_sync_enabled};
-use lldap_domain_handlers::enforcement::{Attempt, Door, admit, door_read, refuse_unreadable};
+use lldap_domain_handlers::enforcement::{
+    Attempt, Door, admit, door_read, gave_up, refuse_unreadable,
+};
 use lldap_domain_handlers::handler::{
     BackendHandler, BindRequest, LoginHandler, MfaBackendHandler, PolicyBackendHandler,
     UserRequestFilter,
@@ -40,7 +42,10 @@ use lldap_domain_handlers::password::{
     record_failed, refuse_unfinishable,
 };
 use lldap_domain_handlers::warn_limited;
-use lldap_domain_model::{error::DomainError, model::UserColumn};
+use lldap_domain_model::{
+    error::{DomainError, NOT_ANSWERED},
+    model::UserColumn,
+};
 use lldap_graphql_server::{open_password_envelope, public_key_der_base64};
 use lldap_opaque_handler::OpaqueHandler;
 use sha2::{Digest, Sha256, Sha512};
@@ -63,6 +68,9 @@ const SESSION_TOKEN_SECS: i64 = 86_400;
 const RESET_TOKEN_SECS: i64 = 300;
 const INVALID_JWT: &str = "Invalid JWT";
 const RESET_TOKEN_ELSEWHERE: &str = "a reset token is taken only to set its user's password";
+const WRONG_RESET_TOKEN: &str = "wrong or expired reset token";
+const GROUPS_UNREADABLE: &str = "groups: unreadable";
+const RESET_TOKEN_UNREADABLE: &str = "reset token: unreadable";
 
 fn default_hash<T: Hash + ?Sized>(token: &T) -> u64 {
     use std::collections::hash_map::DefaultHasher;
@@ -171,7 +179,7 @@ where
     if !path.ends_with('/') {
         path.push('/');
     };
-    if account_is_disabled(&data, &user).await {
+    if account_is_disabled(&data, &user).await? {
         logging::record_as(
             Some(&user),
             LogKind::TokenRefresh,
@@ -356,14 +364,7 @@ where
         .await
         .map_err(|e| {
             debug!("Reset token error: {e:#}");
-            logging::record_as(
-                None,
-                LogKind::PasswordResetComplete,
-                None,
-                false,
-                Some("wrong or expired reset token"),
-            );
-            TcpError::NotFoundError("Wrong or expired reset token".to_owned())
+            reset_token_refused(e)
         })?;
     let _ = data
         .get_tcp_handler()
@@ -403,6 +404,28 @@ where
             user_id: user_id.to_string(),
             token: token.as_str().to_owned(),
         }))
+}
+
+/// A token the table does not hold is a wrong one; a read that failed is answered as itself.
+fn reset_token_refused(e: DomainError) -> TcpError {
+    let (detail, answer) = match e {
+        DomainError::EntityNotFound(_) => (
+            WRONG_RESET_TOKEN,
+            TcpError::NotFoundError("Wrong or expired reset token".to_owned()),
+        ),
+        e => (unread_detail(&e, RESET_TOKEN_UNREADABLE), e.into()),
+    };
+    let kind = LogKind::PasswordResetComplete;
+    logging::record_as(None, kind, None, false, Some(detail));
+    answer
+}
+
+/// A failed read's row detail: the read given up at its bound, else the one that failed.
+fn unread_detail(e: &DomainError, unreadable: &'static str) -> &'static str {
+    match gave_up(e) {
+        true => NOT_ANSWERED,
+        false => unreadable,
+    }
 }
 
 async fn get_password_reset_step2_handler<Backend>(
@@ -1034,13 +1057,11 @@ where
 async fn account_is_disabled<Backend: BackendHandler>(
     state: &AppState<Backend>,
     user: &UserId,
-) -> bool {
-    match door_read(state.get_readonly_handler().get_user_groups(user)).await {
-        Ok(groups) => groups
-            .iter()
-            .any(|g| g.display_name == "lldap_disabled".into()),
-        Err(_) => true,
-    }
+) -> Result<bool, DomainError> {
+    let groups = door_read(state.get_readonly_handler().get_user_groups(user)).await?;
+    Ok(groups
+        .iter()
+        .any(|g| g.display_name == "lldap_disabled".into()))
 }
 
 /// A token's use at GraphQL, where a reset token is answered as an invalid one.
@@ -1098,15 +1119,19 @@ async fn checked_token<Backend: BackendHandler + OpaqueHandler>(
         );
         return Err(ErrorUnauthorized("JWT was logged out"));
     }
-    if account_is_disabled(state, &user).await {
+    let refused = match account_is_disabled(state, &user).await {
+        Ok(disabled) => disabled.then_some("Account disabled"),
+        Err(e) => Some(unread_detail(&e, GROUPS_UNREADABLE)),
+    };
+    if let Some(detail) = refused {
         logging::record_as(
             Some(&user),
             LogKind::AccessDenied,
             None,
             false,
-            Some("Account disabled"),
+            Some(detail),
         );
-        return Err(ErrorUnauthorized("Account disabled"));
+        return Err(ErrorUnauthorized(detail));
     }
     let validation = state.backend_handler.get_permissions_from_groups(
         user,
@@ -3981,15 +4006,15 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial]
     async fn test_a_policy_read_error_refuses_the_refresh_and_the_token_with_one_row() {
-        use lldap_domain_handlers::enforcement::POLICY_UNANSWERED;
         use lldap_test_utils::recording_log::LogGuard;
         let _backend = ONE_BACKEND.lock().await;
         let log = LogGuard::install_on_this_thread();
         let _guard = EnforcementGuard::allowing(&["k2http"], "login-hours");
-        let rows = [
-            (Door::Refresh, "canceling statement due to lock timeout"),
-            (Door::TokenUse, POLICY_UNANSWERED),
-        ];
+        type Cause = fn() -> DomainError;
+        let locked: Cause =
+            || DomainError::InternalError("canceling statement due to lock timeout".to_owned());
+        let given_up: Cause = || DomainError::NotAnswered;
+        let rows = [(Door::Refresh, locked), (Door::TokenUse, given_up)];
         for (n, (door, cause)) in rows.into_iter().enumerate() {
             let mut mock = MockTestBackendHandler::new();
             mock.expect_get_user_groups()
@@ -3997,7 +4022,7 @@ pub(crate) mod tests {
             mock.expect_bounded_policy_entry()
                 .with(eq(UserId::new("k2http")))
                 .times(1)
-                .returning(move |_| Err(DomainError::InternalError(cause.to_owned())));
+                .returning(move |_| Err(cause()));
             let state = app_state(mock);
             let peer = format!("192.0.2.{}", 80 + n);
             let meta = RequestMeta::http(Some(peer.parse().unwrap()), None);
@@ -4153,41 +4178,197 @@ pub(crate) mod tests {
         let answers = tokio::time::timeout(POLICY_READ_WAIT * 2, doors).await;
         let took = clock.elapsed();
         connection.rollback().await.unwrap();
-        let statuses = answers.map(|(refresh, logout, used, asked, reset)| {
-            let used = match used {
-                Ok(_) => 200,
-                Err(e) => e.as_response_error().status_code().as_u16(),
-            };
-            let answered = [refresh, logout, asked, reset].map(|answer| answer.status().as_u16());
-            (answered, used)
-        });
+        let (refresh, logout, used, asked, reset) = answers.expect("each door answers");
+        let used = match used {
+            Ok(_) => 200,
+            Err(e) => e.as_response_error().status_code().as_u16(),
+        };
+        let mut bodies = Vec::new();
+        for response in [refresh, logout, asked, reset] {
+            let (status, body) = answered(response).await;
+            let said = String::from_utf8_lossy(&body).contains(NOT_ANSWERED);
+            bodies.push((status, said));
+        }
         let events = log.recorder().take_events().into_iter();
         let mut rows: Vec<_> = events
-            .map(|e| (e.detail, e.kind, e.success, e.actor))
+            .map(|e| (e.actor, e.kind, e.success, e.detail))
             .collect();
         rows.sort_by_key(|row| row.0.clone());
-        let row = |detail: &str, kind, actor: Option<&str>| {
+        let row = |actor: Option<&str>, kind| {
             let actor = actor.map(str::to_owned);
-            (Some(detail.to_owned()), kind, false, actor)
+            (actor, kind, false, Some(NOT_ANSWERED.to_owned()))
         };
         assert_eq!(
-            (statuses.ok(), took >= POLICY_READ_WAIT, rows),
+            (bodies, used, took >= POLICY_READ_WAIT, rows),
             (
-                Some(([500, 500, 500, 404], 401)),
+                vec![(500, true); 4],
+                401,
                 true,
                 vec![
-                    row("Account disabled", LogKind::AccessDenied, Some("r1door")),
-                    row(
-                        "wrong or expired reset token",
-                        LogKind::PasswordResetComplete,
-                        None
-                    )
+                    row(None, LogKind::PasswordResetComplete),
+                    row(Some("r1door"), LogKind::AccessDenied),
                 ]
             ),
-            "the one connection held: the refresh, the logout and the reset request answer 500 \
-             with no row; the reset finish its 404 and a token's use its 401, each with the row \
-             of its failed read"
+            "the one connection held: the refresh, the logout, the reset request and the reset \
+             finish answer 500 in the words of a read given up at its bound, the last with its \
+             row; a token's use its 401 and its row in the same words"
         );
+    }
+
+    fn in_group(name: &str) -> HashSet<GroupDetails> {
+        let epoch = chrono::DateTime::from_timestamp(0, 0).unwrap().naive_utc();
+        HashSet::from([GroupDetails {
+            group_id: lldap_domain::types::GroupId(2),
+            display_name: name.into(),
+            creation_date: epoch,
+            modified_date: epoch,
+            uuid: lldap_domain::types::Uuid::from_name_and_date(name, &epoch),
+            attributes: Vec::new(),
+        }])
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_failed_read_of_the_disabled_state_is_answered_in_its_own_words() {
+        use lldap_test_utils::recording_log::LogGuard;
+        let _backend = ONE_BACKEND.lock().await;
+        let log = LogGuard::install_on_this_thread();
+        let _guard = EnforcementGuard::none();
+        type Groups = fn() -> DomainResult<HashSet<GroupDetails>>;
+        let disabled: Groups = || Ok(in_group("lldap_disabled"));
+        let given_up: Groups = || Err(DomainError::NotAnswered);
+        let failed: Groups = || Err(DomainError::InternalError("down".to_owned()));
+        type Answer = (u16, Vec<(LogKind, Option<String>)>);
+        let refused = |status: u16, kind: LogKind, detail: &str| {
+            (status, vec![(kind, Some(detail.to_owned()))])
+        };
+        let (used, refreshed) = (LogKind::AccessDenied, LogKind::TokenRefresh);
+        let rows: [(&str, Groups, Answer, Answer); 3] = [
+            (
+                "the account is disabled",
+                disabled,
+                refused(401, used, "Account disabled"),
+                refused(401, refreshed, "account disabled"),
+            ),
+            (
+                "the read was given up at its bound",
+                given_up,
+                refused(401, used, NOT_ANSWERED),
+                (500, vec![]),
+            ),
+            (
+                "the read failed",
+                failed,
+                refused(401, used, GROUPS_UNREADABLE),
+                (500, vec![]),
+            ),
+        ];
+        for (n, (label, groups, at_use, at_refresh)) in rows.into_iter().enumerate() {
+            let mut mock = MockTestBackendHandler::new();
+            mock.expect_get_user_groups().returning(move |_| groups());
+            let state = app_state(mock);
+            let token = session_token(&state.jwt_key, "e2gone");
+            let mut got = Vec::new();
+            for door in [Door::TokenUse, Door::Refresh] {
+                let side = usize::from(door == Door::Refresh);
+                let peer = format!("192.0.2.{}", 120 + 2 * n + side);
+                let meta = RequestMeta::http(Some(peer.parse().unwrap()), None);
+                let status = with_request(meta, async {
+                    if door == Door::Refresh {
+                        let request = actix_web::test::TestRequest::get()
+                            .insert_header(("refresh-token", "e2-refresh+e2gone"))
+                            .to_http_request();
+                        let response = get_refresh_handler(state.clone(), request).await;
+                        return response.status().as_u16();
+                    }
+                    match check_if_token_is_valid(&state, &token).await {
+                        Ok(_) => 200,
+                        Err(e) => e.as_response_error().status_code().as_u16(),
+                    }
+                })
+                .await;
+                let events = log.recorder().take_events().into_iter();
+                let rows: Vec<_> = events
+                    .filter(|e| e.peer.as_deref() == Some(peer.as_str()))
+                    .map(|e| (e.kind, e.detail))
+                    .collect();
+                got.push((status, rows));
+            }
+            assert_eq!(
+                got,
+                vec![at_use, at_refresh],
+                "{label}: a token's use refuses with its row in the read's own words; a refresh \
+                 answers a failed read as its other reads, 500 and no row"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_a_reset_finish_answers_a_wrong_token_and_a_failed_read_each_in_its_own_words() {
+        use actix_web::test::TestRequest;
+        use lldap_test_utils::recording_log::LogGuard;
+        use sea_orm::{ConnectionTrait, Statement, TransactionTrait};
+        #[derive(Clone, Copy, PartialEq)]
+        enum TokenRead {
+            Answers,
+            Held,
+            Fails,
+        }
+        let _backend = ONE_BACKEND.lock().await;
+        let handler = sql_handler_with(&[]).await;
+        let pool = handler.pool().clone();
+        let state = app_state(handler);
+        let log = LogGuard::install_on_this_thread();
+        let rows = [
+            (
+                "a token the table does not hold",
+                TokenRead::Answers,
+                404,
+                WRONG_RESET_TOKEN,
+            ),
+            (
+                "the read given up at its bound",
+                TokenRead::Held,
+                500,
+                NOT_ANSWERED,
+            ),
+            (
+                "the read failed",
+                TokenRead::Fails,
+                500,
+                RESET_TOKEN_UNREADABLE,
+            ),
+        ];
+        let (mut got, mut want) = (Vec::new(), Vec::new());
+        for (label, read, status, detail) in rows {
+            if read == TokenRead::Fails {
+                let backend = pool.get_database_backend();
+                let gone = "DROP TABLE password_reset_tokens".to_owned();
+                pool.execute(Statement::from_string(backend, gone))
+                    .await
+                    .unwrap();
+            }
+            let held = match read {
+                TokenRead::Held => Some(pool.begin().await.unwrap()),
+                _ => None,
+            };
+            let request = TestRequest::get().param("token", "e2-no-such-token");
+            let request = request.to_http_request();
+            let response = get_password_reset_step2_handler(state.clone(), request).await;
+            if let Some(connection) = held {
+                connection.rollback().await.unwrap();
+            }
+            let (answer, body) = answered(response).await;
+            let said = String::from_utf8_lossy(&body).contains(NOT_ANSWERED);
+            let events = log.recorder().take_events().into_iter();
+            let written: Vec<_> = events.map(|e| (e.kind, e.success, e.detail)).collect();
+            got.push((label, answer, said, written));
+            let kind = LogKind::PasswordResetComplete;
+            let row = (kind, false, Some(detail.to_owned()));
+            want.push((label, status, read == TokenRead::Held, vec![row]));
+        }
+        assert_eq!(got, want);
     }
 
     #[tokio::test]

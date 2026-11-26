@@ -131,6 +131,7 @@ pub(crate) fn error_to_http_response(error: TcpError) -> HttpResponse {
             DomainError::DatabaseError(_)
             | DomainError::DatabaseTransactionError(_)
             | DomainError::InternalError(_)
+            | DomainError::NotAnswered
             | DomainError::UnknownCryptoError(_) => {
                 warn_limited!("A request was answered with an internal error: {de}");
                 HttpResponse::InternalServerError()
@@ -478,13 +479,20 @@ mod tests {
         let refusal: Failure = || DomainError::AuthenticationError("for bob".to_owned());
         let fault: Failure = || DomainError::InternalError("the database is away".to_owned());
         let busy: Failure = || DomainError::Busy("no permit".to_owned());
-        for (failure, status, said) in [(refusal, 401, 0), (fault, 500, BUDGET), (busy, 503, 0)] {
+        let given_up: Failure = || DomainError::NotAnswered;
+        let rows = [
+            (refusal, 401, 0),
+            (fault, 500, BUDGET),
+            (busy, 503, 0),
+            (given_up, 500, BUDGET),
+        ];
+        for (failure, status, said) in rows {
             let (lines, _guard) = Lines::capture();
             for _ in 0..100 {
                 let response = error_to_http_response(TcpError::DomainError(failure()));
                 assert_eq!(response.status().as_u16(), status);
             }
-            assert_eq!(lines.take_loud().len(), said, "{status}");
+            assert_eq!(lines.take_loud().len(), said, "{}", failure());
         }
     }
 }

@@ -52,7 +52,6 @@ const FLAG_ON: u8 = 1;
 const FLAG_UNKNOWN: u8 = 2;
 pub const UNREADABLE: &str = "unreadable";
 pub const NOT_LOADED: &str = "not loaded yet";
-pub const POLICY_UNANSWERED: &str = "the policy read did not answer within its bound";
 pub const LOGIN_HOURS: &str = "login-hours";
 pub const ALLOWED_NETWORKS: &str = "allowed-networks";
 pub const INACTIVITY_DAYS: &str = "inactivity-days";
@@ -60,9 +59,9 @@ const GATED: [&str; 3] = [LOGIN_HOURS, ALLOWED_NETWORKS, INACTIVITY_DAYS];
 pub const ZONE_FILES: &str = "/usr/share/zoneinfo";
 pub const BUILT_IN: &str = "built in";
 
-/// A read that gave up within its bound, by the client's timer or the database's own.
+/// A read or a write given up at its bound, by the client's timer or the database's own.
 pub fn gave_up(e: &DomainError) -> bool {
-    matches!(e, DomainError::InternalError(detail) if detail == POLICY_UNANSWERED)
+    matches!(e, DomainError::NotAnswered)
 }
 
 tokio::task_local! {
@@ -1020,10 +1019,9 @@ pub fn policy_cache() -> &'static PolicyCache {
 
 /// A fill has no bound on its length: each of its reads answers within its own, or it fails.
 pub(crate) async fn bounded<T>(wait: Duration, read: impl Future<Output = Result<T>>) -> Result<T> {
-    let unanswered = DomainError::InternalError(POLICY_UNANSWERED.to_owned());
     tokio::time::timeout(wait, read)
         .await
-        .map_err(|_| unanswered)?
+        .map_err(|_| DomainError::NotAnswered)?
 }
 
 /// A door's read, its connection's acquire included, under `POLICY_READ_WAIT`; one that gives up
@@ -1055,8 +1053,7 @@ where
     H: UserBackendHandler + PolicyBackendHandler + ?Sized,
 {
     let read = tokio::time::timeout(POLICY_READ_WAIT, handler.bounded_policy_entry(user));
-    let unanswered = DomainError::InternalError(POLICY_UNANSWERED.to_owned());
-    let (details, levels) = read.await.map_err(|_| unanswered)??;
+    let (details, levels) = read.await.map_err(|_| DomainError::NotAnswered)??;
     let ou_key = canonical_ou_key(&user_ou(&details.attributes));
     let items = resolve_effective_items(POLICY_ITEM_CATALOG, &levels).into();
     Ok((ou_key, items, details))
@@ -1865,6 +1862,7 @@ mod tests {
     use chrono::DateTime;
     use lldap_domain::requests::{CreateUserRequest, UpdateGroupRequest};
     use lldap_domain::types::{Attribute, Group, GroupDetails, GroupId, User, UserAndGroups, Uuid};
+    use lldap_domain_model::error::NOT_ANSWERED;
     use lldap_schema::PublicSchema;
     use pretty_assertions::assert_eq;
     use std::collections::{BTreeMap, HashSet};
@@ -2874,7 +2872,7 @@ mod tests {
             self.entry_reads.fetch_add(1, Ordering::Relaxed);
             match self.policy_read.load(Ordering::Relaxed) {
                 NO_ANSWER => std::future::pending().await,
-                LOCK_ERROR => Err(DomainError::InternalError(POLICY_UNANSWERED.to_owned())),
+                LOCK_ERROR => Err(DomainError::NotAnswered),
                 DOWN => Err(DomainError::InternalError("down".to_owned())),
                 _ => {
                     let details = self.get_user_details(user).await?;
@@ -3814,9 +3812,9 @@ mod tests {
         let directory = Directory::knowing(&[STALLED]);
         let stalled = UserId::new(STALLED);
         let rows = [
-            (NO_ANSWER, POLICY_UNANSWERED, true),
-            (LOCK_ERROR, POLICY_UNANSWERED, false),
-            (DOWN, "down", false),
+            (NO_ANSWER, NOT_ANSWERED, true),
+            (LOCK_ERROR, NOT_ANSWERED, false),
+            (DOWN, "Internal error: `down`", false),
         ];
         for (answer, error, waits) in rows {
             directory.policy_read.store(answer, Ordering::Relaxed);
@@ -3829,7 +3827,7 @@ mod tests {
                     took >= POLICY_READ_WAIT,
                     took < WITHIN
                 ),
-                (Err(format!("Internal error: `{error}`")), waits, true),
+                (Err(error.to_owned()), waits, true),
                 "{answer}"
             );
         }
@@ -5112,7 +5110,7 @@ mod tests {
     async fn test_a_door_read_answers_in_time_or_is_given_up_at_its_bound_as_a_failed_read() {
         let inside = POLICY_READ_WAIT - Duration::from_millis(1);
         let down = || Err("Internal error: `down`".to_owned());
-        let unanswered = Err(format!("Internal error: `{POLICY_UNANSWERED}`"));
+        let unanswered = Err(NOT_ANSWERED.to_owned());
         type Row = (
             &'static str,
             Option<Duration>,
@@ -5173,12 +5171,7 @@ mod tests {
                 took < WITHIN,
                 next.is_ok_and(|state| state.is_some())
             ),
-            (
-                Ok(Err(format!("Internal error: `{POLICY_UNANSWERED}`"))),
-                true,
-                true,
-                true
-            ),
+            (Ok(Err(NOT_ANSWERED.to_owned())), true, true, true),
             "the door's lock read is given up at the bound; the next sign-in reads the row"
         );
     }

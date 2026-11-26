@@ -3282,6 +3282,38 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn test_an_outage_of_the_counts_is_said_in_the_words_of_its_write() {
+        use crate::logging::capture::Lines;
+        use lldap_domain_model::error::NOT_ANSWERED;
+        let rows = [
+            ("the store refuses it", false, "Internal error: `down`"),
+            ("the write is given up at its bound", true, NOT_ANSWERED),
+        ];
+        for (label, stalls, cause) in rows {
+            let lockout = Lockout::default();
+            let store = Memory::default();
+            let user = bob();
+            lockout.seed(&user, LockRow::default());
+            let _ = lockout.failure(&state(policy(0, 0), LockRow::default()), at(1));
+            match stalls {
+                true => *store.delay.lock().unwrap() = POLICY_READ_WAIT * 2,
+                false => store.fails.store(true, Ordering::Relaxed),
+            }
+            let (lines, _guard) = Lines::capture();
+            let _ = lockout.drain(&store).await;
+            let said: Vec<String> = lines
+                .take_loud()
+                .into_iter()
+                .map(|line| line.text)
+                .filter(|text| text.starts_with("Lockout counts"))
+                .collect();
+            let line =
+                format!("Lockout counts are not being stored ({cause}); they are kept and retried");
+            assert_eq!(said, vec![line], "{label}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn test_a_confirm_whose_read_never_answers_is_given_up_at_the_bound() {
         let lockout = Lockout::default();
         let store = Memory::default();

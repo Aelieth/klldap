@@ -1554,16 +1554,16 @@ mod tests {
         const UNREAD: &str = "The admin's password-min-length could not be read (Database \
              error: `the policy store is down`): the configuration's password is checked against \
              8 only";
-        const UNANSWERED: &str = "The admin's password-min-length could not be read (Internal \
-             error: `the policy read did not answer within its bound`): the configuration's \
-             password is checked against 8 only";
+        const UNANSWERED: &str = "The admin's password-min-length could not be read (the \
+             database did not answer in time): the configuration's password is checked against \
+             8 only";
         type Row = (
             &'static str,
             Result<usize, &'static str>,
             Option<&'static str>,
         );
         let down = "Database error: `the policy store is down`";
-        let late = "Internal error: `the policy read did not answer within its bound`";
+        let late = lldap_domain_model::error::NOT_ANSWERED;
         let rows: [Row; 7] = [
             ("Nine-9999", Ok(12), Some(SHORT_12)),
             ("pässwörter", Ok(12), Some(SHORT_12)),

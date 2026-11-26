@@ -1,6 +1,6 @@
 use crate::enforcement::{
-    Attempt, Entries, FILL_CHUNK, INACTIVITY_DAYS, ItemCheck, POLICY_UNANSWERED, PolicyCache,
-    Snapshot, UserFacts, UserState, bounded, item_set,
+    Attempt, Entries, FILL_CHUNK, INACTIVITY_DAYS, ItemCheck, PolicyCache, Snapshot, UserFacts,
+    UserState, bounded, item_set,
 };
 use crate::handler::PolicyBackendHandler;
 use crate::instant::{self, SignedDuration, Timestamp};
@@ -8,7 +8,7 @@ use crate::lockout::{LockStore, QUEUE_LIMIT, STOP_BOUND, WRITE_BOUND};
 use crate::policies::{EffectiveItem, POLICY_READ_WAIT, Policy};
 use crate::warn_limited;
 use lldap_domain::types::UserId;
-use lldap_domain_model::error::Result;
+use lldap_domain_model::error::{NOT_ANSWERED, Result};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
@@ -503,7 +503,7 @@ where
             false
         }
         Err(_) => {
-            warn_limited!("The activity of {user} was not read: {POLICY_UNANSWERED}");
+            warn_limited!("The activity of {user} was not read: {NOT_ANSWERED}");
             false
         }
     }

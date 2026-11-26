@@ -3,7 +3,6 @@ use crate::sql_backend_handler::SqlBackendHandler;
 use crate::sql_policy_handler::policy_levels_on;
 use async_trait::async_trait;
 use lldap_domain::types::{User, UserId, user_ou};
-use lldap_domain_handlers::enforcement::POLICY_UNANSWERED;
 use lldap_domain_handlers::inactivity::Recorded;
 use lldap_domain_handlers::policies::{POLICY_READ_WAIT, PolicyLevel, canonical_ou_key};
 use lldap_domain_model::error::{DomainError, Result};
@@ -109,9 +108,7 @@ impl SqlBackendHandler {
             _ => self.transaction_read(read).await,
         };
         answer.map_err(|e| match e {
-            DomainError::DatabaseError(db) if bound_reached_by(&db) => {
-                DomainError::InternalError(POLICY_UNANSWERED.to_owned())
-            }
+            DomainError::DatabaseError(db) if bound_reached_by(&db) => DomainError::NotAnswered,
             e => e,
         })
     }

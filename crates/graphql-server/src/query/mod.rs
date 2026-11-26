@@ -19,7 +19,6 @@ pub use schema::{AttributeList, ObjectClassInfo, Schema};
 pub use user::User;
 
 use crate::api::{Context, FullHandler, field_error_callback};
-use crate::kerberos_transport::public_key_der_base64;
 use anyhow::anyhow;
 use juniper::{FieldResult, GraphQLObject, ID, graphql_object};
 use lldap_access_control::{ReadonlyBackendHandler, UserReadableBackendHandler};
@@ -43,7 +42,6 @@ pub struct Query<Handler: FullHandler + OpaqueHandler> {
 
 #[derive(GraphQLObject)]
 pub struct KerberosInfo {
-    pub public_key_der_base64: Option<String>,
     pub enabled: bool,
     /// The realm's state, in the words of /health.
     pub state: String,
@@ -225,7 +223,6 @@ impl<Handler: FullHandler + OpaqueHandler> Query<Handler> {
         let health = realm_health();
         let admin = context.get_admin_handler().is_some();
         Ok(KerberosInfo {
-            public_key_der_base64: Some(public_key_der_base64()),
             enabled: kerberos_backend().enabled(),
             state: health.word().to_owned(),
             cause: health.cause().filter(|_| admin).map(str::to_owned),
@@ -1726,6 +1723,26 @@ mod tests {
             let row = format!("{state}, {permission:?}, enrollment pending {enrollment_pending}");
             assert_eq!(got, Some((want, 0)), "{row}");
         }
+    }
+
+    #[tokio::test]
+    async fn kerberos_info_answers_no_envelope_key() {
+        const QUERY: &str = r#"{ kerberosInfo { publicKeyDerBase64 } }"#;
+        let schema = schema(Query::<MockTestBackendHandler>::new());
+        let actor = ValidationResults {
+            user: UserId::new("ann"),
+            permission: Permission::Admin,
+        };
+        let context = Context::new_for_tests(MockTestBackendHandler::new(), actor);
+        let refused = execute(QUERY, None, &schema, &Variables::new(), &context)
+            .await
+            .err()
+            .map(|e| e.to_string());
+        let unknown = r#"Unknown field "publicKeyDerBase64" on type "KerberosInfo""#;
+        assert!(
+            refused.as_deref().is_some_and(|e| e.contains(unknown)),
+            "{refused:?}"
+        );
     }
 
     #[tokio::test]

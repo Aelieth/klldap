@@ -316,7 +316,6 @@ type Group {
 }
 
 type KerberosInfo {
-  publicKeyDerBase64: String
   enabled: Boolean!
   "The realm's state, in the words of /health."
   state: String!

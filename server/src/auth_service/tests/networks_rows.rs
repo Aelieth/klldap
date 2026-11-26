@@ -113,7 +113,7 @@ async fn test_a_right_password_from_outside_gets_a_wrong_ones_body_byte_for_byte
     let simple = async |meta: RequestMeta, password: &str| {
         let request = login::ClientSimpleLoginRequest {
             username: UserId::new("e5body"),
-            password: password.to_owned(),
+            password: password.to_owned().into(),
             enrollment_proof: None,
         };
         let response = with_request(
@@ -180,7 +180,7 @@ async fn test_an_enrolled_user_outside_gets_a_wrong_passwords_body_before_any_co
     let simple = async |meta: RequestMeta, password: &str| {
         let request = login::ClientSimpleLoginRequest {
             username: UserId::new("e3code"),
-            password: password.to_owned(),
+            password: password.to_owned().into(),
             enrollment_proof: None,
         };
         let response = with_request(

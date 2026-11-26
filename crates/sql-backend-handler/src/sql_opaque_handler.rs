@@ -62,7 +62,7 @@ async fn passwords_match(
     username: &UserId,
 ) -> Option<Unmatched> {
     let password_file_bytes = password_file_bytes.to_vec();
-    let clear_password = clear_password.to_owned();
+    let clear_password = lldap_auth::zeroize::Zeroizing::new(clear_password.to_owned());
     let opaque_setup = opaque_setup.clone();
     let username = username.clone();
     let answer = gate.stretch(move || -> Result<()> {
@@ -1096,21 +1096,21 @@ mod tests {
         handler
             .bind(BindRequest {
                 name: UserId::new("bob"),
-                password: "bob00".to_string(),
+                password: "bob00".to_string().into(),
             })
             .await
             .unwrap();
         handler
             .bind(BindRequest {
                 name: UserId::new("andrew"),
-                password: "bob00".to_string(),
+                password: "bob00".to_string().into(),
             })
             .await
             .unwrap_err();
         handler
             .bind(BindRequest {
                 name: UserId::new("bob"),
-                password: "wrong_password".to_string(),
+                password: "wrong_password".to_string().into(),
             })
             .await
             .unwrap_err();
@@ -1139,7 +1139,7 @@ mod tests {
         let baseline = ticks.load(Ordering::SeqCst);
         let bind = handler.bind(BindRequest {
             name: UserId::new("bob"),
-            password: "bob00".to_string(),
+            password: "bob00".to_string().into(),
         });
         tokio::pin!(bind);
         tokio::select! {
@@ -1166,7 +1166,7 @@ mod tests {
         handler
             .bind(BindRequest {
                 name: UserId::new("bob"),
-                password: "bob00".to_string(),
+                password: "bob00".to_string().into(),
             })
             .await
             .unwrap_err();
@@ -1191,7 +1191,7 @@ mod tests {
         let err = handler
             .bind(BindRequest {
                 name: UserId::new("bob"),
-                password: "bob00".to_string(),
+                password: "bob00".to_string().into(),
             })
             .await
             .unwrap_err();
@@ -1304,7 +1304,7 @@ mod tests {
     fn bind_request(user: &str, password: &str) -> BindRequest {
         BindRequest {
             name: UserId::new(user),
-            password: password.to_owned(),
+            password: password.to_owned().into(),
         }
     }
 

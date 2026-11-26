@@ -207,7 +207,7 @@ fn simple_status(client: &Client, base_url: &str, password: &str) -> u16 {
         .post(format!("{base_url}/auth/simple/login"))
         .json(&login::ClientSimpleLoginRequest {
             username: UserId::new(LOCKED),
-            password: password.to_owned(),
+            password: password.to_owned().into(),
             enrollment_proof: None,
         })
         .send()

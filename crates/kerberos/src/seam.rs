@@ -3171,7 +3171,7 @@ mod tests {
         let binds = |password: &str| {
             let request = BindRequest {
                 name: UserId::new("dora"),
-                password: password.to_owned(),
+                password: password.to_owned().into(),
             };
             runtime.block_on(handler.bind(request)).is_ok()
         };
@@ -3839,7 +3839,7 @@ mod tests {
         let binds = |user: &str, password: &str| {
             let request = BindRequest {
                 name: UserId::new(user),
-                password: password.to_owned(),
+                password: password.to_owned().into(),
             };
             runtime.block_on(handler.bind(request)).is_ok()
         };
@@ -4080,7 +4080,7 @@ mod tests {
         let binds = |password: &str| {
             let request = BindRequest {
                 name: ivy.clone(),
-                password: password.to_owned(),
+                password: password.to_owned().into(),
             };
             runtime.block_on(handler.bind(request)).is_ok()
         };
@@ -4463,7 +4463,7 @@ mod tests {
         let binds = |password: &str| {
             let request = BindRequest {
                 name: UserId::new("bob"),
-                password: password.to_owned(),
+                password: password.to_owned().into(),
             };
             runtime.block_on(handler.bind(request)).is_ok()
         };
@@ -5986,7 +5986,7 @@ mod tests {
         let binds = |user: &str, password: &str| {
             let request = BindRequest {
                 name: UserId::new(user),
-                password: password.to_owned(),
+                password: password.to_owned().into(),
             };
             runtime.block_on(handler.bind(request)).is_ok()
         };

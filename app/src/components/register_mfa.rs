@@ -18,6 +18,7 @@ use gloo_console::error;
 use gloo_timers::callback::Timeout;
 use graphql_client::GraphQLQuery;
 use lldap_auth::login;
+use lldap_auth::zeroize::Zeroizing;
 use lldap_mfa::{
     PASSWORD_PROOF_REQUIRED, TOTP_CURRENT_CODE_REQUIRED, TOTP_DIGITS, TOTP_ENROLLMENT_EXPIRED,
     TOTP_ENROLLMENT_TTL_SECS, split_totp_suffix,
@@ -137,7 +138,7 @@ pub struct RegisterMfa {
     gate: Form<GateModel>,
     ask_proof: bool,
     pending_code: Option<String>,
-    opaque_data: Option<(Box<LoginState>, String, String)>,
+    opaque_data: Option<(Box<LoginState>, Zeroizing<String>, String)>,
     phase: Phase,
     hint: CodeHint,
     mfa_exempt: bool,
@@ -231,7 +232,7 @@ impl CommonComponent<RegisterMfa> for RegisterMfa {
                 Err(e) => Err(e),
             },
             Msg::Update => {
-                let combined = self.form.field_value("combined");
+                let combined = Zeroizing::new(self.form.field_value("combined"));
                 self.hint = match (&self.phase, split_totp_suffix(&combined)) {
                     (Phase::InProgress(data), Some((_, code))) => {
                         let now_secs = chrono::Utc::now().timestamp() as u64;
@@ -251,7 +252,7 @@ impl CommonComponent<RegisterMfa> for RegisterMfa {
                 if !self.password.validate() {
                     bail!("Check the form for errors");
                 }
-                let password = self.password.field_value("current_password");
+                let password = Zeroizing::new(self.password.field_value("current_password"));
                 self.password.set_field_value("current_password", "");
                 let (state, request) = begin_login(&ctx.props().username, &password)?;
                 self.ask_proof = true;
@@ -280,14 +281,15 @@ impl CommonComponent<RegisterMfa> for RegisterMfa {
                 if !matches!(self.phase, Phase::InProgress(_)) {
                     bail!("No enrollment in progress");
                 }
-                let combined = self.form.field_value("combined");
+                let combined = Zeroizing::new(self.form.field_value("combined"));
                 let Some((password, code)) = split_totp_suffix(&combined) else {
                     bail!("Check the form for errors");
                 };
                 self.ask_proof = false;
                 let (state, request) = begin_login(&ctx.props().username, password)?;
                 // Keep the submitted code: the field stays editable while the login is in flight.
-                self.opaque_data = Some((Box::new(state), password.to_owned(), code.to_owned()));
+                let password = Zeroizing::new(password.to_owned());
+                self.opaque_data = Some((Box::new(state), password, code.to_owned()));
                 self.common.call_backend(
                     ctx,
                     HostService::login_start(request),

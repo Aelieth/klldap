@@ -102,7 +102,7 @@ async fn test_a_locked_users_refresh_and_token_use_are_refused_with_401_and_one_
     let unlocked = (doors(&handler, "e1door").await, rows(&log, "e1door"));
     let wrong = BindRequest {
         name: UserId::new("e1door"),
-        password: "e1door-wrong-1".to_owned(),
+        password: "e1door-wrong-1".to_owned().into(),
     };
     let bound = (handler.bind(wrong).await.is_ok(), rows(&log, "e1door"));
     let locked = (doors(&handler, "e1door").await, rows(&log, "e1door"));
@@ -142,7 +142,7 @@ async fn test_a_refresh_row_is_marked_proved_only_once_its_token_was_found() {
     policy_on(&handler, "r1 lock", "", &lock).await;
     let wrong = BindRequest {
         name: UserId::new("r1fresh"),
-        password: "r1fresh-wrong-1".to_owned(),
+        password: "r1fresh-wrong-1".to_owned().into(),
     };
     let _ = handler.bind(wrong).await;
     let _ = log.recorder().take_events();

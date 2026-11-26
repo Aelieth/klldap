@@ -17,7 +17,7 @@ pub fn get_token_for(client: &Client, base_url: &str, username: &str, password: 
         .body(
             serde_json::to_string(&login::ClientSimpleLoginRequest {
                 username: UserId::new(username),
-                password: password.to_owned(),
+                password: password.to_owned().into(),
                 enrollment_proof: None,
             })
             .expect("Failed to encode the username/password as json to log in"),

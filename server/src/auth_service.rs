@@ -1551,6 +1551,18 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_a_simple_login_body_is_upstreams_and_its_password_is_held_in_a_wiping_type() {
+        let wire = serde_json::json!({"username": "bob", "password": "Bob-Pass-1"});
+        let request: login::ClientSimpleLoginRequest =
+            serde_json::from_value(wire.clone()).unwrap();
+        let password: &Zeroizing<String> = &request.password;
+        let printed = format!("{request:?}");
+        assert_eq!(password.as_str(), "Bob-Pass-1");
+        assert_eq!(serde_json::to_value(&request).unwrap(), wire);
+        assert!(!printed.contains("Bob-Pass-1"), "{printed}");
+    }
+
+    #[test]
     fn test_a_login_start_body_asks_for_the_key_only_in_its_own_field() {
         let body = login_start_body(None);
         let plain = serde_json::to_value(&body.request).unwrap();
@@ -2513,7 +2525,7 @@ pub(crate) mod tests {
     ) -> bool {
         let request = BindRequest {
             name: UserId::new(user),
-            password: password.to_owned(),
+            password: password.to_owned().into(),
         };
         handler.bind(request).await.is_ok()
     }
@@ -2819,7 +2831,7 @@ pub(crate) mod tests {
             let before = minted(&pool).await;
             let request = login::ClientSimpleLoginRequest {
                 username: UserId::new(user),
-                password,
+                password: password.into(),
                 enrollment_proof: None,
             };
             let response = simple_login_handler(door.clone(), web::Json(request)).await;
@@ -2894,7 +2906,7 @@ pub(crate) mod tests {
                 if kind == LogKind::Bind {
                     let request = login::ClientSimpleLoginRequest {
                         username: user.clone(),
-                        password: PASSWORD.to_owned(),
+                        password: PASSWORD.to_owned().into(),
                         enrollment_proof: None,
                     };
                     let response = simple_login_handler(state.clone(), web::Json(request)).await;
@@ -3279,7 +3291,7 @@ pub(crate) mod tests {
                     _ => {
                         let request = login::ClientSimpleLoginRequest {
                             username: UserId::new(user),
-                            password: password.to_owned(),
+                            password: password.to_owned().into(),
                             enrollment_proof: None,
                         };
                         simple_login_handler(state.clone(), web::Json(request)).await
@@ -3547,7 +3559,7 @@ pub(crate) mod tests {
         let simple = async |password: &str| {
             let request = login::ClientSimpleLoginRequest {
                 username: UserId::new("h2route"),
-                password: password.to_owned(),
+                password: password.to_owned().into(),
                 enrollment_proof: None,
             };
             answer(simple_login_handler(state.clone(), web::Json(request)).await).await
@@ -3747,7 +3759,7 @@ pub(crate) mod tests {
         let simple = async |password: &str| {
             let request = login::ClientSimpleLoginRequest {
                 username: UserId::new("e6http"),
-                password: password.to_owned(),
+                password: password.to_owned().into(),
                 enrollment_proof: None,
             };
             answered(simple_login_handler(state.clone(), web::Json(request)).await).await
@@ -3824,7 +3836,7 @@ pub(crate) mod tests {
         let simple = async |password: &str| {
             let request = login::ClientSimpleLoginRequest {
                 username: UserId::new("q31http"),
-                password: password.to_owned(),
+                password: password.to_owned().into(),
                 enrollment_proof: None,
             };
             answered(simple_login_handler(state.clone(), web::Json(request)).await).await

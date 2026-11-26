@@ -15,6 +15,7 @@ use anyhow::{Result, anyhow, bail};
 use gloo_console::error;
 use graphql_client::GraphQLQuery;
 use lldap_auth::login;
+use lldap_auth::zeroize::Zeroizing;
 use lldap_mfa::split_totp_suffix;
 use validator_derive::Validate;
 use yew::prelude::*;
@@ -43,7 +44,7 @@ pub struct FormModel {
 pub struct ResetOwnMfaForm {
     common: CommonComponentParts<Self>,
     form: Form<FormModel>,
-    opaque_data: Option<(Box<LoginState>, String, String)>,
+    opaque_data: Option<(Box<LoginState>, Zeroizing<String>, String)>,
     pending_code: Option<String>,
 }
 
@@ -77,13 +78,14 @@ impl CommonComponent<ResetOwnMfaForm> for ResetOwnMfaForm {
                 if !self.form.validate() {
                     bail!("Check the form for errors");
                 }
-                let combined = self.form.field_value("combined");
+                let combined = Zeroizing::new(self.form.field_value("combined"));
                 let Some((password, code)) = split_totp_suffix(&combined) else {
                     bail!("Check the form for errors");
                 };
                 let (state, request) = begin_login(&ctx.props().username, password)?;
                 // Keep the submitted code: the field stays editable while the login is in flight.
-                self.opaque_data = Some((Box::new(state), password.to_owned(), code.to_owned()));
+                let password = Zeroizing::new(password.to_owned());
+                self.opaque_data = Some((Box::new(state), password, code.to_owned()));
                 self.common.call_backend(
                     ctx,
                     HostService::login_start(request),

@@ -63,7 +63,7 @@ pub(crate) async fn bind(
     match login_handler
         .bind(BindRequest {
             name: user_id.clone(),
-            password: password.to_owned(),
+            password: password.to_owned().into(),
         })
         .await
     {
@@ -344,7 +344,7 @@ pub mod tests {
         mock.expect_bind()
             .with(eq(lldap_domain_handlers::handler::BindRequest {
                 name: UserId::new("bob"),
-                password: "pass".to_string(),
+                password: "pass".to_string().into(),
             }))
             .times(1)
             .return_once(|_| Ok(()));
@@ -367,7 +367,7 @@ pub mod tests {
         mock.expect_bind()
             .with(eq(lldap_domain_handlers::handler::BindRequest {
                 name: UserId::new("test"),
-                password: "pass".to_string(),
+                password: "pass".to_string().into(),
             }))
             .times(1)
             .return_once(|_| Ok(()));

@@ -14,10 +14,10 @@ use crate::{
     },
 };
 use ldap3_proto::proto::{
-    LdapAddRequest, LdapBindRequest, LdapBindResponse, LdapCompareRequest, LdapExtendedRequest,
-    LdapExtendedResponse, LdapFilter, LdapModifyRequest, LdapOp, LdapPartialAttribute,
-    LdapPasswordModifyRequest, LdapResult as LdapResultOp, LdapResultCode, LdapSearchRequest,
-    OID_PASSWORD_MODIFY, OID_WHOAMI,
+    LdapAddRequest, LdapBindCred, LdapBindRequest, LdapBindResponse, LdapCompareRequest,
+    LdapExtendedRequest, LdapExtendedResponse, LdapFilter, LdapModifyRequest, LdapOp,
+    LdapPartialAttribute, LdapPasswordModifyRequest, LdapResult as LdapResultOp, LdapResultCode,
+    LdapSearchRequest, OID_PASSWORD_MODIFY, OID_WHOAMI,
 };
 use lldap_access_control::AccessControlledBackendHandler;
 use lldap_auth::access_control::ValidationResults;
@@ -375,6 +375,14 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
         }
     }
 
+    pub(crate) async fn bind_and_wipe(&mut self, ldap_op: &mut LdapOp) -> Vec<LdapOp> {
+        let ldap_op = WipePasswords(ldap_op);
+        match &*ldap_op.0 {
+            LdapOp::BindRequest(request) => self.do_bind(request).await,
+            op => unsupported(op),
+        }
+    }
+
     #[instrument(skip_all, level = "debug")]
     pub async fn create_user_or_group(
         &self,
@@ -433,7 +441,7 @@ impl<Backend: BackendHandler + LoginHandler + OpaqueHandler> LdapHandler<Backend
             LdapOp::AddRequest(_) | LdapOp::ModifyRequest(_) | LdapOp::ExtendedRequest(_) => {
                 self.answer_and_wipe(&mut ldap_op).await
             }
-            LdapOp::BindRequest(request) => self.do_bind(&request).await,
+            LdapOp::BindRequest(_) => self.bind_and_wipe(&mut ldap_op).await,
             LdapOp::SearchRequest(request) => self
                 .do_search_or_dse(&request)
                 .await
@@ -469,8 +477,8 @@ fn unsupported(op: &LdapOp) -> Vec<LdapOp> {
     )]
 }
 
-/// Zeroes in place, when dropped, an Add's or a Modify's `userPassword` values and a
-/// PasswordModify's value.
+/// Zeroes in place, when dropped, an Add's or a Modify's `userPassword` values, a
+/// PasswordModify's value and a simple bind's password.
 struct WipePasswords<'r>(&'r mut LdapOp);
 
 impl Drop for WipePasswords<'_> {
@@ -483,6 +491,10 @@ impl Drop for WipePasswords<'_> {
             LdapOp::ExtendedRequest(request) if request.name == OID_PASSWORD_MODIFY => {
                 request.value.iter_mut().for_each(wipe);
             }
+            LdapOp::BindRequest(LdapBindRequest {
+                cred: LdapBindCred::Simple(password),
+                ..
+            }) => wipe_text(password),
             _ => {}
         }
     }
@@ -496,6 +508,12 @@ fn wipe_passwords<'a>(attributes: impl Iterator<Item = &'a mut LdapPartialAttrib
 fn wipe(value: &mut Vec<u8>) {
     value.as_mut_slice().zeroize();
     value.spare_capacity_mut().zeroize();
+}
+
+fn wipe_text(text: &mut String) {
+    let mut bytes = std::mem::take(text).into_bytes();
+    wipe(&mut bytes);
+    *text = String::from_utf8(bytes).unwrap_or_default();
 }
 
 // Every denial ends in a result op with InsufficentAccessRights, so one look at the
@@ -659,6 +677,37 @@ pub mod tests {
                 "{group} {password}: the bind's row is the login handler's, none here"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_a_simple_binds_password_is_wiped_once_it_is_answered() {
+        let mut mock = MockTestBackendHandler::new();
+        mock.expect_bind()
+            .times(1)
+            .withf(|request| request.password.as_str() == "bob-pass-1")
+            .returning(|_| Ok(()));
+        setup_default_ldap_mock(&mut mock);
+        let mut handler = LdapHandler::new_for_tests(mock, "dc=example,dc=com");
+        let mut op = LdapOp::BindRequest(LdapBindRequest {
+            dn: "uid=bob,ou=people,dc=example,dc=com".to_string(),
+            cred: LdapBindCred::Simple("bob-pass-1".to_string()),
+        });
+        let response = handler.bind_and_wipe(&mut op).await;
+        let Some(LdapOp::BindResponse(LdapBindResponse { res, .. })) = response.first() else {
+            panic!("{response:?}");
+        };
+        let LdapOp::BindRequest(LdapBindRequest {
+            cred: LdapBindCred::Simple(left),
+            ..
+        }) = &op
+        else {
+            panic!("not a simple bind");
+        };
+        let zeroed = "\0".repeat(10);
+        assert_eq!(
+            (&res.code, left.as_str()),
+            (&LdapResultCode::Success, zeroed.as_str())
+        );
     }
 
     #[tokio::test]

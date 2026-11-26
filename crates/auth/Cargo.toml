@@ -31,7 +31,7 @@ rust-argon2 = "2"
 sha2 = "0.10"
 thiserror = { workspace = true }
 uuid = { workspace = true, features = ["serde"] }
-zeroize = "1"
+zeroize = { version = "1", features = ["serde"] }
 
 # rsa 0.10 draws from getrandom 0.4; the Kerberos envelope seals with its SysRng.
 [dependencies.getrandom04]

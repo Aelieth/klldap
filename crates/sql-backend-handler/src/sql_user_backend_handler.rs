@@ -3166,7 +3166,7 @@ mod tests {
             .handler
             .bind(BindRequest {
                 name: bob.clone(),
-                password: "Bob-Reset-1".to_owned(),
+                password: "Bob-Reset-1".to_owned().into(),
             })
             .await;
         let rows = model::Logs::find()

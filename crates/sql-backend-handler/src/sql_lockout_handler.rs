@@ -700,7 +700,7 @@ pub(crate) mod tests {
     ) -> Result<()> {
         let request = BindRequest {
             name: UserId::new(user),
-            password: password.to_owned(),
+            password: password.to_owned().into(),
         };
         handler.bind(request).await
     }

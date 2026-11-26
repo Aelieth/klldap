@@ -13,6 +13,7 @@ use crate::{
 use anyhow::{Result, anyhow, bail};
 use gloo_console::error;
 use lldap_auth::login;
+use lldap_auth::zeroize::Zeroizing;
 use lldap_mfa::{TotpFailure, split_totp_suffix, totp_failure};
 use validator_derive::Validate;
 use yew::prelude::*;
@@ -23,7 +24,7 @@ const INVALID_CREDENTIALS: &str = "Invalid username or password";
 
 struct Credentials {
     username: String,
-    password: String,
+    password: Zeroizing<String>,
     code: Option<String>,
     bound_key: Option<String>,
 }
@@ -31,7 +32,10 @@ struct Credentials {
 enum Step {
     Password,
     // The password stays in this component's memory for the code step only.
-    Code { username: String, password: String },
+    Code {
+        username: String,
+        password: Zeroizing<String>,
+    },
 }
 
 pub struct LoginForm {
@@ -135,7 +139,7 @@ impl CommonComponent<LoginForm> for LoginForm {
                     ctx,
                     Credentials {
                         username,
-                        password,
+                        password: Zeroizing::new(password),
                         code: None,
                         bound_key: None,
                     },

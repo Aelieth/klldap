@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result, anyhow, bail};
 use graphql_client::GraphQLQuery;
+use lldap_auth::zeroize::Zeroizing;
 use requestty::{Question, prompt_one};
 use reqwest::blocking::{Client, ClientBuilder};
 use smallvec::SmallVec;
@@ -221,7 +222,7 @@ pub fn get_lldap_user_and_password(
             })
             .build();
         let answer = prompt_one(question)?;
-        answer.as_string().unwrap().to_owned()
+        Zeroizing::new(answer.as_string().unwrap().to_owned())
     };
     match try_login(lldap_server, &username, &password, client) {
         Err(e) => {

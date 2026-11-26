@@ -10,6 +10,7 @@ use uuid::Uuid;
 pub mod access_control;
 pub mod kerberos_envelope;
 pub mod opaque;
+pub use zeroize;
 
 pub const PASSWORD_LENGTH_UNIT: &str = "characters";
 pub const PASSWORD_HAS_NUL: &str = "the password must not contain a NUL character (U+0000)";
@@ -191,7 +192,7 @@ pub mod login {
     #[derive(Serialize, Deserialize, Clone)]
     pub struct ClientSimpleLoginRequest {
         pub username: UserId,
-        pub password: String,
+        pub password: zeroize::Zeroizing<String>,
         /// Present only when this login should mint a first-enrollment proof.
         #[serde(
             default,

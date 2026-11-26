@@ -12,6 +12,7 @@ use crate::policies::{
 };
 use async_trait::async_trait;
 use ldap3_proto::proto::LdapSubstringFilter;
+use lldap_auth::zeroize::Zeroizing;
 use lldap_domain::{
     requests::{
         CreateAttributeRequest, CreateGroupRequest, CreateUserRequest, UpdateGroupRequest,
@@ -27,10 +28,19 @@ use lldap_schema::PublicSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
-#[derive(PartialEq, Eq, Debug, Serialize, Deserialize, Clone)]
+#[derive(PartialEq, Eq, Serialize, Deserialize, Clone)]
 pub struct BindRequest {
     pub name: UserId,
-    pub password: String,
+    pub password: Zeroizing<String>,
+}
+
+impl std::fmt::Debug for BindRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BindRequest")
+            .field("name", &self.name.as_str())
+            .field("password", &"***********")
+            .finish()
+    }
 }
 
 #[derive(PartialEq, Eq, Debug, Serialize, Deserialize, Clone)]
@@ -424,6 +434,21 @@ pub trait PosixBackendHandler: Send + Sync {
 mod tests {
     use super::*;
     use pretty_assertions::assert_ne;
+
+    #[test]
+    fn test_a_bind_requests_password_is_held_in_a_wiping_type_and_never_printed() {
+        let request = BindRequest {
+            name: UserId::new("bob"),
+            password: Zeroizing::new("Bob-Pass-1".to_owned()),
+        };
+        let printed = format!("{request:?}");
+        let password: &Zeroizing<String> = &request.password;
+        assert!(
+            printed.contains("bob") && !printed.contains("Bob-Pass-1"),
+            "{printed}"
+        );
+        assert_eq!(password.as_str(), "Bob-Pass-1");
+    }
 
     #[test]
     fn test_uuid_time() {

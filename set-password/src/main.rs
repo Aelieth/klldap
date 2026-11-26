@@ -6,6 +6,7 @@ use std::io::{BufRead, Write};
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
 use lldap_auth::kerberos_envelope::{SealTo, finish_with_envelope};
+use lldap_auth::zeroize::Zeroizing;
 use lldap_auth::{
     PASSWORD_LENGTH_UNIT, PASSWORD_MIN_LENGTH, PasswordShapeError, login, opaque, password_shape,
     registration,
@@ -13,7 +14,7 @@ use lldap_auth::{
 use reqwest::Url;
 use serde::Serialize;
 
-#[derive(Debug, Parser, Clone)]
+#[derive(Parser)]
 #[command(about = "Set the password for a user in LLDAP")]
 pub struct CliOpts {
     #[clap(short, long, help = "Base LLDAP url, e.g. \"https://lldap/\"")]
@@ -46,6 +47,14 @@ pub struct CliOpts {
         help = "Skip the minimum password length only (8, and the user's minimum from the server). An empty password, or one with a NUL character, is still refused. Unsafe"
     )]
     pub bypass_password_policy: bool,
+}
+
+impl CliOpts {
+    /// The new password and the admin's, moved out of the parsed options into wiping strings.
+    fn take_passwords(&mut self) -> (Option<Zeroizing<String>>, Option<Zeroizing<String>>) {
+        let password = self.password.take().map(Zeroizing::new);
+        (password, self.admin_password.take().map(Zeroizing::new))
+    }
 }
 
 fn append_to_url(base_url: &Url, path: &str) -> Url {
@@ -238,11 +247,10 @@ pub fn register_finish(
 }
 
 fn main() -> Result<()> {
-    let opts = CliOpts::parse();
-
-    let password = opts
-        .password
-        .or_else(|| env::var("LLDAP_USER_PASSWORD").ok())
+    let mut opts = CliOpts::parse();
+    let (password, admin_password) = opts.take_passwords();
+    let password = password
+        .or_else(|| env::var("LLDAP_USER_PASSWORD").ok().map(Zeroizing::new))
         .context("no password given: pass --password or set LLDAP_USER_PASSWORD")?;
 
     check_floor(&password, opts.bypass_password_policy)?;
@@ -250,7 +258,7 @@ fn main() -> Result<()> {
         opts.base_url.scheme() == "http" || opts.base_url.scheme() == "https",
         "Base URL should start with `http://` or `https://`"
     );
-    let signed_in = match (opts.token.as_ref(), opts.admin_password.as_ref()) {
+    let signed_in = match (opts.token.as_ref(), admin_password.as_ref()) {
         (Some(token), _) => SignedIn::Token(token.clone()),
         (None, Some(admin_password)) => {
             let admin = &opts.admin_username;
@@ -325,6 +333,33 @@ mod tests {
             server_data: "sealed".to_owned(),
             registration_upload: finish.message,
         }
+    }
+
+    #[test]
+    fn test_the_tool_holds_its_passwords_in_a_wiping_type() {
+        let mut opts = CliOpts::try_parse_from([
+            "lldap_set_password",
+            "--base-url",
+            "http://localhost:17170",
+            "--username",
+            "bob",
+            "--password",
+            BOB_PASS,
+            "--admin-password",
+            "Admin-Pass-1",
+        ])
+        .unwrap();
+        let taken: (Option<Zeroizing<String>>, Option<Zeroizing<String>>) = opts.take_passwords();
+        let (password, admin) = (taken.0.as_deref(), taken.1.as_deref());
+        assert_eq!(
+            (password.map(String::as_str), admin.map(String::as_str)),
+            (Some(BOB_PASS), Some("Admin-Pass-1"))
+        );
+        assert_eq!(
+            (opts.password, opts.admin_password),
+            (None, None),
+            "nothing of either is left in the parsed options"
+        );
     }
 
     #[test]

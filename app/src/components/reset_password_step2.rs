@@ -14,7 +14,7 @@ use crate::{
 };
 use anyhow::{Result, anyhow, bail};
 use lldap_auth::password_reset::ServerPasswordResetResponse;
-use lldap_auth::{opaque, registration};
+use lldap_auth::{opaque, registration, zeroize::Zeroizing};
 use validator_derive::Validate;
 use yew::prelude::*;
 use yew_form::Form;
@@ -66,7 +66,7 @@ impl CommonComponent<ResetPasswordStep2Form> for ResetPasswordStep2Form {
                 if !self.form.validate() {
                     bail!("Check the form for errors");
                 }
-                let new_password = self.form.model().password.clone();
+                let new_password = Zeroizing::new(self.form.model().password);
                 let Some(username) = self.username.clone() else {
                     bail!("Username not available");
                 };
@@ -89,7 +89,7 @@ impl CommonComponent<ResetPasswordStep2Form> for ResetPasswordStep2Form {
                     bail!("Username not available");
                 };
                 // No password exists to sign in with here: the key as the start answered it.
-                let password = self.form.model().password;
+                let password = Zeroizing::new(self.form.model().password);
                 let req =
                     finish_registration(registration, username, &password, *res, SealTo::Answered)?;
                 self.common.call_backend(

@@ -14,7 +14,7 @@ use crate::{
     },
 };
 use anyhow::{Result, anyhow, bail};
-use lldap_auth::{login, opaque, registration};
+use lldap_auth::{login, opaque, registration, zeroize::Zeroizing};
 use validator_derive::Validate;
 use yew::prelude::*;
 use yew_form::Form;
@@ -25,7 +25,7 @@ use yew_router::{prelude::History, scope_ext::RouterScopeExt};
 enum OpaqueData {
     #[default]
     None,
-    Login(Box<LoginState>, String),
+    Login(Box<LoginState>, Zeroizing<String>),
     Registration(Box<opaque::client::registration::ClientRegistration>),
 }
 
@@ -98,7 +98,7 @@ impl CommonComponent<ChangePasswordForm> for ChangePasswordForm {
                 if ctx.props().is_admin {
                     self.handle_msg(ctx, Msg::SubmitNewPassword)
                 } else {
-                    let old_password = self.form.model().old_password.clone();
+                    let old_password = Zeroizing::new(self.form.model().old_password);
                     if old_password.is_empty() {
                         bail!("Current password is required for non-admin users");
                     }
@@ -135,7 +135,7 @@ impl CommonComponent<ChangePasswordForm> for ChangePasswordForm {
                 self.handle_msg(ctx, Msg::SubmitNewPassword)
             }
             Msg::SubmitNewPassword => {
-                let new_password = self.form.model().password.clone();
+                let new_password = Zeroizing::new(self.form.model().password);
                 let (state, req) = begin_registration(&ctx.props().username, &new_password)?;
                 self.opaque_data = OpaqueData::Registration(Box::new(state));
                 self.common.call_backend(
@@ -157,10 +157,11 @@ impl CommonComponent<ChangePasswordForm> for ChangePasswordForm {
                     true => signed_in_key(),
                     false => self.checked_key.take(),
                 };
+                let new_password = Zeroizing::new(self.form.model().password);
                 let req = finish_registration(
                     registration,
                     &ctx.props().username,
-                    &self.form.model().password,
+                    &new_password,
                     *res,
                     SealTo::Bound(bound.as_deref()),
                 )?;

@@ -256,7 +256,7 @@ async fn test_bind_records_the_claimed_user_and_the_request_scope() {
         RequestMeta::ldap(None, Some(ldap_peer)),
         handler.bind(BindRequest {
             name: bob.clone(),
-            password: "bobbybobbob".to_owned(),
+            password: "bobbybobbob".to_owned().into(),
         }),
     )
     .await
@@ -265,7 +265,7 @@ async fn test_bind_records_the_claimed_user_and_the_request_scope() {
         RequestMeta::http(Some(Ipv4Addr::LOCALHOST.into()), Some("203.0.113.9".into())),
         handler.bind(BindRequest {
             name: bob.clone(),
-            password: "wrong".to_owned(),
+            password: "wrong".to_owned().into(),
         }),
     )
     .await
@@ -273,7 +273,7 @@ async fn test_bind_records_the_claimed_user_and_the_request_scope() {
     handler
         .bind(BindRequest {
             name: UserId::new("nobody"),
-            password: "whatever".to_owned(),
+            password: "whatever".to_owned().into(),
         })
         .await
         .unwrap_err();
@@ -288,7 +288,7 @@ async fn test_bind_records_the_claimed_user_and_the_request_scope() {
     handler
         .bind(BindRequest {
             name: bob.clone(),
-            password: "bobbybobbob".to_owned(),
+            password: "bobbybobbob".to_owned().into(),
         })
         .await
         .unwrap_err();

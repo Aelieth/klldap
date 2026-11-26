@@ -27,7 +27,7 @@ use crate::{
 };
 use anyhow::{Result, anyhow, bail};
 use graphql_client::GraphQLQuery;
-use lldap_auth::{opaque, registration};
+use lldap_auth::{opaque, registration, zeroize::Zeroizing};
 use validator_derive::Validate;
 use yew::Context as YewContext;
 use yew::prelude::*;
@@ -253,7 +253,8 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
             Msg::CreateUserResponse(res) => {
                 let user_id = res?.create_user.id;
                 self.user_id = Some(user_id.clone());
-                let (state, req) = begin_registration(&user_id, &self.form.model().password)
+                let password = Zeroizing::new(self.form.model().password);
+                let (state, req) = begin_registration(&user_id, &password)
                     .map_err(|e| created_without_password(&user_id, &e.to_string()))?;
                 self.opaque_data = Some(state);
                 self.common.call_backend(
@@ -274,9 +275,10 @@ impl CommonComponent<CreateUserForm> for CreateUserForm {
                     .opaque_data
                     .take()
                     .context("Missing registration data")?;
-                let (model, bound) = (self.form.model(), signed_in_key());
+                let (password, bound) =
+                    (Zeroizing::new(self.form.model().password), signed_in_key());
                 let seal_to = SealTo::Bound(bound.as_deref());
-                let req = finish_registration(state, user_id, &model.password, *res, seal_to)
+                let req = finish_registration(state, user_id, &password, *res, seal_to)
                     .map_err(|e| created_without_password(user_id, &format!("{e:#}")))?;
                 self.common.call_backend(
                     ctx,

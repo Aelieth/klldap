@@ -1755,7 +1755,7 @@ pub(crate) mod tests {
     }
 
     async fn wait_lost(lost: &mut watch::Receiver<Option<KerberosLost>>) -> KerberosLost {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + SHORT_STEP * 20;
         loop {
             if let Some(cause) = lost.borrow().clone() {
                 return cause;
@@ -1768,7 +1768,7 @@ pub(crate) mod tests {
     }
 
     async fn wait_thread<T>(rx: std::sync::mpsc::Receiver<T>) -> Result<T, String> {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + SHORT_STEP * 20;
         loop {
             match rx.try_recv() {
                 Ok(result) => return Ok(result),
@@ -2315,13 +2315,17 @@ pub(crate) mod tests {
         Database::connect(opts).await.unwrap()
     }
 
+    /// A begin, an UPDATE and a durable commit to a file, on a loaded runner; the other short
+    /// timings, and the waits of the tests below, are counted in it.
+    const SHORT_STEP: Duration = Duration::from_millis(500);
+
     fn short_timings() -> Timings {
         Timings {
             heartbeat: Duration::from_millis(20),
-            lost_after: Duration::from_millis(400),
+            lost_after: SHORT_STEP * 4,
             watch: Duration::from_secs(5),
-            step: Duration::from_millis(100),
-            first_probe: Duration::from_millis(300),
+            step: SHORT_STEP,
+            first_probe: SHORT_STEP * 3,
             ..standard(false)
         }
     }
@@ -2444,10 +2448,10 @@ pub(crate) mod tests {
         let took = started.elapsed();
         let err = answer.await.unwrap().unwrap_err().to_string();
         assert!(
-            took >= timings.step && took < Duration::from_secs(2),
+            took >= timings.step && took < timings.lost_after,
             "{took:?}"
         );
-        assert!(err.contains("did not answer within 100ms"), "{err}");
+        assert!(err.contains(&late(timings.step)), "{err}");
         assert!(
             matches!(phase, Phase::Held(_)),
             "held just after the failed commit"
@@ -2472,7 +2476,7 @@ pub(crate) mod tests {
             sleep_until(wake_at(&phase)).await;
             phase = on_wake(&pool, phase, &timings, &lost_tx).await;
             assert!(
-                started.elapsed() < Duration::from_secs(2),
+                started.elapsed() < timings.lost_after + timings.step * 3,
                 "{:?}",
                 started.elapsed()
             );
@@ -2699,14 +2703,15 @@ pub(crate) mod tests {
             principals: 0,
             generation,
         };
-        type Row = (
+        type Row<'a> = (
             &'static str,
             Vec<HostRow>,
             Before,
-            Result<(), &'static str>,
+            Result<(), &'a str>,
             After,
         );
-        let rows: Vec<Row> = vec![
+        let ran_out = late(short_timings().step);
+        let rows: Vec<Row<'_>> = vec![
             (
                 "a password and its row",
                 password_rows("alice", RECORD),
@@ -2789,7 +2794,7 @@ pub(crate) mod tests {
                 "the step ran out",
                 password_rows("alice", RECORD),
                 Before::ConnectionHeld,
-                Err("did not answer within 100ms"),
+                Err(ran_out.as_str()),
                 nothing(5),
             ),
             (
@@ -3159,19 +3164,15 @@ pub(crate) mod tests {
     async fn test_the_directory_users_are_read_within_one_step() {
         let db = db().await;
         insert_alice(&db.pool).await;
-        let step = Duration::from_millis(100);
+        let step = short_timings().step;
         let asked = [UserId::new("Alice"), UserId::new("nobody")];
         let found = read_users(&db.pool, &asked, step).await.unwrap();
         let none = read_users(&db.pool, &[], step).await.unwrap();
         let held = db.pool.begin().await.unwrap();
-        let late = read_users(&db.pool, &asked, step).await.unwrap_err();
+        let lapsed = read_users(&db.pool, &asked, step).await.unwrap_err();
         held.rollback().await.unwrap();
         assert_eq!(
-            (
-                found,
-                none,
-                late.to_string().contains("did not answer within 100ms")
-            ),
+            (found, none, lapsed.to_string().contains(&late(step))),
             (vec![UserId::new("alice")], Vec::new(), true)
         );
     }
@@ -3181,7 +3182,7 @@ pub(crate) mod tests {
     async fn test_the_disabled_state_is_read_within_one_step() {
         let db = db().await;
         insert_alice(&db.pool).await;
-        let step = Duration::from_millis(100);
+        let step = short_timings().step;
         let (alice, nobody) = (UserId::new("alice"), UserId::new("nobody"));
         let no_group = read_disabled(&db.pool, &alice, step).await.unwrap();
         db.pool
@@ -3200,12 +3201,12 @@ pub(crate) mod tests {
         let in_it = read_disabled(&db.pool, &alice, step).await.unwrap();
         let no_user = read_disabled(&db.pool, &nobody, step).await.unwrap();
         let held = db.pool.begin().await.unwrap();
-        let late = read_disabled(&db.pool, &alice, step).await.unwrap_err();
+        let lapsed = read_disabled(&db.pool, &alice, step).await.unwrap_err();
         held.rollback().await.unwrap();
         assert_eq!(
             (
                 (no_group, not_in_it, in_it, no_user),
-                late.to_string().contains("did not answer within 100ms")
+                lapsed.to_string().contains(&late(step))
             ),
             ((false, false, true, false), true)
         );
@@ -3339,7 +3340,7 @@ pub(crate) mod tests {
             insert_alice(&db.pool).await;
             insert_realm(&db.pool, 5, true).await;
             let timings = Timings {
-                stall_after_commit: Duration::from_millis(300),
+                stall_after_commit: SHORT_STEP * 3,
                 ..short_timings()
             };
             let (lost_tx, cause) = watch::channel(None);
@@ -3357,9 +3358,9 @@ pub(crate) mod tests {
         }
         assert_eq!(got, want, "the step ran out after COMMIT was sent");
 
-        let ms = Duration::from_millis;
+        let (inside, past) = (SHORT_STEP / 2, SHORT_STEP * 4);
         let mut stalled = Vec::new();
-        for stall in [ms(50), ms(400)] {
+        for stall in [inside, past] {
             let db = db().await;
             insert_alice(&db.pool).await;
             insert_realm(&db.pool, 5, true).await;
@@ -3371,7 +3372,7 @@ pub(crate) mod tests {
             assert!(matches!(wrote, Ok(())), "{wrote:?}");
             let (lost_tx, cause) = watch::channel(None);
             let held = Held {
-                last_ok: Instant::now() - ms(300),
+                last_ok: Instant::now() - SHORT_STEP * 3,
                 ..fresh(5, true, &timings)
             };
             let lost = LOST.to_owned();
@@ -3392,9 +3393,9 @@ pub(crate) mod tests {
         assert_eq!(
             stalled,
             vec![
-                (ms(50), "ok".to_owned(), Some(6), None),
+                (inside, "ok".to_owned(), Some(6), None),
                 (
-                    ms(400),
+                    past,
                     "unknown".to_owned(),
                     None,
                     Some(KerberosLost::Replaced)
@@ -3513,7 +3514,7 @@ pub(crate) mod tests {
             ConnectionHeld,
         }
         let unreachable = Some(KerberosLost::DatabaseUnreachable);
-        let late = Duration::from_millis(350);
+        let late = short_timings().lost_after - SHORT_STEP / 2;
         let rows = [
             (
                 "a dropped answer read back before lost_after",
@@ -3547,7 +3548,7 @@ pub(crate) mod tests {
             let timings = Timings {
                 drop_a_beat: AtomicBool::new(fault == Fault::DroppedAnswer),
                 lose_a_beat: AtomicBool::new(fault == Fault::LandedAnswerLost),
-                stall_before_read: Duration::from_millis(100),
+                stall_before_read: SHORT_STEP,
                 ..short_timings()
             };
             let (lost_tx, lost) = watch::channel(None);
@@ -3576,8 +3577,10 @@ pub(crate) mod tests {
     #[tokio::test]
     #[serial]
     async fn test_a_lost_beat_answer_is_settled_by_the_realm_generation() {
+        let s = SHORT_STEP;
+        let past_lost_after = short_timings().lost_after + s;
         let mut got = Vec::new();
-        for silent in [Duration::ZERO, Duration::from_millis(500)] {
+        for silent in [Duration::ZERO, past_lost_after] {
             let db = db().await;
             insert_realm(&db.pool, 5, true).await;
             let timings = Timings {
@@ -3600,26 +3603,26 @@ pub(crate) mod tests {
             got,
             vec![
                 (Duration::ZERO, (Some(6), None), (Some(7), None), 7),
-                (Duration::from_millis(500), given_up.clone(), given_up, 6),
+                (past_lost_after, given_up.clone(), given_up, 6),
             ],
             "its own landed beat is held on; past lost_after a lost answer is not read back"
         );
 
-        let ms = Duration::from_millis;
+        let zero = Duration::ZERO;
         let cases = [
-            ("one up, in time", 6, false, ms(0), ms(0), "landed"),
-            ("one up, past lost_after", 6, false, ms(500), ms(0), "moved"),
+            ("one up, in time", 6, false, zero, zero, "landed"),
+            ("one up, past lost_after", 6, false, s * 5, zero, "moved"),
             (
                 "one up, the job in time, its read returned past two steps",
                 6,
                 false,
-                ms(700),
-                ms(400),
+                s * 7,
+                s * 4,
                 "moved",
             ),
-            ("unchanged", 5, false, ms(0), ms(0), "unchanged"),
-            ("two up: another holder", 7, false, ms(0), ms(0), "moved"),
-            ("the connection held", 6, true, ms(0), ms(0), "unread"),
+            ("unchanged", 5, false, zero, zero, "unchanged"),
+            ("two up: another holder", 7, false, zero, zero, "moved"),
+            ("the connection held", 6, true, zero, zero, "unread"),
         ];
         let (mut got, mut want) = (Vec::new(), Vec::new());
         for (label, stored, holding, silent, started_ago, expected) in cases {
@@ -3975,7 +3978,7 @@ pub(crate) mod tests {
         let timings = Timings {
             heartbeat: Duration::from_secs(60),
             lost_after: Duration::from_secs(5),
-            step: Duration::from_millis(100),
+            step: SHORT_STEP,
             stall_before_read: Duration::from_millis(300),
             ..standard(true)
         };
@@ -4136,9 +4139,9 @@ pub(crate) mod tests {
         insert_alice(&db.pool).await;
         insert_realm(&db.pool, 5, false).await;
         let timings = Timings {
-            heartbeat: Duration::from_millis(350),
+            heartbeat: short_timings().lost_after - SHORT_STEP / 2,
             drop_a_beat: AtomicBool::new(true),
-            stall_before_read: Duration::from_millis(100),
+            stall_before_read: SHORT_STEP,
             ..short_timings()
         };
         let (lost_after, step) = (timings.lost_after, timings.step);

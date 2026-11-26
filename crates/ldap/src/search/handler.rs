@@ -14,6 +14,7 @@ use ldap3_proto::{LdapFilter, LdapPartialAttribute, LdapResultCode, LdapSearchRe
 use lldap_access_control::UserAndGroupListerBackendHandler;
 use lldap_domain::types::{Group, UserAndGroups};
 use lldap_domain_handlers::handler::{GroupListerBackendHandler, UserListerBackendHandler};
+use lldap_domain_handlers::warn_limited;
 use lldap_schema::PublicSchema;
 use tracing::{debug, instrument};
 
@@ -31,9 +32,12 @@ pub(crate) async fn get_user_list<Backend: UserListerBackendHandler>(
     backend
         .list_users(Some(filters), request_groups)
         .await
-        .map_err(|e| LdapError {
-            code: LdapResultCode::Other,
-            message: format!(r#"Error while searching user "{base}": {e:#}"#),
+        .map_err(|e| {
+            warn_limited!("A search was answered with an error of the server's own: {e}");
+            LdapError {
+                code: LdapResultCode::Other,
+                message: format!(r#"Error while searching user "{base}": {e:#}"#),
+            }
         })
 }
 
@@ -517,6 +521,36 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_search_whose_user_list_fails_is_said_within_the_budget_and_answered_other() {
+        use lldap_domain_handlers::logging::capture::{BUDGET, Lines};
+        type Listed = fn() -> lldap_domain_model::error::Result<Vec<UserAndGroups>>;
+        let answers: Listed = || Ok(vec![user_in("bob", "people")]);
+        let fails: Listed = || Err(DomainError::InternalError("away".to_owned()));
+        let given_up: Listed = || Err(DomainError::NotAnswered);
+        let other = Some(LdapResultCode::Other);
+        let rows = [
+            ("the list answers", answers, None, 0),
+            ("the list fails", fails, other.clone(), BUDGET),
+            ("the list is given up", given_up, other, BUDGET),
+        ];
+        for (label, listed, refused, said) in rows {
+            let mut mock = MockTestBackendHandler::new();
+            setup_default_ldap_mock(&mut mock);
+            mock.expect_list_users().returning(move |_, _| listed());
+            mock.expect_list_groups().returning(|_| Ok(vec![]));
+            let handler = setup_bound_admin_handler(mock).await;
+            let base = "dc=example,dc=com";
+            let search = request(base, LdapSearchScope::Subtree, person_filter());
+            let (lines, _guard) = Lines::capture();
+            for _ in 0..100 {
+                let answered = handler.do_search_or_dse(&search).await;
+                assert_eq!(answered.err().map(|e| e.code), refused, "{label}");
+            }
+            assert_eq!(lines.take_loud().len(), said, "{label}");
         }
     }
 

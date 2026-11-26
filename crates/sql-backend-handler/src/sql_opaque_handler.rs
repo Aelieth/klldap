@@ -847,7 +847,7 @@ impl OpaqueHandler for SqlOpaqueHandler {
         logging::proved(proved).await
     }
 
-    #[instrument(skip_all, level = "debug", err)]
+    #[instrument(skip_all, level = "debug", err(level = "debug"))]
     async fn registration_start(
         &self,
         request: registration::ClientRegistrationStartRequest,
@@ -855,7 +855,7 @@ impl OpaqueHandler for SqlOpaqueHandler {
         self.start_registration(request, None)
     }
 
-    #[instrument(skip_all, level = "debug", err)]
+    #[instrument(skip_all, level = "debug", err(level = "debug"))]
     async fn registration_finish(
         &self,
         request: registration::ClientRegistrationFinishRequest,
@@ -885,7 +885,7 @@ impl OpaqueHandler for SqlOpaqueHandler {
         Ok(username)
     }
 
-    #[instrument(skip_all, level = "debug", err)]
+    #[instrument(skip_all, level = "debug", err(level = "debug"))]
     async fn registration_start_by(
         &self,
         request: registration::ClientRegistrationStartRequest,

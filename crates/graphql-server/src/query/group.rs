@@ -1,5 +1,6 @@
 use super::attribute::AttributeValue;
 use crate::api::{Context, field_error_callback};
+use crate::query::said_unlisted;
 use crate::query::user::User;
 use chrono::TimeZone;
 use juniper::{FieldResult, graphql_object};
@@ -122,7 +123,8 @@ impl<Handler: BackendHandler + OpaqueHandler> Group<Handler> {
                 false,
             )
             .instrument(span)
-            .await?;
+            .await
+            .map_err(said_unlisted)?;
         domain_users
             .into_iter()
             .map(|u| User::<Handler>::from_user_and_groups(u, self.schema.clone()))

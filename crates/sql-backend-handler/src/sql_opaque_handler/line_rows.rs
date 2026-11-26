@@ -130,3 +130,18 @@ async fn test_a_registration_finish_with_junk_server_data_prints_no_line_at_erro
         "the refusal is said, at debug: {levels:?}"
     );
 }
+
+#[tokio::test]
+async fn test_a_registration_finish_that_fails_prints_no_line_at_error() {
+    let h = doors::handler().await;
+    let bob = session("bob", 1);
+    let mut request = web_registration(&h, "bob", "bob-new-1", &bob, None).await;
+    request.server_data = "junk".to_owned();
+    let (lines, _guard) = Lines::capture();
+    let refused = h.registration_finish(request).await;
+    let levels: Vec<_> = lines.take().into_iter().map(|line| line.level).collect();
+    assert!(
+        refused.is_err() && !levels.is_empty() && !levels.contains(&Level::ERROR),
+        "the failure is said at debug; its caller's row or exit says it louder: {levels:?}"
+    );
+}

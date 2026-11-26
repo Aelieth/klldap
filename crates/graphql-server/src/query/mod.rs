@@ -28,11 +28,19 @@ use lldap_domain_handlers::handler::{
 };
 use lldap_domain_handlers::kerberos::{kerberos_backend, realm_health};
 use lldap_domain_handlers::logging::current_request;
+use lldap_domain_handlers::warn_limited;
+use lldap_domain_model::error::DomainError;
 use lldap_keycloak::{KeycloakConfig, SUGGESTED_HOSTNAME};
 use lldap_opaque_handler::OpaqueHandler;
 use lldap_schema::PublicSchema;
 use std::sync::Arc;
 use tracing::{Instrument, Span, debug, debug_span};
+
+/// A list of users that failed, said once where it is answered; the client gets the field's error.
+pub(crate) fn said_unlisted(e: DomainError) -> DomainError {
+    warn_limited!("A list of users was answered with an error of the server's own: {e}");
+    e
+}
 
 #[derive(PartialEq, Eq, Debug)]
 /// The top-level GraphQL query type.
@@ -164,7 +172,8 @@ impl<Handler: FullHandler + OpaqueHandler> Query<Handler> {
                 true,
             )
             .instrument(span)
-            .await?;
+            .await
+            .map_err(said_unlisted)?;
         users
             .into_iter()
             .map(|u| User::<Handler>::from_user_and_groups(u, schema.clone()))
@@ -831,6 +840,56 @@ mod tests {
                 (expected, 0),
                 "{label}: an admin's list answers null for each user and reads nothing: {errors:?}"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_a_list_of_users_that_fails_is_said_within_the_budget() {
+        use lldap_domain_handlers::logging::capture::{BUDGET, Lines};
+        use lldap_domain_model::error::NOT_ANSWERED;
+        let mut mock = MockTestBackendHandler::new();
+        setup_default_schema(&mut mock);
+        mock.expect_list_users()
+            .returning(|_, _| Err(DomainError::NotAnswered));
+        mock.expect_get_group_details()
+            .with(eq(GroupId(3)))
+            .returning(|_| {
+                let epoch = chrono::Utc.timestamp_nanos(42).naive_utc();
+                Ok(GroupDetails {
+                    group_id: GroupId(3),
+                    display_name: "Bobbersons".into(),
+                    creation_date: epoch,
+                    uuid: lldap_domain::types::Uuid::from_name_and_date("Bobbersons", &epoch),
+                    attributes: Vec::new(),
+                    modified_date: epoch,
+                })
+            });
+        let context = Context::<MockTestBackendHandler>::new_for_tests(
+            mock,
+            ValidationResults {
+                user: UserId::new("admin"),
+                permission: Permission::Admin,
+            },
+        );
+        let schema = schema(Query::<MockTestBackendHandler>::new());
+        let rows = [
+            ("users", r#"{ users { id } }"#),
+            ("a group's", r#"{ group(groupId: 3) { users { id } } }"#),
+        ];
+        for (label, query) in rows {
+            let (lines, _guard) = Lines::capture();
+            let mut errors = Vec::new();
+            for _ in 0..100 {
+                let answered = execute(query, None, &schema, &Variables::new(), &context).await;
+                let (_, failed) = answered.unwrap();
+                errors.extend(failed.iter().map(|e| e.error().message().to_owned()));
+            }
+            assert_eq!(
+                (errors.len(), errors.iter().all(|e| e == NOT_ANSWERED)),
+                (100, true),
+                "{label}: the client is answered the field's error"
+            );
+            assert_eq!(lines.take_loud().len(), BUDGET, "{label}");
         }
     }
 

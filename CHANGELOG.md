@@ -90,6 +90,9 @@ release candidate. Further testing and verification come before it is promoted.
 - A password-reset link's token lives five minutes like its cookie, is taken only by the password's
   register start and finish, and ends when the password is set (at once on that server, on others at
   their next start). GraphQL answers it `Invalid JWT` with an `access_denied` row.
+- A password reset that sets the password also ends every other session of the user: its access
+  tokens and its refresh tokens, at once on that server and on others at their next start, as a
+  logout does.
 - The web pages, and `lldap_set_password` given `--admin-password`, seal a synced user's new
   password only to the envelope key bound to their own sign-in: a login start may ask for the key
   (`"kerberos_envelope_key": true`), and the server binds it as the OPAQUE login's context. After a

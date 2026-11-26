@@ -138,6 +138,16 @@ impl TcpBackendHandler for SqlBackendHandler {
     }
 
     #[instrument(skip_all, level = "debug")]
+    async fn delete_refresh_tokens(&self, user: &UserId) -> Result<()> {
+        debug!(?user);
+        model::JwtRefreshStorage::delete_many()
+            .filter(JwtRefreshStorageColumn::UserId.eq(user))
+            .exec(self.pool())
+            .await?;
+        Ok(())
+    }
+
+    #[instrument(skip_all, level = "debug")]
     async fn start_password_reset(&self, user: &UserId) -> Result<Option<String>> {
         debug!(?user);
         if model::User::find_by_id(user.clone())

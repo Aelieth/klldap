@@ -965,7 +965,7 @@ where
     .await?;
     // A recovery clears the second factor only once the new password is committed.
     if presenter.reset {
-        end_reset_token(data, token_hash).await;
+        end_sessions_at_reset(data, &presenter.actor, token_hash).await;
         with_actor(
             actor,
             data.get_mfa_handler()
@@ -976,12 +976,24 @@ where
     Ok(HttpResponse::Ok().finish())
 }
 
-/// A reset token ends once its password is set: here at once, and in the table, as a logout
-/// ends a session's.
-async fn end_reset_token<Backend: TcpBackendHandler>(data: &AppState<Backend>, jwt_hash: u64) {
+/// A reset that sets the password ends its token and every session of its user: here at once,
+/// and in the tables, as a logout ends a session's; another server follows at its next start.
+async fn end_sessions_at_reset<Backend: TcpBackendHandler>(
+    data: &AppState<Backend>,
+    user: &UserId,
+    jwt_hash: u64,
+) {
     data.jwt_blacklist.write().unwrap().insert(jwt_hash);
-    if let Err(e) = data.get_tcp_handler().blacklist_jwt(jwt_hash).await {
+    let handler = data.get_tcp_handler();
+    if let Err(e) = handler.blacklist_jwt(jwt_hash).await {
         warn!("A reset token was ended here but could not be ended in the table: {e}");
+    }
+    match handler.blacklist_jwts(user).await {
+        Ok(hashes) => data.jwt_blacklist.write().unwrap().extend(hashes),
+        Err(e) => warn!("A reset could not end the other sessions of {user} in the table: {e}"),
+    }
+    if let Err(e) = handler.delete_refresh_tokens(user).await {
+        warn!("A reset could not end the refresh tokens of {user}: {e}");
     }
 }
 
@@ -2284,13 +2296,16 @@ pub(crate) mod tests {
             Ok(true)
         }
         async fn blacklist_jwts(&self, _: &UserId) -> DomainResult<HashSet<u64>> {
-            unimplemented!()
+            Ok(HashSet::new())
         }
         async fn blacklist_jwt(&self, _: u64) -> DomainResult<()> {
             Ok(())
         }
         async fn delete_refresh_token(&self, _: u64) -> DomainResult<()> {
             unimplemented!()
+        }
+        async fn delete_refresh_tokens(&self, _: &UserId) -> DomainResult<()> {
+            Ok(())
         }
         async fn start_password_reset(&self, _: &UserId) -> DomainResult<Option<String>> {
             unimplemented!()
@@ -4475,7 +4490,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn test_a_reset_token_ends_when_its_password_is_set_and_not_before() {
+    async fn test_a_reset_ends_its_token_and_the_users_sessions_when_its_password_is_set() {
         const ANN: &str = "p1ann";
         let _backend = ONE_BACKEND.lock().await;
         let _guard = EnforcementGuard::none();
@@ -4487,6 +4502,9 @@ pub(crate) mod tests {
             token.await.unwrap().as_str().to_owned()
         };
         let (reset, session) = (mint(true).await, mint(false).await);
+        let (refresh, _) = handler.create_refresh_token(&ann).await.unwrap();
+        let refresh = default_hash(&refresh);
+        let refreshes = async || handler.check_token(refresh, &ann).await.unwrap();
         let ended = async || {
             let stored = handler.get_jwt_blacklist().await.unwrap();
             let in_memory = state.jwt_blacklist.read().unwrap().clone();
@@ -4497,13 +4515,13 @@ pub(crate) mod tests {
         };
         let by_session = started(&state, &session, ANN, "p1ann-pass-1").await;
         let refused = finished(&state, Some(&reset), &by_session).await;
-        let after_refused = ended().await;
+        let after_refused = (ended().await, refreshes().await);
         let body = started(&state, &reset, ANN, "p1ann-pass-2").await;
         let taken = finished(&state, Some(&reset), &body).await.0;
-        let after_taken = ended().await;
+        let after_taken = (ended().await, refreshes().await);
         let starts = (
             start_answered(&state, &reset, ANN).await,
-            start_answered(&state, &session, ANN).await.0,
+            start_answered(&state, &session, ANN).await,
         );
         let unauthorized = (401, format!("Unauthorized: `{NOT_AUTHORIZED}`"));
         assert_eq!(
@@ -4517,13 +4535,13 @@ pub(crate) mod tests {
                 starts
             ),
             (
-                (unfinishable(), [(false, false); 2]),
-                (200, [(true, true), (false, false)], true),
-                (unauthorized, 200)
+                (unfinishable(), ([(false, false); 2], true)),
+                (200, ([(true, true); 2], false), true),
+                (unauthorized.clone(), unauthorized)
             ),
             "a refused finish ends nothing; the finish that sets the password ends its reset \
-             token, in the table and here, and no other token of the user; the reset token \
-             then starts nothing, the session still does"
+             token and every session of the user, in the tables and here, and the user's \
+             refresh token; neither token then starts anything"
         );
     }
 

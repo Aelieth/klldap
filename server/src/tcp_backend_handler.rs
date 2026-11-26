@@ -19,6 +19,8 @@ pub trait TcpBackendHandler: Sync {
     /// Ends one access token, in the store a logout ends each of its user's in.
     async fn blacklist_jwt(&self, jwt_hash: u64) -> Result<()>;
     async fn delete_refresh_token(&self, refresh_token_hash: u64) -> Result<()>;
+    /// Ends every refresh token of `user`, so none of its sessions makes a new access token.
+    async fn delete_refresh_tokens(&self, user: &UserId) -> Result<()>;
 
     /// Request a token to reset a user's password.
     /// If the user doesn't exist, returns `Ok(None)`, otherwise `Ok(Some(token))`.

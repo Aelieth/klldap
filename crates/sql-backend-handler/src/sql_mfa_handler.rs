@@ -1081,6 +1081,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_the_code_at_kinit_is_the_users_own_choice_and_goes_with_the_factor() {
         let _clock = pin_clock(AT);
         let guard = LogGuard::install_on_this_thread();
@@ -2462,6 +2463,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn test_with_a_case_twin_nobody_is_exempt_nothing_is_made_and_every_start_warns() {
         exempt_twin_lane(&get_initialized_db().await).await;
     }

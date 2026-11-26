@@ -75,7 +75,7 @@ nginx's `$proxy_add_x_forwarded_for` and HAProxy's `option forwardfor` do: a pro
 client's own header through lets the client name any address. An allowed list that contains a
 proxy's own address admits requests made from that host itself.
 
-The `Forwarded` header (RFC 7239) is not read in 0.8.1. RFC 7239 section 8.1 says of that header
+The `Forwarded` header (RFC 7239) is not read in 0.8.2. RFC 7239 section 8.1 says of that header
 that it "cannot be relied upon to be correct, as it may be modified, whether mistakenly or for
 malicious reasons, by every node on the way to the server, including the client making the
 request"; the same holds for `X-Forwarded-For`, which is why only the listed proxies are believed.

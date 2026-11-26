@@ -6,7 +6,7 @@ KLLDAP contains LLDAP, Copyright (C) the LLDAP authors, GPL-3.0-only.
 
 Third-party crate licenses are gated by deny.toml.
 
-KLLDAP links kerber-rust v1.2.3 (https://github.com/Aelieth/kerber-rust).
+KLLDAP links kerber-rust v1.2.4-rc.4 (https://github.com/Aelieth/kerber-rust).
 Its NOTICE follows; the paths in it are kerber-rust's.
 
 kerber-rust

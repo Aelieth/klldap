@@ -14,7 +14,7 @@ Restart=on-failure
 [Container]
 # The image is built first (see docs/install.md); podman keeps a locally built image under localhost/.
 ContainerName=lldap
-Image=localhost/aelieth/klldap:0.8.1
+Image=localhost/aelieth/klldap:0.8.2
 
 # /data holds the config, keytabs and (for sqlite) the database; the KDC database has
 # its own volume. Both must persist.

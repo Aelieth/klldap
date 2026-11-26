@@ -504,7 +504,7 @@ sssctl domain-status klldap && getent passwd testuser && klist
 ```yaml
 services:
   klldap:
-    image: aelieth/klldap:0.8.1
+    image: aelieth/klldap:0.8.2
     volumes:
       - ./data:/data
       - ./krb5kdc:/var/kerberos/krb5kdc

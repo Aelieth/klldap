@@ -3,22 +3,22 @@
 The Kerberos KDC runs inside the `lldap` process. You run the server from an image you build,
 or from the release tarball on a host.
 
-0.8.1 is a pre-release, and its images are not published to a registry. To run it in a
-container, build the image yourself, at the root of a checkout of the `v0.8.1` tag:
+0.8.2 is a pre-release, and its images are not published to a registry. To run it in a
+container, build the image yourself, at the root of a checkout of the `v0.8.2` tag:
 
 ```sh
-docker build --build-arg VERSION=0.8.1 --tag aelieth/klldap:0.8.1 .
+docker build --build-arg VERSION=0.8.2 --tag aelieth/klldap:0.8.2 .
 ```
 
-`VERSION=0.8.1` sets the image's `version` label (`dev` without it), and `aelieth/klldap:0.8.1`
+`VERSION=0.8.2` sets the image's `version` label (`dev` without it), and `aelieth/klldap:0.8.2`
 is the name the examples on this page use. The build fetches its dependencies, kerber-rust
-v1.2.3 among them from GitHub, so it needs the network. The
+v1.2.4-rc.4 among them from GitHub, so it needs the network. The
 `Dockerfile`'s `rootless` target gives the rootless image; name it
-`aelieth/klldap:0.8.1-rootless`. The image builds for amd64 and arm64; the arm64 image is built
+`aelieth/klldap:0.8.2-rootless`. The image builds for amd64 and arm64; the arm64 image is built
 under emulation and is not tested by us. To install without building, use the
 [release tarball](#install-from-the-release-tarball).
 
-KLLDAP 0.8.1 is 64-bit only (x86_64 and arm64); there is no 32-bit or ARMv7 build.
+KLLDAP 0.8.2 is 64-bit only (x86_64 and arm64); there is no 32-bit or ARMv7 build.
 
 **Set a restart policy. If a Kerberos thread dies, or the server gives the
 Kerberos realm up because its writes stopped reaching the database, the process
@@ -49,7 +49,7 @@ still work, and they win when both names are set. A root start repairs ownership
 `/data`, `/app` and the KDC directory, then `gosu` runs the server as that user.
 `tini` is the init. The rootless image starts as user `lldap` and does not change
 ownership; `/data` must already be writable by that user. `--user` on the standard
-image fails, because `gosu` cannot switch user without root. Use `aelieth/klldap:0.8.1-rootless`,
+image fails, because `gosu` cannot switch user without root. Use `aelieth/klldap:0.8.2-rootless`,
 and the compose `user:` field in place of `UID` and `GID`.
 
 The KDC listens on 1088 and kadmin on `127.0.0.1:1749`. Publish the KDC as `88:1088`
@@ -80,7 +80,7 @@ volumes:
 
 services:
   klldap:
-    image: aelieth/klldap:0.8.1
+    image: aelieth/klldap:0.8.2
     container_name: klldap
     restart: unless-stopped
     ports:
@@ -223,7 +223,7 @@ Moving between database backends is in [database_migration.md](database_migratio
 
 ### Upgrading from KLLDAP 0.7.2
 
-Write a dump of the Kerberos realm with the 0.7.2 image before the first 0.8.1 start; 0.8.1
+Write a dump of the Kerberos realm with the 0.7.2 image before the first 0.8.2 start; 0.8.2
 loads it and keeps the MIT files: [kerberos.md](kerberos.md#upgrading-from-072).
 
 At each start, a principal of a directory user without `kerberosSync`, a migrated one
@@ -232,7 +232,7 @@ turn `kerberosSync` on for the user, then change the user's password: the passwo
 what brings kinit back. Or remove the principal with kadmin.
 
 On MySQL and MariaDB schema changes are not transactional (the server commits at each DDL
-statement), so take a backup before the first 0.8.1 start; if a start is interrupted
+statement), so take a backup before the first 0.8.2 start; if a start is interrupted
 mid-migration the next start completes it.
 
 **A 0.7.2 compose file that publishes `88:88` must publish `88:1088`, or the KDC is

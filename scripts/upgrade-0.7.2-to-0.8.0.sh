@@ -11,8 +11,8 @@ usage: $0 [--yes] CONTAINER [BACKUP_DIR]
 
 Without --yes, print the plan and change nothing.
 --yes stops the 0.7.2 container, backs up both mounts, writes principal.dump
-with that container's image, and prints the edits. It does not start 0.8.1.
---verify checks the 0.8.1 container against the backup directory.
+with that container's image, and prints the edits. It does not start 0.8.2.
+--verify checks the 0.8.2 container against the backup directory.
 EOF
 }
 
@@ -362,9 +362,9 @@ print_env_actions() {
         else
             printf 'environment:  add LLDAP_KERBEROS_OPTIONS__REALM=%s\n' "$realm"
         fi
-        echo "              delete LLDAP_KERB_REALM_NAME (0.8.1 ignores it)"
+        echo "              delete LLDAP_KERB_REALM_NAME (0.8.2 ignores it)"
     else
-        echo "environment:  delete LLDAP_KERB_REALM_NAME (0.8.1 ignores it)"
+        echo "environment:  delete LLDAP_KERB_REALM_NAME (0.8.2 ignores it)"
     fi
     if [ "$keycloak_set" = yes ]; then
         echo "              rename LLDAP_KEYCLOAK_ADMIN_PASS to LLDAP_KEYCLOAK_OPTIONS__ADMIN_PASS (keep its value)"
@@ -407,7 +407,7 @@ print_compose_block() {
     else
         echo "In the compose file:"
     fi
-    echo "image:        change to aelieth/klldap:0.8.1"
+    echo "image:        change to aelieth/klldap:0.8.2"
     print_port_actions quote
     print_env_actions compose
     echo "a configuration that does not set kerberos_options.enabled now starts a realm; set enabled = false to stay without one"
@@ -422,7 +422,7 @@ print_run_block() {
     echo "For docker run:"
     echo "the old container must be renamed or removed before a new one takes its name; this script never removes it"
     echo "docker rename ${name} ${name}-0.7.2"
-    echo "image:        change to aelieth/klldap:0.8.1"
+    echo "image:        change to aelieth/klldap:0.8.2"
     print_port_actions tick
     print_env_actions run
     echo "a configuration that does not set kerberos_options.enabled now starts a realm; set enabled = false to stay without one"
@@ -436,7 +436,7 @@ print_run_block() {
 print_edits() {
     compose_of
     read_ports
-    echo "0.7.2 is stopped. Apply one of the two blocks, then start 0.8.1 yourself."
+    echo "0.7.2 is stopped. Apply one of the two blocks, then start 0.8.2 yourself."
     if [ -n "$compose_project" ]; then
         print_compose_block
         print_run_block
@@ -561,12 +561,12 @@ printf "%s\n" "$n"')"
 do_verify() {
     local vrunning realm count logs loaded migrated listed mode
     if ! docker inspect "$container" >/dev/null 2>&1; then
-        echo "no such container ${container}. Pass the 0.8.1 container name and the backup directory." >&2
+        echo "no such container ${container}. Pass the 0.8.2 container name and the backup directory." >&2
         exit 1
     fi
     vrunning="$(docker inspect -f '{{.State.Running}}' "$container")"
     if [ "$vrunning" != true ]; then
-        echo "${container} is not running. Start 0.8.1, then run --verify again. Nothing was changed." >&2
+        echo "${container} is not running. Start 0.8.2, then run --verify again. Nothing was changed." >&2
         exit 1
     fi
     if [ ! -f "${backup}/dump_count" ] || [ ! -f "${backup}/realm" ]; then
@@ -660,7 +660,7 @@ if ! docker image inspect "$image_id" >/dev/null 2>&1; then
     exit 1
 fi
 if ! image_is_072 "$image_id"; then
-    echo "${name} (ref ${image_ref}) is not a 0.7.2 image: ${image_id} has no kdb5_util or no /app/kerberos_manager. A 0.8.1 image has neither. Nothing was changed. This script does not pull. Podman follows the manual steps in docs/kerberos.md." >&2
+    echo "${name} (ref ${image_ref}) is not a 0.7.2 image: ${image_id} has no kdb5_util or no /app/kerberos_manager. A 0.8.2 image has neither. Nothing was changed. This script does not pull. Podman follows the manual steps in docs/kerberos.md." >&2
     exit 1
 fi
 
@@ -728,7 +728,7 @@ if [ -n "$others" ]; then
 fi
 
 if file_there "$kdc_spec" principal.dump; then
-    echo "principal.dump is already in the KDC directory. Nothing was changed. Move that file aside yourself and run again, or if 0.8.1 is already up run --verify. This script does not delete it." >&2
+    echo "principal.dump is already in the KDC directory. Nothing was changed. Move that file aside yourself and run again, or if 0.8.2 is already up run --verify. This script does not delete it." >&2
     exit 1
 fi
 
@@ -795,10 +795,10 @@ echo "backup_need ${need}"
 echo "backup_free ${free}"
 echo "backup_dir ${backup_abs}"
 if [ "$db_external" = yes ]; then
-    echo "the database is outside these volumes; back it up yourself before the first 0.8.1 start; on MySQL and MariaDB schema changes are not transactional"
+    echo "the database is outside these volumes; back it up yourself before the first 0.8.2 start; on MySQL and MariaDB schema changes are not transactional"
 fi
 if [ "$db_file" = yes ]; then
-    echo "the database URL comes from a file this script does not read; if it is not SQLite, back it up yourself before the first 0.8.1 start; on MySQL and MariaDB schema changes are not transactional"
+    echo "the database URL comes from a file this script does not read; if it is not SQLite, back it up yourself before the first 0.8.2 start; on MySQL and MariaDB schema changes are not transactional"
 fi
 
 if [ "$yes" -eq 0 ]; then
@@ -823,7 +823,7 @@ backup_begun=0
 
 if [ "$has_principal" = no ]; then
     echo "no principal file in the KDC directory; nothing to dump."
-    echo "0.8.1 starts a realm unless kerberos_options.enabled = false."
+    echo "0.8.2 starts a realm unless kerberos_options.enabled = false."
     echo "no_realm nothing_to_dump"
     print_edits
     ok=1

@@ -213,7 +213,7 @@ version: "3"
 
 services:
   lldap:
-    image: aelieth/klldap:0.8.1
+    image: aelieth/klldap:0.8.2
     volumes:
       - ./bootstrap:/bootstrap
     ports:
@@ -257,7 +257,7 @@ spec:
       restartPolicy: OnFailure
       containers:
         - name: lldap-bootstrap
-          image: aelieth/klldap:0.8.1
+          image: aelieth/klldap:0.8.2
 
           command:
             - /app/bootstrap.sh

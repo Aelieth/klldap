@@ -1,8 +1,235 @@
 # Changelog
 
-## [0.8.2] (unreleased)
+## [0.8.2] - 2026-11-25
 
-0.8.2 is not a release. This heading only opens the branch.
+0.8.2 is a pre-release: the owner's code review of 0.8.1, and its fixes. It is not merged to `main`,
+and its images are not published to a registry. Its KDC and kadmin are kerber-rust v1.2.4-rc.4, a
+release candidate. Further testing and verification come before it is promoted.
+
+### Added
+
+- kinit can ask for the second factor itself, for a user who turns on "code at kinit" on their own
+  page. `kinit -l 5m` with the password gives a five-minute ticket good only as armor. `kinit -T`
+  with that ticket and the code alone gives the ticket, marked `mfa`, whose renewals and service
+  tickets need no window. The code is the directory's code: five attempts a step, and used once
+  across every door and the KDC. A value that is not six digits is refused unread and never logged.
+- GraphQL `setCodeAtKinit(on)` turns the code at kinit on or off for the signed-in user alone, and
+  `User.codeAtKinit` reads it, for the user and an administrator. It is off by default, removing or
+  resetting the factor turns it off, and each change writes one row.
+- `mfa_proof_window = "0"` turns the window off: a sign-in with the code at a directory door then
+  opens nothing at the KDC.
+- A ticket marked `mfa` is refused at its next renewal or service ticket once the user's factor has
+  changed after it was issued.
+- `lldap healthcheck --kerberos` fails unless the server says its realm is ready. A flag of this
+  name was removed in 0.8.0; it is back with this meaning, so a compose file that overrides the
+  healthcheck with it now fails unless the realm is ready. `kerberosInfo` gains `state`, and `cause`
+  for admins. The web interface shows admins a notice while the realm is closed, and locks the
+  Kerberos sync switch.
+- On a directory-only server a user with Kerberos sync is deleted with a confirmation: GraphQL
+  `deleteUser` takes `confirmUserId`, equal to `userId` in any case, and the users page asks for
+  each such user's name in turn. The user is deleted, and in the same transaction its principal is
+  marked in the new table `kerberos_delete_marks` (made at start, with no schema number) with one
+  `kerberos_sync` row; the answer's `warnings` say that the principal stays until the realm opens.
+  The realm's next opening removes each marked principal before the KDC serves, and until then the
+  KDC refuses the name. Without the confirmation, and at an LDAP Delete, the delete is refused. A
+  confirmation that names another user, or one for a user who has no sync now, deletes nothing;
+  outside directory-only `confirmUserId` changes nothing but that check.
+
+### Removed
+
+- `kerberosInfo.publicKeyDerBase64` is removed. A client takes the envelope key from a register
+  start, or from a login start that asks for it, which binds it.
+
+### Changed
+
+- Upgrading from 0.8.1 ([install.md](docs/install.md#upgrading-from-klldap-081)): a server whose
+  Kerberos realm does not open now serves the directory to everyone by default (next entry); a web
+  sign-in in progress across the upgrade is refused once: sign in again; `lldap_set_password
+  --admin-password` no longer takes `password:code`; `kerberosInfo.publicKeyDerBase64` is gone; and
+  a `ticket_lifetime` of ten minutes or less refuses the start.
+- **The default changed: a server whose Kerberos realm does not open at start now serves the
+  directory to everyone.** Until 0.8.1 such a server listened on loopback only, admitted only
+  members of `lldap_admin` and refused most changes. From 0.8.2 it serves LDAP, LDAPS and the web
+  interface as configured, to every user, with every policy judged as always (`directory-only`).
+  Kerberos is closed: the KDC and kadmin do not answer, and every change that needs a principal is
+  refused with LDAP 52, HTTP 503 or a GraphQL error and the text `Kerberos KDC unavailable: <class>;
+  the change will be possible when this server's realm opens`, where `<class>` is the kind of cause
+  (below): a password change of a user with Kerberos sync, creating such a user, turning sync on or
+  off, and deleting such a user without a confirmation. The Keycloak keytab export is refused too.
+  Nothing is queued. To keep the old behaviour set `kerberos_options.on_realm_failure =
+  "admin-only"` (`LLDAP_KERBEROS_OPTIONS__ON_REALM_FAILURE=admin-only`). A server stays admin-only
+  whatever the key says when the realm's lockout file is missing, unreadable or not a lockout file,
+  when the database has never held a realm, and when it cannot learn that it holds the realm. A
+  running server that loses its realm still exits.
+- `/health` answers a JSON object in every state, `{"kerberos": "<state>", "cause": "<text>"}`, with
+  `cause` only where there is one: 200 for `disabled`, `ready` and `directory-only`, 503 for
+  `admin-only`, `unsettled` and `lost`. The cause there names no file and no count; the full cause
+  is in the server log and, for admins, in `kerberosInfo.cause`. Before, the body was empty or the
+  bare cause.
+- A realm that did not open names the kind of its cause in public, in `/health`, in the healthcheck
+  and in the refusals in directory-only: "the Kerberos data directory cannot be used", "the realm's
+  records did not open", "the start pass failed", "the KDC did not start", "the database's
+  durability setting is unsafe" or "this database holds no Kerberos realm yet". The server log, the
+  rows and `kerberosInfo.cause` keep the full cause ([kerberos.md](docs/kerberos.md#health)).
+- `lldap healthcheck`, and so the image's HEALTHCHECK, passes a directory-only server: it no longer
+  says that the realm serves. For a ready realm it checks the KDC port and the admin keytab as
+  before.
+- `/auth/logout` now acts only on a refresh token the server holds; any other token changes nothing.
+- A password registration sent over HTTP (the pages, `lldap_set_password`) is finished once, within
+  two minutes of its start, and only by the session that started it.
+- For a user with Kerberos sync the envelope's label is now `klldap-kerberos-envelope-v2:<user
+  id>:<server_data>`, with `server_data` as the register start answered it, so an envelope opens
+  only for its own start; it was `klldap-kerberos-envelope-v1:<user id>`. A Rust client gets the
+  whole finish from `lldap_auth::kerberos_envelope::finish_with_envelope`. The finish takes its
+  start's id in the new table `used_registration_starts`, made at start with no schema number and
+  left out of dumps.
+- A web login's finish is taken once, within two minutes of its start; a second or late finish gets
+  the wrong-password answer with its own `login` row and counts nothing. The new table
+  `used_login_starts` is made at start with no schema number, and left out of dumps.
+- A password-reset link's token lives five minutes like its cookie, is taken only by the password's
+  register start and finish, and ends when the password is set (at once on that server, on others at
+  their next start). GraphQL answers it `Invalid JWT` with an `access_denied` row.
+- The web pages, and `lldap_set_password` given `--admin-password`, seal a synced user's new
+  password only to the envelope key bound to their own sign-in: a login start may ask for the key
+  (`"kerberos_envelope_key": true`), and the server binds it as the OPAQUE login's context. After a
+  reload, or a server restart, the admin's change page and the create page ask for a new sign-in.
+  The e-mail reset page and `lldap_set_password --token` take the key as answered: serve the web
+  port over TLS.
+- `lldap_set_password --admin-password` signs in by OPAQUE, not by `/auth/simple/login`: the admin's
+  password no longer reaches the server. An admin with a second factor gives the password alone and
+  is asked the code; `password:code` no longer works there.
+- `lldap_set_password --admin-password` with a second factor: `password:code` no longer works; the
+  code comes from the prompt or `LLDAP_ADMIN_TOTP_CODE`.
+- KLLDAP's own copies of a password at `/auth/simple/login`, an LDAP simple bind (the decoded
+  request's copy included), a bind's check of the password, the web pages and `lldap_set_password`
+  are wiped when they are dropped. Not wiped: the HTTP body buffers and the JSON reader's copies,
+  GraphQL's parsed variables (and the query text when a password is written in it), the LDAP
+  library's decode copies and read buffer, the browser's fields, form model and JavaScript side, and
+  the tool's arguments, environment, parser copies and HTTP body.
+- The migration tool (`lldap_migration_tool`) holds the source directory's bind password from its
+  prompt, and each password value a search of that directory returns, in types that wipe them when
+  they are dropped; a user's debug output prints no password.
+- For a user with a second factor the KDC checks the password before the second factor. A wrong
+  password at kinit is now `Password incorrect` and counts toward the lockout. The right password
+  without the code or a window is refused with error 12 after it; 0.8.1 refused before looking at
+  the password. A user who must enrol first is still refused before the password.
+- The server refuses to start with a `ticket_lifetime` of ten minutes or less.
+- A directory user's own ticket in an S4U request is now judged for the second factor; user-to-user
+  is judged on the asking user's ticket.
+- While a user's `enable-mfa` value cannot be read, the web login refuses when the sign-in starts,
+  answered as a name with no password file is, with its one `login` row `policy: unreadable` and
+  nothing counted toward the lockout; before, it refused at the finish, after the password had
+  verified.
+- As in 0.8.1, a refusal by a policy item counts nothing toward the lockout, at every door; the
+  lockout counts only wrong passwords and wrong codes. While the lockout counts, a right password,
+  or a right code, that a policy item refuses at an LDAP bind or `/auth/simple/login` now writes the
+  user's lockout row again as it stands, the way a wrong password's count is written, and changes no
+  count and no lock.
+- The groups `lldap_admin` and `lldap_disabled` are compared in any case, as LLDAP compares them: at
+  the LDAP bind and `/auth/simple/login`, the web login, the reset request, an admin-only server's
+  check for admins, the Kerberos status of a synced user's principal, the last-admin guards, LDAP's
+  `loginDisabled`, GraphQL `isDisabled` and the web pages' switches. `lldap_mfa_disabled` is still
+  compared by its exact name.
+- A sign-in refused before any credential was proved (a wrong password or a locked, disabled or
+  unknown account at a bind, a web login, a Kerberos sign-in, a token refresh with a token the
+  server does not hold, a password reset) is stored one to one only for the first 8 of its flood
+  window; past that the refusals are counted in a `started` and a `resolved` row of the new kind
+  `sign_in_flood`. Each known user's first 8 refusals from one client address, of one kind over one
+  protocol, are kept, for up to 16 users per address at a time; past that, and for names that are no
+  user, the address's first 8. This replaces the 0.7.5 statement that wrong passwords against real
+  accounts are always stored one to one; what stays per user is the `account_lock` row and the
+  stored counts; `logActivity.failuresSinceLastSuccess` counts stored rows. Rows written after a
+  credential was proved are stored every time. Flood windows are keyed by the client address
+  `allowed-networks` judges, not by the socket peer. At most 512 windows of one `sign_in_flood` kind
+  are open at once; one more is counted in a `... flood from many sources` pair, and an open window
+  is no longer closed to make room.
+- Every terminal line a request can cause before a credential is proved goes through the failure
+  lines' limit of 64 per 10 seconds, or is printed at `debug`: the server's own warnings that a
+  request can cause (a policy or lockout that could not be read, a mail that could not be sent, an
+  LDAP connection's error, now a warning, not an error) and the `info` line of an LDAP write request
+  share the limit, and an unknown LDAP control and a malformed DN are `debug`. An internal error is
+  said once where it is answered, within the limit: at the LDAP bind, at an HTTP 500, and where an
+  LDAP search or a GraphQL list of users cannot read its users. A log writer that cannot store says
+  so once when that starts and once when it ends, with the number lost. The embedded KDC's own lines
+  (`target: krb5_klog`) are `debug` below a warning and share the limit from a warning up
+  ([logging.md](docs/logging.md#terminal-lines)).
+- Events the log writer drops are stored as at most one `log_gap` row every 10 seconds: the first
+  drops are written at once, later ones together once the 10 seconds are over, or when the writer
+  stops.
+- The reads at the sign-in and token doors, and the background reads and writes, are given up at a
+  bound of 2 seconds (5 for the second factor's prune). The policy cache's fill reads the activity
+  rows and the proof windows 500 at a time, and the lockout reads the rows the other servers wrote
+  500 users at a time, each page within the bound; a lockout read given up leaves the server judging
+  with the rows it read before until its next read. A wait for a connection of the main database
+  pool gives up after 10 seconds (it was 30).
+- A read or a write given up at its bound says so in one set of words, `the database did not answer
+  in time`: in the server's warning, in an HTTP 500's body, and as the detail of the row a token's
+  use or a reset token's finish writes. A token's use whose groups cannot be read is refused with an
+  `access_denied` row in those words, or `groups: unreadable` for another failure, where the row
+  said `Account disabled`; a token refresh answers that read 500. A reset finish whose token cannot
+  be read answers 500 with a row in those words, or `reset token: unreadable`; a wrong or expired
+  token keeps its 404.
+- A bind that gets none of the server's four key-stretching slots within 2 seconds, or finds 32
+  binds already waiting for one, is answered busy (LDAP result 51, HTTP 503) with one failed `bind`
+  row, `server busy`, and counts as no failure. A bind whose key stretching began and did not
+  complete answers an internal error, no longer a wrong password.
+- A name read as no user is remembered as such for 5 seconds on the server that read it, and is
+  asked only before a credential is proved: a bind for such a name is refused as `unknown user` at
+  once. A user created on another server within those seconds of a sign-in attempt for its name is
+  answered `unknown user` there until they pass.
+- After one wait of 250 ms for a lockout count's write runs out, the KDC stops waiting: until a
+  count's write lands within 250 ms again, it answers at once and each count it takes is owed and
+  tried again about a second later. The sign-in time an issued ticket records for `inactivity-days`
+  follows the same rule on its own.
+- A user or a second-factor proof written while another write or a short hold had the policy cache's
+  lock is now loaded for Kerberos by that holder, or by the filler alone within a quarter of a
+  second, instead of waiting for a whole refill. A write of one user no longer copies the whole
+  policy cache. A fill lists users 500 at a time, each chunk under its own bound, and no longer
+  holds back writes: a user created or changed during a fill is known to the KDC at once.
+- 0.8.1's entry on adopted principals is corrected: when sync is turned on, or a user is created
+  with sync, for a name that already has a principal, the principal's keys are replaced and with
+  them its password expiry is cleared whoever set it, its must-change flag is cleared and its
+  Kerberos failure count is set to 0.
+- KLLDAP's own policy, lockout, inactivity and log code now keeps time with jiff instead of chrono.
+  Stored data and LDAP and GraphQL output are unchanged, with three exceptions at the far edge: a
+  log filter time after 9999-12-30T22:00:00Z is refused with an error; a stored time outside the
+  years -9999 to 9999 is read as the nearest representable instant; the logged reason for an
+  unreadable `inactivity_recording_since` value is worded differently.
+- On MySQL and MariaDB the bounded policy read chooses its statement time limit by which of
+  `max_statement_time` and `max_execution_time` the server has, asked once, not by the text of
+  `SELECT VERSION()`; a server with neither refuses the read.
+- A renewal or service ticket asked for a subject whose entry could not be read is refused (Kerberos
+  error 18, no text, one `access_denied` row, `the principal could not be read`); MIT goes on with
+  such a request.
+- kadmin `cpw -e <types>` on a directory user's principal is refused with `BAD_KEYSALTS` (kadmin
+  prints `Invalid key/salt tuples`) before anything is derived or written: a directory user's key
+  types are the realm's `supported_enctypes`. A change that would leave a key of a type outside
+  `supported_enctypes`, or a Kerberos policy name, on such a principal is refused when it is written
+  (`BAD_KEYSALTS`, `PROTECT_PRINCIPAL`). Principals that are not directory users keep MIT's
+  behaviour.
+- A kadmin `cpw` that meets another change to the same principal at the same instant is written,
+  from the change prepared once, instead of being refused.
+- The gate's upgrade phase from the 0.8.0 pre-release is dropped; the `lldap-cli` phase is
+  rewritten; CI builds the kill-points image, checks each package alone, and fails on a call that
+  asks jiff for a time zone.
+
+### Fixed
+
+- A Cancel, Close or confirm clicked while a confirmation dialog is still opening now closes it when
+  the opening ends, instead of doing nothing until a second click.
+- A new token whose row cannot be stored answers HTTP 500; before, the request panicked.
+- GraphQL `removeUserFromGroup` on `lldap_admin` answers a failed read of the group or of its
+  members as an error and changes nothing. `deleteOu` reads the OU's users and groups before any
+  change, and a failed read refuses the delete.
+
+### Dependencies
+
+- kerber-rust v1.2.4-rc.4, a release candidate, replaces v1.2.3, at its tag: `krb5-kdc`,
+  `krb5-admin`, `krb5-asn1`, `krb5-config`, `krb5-crypto`, `krb5-gss`, `krb5-log`, `krb5-protocol`,
+  `krb5-types` and its `rasn` patch.
+- `url` 2.5.9 (RUSTSEC-2026-0592), with `form_urlencoded` 1.2.3.
+- RUSTSEC-2026-0594 (`cookie` 0.16, through actix-web 4) is ignored in `deny.toml`: it concerns only
+  private (encrypted) cookies, whose jar is not compiled; the server sets plain cookies only.
 
 ## [0.8.1] - 2026-11-23
 

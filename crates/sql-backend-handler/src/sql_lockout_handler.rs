@@ -26,7 +26,7 @@ use lldap_domain_model::{
 };
 use sea_orm::{
     ActiveValue::Set, ColumnTrait, Condition, ConnectionTrait, DbBackend, EntityTrait, QueryFilter,
-    QuerySelect, Statement, TransactionTrait, Value, sea_query::OnConflict,
+    QueryOrder, QuerySelect, Select, Statement, TransactionTrait, Value, sea_query::OnConflict,
 };
 use std::collections::HashMap;
 use tracing::debug;
@@ -298,6 +298,28 @@ impl CountingStart {
     }
 }
 
+/// The rows with a stamp at or after `since`, and after `after` in user-id order when given.
+fn locks_since(since: Option<Timestamp>, after: Option<&UserId>) -> Select<model::LoginLockouts> {
+    let mut query = model::LoginLockouts::find();
+    if let Some(since) = since.map(to_naive) {
+        query = query.filter(
+            Condition::any()
+                .add(LoginLockoutsColumn::LastFailed.gte(since))
+                .add(LoginLockoutsColumn::LastSuccess.gte(since))
+                .add(LoginLockoutsColumn::LastAdminUnlock.gte(since))
+                .add(LoginLockoutsColumn::LockLogged.gte(since)),
+        );
+    }
+    if let Some(after) = after {
+        query = query.filter(LoginLockoutsColumn::UserId.gt(after.clone()));
+    }
+    query
+}
+
+fn page_limit(limit: usize) -> u64 {
+    u64::try_from(limit).unwrap_or(u64::MAX)
+}
+
 fn row_of(found: model::login_lockouts::Model) -> LockRow {
     LockRow {
         fail_count: u32::try_from(found.fail_count).unwrap_or(0),
@@ -308,27 +330,12 @@ fn row_of(found: model::login_lockouts::Model) -> LockRow {
     }
 }
 
-#[async_trait]
-impl LockStore for SqlBackendHandler {
-    async fn read_lock(&self, user: &UserId) -> Result<Option<LockRow>> {
-        let found = model::LoginLockouts::find_by_id(user.clone())
-            .one(&self.sql_pool)
-            .await?;
-        Ok(found.map(row_of))
-    }
-
-    async fn read_locks(&self, since: Option<Timestamp>) -> Result<Vec<StoredLock>> {
-        let mut query = model::LoginLockouts::find();
-        if let Some(since) = since.map(to_naive) {
-            query = query.filter(
-                Condition::any()
-                    .add(LoginLockoutsColumn::LastFailed.gte(since))
-                    .add(LoginLockoutsColumn::LastSuccess.gte(since))
-                    .add(LoginLockoutsColumn::LastAdminUnlock.gte(since))
-                    .add(LoginLockoutsColumn::LockLogged.gte(since)),
-            );
-        }
-        let found = query.all(&self.sql_pool).await?;
+impl SqlBackendHandler {
+    /// Each row with its account's uuid, the names read a batch at a time.
+    async fn with_accounts(
+        &self,
+        found: Vec<model::login_lockouts::Model>,
+    ) -> Result<Vec<StoredLock>> {
         let users: Vec<UserId> = found.iter().map(|row| row.user_id.clone()).collect();
         let mut accounts: HashMap<UserId, Uuid> = HashMap::new();
         for some in users.chunks(BATCH_LIMIT) {
@@ -350,11 +357,56 @@ impl LockStore for SqlBackendHandler {
             })
             .collect())
     }
+}
+
+#[async_trait]
+impl LockStore for SqlBackendHandler {
+    async fn read_lock(&self, user: &UserId) -> Result<Option<LockRow>> {
+        let found = model::LoginLockouts::find_by_id(user.clone())
+            .one(&self.sql_pool)
+            .await?;
+        Ok(found.map(row_of))
+    }
+
+    async fn read_locks(&self, since: Option<Timestamp>) -> Result<Vec<StoredLock>> {
+        let found = locks_since(since, None).all(&self.sql_pool).await?;
+        self.with_accounts(found).await
+    }
+
+    async fn read_locks_after(
+        &self,
+        since: Option<Timestamp>,
+        after: Option<&UserId>,
+        limit: usize,
+    ) -> Result<Vec<StoredLock>> {
+        let found = locks_since(since, after)
+            .order_by_asc(LoginLockoutsColumn::UserId)
+            .limit(page_limit(limit))
+            .all(&self.sql_pool)
+            .await?;
+        self.with_accounts(found).await
+    }
 
     async fn read_lock_users(&self) -> Result<Vec<UserId>> {
         let found: Vec<UserId> = model::LoginLockouts::find()
             .select_only()
             .column(LoginLockoutsColumn::UserId)
+            .into_tuple()
+            .all(&self.sql_pool)
+            .await?;
+        Ok(found)
+    }
+
+    async fn read_lock_users_after(
+        &self,
+        after: Option<&UserId>,
+        limit: usize,
+    ) -> Result<Vec<UserId>> {
+        let found: Vec<UserId> = locks_since(None, after)
+            .select_only()
+            .column(LoginLockoutsColumn::UserId)
+            .order_by_asc(LoginLockoutsColumn::UserId)
+            .limit(page_limit(limit))
             .into_tuple()
             .all(&self.sql_pool)
             .await?;
@@ -923,6 +975,42 @@ pub(crate) mod tests {
             vec![],
             "the row goes with its user"
         );
+        let [one, two, three] = ["e2page1", "e2page2", "e2page3"].map(UserId::new);
+        let later = first.failed(time(4, 0));
+        for (paged, row) in [(&one, first), (&two, first), (&three, later)] {
+            insert_user_no_password(&handler, paged.as_str()).await;
+            let written = handler.write_locks("1", &[write(paged, row)]).await;
+            assert_eq!(written.unwrap().kept, vec![], "{paged}");
+        }
+        let third = Some(handler.get_user_details(&three).await.unwrap().uuid);
+        let names = |rows: Vec<StoredLock>| -> Vec<UserId> {
+            rows.into_iter().map(|(paged, _, _)| paged).collect()
+        };
+        let opening = handler.read_locks_after(None, None, 2).await.unwrap();
+        let following = handler.read_locks_after(None, Some(&two), 2).await.unwrap();
+        let stamped = handler.read_locks_after(Some(time(2, 0)), Some(&one), 2);
+        let pages = (
+            names(opening),
+            following,
+            names(stamped.await.unwrap()),
+            handler.read_lock_users_after(None, 2).await.unwrap(),
+            handler.read_lock_users_after(Some(&two), 2).await.unwrap(),
+        );
+        assert_eq!(
+            pages,
+            (
+                vec![one.clone(), two.clone()],
+                vec![(three.clone(), third, later)],
+                vec![three.clone()],
+                vec![one.clone(), two.clone()],
+                vec![three.clone()],
+            ),
+            "pages in user-id order after the last name, each row with its account, the stamp \
+             filter and the page together"
+        );
+        for paged in [one, two, three] {
+            handler.delete_user(&paged).await.unwrap();
+        }
     }
 
     /// Two servers: a user deleted on one while the other owes it a write.

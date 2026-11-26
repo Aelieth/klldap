@@ -317,30 +317,35 @@ where
     entries.windows = windows.collect();
 }
 
-/// One user's windows again, as a write or a refusal asks; false when the read failed.
-pub(crate) async fn take_user_windows<H>(handler: &H, cache: &PolicyCache, user: &UserId) -> bool
+/// One user's windows again, as a write or a refusal asks, under the bound; a read that failed
+/// leaves the user none.
+pub(crate) async fn take_user_windows<H>(
+    handler: &H,
+    cache: &PolicyCache,
+    user: &UserId,
+) -> Result<()>
 where
     H: PolicyBackendHandler + ?Sized,
 {
     if !proofs_live(cache) {
-        return true;
+        return Ok(());
     }
     let entries = cache.get();
     if !known_required(cache, &entries, user) {
         if !entries.windows_of(user).is_empty() {
             cache.put_windows(user, Vec::new());
         }
-        return true;
+        return Ok(());
     }
-    match handler.read_proof_windows(Some(user)).await {
+    match bounded(POLICY_READ_WAIT, handler.read_proof_windows(Some(user))).await {
         Ok(rows) => {
             cache.put_windows(user, rows.into_iter().map(|(_, w)| w).collect());
-            true
+            Ok(())
         }
         Err(e) => {
             warn_limited!("The second factor's windows of {user} were not read: {e}");
             cache.put_windows(user, Vec::new());
-            false
+            Err(e)
         }
     }
 }

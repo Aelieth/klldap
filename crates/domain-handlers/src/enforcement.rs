@@ -1497,8 +1497,15 @@ where
                 }
                 cache.put_user(&user, &ou_key, items);
                 cache.put_facts(&user, facts);
-                if !read || !take_user_windows(handler, cache, &user).await {
+                if !read {
                     cache.note_read_failed();
+                    continue;
+                }
+                if let Err(e) = take_user_windows(handler, cache, &user).await {
+                    cache.note_read_failed();
+                    if gave_up(&e) {
+                        return false;
+                    }
                     continue;
                 }
             }
@@ -2892,6 +2899,9 @@ mod tests {
             if user.is_none() && self.proofs_parked.load(Ordering::Relaxed) {
                 std::future::pending::<()>().await;
             }
+            if user.is_some() {
+                self.parked("user_windows").await;
+            }
             self.chunk(user).await;
             if self.proofs_down.load(Ordering::Relaxed) {
                 return Err(DomainError::InternalError("down".to_owned()));
@@ -2998,6 +3008,10 @@ mod tests {
                 true => Err(DomainError::InternalError("down".to_owned())),
                 false => Ok(None),
             }
+        }
+        async fn write_recording(&self, live: bool, at: Timestamp) -> Result<Option<Timestamp>> {
+            self.parked("write_recording").await;
+            Ok(live.then_some(at))
         }
         async fn write_success(&self, user: &UserId, at: Timestamp) -> Result<()> {
             self.successes.lock().unwrap().push((user.clone(), at));
@@ -5213,29 +5227,76 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     #[serial_test::serial]
+    async fn test_a_mark_pass_whose_windows_read_never_answers_leaves_at_the_bound_without_them() {
+        let cache = PolicyCache::new();
+        cache.set_proofs(Some(ProofSettings::new(600, false, 3600)));
+        cache.set_mfa_policy(Some(MfaPolicy::Enrolled));
+        let mut directory = Directory::knowing(&[LATE, OTHER]).enrolling(&[LATE, OTHER]);
+        let both = [LATE, OTHER].map(|name| (UserId::new(name), opened()));
+        directory.proof_rows = both.to_vec();
+        let (late, other) = (UserId::new(LATE), UserId::new(OTHER));
+        cache.mark(&other);
+        directory.park("user_windows");
+        let started = tokio::time::Instant::now();
+        let walk = user_written(&directory, &cache, &late);
+        let returned = tokio::time::timeout(WITHIN, walk).await.is_ok();
+        let took = started.elapsed();
+        let windows = |user: &UserId| cache.get().windows_of(user).to_vec();
+        let marks = || [&late, &other].map(|user| cache.marked(user));
+        let left = (returned, marks(), windows(&late), cache.failed_read());
+        directory.unpark();
+        user_written(&directory, &cache, &late).await;
+        assert_eq!(
+            (left, took >= POLICY_READ_WAIT, took < WITHIN),
+            ((true, [true, true], vec![], true), true, true),
+            "given up at the bound: the user has no window and the read is noted as failed; the \
+             pass ends with both marks kept"
+        );
+        assert_eq!(
+            (marks(), windows(&late), windows(&other)),
+            ([false, false], vec![opened()], vec![opened()]),
+            "the next pass reads both users' windows"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[serial_test::serial]
     async fn test_a_follows_read_that_never_answers_is_given_up_at_the_bound() {
-        type Row = (&'static str, Option<(&'static str, &'static str)>, bool);
-        let rows: [Row; 5] = [
-            ("list_policies", None, true),
-            ("read_period", None, true),
-            ("read_recording", Some((INACTIVITY_DAYS, "30")), true),
-            ("list_groups", Some((ENABLE_MFA, "always")), false),
-            ("read_locks", None, true),
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum By {
+            Follow,
+            FirstRefresh,
+            Refresh,
+        }
+        type Row = (&'static str, Option<(&'static str, &'static str)>, By, bool);
+        let idle = Some((INACTIVITY_DAYS, "30"));
+        let mfa = Some((ENABLE_MFA, "always"));
+        let locking = Some(("lockout-threshold", "3"));
+        let rows: [Row; 10] = [
+            ("list_policies", None, By::Follow, true),
+            ("read_period", None, By::Follow, true),
+            ("read_recording", idle, By::Follow, true),
+            ("write_recording", idle, By::Follow, true),
+            ("write_recording", None, By::Follow, true),
+            ("list_groups", mfa, By::Follow, false),
+            ("read_locks", locking, By::Follow, true),
+            ("read_locks", None, By::FirstRefresh, true),
+            ("read_locks", None, By::Refresh, true),
+            ("read_lock_users", None, By::Refresh, true),
         ];
-        for (read, set, fails) in rows {
+        for (read, set, by, fails) in rows {
             let (cache, counter) = (PolicyCache::new(), Lockout::default());
+            let item = set.map(|(key, _)| key);
             let set = set.map(|(key, value)| linked(key, value, &[LABS]));
             let directory = Directory {
                 policies: set.into_iter().collect(),
                 ..Directory::default()
             };
-            // Only a refresh's read of the rows since its last one is timed: a whole read is not.
-            let refresh = read == "read_locks";
-            let follow = async || match refresh {
-                true => counter.refresh(&directory).await.map(drop),
-                false => counter.follow_policies(&directory, &cache).await.map(drop),
+            let follow = async || match by {
+                By::Follow => counter.follow_policies(&directory, &cache).await.map(drop),
+                By::FirstRefresh | By::Refresh => counter.refresh(&directory).await.map(drop),
             };
-            if refresh {
+            if by == By::Refresh {
                 follow().await.unwrap();
             }
             directory.park(read);
@@ -5253,8 +5314,8 @@ mod tests {
                     next.is_ok()
                 ),
                 (fails, !fails, true, true, true),
-                "{read}: given up at the bound, an error of the follow where a failed read is \
-                 one; the next follow reads"
+                "{read} ({by:?}, {item:?}): given up at the bound, an error of the follow where a \
+                 failed read is one; the next follow reads"
             );
         }
     }

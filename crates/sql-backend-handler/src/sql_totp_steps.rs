@@ -241,7 +241,7 @@ impl SqlBackendHandler {
         };
         let pruned = tokio::time::timeout(PRUNE_BOUND, both)
             .await
-            .unwrap_or_else(|_| Err(DomainError::InternalError("the prune timed out".to_owned())));
+            .unwrap_or_else(|_| Err(DomainError::NotAnswered));
         if pruned.is_err() {
             self.note_codes_written();
         }
@@ -558,6 +558,31 @@ pub(crate) mod tests {
         handler.note_codes_written();
         handler.prune_totp_steps().await.unwrap();
         assert_eq!(deletes(), 4, "a row written: the next tick prunes the four");
+    }
+
+    #[tokio::test]
+    async fn test_a_prune_given_up_at_its_bound_says_so_and_runs_again_at_the_next_tick() {
+        use lldap_domain_handlers::enforcement::gave_up;
+        let db = get_initialized_db().await;
+        let handler = SqlBackendHandler::new(generate_random_private_key(), db.clone());
+        let held = db.begin().await.unwrap();
+        let started = std::time::Instant::now();
+        let given_up = handler.prune_totp_steps().await;
+        let took = started.elapsed();
+        held.rollback().await.unwrap();
+        let next = handler.prune_totp_steps().await;
+        let then = handler.prune_totp_steps().await;
+        assert_eq!(
+            (
+                given_up.as_ref().is_err_and(gave_up),
+                took >= PRUNE_BOUND,
+                next.is_ok(),
+                then.ok()
+            ),
+            (true, true, true, Some(0)),
+            "the one connection held: given up at the bound in the words of a read given up, the \
+             prune is owed and the next tick runs it; the one after has nothing to do"
+        );
     }
 
     #[tokio::test]

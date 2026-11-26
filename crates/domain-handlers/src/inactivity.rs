@@ -389,13 +389,13 @@ pub async fn follow_recording<S: LockStore + ?Sized>(
     let next = match (item_set(policies, INACTIVITY_DAYS), cache.recording()) {
         (false, Recording::Off) => return Ok(()),
         (false, _) => {
-            store.write_recording(false, at).await?;
+            bounded(POLICY_READ_WAIT, store.write_recording(false, at)).await?;
             Recording::Off
         }
         (true, _) => {
             let turning = !live(cache) || cache.item_unread(INACTIVITY_DAYS);
             let stored = match bounded(POLICY_READ_WAIT, store.read_recording()).await {
-                Ok(None) => store.write_recording(true, at).await,
+                Ok(None) => bounded(POLICY_READ_WAIT, store.write_recording(true, at)).await,
                 read => read,
             };
             if turning && stored.is_err() {

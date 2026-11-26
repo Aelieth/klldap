@@ -1,7 +1,7 @@
 use crate::enforcement::{
-    Attempt, Door, INACTIVITY_DAYS, ItemCheck, POLICY_REFILL, PolicyCache, UserState, bounded,
-    cached_mfa_policy, door_clock, door_read, ensure_exempt_group, fill_policy_cache, follow_items,
-    follow_mfa_item, gave_up, item_checks, resolve_items,
+    Attempt, Door, FILL_CHUNK, INACTIVITY_DAYS, ItemCheck, POLICY_REFILL, PolicyCache, UserState,
+    bounded, cached_mfa_policy, door_clock, door_read, ensure_exempt_group, fill_policy_cache,
+    follow_items, follow_mfa_item, gave_up, item_checks, resolve_items,
 };
 use crate::handler::{
     GroupBackendHandler, GroupListerBackendHandler, PolicyBackendHandler, UserBackendHandler,
@@ -244,6 +244,30 @@ pub trait LockStore: Send + Sync {
     /// The rows with a stamp at or after `since`; every row for `None`.
     async fn read_locks(&self, since: Option<Timestamp>) -> Result<Vec<StoredLock>>;
     async fn read_lock_users(&self) -> Result<Vec<UserId>>;
+    /// `read_locks` in user-id order after `after`; a page shorter than `limit` is the last.
+    /// Without paging: all, per page.
+    async fn read_locks_after(
+        &self,
+        since: Option<Timestamp>,
+        after: Option<&UserId>,
+        limit: usize,
+    ) -> Result<Vec<StoredLock>> {
+        let mut rows = self.read_locks(since).await?;
+        rows.sort_by_key(|(user, _, _)| user.clone());
+        let later = |(user, _, _): &StoredLock| after.is_none_or(|after| user > after);
+        Ok(rows.into_iter().filter(later).take(limit).collect())
+    }
+    /// `read_lock_users` in the same order and pages.
+    async fn read_lock_users_after(
+        &self,
+        after: Option<&UserId>,
+        limit: usize,
+    ) -> Result<Vec<UserId>> {
+        let mut users = self.read_lock_users().await?;
+        users.sort();
+        let later = |user: &UserId| after.is_none_or(|after| user > after);
+        Ok(users.into_iter().filter(later).take(limit).collect())
+    }
     async fn read_split(&self, user: &UserId) -> Result<Option<SplitMark>>;
     async fn read_period(&self) -> Result<String>;
     /// One transaction: nothing is stored unless the period, read under a lock, is `period`.
@@ -1433,13 +1457,10 @@ impl Lockout {
             };
             (book.changes, since_at)
         };
-        let rows = match since_at {
-            Some(_) => bounded(POLICY_READ_WAIT, store.read_locks(since_at)).await?,
-            None => store.read_locks(since_at).await?,
-        };
+        let rows = lock_rows(store, since_at).await?;
         let present: HashSet<UserId> = match all {
             true => rows.iter().map(|(user, _, _)| user.clone()).collect(),
-            false => store.read_lock_users().await?.into_iter().collect(),
+            false => lock_users(store).await?.into_iter().collect(),
         };
         let mut book = self.book();
         let mut taken = 0;
@@ -1641,6 +1662,41 @@ impl Lockout {
 }
 
 pub type Running = tokio::task::JoinHandle<()>;
+
+/// The rows `read_locks` names, a page at a time in user-id order, each page under its own bound.
+async fn lock_rows<S: LockStore + ?Sized>(
+    store: &S,
+    since: Option<Timestamp>,
+) -> Result<Vec<StoredLock>> {
+    let mut rows: Vec<StoredLock> = Vec::new();
+    loop {
+        let after = rows.last().map(|(user, _, _)| user.clone());
+        let page = store.read_locks_after(since, after.as_ref(), FILL_CHUNK);
+        let page = bounded(POLICY_READ_WAIT, page).await?;
+        let last = page.len() < FILL_CHUNK;
+        rows.extend(page);
+        if last {
+            return Ok(rows);
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+/// Every user with a row, a page at a time in user-id order, each page under its own bound.
+async fn lock_users<S: LockStore + ?Sized>(store: &S) -> Result<Vec<UserId>> {
+    let mut users: Vec<UserId> = Vec::new();
+    loop {
+        let after = users.last().cloned();
+        let page = store.read_lock_users_after(after.as_ref(), FILL_CHUNK);
+        let page = bounded(POLICY_READ_WAIT, page).await?;
+        let last = page.len() < FILL_CHUNK;
+        users.extend(page);
+        if last {
+            return Ok(users);
+        }
+        tokio::task::yield_now().await;
+    }
+}
 
 /// Before the KDC serves: until the first follow reads the policies, every door the lockout
 /// or enable-mfa judges refuses, and the follow is tried again every second.
@@ -2348,6 +2404,7 @@ mod tests {
         meanwhile: Mutex<Option<Meanwhile>>,
         uuids: Mutex<HashMap<UserId, Uuid>>,
         read_delay: Mutex<Duration>,
+        page_delay: Duration,
     }
 
     impl Memory {
@@ -2391,6 +2448,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("read since {since:?}"));
+            if !self.page_delay.is_zero() {
+                tokio::time::sleep(self.page_delay).await;
+            }
             let rows: Vec<StoredLock> = {
                 let rows = self.rows.lock().unwrap();
                 let uuids = self.uuids.lock().unwrap();
@@ -2405,6 +2465,9 @@ mod tests {
         }
 
         async fn read_lock_users(&self) -> Result<Vec<UserId>> {
+            if !self.page_delay.is_zero() {
+                tokio::time::sleep(self.page_delay).await;
+            }
             Ok(self.rows.lock().unwrap().keys().cloned().collect())
         }
 
@@ -3278,6 +3341,35 @@ mod tests {
             ),
             "given up at the bound as a failed write: kept, owed and counted as an outage; the \
              next batch stores it"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_a_reread_of_many_pages_that_each_answer_in_time_is_not_failed_by_its_length() {
+        let store = Memory {
+            page_delay: POLICY_READ_WAIT - Duration::from_millis(100),
+            ..Memory::default()
+        };
+        let users: Vec<UserId> = (0..1_200)
+            .map(|n| UserId::new(&format!("e2rows{n:04}")))
+            .collect();
+        for user in &users {
+            store.put(user, row(1, Some(0), None));
+        }
+        let lockout = Lockout::default();
+        let started = tokio::time::Instant::now();
+        let taken = lockout.refresh(&store).await;
+        let took = started.elapsed();
+        let reads = store.calls().len();
+        let held = users
+            .iter()
+            .filter(|user| lockout.row(user).is_some())
+            .count();
+        assert_eq!(
+            (taken.ok(), reads, held, took > POLICY_READ_WAIT * 5),
+            (Some(1_200), 3, 1_200, true),
+            "three pages of rows and three of names, 1.9 s each: each page answered within its \
+             own bound, and every row is held"
         );
     }
 

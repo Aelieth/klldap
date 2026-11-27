@@ -1,6 +1,6 @@
 # Changelog
 
-## [0.8.2] - 2026-11-25
+## [0.8.2] - 2026-11-26
 
 0.8.2 is a pre-release: the owner's code review of 0.8.1, and its fixes. It is not merged to `main`,
 and its images are not published to a registry. Its KDC and kadmin are kerber-rust v1.2.4.

@@ -3,8 +3,8 @@
 ## [0.8.2] - 2026-11-25
 
 0.8.2 is a pre-release: the owner's code review of 0.8.1, and its fixes. It is not merged to `main`,
-and its images are not published to a registry. Its KDC and kadmin are kerber-rust v1.2.4-rc.4, a
-release candidate. Further testing and verification come before it is promoted.
+and its images are not published to a registry. Its KDC and kadmin are kerber-rust v1.2.4.
+Further testing and verification come before it is promoted.
 
 ### Added
 
@@ -228,7 +228,7 @@ release candidate. Further testing and verification come before it is promoted.
 
 ### Dependencies
 
-- kerber-rust v1.2.4-rc.4, a release candidate, replaces v1.2.3, at its tag: `krb5-kdc`,
+- kerber-rust v1.2.4 replaces v1.2.3, at its tag: `krb5-kdc`,
   `krb5-admin`, `krb5-asn1`, `krb5-config`, `krb5-crypto`, `krb5-gss`, `krb5-log`, `krb5-protocol`,
   `krb5-types` and its `rasn` patch.
 - `url` 2.5.9 (RUSTSEC-2026-0592), with `form_urlencoded` 1.2.3.

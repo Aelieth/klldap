@@ -12,7 +12,7 @@ docker build --build-arg VERSION=0.8.2 --tag aelieth/klldap:0.8.2 .
 
 `VERSION=0.8.2` sets the image's `version` label (`dev` without it), and `aelieth/klldap:0.8.2`
 is the name the examples on this page use. The build fetches its dependencies, kerber-rust
-v1.2.4-rc.4 among them from GitHub, so it needs the network. The
+v1.2.4 among them from GitHub, so it needs the network. The
 `Dockerfile`'s `rootless` target gives the rootless image; name it
 `aelieth/klldap:0.8.2-rootless`. The image builds for amd64 and arm64; the arm64 image is built
 under emulation and is not tested by us. To install without building, use the
